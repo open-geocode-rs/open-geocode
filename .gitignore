@@ -1,0 +1,23 @@
+# Rust
+/target/
+
+# Generated data
+/data/
+/packs/
+/tmp/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
