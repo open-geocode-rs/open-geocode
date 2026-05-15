@@ -32,3 +32,12 @@ Comapred to other OSS geocoding alternatives:
 | Batch geocoding | Enrich CSVs, database tables, and large address lists without per-row API pricing |
 | Search optimization | Handle messy addresses, abbreviations, typos, partial queries, and ranked candidates |
 | Private data | Geocode internal addresses, custom places, service zones, or proprietary datasets |
+
+## License
+
+`open-geocode` is licensed under the [MIT License](LICENSE).
+
+Third-party code dependencies remain under their own OSS licenses. Generated
+records and future packs preserve source metadata needed for attribution and
+auditability; users are responsible for following the license terms of the
+geospatial data they build from.
