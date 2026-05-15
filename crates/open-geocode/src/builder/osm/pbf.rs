@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use indicatif::ProgressBar;
 use osmpbf::ElementReader;
 
-use super::progress::byte_progress_bar;
+use crate::builder::progress::byte_progress_bar;
 
 pub(crate) fn element_reader_with_progress(
     input: &Path,

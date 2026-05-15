@@ -8,13 +8,14 @@ use std::{
 use anyhow::{Context, Result};
 use osmpbf::Element;
 
+use crate::{
+    builder::report::{BuilderReport, CandidateIssue},
+    record::{LocationPrecision, OsmObjectType},
+};
+
 use super::{
-    address::{
-        AddressCandidate, LocationPrecision, OsmObjectType, collect_addr_tags,
-        validate_address_tags, write_candidate,
-    },
-    osm_reader::{element_reader_with_progress, input_bytes},
-    report::{CandidateIssue, ImportReport},
+    address::{AddressCandidate, collect_addr_tags, validate_address_tags, write_candidate},
+    pbf::{element_reader_with_progress, input_bytes},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +27,7 @@ pub(crate) struct AddressWayStub {
 
 #[derive(Debug)]
 pub(crate) struct DiscoveryResult {
-    pub report: ImportReport,
+    pub report: BuilderReport,
     pub way_stubs: Vec<AddressWayStub>,
     pub required_node_ids: HashSet<i64>,
 }
@@ -35,12 +36,12 @@ pub(crate) fn discover_address_features(
     input: &Path,
     node_records_path: &Path,
 ) -> Result<DiscoveryResult> {
-    let mut report = ImportReport {
+    let mut report = BuilderReport {
         schema_version: 1,
         input: input.display().to_string(),
         output: node_records_path.display().to_string(),
         input_bytes: input_bytes(input)?,
-        ..ImportReport::default()
+        ..BuilderReport::default()
     };
     let output_file = File::create(node_records_path)
         .with_context(|| format!("failed to create {}", node_records_path.display()))?;

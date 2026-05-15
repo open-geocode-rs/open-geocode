@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use osmpbf::Element;
 
-use super::{collector::AddressWayStub, osm_reader::element_reader_with_progress};
+use super::{collector::AddressWayStub, pbf::element_reader_with_progress};
 
 pub(crate) fn resolve_required_node_locations(
     input: &Path,

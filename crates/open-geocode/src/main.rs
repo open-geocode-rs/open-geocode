@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use open_geocode::normalize_osm::{NormalizeOsmOptions, normalize_osm};
+use open_geocode::builder::{BuildOsmRecordsOptions, build_osm_records};
 
 #[derive(Debug, Parser)]
 #[command(name = "open-geocode")]
@@ -15,17 +15,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Normalize explicit OSM address records from a regional .osm.pbf extract.
-    NormalizeOsm {
+    /// Build normalized records from a regional OSM .pbf extract.
+    #[command(name = "build-osm-records", alias = "normalize-osm")]
+    BuildOsmRecords {
         /// Input regional .osm.pbf extract.
         #[arg(long)]
         input: PathBuf,
 
-        /// Output normalized AddressRecord NDJSON.
+        /// Output normalized record NDJSON.
         #[arg(long)]
         output: PathBuf,
 
-        /// Output import report JSON.
+        /// Output builder report JSON.
         #[arg(long)]
         report: PathBuf,
     },
@@ -35,11 +36,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::NormalizeOsm {
+        Commands::BuildOsmRecords {
             input,
             output,
             report,
-        } => normalize_osm(NormalizeOsmOptions {
+        } => build_osm_records(BuildOsmRecordsOptions {
             input,
             output,
             report,

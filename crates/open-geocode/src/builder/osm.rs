@@ -1,9 +1,7 @@
 mod address;
 mod collector;
 mod geometry;
-mod osm_reader;
-mod progress;
-mod report;
+mod pbf;
 
 use std::{
     collections::HashMap,
@@ -15,25 +13,24 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use crate::{
+    builder::{progress::item_progress_bar, report::BuilderReport},
+    record::{LocationPrecision, OsmObjectType},
+};
 use address::{AddressCandidate, write_candidate};
-pub use address::{AddressRecord, LocationPrecision, OsmObjectType, RecordKind, SourceProvenance};
 use collector::{AddressWayStub, discover_address_features};
 use geometry::{centroid, resolve_required_node_locations, resolve_way_points};
-use progress::item_progress_bar;
-use report::CandidateIssue;
-pub use report::{
-    AcceptedCounts, CandidateDispositionCounts, CompletenessCounts, GeometryResolutionCounts,
-    ImportReport, PhaseTimings, RejectedCounts, ScannedCounts,
-};
+
+use super::report::CandidateIssue;
 
 #[derive(Debug, Clone)]
-pub struct NormalizeOsmOptions {
+pub struct BuildOsmRecordsOptions {
     pub input: PathBuf,
     pub output: PathBuf,
     pub report: PathBuf,
 }
 
-pub fn normalize_osm(options: NormalizeOsmOptions) -> Result<()> {
+pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
     ensure_parent_dir(&options.output)?;
     ensure_parent_dir(&options.report)?;
 
@@ -86,7 +83,7 @@ fn emit_normalized_records(
     node_records_path: &Path,
     way_stubs: &[AddressWayStub],
     node_locations: &HashMap<i64, (f64, f64)>,
-    report: &mut ImportReport,
+    report: &mut BuilderReport,
 ) -> Result<()> {
     let output_file = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
@@ -155,8 +152,8 @@ mod tests {
         fs,
     };
 
+    use super::address::{AddressCandidate, write_record};
     use super::*;
-    use crate::normalize_osm::address::{AddressCandidate, write_record};
 
     #[test]
     fn emits_node_records_and_resolved_way_records_deterministically() {
@@ -193,7 +190,7 @@ mod tests {
             ]),
         }];
         let node_locations = HashMap::from([(1, (0.0, 0.0)), (2, (0.0, 2.0)), (3, (2.0, 0.0))]);
-        let mut report = ImportReport::default();
+        let mut report = BuilderReport::default();
 
         emit_normalized_records(
             &output_path,

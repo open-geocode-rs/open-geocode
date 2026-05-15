@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::address::{AddressRecord, LocationPrecision};
+use crate::record::{AddressRecord, LocationPrecision};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct ImportReport {
+pub struct BuilderReport {
     pub schema_version: u32,
     pub input: String,
     pub output: String,
@@ -108,7 +108,7 @@ enum CandidateDisposition {
     UnresolvedGeometry,
 }
 
-impl ImportReport {
+impl BuilderReport {
     pub(crate) fn accept(&mut self, record: &AddressRecord) {
         self.accepted.total += 1;
         match record.location_precision {
