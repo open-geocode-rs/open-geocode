@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = []
+members = ["crates/open-geocode"]
 
 [workspace.package]
 edition = "2024"
