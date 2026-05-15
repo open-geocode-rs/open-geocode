@@ -1,96 +1,34 @@
 # open-geocode
 
-Fast, self-hosted geocoding for address search, autocomplete, reverse geocoding,
-and batch workflows.
+Fast, lightweight, self-hosted geocoding in pure Rust.
 
-`open-geocode` builds compact region packs from open and private location data,
-then serves geocoding APIs from a single Rust binary. It is designed for teams
-that need predictable infrastructure, private data handling, and clear result
-confidence for operational location workflows.
+`open-geocode` is a mininmal Rust-native geocoding engine for address search to geo coordnates, reverse
+geocoding (coordinates to address). It turns
+OpenStreetMap, open address data, and private location data into compact regional
+datasets that can be queried without a heavy database or search cluster.
 
-## Features
+Self-hosting is designed around a single Rust runtime for the HTTP API,
+parser/search engine, and local object-storage index loading, not a PostGIS,
+Elasticsearch, Redis, or JVM stack.
 
-- Forward geocoding for addresses, streets, postcodes, and admin areas
-- Reverse geocoding for GPS points, fleet events, delivery scans, and field work
-- Autocomplete for internal tools, store locators, and address forms
-- Batch geocoding for CSV files, tables, and API streams
-- Source, precision, and confidence metadata on every result
-- Static region packs built offline and served by a lightweight runtime
-- Embedded search powered by Tantivy
+## Why open-geocode?
 
-## Quick Start
+`open-geocode` focuses on pure OSS self-hosting, not paid third-party geocoding
+APIs or vendor-locked map platforms like Google Maps and MapBox.
 
-Build a region pack:
+Comapred to other OSS geocoding alternatives:
+| Option | Tradeoff | open-geocode focus |
+|---|---|---|
+| Nominatim | Heavy PostgreSQL/PostGIS deployment | Static regional packs, no required database |
+| Pelias | Elasticsearch and multi-service ops | Single Rust runtime, no service graph |
 
-```sh
-open-geocode build \
-  --input ./data \
-  --region us-ca \
-  --output ./packs/us-ca
-```
+## Use Cases
 
-Start the API server:
-
-```sh
-open-geocode serve ./packs/us-ca --listen 127.0.0.1:8080
-```
-
-Search for an address:
-
-```sh
-curl 'http://127.0.0.1:8080/search?q=1600+Amphitheatre+Parkway,+Mountain+View,+CA'
-```
-
-Reverse geocode a point:
-
-```sh
-curl 'http://127.0.0.1:8080/reverse?lat=37.422&lon=-122.084'
-```
-
-Run a batch job:
-
-```sh
-open-geocode batch \
-  --pack ./packs/us-ca \
-  --input ./addresses.csv \
-  --output ./geocoded.csv
-```
-
-## Architecture
-
-```text
-source data
-  -> normalize
-  -> index
-  -> write region pack
-  -> serve search, reverse, autocomplete, and batch APIs
-```
-
-The offline builder handles imports, normalization, deduplication, scoring, and
-index creation. The runtime loads finished region packs and serves requests
-without PostgreSQL/PostGIS, Elasticsearch/OpenSearch, Redis, or JVM services.
-
-## Repository Layout
-
-```text
-Cargo.toml             # Cargo workspace
-rust-toolchain.toml    # Rust toolchain configuration
-crates/                # internal Rust crates
-benches/               # benchmark harnesses and scenarios
-docs/                  # product and architecture notes
-fixtures/              # test datasets and sample inputs
-docker/                # container and deployment assets
-.github/workflows/     # CI workflows
-```
-
-## Benchmarks
-
-Benchmarks track import time, disk size, memory usage, P50/P95 latency, QPS,
-batch throughput, match rate, and confidence calibration against established
-open-source geocoders.
-
-## Documentation
-
-- [Product thesis](docs/why.md)
-- [Architecture direction](docs/spec.md)
-- [First pass implementation](docs/first-pass-implementation.md)
+| Capability | Example use case |
+|---|---|
+| Forward geocoding | Turn customer, store, vendor, or service addresses into coordinates |
+| Reverse geocoding | Convert fleet, delivery, device, or field-work GPS pings into readable locations |
+| Autocomplete | Power address forms, checkout flows, internal tools, and store locators |
+| Batch geocoding | Enrich CSVs, database tables, and large address lists without per-row API pricing |
+| Search optimization | Handle messy addresses, abbreviations, typos, partial queries, and ranked candidates |
+| Private data | Geocode internal addresses, custom places, service zones, or proprietary datasets |
