@@ -6,6 +6,7 @@
 /out/
 /packs/
 /tmp/
+/demo/data/*.js
 
 # Environment
 .env

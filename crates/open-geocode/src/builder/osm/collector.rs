@@ -14,7 +14,10 @@ use crate::{
 };
 
 use super::{
-    address::{AddressCandidate, collect_addr_tags, validate_address_tags, write_candidate},
+    address::{
+        AddressCandidate, collect_addr_tags_from_map, collect_clean_tags, validate_address_tags,
+        write_candidate,
+    },
     pbf::{element_reader_with_progress, input_bytes},
 };
 
@@ -37,7 +40,7 @@ pub(crate) fn discover_address_features(
     node_records_path: &Path,
 ) -> Result<DiscoveryResult> {
     let mut report = BuilderReport {
-        schema_version: 1,
+        schema_version: 2,
         input: input.display().to_string(),
         output: node_records_path.display().to_string(),
         input_bytes: input_bytes(input)?,
@@ -58,8 +61,13 @@ pub(crate) fn discover_address_features(
                 if write_error.is_some() {
                     return;
                 }
-                let tags = collect_addr_tags(node.tags());
+                let all_tags = collect_clean_tags(node.tags());
+                let tags = collect_addr_tags_from_map(&all_tags);
                 if tags.is_empty() {
+                    return;
+                }
+                if let Err(issue) = validate_address_tags(&tags) {
+                    report.reject_with_tags(issue, OsmObjectType::Node, &all_tags, &tags);
                     return;
                 }
                 let candidate = AddressCandidate {
@@ -79,8 +87,13 @@ pub(crate) fn discover_address_features(
                 if write_error.is_some() {
                     return;
                 }
-                let tags = collect_addr_tags(node.tags());
+                let all_tags = collect_clean_tags(node.tags());
+                let tags = collect_addr_tags_from_map(&all_tags);
                 if tags.is_empty() {
+                    return;
+                }
+                if let Err(issue) = validate_address_tags(&tags) {
+                    report.reject_with_tags(issue, OsmObjectType::Node, &all_tags, &tags);
                     return;
                 }
                 let candidate = AddressCandidate {
@@ -100,13 +113,14 @@ pub(crate) fn discover_address_features(
                 if write_error.is_some() {
                     return;
                 }
-                let tags = collect_addr_tags(way.tags());
+                let all_tags = collect_clean_tags(way.tags());
+                let tags = collect_addr_tags_from_map(&all_tags);
                 if tags.is_empty() {
                     return;
                 }
 
                 if let Err(issue) = validate_address_tags(&tags) {
-                    report.reject(issue);
+                    report.reject_with_tags(issue, OsmObjectType::Way, &all_tags, &tags);
                     return;
                 }
 
@@ -130,9 +144,15 @@ pub(crate) fn discover_address_features(
                 if write_error.is_some() {
                     return;
                 }
-                let tags = collect_addr_tags(relation.tags());
+                let all_tags = collect_clean_tags(relation.tags());
+                let tags = collect_addr_tags_from_map(&all_tags);
                 if !tags.is_empty() {
-                    report.reject(CandidateIssue::UnsupportedRelation);
+                    report.reject_with_tags(
+                        CandidateIssue::UnsupportedRelation,
+                        OsmObjectType::Relation,
+                        &all_tags,
+                        &tags,
+                    );
                 }
             }
         })

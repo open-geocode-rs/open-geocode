@@ -111,17 +111,27 @@ pub(crate) fn address_record_from_candidate(
     })
 }
 
-pub(crate) fn collect_addr_tags<'a>(
+pub(crate) fn collect_clean_tags<'a>(
     tags: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> BTreeMap<String, String> {
     tags.filter_map(|(key, value)| {
-        if !key.starts_with("addr:") {
-            return None;
-        }
         let value = clean_text(value)?;
         Some((key.to_string(), value))
     })
     .collect()
+}
+
+pub(crate) fn collect_addr_tags_from_map(
+    tags: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    tags.iter()
+        .filter_map(|(key, value)| {
+            if !key.starts_with("addr:") {
+                return None;
+            }
+            Some((key.clone(), value.clone()))
+        })
+        .collect()
 }
 
 pub(crate) fn validate_address_tags(
@@ -253,7 +263,8 @@ mod tests {
             ("addr:unit", "   "),
         ];
 
-        let collected = collect_addr_tags(tags.into_iter());
+        let tags = collect_clean_tags(tags.into_iter());
+        let collected = collect_addr_tags_from_map(&tags);
 
         assert_eq!(
             collected,
