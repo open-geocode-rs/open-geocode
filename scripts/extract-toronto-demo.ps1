@@ -1,5 +1,5 @@
 param(
-    [string]$InputPath = ".\data\build\address-records.ndjson",
+    [string]$InputPath = ".\data\build\normalized-records.ndjson",
     [string]$OutputPath = ".\demo\data\toronto-addresses.js",
     [double]$MinLon = -79.65,
     [double]$MinLat = 43.55,
@@ -25,7 +25,6 @@ $reader = [System.IO.File]::OpenText((Resolve-Path -LiteralPath $InputPath))
 $scanned = 0
 $points = 0
 $centroids = 0
-$coordinatePattern = '"lat":(?<lat>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?),"lon":(?<lon>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?),"location_precision":"(?<precision>[^"]+)"'
 
 try {
     while (($line = $reader.ReadLine()) -ne $null) {
@@ -35,13 +34,14 @@ try {
             continue
         }
 
-        if ($line -notmatch $coordinatePattern) {
+        $root = $line | ConvertFrom-Json
+        if ($root.layer -ne "address" -or $root.geometry.type -ne "Point") {
             continue
         }
 
-        $lat = [double]$Matches.lat
-        $lon = [double]$Matches.lon
-        $precision = $Matches.precision
+        $lon = [double]$root.geometry.coordinates[0]
+        $lat = [double]$root.geometry.coordinates[1]
+        $precision = $root.location_precision
 
         if ($lat -lt $MinLat -or $lat -gt $MaxLat -or $lon -lt $MinLon -or $lon -gt $MaxLon) {
             continue
@@ -54,9 +54,8 @@ try {
             continue
         }
 
-        $root = $line | ConvertFrom-Json
         $records.Add([pscustomobject][ordered]@{
-            id = $root.record_id
+            id = $root.id
             label = $root.label
             lat = $lat
             lon = $lon

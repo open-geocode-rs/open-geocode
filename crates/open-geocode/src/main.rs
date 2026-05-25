@@ -26,6 +26,10 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
 
+        /// Output rejected record NDJSON.
+        #[arg(long)]
+        rejected_output: Option<PathBuf>,
+
         /// Output builder report JSON.
         #[arg(long)]
         report: PathBuf,
@@ -39,10 +43,12 @@ fn main() -> Result<()> {
         Commands::BuildOsmRecords {
             input,
             output,
+            rejected_output,
             report,
         } => build_osm_records(BuildOsmRecordsOptions {
             input,
             output,
+            rejected_output,
             report,
         }),
     }

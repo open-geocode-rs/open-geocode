@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::record::{AddressRecord, LocationPrecision, OsmObjectType};
+use crate::record::{LocationPrecision, NormalizedRecord, OsmObjectType};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct BuilderReport {
     pub schema_version: u32,
     pub input: String,
     pub output: String,
+    pub rejected_output: String,
     pub input_bytes: u64,
     pub scanned: ScannedCounts,
     pub accepted: AcceptedCounts,
@@ -20,6 +21,7 @@ pub struct BuilderReport {
     pub phases: PhaseTimings,
     pub node_cache_entries: usize,
     pub output_ndjson_bytes: u64,
+    pub rejected_ndjson_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -33,8 +35,10 @@ pub struct ScannedCounts {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AcceptedCounts {
     pub total: u64,
+    pub by_layer: BTreeMap<String, u64>,
     pub node_addresses: u64,
     pub way_centroid_addresses: u64,
+    pub interpolation_ranges: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -58,6 +62,7 @@ pub struct ValidationAuditCounts {
     pub missing_street_or_place: IssueAuditCounts,
     pub unsupported_relation: IssueAuditCounts,
     pub unresolved_geometry: IssueAuditCounts,
+    pub interpolation: IssueAuditCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -71,6 +76,7 @@ pub struct IssueAuditCounts {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct GeometryResolutionCounts {
     pub address_way_stubs: usize,
+    pub interpolation_way_stubs: usize,
     pub required_node_refs: usize,
     pub resolved_node_refs: usize,
 }
@@ -97,6 +103,17 @@ pub(crate) enum CandidateIssue {
     MissingStreetOrPlace,
     UnsupportedRelation,
     WayWithoutResolvedNodes,
+    InterpolationUnsupportedValue,
+    InterpolationUnsupportedObject,
+    InterpolationWayWithoutNodes,
+    InterpolationUnresolvedGeometry,
+    InterpolationMissingAnchors,
+    InterpolationInsufficientNumericAnchors,
+    InterpolationMissingStreetOrPlace,
+    InterpolationAnchorStreetMismatch,
+    InterpolationInvalidNumberRange,
+    InterpolationInvalidParity,
+    InterpolationNonNumericAnchor,
 }
 
 impl CandidateIssue {
@@ -106,14 +123,38 @@ impl CandidateIssue {
             Self::MissingStreetOrPlace => "missing_street_or_place",
             Self::UnsupportedRelation => "unsupported_relation",
             Self::WayWithoutResolvedNodes => "way_without_resolved_nodes",
+            Self::InterpolationUnsupportedValue => "interpolation_unsupported_value",
+            Self::InterpolationUnsupportedObject => "interpolation_unsupported_object",
+            Self::InterpolationWayWithoutNodes => "interpolation_way_without_nodes",
+            Self::InterpolationUnresolvedGeometry => "interpolation_unresolved_geometry",
+            Self::InterpolationMissingAnchors => "interpolation_missing_anchors",
+            Self::InterpolationInsufficientNumericAnchors => {
+                "interpolation_insufficient_numeric_anchors"
+            }
+            Self::InterpolationMissingStreetOrPlace => "interpolation_missing_street_or_place",
+            Self::InterpolationAnchorStreetMismatch => "interpolation_anchor_street_mismatch",
+            Self::InterpolationInvalidNumberRange => "interpolation_invalid_number_range",
+            Self::InterpolationInvalidParity => "interpolation_invalid_parity",
+            Self::InterpolationNonNumericAnchor => "interpolation_non_numeric_anchor",
         }
     }
 
     const fn disposition(self) -> CandidateDisposition {
         match self {
             Self::MissingHouseNumber | Self::MissingStreetOrPlace => CandidateDisposition::Invalid,
-            Self::UnsupportedRelation => CandidateDisposition::Unsupported,
-            Self::WayWithoutResolvedNodes => CandidateDisposition::UnresolvedGeometry,
+            Self::UnsupportedRelation
+            | Self::InterpolationUnsupportedValue
+            | Self::InterpolationUnsupportedObject => CandidateDisposition::Unsupported,
+            Self::WayWithoutResolvedNodes
+            | Self::InterpolationWayWithoutNodes
+            | Self::InterpolationUnresolvedGeometry => CandidateDisposition::UnresolvedGeometry,
+            Self::InterpolationMissingAnchors
+            | Self::InterpolationInsufficientNumericAnchors
+            | Self::InterpolationMissingStreetOrPlace
+            | Self::InterpolationAnchorStreetMismatch
+            | Self::InterpolationInvalidNumberRange
+            | Self::InterpolationInvalidParity
+            | Self::InterpolationNonNumericAnchor => CandidateDisposition::Invalid,
         }
     }
 }
@@ -126,24 +167,37 @@ enum CandidateDisposition {
 }
 
 impl BuilderReport {
-    pub(crate) fn accept(&mut self, record: &AddressRecord) {
+    pub(crate) fn accept(&mut self, record: &NormalizedRecord) {
         self.accepted.total += 1;
-        match record.location_precision {
-            LocationPrecision::Point => self.accepted.node_addresses += 1,
-            LocationPrecision::Centroid => self.accepted.way_centroid_addresses += 1,
-        }
+        *self
+            .accepted
+            .by_layer
+            .entry(record.layer().to_string())
+            .or_default() += 1;
 
-        if record.city.is_some() {
-            self.completeness.city += 1;
-        }
-        if record.postcode.is_some() {
-            self.completeness.postcode += 1;
-        }
-        if record.state.is_some() {
-            self.completeness.state += 1;
-        }
-        if record.country.is_some() {
-            self.completeness.country += 1;
+        match record {
+            NormalizedRecord::Address(address) => {
+                match address.location_precision() {
+                    LocationPrecision::Point => self.accepted.node_addresses += 1,
+                    LocationPrecision::Centroid => self.accepted.way_centroid_addresses += 1,
+                };
+
+                if address.address.locality.is_some() {
+                    self.completeness.city += 1;
+                }
+                if address.address.postcode.is_some() {
+                    self.completeness.postcode += 1;
+                }
+                if address.address.region.is_some() {
+                    self.completeness.state += 1;
+                }
+                if address.address.country.is_some() {
+                    self.completeness.country += 1;
+                }
+            }
+            NormalizedRecord::Interpolation(_) => {
+                self.accepted.interpolation_ranges += 1;
+            }
         }
     }
 
@@ -196,6 +250,17 @@ impl BuilderReport {
             CandidateIssue::MissingStreetOrPlace => &mut self.validation.missing_street_or_place,
             CandidateIssue::UnsupportedRelation => &mut self.validation.unsupported_relation,
             CandidateIssue::WayWithoutResolvedNodes => &mut self.validation.unresolved_geometry,
+            CandidateIssue::InterpolationUnsupportedValue
+            | CandidateIssue::InterpolationUnsupportedObject
+            | CandidateIssue::InterpolationWayWithoutNodes
+            | CandidateIssue::InterpolationUnresolvedGeometry
+            | CandidateIssue::InterpolationMissingAnchors
+            | CandidateIssue::InterpolationInsufficientNumericAnchors
+            | CandidateIssue::InterpolationMissingStreetOrPlace
+            | CandidateIssue::InterpolationAnchorStreetMismatch
+            | CandidateIssue::InterpolationInvalidNumberRange
+            | CandidateIssue::InterpolationInvalidParity
+            | CandidateIssue::InterpolationNonNumericAnchor => &mut self.validation.interpolation,
         };
 
         *audit.by_shape.entry(shape.to_string()).or_default() += 1;
@@ -238,6 +303,17 @@ fn address_shape(issue: CandidateIssue, addr_tags: &BTreeMap<String, String>) ->
             }
         }
         CandidateIssue::WayWithoutResolvedNodes => "way_without_resolved_nodes",
+        CandidateIssue::InterpolationUnsupportedValue
+        | CandidateIssue::InterpolationUnsupportedObject
+        | CandidateIssue::InterpolationWayWithoutNodes
+        | CandidateIssue::InterpolationUnresolvedGeometry
+        | CandidateIssue::InterpolationMissingAnchors
+        | CandidateIssue::InterpolationInsufficientNumericAnchors
+        | CandidateIssue::InterpolationMissingStreetOrPlace
+        | CandidateIssue::InterpolationAnchorStreetMismatch
+        | CandidateIssue::InterpolationInvalidNumberRange
+        | CandidateIssue::InterpolationInvalidParity
+        | CandidateIssue::InterpolationNonNumericAnchor => "interpolation",
     }
 }
 

@@ -4,7 +4,10 @@ use anyhow::Result;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
-    record::{AddressRecord, LocationPrecision, OsmObjectType, RecordKind, SourceProvenance},
+    record::{
+        AddressComponents, AddressRecord, LocationPrecision, NormalizedRecord, OsmObjectType,
+        RejectedRecord, SourceProvenance, point_geometry,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +39,7 @@ pub(crate) fn write_candidate<W: Write>(
 ) -> Result<()> {
     match address_record_from_candidate(candidate) {
         Ok(record) => {
+            let record = NormalizedRecord::address(record);
             serde_json::to_writer(&mut *output, &record)?;
             writeln!(output)?;
             report.accept(&record);
@@ -47,11 +51,29 @@ pub(crate) fn write_candidate<W: Write>(
 
 #[cfg(test)]
 pub(crate) fn write_record<W: Write>(
-    record: &AddressRecord,
+    record: &NormalizedRecord,
     output: &mut W,
 ) -> std::io::Result<()> {
     serde_json::to_writer(&mut *output, record).map_err(std::io::Error::other)?;
     writeln!(output)
+}
+
+pub(crate) fn write_rejected_record<W: Write>(
+    issue: CandidateIssue,
+    object_type: OsmObjectType,
+    object_id: i64,
+    tags: &BTreeMap<String, String>,
+    layer_hint: Option<&str>,
+    output: &mut W,
+) -> Result<()> {
+    let record = RejectedRecord {
+        reason: issue.as_str().to_string(),
+        layer_hint: layer_hint.map(str::to_string),
+        source: SourceProvenance::osm_with_tags(object_type, object_id, tags.clone()),
+    };
+    serde_json::to_writer(&mut *output, &record)?;
+    writeln!(output)?;
+    Ok(())
 }
 
 pub(crate) fn address_record_from_candidate(
@@ -71,6 +93,14 @@ pub(crate) fn address_record_from_candidate(
     let postcode = tag_value(&candidate.tags, "addr:postcode");
     let state = tag_value(&candidate.tags, "addr:state");
     let country = tag_value(&candidate.tags, "addr:country");
+    let name = [
+        Some(house_number.as_str()),
+        street.as_deref().or(place.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
     let label = build_label(LabelParts {
         house_number: &house_number,
         street: street.as_deref(),
@@ -83,31 +113,26 @@ pub(crate) fn address_record_from_candidate(
     });
 
     Ok(AddressRecord {
-        schema_version: 1,
-        record_id: format!(
+        id: format!(
             "osm:{}:{}",
             osm_object_type_name(candidate.object_type),
             candidate.object_id
         ),
-        kind: RecordKind::Address,
         label,
-        house_number,
-        street,
-        place,
-        unit,
-        city,
-        postcode,
-        state,
-        country,
-        lat: candidate.lat,
-        lon: candidate.lon,
-        location_precision: candidate.location_precision,
-        source: SourceProvenance {
-            dataset: "osm".to_string(),
-            object_type: candidate.object_type,
-            object_id: candidate.object_id,
-            tags: candidate.tags,
+        name,
+        address: AddressComponents {
+            number: house_number,
+            street,
+            place,
+            unit,
+            locality: city,
+            region: state,
+            postcode,
+            country,
         },
+        geometry: point_geometry(candidate.lon, candidate.lat),
+        location_precision: candidate.location_precision,
+        source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
     })
 }
 
@@ -191,6 +216,8 @@ fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use geojson::GeometryValue;
+
     use super::*;
 
     #[test]
@@ -212,12 +239,21 @@ mod tests {
 
         let record = address_record_from_candidate(candidate).expect("record should be accepted");
 
-        assert_eq!(record.record_id, "osm:node:42");
-        assert_eq!(record.kind, RecordKind::Address);
+        assert_eq!(record.id, "osm:node:42");
         assert_eq!(record.label, "10 King Street, Toronto, ON, CA");
-        assert_eq!(record.street.as_deref(), Some("King Street"));
+        assert_eq!(record.name, "10 King Street");
+        assert_eq!(record.address.street.as_deref(), Some("King Street"));
+        assert_eq!(record.address.locality.as_deref(), Some("Toronto"));
+        assert_eq!(record.address.region.as_deref(), Some("ON"));
+        match &record.geometry.value {
+            GeometryValue::Point { coordinates } => {
+                assert_eq!(coordinates.as_slice(), &[-79.3832, 43.6532]);
+            }
+            other => panic!("expected Point, got {}", other.type_name()),
+        }
         assert_eq!(record.source.object_type, OsmObjectType::Node);
         assert_eq!(record.source.object_id, 42);
+        assert_eq!(record.source.tags, None);
     }
 
     #[test]
@@ -273,5 +309,31 @@ mod tests {
                 ("addr:street".to_string(), "King Street".to_string())
             ])
         );
+    }
+
+    #[test]
+    fn writes_rejected_record_with_source_tags() {
+        let tags = BTreeMap::from([
+            ("addr:street".to_string(), "King Street".to_string()),
+            ("building".to_string(), "yes".to_string()),
+        ]);
+        let mut output = Vec::new();
+
+        write_rejected_record(
+            CandidateIssue::MissingHouseNumber,
+            OsmObjectType::Way,
+            42,
+            &tags,
+            Some("address"),
+            &mut output,
+        )
+        .expect("write rejected record");
+
+        let line = String::from_utf8(output).expect("utf8");
+        assert!(line.contains("\"reason\":\"missing_housenumber\""));
+        assert!(line.contains("\"layer_hint\":\"address\""));
+        assert!(line.contains("\"object_type\":\"way\""));
+        assert!(line.contains("\"object_id\":42"));
+        assert!(line.contains("\"addr:street\":\"King Street\""));
     }
 }

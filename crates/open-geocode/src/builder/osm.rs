@@ -1,11 +1,12 @@
 mod address;
 mod collector;
 mod geometry;
+mod interpolation;
 mod pbf;
 
 use std::{
-    collections::HashMap,
-    fs::{self, File},
+    collections::{BTreeMap, HashMap},
+    fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     time::Instant,
@@ -17,9 +18,10 @@ use crate::{
     builder::{progress::item_progress_bar, report::BuilderReport},
     record::{LocationPrecision, OsmObjectType},
 };
-use address::{AddressCandidate, write_candidate};
+use address::{AddressCandidate, write_candidate, write_rejected_record};
 use collector::{AddressWayStub, discover_address_features};
 use geometry::{centroid, resolve_required_node_locations, resolve_way_points};
+use interpolation::{InterpolationWayStub, write_interpolation_records};
 
 use super::report::CandidateIssue;
 
@@ -27,23 +29,33 @@ use super::report::CandidateIssue;
 pub struct BuildOsmRecordsOptions {
     pub input: PathBuf,
     pub output: PathBuf,
+    pub rejected_output: Option<PathBuf>,
     pub report: PathBuf,
 }
 
 pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
     ensure_parent_dir(&options.output)?;
+    let rejected_output = options
+        .rejected_output
+        .clone()
+        .unwrap_or_else(|| default_rejected_records_path(&options.output));
+    ensure_parent_dir(&rejected_output)?;
     ensure_parent_dir(&options.report)?;
 
     let total_started = Instant::now();
     let node_records_path = temp_node_records_path(&options.output);
     let _ = fs::remove_file(&options.output);
+    let _ = fs::remove_file(&rejected_output);
     let _ = fs::remove_file(&node_records_path);
 
     let discovery_started = Instant::now();
-    let mut discovery = discover_address_features(&options.input, &node_records_path)?;
+    let mut discovery =
+        discover_address_features(&options.input, &node_records_path, &rejected_output)?;
     discovery.report.phases.discovery_ms = discovery_started.elapsed().as_millis();
     discovery.report.output = options.output.display().to_string();
     discovery.report.geometry_resolution.address_way_stubs = discovery.way_stubs.len();
+    discovery.report.geometry_resolution.interpolation_way_stubs =
+        discovery.interpolation_way_stubs.len();
     discovery.report.geometry_resolution.required_node_refs = discovery.required_node_ids.len();
 
     let resolution_started = Instant::now();
@@ -56,8 +68,11 @@ pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
     let emission_started = Instant::now();
     emit_normalized_records(
         &options.output,
+        &rejected_output,
         &node_records_path,
         &discovery.way_stubs,
+        &discovery.interpolation_way_stubs,
+        &discovery.address_node_tags,
         &node_locations,
         &mut discovery.report,
     )?;
@@ -65,6 +80,10 @@ pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
 
     discovery.report.output_ndjson_bytes = fs::metadata(&options.output)
         .with_context(|| format!("failed to stat {}", options.output.display()))?
+        .len();
+    discovery.report.rejected_output = rejected_output.display().to_string();
+    discovery.report.rejected_ndjson_bytes = fs::metadata(&rejected_output)
+        .with_context(|| format!("failed to stat {}", rejected_output.display()))?
         .len();
     discovery.report.phases.total_ms = total_started.elapsed().as_millis();
 
@@ -80,8 +99,11 @@ pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
 
 fn emit_normalized_records(
     output_path: &Path,
+    rejected_records_path: &Path,
     node_records_path: &Path,
     way_stubs: &[AddressWayStub],
+    interpolation_way_stubs: &[InterpolationWayStub],
+    address_node_tags: &HashMap<i64, BTreeMap<String, String>>,
     node_locations: &HashMap<i64, (f64, f64)>,
     report: &mut BuilderReport,
 ) -> Result<()> {
@@ -93,17 +115,39 @@ fn emit_normalized_records(
         .with_context(|| format!("failed to open {}", node_records_path.display()))?;
     io::copy(&mut node_records, &mut output)
         .with_context(|| format!("failed to copy {}", node_records_path.display()))?;
+    let rejected_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(rejected_records_path)
+        .with_context(|| format!("failed to open {}", rejected_records_path.display()))?;
+    let mut rejected_records = BufWriter::new(rejected_file);
 
     let progress = item_progress_bar(way_stubs.len() as u64, "3/3 emit way centroids");
     for stub in way_stubs {
         let Some(points) = resolve_way_points(stub, node_locations) else {
             report.reject(CandidateIssue::WayWithoutResolvedNodes);
+            write_rejected_record(
+                CandidateIssue::WayWithoutResolvedNodes,
+                OsmObjectType::Way,
+                stub.object_id,
+                &stub.tags,
+                Some("address"),
+                &mut rejected_records,
+            )?;
             progress.inc(1);
             continue;
         };
 
         let Some((lat, lon)) = centroid(&points) else {
             report.reject(CandidateIssue::WayWithoutResolvedNodes);
+            write_rejected_record(
+                CandidateIssue::WayWithoutResolvedNodes,
+                OsmObjectType::Way,
+                stub.object_id,
+                &stub.tags,
+                Some("address"),
+                &mut rejected_records,
+            )?;
             progress.inc(1);
             continue;
         };
@@ -121,9 +165,29 @@ fn emit_normalized_records(
     }
     progress.finish_with_message("3/3 emit way centroids complete");
 
+    let progress = item_progress_bar(
+        interpolation_way_stubs.len() as u64,
+        "3/3 emit interpolation ranges",
+    );
+    for stub in interpolation_way_stubs {
+        write_interpolation_records(
+            stub,
+            node_locations,
+            address_node_tags,
+            &mut output,
+            &mut rejected_records,
+            report,
+        )?;
+        progress.inc(1);
+    }
+    progress.finish_with_message("3/3 emit interpolation ranges complete");
+
     output
         .flush()
         .with_context(|| format!("failed to flush {}", output_path.display()))?;
+    rejected_records
+        .flush()
+        .with_context(|| format!("failed to flush {}", rejected_records_path.display()))?;
     Ok(())
 }
 
@@ -145,12 +209,18 @@ fn temp_node_records_path(output: &Path) -> PathBuf {
     output.with_file_name(format!("{file_name}.nodes.tmp"))
 }
 
+fn default_rejected_records_path(output: &Path) -> PathBuf {
+    output.with_file_name("rejected-records.ndjson")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         fs,
     };
+
+    use crate::record::NormalizedRecord;
 
     use super::address::{AddressCandidate, write_record};
     use super::*;
@@ -164,6 +234,7 @@ mod tests {
 
         let node_records_path = temp_dir.join("nodes.ndjson");
         let output_path = temp_dir.join("records.ndjson");
+        let rejected_path = temp_dir.join("rejected.ndjson");
         let mut node_records = BufWriter::new(File::create(&node_records_path).expect("nodes"));
         let node_candidate = AddressCandidate {
             object_type: OsmObjectType::Node,
@@ -178,7 +249,8 @@ mod tests {
         };
         let node_record =
             address::address_record_from_candidate(node_candidate).expect("node record");
-        write_record(&node_record, &mut node_records).expect("write node");
+        write_record(&NormalizedRecord::address(node_record), &mut node_records)
+            .expect("write node");
         node_records.flush().expect("flush node");
 
         let way_stubs = vec![AddressWayStub {
@@ -194,8 +266,11 @@ mod tests {
 
         emit_normalized_records(
             &output_path,
+            &rejected_path,
             &node_records_path,
             &way_stubs,
+            &[],
+            &HashMap::new(),
             &node_locations,
             &mut report,
         )
@@ -204,8 +279,12 @@ mod tests {
         let output = fs::read_to_string(&output_path).expect("output");
         let lines = output.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"record_id\":\"osm:node:100\""));
-        assert!(lines[1].contains("\"record_id\":\"osm:way:200\""));
+        assert!(lines[0].contains("\"layer\":\"address\""));
+        assert!(lines[0].contains("\"id\":\"osm:node:100\""));
+        assert!(
+            lines[0].contains("\"geometry\":{\"type\":\"Point\",\"coordinates\":[-79.0,43.0]}")
+        );
+        assert!(lines[1].contains("\"id\":\"osm:way:200\""));
         assert_eq!(report.accepted.way_centroid_addresses, 1);
 
         let _ = fs::remove_dir_all(temp_dir);
