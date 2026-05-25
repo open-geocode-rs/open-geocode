@@ -233,11 +233,11 @@
         border: 1px solid var(--line);
         border-radius: 8px;
         box-shadow: 0 14px 42px rgb(28 47 47 / 0.22);
-        overflow: hidden;
+        overflow: visible;
       }
 
       .panel header {
-        padding: 14px 16px 12px;
+        padding: 14px 16px 10px;
         border-bottom: 1px solid var(--line);
         background: #fffbf0;
       }
@@ -256,74 +256,154 @@
         font-size: 12px;
       }
 
-      .metrics {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        border-bottom: 1px solid var(--line);
-      }
-
-      .metric {
-        min-width: 0;
+      .search-wrap {
+        position: relative;
         padding: 12px 14px;
-        border-right: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        background: #fffaf0;
       }
 
-      .metric:last-child {
-        border-right: 0;
+      .search-box {
+        position: relative;
+        display: grid;
+        grid-template-columns: 22px 1fr 24px;
+        align-items: center;
+        gap: 8px;
+        min-height: 42px;
+        padding: 0 12px;
+        border: 1px solid #cfc2ad;
+        border-radius: 999px;
+        background: #fffefa;
+        box-shadow: 0 3px 12px rgb(28 47 47 / 0.08);
       }
 
-      .metric strong {
-        display: block;
-        font-size: 16px;
-        line-height: 1.1;
+      .search-box:focus-within {
+        border-color: #9d8f78;
+        box-shadow: 0 5px 18px rgb(28 47 47 / 0.14);
       }
 
-      .metric span {
-        display: block;
-        margin-top: 4px;
+      .search-icon {
+        width: 16px;
+        height: 16px;
+        color: #6a655c;
+      }
+
+      #search-input {
+        min-width: 0;
+        width: 100%;
+        border: 0;
+        outline: 0;
+        background: transparent;
+        color: var(--ink);
+        font: inherit;
+        font-size: 14px;
+      }
+
+      #search-input::placeholder {
+        color: #858077;
+      }
+
+      .clear-search {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: #6a655c;
+        font-size: 18px;
+        line-height: 1;
+      }
+
+      .clear-search:hover {
+        background: #eee5d6;
+        color: var(--ink);
+      }
+
+      .clear-search[hidden] {
+        display: none;
+      }
+
+      .suggestions {
+        position: absolute;
+        z-index: 1200;
+        top: 62px;
+        left: 14px;
+        right: 14px;
+        max-height: min(320px, calc(100vh - 190px));
+        margin: 0;
+        padding: 6px 0;
+        overflow-y: auto;
+        border: 1px solid #cfc2ad;
+        border-radius: 8px;
+        background: #fffefa;
+        box-shadow: 0 18px 40px rgb(28 47 47 / 0.2);
+        list-style: none;
+      }
+
+      .suggestions[hidden] {
+        display: none;
+      }
+
+      .suggestion {
+        display: grid;
+        grid-template-columns: 28px 1fr;
+        gap: 9px;
+        width: 100%;
+        min-height: 48px;
+        padding: 8px 12px;
+        border: 0;
+        background: transparent;
+        color: var(--ink);
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .suggestion:hover,
+      .suggestion[aria-selected="true"] {
+        background: #f2eadc;
+      }
+
+      .suggestion-pin {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        margin-top: 2px;
+        border-radius: 50%;
+        background: #eef5f2;
+        color: #166a64;
+      }
+
+      .suggestion-pin::before {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: currentColor;
+        content: "";
+      }
+
+      .suggestion-main {
+        min-width: 0;
+      }
+
+      .suggestion-label {
+        overflow: hidden;
+        font-size: 13px;
+        line-height: 1.25;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .suggestion-meta {
+        margin-top: 3px;
+        overflow: hidden;
         color: var(--muted);
         font-size: 11px;
-        text-transform: uppercase;
-      }
-
-      .controls {
-        display: grid;
-        gap: 10px;
-        padding: 12px 14px 14px;
-      }
-
-      .toggles {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-      }
-
-      .toggle {
-        display: inline-flex;
-        align-items: center;
-        gap: 7px;
-        min-height: 32px;
-        padding: 6px 10px;
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        background: #fffaf0;
-        color: var(--ink);
-        font-size: 13px;
-        cursor: pointer;
-        user-select: none;
-      }
-
-      .toggle input {
-        width: 14px;
-        height: 14px;
-        margin: 0;
-        accent-color: var(--accent);
-      }
-
-      .swatch {
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .point {
@@ -334,21 +414,9 @@
         background: var(--centroid);
       }
 
-      button {
-        min-height: 36px;
-        width: fit-content;
-        padding: 7px 13px;
-        border: 1px solid #182b2a;
-        border-radius: 6px;
-        background: #1c2f2f;
-        color: #fff9ed;
-        font: inherit;
-        font-size: 13px;
-        cursor: pointer;
-      }
-
-      button:hover {
-        background: #28403f;
+      .search-wrap button {
+        min-height: 0;
+        width: auto;
       }
 
       .leaflet-popup-content-wrapper,
@@ -378,13 +446,8 @@
           width: calc(100vw - 20px);
         }
 
-        .metrics {
-          grid-template-columns: 1fr 1fr;
-        }
-
-        .metric:last-child {
-          grid-column: span 2;
-          border-top: 1px solid var(--line);
+        .suggestion-label {
+          white-space: normal;
         }
       }
     </style>
@@ -397,34 +460,33 @@
         <h1>Ontario Address QA</h1>
         <div class="subhead">Toronto subset over OpenStreetMap tiles</div>
       </header>
-      <section class="metrics" aria-label="Record counts">
-        <div class="metric">
-          <strong id="record-count">0</strong>
-          <span>records</span>
+      <section class="search-wrap" aria-label="Address search">
+        <div class="search-box">
+          <svg class="search-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <path
+              d="m21 21-4.2-4.2m1.2-5.3a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z"
+              fill="none"
+              stroke="currentColor"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+            />
+          </svg>
+          <input
+            id="search-input"
+            type="search"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Search addresses"
+            aria-autocomplete="list"
+            aria-controls="suggestions"
+            aria-expanded="false"
+          />
+          <button id="clear-search" class="clear-search" type="button" aria-label="Clear search" hidden>
+            &times;
+          </button>
         </div>
-        <div class="metric">
-          <strong id="point-count">0</strong>
-          <span>points</span>
-        </div>
-        <div class="metric">
-          <strong id="centroid-count">0</strong>
-          <span>centroids</span>
-        </div>
-      </section>
-      <section class="controls" aria-label="Layer controls">
-        <div class="toggles">
-          <label class="toggle">
-            <input id="show-points" type="checkbox" checked />
-            <span class="swatch point"></span>
-            Point
-          </label>
-          <label class="toggle">
-            <input id="show-centroids" type="checkbox" checked />
-            <span class="swatch centroid"></span>
-            Centroid
-          </label>
-        </div>
-        <button id="fit-records" type="button">Fit Records</button>
+        <ul id="suggestions" class="suggestions" role="listbox" hidden></ul>
       </section>
     </aside>
 
@@ -436,11 +498,14 @@
     ></script>
     <script>
       const records = window.OPEN_GEOCODE_TORONTO_RECORDS ?? [];
-      const pointToggle = document.querySelector("#show-points");
-      const centroidToggle = document.querySelector("#show-centroids");
+      const searchInput = document.querySelector("#search-input");
+      const clearSearch = document.querySelector("#clear-search");
+      const suggestionsList = document.querySelector("#suggestions");
       const layer = L.layerGroup();
       const renderer = L.canvas({ padding: 0.5 });
-      const formatter = new Intl.NumberFormat("en-US");
+      const markerById = new Map();
+      let activeSuggestion = -1;
+      let currentSuggestions = [];
 
       const map = L.map("map", {
         preferCanvas: true,
@@ -469,18 +534,108 @@
         return record.precision ?? record.p;
       }
 
+      function normalizeSearch(value) {
+        return String(value)
+          .toLocaleLowerCase()
+          .replace(/[^\p{L}\p{N}\s]/gu, " ")
+          .split(/\s+/)
+          .filter(Boolean)
+          .join(" ");
+      }
+
+      function suggestionScore(record, query) {
+        const label = normalizeSearch(record.label);
+        const tokens = query.split(" ").filter(Boolean);
+        if (tokens.length === 0) return 0;
+        if (!tokens.every((token) => label.includes(token))) return 0;
+        if (label === query) return 100;
+        if (label.startsWith(query)) return 80;
+        if (label.includes(` ${query}`)) return 60;
+        return 30;
+      }
+
+      function findSuggestions(query) {
+        const normalized = normalizeSearch(query);
+        if (normalized.length < 2) return [];
+
+        return records
+          .map((record) => ({ record, score: suggestionScore(record, normalized) }))
+          .filter((item) => item.score > 0)
+          .sort((a, b) => b.score - a.score || a.record.label.localeCompare(b.record.label))
+          .slice(0, 7)
+          .map((item) => item.record);
+      }
+
+      function renderSuggestions(items) {
+        currentSuggestions = items;
+        activeSuggestion = items.length > 0 ? 0 : -1;
+        suggestionsList.replaceChildren();
+
+        if (items.length === 0) {
+          suggestionsList.hidden = true;
+          searchInput.setAttribute("aria-expanded", "false");
+          return;
+        }
+
+        for (const [index, record] of items.entries()) {
+          const option = document.createElement("li");
+          option.id = `suggestion-${index}`;
+          option.className = "suggestion";
+          option.role = "option";
+          option.setAttribute("aria-selected", String(index === activeSuggestion));
+          option.innerHTML = `
+            <span class="suggestion-pin" aria-hidden="true"></span>
+            <span class="suggestion-main">
+              <span class="suggestion-label">${escapeHtml(record.label)}</span>
+              <span class="suggestion-meta">${escapeHtml(record.id)} &middot; ${escapeHtml(precisionOf(record))}</span>
+            </span>
+          `;
+          option.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            selectRecord(record);
+          });
+          suggestionsList.appendChild(option);
+        }
+
+        suggestionsList.hidden = false;
+        searchInput.setAttribute("aria-expanded", "true");
+        searchInput.setAttribute("aria-activedescendant", `suggestion-${activeSuggestion}`);
+      }
+
+      function updateActiveSuggestion(nextIndex) {
+        if (currentSuggestions.length === 0) return;
+        activeSuggestion = (nextIndex + currentSuggestions.length) % currentSuggestions.length;
+        for (const [index, option] of Array.from(suggestionsList.children).entries()) {
+          option.setAttribute("aria-selected", String(index === activeSuggestion));
+        }
+        searchInput.setAttribute("aria-activedescendant", `suggestion-${activeSuggestion}`);
+      }
+
+      function hideSuggestions() {
+        suggestionsList.hidden = true;
+        searchInput.setAttribute("aria-expanded", "false");
+        searchInput.removeAttribute("aria-activedescendant");
+      }
+
+      function selectRecord(record) {
+        searchInput.value = record.label;
+        clearSearch.hidden = false;
+        hideSuggestions();
+
+        const marker = markerById.get(record.id);
+        map.flyTo([record.lat, record.lon], Math.max(map.getZoom(), 16), { duration: 0.45 });
+        marker?.openPopup();
+      }
+
       function paintRecords() {
         layer.clearLayers();
-        const showPoints = pointToggle.checked;
-        const showCentroids = centroidToggle.checked;
+        markerById.clear();
 
         for (const record of records) {
           const precision = precisionOf(record);
-          if (precision === "point" && !showPoints) continue;
-          if (precision === "centroid" && !showCentroids) continue;
 
           const isCentroid = precision === "centroid";
-          L.circleMarker([record.lat, record.lon], {
+          const marker = L.circleMarker([record.lat, record.lon], {
             renderer,
             radius: isCentroid ? 3.5 : 2.4,
             stroke: true,
@@ -497,6 +652,7 @@
                </div>`,
             )
             .addTo(layer);
+          markerById.set(record.id, marker);
         }
       }
 
@@ -506,15 +662,37 @@
         map.fitBounds(bounds, { padding: [42, 42], maxZoom: 13 });
       }
 
-      const points = records.filter((record) => precisionOf(record) === "point").length;
-      const centroids = records.filter((record) => precisionOf(record) === "centroid").length;
-      document.querySelector("#record-count").textContent = formatter.format(records.length);
-      document.querySelector("#point-count").textContent = formatter.format(points);
-      document.querySelector("#centroid-count").textContent = formatter.format(centroids);
-
-      pointToggle.addEventListener("change", paintRecords);
-      centroidToggle.addEventListener("change", paintRecords);
-      document.querySelector("#fit-records").addEventListener("click", fitRecords);
+      searchInput.addEventListener("input", () => {
+        clearSearch.hidden = searchInput.value.length === 0;
+        renderSuggestions(findSuggestions(searchInput.value));
+      });
+      searchInput.addEventListener("focus", () => {
+        renderSuggestions(findSuggestions(searchInput.value));
+      });
+      searchInput.addEventListener("blur", () => {
+        window.setTimeout(hideSuggestions, 120);
+      });
+      searchInput.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          updateActiveSuggestion(activeSuggestion + 1);
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          updateActiveSuggestion(activeSuggestion - 1);
+        } else if (event.key === "Enter" && activeSuggestion >= 0) {
+          event.preventDefault();
+          selectRecord(currentSuggestions[activeSuggestion]);
+        } else if (event.key === "Escape") {
+          hideSuggestions();
+          searchInput.blur();
+        }
+      });
+      clearSearch.addEventListener("click", () => {
+        searchInput.value = "";
+        clearSearch.hidden = true;
+        hideSuggestions();
+        searchInput.focus();
+      });
 
       paintRecords();
       fitRecords();

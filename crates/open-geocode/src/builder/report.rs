@@ -39,6 +39,9 @@ pub struct AcceptedCounts {
     pub node_addresses: u64,
     pub way_centroid_addresses: u64,
     pub interpolation_ranges: u64,
+    pub street_segments: u64,
+    pub postcode_records: u64,
+    pub place_nodes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -77,6 +80,7 @@ pub struct IssueAuditCounts {
 pub struct GeometryResolutionCounts {
     pub address_way_stubs: usize,
     pub interpolation_way_stubs: usize,
+    pub street_way_stubs: usize,
     pub required_node_refs: usize,
     pub resolved_node_refs: usize,
 }
@@ -114,6 +118,11 @@ pub(crate) enum CandidateIssue {
     InterpolationInvalidNumberRange,
     InterpolationInvalidParity,
     InterpolationNonNumericAnchor,
+    StreetMissingName,
+    StreetRefOnlyName,
+    StreetUnresolvedGeometry,
+    PlaceMissingName,
+    PlaceUnsupportedValue,
 }
 
 impl CandidateIssue {
@@ -136,6 +145,11 @@ impl CandidateIssue {
             Self::InterpolationInvalidNumberRange => "interpolation_invalid_number_range",
             Self::InterpolationInvalidParity => "interpolation_invalid_parity",
             Self::InterpolationNonNumericAnchor => "interpolation_non_numeric_anchor",
+            Self::StreetMissingName => "street_missing_name",
+            Self::StreetRefOnlyName => "street_ref_only_name",
+            Self::StreetUnresolvedGeometry => "street_unresolved_geometry",
+            Self::PlaceMissingName => "place_missing_name",
+            Self::PlaceUnsupportedValue => "place_unsupported_value",
         }
     }
 
@@ -147,7 +161,8 @@ impl CandidateIssue {
             | Self::InterpolationUnsupportedObject => CandidateDisposition::Unsupported,
             Self::WayWithoutResolvedNodes
             | Self::InterpolationWayWithoutNodes
-            | Self::InterpolationUnresolvedGeometry => CandidateDisposition::UnresolvedGeometry,
+            | Self::InterpolationUnresolvedGeometry
+            | Self::StreetUnresolvedGeometry => CandidateDisposition::UnresolvedGeometry,
             Self::InterpolationMissingAnchors
             | Self::InterpolationInsufficientNumericAnchors
             | Self::InterpolationMissingStreetOrPlace
@@ -155,6 +170,10 @@ impl CandidateIssue {
             | Self::InterpolationInvalidNumberRange
             | Self::InterpolationInvalidParity
             | Self::InterpolationNonNumericAnchor => CandidateDisposition::Invalid,
+            Self::StreetMissingName
+            | Self::StreetRefOnlyName
+            | Self::PlaceMissingName
+            | Self::PlaceUnsupportedValue => CandidateDisposition::OutOfScope,
         }
     }
 }
@@ -162,6 +181,7 @@ impl CandidateIssue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateDisposition {
     Invalid,
+    OutOfScope,
     Unsupported,
     UnresolvedGeometry,
 }
@@ -198,6 +218,20 @@ impl BuilderReport {
             NormalizedRecord::Interpolation(_) => {
                 self.accepted.interpolation_ranges += 1;
             }
+            NormalizedRecord::Street(_) => {
+                self.accepted.street_segments += 1;
+            }
+            NormalizedRecord::Postcode(_) => {
+                self.accepted.postcode_records += 1;
+            }
+            NormalizedRecord::Country(_)
+            | NormalizedRecord::District(_)
+            | NormalizedRecord::Locality(_)
+            | NormalizedRecord::Neighbourhood(_)
+            | NormalizedRecord::Place(_)
+            | NormalizedRecord::Region(_) => {
+                self.accepted.place_nodes += 1;
+            }
         }
     }
 
@@ -232,6 +266,7 @@ impl BuilderReport {
 
         match issue.disposition() {
             CandidateDisposition::Invalid => self.disposition.invalid += 1,
+            CandidateDisposition::OutOfScope => self.disposition.out_of_scope += 1,
             CandidateDisposition::Unsupported => self.disposition.unsupported += 1,
             CandidateDisposition::UnresolvedGeometry => self.disposition.unresolved_geometry += 1,
         }
@@ -249,7 +284,9 @@ impl BuilderReport {
             CandidateIssue::MissingHouseNumber => &mut self.validation.missing_housenumber,
             CandidateIssue::MissingStreetOrPlace => &mut self.validation.missing_street_or_place,
             CandidateIssue::UnsupportedRelation => &mut self.validation.unsupported_relation,
-            CandidateIssue::WayWithoutResolvedNodes => &mut self.validation.unresolved_geometry,
+            CandidateIssue::WayWithoutResolvedNodes | CandidateIssue::StreetUnresolvedGeometry => {
+                &mut self.validation.unresolved_geometry
+            }
             CandidateIssue::InterpolationUnsupportedValue
             | CandidateIssue::InterpolationUnsupportedObject
             | CandidateIssue::InterpolationWayWithoutNodes
@@ -261,6 +298,12 @@ impl BuilderReport {
             | CandidateIssue::InterpolationInvalidNumberRange
             | CandidateIssue::InterpolationInvalidParity
             | CandidateIssue::InterpolationNonNumericAnchor => &mut self.validation.interpolation,
+            CandidateIssue::StreetMissingName | CandidateIssue::StreetRefOnlyName => {
+                &mut self.validation.unresolved_geometry
+            }
+            CandidateIssue::PlaceMissingName | CandidateIssue::PlaceUnsupportedValue => {
+                &mut self.validation.unsupported_relation
+            }
         };
 
         *audit.by_shape.entry(shape.to_string()).or_default() += 1;
@@ -303,6 +346,11 @@ fn address_shape(issue: CandidateIssue, addr_tags: &BTreeMap<String, String>) ->
             }
         }
         CandidateIssue::WayWithoutResolvedNodes => "way_without_resolved_nodes",
+        CandidateIssue::StreetUnresolvedGeometry => "street_unresolved_geometry",
+        CandidateIssue::StreetMissingName => "street_missing_name",
+        CandidateIssue::StreetRefOnlyName => "street_ref_only_name",
+        CandidateIssue::PlaceMissingName => "place_missing_name",
+        CandidateIssue::PlaceUnsupportedValue => "place_unsupported_value",
         CandidateIssue::InterpolationUnsupportedValue
         | CandidateIssue::InterpolationUnsupportedObject
         | CandidateIssue::InterpolationWayWithoutNodes

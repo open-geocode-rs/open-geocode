@@ -36,17 +36,21 @@ pub(crate) fn write_candidate<W: Write>(
     candidate: AddressCandidate,
     output: &mut W,
     report: &mut BuilderReport,
-) -> Result<()> {
+) -> Result<Option<AddressRecord>> {
     match address_record_from_candidate(candidate) {
         Ok(record) => {
-            let record = NormalizedRecord::address(record);
-            serde_json::to_writer(&mut *output, &record)?;
+            let accepted = record.clone();
+            let normalized = NormalizedRecord::address(record);
+            serde_json::to_writer(&mut *output, &normalized)?;
             writeln!(output)?;
-            report.accept(&record);
+            report.accept(&normalized);
+            Ok(Some(accepted))
         }
-        Err(issue) => report.reject(issue),
+        Err(issue) => {
+            report.reject(issue);
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

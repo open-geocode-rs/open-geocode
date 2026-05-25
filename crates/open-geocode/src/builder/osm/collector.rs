@@ -20,6 +20,9 @@ use super::{
     },
     interpolation::{InterpolationWayStub, has_interpolation_tag},
     pbf::{element_reader_with_progress, input_bytes},
+    place::{has_place_tag, write_place_node},
+    postcode::PostcodeAccumulator,
+    street::{StreetWayStub, has_highway_tag, missing_street_name_issue, street_name},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +37,8 @@ pub(crate) struct DiscoveryResult {
     pub report: BuilderReport,
     pub way_stubs: Vec<AddressWayStub>,
     pub interpolation_way_stubs: Vec<InterpolationWayStub>,
+    pub street_way_stubs: Vec<StreetWayStub>,
+    pub postcode_accumulator: PostcodeAccumulator,
     pub address_node_tags: HashMap<i64, BTreeMap<String, String>>,
     pub required_node_ids: HashSet<i64>,
 }
@@ -44,7 +49,7 @@ pub(crate) fn discover_address_features(
     rejected_records_path: &Path,
 ) -> Result<DiscoveryResult> {
     let mut report = BuilderReport {
-        schema_version: 3,
+        schema_version: 5,
         input: input.display().to_string(),
         output: node_records_path.display().to_string(),
         input_bytes: input_bytes(input)?,
@@ -58,6 +63,8 @@ pub(crate) fn discover_address_features(
     let mut rejected_records = BufWriter::new(rejected_file);
     let mut way_stubs = Vec::new();
     let mut interpolation_way_stubs = Vec::new();
+    let mut street_way_stubs = Vec::new();
+    let mut postcode_accumulator = PostcodeAccumulator::default();
     let mut address_node_tags = HashMap::new();
     let mut required_node_ids = HashSet::new();
     let mut write_error: Option<anyhow::Error> = None;
@@ -71,6 +78,20 @@ pub(crate) fn discover_address_features(
                     return;
                 }
                 let all_tags = collect_clean_tags(node.tags());
+                if has_place_tag(&all_tags)
+                    && let Err(error) = write_place_node(
+                        node.id(),
+                        node.lat(),
+                        node.lon(),
+                        &all_tags,
+                        &mut node_records,
+                        &mut report,
+                    )
+                {
+                    write_error = Some(error);
+                    return;
+                }
+
                 let tags = collect_addr_tags_from_map(&all_tags);
                 if tags.is_empty() {
                     return;
@@ -117,8 +138,10 @@ pub(crate) fn discover_address_features(
                     location_precision: LocationPrecision::Point,
                     tags,
                 };
-                if let Err(error) = write_candidate(candidate, &mut node_records, &mut report) {
-                    write_error = Some(error);
+                match write_candidate(candidate, &mut node_records, &mut report) {
+                    Ok(Some(record)) => postcode_accumulator.accept_address(&record),
+                    Ok(None) => {}
+                    Err(error) => write_error = Some(error),
                 }
             }
             Element::Node(node) => {
@@ -127,6 +150,20 @@ pub(crate) fn discover_address_features(
                     return;
                 }
                 let all_tags = collect_clean_tags(node.tags());
+                if has_place_tag(&all_tags)
+                    && let Err(error) = write_place_node(
+                        node.id(),
+                        node.lat(),
+                        node.lon(),
+                        &all_tags,
+                        &mut node_records,
+                        &mut report,
+                    )
+                {
+                    write_error = Some(error);
+                    return;
+                }
+
                 let tags = collect_addr_tags_from_map(&all_tags);
                 if tags.is_empty() {
                     return;
@@ -173,8 +210,10 @@ pub(crate) fn discover_address_features(
                     location_precision: LocationPrecision::Point,
                     tags,
                 };
-                if let Err(error) = write_candidate(candidate, &mut node_records, &mut report) {
-                    write_error = Some(error);
+                match write_candidate(candidate, &mut node_records, &mut report) {
+                    Ok(Some(record)) => postcode_accumulator.accept_address(&record),
+                    Ok(None) => {}
+                    Err(error) => write_error = Some(error),
                 }
             }
             Element::Way(way) => {
@@ -183,6 +222,41 @@ pub(crate) fn discover_address_features(
                     return;
                 }
                 let all_tags = collect_clean_tags(way.tags());
+                if has_highway_tag(&all_tags) {
+                    if street_name(&all_tags).is_some() {
+                        let node_refs = way.refs().collect::<Vec<_>>();
+                        if node_refs.is_empty() {
+                            report.reject_with_tags(
+                                CandidateIssue::StreetUnresolvedGeometry,
+                                OsmObjectType::Way,
+                                &all_tags,
+                                &BTreeMap::new(),
+                            );
+                            if let Err(error) = write_rejected_record(
+                                CandidateIssue::StreetUnresolvedGeometry,
+                                OsmObjectType::Way,
+                                way.id(),
+                                &all_tags,
+                                Some("street"),
+                                &mut rejected_records,
+                            ) {
+                                write_error = Some(error);
+                            }
+                        } else {
+                            for node_id in &node_refs {
+                                required_node_ids.insert(*node_id);
+                            }
+                            street_way_stubs.push(StreetWayStub {
+                                object_id: way.id(),
+                                node_refs,
+                                tags: all_tags.clone(),
+                            });
+                        }
+                    } else {
+                        report.reject(missing_street_name_issue(&all_tags));
+                    }
+                }
+
                 let tags = collect_addr_tags_from_map(&all_tags);
                 if tags.is_empty() {
                     return;
@@ -309,6 +383,8 @@ pub(crate) fn discover_address_features(
         report,
         way_stubs,
         interpolation_way_stubs,
+        street_way_stubs,
+        postcode_accumulator,
         address_node_tags,
         required_node_ids,
     })

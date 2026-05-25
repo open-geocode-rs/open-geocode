@@ -3,6 +3,9 @@ mod collector;
 mod geometry;
 mod interpolation;
 mod pbf;
+mod place;
+mod postcode;
+mod street;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,6 +25,8 @@ use address::{AddressCandidate, write_candidate, write_rejected_record};
 use collector::{AddressWayStub, discover_address_features};
 use geometry::{centroid, resolve_required_node_locations, resolve_way_points};
 use interpolation::{InterpolationWayStub, write_interpolation_records};
+use postcode::PostcodeAccumulator;
+use street::{StreetWayStub, write_street_record};
 
 use super::report::CandidateIssue;
 
@@ -56,6 +61,7 @@ pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
     discovery.report.geometry_resolution.address_way_stubs = discovery.way_stubs.len();
     discovery.report.geometry_resolution.interpolation_way_stubs =
         discovery.interpolation_way_stubs.len();
+    discovery.report.geometry_resolution.street_way_stubs = discovery.street_way_stubs.len();
     discovery.report.geometry_resolution.required_node_refs = discovery.required_node_ids.len();
 
     let resolution_started = Instant::now();
@@ -72,6 +78,8 @@ pub fn build_osm_records(options: BuildOsmRecordsOptions) -> Result<()> {
         &node_records_path,
         &discovery.way_stubs,
         &discovery.interpolation_way_stubs,
+        &discovery.street_way_stubs,
+        &mut discovery.postcode_accumulator,
         &discovery.address_node_tags,
         &node_locations,
         &mut discovery.report,
@@ -103,6 +111,8 @@ fn emit_normalized_records(
     node_records_path: &Path,
     way_stubs: &[AddressWayStub],
     interpolation_way_stubs: &[InterpolationWayStub],
+    street_way_stubs: &[StreetWayStub],
+    postcode_accumulator: &mut PostcodeAccumulator,
     address_node_tags: &HashMap<i64, BTreeMap<String, String>>,
     node_locations: &HashMap<i64, (f64, f64)>,
     report: &mut BuilderReport,
@@ -160,10 +170,14 @@ fn emit_normalized_records(
             location_precision: LocationPrecision::Centroid,
             tags: stub.tags.clone(),
         };
-        write_candidate(candidate, &mut output, report)?;
+        if let Some(record) = write_candidate(candidate, &mut output, report)? {
+            postcode_accumulator.accept_address(&record);
+        }
         progress.inc(1);
     }
     progress.finish_with_message("3/3 emit way centroids complete");
+
+    postcode_accumulator.write_records(&mut output, report)?;
 
     let progress = item_progress_bar(
         interpolation_way_stubs.len() as u64,
@@ -181,6 +195,19 @@ fn emit_normalized_records(
         progress.inc(1);
     }
     progress.finish_with_message("3/3 emit interpolation ranges complete");
+
+    let progress = item_progress_bar(street_way_stubs.len() as u64, "3/3 emit street segments");
+    for stub in street_way_stubs {
+        write_street_record(
+            stub,
+            node_locations,
+            &mut output,
+            &mut rejected_records,
+            report,
+        )?;
+        progress.inc(1);
+    }
+    progress.finish_with_message("3/3 emit street segments complete");
 
     output
         .flush()
@@ -261,8 +288,17 @@ mod tests {
                 ("addr:street".to_string(), "Queen Street".to_string()),
             ]),
         }];
+        let street_way_stubs = vec![StreetWayStub {
+            object_id: 300,
+            node_refs: vec![1, 2],
+            tags: BTreeMap::from([
+                ("highway".to_string(), "residential".to_string()),
+                ("name".to_string(), "King Street".to_string()),
+            ]),
+        }];
         let node_locations = HashMap::from([(1, (0.0, 0.0)), (2, (0.0, 2.0)), (3, (2.0, 0.0))]);
         let mut report = BuilderReport::default();
+        let mut postcode_accumulator = PostcodeAccumulator::default();
 
         emit_normalized_records(
             &output_path,
@@ -270,6 +306,8 @@ mod tests {
             &node_records_path,
             &way_stubs,
             &[],
+            &street_way_stubs,
+            &mut postcode_accumulator,
             &HashMap::new(),
             &node_locations,
             &mut report,
@@ -278,14 +316,20 @@ mod tests {
 
         let output = fs::read_to_string(&output_path).expect("output");
         let lines = output.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("\"layer\":\"address\""));
         assert!(lines[0].contains("\"id\":\"osm:node:100\""));
         assert!(
             lines[0].contains("\"geometry\":{\"type\":\"Point\",\"coordinates\":[-79.0,43.0]}")
         );
         assert!(lines[1].contains("\"id\":\"osm:way:200\""));
+        assert!(lines[2].contains("\"layer\":\"street\""));
+        assert!(lines[2].contains("\"id\":\"osm:way:300\""));
+        assert!(lines[2].contains("\"label\":\"King Street\""));
+        assert!(lines[2].contains("\"bbox\":[0.0,0.0,2.0,0.0]"));
         assert_eq!(report.accepted.way_centroid_addresses, 1);
+        assert_eq!(report.accepted.street_segments, 1);
+        assert_eq!(report.accepted.by_layer.get("street"), Some(&1),);
 
         let _ = fs::remove_dir_all(temp_dir);
     }

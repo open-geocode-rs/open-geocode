@@ -7,7 +7,15 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "layer", rename_all = "snake_case")]
 pub enum NormalizedRecord {
     Address(AddressRecord),
+    Country(PlaceRecord),
+    District(PlaceRecord),
     Interpolation(InterpolationRecord),
+    Locality(PlaceRecord),
+    Neighbourhood(PlaceRecord),
+    Place(PlaceRecord),
+    Postcode(PostcodeRecord),
+    Region(PlaceRecord),
+    Street(StreetRecord),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,6 +40,46 @@ pub struct InterpolationRecord {
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreetRecord {
+    pub id: String,
+    pub label: String,
+    pub name: String,
+    pub geometry: Geometry,
+    pub representative_point: [f64; 2],
+    pub source: SourceProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PostcodeRecord {
+    pub id: String,
+    pub label: String,
+    pub name: String,
+    pub postcode: String,
+    pub geometry: Geometry,
+    pub source: DerivedSourceProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlaceRecord {
+    pub id: String,
+    pub label: String,
+    pub name: String,
+    pub place_type: String,
+    pub geometry: Geometry,
+    pub source: SourceProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceLayer {
+    Country,
+    Region,
+    District,
+    Place,
+    Locality,
+    Neighbourhood,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +149,13 @@ pub struct SourceProvenance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DerivedSourceProvenance {
+    pub dataset: String,
+    pub derived_from: String,
+    pub record_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RejectedRecord {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,14 +176,41 @@ impl NormalizedRecord {
         Self::Address(record)
     }
 
+    pub fn place(record: PlaceRecord, layer: PlaceLayer) -> Self {
+        match layer {
+            PlaceLayer::Country => Self::Country(record),
+            PlaceLayer::Region => Self::Region(record),
+            PlaceLayer::District => Self::District(record),
+            PlaceLayer::Place => Self::Place(record),
+            PlaceLayer::Locality => Self::Locality(record),
+            PlaceLayer::Neighbourhood => Self::Neighbourhood(record),
+        }
+    }
+
+    pub fn postcode(record: PostcodeRecord) -> Self {
+        Self::Postcode(record)
+    }
+
     pub fn interpolation(record: InterpolationRecord) -> Self {
         Self::Interpolation(record)
+    }
+
+    pub fn street(record: StreetRecord) -> Self {
+        Self::Street(record)
     }
 
     pub const fn layer(&self) -> &'static str {
         match self {
             Self::Address(_) => "address",
+            Self::Country(_) => "country",
+            Self::District(_) => "district",
             Self::Interpolation(_) => "interpolation",
+            Self::Locality(_) => "locality",
+            Self::Neighbourhood(_) => "neighbourhood",
+            Self::Place(_) => "place",
+            Self::Postcode(_) => "postcode",
+            Self::Region(_) => "region",
+            Self::Street(_) => "street",
         }
     }
 }
@@ -159,6 +241,16 @@ impl SourceProvenance {
             object_type,
             object_id,
             tags: Some(tags),
+        }
+    }
+}
+
+impl DerivedSourceProvenance {
+    pub fn osm_address_records(record_count: u64) -> Self {
+        Self {
+            dataset: "osm".to_string(),
+            derived_from: "accepted_address_records".to_string(),
+            record_count,
         }
     }
 }
