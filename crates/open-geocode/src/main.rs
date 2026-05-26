@@ -7,6 +7,7 @@ use serde_json::Value;
 use open_geocode::{
     builder::{BuildOsmOptions, build_osm_pack},
     pack::{PackReader, RecordId},
+    search::{PackTextSearcher, TextSearchOptions},
 };
 
 #[derive(Debug, Parser)]
@@ -57,6 +58,26 @@ enum Commands {
         #[arg(long)]
         rejections: bool,
     },
+
+    /// Search a Pack text index and hydrate matching records.
+    #[command(name = "search-pack")]
+    SearchPack {
+        /// Binary Pack directory.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Text query to search.
+        #[arg(long)]
+        query: String,
+
+        /// Restrict hits to one record layer.
+        #[arg(long)]
+        layer: Option<String>,
+
+        /// Number of search hits to print. Use 0 for the default.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -72,6 +93,12 @@ fn main() -> Result<()> {
             limit,
             rejections,
         } => inspect_pack(pack, row, id, layer, limit, rejections),
+        Commands::SearchPack {
+            pack,
+            query,
+            layer,
+            limit,
+        } => search_pack(pack, query, layer, limit),
     }
 }
 
@@ -109,4 +136,14 @@ fn write_json(value: Value) -> Result<()> {
     use std::io::Write;
     writeln!(lock)?;
     Ok(())
+}
+
+fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
+    let searcher = PackTextSearcher::open(pack)?;
+    let hits = searcher.search(TextSearchOptions {
+        query,
+        limit,
+        layer,
+    })?;
+    write_json(serde_json::to_value(hits)?)
 }

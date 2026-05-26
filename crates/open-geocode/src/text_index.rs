@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
-    schema::{FAST, Field, INDEXED, STORED, STRING, Schema, TEXT},
+    schema::{
+        FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing,
+        TextOptions,
+    },
 };
 
 use crate::{
@@ -22,9 +25,6 @@ pub const TEXT_INDEX_RELATIVE_PATH: &str = "text/tantivy";
 pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 1;
 
 const INDEX_MEMORY_BUDGET_BYTES: usize = 50_000_000;
-const MAX_AUTOCOMPLETE_TERMS: usize = 128;
-const MAX_PREFIX_CHARS: usize = 24;
-const MAX_LEADING_SEQUENCE_TOKENS: usize = 4;
 
 pub struct TantivyTextIndexWriter {
     writer: IndexWriter,
@@ -42,7 +42,6 @@ pub struct TextIndexFields {
     pub label_text: Field,
     pub name_text: Field,
     pub all_text: Field,
-    pub autocomplete_text: Field,
     pub address_number: Field,
     pub street_text: Field,
     pub place_text: Field,
@@ -84,7 +83,6 @@ pub struct TextIndexDocument {
     pub interpolation_end: Option<u64>,
     pub interpolation_step: Option<u64>,
     pub all_text: String,
-    pub autocomplete_terms: Vec<String>,
 }
 
 impl fmt::Debug for TantivyTextIndexWriter {
@@ -147,7 +145,6 @@ impl TextIndexFields {
             label_text: schema.get_field("label_text")?,
             name_text: schema.get_field("name_text")?,
             all_text: schema.get_field("all_text")?,
-            autocomplete_text: schema.get_field("autocomplete_text")?,
             address_number: schema.get_field("address_number")?,
             street_text: schema.get_field("street_text")?,
             place_text: schema.get_field("place_text")?,
@@ -221,9 +218,6 @@ impl TextIndexFields {
         if !projected.all_text.is_empty() {
             document.add_text(self.all_text, &projected.all_text);
         }
-        for term in &projected.autocomplete_terms {
-            document.add_text(self.autocomplete_text, term);
-        }
         document
     }
 }
@@ -287,22 +281,22 @@ pub fn open_text_index(pack_path: impl AsRef<Path>) -> Result<Index> {
 fn build_schema() -> (Schema, TextIndexFields) {
     let mut builder = Schema::builder();
     let record_id = builder.add_u64_field("record_id", INDEXED | STORED | FAST);
-    let layer = builder.add_text_field("layer", STRING | STORED);
-    let source_id = builder.add_text_field("source_id", STRING | STORED);
-    let place_type = builder.add_text_field("place_type", STRING | STORED);
-    let location_precision = builder.add_text_field("location_precision", STRING | STORED);
+    let exact_stored = exact_string_options(true);
+    let layer = builder.add_text_field("layer", exact_stored.clone());
+    let source_id = builder.add_text_field("source_id", exact_stored.clone());
+    let place_type = builder.add_text_field("place_type", exact_stored.clone());
+    let location_precision = builder.add_text_field("location_precision", exact_stored.clone());
     let label_text = builder.add_text_field("label_text", TEXT);
     let name_text = builder.add_text_field("name_text", TEXT);
     let all_text = builder.add_text_field("all_text", TEXT);
-    let autocomplete_text = builder.add_text_field("autocomplete_text", STRING);
-    let address_number = builder.add_text_field("address_number", STRING | STORED);
+    let address_number = builder.add_text_field("address_number", exact_stored.clone());
     let street_text = builder.add_text_field("street_text", TEXT);
     let place_text = builder.add_text_field("place_text", TEXT);
     let unit_text = builder.add_text_field("unit_text", TEXT);
     let locality_text = builder.add_text_field("locality_text", TEXT);
     let region_text = builder.add_text_field("region_text", TEXT);
     let postcode_text = builder.add_text_field("postcode_text", TEXT);
-    let postcode_exact = builder.add_text_field("postcode_exact", STRING | STORED);
+    let postcode_exact = builder.add_text_field("postcode_exact", exact_stored);
     let country_text = builder.add_text_field("country_text", TEXT);
     let interpolation_start = builder.add_u64_field("interpolation_start", INDEXED | STORED);
     let interpolation_end = builder.add_u64_field("interpolation_end", INDEXED | STORED);
@@ -317,7 +311,6 @@ fn build_schema() -> (Schema, TextIndexFields) {
         label_text,
         name_text,
         all_text,
-        autocomplete_text,
         address_number,
         street_text,
         place_text,
@@ -332,6 +325,20 @@ fn build_schema() -> (Schema, TextIndexFields) {
         interpolation_step,
     };
     (schema, fields)
+}
+
+fn exact_string_options(stored: bool) -> TextOptions {
+    let options = STRING.set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("raw")
+            .set_index_option(IndexRecordOption::Basic)
+            .set_fieldnorms(false),
+    );
+    if stored {
+        options.set_stored()
+    } else {
+        options
+    }
 }
 
 fn project_place(
@@ -351,7 +358,6 @@ fn project_place(
 struct ProjectionBuilder {
     projected: TextIndexDocument,
     text_parts: Vec<String>,
-    autocomplete_sources: Vec<String>,
 }
 
 impl ProjectionBuilder {
@@ -377,10 +383,8 @@ impl ProjectionBuilder {
                 interpolation_end: None,
                 interpolation_step: None,
                 all_text: String::new(),
-                autocomplete_terms: Vec::new(),
             },
             text_parts: Vec::new(),
-            autocomplete_sources: Vec::new(),
         }
     }
 
@@ -449,9 +453,6 @@ impl ProjectionBuilder {
         if let Some(normalized) = normalize_index_text(value) {
             self.text_parts.push(normalized);
         }
-        if let Some(cleaned) = clean_text(value) {
-            self.autocomplete_sources.push(cleaned);
-        }
     }
 
     fn build(mut self) -> TextIndexDocument {
@@ -462,7 +463,6 @@ impl ProjectionBuilder {
             .filter(|part| seen.insert(part.clone()))
             .collect::<Vec<_>>()
             .join(" ");
-        self.projected.autocomplete_terms = autocomplete_terms(&self.autocomplete_sources);
         self.projected
     }
 }
@@ -514,61 +514,6 @@ fn normalize_index_text(value: &str) -> Option<String> {
     }
 }
 
-fn autocomplete_terms(values: &[String]) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut seen = BTreeSet::new();
-    for value in values {
-        let Some(normalized) = normalize_index_text(value) else {
-            continue;
-        };
-        add_prefix_terms(&normalized, &mut terms, &mut seen);
-        if terms.len() >= MAX_AUTOCOMPLETE_TERMS {
-            break;
-        }
-    }
-    terms
-}
-
-fn add_prefix_terms(value: &str, terms: &mut Vec<String>, seen: &mut BTreeSet<String>) {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
-    for token in &tokens {
-        for prefix in token_prefixes(token) {
-            push_autocomplete_term(prefix, terms, seen);
-            if terms.len() >= MAX_AUTOCOMPLETE_TERMS {
-                return;
-            }
-        }
-    }
-
-    for end_index in 0..tokens.len().min(MAX_LEADING_SEQUENCE_TOKENS) {
-        for prefix in token_prefixes(tokens[end_index]) {
-            let mut sequence = tokens[..end_index].to_vec();
-            sequence.push(prefix.as_str());
-            push_autocomplete_term(sequence.join(" "), terms, seen);
-            if terms.len() >= MAX_AUTOCOMPLETE_TERMS {
-                return;
-            }
-        }
-    }
-}
-
-fn push_autocomplete_term(term: String, terms: &mut Vec<String>, seen: &mut BTreeSet<String>) {
-    if seen.insert(term.clone()) {
-        terms.push(term);
-    }
-}
-
-fn token_prefixes(token: &str) -> Vec<String> {
-    let characters = token.chars().collect::<Vec<_>>();
-    if characters.len() < 2 {
-        return Vec::new();
-    }
-    let max = characters.len().min(MAX_PREFIX_CHARS);
-    (2..=max)
-        .map(|length| characters[..length].iter().collect::<String>())
-        .collect()
-}
-
 fn location_precision_name(precision: LocationPrecision) -> &'static str {
     match precision {
         LocationPrecision::Point => "point",
@@ -588,7 +533,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projects_address_fields_and_autocomplete_prefixes() {
+    fn projects_address_fields_for_search() {
         let record = NormalizedRecord::address(AddressRecord {
             id: "osm:node:123".to_string(),
             label: "221B Baker Street, London, NW1".to_string(),
@@ -616,16 +561,6 @@ mod tests {
         assert_eq!(projected.address_number.as_deref(), Some("221B"));
         assert_eq!(projected.street.as_deref(), Some("Baker Street"));
         assert!(projected.all_text.contains("221b baker street"));
-        assert!(
-            projected
-                .autocomplete_terms
-                .contains(&"221b ba".to_string())
-        );
-        assert!(
-            projected
-                .autocomplete_terms
-                .contains(&"baker st".to_string())
-        );
     }
 
     #[test]
@@ -693,7 +628,6 @@ mod tests {
         let place = TextIndexDocument::from_record(2, &place);
 
         assert_eq!(postcode.postcode.as_deref(), Some("M5V"));
-        assert!(postcode.autocomplete_terms.contains(&"m5".to_string()));
         assert_eq!(place.layer, "locality");
         assert_eq!(place.place_type.as_deref(), Some("city"));
         assert_eq!(place.place.as_deref(), Some("Toronto"));
