@@ -22,9 +22,12 @@ use crate::{
 };
 
 pub const TEXT_INDEX_RELATIVE_PATH: &str = "text/tantivy";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 1;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 2;
 
 const INDEX_MEMORY_BUDGET_BYTES: usize = 50_000_000;
+const MIN_AUTOCOMPLETE_PREFIX_CHARS: usize = 2;
+const MAX_AUTOCOMPLETE_PREFIX_TERMS_PER_RECORD: usize = 128;
+const MAX_AUTOCOMPLETE_PREFIX_TERM_BYTES: usize = 96;
 
 pub struct TantivyTextIndexWriter {
     writer: IndexWriter,
@@ -51,6 +54,9 @@ pub struct TextIndexFields {
     pub postcode_text: Field,
     pub postcode_exact: Field,
     pub country_text: Field,
+    pub autocomplete_prefix: Field,
+    pub autocomplete_postcode_prefix: Field,
+    pub autocomplete_house_number_prefix: Field,
     pub interpolation_start: Field,
     pub interpolation_end: Field,
     pub interpolation_step: Field,
@@ -79,6 +85,9 @@ pub struct TextIndexDocument {
     pub region: Option<String>,
     pub postcode: Option<String>,
     pub country: Option<String>,
+    pub autocomplete_prefixes: Vec<String>,
+    pub autocomplete_postcode_prefixes: Vec<String>,
+    pub autocomplete_house_number_prefixes: Vec<String>,
     pub interpolation_start: Option<u64>,
     pub interpolation_end: Option<u64>,
     pub interpolation_step: Option<u64>,
@@ -154,6 +163,10 @@ impl TextIndexFields {
             postcode_text: schema.get_field("postcode_text")?,
             postcode_exact: schema.get_field("postcode_exact")?,
             country_text: schema.get_field("country_text")?,
+            autocomplete_prefix: schema.get_field("autocomplete_prefix")?,
+            autocomplete_postcode_prefix: schema.get_field("autocomplete_postcode_prefix")?,
+            autocomplete_house_number_prefix: schema
+                .get_field("autocomplete_house_number_prefix")?,
             interpolation_start: schema.get_field("interpolation_start")?,
             interpolation_end: schema.get_field("interpolation_end")?,
             interpolation_step: schema.get_field("interpolation_step")?,
@@ -205,6 +218,21 @@ impl TextIndexFields {
             &mut document,
             self.country_text,
             projected.country.as_deref(),
+        );
+        add_generated_terms(
+            &mut document,
+            self.autocomplete_prefix,
+            &projected.autocomplete_prefixes,
+        );
+        add_generated_terms(
+            &mut document,
+            self.autocomplete_postcode_prefix,
+            &projected.autocomplete_postcode_prefixes,
+        );
+        add_generated_terms(
+            &mut document,
+            self.autocomplete_house_number_prefix,
+            &projected.autocomplete_house_number_prefixes,
         );
         if let Some(value) = projected.interpolation_start {
             document.add_u64(self.interpolation_start, value);
@@ -298,6 +326,12 @@ fn build_schema() -> (Schema, TextIndexFields) {
     let postcode_text = builder.add_text_field("postcode_text", TEXT);
     let postcode_exact = builder.add_text_field("postcode_exact", exact_stored);
     let country_text = builder.add_text_field("country_text", TEXT);
+    let exact_unstored = exact_string_options(false);
+    let autocomplete_prefix = builder.add_text_field("autocomplete_prefix", exact_unstored.clone());
+    let autocomplete_postcode_prefix =
+        builder.add_text_field("autocomplete_postcode_prefix", exact_unstored.clone());
+    let autocomplete_house_number_prefix =
+        builder.add_text_field("autocomplete_house_number_prefix", exact_unstored);
     let interpolation_start = builder.add_u64_field("interpolation_start", INDEXED | STORED);
     let interpolation_end = builder.add_u64_field("interpolation_end", INDEXED | STORED);
     let interpolation_step = builder.add_u64_field("interpolation_step", INDEXED | STORED);
@@ -320,6 +354,9 @@ fn build_schema() -> (Schema, TextIndexFields) {
         postcode_text,
         postcode_exact,
         country_text,
+        autocomplete_prefix,
+        autocomplete_postcode_prefix,
+        autocomplete_house_number_prefix,
         interpolation_start,
         interpolation_end,
         interpolation_step,
@@ -358,6 +395,9 @@ fn project_place(
 struct ProjectionBuilder {
     projected: TextIndexDocument,
     text_parts: Vec<String>,
+    autocomplete_parts: Vec<String>,
+    postcode_parts: Vec<String>,
+    house_number_parts: Vec<String>,
 }
 
 impl ProjectionBuilder {
@@ -379,44 +419,53 @@ impl ProjectionBuilder {
                 region: None,
                 postcode: None,
                 country: None,
+                autocomplete_prefixes: Vec::new(),
+                autocomplete_postcode_prefixes: Vec::new(),
+                autocomplete_house_number_prefixes: Vec::new(),
                 interpolation_start: None,
                 interpolation_end: None,
                 interpolation_step: None,
                 all_text: String::new(),
             },
             text_parts: Vec::new(),
+            autocomplete_parts: Vec::new(),
+            postcode_parts: Vec::new(),
+            house_number_parts: Vec::new(),
         }
     }
 
     fn label(&mut self, value: &str) {
         self.projected.label = clean_text(value);
         self.add_text(value);
+        self.add_autocomplete_text(value);
     }
 
     fn name(&mut self, value: &str) {
         self.projected.name = clean_text(value);
         self.add_text(value);
+        self.add_autocomplete_text(value);
     }
 
     fn address(&mut self, address: &AddressComponents) {
         self.projected.address_number = clean_text(&address.number);
         self.add_text(&address.number);
-        self.projected.street = self.add_optional_text(address.street.as_deref());
-        self.projected.place = self.add_optional_text(address.place.as_deref());
-        self.projected.unit = self.add_optional_text(address.unit.as_deref());
-        self.projected.locality = self.add_optional_text(address.locality.as_deref());
-        self.projected.region = self.add_optional_text(address.region.as_deref());
-        self.projected.postcode = self.add_optional_text(address.postcode.as_deref());
-        self.projected.country = self.add_optional_text(address.country.as_deref());
+        self.add_house_number_text(&address.number);
+        self.projected.street = self.add_optional_autocomplete_text(address.street.as_deref());
+        self.projected.place = self.add_optional_autocomplete_text(address.place.as_deref());
+        self.projected.unit = self.add_optional_autocomplete_text(address.unit.as_deref());
+        self.projected.locality = self.add_optional_autocomplete_text(address.locality.as_deref());
+        self.projected.region = self.add_optional_autocomplete_text(address.region.as_deref());
+        self.projected.postcode = self.add_optional_postcode_text(address.postcode.as_deref());
+        self.projected.country = self.add_optional_autocomplete_text(address.country.as_deref());
     }
 
     fn interpolation_address(&mut self, address: &InterpolationAddressComponents) {
-        self.projected.street = self.add_optional_text(address.street.as_deref());
-        self.projected.place = self.add_optional_text(address.place.as_deref());
-        self.projected.locality = self.add_optional_text(address.locality.as_deref());
-        self.projected.region = self.add_optional_text(address.region.as_deref());
-        self.projected.postcode = self.add_optional_text(address.postcode.as_deref());
-        self.projected.country = self.add_optional_text(address.country.as_deref());
+        self.projected.street = self.add_optional_autocomplete_text(address.street.as_deref());
+        self.projected.place = self.add_optional_autocomplete_text(address.place.as_deref());
+        self.projected.locality = self.add_optional_autocomplete_text(address.locality.as_deref());
+        self.projected.region = self.add_optional_autocomplete_text(address.region.as_deref());
+        self.projected.postcode = self.add_optional_postcode_text(address.postcode.as_deref());
+        self.projected.country = self.add_optional_autocomplete_text(address.country.as_deref());
     }
 
     fn interpolation_range(&mut self, start: u64, end: u64, step: u64) {
@@ -428,11 +477,13 @@ impl ProjectionBuilder {
     fn postcode(&mut self, value: &str) {
         self.projected.postcode = clean_text(value);
         self.add_text(value);
+        self.add_postcode_text(value);
     }
 
     fn place(&mut self, value: &str) {
         self.projected.place = clean_text(value);
         self.add_text(value);
+        self.add_autocomplete_text(value);
     }
 
     fn place_type(&mut self, value: &str) {
@@ -443,9 +494,17 @@ impl ProjectionBuilder {
         self.projected.location_precision = clean_text(value);
     }
 
-    fn add_optional_text(&mut self, value: Option<&str>) -> Option<String> {
+    fn add_optional_autocomplete_text(&mut self, value: Option<&str>) -> Option<String> {
         let cleaned = value.and_then(clean_text)?;
         self.add_text(&cleaned);
+        self.add_autocomplete_text(&cleaned);
+        Some(cleaned)
+    }
+
+    fn add_optional_postcode_text(&mut self, value: Option<&str>) -> Option<String> {
+        let cleaned = value.and_then(clean_text)?;
+        self.add_text(&cleaned);
+        self.add_postcode_text(&cleaned);
         Some(cleaned)
     }
 
@@ -455,15 +514,45 @@ impl ProjectionBuilder {
         }
     }
 
+    fn add_autocomplete_text(&mut self, value: &str) {
+        if let Some(normalized) = normalize_index_text(value) {
+            self.autocomplete_parts.push(normalized);
+        }
+    }
+
+    fn add_postcode_text(&mut self, value: &str) {
+        if let Some(normalized) = normalize_index_text(value) {
+            self.postcode_parts.push(normalized);
+        }
+    }
+
+    fn add_house_number_text(&mut self, value: &str) {
+        if let Some(normalized) = normalize_index_text(value) {
+            self.house_number_parts.push(normalized);
+        }
+    }
+
     fn build(mut self) -> TextIndexDocument {
         let mut seen = BTreeSet::new();
-        self.projected.all_text = self
+        let text_parts = self
             .text_parts
             .into_iter()
             .filter(|part| seen.insert(part.clone()))
-            .collect::<Vec<_>>()
-            .join(" ");
+            .collect::<Vec<_>>();
+        self.projected.all_text = text_parts.join(" ");
+        self.projected.autocomplete_prefixes =
+            autocomplete_text_prefix_terms(&self.autocomplete_parts);
+        self.projected.autocomplete_postcode_prefixes =
+            autocomplete_postcode_prefix_terms(&self.postcode_parts);
+        self.projected.autocomplete_house_number_prefixes =
+            autocomplete_compact_prefix_terms(&self.house_number_parts);
         self.projected
+    }
+}
+
+fn add_generated_terms(document: &mut TantivyDocument, field: Field, terms: &[String]) {
+    for term in terms {
+        document.add_text(field, term);
     }
 }
 
@@ -492,7 +581,7 @@ fn clean_text(value: &str) -> Option<String> {
     }
 }
 
-fn normalize_index_text(value: &str) -> Option<String> {
+pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
     let mut normalized = String::with_capacity(value.len());
     let mut previous_was_space = true;
     for character in value.chars() {
@@ -512,6 +601,123 @@ fn normalize_index_text(value: &str) -> Option<String> {
     } else {
         Some(normalized)
     }
+}
+
+fn autocomplete_text_prefix_terms(parts: &[String]) -> Vec<String> {
+    let mut terms = PrefixTerms::default();
+    for part in parts {
+        add_token_prefixes(part, &mut terms);
+        add_leading_sequence_prefixes(part, &mut terms);
+        if terms.is_full() {
+            break;
+        }
+    }
+    terms.into_vec()
+}
+
+fn autocomplete_postcode_prefix_terms(parts: &[String]) -> Vec<String> {
+    let mut terms = PrefixTerms::default();
+    for part in parts {
+        add_full_value_prefixes(part, &mut terms);
+        let compact = part.split_whitespace().collect::<String>();
+        if compact != *part {
+            add_full_value_prefixes(&compact, &mut terms);
+        }
+        if terms.is_full() {
+            break;
+        }
+    }
+    terms.into_vec()
+}
+
+fn autocomplete_compact_prefix_terms(parts: &[String]) -> Vec<String> {
+    let mut terms = PrefixTerms::default();
+    for part in parts {
+        let compact = part.split_whitespace().collect::<String>();
+        add_full_value_prefixes(&compact, &mut terms);
+        if terms.is_full() {
+            break;
+        }
+    }
+    terms.into_vec()
+}
+
+#[derive(Debug, Default)]
+struct PrefixTerms {
+    seen: BTreeSet<String>,
+    terms: Vec<String>,
+}
+
+impl PrefixTerms {
+    fn insert(&mut self, term: String) {
+        if self.is_full() || term.len() > MAX_AUTOCOMPLETE_PREFIX_TERM_BYTES {
+            return;
+        }
+        if self.seen.insert(term.clone()) {
+            self.terms.push(term);
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.terms.len() >= MAX_AUTOCOMPLETE_PREFIX_TERMS_PER_RECORD
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.terms
+    }
+}
+
+fn add_token_prefixes(value: &str, terms: &mut PrefixTerms) {
+    for token in value.split_whitespace() {
+        add_full_value_prefixes(token, terms);
+        if terms.is_full() {
+            break;
+        }
+    }
+}
+
+fn add_leading_sequence_prefixes(value: &str, terms: &mut PrefixTerms) {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    for token_count in 2..=tokens.len().min(6) {
+        let head = tokens[..token_count - 1].join(" ");
+        let tail = tokens[token_count - 1];
+        for prefix in prefixes(tail) {
+            terms.insert(format!("{head} {prefix}"));
+            if terms.is_full() {
+                return;
+            }
+        }
+    }
+}
+
+fn add_full_value_prefixes(value: &str, terms: &mut PrefixTerms) {
+    for prefix in prefixes(value) {
+        terms.insert(prefix);
+        if terms.is_full() {
+            return;
+        }
+    }
+}
+
+fn prefixes(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .filter(|end| {
+            value[..*end]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .count()
+                >= MIN_AUTOCOMPLETE_PREFIX_CHARS
+        })
+        .filter_map(|end| {
+            let prefix = value[..end].trim_end();
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.to_string())
+            }
+        })
 }
 
 fn location_precision_name(precision: LocationPrecision) -> &'static str {
@@ -561,6 +767,26 @@ mod tests {
         assert_eq!(projected.address_number.as_deref(), Some("221B"));
         assert_eq!(projected.street.as_deref(), Some("Baker Street"));
         assert!(projected.all_text.contains("221b baker street"));
+        assert!(
+            projected
+                .autocomplete_prefixes
+                .contains(&"bake".to_string())
+        );
+        assert!(
+            projected
+                .autocomplete_prefixes
+                .contains(&"221b baker".to_string())
+        );
+        assert!(
+            projected
+                .autocomplete_house_number_prefixes
+                .contains(&"221b".to_string())
+        );
+        assert!(
+            projected
+                .autocomplete_postcode_prefixes
+                .contains(&"nw1".to_string())
+        );
     }
 
     #[test]

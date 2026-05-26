@@ -1,0 +1,686 @@
+use std::{collections::BTreeSet, path::Path};
+
+use anyhow::Result;
+use serde::Serialize;
+
+use crate::{
+    pack::{PackReader, RecordId},
+    record::{
+        AddressComponents, InterpolationAddressComponents, InterpolationRange, NormalizedRecord,
+    },
+    spatial_index::{PackSpatialIndexReader, SpatialLayer},
+};
+
+const ADDRESS_RADIUS_M: f64 = 30.0;
+const INTERPOLATION_RADIUS_M: f64 = 30.0;
+const STREET_RADIUS_M: f64 = 30.0;
+const CONTEXT_RADIUS_M: f64 = 50_000.0;
+const CANDIDATE_LIMIT: usize = 16;
+
+#[derive(Debug)]
+pub struct PackReverseGeocoder {
+    pack: PackReader,
+    spatial: PackSpatialIndexReader,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReverseGeocodeOptions {
+    pub lon: f64,
+    pub lat: f64,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ReverseGeocodeResponse {
+    pub lon: f64,
+    pub lat: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ReverseGeocodeResult>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ReverseGeocodeResult {
+    pub match_kind: ReverseMatchKind,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_record_id: Option<RecordId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point: Option<ReversePoint>,
+    pub context: ReverseContext,
+    pub evidence: ReverseEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReverseMatchKind {
+    ExplicitAddress,
+    EstimatedAddress,
+    NearestStreet,
+    ContextOnly,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReversePoint {
+    pub lon: f64,
+    pub lat: f64,
+    pub precision: ReversePointPrecision,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReversePointPrecision {
+    Point,
+    Estimated,
+    Street,
+    Context,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ReverseContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbourhood: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub district: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ReverseEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_address_record_id: Option<RecordId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpolation_record_id: Option<RecordId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street_record_id: Option<RecordId>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_record_ids: Vec<RecordId>,
+}
+
+impl PackReverseGeocoder {
+    pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
+        let pack_path = pack_path.as_ref();
+        Ok(Self {
+            pack: PackReader::open(pack_path)?,
+            spatial: PackSpatialIndexReader::open(pack_path)?,
+        })
+    }
+
+    pub fn reverse(&self, options: ReverseGeocodeOptions) -> Result<ReverseGeocodeResponse> {
+        let mut context = ReverseContext::default();
+        let mut context_record_ids = Vec::new();
+
+        let mut result = self.explicit_address(options, &mut context, &mut context_record_ids)?;
+        if result.is_none() {
+            result = self.estimated_address(options, &mut context, &mut context_record_ids)?;
+        }
+        if result.is_none() {
+            result = self.nearest_street(options, &mut context, &mut context_record_ids)?;
+        }
+        if result.is_none() {
+            result = self.context_only(options, &mut context, &mut context_record_ids)?;
+        }
+
+        Ok(ReverseGeocodeResponse {
+            lon: options.lon,
+            lat: options.lat,
+            result,
+        })
+    }
+
+    fn explicit_address(
+        &self,
+        options: ReverseGeocodeOptions,
+        context: &mut ReverseContext,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<ReverseGeocodeResult>> {
+        let Some(candidate) = self
+            .spatial
+            .point_candidates(
+                options.lon,
+                options.lat,
+                SpatialLayer::Address,
+                ADDRESS_RADIUS_M,
+                1,
+            )
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let record = self.pack.read_record(candidate.record_id)?;
+        let NormalizedRecord::Address(address) = record else {
+            return Ok(None);
+        };
+
+        apply_address_context(context, &address.address);
+        self.enrich_context(options, context, context_record_ids)?;
+
+        Ok(Some(ReverseGeocodeResult {
+            match_kind: ReverseMatchKind::ExplicitAddress,
+            label: address.label,
+            primary_record_id: Some(candidate.record_id),
+            id: Some(address.id),
+            layer: Some("address".to_string()),
+            distance_m: Some(candidate.distance_m),
+            point: Some(ReversePoint {
+                lon: candidate.lon,
+                lat: candidate.lat,
+                precision: ReversePointPrecision::Point,
+            }),
+            context: context.clone(),
+            evidence: ReverseEvidence {
+                explicit_address_record_id: Some(candidate.record_id),
+                context_record_ids: context_record_ids.clone(),
+                ..ReverseEvidence::default()
+            },
+        }))
+    }
+
+    fn estimated_address(
+        &self,
+        options: ReverseGeocodeOptions,
+        context: &mut ReverseContext,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<ReverseGeocodeResult>> {
+        for candidate in self.spatial.segment_candidates(
+            options.lon,
+            options.lat,
+            SpatialLayer::Interpolation,
+            INTERPOLATION_RADIUS_M,
+            CANDIDATE_LIMIT,
+        ) {
+            let record = self.pack.read_record(candidate.record_id)?;
+            let NormalizedRecord::Interpolation(interpolation) = record else {
+                continue;
+            };
+            let number = estimated_number(&interpolation.interpolation, candidate.fraction);
+            apply_interpolation_context(context, &interpolation.address);
+            self.enrich_context(options, context, context_record_ids)?;
+            let primary = estimated_primary_label(number, &interpolation.address)
+                .unwrap_or_else(|| format!("{} {}", number, interpolation.name));
+
+            return Ok(Some(ReverseGeocodeResult {
+                match_kind: ReverseMatchKind::EstimatedAddress,
+                label: compose_label(&primary, context),
+                primary_record_id: Some(candidate.record_id),
+                id: Some(interpolation.id),
+                layer: Some("interpolation".to_string()),
+                distance_m: Some(candidate.distance_m),
+                point: Some(ReversePoint {
+                    lon: candidate.closest_lon,
+                    lat: candidate.closest_lat,
+                    precision: ReversePointPrecision::Estimated,
+                }),
+                context: context.clone(),
+                evidence: ReverseEvidence {
+                    interpolation_record_id: Some(candidate.record_id),
+                    context_record_ids: context_record_ids.clone(),
+                    ..ReverseEvidence::default()
+                },
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn nearest_street(
+        &self,
+        options: ReverseGeocodeOptions,
+        context: &mut ReverseContext,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<ReverseGeocodeResult>> {
+        let Some(candidate) = self
+            .spatial
+            .segment_candidates(
+                options.lon,
+                options.lat,
+                SpatialLayer::Street,
+                STREET_RADIUS_M,
+                1,
+            )
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let record = self.pack.read_record(candidate.record_id)?;
+        let NormalizedRecord::Street(street) = record else {
+            return Ok(None);
+        };
+
+        set_if_missing(&mut context.street, street.name.clone());
+        self.enrich_context(options, context, context_record_ids)?;
+
+        Ok(Some(ReverseGeocodeResult {
+            match_kind: ReverseMatchKind::NearestStreet,
+            label: compose_label(&street.label, context),
+            primary_record_id: Some(candidate.record_id),
+            id: Some(street.id),
+            layer: Some("street".to_string()),
+            distance_m: Some(candidate.distance_m),
+            point: Some(ReversePoint {
+                lon: candidate.closest_lon,
+                lat: candidate.closest_lat,
+                precision: ReversePointPrecision::Street,
+            }),
+            context: context.clone(),
+            evidence: ReverseEvidence {
+                street_record_id: Some(candidate.record_id),
+                context_record_ids: context_record_ids.clone(),
+                ..ReverseEvidence::default()
+            },
+        }))
+    }
+
+    fn context_only(
+        &self,
+        options: ReverseGeocodeOptions,
+        context: &mut ReverseContext,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<ReverseGeocodeResult>> {
+        self.enrich_context(options, context, context_record_ids)?;
+        let Some(primary_record_id) = context_record_ids.first().copied() else {
+            return Ok(None);
+        };
+        let record = self.pack.read_record(primary_record_id)?;
+        let Some(label) = context_only_label(context).or_else(|| Some(record.label().to_string()))
+        else {
+            return Ok(None);
+        };
+        let point = point_from_record(&record);
+
+        Ok(Some(ReverseGeocodeResult {
+            match_kind: ReverseMatchKind::ContextOnly,
+            label,
+            primary_record_id: Some(primary_record_id),
+            id: Some(record.id().to_string()),
+            layer: Some(record.layer().to_string()),
+            distance_m: None,
+            point,
+            context: context.clone(),
+            evidence: ReverseEvidence {
+                context_record_ids: context_record_ids.clone(),
+                ..ReverseEvidence::default()
+            },
+        }))
+    }
+
+    fn enrich_context(
+        &self,
+        options: ReverseGeocodeOptions,
+        context: &mut ReverseContext,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<()> {
+        let mut seen = context_record_ids.iter().copied().collect::<BTreeSet<_>>();
+        for candidate in self.spatial.context_candidates(
+            options.lon,
+            options.lat,
+            CONTEXT_RADIUS_M,
+            CANDIDATE_LIMIT,
+        ) {
+            if !seen.insert(candidate.record_id) {
+                continue;
+            }
+            let record = self.pack.read_record(candidate.record_id)?;
+            if apply_context_record(context, &record) {
+                context_record_ids.push(candidate.record_id);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn apply_address_context(context: &mut ReverseContext, address: &AddressComponents) {
+    set_option_if_missing(&mut context.street, address.street.clone());
+    set_option_if_missing(&mut context.place, address.place.clone());
+    set_option_if_missing(&mut context.postcode, address.postcode.clone());
+    set_option_if_missing(&mut context.locality, address.locality.clone());
+    set_option_if_missing(&mut context.region, address.region.clone());
+    set_option_if_missing(&mut context.country, address.country.clone());
+}
+
+fn apply_interpolation_context(
+    context: &mut ReverseContext,
+    address: &InterpolationAddressComponents,
+) {
+    set_option_if_missing(&mut context.street, address.street.clone());
+    set_option_if_missing(&mut context.place, address.place.clone());
+    set_option_if_missing(&mut context.postcode, address.postcode.clone());
+    set_option_if_missing(&mut context.locality, address.locality.clone());
+    set_option_if_missing(&mut context.region, address.region.clone());
+    set_option_if_missing(&mut context.country, address.country.clone());
+}
+
+fn apply_context_record(context: &mut ReverseContext, record: &NormalizedRecord) -> bool {
+    match record {
+        NormalizedRecord::Postcode(record) => {
+            set_if_missing(&mut context.postcode, record.postcode.clone())
+        }
+        NormalizedRecord::Neighbourhood(record) => {
+            set_if_missing(&mut context.neighbourhood, record.name.clone())
+        }
+        NormalizedRecord::Locality(record) => {
+            set_if_missing(&mut context.locality, record.name.clone())
+        }
+        NormalizedRecord::District(record) => {
+            set_if_missing(&mut context.district, record.name.clone())
+        }
+        NormalizedRecord::Region(record) => {
+            set_if_missing(&mut context.region, record.name.clone())
+        }
+        NormalizedRecord::Country(record) => {
+            set_if_missing(&mut context.country, record.name.clone())
+        }
+        NormalizedRecord::Place(record) => set_if_missing(&mut context.place, record.name.clone()),
+        NormalizedRecord::Address(_)
+        | NormalizedRecord::Interpolation(_)
+        | NormalizedRecord::Street(_) => false,
+    }
+}
+
+fn estimated_number(range: &InterpolationRange, fraction: f64) -> u32 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let span = range.end.saturating_sub(range.start);
+    if span == 0 || range.step == 0 {
+        return range.start;
+    }
+    let raw = range.start as f64 + fraction * span as f64;
+    let step_index = ((raw - range.start as f64) / range.step as f64).round() as u32;
+    (range.start + step_index * range.step).min(range.end)
+}
+
+fn estimated_primary_label(
+    number: u32,
+    address: &InterpolationAddressComponents,
+) -> Option<String> {
+    address
+        .street
+        .as_deref()
+        .or(address.place.as_deref())
+        .map(|street_or_place| format!("{number} {street_or_place}"))
+}
+
+fn compose_label(primary: &str, context: &ReverseContext) -> String {
+    let mut parts = vec![primary.to_string()];
+    for part in [
+        context.place.as_deref(),
+        context.neighbourhood.as_deref(),
+        context.locality.as_deref(),
+        context.district.as_deref(),
+        context.region.as_deref(),
+        context.postcode.as_deref(),
+        context.country.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !parts.iter().any(|existing| same_text(existing, part)) {
+            parts.push(part.to_string());
+        }
+    }
+    parts.join(", ")
+}
+
+fn context_only_label(context: &ReverseContext) -> Option<String> {
+    [
+        context.place.as_deref(),
+        context.neighbourhood.as_deref(),
+        context.locality.as_deref(),
+        context.district.as_deref(),
+        context.region.as_deref(),
+        context.postcode.as_deref(),
+        context.country.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .map(|primary| compose_label(primary, context))
+}
+
+fn point_from_record(record: &NormalizedRecord) -> Option<ReversePoint> {
+    let (lon, lat) = match record {
+        NormalizedRecord::Address(record) => point_coordinates(&record.geometry)?,
+        NormalizedRecord::Postcode(record) => point_coordinates(&record.geometry)?,
+        NormalizedRecord::Country(record)
+        | NormalizedRecord::District(record)
+        | NormalizedRecord::Locality(record)
+        | NormalizedRecord::Neighbourhood(record)
+        | NormalizedRecord::Place(record)
+        | NormalizedRecord::Region(record) => point_coordinates(&record.geometry)?,
+        NormalizedRecord::Interpolation(record) => (
+            record.representative_point[0],
+            record.representative_point[1],
+        ),
+        NormalizedRecord::Street(record) => (
+            record.representative_point[0],
+            record.representative_point[1],
+        ),
+    };
+    Some(ReversePoint {
+        lon,
+        lat,
+        precision: ReversePointPrecision::Context,
+    })
+}
+
+fn point_coordinates(geometry: &geojson::Geometry) -> Option<(f64, f64)> {
+    let geojson::GeometryValue::Point { coordinates } = &geometry.value else {
+        return None;
+    };
+    let [lon, lat, ..] = coordinates.as_slice() else {
+        return None;
+    };
+    Some((*lon, *lat))
+}
+
+fn set_option_if_missing(target: &mut Option<String>, value: Option<String>) {
+    if let Some(value) = value {
+        set_if_missing(target, value);
+    }
+}
+
+fn set_if_missing(target: &mut Option<String>, value: String) -> bool {
+    if target.is_none() && !value.trim().is_empty() {
+        *target = Some(value);
+        true
+    } else {
+        false
+    }
+}
+
+fn same_text(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use geojson::{Geometry, GeometryValue};
+
+    use crate::{
+        builder::report::BuilderReport,
+        pack::{PackWriter, RecordWriter},
+        record::{
+            AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance, StreetRecord,
+            point_geometry,
+        },
+    };
+
+    use super::*;
+
+    #[test]
+    fn reverse_prefers_explicit_address() {
+        let temp_dir = temp_pack_dir("explicit");
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write_record(NormalizedRecord::street(street_record()))
+            .expect("street");
+        writer
+            .write_record(NormalizedRecord::address(address_record()))
+            .expect("address");
+        let mut report = BuilderReport::default();
+        writer.finish(&mut report).expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let response = geocoder
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.0,
+                lat: 43.0,
+            })
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.primary_record_id, Some(1));
+        assert_eq!(result.evidence.explicit_address_record_id, Some(1));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn reverse_estimates_address_from_interpolation() {
+        let temp_dir = temp_pack_dir("interpolation");
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write_record(NormalizedRecord::interpolation(interpolation_record()))
+            .expect("interpolation");
+        let mut report = BuilderReport::default();
+        writer.finish(&mut report).expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let response = geocoder
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.00001,
+                lat: 43.0005,
+            })
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.match_kind, ReverseMatchKind::EstimatedAddress);
+        assert!(result.label.starts_with("50 Queen Street"));
+        assert_eq!(result.evidence.interpolation_record_id, Some(0));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn reverse_falls_back_to_street() {
+        let temp_dir = temp_pack_dir("street");
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write_record(NormalizedRecord::street(street_record()))
+            .expect("street");
+        let mut report = BuilderReport::default();
+        writer.finish(&mut report).expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let response = geocoder
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.00001,
+                lat: 43.0005,
+            })
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.match_kind, ReverseMatchKind::NearestStreet);
+        assert!(result.label.starts_with("Queen Street"));
+        assert_eq!(result.evidence.street_record_id, Some(0));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn temp_pack_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "open-geocode-reverse-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn address_record() -> AddressRecord {
+        AddressRecord {
+            id: "osm:node:10".to_string(),
+            label: "10 Queen Street, Toronto".to_string(),
+            name: "10 Queen Street".to_string(),
+            address: AddressComponents {
+                number: "10".to_string(),
+                street: Some("Queen Street".to_string()),
+                place: None,
+                unit: None,
+                locality: Some("Toronto".to_string()),
+                region: Some("Ontario".to_string()),
+                postcode: None,
+                country: Some("Canada".to_string()),
+            },
+            geometry: point_geometry(-79.0, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(OsmObjectType::Node, 10),
+        }
+    }
+
+    fn interpolation_record() -> crate::record::InterpolationRecord {
+        crate::record::InterpolationRecord {
+            id: "osm:way:20:interp:2-98".to_string(),
+            label: "Queen Street 2-98 even".to_string(),
+            name: "Queen Street".to_string(),
+            address: InterpolationAddressComponents {
+                street: Some("Queen Street".to_string()),
+                place: None,
+                locality: Some("Toronto".to_string()),
+                region: Some("Ontario".to_string()),
+                postcode: None,
+                country: Some("Canada".to_string()),
+            },
+            interpolation: InterpolationRange {
+                kind: "even".to_string(),
+                start: 2,
+                end: 98,
+                step: 2,
+            },
+            anchor_ids: vec!["osm:node:2".to_string(), "osm:node:98".to_string()],
+            geometry: line_geometry(),
+            representative_point: [-79.0, 43.0005],
+            source: SourceProvenance::osm(OsmObjectType::Way, 20),
+        }
+    }
+
+    fn street_record() -> StreetRecord {
+        StreetRecord {
+            id: "osm:way:30".to_string(),
+            label: "Queen Street".to_string(),
+            name: "Queen Street".to_string(),
+            geometry: line_geometry(),
+            representative_point: [-79.0, 43.0005],
+            source: SourceProvenance::osm(OsmObjectType::Way, 30),
+        }
+    }
+
+    fn line_geometry() -> Geometry {
+        Geometry::new(GeometryValue::LineString {
+            coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
+        })
+    }
+}

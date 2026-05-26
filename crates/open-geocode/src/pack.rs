@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     builder::report::BuilderReport,
     record::{NormalizedRecord, RejectedRecord},
+    spatial_index::{PackSpatialIndexWriter, SPATIAL_INDEX_RELATIVE_PATH, SpatialIndexCommit},
     text_index::{TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit},
 };
 
@@ -30,6 +31,7 @@ pub struct PackWriter {
     rejections: File,
     rejection_offsets: File,
     text_index: TantivyTextIndexWriter,
+    spatial_index: PackSpatialIndexWriter,
     record_count: u64,
     rejection_count: u64,
     layer_counts: BTreeMap<String, u64>,
@@ -51,6 +53,8 @@ pub struct PackManifest {
     pub layer_counts: BTreeMap<String, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_index: Option<PackTextIndex>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spatial_index: Option<PackSpatialIndex>,
     pub files: BTreeMap<String, PackFile>,
 }
 
@@ -59,6 +63,15 @@ pub struct PackTextIndex {
     pub path: String,
     pub schema_version: u32,
     pub document_count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackSpatialIndex {
+    pub path: String,
+    pub schema_version: u32,
+    pub point_count: u64,
+    pub segment_count: u64,
     pub bytes: u64,
 }
 
@@ -126,6 +139,7 @@ impl PackWriter {
             rejections,
             rejection_offsets,
             text_index,
+            spatial_index: PackSpatialIndexWriter::default(),
             record_count: 0,
             rejection_count: 0,
             layer_counts: BTreeMap::new(),
@@ -147,6 +161,9 @@ impl PackWriter {
 
         let text_index_commit = self.text_index.commit()?;
         let text_index_bytes = dir_size(self.path.join(TEXT_INDEX_RELATIVE_PATH))?;
+        let spatial_index = std::mem::take(&mut self.spatial_index);
+        let spatial_index_commit = spatial_index.finish(&self.path)?;
+        let spatial_index_bytes = file_len(self.path.join(SPATIAL_INDEX_RELATIVE_PATH))?;
 
         report.record_table_bytes = file_len(self.path.join("records").join("records.bin"))?;
         report.offset_table_bytes = file_len(self.path.join("records").join("offsets.bin"))?;
@@ -157,6 +174,11 @@ impl PackWriter {
         report.text_index_schema_version = text_index_commit.schema_version;
         report.text_index_document_count = text_index_commit.document_count;
         report.text_index_bytes = text_index_bytes;
+        report.spatial_index_path = SPATIAL_INDEX_RELATIVE_PATH.to_string();
+        report.spatial_index_schema_version = spatial_index_commit.schema_version;
+        report.spatial_index_point_count = spatial_index_commit.point_count;
+        report.spatial_index_segment_count = spatial_index_commit.segment_count;
+        report.spatial_index_bytes = spatial_index_bytes;
 
         let report_path = self.path.join("audit").join("build-report.json");
         let report_file = File::create(&report_path)
@@ -164,7 +186,12 @@ impl PackWriter {
         serde_json::to_writer_pretty(report_file, report)
             .with_context(|| format!("failed to write {}", report_path.display()))?;
 
-        let manifest = self.manifest(text_index_commit, text_index_bytes)?;
+        let manifest = self.manifest(
+            text_index_commit,
+            text_index_bytes,
+            spatial_index_commit,
+            spatial_index_bytes,
+        )?;
         let manifest_path = self.path.join("manifest.json");
         let manifest_file = File::create(&manifest_path)
             .with_context(|| format!("failed to create {}", manifest_path.display()))?;
@@ -178,6 +205,8 @@ impl PackWriter {
         &self,
         text_index_commit: TextIndexCommit,
         text_index_bytes: u64,
+        spatial_index_commit: SpatialIndexCommit,
+        spatial_index_bytes: u64,
     ) -> Result<PackManifest> {
         let mut files = BTreeMap::new();
         for relative in [
@@ -190,6 +219,7 @@ impl PackWriter {
             insert_pack_file(&mut files, &self.path, relative)?;
         }
         insert_pack_files_under(&mut files, &self.path, TEXT_INDEX_RELATIVE_PATH)?;
+        insert_pack_file(&mut files, &self.path, SPATIAL_INDEX_RELATIVE_PATH)?;
 
         Ok(PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -206,6 +236,13 @@ impl PackWriter {
                 schema_version: text_index_commit.schema_version,
                 document_count: text_index_commit.document_count,
                 bytes: text_index_bytes,
+            }),
+            spatial_index: Some(PackSpatialIndex {
+                path: SPATIAL_INDEX_RELATIVE_PATH.to_string(),
+                schema_version: spatial_index_commit.schema_version,
+                point_count: spatial_index_commit.point_count,
+                segment_count: spatial_index_commit.segment_count,
+                bytes: spatial_index_bytes,
             }),
             files,
         })
@@ -246,6 +283,7 @@ impl RecordWriter for PackWriter {
             &bytes,
         )?;
         self.text_index.add_record(record_id, &record)?;
+        self.spatial_index.add_record(record_id, &record)?;
 
         self.record_count += 1;
         *self.layer_counts.entry(layer.to_string()).or_default() += 1;
@@ -628,6 +666,8 @@ mod tests {
         assert!(report.offset_table_bytes > 16);
         assert!(report.text_index_bytes > 0);
         assert_eq!(report.text_index_document_count, 2);
+        assert!(report.spatial_index_bytes > 0);
+        assert_eq!(report.spatial_index_point_count, 2);
         assert_eq!(
             reader
                 .manifest()
@@ -637,6 +677,15 @@ mod tests {
                 .document_count,
             2
         );
+        assert_eq!(
+            reader
+                .manifest()
+                .spatial_index
+                .as_ref()
+                .expect("spatial index")
+                .point_count,
+            2
+        );
         assert!(
             reader
                 .manifest()
@@ -644,6 +693,7 @@ mod tests {
                 .keys()
                 .any(|path| path.starts_with("text/tantivy/"))
         );
+        assert!(reader.manifest().files.contains_key("spatial/reverse.rmp"));
         assert_eq!(text_hit_record_id(&temp_dir, "queen").expect("text hit"), 1);
 
         let _ = fs::remove_dir_all(temp_dir);

@@ -1,5 +1,8 @@
 pub mod builder;
 pub mod pack;
 pub mod record;
+pub mod reverse;
+pub mod runtime;
 pub mod search;
+pub mod spatial_index;
 pub mod text_index;

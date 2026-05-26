@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -7,6 +7,8 @@ use serde_json::Value;
 use open_geocode::{
     builder::{BuildOsmOptions, build_osm_pack},
     pack::{PackReader, RecordId},
+    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    runtime::{ServeOptions, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
 
@@ -78,9 +80,41 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+
+    /// Reverse geocode one coordinate from a Pack spatial index.
+    #[command(name = "reverse-pack")]
+    ReversePack {
+        /// Binary Pack directory.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Longitude in WGS84 decimal degrees.
+        #[arg(long)]
+        lon: f64,
+
+        /// Latitude in WGS84 decimal degrees.
+        #[arg(long)]
+        lat: f64,
+    },
+
+    /// Serve the Runtime HTTP API and static demo files.
+    Serve {
+        /// Binary Pack directory.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Static demo directory to serve.
+        #[arg(long, default_value = "demo")]
+        demo: PathBuf,
+
+        /// Address and port to bind.
+        #[arg(long, default_value = "127.0.0.1:5173")]
+        bind: SocketAddr,
+    },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -99,6 +133,8 @@ fn main() -> Result<()> {
             layer,
             limit,
         } => search_pack(pack, query, layer, limit),
+        Commands::ReversePack { pack, lon, lat } => reverse_pack(pack, lon, lat),
+        Commands::Serve { pack, demo, bind } => serve(ServeOptions { pack, demo, bind }).await,
     }
 }
 
@@ -146,4 +182,10 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
         layer,
     })?;
     write_json(serde_json::to_value(hits)?)
+}
+
+fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
+    let geocoder = PackReverseGeocoder::open(pack)?;
+    let response = geocoder.reverse(ReverseGeocodeOptions { lon, lat })?;
+    write_json(serde_json::to_value(response)?)
 }

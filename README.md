@@ -59,6 +59,18 @@ cargo run -p open-geocode -- inspect-pack --pack .\data\build\pack --row 42
 cargo run -p open-geocode -- inspect-pack --pack .\data\build\pack --id osm:node:123
 ```
 
+Search a Pack from the CLI:
+
+```powershell
+cargo run -p open-geocode -- search-pack --pack .\data\build\pack --query "King Street Toronto"
+```
+
+Serve the Runtime API and demo:
+
+```powershell
+cargo run -p open-geocode -- serve --pack .\data\build\pack --demo .\demo --bind 127.0.0.1:5173
+```
+
 ## Use Cases
 
 | Capability | Example use case |

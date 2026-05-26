@@ -27,6 +27,11 @@ pub struct BuilderReport {
     pub text_index_schema_version: u32,
     pub text_index_document_count: u64,
     pub text_index_bytes: u64,
+    pub spatial_index_path: String,
+    pub spatial_index_schema_version: u32,
+    pub spatial_index_point_count: u64,
+    pub spatial_index_segment_count: u64,
+    pub spatial_index_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
