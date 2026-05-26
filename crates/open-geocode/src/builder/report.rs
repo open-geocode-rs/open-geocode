@@ -23,6 +23,10 @@ pub struct BuilderReport {
     pub offset_table_bytes: u64,
     pub rejection_table_bytes: u64,
     pub rejection_offset_table_bytes: u64,
+    pub text_index_path: String,
+    pub text_index_schema_version: u32,
+    pub text_index_document_count: u64,
+    pub text_index_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

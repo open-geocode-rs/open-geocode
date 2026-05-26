@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     builder::report::BuilderReport,
     record::{NormalizedRecord, RejectedRecord},
+    text_index::{TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit},
 };
 
 pub type RecordId = u64;
@@ -28,6 +29,7 @@ pub struct PackWriter {
     offsets: File,
     rejections: File,
     rejection_offsets: File,
+    text_index: TantivyTextIndexWriter,
     record_count: u64,
     rejection_count: u64,
     layer_counts: BTreeMap<String, u64>,
@@ -47,7 +49,17 @@ pub struct PackManifest {
     pub record_count: u64,
     pub rejection_count: u64,
     pub layer_counts: BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_index: Option<PackTextIndex>,
     pub files: BTreeMap<String, PackFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackTextIndex {
+    pub path: String,
+    pub schema_version: u32,
+    pub document_count: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,12 +117,15 @@ impl PackWriter {
             .with_context(|| "failed to create rejection_offsets.bin")?;
         write_offset_header(&mut rejection_offsets, REJECTION_OFFSETS_MAGIC, 0)?;
 
+        let text_index = TantivyTextIndexWriter::create(&path)?;
+
         Ok(Self {
             path,
             records,
             offsets,
             rejections,
             rejection_offsets,
+            text_index,
             record_count: 0,
             rejection_count: 0,
             layer_counts: BTreeMap::new(),
@@ -130,11 +145,18 @@ impl PackWriter {
         self.rejections.flush()?;
         self.rejection_offsets.flush()?;
 
+        let text_index_commit = self.text_index.commit()?;
+        let text_index_bytes = dir_size(self.path.join(TEXT_INDEX_RELATIVE_PATH))?;
+
         report.record_table_bytes = file_len(self.path.join("records").join("records.bin"))?;
         report.offset_table_bytes = file_len(self.path.join("records").join("offsets.bin"))?;
         report.rejection_table_bytes = file_len(self.path.join("audit").join("rejections.bin"))?;
         report.rejection_offset_table_bytes =
             file_len(self.path.join("audit").join("rejection_offsets.bin"))?;
+        report.text_index_path = TEXT_INDEX_RELATIVE_PATH.to_string();
+        report.text_index_schema_version = text_index_commit.schema_version;
+        report.text_index_document_count = text_index_commit.document_count;
+        report.text_index_bytes = text_index_bytes;
 
         let report_path = self.path.join("audit").join("build-report.json");
         let report_file = File::create(&report_path)
@@ -142,7 +164,7 @@ impl PackWriter {
         serde_json::to_writer_pretty(report_file, report)
             .with_context(|| format!("failed to write {}", report_path.display()))?;
 
-        let manifest = self.manifest()?;
+        let manifest = self.manifest(text_index_commit, text_index_bytes)?;
         let manifest_path = self.path.join("manifest.json");
         let manifest_file = File::create(&manifest_path)
             .with_context(|| format!("failed to create {}", manifest_path.display()))?;
@@ -152,7 +174,11 @@ impl PackWriter {
         Ok(manifest)
     }
 
-    fn manifest(&self) -> Result<PackManifest> {
+    fn manifest(
+        &self,
+        text_index_commit: TextIndexCommit,
+        text_index_bytes: u64,
+    ) -> Result<PackManifest> {
         let mut files = BTreeMap::new();
         for relative in [
             "records/records.bin",
@@ -161,14 +187,9 @@ impl PackWriter {
             "audit/rejection_offsets.bin",
             "audit/build-report.json",
         ] {
-            files.insert(
-                relative.to_string(),
-                PackFile {
-                    path: relative.to_string(),
-                    bytes: file_len(self.path.join(relative))?,
-                },
-            );
+            insert_pack_file(&mut files, &self.path, relative)?;
         }
+        insert_pack_files_under(&mut files, &self.path, TEXT_INDEX_RELATIVE_PATH)?;
 
         Ok(PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -180,6 +201,12 @@ impl PackWriter {
             record_count: self.record_count,
             rejection_count: self.rejection_count,
             layer_counts: self.layer_counts.clone(),
+            text_index: Some(PackTextIndex {
+                path: TEXT_INDEX_RELATIVE_PATH.to_string(),
+                schema_version: text_index_commit.schema_version,
+                document_count: text_index_commit.document_count,
+                bytes: text_index_bytes,
+            }),
             files,
         })
     }
@@ -218,6 +245,7 @@ impl RecordWriter for PackWriter {
             layer_code,
             &bytes,
         )?;
+        self.text_index.add_record(record_id, &record)?;
 
         self.record_count += 1;
         *self.layer_counts.entry(layer.to_string()).or_default() += 1;
@@ -437,6 +465,71 @@ fn file_len(path: impl AsRef<Path>) -> Result<u64> {
         .len())
 }
 
+fn dir_size(path: impl AsRef<Path>) -> Result<u64> {
+    let path = path.as_ref();
+    let mut bytes = 0;
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            bytes += dir_size(entry.path())?;
+        } else if metadata.is_file() {
+            bytes += metadata.len();
+        }
+    }
+    Ok(bytes)
+}
+
+fn insert_pack_file(
+    files: &mut BTreeMap<String, PackFile>,
+    pack_path: &Path,
+    relative: &str,
+) -> Result<()> {
+    let bytes = file_len(pack_path.join(relative))?;
+    files.insert(
+        relative.to_string(),
+        PackFile {
+            path: relative.to_string(),
+            bytes,
+        },
+    );
+    Ok(())
+}
+
+fn insert_pack_files_under(
+    files: &mut BTreeMap<String, PackFile>,
+    pack_path: &Path,
+    relative_dir: &str,
+) -> Result<()> {
+    let root = pack_path.join(relative_dir);
+    for entry in
+        fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            let relative = pack_relative_path(pack_path, &path)?;
+            insert_pack_files_under(files, pack_path, &relative)?;
+        } else if metadata.is_file() {
+            let relative = pack_relative_path(pack_path, &path)?;
+            insert_pack_file(files, pack_path, &relative)?;
+        }
+    }
+    Ok(())
+}
+
+fn pack_relative_path(pack_path: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(pack_path)
+        .with_context(|| format!("{} is not inside {}", path.display(), pack_path.display()))?;
+    Ok(relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
 fn layer_code(layer: &str) -> Result<u16> {
     match layer {
         "address" => Ok(1),
@@ -479,12 +572,15 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::Path};
+
+    use tantivy::{TantivyDocument, collector::TopDocs, query::QueryParser, schema::Value};
 
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
         point_geometry,
     };
+    use crate::text_index::{TextIndexFields, open_text_index};
 
     use super::*;
 
@@ -530,8 +626,46 @@ mod tests {
         );
         assert!(report.record_table_bytes > 8);
         assert!(report.offset_table_bytes > 16);
+        assert!(report.text_index_bytes > 0);
+        assert_eq!(report.text_index_document_count, 2);
+        assert_eq!(
+            reader
+                .manifest()
+                .text_index
+                .as_ref()
+                .expect("text index")
+                .document_count,
+            2
+        );
+        assert!(
+            reader
+                .manifest()
+                .files
+                .keys()
+                .any(|path| path.starts_with("text/tantivy/"))
+        );
+        assert_eq!(text_hit_record_id(&temp_dir, "queen").expect("text hit"), 1);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn text_hit_record_id(pack_path: &Path, query: &str) -> Result<RecordId> {
+        let index = open_text_index(pack_path)?;
+        let schema = index.schema();
+        let fields = TextIndexFields::from_schema(&schema)?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let query_parser = QueryParser::for_index(&index, vec![fields.all_text]);
+        let parsed_query = query_parser.parse_query(query)?;
+        let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(1))?;
+        let Some((_score, doc_address)) = top_docs.first() else {
+            bail!("no text hit for {query}");
+        };
+        let document: TantivyDocument = searcher.doc(*doc_address)?;
+        document
+            .get_first(fields.record_id)
+            .and_then(|value| value.as_u64())
+            .with_context(|| format!("missing record_id for text hit {query}"))
     }
 
     fn address_record(id: &str, label: &str) -> AddressRecord {
