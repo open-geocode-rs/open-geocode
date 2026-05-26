@@ -1,10 +1,11 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{fs::File, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
 use open_geocode::{
+    bench::{PackBenchmarkOptions, benchmark_pack},
     builder::{BuildOsmOptions, build_osm_pack},
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
@@ -97,6 +98,30 @@ enum Commands {
         lat: f64,
     },
 
+    /// Benchmark Pack size, open time, and query latency.
+    #[command(name = "bench-pack")]
+    BenchPack {
+        /// Binary Pack directory.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Optional JSON fixture with search, autocomplete, and reverse cases.
+        #[arg(long)]
+        queries: Option<PathBuf>,
+
+        /// Measured runs per query case.
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+
+        /// Warmup runs per query case, excluded from latency stats.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+
+        /// Optional output path for the JSON benchmark report.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
     /// Serve the Runtime HTTP API and static demo files.
     Serve {
         /// Binary Pack directory.
@@ -134,6 +159,13 @@ async fn main() -> Result<()> {
             limit,
         } => search_pack(pack, query, layer, limit),
         Commands::ReversePack { pack, lon, lat } => reverse_pack(pack, lon, lat),
+        Commands::BenchPack {
+            pack,
+            queries,
+            iterations,
+            warmup,
+            output,
+        } => bench_pack(pack, queries, iterations, warmup, output),
         Commands::Serve { pack, demo, bind } => serve(ServeOptions { pack, demo, bind }).await,
     }
 }
@@ -174,6 +206,17 @@ fn write_json(value: Value) -> Result<()> {
     Ok(())
 }
 
+fn write_json_to_path(value: &Value, output: PathBuf) -> Result<()> {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = File::create(&output)?;
+    serde_json::to_writer_pretty(file, value)?;
+    Ok(())
+}
+
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
     let searcher = PackTextSearcher::open(pack)?;
     let hits = searcher.search(TextSearchOptions {
@@ -188,4 +231,25 @@ fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let geocoder = PackReverseGeocoder::open(pack)?;
     let response = geocoder.reverse(ReverseGeocodeOptions { lon, lat })?;
     write_json(serde_json::to_value(response)?)
+}
+
+fn bench_pack(
+    pack: PathBuf,
+    queries: Option<PathBuf>,
+    iterations: usize,
+    warmup: usize,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    let report = benchmark_pack(PackBenchmarkOptions {
+        pack,
+        queries,
+        iterations,
+        warmup,
+    })?;
+    let value = serde_json::to_value(report)?;
+    if let Some(output) = output {
+        write_json_to_path(&value, output)
+    } else {
+        write_json(value)
+    }
 }

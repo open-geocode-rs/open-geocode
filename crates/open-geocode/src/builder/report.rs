@@ -18,6 +18,7 @@ pub struct BuilderReport {
     pub geometry_resolution: GeometryResolutionCounts,
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
+    pub pack_write: PackWriteTimings,
     pub node_cache_entries: usize,
     pub record_table_bytes: u64,
     pub offset_table_bytes: u64,
@@ -105,10 +106,30 @@ pub struct CompletenessCounts {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PhaseTimings {
+    pub pack_create_ms: u128,
     pub discovery_ms: u128,
     pub coordinate_resolution_ms: u128,
     pub record_emission_ms: u128,
+    pub pack_finish_ms: u128,
     pub total_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PackWriteTimings {
+    pub record_encode_ms: u128,
+    pub record_table_write_ms: u128,
+    pub text_index_write_ms: u128,
+    pub spatial_index_write_ms: u128,
+    pub rejection_encode_ms: u128,
+    pub rejection_table_write_ms: u128,
+    pub final_offset_header_ms: u128,
+    pub table_flush_ms: u128,
+    pub text_index_commit_ms: u128,
+    pub text_index_size_ms: u128,
+    pub spatial_index_finish_ms: u128,
+    pub spatial_index_size_ms: u128,
+    pub table_size_ms: u128,
+    pub runtime_finalize_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

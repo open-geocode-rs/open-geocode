@@ -1,0 +1,35 @@
+{
+  "search": [
+    {
+      "name": "known address",
+      "q": "44 Gould Street Cobden",
+      "limit": 10
+    },
+    {
+      "name": "known street",
+      "q": "Guelph Line",
+      "layer": "street",
+      "limit": 10
+    }
+  ],
+  "autocomplete": [
+    {
+      "name": "address prefix",
+      "q": "44 gou",
+      "limit": 10
+    },
+    {
+      "name": "street prefix",
+      "q": "gue",
+      "layer": "street",
+      "limit": 10
+    }
+  ],
+  "reverse": [
+    {
+      "name": "known address point",
+      "lon": -76.8816644,
+      "lat": 45.6278725
+    }
+  ]
+}

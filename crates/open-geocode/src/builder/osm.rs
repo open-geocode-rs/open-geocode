@@ -37,10 +37,13 @@ pub struct BuildOsmOptions {
 
 pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
     let total_started = Instant::now();
+    let pack_create_started = Instant::now();
     let mut pack_writer = PackWriter::create(&options.pack)?;
+    let pack_create_ms = pack_create_started.elapsed().as_millis();
 
     let discovery_started = Instant::now();
     let mut discovery = discover_address_features(&options.input, &mut pack_writer)?;
+    discovery.report.phases.pack_create_ms = pack_create_ms;
     discovery.report.phases.discovery_ms = discovery_started.elapsed().as_millis();
     discovery.report.pack = options.pack.display().to_string();
     discovery.report.geometry_resolution.address_way_stubs = discovery.way_stubs.len();

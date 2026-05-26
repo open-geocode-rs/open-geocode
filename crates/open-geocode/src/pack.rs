@@ -3,16 +3,16 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    builder::report::BuilderReport,
+    builder::report::{BuilderReport, PackWriteTimings},
     record::{NormalizedRecord, RejectedRecord},
-    spatial_index::{PackSpatialIndexWriter, SPATIAL_INDEX_RELATIVE_PATH, SpatialIndexCommit},
+    spatial_index::{PackSpatialIndexWriter, SpatialIndexCommit},
     text_index::{TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit},
 };
 
@@ -32,6 +32,7 @@ pub struct PackWriter {
     rejection_offsets: File,
     text_index: TantivyTextIndexWriter,
     spatial_index: PackSpatialIndexWriter,
+    write_timings: PackWriteTimings,
     record_count: u64,
     rejection_count: u64,
     layer_counts: BTreeMap<String, u64>,
@@ -140,6 +141,7 @@ impl PackWriter {
             rejection_offsets,
             text_index,
             spatial_index: PackSpatialIndexWriter::default(),
+            write_timings: PackWriteTimings::default(),
             record_count: 0,
             rejection_count: 0,
             layer_counts: BTreeMap::new(),
@@ -147,38 +149,62 @@ impl PackWriter {
     }
 
     pub fn finish(mut self, report: &mut BuilderReport) -> Result<PackManifest> {
+        let runtime_finalize_started = Instant::now();
+
+        let started = Instant::now();
         write_offset_header(&mut self.offsets, OFFSETS_MAGIC, self.record_count)?;
         write_offset_header(
             &mut self.rejection_offsets,
             REJECTION_OFFSETS_MAGIC,
             self.rejection_count,
         )?;
+        self.write_timings.final_offset_header_ms += elapsed_ms(started);
 
+        let started = Instant::now();
         self.records.flush()?;
         self.offsets.flush()?;
         self.rejections.flush()?;
         self.rejection_offsets.flush()?;
+        self.write_timings.table_flush_ms += elapsed_ms(started);
 
+        let started = Instant::now();
         let text_index_commit = self.text_index.commit()?;
-        let text_index_bytes = dir_size(self.path.join(TEXT_INDEX_RELATIVE_PATH))?;
-        let spatial_index = std::mem::take(&mut self.spatial_index);
-        let spatial_index_commit = spatial_index.finish(&self.path)?;
-        let spatial_index_bytes = file_len(self.path.join(SPATIAL_INDEX_RELATIVE_PATH))?;
+        self.write_timings.text_index_commit_ms += elapsed_ms(started);
 
+        let started = Instant::now();
+        let text_index_bytes = dir_size(self.path.join(TEXT_INDEX_RELATIVE_PATH))?;
+        self.write_timings.text_index_size_ms += elapsed_ms(started);
+
+        let spatial_index = std::mem::take(&mut self.spatial_index);
+        let started = Instant::now();
+        let spatial_index_commit = spatial_index.finish(&self.path)?;
+        self.write_timings.spatial_index_finish_ms += elapsed_ms(started);
+
+        let started = Instant::now();
+        let spatial_index_bytes = dir_size(self.path.join(&spatial_index_commit.relative_path))?;
+        self.write_timings.spatial_index_size_ms += elapsed_ms(started);
+
+        let started = Instant::now();
         report.record_table_bytes = file_len(self.path.join("records").join("records.bin"))?;
         report.offset_table_bytes = file_len(self.path.join("records").join("offsets.bin"))?;
         report.rejection_table_bytes = file_len(self.path.join("audit").join("rejections.bin"))?;
         report.rejection_offset_table_bytes =
             file_len(self.path.join("audit").join("rejection_offsets.bin"))?;
+        self.write_timings.table_size_ms += elapsed_ms(started);
+
         report.text_index_path = TEXT_INDEX_RELATIVE_PATH.to_string();
         report.text_index_schema_version = text_index_commit.schema_version;
         report.text_index_document_count = text_index_commit.document_count;
         report.text_index_bytes = text_index_bytes;
-        report.spatial_index_path = SPATIAL_INDEX_RELATIVE_PATH.to_string();
+        report.spatial_index_path = spatial_index_commit.relative_path.clone();
         report.spatial_index_schema_version = spatial_index_commit.schema_version;
         report.spatial_index_point_count = spatial_index_commit.point_count;
         report.spatial_index_segment_count = spatial_index_commit.segment_count;
         report.spatial_index_bytes = spatial_index_bytes;
+        self.write_timings.runtime_finalize_ms += elapsed_ms(runtime_finalize_started);
+        report.phases.pack_finish_ms = self.write_timings.runtime_finalize_ms;
+        report.phases.total_ms += self.write_timings.runtime_finalize_ms;
+        report.pack_write = self.write_timings.clone();
 
         let report_path = self.path.join("audit").join("build-report.json");
         let report_file = File::create(&report_path)
@@ -219,7 +245,7 @@ impl PackWriter {
             insert_pack_file(&mut files, &self.path, relative)?;
         }
         insert_pack_files_under(&mut files, &self.path, TEXT_INDEX_RELATIVE_PATH)?;
-        insert_pack_file(&mut files, &self.path, SPATIAL_INDEX_RELATIVE_PATH)?;
+        insert_pack_files_under(&mut files, &self.path, &spatial_index_commit.relative_path)?;
 
         Ok(PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -238,7 +264,7 @@ impl PackWriter {
                 bytes: text_index_bytes,
             }),
             spatial_index: Some(PackSpatialIndex {
-                path: SPATIAL_INDEX_RELATIVE_PATH.to_string(),
+                path: spatial_index_commit.relative_path.clone(),
                 schema_version: spatial_index_commit.schema_version,
                 point_count: spatial_index_commit.point_count,
                 segment_count: spatial_index_commit.segment_count,
@@ -274,7 +300,12 @@ impl RecordWriter for PackWriter {
         let record_id = self.record_count;
         let layer = record.layer();
         let layer_code = layer_code(layer)?;
+
+        let started = Instant::now();
         let bytes = rmp_serde::to_vec_named(&record).context("failed to encode record")?;
+        self.write_timings.record_encode_ms += elapsed_ms(started);
+
+        let started = Instant::now();
         Self::append_chunk(
             &mut self.records,
             &mut self.offsets,
@@ -282,8 +313,15 @@ impl RecordWriter for PackWriter {
             layer_code,
             &bytes,
         )?;
+        self.write_timings.record_table_write_ms += elapsed_ms(started);
+
+        let started = Instant::now();
         self.text_index.add_record(record_id, &record)?;
+        self.write_timings.text_index_write_ms += elapsed_ms(started);
+
+        let started = Instant::now();
         self.spatial_index.add_record(record_id, &record)?;
+        self.write_timings.spatial_index_write_ms += elapsed_ms(started);
 
         self.record_count += 1;
         *self.layer_counts.entry(layer.to_string()).or_default() += 1;
@@ -298,7 +336,11 @@ impl RecordWriter for PackWriter {
             .map(layer_code)
             .transpose()?
             .unwrap_or(0);
+        let started = Instant::now();
         let bytes = rmp_serde::to_vec_named(&rejection).context("failed to encode rejection")?;
+        self.write_timings.rejection_encode_ms += elapsed_ms(started);
+
+        let started = Instant::now();
         Self::append_chunk(
             &mut self.rejections,
             &mut self.rejection_offsets,
@@ -306,6 +348,7 @@ impl RecordWriter for PackWriter {
             layer_code,
             &bytes,
         )?;
+        self.write_timings.rejection_table_write_ms += elapsed_ms(started);
 
         self.rejection_count += 1;
         Ok(())
@@ -496,6 +539,10 @@ fn read_u16(file: &mut File) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes))
 }
 
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
 fn file_len(path: impl AsRef<Path>) -> Result<u64> {
     let path = path.as_ref();
     Ok(fs::metadata(path)
@@ -669,6 +716,10 @@ mod tests {
         assert!(report.spatial_index_bytes > 0);
         assert_eq!(report.spatial_index_point_count, 2);
         assert_eq!(
+            report.phases.pack_finish_ms,
+            report.pack_write.runtime_finalize_ms
+        );
+        assert_eq!(
             reader
                 .manifest()
                 .text_index
@@ -693,7 +744,12 @@ mod tests {
                 .keys()
                 .any(|path| path.starts_with("text/tantivy/"))
         );
-        assert!(reader.manifest().files.contains_key("spatial/reverse.rmp"));
+        assert!(
+            reader
+                .manifest()
+                .files
+                .contains_key("spatial/v2/manifest.json")
+        );
         assert_eq!(text_hit_record_id(&temp_dir, "queen").expect("text hit"), 1);
 
         let _ = fs::remove_dir_all(temp_dir);
