@@ -1,10 +1,11 @@
-use std::{collections::BTreeMap, io::Write};
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 use geojson::GeometryValue;
 
 use crate::{
     builder::report::BuilderReport,
+    pack::RecordWriter,
     record::{
         AddressRecord, DerivedSourceProvenance, NormalizedRecord, PostcodeRecord, point_geometry,
     },
@@ -46,16 +47,15 @@ impl PostcodeAccumulator {
         group.record_count += 1;
     }
 
-    pub(crate) fn write_records<W: Write>(
+    pub(crate) fn write_records(
         &self,
-        output: &mut W,
+        writer: &mut dyn RecordWriter,
         report: &mut BuilderReport,
     ) -> Result<()> {
         for group in self.groups.values() {
             let record = group.to_record();
             let record = NormalizedRecord::postcode(record);
-            serde_json::to_writer(&mut *output, &record)?;
-            writeln!(output)?;
+            writer.write_record(record.clone())?;
             report.accept(&record);
         }
         Ok(())

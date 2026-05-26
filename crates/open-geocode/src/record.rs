@@ -213,6 +213,36 @@ impl NormalizedRecord {
             Self::Street(_) => "street",
         }
     }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Address(record) => &record.id,
+            Self::Country(record)
+            | Self::District(record)
+            | Self::Locality(record)
+            | Self::Neighbourhood(record)
+            | Self::Place(record)
+            | Self::Region(record) => &record.id,
+            Self::Interpolation(record) => &record.id,
+            Self::Postcode(record) => &record.id,
+            Self::Street(record) => &record.id,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Address(record) => &record.label,
+            Self::Country(record)
+            | Self::District(record)
+            | Self::Locality(record)
+            | Self::Neighbourhood(record)
+            | Self::Place(record)
+            | Self::Region(record) => &record.label,
+            Self::Interpolation(record) => &record.label,
+            Self::Postcode(record) => &record.label,
+            Self::Street(record) => &record.label,
+        }
+    }
 }
 
 impl AddressRecord {

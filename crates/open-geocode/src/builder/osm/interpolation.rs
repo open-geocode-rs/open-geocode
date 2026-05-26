@@ -1,12 +1,10 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    io::Write,
-};
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
+    pack::RecordWriter,
     record::{
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, NormalizedRecord,
         OsmObjectType, SourceProvenance,
@@ -50,19 +48,18 @@ pub(crate) fn has_interpolation_tag(tags: &BTreeMap<String, String>) -> bool {
     tag_value(tags, "addr:interpolation").is_some()
 }
 
-pub(crate) fn write_interpolation_records<W: Write, R: Write>(
+pub(crate) fn write_interpolation_records(
     stub: &InterpolationWayStub,
     node_locations: &HashMap<i64, (f64, f64)>,
     address_node_tags: &HashMap<i64, BTreeMap<String, String>>,
-    output: &mut W,
-    rejected_records: &mut R,
+    writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<()> {
     let Ok(rule) = interpolation_rule(&stub.tags) else {
         reject_interpolation(
             CandidateIssue::InterpolationUnsupportedValue,
             stub,
-            rejected_records,
+            writer,
             report,
         )?;
         return Ok(());
@@ -72,7 +69,7 @@ pub(crate) fn write_interpolation_records<W: Write, R: Write>(
         reject_interpolation(
             CandidateIssue::InterpolationWayWithoutNodes,
             stub,
-            rejected_records,
+            writer,
             report,
         )?;
         return Ok(());
@@ -82,7 +79,7 @@ pub(crate) fn write_interpolation_records<W: Write, R: Write>(
         reject_interpolation(
             CandidateIssue::InterpolationUnresolvedGeometry,
             stub,
-            rejected_records,
+            writer,
             report,
         )?;
         return Ok(());
@@ -91,7 +88,7 @@ pub(crate) fn write_interpolation_records<W: Write, R: Write>(
     let anchors = match numeric_anchors(stub, address_node_tags) {
         Ok(anchors) => anchors,
         Err(issue) => {
-            reject_interpolation(issue, stub, rejected_records, report)?;
+            reject_interpolation(issue, stub, writer, report)?;
             return Ok(());
         }
     };
@@ -103,7 +100,7 @@ pub(crate) fn write_interpolation_records<W: Write, R: Write>(
         None
     };
     if let Some(issue) = issue {
-        reject_interpolation(issue, stub, rejected_records, report)?;
+        reject_interpolation(issue, stub, writer, report)?;
         return Ok(());
     }
 
@@ -113,12 +110,11 @@ pub(crate) fn write_interpolation_records<W: Write, R: Write>(
         match interpolation_record_from_segment(stub, &rule, start_anchor, end_anchor, &points) {
             Ok(record) => {
                 let record = NormalizedRecord::interpolation(record);
-                serde_json::to_writer(&mut *output, &record)?;
-                writeln!(output)?;
+                writer.write_record(record.clone())?;
                 report.accept(&record);
             }
             Err(issue) => {
-                reject_interpolation(issue, stub, rejected_records, report)?;
+                reject_interpolation(issue, stub, writer, report)?;
             }
         }
     }
@@ -371,10 +367,10 @@ fn segment_points_between(
     Some(points[start..=end].to_vec())
 }
 
-fn reject_interpolation<W: Write>(
+fn reject_interpolation(
     issue: CandidateIssue,
     stub: &InterpolationWayStub,
-    rejected_records: &mut W,
+    writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<()> {
     let addr_tags = collect_addr_tags_from_map(&stub.tags);
@@ -385,7 +381,7 @@ fn reject_interpolation<W: Write>(
         stub.object_id,
         &stub.tags,
         Some("interpolation"),
-        rejected_records,
+        writer,
     )
 }
 
@@ -441,6 +437,8 @@ fn normalize_for_compare(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::pack::test_support::MemoryRecordWriter;
+
     use super::*;
 
     #[test]
@@ -478,27 +476,29 @@ mod tests {
                 ]),
             ),
         ]);
-        let mut output = Vec::new();
-        let mut rejected = Vec::new();
+        let mut writer = MemoryRecordWriter::default();
         let mut report = BuilderReport::default();
 
         write_interpolation_records(
             &stub,
             &node_locations,
             &address_node_tags,
-            &mut output,
-            &mut rejected,
+            &mut writer,
             &mut report,
         )
         .expect("write interpolation");
 
-        let output = String::from_utf8(output).expect("utf8");
-        let lines = output.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"layer\":\"interpolation\""));
-        assert!(lines[0].contains("\"start\":101"));
-        assert!(lines[1].contains("\"start\":103"));
-        assert!(rejected.is_empty());
+        assert_eq!(writer.records.len(), 2);
+        assert_eq!(writer.records[0].layer(), "interpolation");
+        let NormalizedRecord::Interpolation(first) = &writer.records[0] else {
+            panic!("expected interpolation");
+        };
+        let NormalizedRecord::Interpolation(second) = &writer.records[1] else {
+            panic!("expected interpolation");
+        };
+        assert_eq!(first.interpolation.start, 101);
+        assert_eq!(second.interpolation.start, 103);
+        assert!(writer.rejections.is_empty());
         assert_eq!(report.accepted.interpolation_ranges, 2);
     }
 

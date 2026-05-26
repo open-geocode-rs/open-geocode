@@ -1,0 +1,562 @@
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    builder::report::BuilderReport,
+    record::{NormalizedRecord, RejectedRecord},
+};
+
+pub type RecordId = u64;
+
+pub trait RecordWriter {
+    fn write_record(&mut self, record: NormalizedRecord) -> Result<RecordId>;
+    fn write_rejection(&mut self, rejection: RejectedRecord) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub struct PackWriter {
+    path: PathBuf,
+    records: File,
+    offsets: File,
+    rejections: File,
+    rejection_offsets: File,
+    record_count: u64,
+    rejection_count: u64,
+    layer_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug)]
+pub struct PackReader {
+    path: PathBuf,
+    manifest: PackManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackManifest {
+    pub schema_version: u32,
+    pub crate_version: String,
+    pub built_at_unix: u64,
+    pub record_count: u64,
+    pub rejection_count: u64,
+    pub layer_counts: BTreeMap<String, u64>,
+    pub files: BTreeMap<String, PackFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OffsetEntry {
+    offset: u64,
+    length: u64,
+    layer_code: u16,
+}
+
+const PACK_SCHEMA_VERSION: u32 = 1;
+const RECORDS_MAGIC: &[u8; 8] = b"OGREC001";
+const OFFSETS_MAGIC: &[u8; 8] = b"OGOFF001";
+const REJECTIONS_MAGIC: &[u8; 8] = b"OGREJ001";
+const REJECTION_OFFSETS_MAGIC: &[u8; 8] = b"OGROF001";
+const OFFSET_HEADER_BYTES: u64 = 16;
+const OFFSET_ENTRY_BYTES: u64 = 24;
+
+impl PackWriter {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if path.exists() {
+            if path.is_dir() {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to clear pack {}", path.display()))?;
+            } else {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+
+        fs::create_dir_all(path.join("records"))
+            .with_context(|| format!("failed to create {}", path.join("records").display()))?;
+        fs::create_dir_all(path.join("audit"))
+            .with_context(|| format!("failed to create {}", path.join("audit").display()))?;
+
+        let mut records = File::create(path.join("records").join("records.bin"))
+            .with_context(|| "failed to create records.bin")?;
+        records.write_all(RECORDS_MAGIC)?;
+
+        let mut offsets = File::create(path.join("records").join("offsets.bin"))
+            .with_context(|| "failed to create offsets.bin")?;
+        write_offset_header(&mut offsets, OFFSETS_MAGIC, 0)?;
+
+        let mut rejections = File::create(path.join("audit").join("rejections.bin"))
+            .with_context(|| "failed to create rejections.bin")?;
+        rejections.write_all(REJECTIONS_MAGIC)?;
+
+        let mut rejection_offsets = File::create(path.join("audit").join("rejection_offsets.bin"))
+            .with_context(|| "failed to create rejection_offsets.bin")?;
+        write_offset_header(&mut rejection_offsets, REJECTION_OFFSETS_MAGIC, 0)?;
+
+        Ok(Self {
+            path,
+            records,
+            offsets,
+            rejections,
+            rejection_offsets,
+            record_count: 0,
+            rejection_count: 0,
+            layer_counts: BTreeMap::new(),
+        })
+    }
+
+    pub fn finish(mut self, report: &mut BuilderReport) -> Result<PackManifest> {
+        write_offset_header(&mut self.offsets, OFFSETS_MAGIC, self.record_count)?;
+        write_offset_header(
+            &mut self.rejection_offsets,
+            REJECTION_OFFSETS_MAGIC,
+            self.rejection_count,
+        )?;
+
+        self.records.flush()?;
+        self.offsets.flush()?;
+        self.rejections.flush()?;
+        self.rejection_offsets.flush()?;
+
+        report.record_table_bytes = file_len(self.path.join("records").join("records.bin"))?;
+        report.offset_table_bytes = file_len(self.path.join("records").join("offsets.bin"))?;
+        report.rejection_table_bytes = file_len(self.path.join("audit").join("rejections.bin"))?;
+        report.rejection_offset_table_bytes =
+            file_len(self.path.join("audit").join("rejection_offsets.bin"))?;
+
+        let report_path = self.path.join("audit").join("build-report.json");
+        let report_file = File::create(&report_path)
+            .with_context(|| format!("failed to create {}", report_path.display()))?;
+        serde_json::to_writer_pretty(report_file, report)
+            .with_context(|| format!("failed to write {}", report_path.display()))?;
+
+        let manifest = self.manifest()?;
+        let manifest_path = self.path.join("manifest.json");
+        let manifest_file = File::create(&manifest_path)
+            .with_context(|| format!("failed to create {}", manifest_path.display()))?;
+        serde_json::to_writer_pretty(manifest_file, &manifest)
+            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+
+        Ok(manifest)
+    }
+
+    fn manifest(&self) -> Result<PackManifest> {
+        let mut files = BTreeMap::new();
+        for relative in [
+            "records/records.bin",
+            "records/offsets.bin",
+            "audit/rejections.bin",
+            "audit/rejection_offsets.bin",
+            "audit/build-report.json",
+        ] {
+            files.insert(
+                relative.to_string(),
+                PackFile {
+                    path: relative.to_string(),
+                    bytes: file_len(self.path.join(relative))?,
+                },
+            );
+        }
+
+        Ok(PackManifest {
+            schema_version: PACK_SCHEMA_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            built_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            record_count: self.record_count,
+            rejection_count: self.rejection_count,
+            layer_counts: self.layer_counts.clone(),
+            files,
+        })
+    }
+
+    fn append_chunk(
+        data: &mut File,
+        offsets: &mut File,
+        row: u64,
+        layer_code: u16,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let offset = data.seek(SeekFrom::End(0))?;
+        data.write_all(bytes)?;
+        write_offset_entry(
+            offsets,
+            row,
+            OffsetEntry {
+                offset,
+                length: bytes.len() as u64,
+                layer_code,
+            },
+        )
+    }
+}
+
+impl RecordWriter for PackWriter {
+    fn write_record(&mut self, record: NormalizedRecord) -> Result<RecordId> {
+        let record_id = self.record_count;
+        let layer = record.layer();
+        let layer_code = layer_code(layer)?;
+        let bytes = rmp_serde::to_vec_named(&record).context("failed to encode record")?;
+        Self::append_chunk(
+            &mut self.records,
+            &mut self.offsets,
+            record_id,
+            layer_code,
+            &bytes,
+        )?;
+
+        self.record_count += 1;
+        *self.layer_counts.entry(layer.to_string()).or_default() += 1;
+        Ok(record_id)
+    }
+
+    fn write_rejection(&mut self, rejection: RejectedRecord) -> Result<()> {
+        let row = self.rejection_count;
+        let layer_code = rejection
+            .layer_hint
+            .as_deref()
+            .map(layer_code)
+            .transpose()?
+            .unwrap_or(0);
+        let bytes = rmp_serde::to_vec_named(&rejection).context("failed to encode rejection")?;
+        Self::append_chunk(
+            &mut self.rejections,
+            &mut self.rejection_offsets,
+            row,
+            layer_code,
+            &bytes,
+        )?;
+
+        self.rejection_count += 1;
+        Ok(())
+    }
+}
+
+impl PackReader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let manifest_path = path.join("manifest.json");
+        let manifest_file = File::open(&manifest_path)
+            .with_context(|| format!("failed to open {}", manifest_path.display()))?;
+        let manifest = serde_json::from_reader(manifest_file)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        Ok(Self { path, manifest })
+    }
+
+    pub const fn manifest(&self) -> &PackManifest {
+        &self.manifest
+    }
+
+    pub fn read_record(&self, record_id: RecordId) -> Result<NormalizedRecord> {
+        let entry = self.record_offset(record_id)?;
+        let bytes = self.read_chunk("records/records.bin", RECORDS_MAGIC, entry)?;
+        rmp_serde::from_slice(&bytes).context("failed to decode record")
+    }
+
+    pub fn read_rejection(&self, row: u64) -> Result<RejectedRecord> {
+        let entry = self.rejection_offset(row)?;
+        let bytes = self.read_chunk("audit/rejections.bin", REJECTIONS_MAGIC, entry)?;
+        rmp_serde::from_slice(&bytes).context("failed to decode rejection")
+    }
+
+    pub fn records_by_layer(&self, layer: &str, limit: usize) -> Result<Vec<NormalizedRecord>> {
+        let wanted = layer_code(layer)?;
+        let count = offset_count(self.path.join("records").join("offsets.bin"), OFFSETS_MAGIC)?;
+        let mut records = Vec::new();
+        for record_id in 0..count {
+            let entry = self.record_offset(record_id)?;
+            if entry.layer_code != wanted {
+                continue;
+            }
+            records.push(self.read_record(record_id)?);
+            if limit > 0 && records.len() >= limit {
+                break;
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn rejections(&self, limit: usize) -> Result<Vec<RejectedRecord>> {
+        let count = offset_count(
+            self.path.join("audit").join("rejection_offsets.bin"),
+            REJECTION_OFFSETS_MAGIC,
+        )?;
+        let count = if limit == 0 {
+            count
+        } else {
+            count.min(limit as u64)
+        };
+        let mut rejections = Vec::new();
+        for row in 0..count {
+            rejections.push(self.read_rejection(row)?);
+        }
+        Ok(rejections)
+    }
+
+    pub fn record_by_source_id(&self, source_id: &str) -> Result<Option<NormalizedRecord>> {
+        for record_id in 0..self.manifest.record_count {
+            let record = self.read_record(record_id)?;
+            if record.id() == source_id {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn record_offset(&self, record_id: RecordId) -> Result<OffsetEntry> {
+        read_offset_entry(
+            self.path.join("records").join("offsets.bin"),
+            OFFSETS_MAGIC,
+            record_id,
+        )
+    }
+
+    fn rejection_offset(&self, row: u64) -> Result<OffsetEntry> {
+        read_offset_entry(
+            self.path.join("audit").join("rejection_offsets.bin"),
+            REJECTION_OFFSETS_MAGIC,
+            row,
+        )
+    }
+
+    fn read_chunk(
+        &self,
+        relative: &str,
+        expected_magic: &[u8; 8],
+        entry: OffsetEntry,
+    ) -> Result<Vec<u8>> {
+        let path = self.path.join(relative);
+        let mut file =
+            File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)?;
+        if &magic != expected_magic {
+            bail!("{} has an invalid magic header", path.display());
+        }
+
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut bytes = vec![0; entry.length as usize];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+fn write_offset_header(file: &mut File, magic: &[u8; 8], count: u64) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(magic)?;
+    file.write_all(&count.to_le_bytes())?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+fn write_offset_entry(file: &mut File, row: u64, entry: OffsetEntry) -> Result<()> {
+    file.seek(SeekFrom::Start(
+        OFFSET_HEADER_BYTES + row * OFFSET_ENTRY_BYTES,
+    ))?;
+    file.write_all(&entry.offset.to_le_bytes())?;
+    file.write_all(&entry.length.to_le_bytes())?;
+    file.write_all(&entry.layer_code.to_le_bytes())?;
+    file.write_all(&[0; 6])?;
+    Ok(())
+}
+
+fn read_offset_entry(
+    path: impl AsRef<Path>,
+    expected_magic: &[u8; 8],
+    row: u64,
+) -> Result<OffsetEntry> {
+    let path = path.as_ref();
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let count = read_offset_header(&mut file, path, expected_magic)?;
+    if row >= count {
+        bail!("record row {row} is out of range; table has {count} rows");
+    }
+
+    file.seek(SeekFrom::Start(
+        OFFSET_HEADER_BYTES + row * OFFSET_ENTRY_BYTES,
+    ))?;
+    let offset = read_u64(&mut file)?;
+    let length = read_u64(&mut file)?;
+    let layer_code = read_u16(&mut file)?;
+    let mut reserved = [0; 6];
+    file.read_exact(&mut reserved)?;
+    Ok(OffsetEntry {
+        offset,
+        length,
+        layer_code,
+    })
+}
+
+fn offset_count(path: impl AsRef<Path>, expected_magic: &[u8; 8]) -> Result<u64> {
+    let path = path.as_ref();
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    read_offset_header(&mut file, path, expected_magic)
+}
+
+fn read_offset_header(file: &mut File, path: &Path, expected_magic: &[u8; 8]) -> Result<u64> {
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    if &magic != expected_magic {
+        bail!("{} has an invalid magic header", path.display());
+    }
+    read_u64(file)
+}
+
+fn read_u64(file: &mut File) -> Result<u64> {
+    let mut bytes = [0; 8];
+    file.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u16(file: &mut File) -> Result<u16> {
+    let mut bytes = [0; 2];
+    file.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn file_len(path: impl AsRef<Path>) -> Result<u64> {
+    let path = path.as_ref();
+    Ok(fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len())
+}
+
+fn layer_code(layer: &str) -> Result<u16> {
+    match layer {
+        "address" => Ok(1),
+        "country" => Ok(2),
+        "district" => Ok(3),
+        "interpolation" => Ok(4),
+        "locality" => Ok(5),
+        "neighbourhood" => Ok(6),
+        "place" => Ok(7),
+        "postcode" => Ok(8),
+        "region" => Ok(9),
+        "street" => Ok(10),
+        other => bail!("unknown record layer: {other}"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct MemoryRecordWriter {
+        pub(crate) records: Vec<NormalizedRecord>,
+        pub(crate) rejections: Vec<RejectedRecord>,
+    }
+
+    impl RecordWriter for MemoryRecordWriter {
+        fn write_record(&mut self, record: NormalizedRecord) -> Result<RecordId> {
+            let record_id = self.records.len() as u64;
+            self.records.push(record);
+            Ok(record_id)
+        }
+
+        fn write_rejection(&mut self, rejection: RejectedRecord) -> Result<()> {
+            self.rejections.push(rejection);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::record::{
+        AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
+        point_geometry,
+    };
+
+    use super::*;
+
+    #[test]
+    fn writes_and_reads_binary_records_by_row_layer_and_source_id() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("open-geocode-pack-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write_record(NormalizedRecord::address(address_record(
+                "osm:node:1",
+                "10 King Street",
+            )))
+            .expect("write first");
+        writer
+            .write_record(NormalizedRecord::address(address_record(
+                "osm:node:2",
+                "20 Queen Street",
+            )))
+            .expect("write second");
+        let mut report = BuilderReport::default();
+        writer.finish(&mut report).expect("finish");
+
+        let reader = PackReader::open(&temp_dir).expect("reader");
+        assert_eq!(reader.manifest().record_count, 2);
+        assert_eq!(reader.read_record(1).expect("row 1").id(), "osm:node:2");
+        assert_eq!(
+            reader
+                .record_by_source_id("osm:node:1")
+                .expect("lookup")
+                .expect("record")
+                .label(),
+            "10 King Street"
+        );
+        assert_eq!(
+            reader
+                .records_by_layer("address", 10)
+                .expect("layer records")
+                .len(),
+            2
+        );
+        assert!(report.record_table_bytes > 8);
+        assert!(report.offset_table_bytes > 16);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn address_record(id: &str, label: &str) -> AddressRecord {
+        AddressRecord {
+            id: id.to_string(),
+            label: label.to_string(),
+            name: label.to_string(),
+            address: AddressComponents {
+                number: "10".to_string(),
+                street: Some("King Street".to_string()),
+                place: None,
+                unit: None,
+                locality: None,
+                region: None,
+                postcode: None,
+                country: None,
+            },
+            geometry: point_geometry(-79.0, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance {
+                dataset: "osm".to_string(),
+                object_type: OsmObjectType::Node,
+                object_id: 1,
+                tags: Some(BTreeMap::new()),
+            },
+        }
+    }
+}

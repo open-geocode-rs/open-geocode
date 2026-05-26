@@ -1,11 +1,12 @@
 # open-geocode Map QA Demo
 
-This demo overlays a small Toronto subset of `address-records.ndjson` on top of
+This demo overlays a small Toronto subset from a binary Pack on top of
 OpenStreetMap raster tiles using Leaflet.
 
-Generate the demo data from the repo root:
+Generate the Pack and demo data from the repo root:
 
 ```powershell
+.\scripts\build-pack.ps1
 .\scripts\extract-toronto-demo.ps1
 ```
 

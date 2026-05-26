@@ -1,9 +1,10 @@
-use std::{collections::BTreeMap, io::Write};
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
+    pack::RecordWriter,
     record::{
         NormalizedRecord, OsmObjectType, PlaceLayer, PlaceRecord, SourceProvenance, point_geometry,
     },
@@ -13,19 +14,18 @@ pub(crate) fn has_place_tag(tags: &BTreeMap<String, String>) -> bool {
     tag_value(tags, "place").is_some()
 }
 
-pub(crate) fn write_place_node<W: Write>(
+pub(crate) fn write_place_node(
     object_id: i64,
     lat: f64,
     lon: f64,
     tags: &BTreeMap<String, String>,
-    output: &mut W,
+    writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<()> {
     match place_record_from_node(object_id, lat, lon, tags) {
         Ok((record, layer)) => {
             let record = NormalizedRecord::place(record, layer);
-            serde_json::to_writer(&mut *output, &record)?;
-            writeln!(output)?;
+            writer.write_record(record.clone())?;
             report.accept(&record);
         }
         Err(issue) => report.reject(issue),

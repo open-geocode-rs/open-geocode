@@ -8,8 +8,7 @@ use crate::record::{LocationPrecision, NormalizedRecord, OsmObjectType};
 pub struct BuilderReport {
     pub schema_version: u32,
     pub input: String,
-    pub output: String,
-    pub rejected_output: String,
+    pub pack: String,
     pub input_bytes: u64,
     pub scanned: ScannedCounts,
     pub accepted: AcceptedCounts,
@@ -20,8 +19,10 @@ pub struct BuilderReport {
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
     pub node_cache_entries: usize,
-    pub output_ndjson_bytes: u64,
-    pub rejected_ndjson_bytes: u64,
+    pub record_table_bytes: u64,
+    pub offset_table_bytes: u64,
+    pub rejection_table_bytes: u64,
+    pub rejection_offset_table_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

@@ -1,7 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::File,
-    io::{BufWriter, Write},
     path::Path,
 };
 
@@ -10,6 +8,7 @@ use osmpbf::Element;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
+    pack::RecordWriter,
     record::{LocationPrecision, OsmObjectType},
 };
 
@@ -45,22 +44,14 @@ pub(crate) struct DiscoveryResult {
 
 pub(crate) fn discover_address_features(
     input: &Path,
-    node_records_path: &Path,
-    rejected_records_path: &Path,
+    writer: &mut dyn RecordWriter,
 ) -> Result<DiscoveryResult> {
     let mut report = BuilderReport {
         schema_version: 5,
         input: input.display().to_string(),
-        output: node_records_path.display().to_string(),
         input_bytes: input_bytes(input)?,
         ..BuilderReport::default()
     };
-    let output_file = File::create(node_records_path)
-        .with_context(|| format!("failed to create {}", node_records_path.display()))?;
-    let mut node_records = BufWriter::new(output_file);
-    let rejected_file = File::create(rejected_records_path)
-        .with_context(|| format!("failed to create {}", rejected_records_path.display()))?;
-    let mut rejected_records = BufWriter::new(rejected_file);
     let mut way_stubs = Vec::new();
     let mut interpolation_way_stubs = Vec::new();
     let mut street_way_stubs = Vec::new();
@@ -84,7 +75,7 @@ pub(crate) fn discover_address_features(
                         node.lat(),
                         node.lon(),
                         &all_tags,
-                        &mut node_records,
+                        writer,
                         &mut report,
                     )
                 {
@@ -110,7 +101,7 @@ pub(crate) fn discover_address_features(
                         node.id(),
                         &all_tags,
                         Some("interpolation"),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -124,7 +115,7 @@ pub(crate) fn discover_address_features(
                         node.id(),
                         &all_tags,
                         Some("address"),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -138,7 +129,7 @@ pub(crate) fn discover_address_features(
                     location_precision: LocationPrecision::Point,
                     tags,
                 };
-                match write_candidate(candidate, &mut node_records, &mut report) {
+                match write_candidate(candidate, writer, &mut report) {
                     Ok(Some(record)) => postcode_accumulator.accept_address(&record),
                     Ok(None) => {}
                     Err(error) => write_error = Some(error),
@@ -156,7 +147,7 @@ pub(crate) fn discover_address_features(
                         node.lat(),
                         node.lon(),
                         &all_tags,
-                        &mut node_records,
+                        writer,
                         &mut report,
                     )
                 {
@@ -182,7 +173,7 @@ pub(crate) fn discover_address_features(
                         node.id(),
                         &all_tags,
                         Some("interpolation"),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -196,7 +187,7 @@ pub(crate) fn discover_address_features(
                         node.id(),
                         &all_tags,
                         Some("address"),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -210,7 +201,7 @@ pub(crate) fn discover_address_features(
                     location_precision: LocationPrecision::Point,
                     tags,
                 };
-                match write_candidate(candidate, &mut node_records, &mut report) {
+                match write_candidate(candidate, writer, &mut report) {
                     Ok(Some(record)) => postcode_accumulator.accept_address(&record),
                     Ok(None) => {}
                     Err(error) => write_error = Some(error),
@@ -238,7 +229,7 @@ pub(crate) fn discover_address_features(
                                 way.id(),
                                 &all_tags,
                                 Some("street"),
-                                &mut rejected_records,
+                                writer,
                             ) {
                                 write_error = Some(error);
                             }
@@ -277,7 +268,7 @@ pub(crate) fn discover_address_features(
                             way.id(),
                             &all_tags,
                             Some("interpolation"),
-                            &mut rejected_records,
+                            writer,
                         ) {
                             write_error = Some(error);
                         }
@@ -303,7 +294,7 @@ pub(crate) fn discover_address_features(
                         way.id(),
                         &all_tags,
                         Some("address"),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -319,7 +310,7 @@ pub(crate) fn discover_address_features(
                         way.id(),
                         &all_tags,
                         Some("address"),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -358,7 +349,7 @@ pub(crate) fn discover_address_features(
                         relation.id(),
                         &all_tags,
                         Some(layer_hint),
-                        &mut rejected_records,
+                        writer,
                     ) {
                         write_error = Some(error);
                     }
@@ -371,13 +362,6 @@ pub(crate) fn discover_address_features(
     if let Some(error) = write_error {
         return Err(error);
     }
-
-    node_records
-        .flush()
-        .with_context(|| format!("failed to flush {}", node_records_path.display()))?;
-    rejected_records
-        .flush()
-        .with_context(|| format!("failed to flush {}", rejected_records_path.display()))?;
 
     Ok(DiscoveryResult {
         report,

@@ -1,12 +1,10 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    io::Write,
-};
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
+    pack::RecordWriter,
     record::{NormalizedRecord, OsmObjectType, SourceProvenance, StreetRecord},
 };
 
@@ -38,21 +36,19 @@ pub(crate) fn missing_street_name_issue(tags: &BTreeMap<String, String>) -> Cand
     }
 }
 
-pub(crate) fn write_street_record<W: Write, R: Write>(
+pub(crate) fn write_street_record(
     stub: &StreetWayStub,
     node_locations: &HashMap<i64, (f64, f64)>,
-    output: &mut W,
-    rejected_records: &mut R,
+    writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<()> {
     let Some(record) = street_record_from_stub(stub, node_locations) else {
-        reject_street_geometry(stub, rejected_records, report)?;
+        reject_street_geometry(stub, writer, report)?;
         return Ok(());
     };
 
     let record = NormalizedRecord::street(record);
-    serde_json::to_writer(&mut *output, &record)?;
-    writeln!(output)?;
+    writer.write_record(record.clone())?;
     report.accept(&record);
     Ok(())
 }
@@ -75,9 +71,9 @@ fn street_record_from_stub(
     })
 }
 
-fn reject_street_geometry<W: Write>(
+fn reject_street_geometry(
     stub: &StreetWayStub,
-    rejected_records: &mut W,
+    writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<()> {
     report.reject_with_tags(
@@ -92,7 +88,7 @@ fn reject_street_geometry<W: Write>(
         stub.object_id,
         &stub.tags,
         Some("street"),
-        rejected_records,
+        writer,
     )
 }
 
@@ -112,6 +108,8 @@ fn clean_text(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use geojson::GeometryValue;
+
+    use crate::pack::test_support::MemoryRecordWriter;
 
     use super::*;
 
@@ -157,23 +155,16 @@ mod tests {
             ]),
         };
         let node_locations = HashMap::from([(1, (43.64, -79.41))]);
-        let mut output = Vec::new();
-        let mut rejected = Vec::new();
+        let mut writer = MemoryRecordWriter::default();
         let mut report = BuilderReport::default();
 
-        write_street_record(
-            &stub,
-            &node_locations,
-            &mut output,
-            &mut rejected,
-            &mut report,
-        )
-        .expect("write street");
+        write_street_record(&stub, &node_locations, &mut writer, &mut report)
+            .expect("write street");
 
-        assert!(output.is_empty());
-        let rejected = String::from_utf8(rejected).expect("utf8");
-        assert!(rejected.contains("\"reason\":\"street_unresolved_geometry\""));
-        assert!(rejected.contains("\"layer_hint\":\"street\""));
+        assert!(writer.records.is_empty());
+        assert_eq!(writer.rejections.len(), 1);
+        assert_eq!(writer.rejections[0].reason, "street_unresolved_geometry");
+        assert_eq!(writer.rejections[0].layer_hint.as_deref(), Some("street"));
         assert_eq!(report.rejected.total, 1);
         assert_eq!(report.disposition.unresolved_geometry, 1);
     }

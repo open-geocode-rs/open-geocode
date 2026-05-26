@@ -1,9 +1,10 @@
-use std::{collections::BTreeMap, io::Write};
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
+    pack::RecordWriter,
     record::{
         AddressComponents, AddressRecord, LocationPrecision, NormalizedRecord, OsmObjectType,
         RejectedRecord, SourceProvenance, point_geometry,
@@ -32,17 +33,16 @@ struct LabelParts<'a> {
     country: Option<&'a str>,
 }
 
-pub(crate) fn write_candidate<W: Write>(
+pub(crate) fn write_candidate(
     candidate: AddressCandidate,
-    output: &mut W,
+    writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<Option<AddressRecord>> {
     match address_record_from_candidate(candidate) {
         Ok(record) => {
             let accepted = record.clone();
             let normalized = NormalizedRecord::address(record);
-            serde_json::to_writer(&mut *output, &normalized)?;
-            writeln!(output)?;
+            writer.write_record(normalized.clone())?;
             report.accept(&normalized);
             Ok(Some(accepted))
         }
@@ -53,31 +53,20 @@ pub(crate) fn write_candidate<W: Write>(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn write_record<W: Write>(
-    record: &NormalizedRecord,
-    output: &mut W,
-) -> std::io::Result<()> {
-    serde_json::to_writer(&mut *output, record).map_err(std::io::Error::other)?;
-    writeln!(output)
-}
-
-pub(crate) fn write_rejected_record<W: Write>(
+pub(crate) fn write_rejected_record(
     issue: CandidateIssue,
     object_type: OsmObjectType,
     object_id: i64,
     tags: &BTreeMap<String, String>,
     layer_hint: Option<&str>,
-    output: &mut W,
+    writer: &mut dyn RecordWriter,
 ) -> Result<()> {
     let record = RejectedRecord {
         reason: issue.as_str().to_string(),
         layer_hint: layer_hint.map(str::to_string),
         source: SourceProvenance::osm_with_tags(object_type, object_id, tags.clone()),
     };
-    serde_json::to_writer(&mut *output, &record)?;
-    writeln!(output)?;
-    Ok(())
+    writer.write_rejection(record)
 }
 
 pub(crate) fn address_record_from_candidate(
@@ -222,6 +211,8 @@ fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
 mod tests {
     use geojson::GeometryValue;
 
+    use crate::pack::test_support::MemoryRecordWriter;
+
     use super::*;
 
     #[test]
@@ -321,7 +312,7 @@ mod tests {
             ("addr:street".to_string(), "King Street".to_string()),
             ("building".to_string(), "yes".to_string()),
         ]);
-        let mut output = Vec::new();
+        let mut writer = MemoryRecordWriter::default();
 
         write_rejected_record(
             CandidateIssue::MissingHouseNumber,
@@ -329,15 +320,22 @@ mod tests {
             42,
             &tags,
             Some("address"),
-            &mut output,
+            &mut writer,
         )
         .expect("write rejected record");
 
-        let line = String::from_utf8(output).expect("utf8");
-        assert!(line.contains("\"reason\":\"missing_housenumber\""));
-        assert!(line.contains("\"layer_hint\":\"address\""));
-        assert!(line.contains("\"object_type\":\"way\""));
-        assert!(line.contains("\"object_id\":42"));
-        assert!(line.contains("\"addr:street\":\"King Street\""));
+        let record = writer.rejections.first().expect("rejection");
+        assert_eq!(record.reason, "missing_housenumber");
+        assert_eq!(record.layer_hint.as_deref(), Some("address"));
+        assert_eq!(record.source.object_type, OsmObjectType::Way);
+        assert_eq!(record.source.object_id, 42);
+        assert_eq!(
+            record
+                .source
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("addr:street")),
+            Some(&"King Street".to_string())
+        );
     }
 }
