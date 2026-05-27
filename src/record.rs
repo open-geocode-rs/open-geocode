@@ -4,21 +4,6 @@ use geojson::{Geometry, GeometryValue};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "layer", rename_all = "snake_case")]
-pub enum NormalizedRecord {
-    Address(AddressRecord),
-    Country(PlaceRecord),
-    District(PlaceRecord),
-    Interpolation(InterpolationRecord),
-    Locality(PlaceRecord),
-    Neighbourhood(PlaceRecord),
-    Place(PlaceRecord),
-    Postcode(PostcodeRecord),
-    Region(PlaceRecord),
-    Street(StreetRecord),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AddressRecord {
     pub id: String,
     pub label: String,
@@ -169,80 +154,6 @@ pub enum OsmObjectType {
     Node,
     Way,
     Relation,
-}
-
-impl NormalizedRecord {
-    pub fn address(record: AddressRecord) -> Self {
-        Self::Address(record)
-    }
-
-    pub fn place(record: PlaceRecord, layer: PlaceLayer) -> Self {
-        match layer {
-            PlaceLayer::Country => Self::Country(record),
-            PlaceLayer::Region => Self::Region(record),
-            PlaceLayer::District => Self::District(record),
-            PlaceLayer::Place => Self::Place(record),
-            PlaceLayer::Locality => Self::Locality(record),
-            PlaceLayer::Neighbourhood => Self::Neighbourhood(record),
-        }
-    }
-
-    pub fn postcode(record: PostcodeRecord) -> Self {
-        Self::Postcode(record)
-    }
-
-    pub fn interpolation(record: InterpolationRecord) -> Self {
-        Self::Interpolation(record)
-    }
-
-    pub fn street(record: StreetRecord) -> Self {
-        Self::Street(record)
-    }
-
-    pub const fn layer(&self) -> &'static str {
-        match self {
-            Self::Address(_) => "address",
-            Self::Country(_) => "country",
-            Self::District(_) => "district",
-            Self::Interpolation(_) => "interpolation",
-            Self::Locality(_) => "locality",
-            Self::Neighbourhood(_) => "neighbourhood",
-            Self::Place(_) => "place",
-            Self::Postcode(_) => "postcode",
-            Self::Region(_) => "region",
-            Self::Street(_) => "street",
-        }
-    }
-
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Address(record) => &record.id,
-            Self::Country(record)
-            | Self::District(record)
-            | Self::Locality(record)
-            | Self::Neighbourhood(record)
-            | Self::Place(record)
-            | Self::Region(record) => &record.id,
-            Self::Interpolation(record) => &record.id,
-            Self::Postcode(record) => &record.id,
-            Self::Street(record) => &record.id,
-        }
-    }
-
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Address(record) => &record.label,
-            Self::Country(record)
-            | Self::District(record)
-            | Self::Locality(record)
-            | Self::Neighbourhood(record)
-            | Self::Place(record)
-            | Self::Region(record) => &record.label,
-            Self::Interpolation(record) => &record.label,
-            Self::Postcode(record) => &record.label,
-            Self::Street(record) => &record.label,
-        }
-    }
 }
 
 impl AddressRecord {

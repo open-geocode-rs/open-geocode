@@ -8,16 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use geojson::{Geometry, GeometryValue};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, task};
 use tower_http::services::ServeDir;
 
 use crate::{
-    record::{
-        DerivedSourceProvenance, LocationPrecision, NormalizedRecord, OsmObjectType,
-        SourceProvenance,
-    },
+    pack::{RecordPoint, RecordPointPrecision, RecordSource},
+    record::OsmObjectType,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseGeocodeResponse},
     search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
 };
@@ -215,12 +212,12 @@ impl SearchApiResult {
     fn from_hit(hit: TextSearchHit) -> Self {
         Self {
             record_id: hit.record_id,
-            id: hit.record.id().to_string(),
-            layer: hit.record.layer().to_string(),
-            label: hit.record.label().to_string(),
+            id: hit.record.id,
+            layer: hit.record.layer,
+            label: hit.record.label,
             score: hit.score,
-            point: display_point(&hit.record),
-            source: source_summary(&hit.record),
+            point: hit.record.point.map(SearchApiPoint::from),
+            source: SearchApiSource::from(hit.record.source),
         }
     }
 }
@@ -262,105 +259,38 @@ fn search_api_error(error: anyhow::Error) -> ApiError {
     }
 }
 
-fn display_point(record: &NormalizedRecord) -> Option<SearchApiPoint> {
-    match record {
-        NormalizedRecord::Address(record) => point_from_geometry(
-            &record.geometry,
-            point_precision_from_location(record.location_precision()),
-        ),
-        NormalizedRecord::Country(record)
-        | NormalizedRecord::District(record)
-        | NormalizedRecord::Locality(record)
-        | NormalizedRecord::Neighbourhood(record)
-        | NormalizedRecord::Place(record)
-        | NormalizedRecord::Region(record) => {
-            point_from_geometry(&record.geometry, SearchApiPointPrecision::Point)
+impl From<RecordPoint> for SearchApiPoint {
+    fn from(point: RecordPoint) -> Self {
+        Self {
+            lon: point.lon,
+            lat: point.lat,
+            precision: match point.precision {
+                RecordPointPrecision::Point => SearchApiPointPrecision::Point,
+                RecordPointPrecision::Centroid => SearchApiPointPrecision::Centroid,
+                RecordPointPrecision::RepresentativePoint => {
+                    SearchApiPointPrecision::RepresentativePoint
+                }
+            },
         }
-        NormalizedRecord::Interpolation(record) => {
-            Some(representative_point(record.representative_point))
+    }
+}
+
+impl From<RecordSource> for SearchApiSource {
+    fn from(source: RecordSource) -> Self {
+        Self {
+            dataset: source.dataset,
+            object_type: source.object_type,
+            object_id: source.object_id,
+            derived_from: source.derived_from,
+            record_count: source.record_count,
         }
-        NormalizedRecord::Postcode(record) => {
-            point_from_geometry(&record.geometry, SearchApiPointPrecision::Point)
-        }
-        NormalizedRecord::Street(record) => Some(representative_point(record.representative_point)),
-    }
-}
-
-fn point_from_geometry(
-    geometry: &Geometry,
-    precision: SearchApiPointPrecision,
-) -> Option<SearchApiPoint> {
-    let GeometryValue::Point { coordinates } = &geometry.value else {
-        return None;
-    };
-    let [lon, lat, ..] = coordinates.as_slice() else {
-        return None;
-    };
-    Some(SearchApiPoint {
-        lon: *lon,
-        lat: *lat,
-        precision,
-    })
-}
-
-fn representative_point(point: [f64; 2]) -> SearchApiPoint {
-    SearchApiPoint {
-        lon: point[0],
-        lat: point[1],
-        precision: SearchApiPointPrecision::RepresentativePoint,
-    }
-}
-
-fn point_precision_from_location(precision: LocationPrecision) -> SearchApiPointPrecision {
-    match precision {
-        LocationPrecision::Point => SearchApiPointPrecision::Point,
-        LocationPrecision::Centroid => SearchApiPointPrecision::Centroid,
-    }
-}
-
-fn source_summary(record: &NormalizedRecord) -> SearchApiSource {
-    match record {
-        NormalizedRecord::Address(record) => source_from_osm(&record.source),
-        NormalizedRecord::Country(record)
-        | NormalizedRecord::District(record)
-        | NormalizedRecord::Locality(record)
-        | NormalizedRecord::Neighbourhood(record)
-        | NormalizedRecord::Place(record)
-        | NormalizedRecord::Region(record) => source_from_osm(&record.source),
-        NormalizedRecord::Interpolation(record) => source_from_osm(&record.source),
-        NormalizedRecord::Postcode(record) => source_from_derived(&record.source),
-        NormalizedRecord::Street(record) => source_from_osm(&record.source),
-    }
-}
-
-fn source_from_osm(source: &SourceProvenance) -> SearchApiSource {
-    SearchApiSource {
-        dataset: source.dataset.clone(),
-        object_type: Some(source.object_type),
-        object_id: Some(source.object_id),
-        derived_from: None,
-        record_count: None,
-    }
-}
-
-fn source_from_derived(source: &DerivedSourceProvenance) -> SearchApiSource {
-    SearchApiSource {
-        dataset: source.dataset.clone(),
-        object_type: None,
-        object_id: None,
-        derived_from: Some(source.derived_from.clone()),
-        record_count: Some(source.record_count),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use crate::record::{
-        AddressComponents, AddressRecord, LocationPrecision, NormalizedRecord, OsmObjectType,
-        SourceProvenance, StreetRecord, point_geometry,
-    };
+    use crate::pack::RecordSummary;
+    use crate::record::OsmObjectType;
 
     use super::*;
 
@@ -369,24 +299,23 @@ mod tests {
         let hit = TextSearchHit {
             record_id: 7,
             score: 4.25,
-            record: NormalizedRecord::address(AddressRecord {
+            record: RecordSummary {
                 id: "osm:node:1".to_string(),
+                layer: "address".to_string(),
                 label: "10 King Street, Toronto".to_string(),
-                name: "10 King Street".to_string(),
-                address: AddressComponents {
-                    number: "10".to_string(),
-                    street: Some("King Street".to_string()),
-                    place: None,
-                    unit: None,
-                    locality: Some("Toronto".to_string()),
-                    region: None,
-                    postcode: None,
-                    country: None,
+                point: Some(RecordPoint {
+                    lon: -79.3832,
+                    lat: 43.6532,
+                    precision: RecordPointPrecision::Point,
+                }),
+                source: RecordSource {
+                    dataset: "osm".to_string(),
+                    object_type: Some(OsmObjectType::Node),
+                    object_id: Some(1),
+                    derived_from: None,
+                    record_count: None,
                 },
-                geometry: point_geometry(-79.3832, 43.6532),
-                location_precision: LocationPrecision::Point,
-                source: SourceProvenance::osm(OsmObjectType::Node, 1),
-            }),
+            },
         };
 
         let result = SearchApiResult::from_hit(hit);
@@ -412,19 +341,23 @@ mod tests {
         let hit = TextSearchHit {
             record_id: 12,
             score: 3.0,
-            record: NormalizedRecord::street(StreetRecord {
+            record: RecordSummary {
                 id: "osm:way:9".to_string(),
+                layer: "street".to_string(),
                 label: "King Street".to_string(),
-                name: "King Street".to_string(),
-                geometry: point_geometry(-79.4, 43.6),
-                representative_point: [-79.41, 43.61],
-                source: SourceProvenance {
+                point: Some(RecordPoint {
+                    lon: -79.41,
+                    lat: 43.61,
+                    precision: RecordPointPrecision::RepresentativePoint,
+                }),
+                source: RecordSource {
                     dataset: "osm".to_string(),
-                    object_type: OsmObjectType::Way,
-                    object_id: 9,
-                    tags: Some(BTreeMap::new()),
+                    object_type: Some(OsmObjectType::Way),
+                    object_id: Some(9),
+                    derived_from: None,
+                    record_count: None,
                 },
-            }),
+            },
         };
 
         let result = SearchApiResult::from_hit(hit);

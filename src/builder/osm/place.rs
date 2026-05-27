@@ -5,9 +5,7 @@ use anyhow::Result;
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
     pack::RecordWriter,
-    record::{
-        NormalizedRecord, OsmObjectType, PlaceLayer, PlaceRecord, SourceProvenance, point_geometry,
-    },
+    record::{OsmObjectType, PlaceLayer, PlaceRecord, SourceProvenance, point_geometry},
 };
 
 pub(crate) fn has_place_tag(tags: &BTreeMap<String, String>) -> bool {
@@ -24,9 +22,8 @@ pub(crate) fn write_place_node(
 ) -> Result<()> {
     match place_record_from_node(object_id, lat, lon, tags) {
         Ok((record, layer)) => {
-            let record = NormalizedRecord::place(record, layer);
-            writer.write_record(record.clone())?;
-            report.accept(&record);
+            writer.write_place(&record, layer)?;
+            report.accept_place(layer);
         }
         Err(issue) => report.reject(issue),
     }

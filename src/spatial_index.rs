@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     pack::RecordId,
-    record::{NormalizedRecord, PlaceRecord},
+    record::{
+        AddressRecord, InterpolationRecord, PlaceLayer, PlaceRecord, PostcodeRecord, StreetRecord,
+    },
 };
 
 #[cfg(not(target_endian = "little"))]
@@ -112,6 +114,19 @@ pub enum SpatialLayer {
     Postcode,
     Region,
     Street,
+}
+
+impl From<PlaceLayer> for SpatialLayer {
+    fn from(layer: PlaceLayer) -> Self {
+        match layer {
+            PlaceLayer::Country => Self::Country,
+            PlaceLayer::Region => Self::Region,
+            PlaceLayer::District => Self::District,
+            PlaceLayer::Place => Self::Place,
+            PlaceLayer::Locality => Self::Locality,
+            PlaceLayer::Neighbourhood => Self::Neighbourhood,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -248,55 +263,40 @@ struct SegmentProjection {
 }
 
 impl PackSpatialIndexWriter {
-    pub fn add_record(&mut self, record_id: RecordId, record: &NormalizedRecord) -> Result<()> {
-        match record {
-            NormalizedRecord::Address(record) => {
-                if let Some((lon, lat)) = point_coordinates(&record.geometry) {
-                    self.points.push(SpatialPointEntry {
-                        record_id,
-                        layer: SpatialLayer::Address,
-                        lon,
-                        lat,
-                    });
-                }
-            }
-            NormalizedRecord::Interpolation(record) => {
-                self.add_line_segments(record_id, SpatialLayer::Interpolation, &record.geometry);
-            }
-            NormalizedRecord::Street(record) => {
-                self.add_line_segments(record_id, SpatialLayer::Street, &record.geometry);
-            }
-            NormalizedRecord::Postcode(record) => {
-                if let Some((lon, lat)) = point_coordinates(&record.geometry) {
-                    self.points.push(SpatialPointEntry {
-                        record_id,
-                        layer: SpatialLayer::Postcode,
-                        lon,
-                        lat,
-                    });
-                }
-            }
-            NormalizedRecord::Country(record) => {
-                self.add_place_point(record_id, SpatialLayer::Country, record);
-            }
-            NormalizedRecord::District(record) => {
-                self.add_place_point(record_id, SpatialLayer::District, record);
-            }
-            NormalizedRecord::Locality(record) => {
-                self.add_place_point(record_id, SpatialLayer::Locality, record);
-            }
-            NormalizedRecord::Neighbourhood(record) => {
-                self.add_place_point(record_id, SpatialLayer::Neighbourhood, record);
-            }
-            NormalizedRecord::Place(record) => {
-                self.add_place_point(record_id, SpatialLayer::Place, record);
-            }
-            NormalizedRecord::Region(record) => {
-                self.add_place_point(record_id, SpatialLayer::Region, record);
-            }
+    pub fn add_address(&mut self, record_id: RecordId, record: &AddressRecord) -> Result<()> {
+        if let Some((lon, lat)) = point_coordinates(&record.geometry) {
+            self.points.push(SpatialPointEntry {
+                record_id,
+                layer: SpatialLayer::Address,
+                lon,
+                lat,
+            });
         }
-
         Ok(())
+    }
+
+    pub fn add_interpolation(&mut self, record_id: RecordId, record: &InterpolationRecord) {
+        self.add_line_segments(record_id, SpatialLayer::Interpolation, &record.geometry);
+    }
+
+    pub fn add_street(&mut self, record_id: RecordId, record: &StreetRecord) {
+        self.add_line_segments(record_id, SpatialLayer::Street, &record.geometry);
+    }
+
+    pub fn add_postcode(&mut self, record_id: RecordId, record: &PostcodeRecord) -> Result<()> {
+        if let Some((lon, lat)) = point_coordinates(&record.geometry) {
+            self.points.push(SpatialPointEntry {
+                record_id,
+                layer: SpatialLayer::Postcode,
+                lon,
+                lat,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn add_place(&mut self, record_id: RecordId, layer: SpatialLayer, record: &PlaceRecord) {
+        self.add_place_point(record_id, layer, record);
     }
 
     pub fn finish(self, pack_path: &Path) -> Result<SpatialIndexCommit> {
@@ -1225,8 +1225,8 @@ mod tests {
     use geojson::GeometryValue;
 
     use crate::record::{
-        AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
-        StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
+        OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
     };
 
     use super::*;
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn indexes_and_queries_address_points() {
         let mut writer = PackSpatialIndexWriter::default();
-        let record = NormalizedRecord::address(AddressRecord {
+        let record = AddressRecord {
             id: "osm:node:1".to_string(),
             label: "10 King Street".to_string(),
             name: "10 King Street".to_string(),
@@ -1251,9 +1251,9 @@ mod tests {
             geometry: point_geometry(-79.0, 43.0),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(OsmObjectType::Node, 1),
-        });
+        };
 
-        writer.add_record(7, &record).expect("add record");
+        writer.add_address(7, &record).expect("add record");
         let temp_dir =
             std::env::temp_dir().join(format!("open-geocode-spatial-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1278,16 +1278,16 @@ mod tests {
     #[test]
     fn indexes_context_points_with_coarse_h3_cells() {
         let mut writer = PackSpatialIndexWriter::default();
-        let record = NormalizedRecord::postcode(crate::record::PostcodeRecord {
+        let record = PostcodeRecord {
             id: "derived:postcode:m5v".to_string(),
             label: "M5V".to_string(),
             name: "M5V".to_string(),
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
-            source: crate::record::DerivedSourceProvenance::osm_address_records(1),
-        });
+            source: DerivedSourceProvenance::osm_address_records(1),
+        };
 
-        writer.add_record(11, &record).expect("add record");
+        writer.add_postcode(11, &record).expect("add record");
         let temp_dir = std::env::temp_dir().join(format!(
             "open-geocode-spatial-context-test-{}",
             std::process::id()
@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn indexes_line_segments_with_fraction() {
         let mut writer = PackSpatialIndexWriter::default();
-        let record = NormalizedRecord::street(StreetRecord {
+        let record = StreetRecord {
             id: "osm:way:1".to_string(),
             label: "King Street".to_string(),
             name: "King Street".to_string(),
@@ -1316,9 +1316,9 @@ mod tests {
             }),
             representative_point: [-79.0, 43.0005],
             source: SourceProvenance::osm(OsmObjectType::Way, 1),
-        });
+        };
 
-        writer.add_record(9, &record).expect("add record");
+        writer.add_street(9, &record);
         let temp_dir = std::env::temp_dir().join(format!(
             "open-geocode-spatial-line-test-{}",
             std::process::id()

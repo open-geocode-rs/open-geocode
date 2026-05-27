@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
     pack::RecordWriter,
-    record::{NormalizedRecord, OsmObjectType, SourceProvenance, StreetRecord},
+    record::{OsmObjectType, SourceProvenance, StreetRecord},
 };
 
 use super::{
@@ -47,9 +47,8 @@ pub(crate) fn write_street_record(
         return Ok(());
     };
 
-    let record = NormalizedRecord::street(record);
-    writer.write_record(record.clone())?;
-    report.accept(&record);
+    writer.write_street(&record)?;
+    report.accept_street();
     Ok(())
 }
 

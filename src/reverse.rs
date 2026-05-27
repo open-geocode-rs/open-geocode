@@ -4,10 +4,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::{
-    pack::{PackReader, RecordId},
-    record::{
-        AddressComponents, InterpolationAddressComponents, InterpolationRange, NormalizedRecord,
-    },
+    pack::{ContextRecord, PackReader, RecordId},
+    record::{AddressComponents, InterpolationAddressComponents, InterpolationRange},
     spatial_index::{PackSpatialIndexReader, SpatialLayer},
 };
 
@@ -163,8 +161,7 @@ impl PackReverseGeocoder {
         else {
             return Ok(None);
         };
-        let record = self.pack.read_record(candidate.record_id)?;
-        let NormalizedRecord::Address(address) = record else {
+        let Some(address) = self.pack.address(candidate.record_id)? else {
             return Ok(None);
         };
 
@@ -205,8 +202,7 @@ impl PackReverseGeocoder {
             INTERPOLATION_RADIUS_M,
             CANDIDATE_LIMIT,
         ) {
-            let record = self.pack.read_record(candidate.record_id)?;
-            let NormalizedRecord::Interpolation(interpolation) = record else {
+            let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
                 continue;
             };
             let number = estimated_number(&interpolation.interpolation, candidate.fraction);
@@ -259,8 +255,7 @@ impl PackReverseGeocoder {
         else {
             return Ok(None);
         };
-        let record = self.pack.read_record(candidate.record_id)?;
-        let NormalizedRecord::Street(street) = record else {
+        let Some(street) = self.pack.street(candidate.record_id)? else {
             return Ok(None);
         };
 
@@ -298,21 +293,21 @@ impl PackReverseGeocoder {
         let Some(primary_record_id) = context_record_ids.first().copied() else {
             return Ok(None);
         };
-        let record = self.pack.read_record(primary_record_id)?;
-        let Some(label) = context_only_label(context).or_else(|| Some(record.label().to_string()))
-        else {
+        let Some(record) = self.pack.context_record(primary_record_id)? else {
             return Ok(None);
         };
-        let point = point_from_record(&record);
+        let Some(label) = context_only_label(context).or_else(|| Some(record.label.clone())) else {
+            return Ok(None);
+        };
 
         Ok(Some(ReverseGeocodeResult {
             match_kind: ReverseMatchKind::ContextOnly,
             label,
             primary_record_id: Some(primary_record_id),
-            id: Some(record.id().to_string()),
-            layer: Some(record.layer().to_string()),
+            id: Some(record.id),
+            layer: Some(record.layer),
             distance_m: None,
-            point,
+            point: record.point.map(context_point),
             context: context.clone(),
             evidence: ReverseEvidence {
                 context_record_ids: context_record_ids.clone(),
@@ -337,8 +332,9 @@ impl PackReverseGeocoder {
             if !seen.insert(candidate.record_id) {
                 continue;
             }
-            let record = self.pack.read_record(candidate.record_id)?;
-            if apply_context_record(context, &record) {
+            if let Some(record) = self.pack.context_record(candidate.record_id)?
+                && apply_context_record(context, &record)
+            {
                 context_record_ids.push(candidate.record_id);
             }
         }
@@ -367,30 +363,16 @@ fn apply_interpolation_context(
     set_option_if_missing(&mut context.country, address.country.clone());
 }
 
-fn apply_context_record(context: &mut ReverseContext, record: &NormalizedRecord) -> bool {
-    match record {
-        NormalizedRecord::Postcode(record) => {
-            set_if_missing(&mut context.postcode, record.postcode.clone())
-        }
-        NormalizedRecord::Neighbourhood(record) => {
-            set_if_missing(&mut context.neighbourhood, record.name.clone())
-        }
-        NormalizedRecord::Locality(record) => {
-            set_if_missing(&mut context.locality, record.name.clone())
-        }
-        NormalizedRecord::District(record) => {
-            set_if_missing(&mut context.district, record.name.clone())
-        }
-        NormalizedRecord::Region(record) => {
-            set_if_missing(&mut context.region, record.name.clone())
-        }
-        NormalizedRecord::Country(record) => {
-            set_if_missing(&mut context.country, record.name.clone())
-        }
-        NormalizedRecord::Place(record) => set_if_missing(&mut context.place, record.name.clone()),
-        NormalizedRecord::Address(_)
-        | NormalizedRecord::Interpolation(_)
-        | NormalizedRecord::Street(_) => false,
+fn apply_context_record(context: &mut ReverseContext, record: &ContextRecord) -> bool {
+    match record.layer.as_str() {
+        "postcode" => set_option_if_missing(&mut context.postcode, record.postcode.clone()),
+        "neighbourhood" => set_if_missing(&mut context.neighbourhood, record.name.clone()),
+        "locality" => set_if_missing(&mut context.locality, record.name.clone()),
+        "district" => set_if_missing(&mut context.district, record.name.clone()),
+        "region" => set_if_missing(&mut context.region, record.name.clone()),
+        "country" => set_if_missing(&mut context.country, record.name.clone()),
+        "place" => set_if_missing(&mut context.place, record.name.clone()),
+        _ => false,
     }
 }
 
@@ -453,45 +435,19 @@ fn context_only_label(context: &ReverseContext) -> Option<String> {
     .map(|primary| compose_label(primary, context))
 }
 
-fn point_from_record(record: &NormalizedRecord) -> Option<ReversePoint> {
-    let (lon, lat) = match record {
-        NormalizedRecord::Address(record) => point_coordinates(&record.geometry)?,
-        NormalizedRecord::Postcode(record) => point_coordinates(&record.geometry)?,
-        NormalizedRecord::Country(record)
-        | NormalizedRecord::District(record)
-        | NormalizedRecord::Locality(record)
-        | NormalizedRecord::Neighbourhood(record)
-        | NormalizedRecord::Place(record)
-        | NormalizedRecord::Region(record) => point_coordinates(&record.geometry)?,
-        NormalizedRecord::Interpolation(record) => (
-            record.representative_point[0],
-            record.representative_point[1],
-        ),
-        NormalizedRecord::Street(record) => (
-            record.representative_point[0],
-            record.representative_point[1],
-        ),
-    };
-    Some(ReversePoint {
-        lon,
-        lat,
+fn context_point(point: crate::pack::RecordPoint) -> ReversePoint {
+    ReversePoint {
+        lon: point.lon,
+        lat: point.lat,
         precision: ReversePointPrecision::Context,
-    })
+    }
 }
 
-fn point_coordinates(geometry: &geojson::Geometry) -> Option<(f64, f64)> {
-    let geojson::GeometryValue::Point { coordinates } = &geometry.value else {
-        return None;
-    };
-    let [lon, lat, ..] = coordinates.as_slice() else {
-        return None;
-    };
-    Some((*lon, *lat))
-}
-
-fn set_option_if_missing(target: &mut Option<String>, value: Option<String>) {
+fn set_option_if_missing(target: &mut Option<String>, value: Option<String>) -> bool {
     if let Some(value) = value {
-        set_if_missing(target, value);
+        set_if_missing(target, value)
+    } else {
+        false
     }
 }
 
@@ -532,12 +488,8 @@ mod tests {
     fn reverse_prefers_explicit_address() {
         let temp_dir = temp_pack_dir("explicit");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
-        writer
-            .write_record(NormalizedRecord::street(street_record()))
-            .expect("street");
-        writer
-            .write_record(NormalizedRecord::address(address_record()))
-            .expect("address");
+        writer.write_street(&street_record()).expect("street");
+        writer.write_address(&address_record()).expect("address");
         let mut report = BuilderReport::default();
         writer.finish(&mut report).expect("finish");
 
@@ -562,7 +514,7 @@ mod tests {
         let temp_dir = temp_pack_dir("interpolation");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::interpolation(interpolation_record()))
+            .write_interpolation(&interpolation_record())
             .expect("interpolation");
         let mut report = BuilderReport::default();
         writer.finish(&mut report).expect("finish");
@@ -587,9 +539,7 @@ mod tests {
     fn reverse_falls_back_to_street() {
         let temp_dir = temp_pack_dir("street");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
-        writer
-            .write_record(NormalizedRecord::street(street_record()))
-            .expect("street");
+        writer.write_street(&street_record()).expect("street");
         let mut report = BuilderReport::default();
         writer.finish(&mut report).expect("finish");
 

@@ -6,8 +6,8 @@ use crate::{
     builder::report::{BuilderReport, CandidateIssue},
     pack::RecordWriter,
     record::{
-        AddressComponents, AddressRecord, LocationPrecision, NormalizedRecord, OsmObjectType,
-        RejectedRecord, SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, RejectedRecord,
+        SourceProvenance, point_geometry,
     },
 };
 
@@ -40,11 +40,9 @@ pub(crate) fn write_candidate(
 ) -> Result<Option<AddressRecord>> {
     match address_record_from_candidate(candidate) {
         Ok(record) => {
-            let accepted = record.clone();
-            let normalized = NormalizedRecord::address(record);
-            writer.write_record(normalized.clone())?;
-            report.accept(&normalized);
-            Ok(Some(accepted))
+            writer.write_address(&record)?;
+            report.accept_address(&record);
+            Ok(Some(record))
         }
         Err(issue) => {
             report.reject(issue);

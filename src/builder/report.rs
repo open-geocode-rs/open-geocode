@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::record::{LocationPrecision, NormalizedRecord, OsmObjectType};
+use crate::record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -239,52 +239,50 @@ enum CandidateDisposition {
 }
 
 impl BuilderReport {
-    pub(crate) fn accept(&mut self, record: &NormalizedRecord) {
-        self.accepted.total += 1;
-        *self
-            .accepted
-            .by_layer
-            .entry(record.layer().to_string())
-            .or_default() += 1;
+    pub(crate) fn accept_address(&mut self, address: &AddressRecord) {
+        self.accept_layer("address");
+        match address.location_precision() {
+            LocationPrecision::Point => self.accepted.node_addresses += 1,
+            LocationPrecision::Centroid => self.accepted.way_centroid_addresses += 1,
+        };
 
-        match record {
-            NormalizedRecord::Address(address) => {
-                match address.location_precision() {
-                    LocationPrecision::Point => self.accepted.node_addresses += 1,
-                    LocationPrecision::Centroid => self.accepted.way_centroid_addresses += 1,
-                };
-
-                if address.address.locality.is_some() {
-                    self.completeness.city += 1;
-                }
-                if address.address.postcode.is_some() {
-                    self.completeness.postcode += 1;
-                }
-                if address.address.region.is_some() {
-                    self.completeness.state += 1;
-                }
-                if address.address.country.is_some() {
-                    self.completeness.country += 1;
-                }
-            }
-            NormalizedRecord::Interpolation(_) => {
-                self.accepted.interpolation_ranges += 1;
-            }
-            NormalizedRecord::Street(_) => {
-                self.accepted.street_segments += 1;
-            }
-            NormalizedRecord::Postcode(_) => {
-                self.accepted.postcode_records += 1;
-            }
-            NormalizedRecord::Country(_)
-            | NormalizedRecord::District(_)
-            | NormalizedRecord::Locality(_)
-            | NormalizedRecord::Neighbourhood(_)
-            | NormalizedRecord::Place(_)
-            | NormalizedRecord::Region(_) => {
-                self.accepted.place_nodes += 1;
-            }
+        if address.address.locality.is_some() {
+            self.completeness.city += 1;
         }
+        if address.address.postcode.is_some() {
+            self.completeness.postcode += 1;
+        }
+        if address.address.region.is_some() {
+            self.completeness.state += 1;
+        }
+        if address.address.country.is_some() {
+            self.completeness.country += 1;
+        }
+    }
+
+    pub(crate) fn accept_interpolation(&mut self) {
+        self.accept_layer("interpolation");
+        self.accepted.interpolation_ranges += 1;
+    }
+
+    pub(crate) fn accept_street(&mut self) {
+        self.accept_layer("street");
+        self.accepted.street_segments += 1;
+    }
+
+    pub(crate) fn accept_postcode(&mut self) {
+        self.accept_layer("postcode");
+        self.accepted.postcode_records += 1;
+    }
+
+    pub(crate) fn accept_place(&mut self, layer: PlaceLayer) {
+        self.accept_layer(place_layer_name(layer));
+        self.accepted.place_nodes += 1;
+    }
+
+    fn accept_layer(&mut self, layer: &str) {
+        self.accepted.total += 1;
+        *self.accepted.by_layer.entry(layer.to_string()).or_default() += 1;
     }
 
     pub(crate) fn reject(&mut self, issue: CandidateIssue) {
@@ -478,6 +476,17 @@ fn object_type_name(object_type: OsmObjectType) -> &'static str {
         OsmObjectType::Node => "node",
         OsmObjectType::Way => "way",
         OsmObjectType::Relation => "relation",
+    }
+}
+
+fn place_layer_name(layer: PlaceLayer) -> &'static str {
+    match layer {
+        PlaceLayer::Country => "country",
+        PlaceLayer::Region => "region",
+        PlaceLayer::District => "district",
+        PlaceLayer::Place => "place",
+        PlaceLayer::Locality => "locality",
+        PlaceLayer::Neighbourhood => "neighbourhood",
     }
 }
 

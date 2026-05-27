@@ -15,7 +15,10 @@ use tantivy::{
 use crate::{
     builder::report::TextIndexPrefixStats,
     pack::RecordId,
-    record::{AddressComponents, InterpolationAddressComponents, NormalizedRecord, PlaceRecord},
+    record::{
+        AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
+        PlaceLayer, PlaceRecord, PostcodeRecord, StreetRecord,
+    },
 };
 
 pub const TEXT_INDEX_RELATIVE_PATH: &str = "text/tantivy";
@@ -143,16 +146,65 @@ impl TantivyTextIndexWriter {
         })
     }
 
-    pub fn add_record(
+    pub fn add_address(
         &mut self,
         record_id: RecordId,
-        record: &NormalizedRecord,
+        record: &AddressRecord,
+    ) -> Result<TextIndexWriteMetrics> {
+        let started = Instant::now();
+        let projected = TextIndexDocument::project_address(record_id, record);
+        self.add_projection(projected, elapsed_ns(started))
+    }
+
+    pub fn add_place(
+        &mut self,
+        record_id: RecordId,
+        record: &PlaceRecord,
+        layer: PlaceLayer,
+    ) -> Result<TextIndexWriteMetrics> {
+        let started = Instant::now();
+        let projected =
+            TextIndexDocument::project_place(record_id, place_layer_name(layer), record);
+        self.add_projection(projected, elapsed_ns(started))
+    }
+
+    pub fn add_interpolation(
+        &mut self,
+        record_id: RecordId,
+        record: &InterpolationRecord,
+    ) -> Result<TextIndexWriteMetrics> {
+        let started = Instant::now();
+        let projected = TextIndexDocument::project_interpolation(record_id, record);
+        self.add_projection(projected, elapsed_ns(started))
+    }
+
+    pub fn add_street(
+        &mut self,
+        record_id: RecordId,
+        record: &StreetRecord,
+    ) -> Result<TextIndexWriteMetrics> {
+        let started = Instant::now();
+        let projected = TextIndexDocument::project_street(record_id, record);
+        self.add_projection(projected, elapsed_ns(started))
+    }
+
+    pub fn add_postcode(
+        &mut self,
+        record_id: RecordId,
+        record: &PostcodeRecord,
+    ) -> Result<TextIndexWriteMetrics> {
+        let started = Instant::now();
+        let projected = TextIndexDocument::project_postcode(record_id, record);
+        self.add_projection(projected, elapsed_ns(started))
+    }
+
+    fn add_projection(
+        &mut self,
+        projected: TextIndexProjection,
+        projection_ns: u128,
     ) -> Result<TextIndexWriteMetrics> {
         let mut metrics = TextIndexWriteMetrics::default();
 
-        let started = Instant::now();
-        let projected = TextIndexDocument::project(record_id, record);
-        let projection_ns = elapsed_ns(started);
         metrics.text_projection_ns += projection_ns.saturating_sub(projected.prefix_generation_ns);
         metrics.text_prefix_generation_ns += projected.prefix_generation_ns;
 
@@ -287,46 +339,49 @@ impl TextIndexFields {
 }
 
 impl TextIndexDocument {
-    pub fn from_record(record_id: RecordId, record: &NormalizedRecord) -> Self {
-        Self::project(record_id, record).document
+    pub fn from_address(record_id: RecordId, record: &AddressRecord) -> Self {
+        Self::project_address(record_id, record).document
     }
 
-    fn project(record_id: RecordId, record: &NormalizedRecord) -> TextIndexProjection {
-        match record {
-            NormalizedRecord::Address(address) => {
-                let mut builder = ProjectionBuilder::new(record_id, record.layer());
-                builder.label(&address.label);
-                builder.name(&address.name);
-                builder.address(&address.address);
-                builder.build()
-            }
-            NormalizedRecord::Interpolation(interpolation) => {
-                let mut builder = ProjectionBuilder::new(record_id, record.layer());
-                builder.label(&interpolation.label);
-                builder.name(&interpolation.name);
-                builder.interpolation_address(&interpolation.address);
-                builder.build()
-            }
-            NormalizedRecord::Street(street) => {
-                let mut builder = ProjectionBuilder::new(record_id, record.layer());
-                builder.label(&street.label);
-                builder.name(&street.name);
-                builder.build()
-            }
-            NormalizedRecord::Postcode(postcode) => {
-                let mut builder = ProjectionBuilder::new(record_id, record.layer());
-                builder.label(&postcode.label);
-                builder.name(&postcode.name);
-                builder.postcode(&postcode.postcode);
-                builder.build()
-            }
-            NormalizedRecord::Country(place)
-            | NormalizedRecord::District(place)
-            | NormalizedRecord::Locality(place)
-            | NormalizedRecord::Neighbourhood(place)
-            | NormalizedRecord::Place(place)
-            | NormalizedRecord::Region(place) => project_place(record_id, record, place),
-        }
+    fn project_address(record_id: RecordId, address: &AddressRecord) -> TextIndexProjection {
+        let mut builder = ProjectionBuilder::new(record_id, "address");
+        builder.label(&address.label);
+        builder.name(&address.name);
+        builder.address(&address.address);
+        builder.build()
+    }
+
+    fn project_interpolation(
+        record_id: RecordId,
+        interpolation: &InterpolationRecord,
+    ) -> TextIndexProjection {
+        let mut builder = ProjectionBuilder::new(record_id, "interpolation");
+        builder.label(&interpolation.label);
+        builder.name(&interpolation.name);
+        builder.interpolation_address(&interpolation.address);
+        builder.build()
+    }
+
+    fn project_street(record_id: RecordId, street: &StreetRecord) -> TextIndexProjection {
+        let mut builder = ProjectionBuilder::new(record_id, "street");
+        builder.label(&street.label);
+        builder.name(&street.name);
+        builder.build()
+    }
+
+    fn project_postcode(record_id: RecordId, postcode: &PostcodeRecord) -> TextIndexProjection {
+        let mut builder = ProjectionBuilder::new(record_id, "postcode");
+        builder.label(&postcode.label);
+        builder.name(&postcode.name);
+        builder.postcode(&postcode.postcode);
+        builder.build()
+    }
+
+    fn project_place(record_id: RecordId, layer: &str, place: &PlaceRecord) -> TextIndexProjection {
+        let mut builder = ProjectionBuilder::new(record_id, layer);
+        builder.label(&place.label);
+        builder.name(&place.name);
+        builder.build()
     }
 }
 
@@ -452,15 +507,15 @@ fn exact_string_options() -> TextOptions {
     )
 }
 
-fn project_place(
-    record_id: RecordId,
-    record: &NormalizedRecord,
-    place: &PlaceRecord,
-) -> TextIndexProjection {
-    let mut builder = ProjectionBuilder::new(record_id, record.layer());
-    builder.label(&place.label);
-    builder.name(&place.name);
-    builder.build()
+fn place_layer_name(layer: PlaceLayer) -> &'static str {
+    match layer {
+        PlaceLayer::Country => "country",
+        PlaceLayer::Region => "region",
+        PlaceLayer::District => "district",
+        PlaceLayer::Place => "place",
+        PlaceLayer::Locality => "locality",
+        PlaceLayer::Neighbourhood => "neighbourhood",
+    }
 }
 
 #[derive(Debug)]
@@ -823,7 +878,7 @@ mod tests {
 
     #[test]
     fn projects_address_fields_for_search() {
-        let record = NormalizedRecord::address(AddressRecord {
+        let record = AddressRecord {
             id: "osm:node:123".to_string(),
             label: "221B Baker Street, London, NW1".to_string(),
             name: "221B Baker Street".to_string(),
@@ -840,9 +895,9 @@ mod tests {
             geometry: point_geometry(-0.1586, 51.5237),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(OsmObjectType::Node, 123),
-        });
+        };
 
-        let projected = TextIndexDocument::from_record(42, &record);
+        let projected = TextIndexDocument::project_address(42, &record).document;
 
         assert_eq!(projected.record_id, 42);
         assert_eq!(projected.layer, "address");
@@ -872,7 +927,7 @@ mod tests {
 
     #[test]
     fn projects_interpolation_without_indexing_range_fields() {
-        let record = NormalizedRecord::interpolation(crate::record::InterpolationRecord {
+        let record = crate::record::InterpolationRecord {
             id: "osm:way:9:interp:1-2".to_string(),
             label: "Baker Street 1-99 odd, London".to_string(),
             name: "Baker Street".to_string(),
@@ -894,9 +949,9 @@ mod tests {
             geometry: point_geometry(-0.1586, 51.5237),
             representative_point: [-0.1586, 51.5237],
             source: SourceProvenance::osm(OsmObjectType::Way, 9),
-        });
+        };
 
-        let projected = TextIndexDocument::from_record(7, &record);
+        let projected = TextIndexDocument::project_interpolation(7, &record).document;
 
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
@@ -905,33 +960,32 @@ mod tests {
 
     #[test]
     fn projects_postcodes_and_place_layers() {
-        let postcode = NormalizedRecord::postcode(PostcodeRecord {
+        let postcode = PostcodeRecord {
             id: "derived:osm:postcode:M5V".to_string(),
             label: "M5V".to_string(),
             name: "M5V".to_string(),
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(2),
-        });
-        let place = NormalizedRecord::place(
-            PlaceRecord {
-                id: "osm:node:1".to_string(),
-                label: "Toronto".to_string(),
-                name: "Toronto".to_string(),
-                place_type: "city".to_string(),
-                geometry: point_geometry(-79.4, 43.6),
-                source: SourceProvenance {
-                    dataset: "osm".to_string(),
-                    object_type: OsmObjectType::Node,
-                    object_id: 1,
-                    tags: Some(BTreeMap::new()),
-                },
+        };
+        let place = PlaceRecord {
+            id: "osm:node:1".to_string(),
+            label: "Toronto".to_string(),
+            name: "Toronto".to_string(),
+            place_type: "city".to_string(),
+            geometry: point_geometry(-79.4, 43.6),
+            source: SourceProvenance {
+                dataset: "osm".to_string(),
+                object_type: OsmObjectType::Node,
+                object_id: 1,
+                tags: Some(BTreeMap::new()),
             },
-            PlaceLayer::Locality,
-        );
+        };
 
-        let postcode = TextIndexDocument::from_record(1, &postcode);
-        let place = TextIndexDocument::from_record(2, &place);
+        let postcode = TextIndexDocument::project_postcode(1, &postcode).document;
+        let place =
+            TextIndexDocument::project_place(2, place_layer_name(PlaceLayer::Locality), &place)
+                .document;
 
         assert_eq!(postcode.postcode.as_deref(), Some("M5V"));
         assert_eq!(place.layer, "locality");

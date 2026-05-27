@@ -6,9 +6,7 @@ use geojson::GeometryValue;
 use crate::{
     builder::report::BuilderReport,
     pack::RecordWriter,
-    record::{
-        AddressRecord, DerivedSourceProvenance, NormalizedRecord, PostcodeRecord, point_geometry,
-    },
+    record::{AddressRecord, DerivedSourceProvenance, PostcodeRecord, point_geometry},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -54,9 +52,8 @@ impl PostcodeAccumulator {
     ) -> Result<()> {
         for group in self.groups.values() {
             let record = group.to_record();
-            let record = NormalizedRecord::postcode(record);
-            writer.write_record(record.clone())?;
-            report.accept(&record);
+            writer.write_postcode(&record)?;
+            report.accept_postcode();
         }
         Ok(())
     }

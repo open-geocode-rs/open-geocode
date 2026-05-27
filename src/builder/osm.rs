@@ -21,9 +21,12 @@ use crate::{
     record::{LocationPrecision, OsmObjectType},
 };
 use address::{AddressCandidate, write_candidate, write_rejected_record};
-use collector::{AddressWayStub, discover_address_features};
+use collector::{
+    AddressWayStub, CollectedRejection, PlaceNodeCandidate, discover_address_features,
+};
 use geometry::{centroid, resolve_required_node_locations, resolve_way_points};
 use interpolation::{InterpolationWayStub, write_interpolation_records};
+use place::write_place_node;
 use postcode::PostcodeAccumulator;
 use street::{StreetWayStub, write_street_record};
 
@@ -42,7 +45,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
     let pack_create_ms = pack_create_started.elapsed().as_millis();
 
     let discovery_started = Instant::now();
-    let mut discovery = discover_address_features(&options.input, &mut pack_writer)?;
+    let mut discovery = discover_address_features(&options.input)?;
     discovery.report.phases.pack_create_ms = pack_create_ms;
     discovery.report.phases.discovery_ms = discovery_started.elapsed().as_millis();
     discovery.report.pack = options.pack.display().to_string();
@@ -60,16 +63,20 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
     discovery.report.node_cache_entries = node_locations.len();
 
     let emission_started = Instant::now();
+    let mut postcode_accumulator = PostcodeAccumulator::default();
     emit_normalized_records(
         &mut pack_writer,
         EmissionInputs {
+            place_node_candidates: &discovery.place_node_candidates,
+            address_node_candidates: &discovery.address_node_candidates,
             way_stubs: &discovery.way_stubs,
             interpolation_way_stubs: &discovery.interpolation_way_stubs,
             street_way_stubs: &discovery.street_way_stubs,
+            rejections: &discovery.rejections,
             address_node_tags: &discovery.address_node_tags,
             node_locations: &node_locations,
         },
-        &mut discovery.postcode_accumulator,
+        &mut postcode_accumulator,
         &mut discovery.report,
     )?;
     discovery.report.phases.record_emission_ms = emission_started.elapsed().as_millis();
@@ -80,9 +87,12 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
 }
 
 struct EmissionInputs<'a> {
+    place_node_candidates: &'a [PlaceNodeCandidate],
+    address_node_candidates: &'a [AddressCandidate],
     way_stubs: &'a [AddressWayStub],
     interpolation_way_stubs: &'a [InterpolationWayStub],
     street_way_stubs: &'a [StreetWayStub],
+    rejections: &'a [CollectedRejection],
     address_node_tags: &'a HashMap<i64, BTreeMap<String, String>>,
     node_locations: &'a HashMap<i64, (f64, f64)>,
 }
@@ -93,7 +103,39 @@ fn emit_normalized_records(
     postcode_accumulator: &mut PostcodeAccumulator,
     report: &mut BuilderReport,
 ) -> Result<()> {
-    let progress = item_progress_bar(inputs.way_stubs.len() as u64, "3/7 emit address centroids");
+    for rejection in inputs.rejections {
+        write_rejected_record(
+            rejection.issue,
+            rejection.object_type,
+            rejection.object_id,
+            &rejection.tags,
+            rejection.layer_hint,
+            writer,
+        )?;
+    }
+
+    for candidate in inputs.place_node_candidates {
+        write_place_node(
+            candidate.object_id,
+            candidate.lat,
+            candidate.lon,
+            &candidate.tags,
+            writer,
+            report,
+        )?;
+    }
+
+    let progress = item_progress_bar(
+        (inputs.address_node_candidates.len() + inputs.way_stubs.len()) as u64,
+        "3/7 emit address records",
+    );
+    for candidate in inputs.address_node_candidates {
+        if let Some(record) = write_candidate(candidate.clone(), writer, report)? {
+            postcode_accumulator.accept_address(&record);
+        }
+        progress.inc(1);
+    }
+
     for stub in inputs.way_stubs {
         let Some(points) = resolve_way_points(stub, inputs.node_locations) else {
             report.reject(CandidateIssue::WayWithoutResolvedNodes);
@@ -136,7 +178,7 @@ fn emit_normalized_records(
         }
         progress.inc(1);
     }
-    progress.finish_with_message("3/7 emit address centroids complete");
+    progress.finish_with_message("3/7 emit address records complete");
 
     postcode_accumulator.write_records(writer, report)?;
 
@@ -173,7 +215,6 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use crate::pack::test_support::MemoryRecordWriter;
-    use crate::record::NormalizedRecord;
 
     use super::address::AddressCandidate;
     use super::*;
@@ -192,11 +233,6 @@ mod tests {
                 ("addr:street".to_string(), "King Street".to_string()),
             ]),
         };
-        let node_record =
-            address::address_record_from_candidate(node_candidate).expect("node record");
-        writer
-            .write_record(NormalizedRecord::address(node_record))
-            .expect("write node");
 
         let way_stubs = vec![AddressWayStub {
             object_id: 200,
@@ -221,9 +257,12 @@ mod tests {
         emit_normalized_records(
             &mut writer,
             EmissionInputs {
+                place_node_candidates: &[],
+                address_node_candidates: &[node_candidate],
                 way_stubs: &way_stubs,
                 interpolation_way_stubs: &[],
                 street_way_stubs: &street_way_stubs,
+                rejections: &[],
                 address_node_tags: &HashMap::new(),
                 node_locations: &node_locations,
             },
@@ -239,6 +278,7 @@ mod tests {
         assert_eq!(writer.records[2].layer(), "street");
         assert_eq!(writer.records[2].id(), "osm:way:300");
         assert_eq!(writer.records[2].label(), "King Street");
+        assert_eq!(report.accepted.node_addresses, 1);
         assert_eq!(report.accepted.way_centroid_addresses, 1);
         assert_eq!(report.accepted.street_segments, 1);
         assert_eq!(report.accepted.by_layer.get("street"), Some(&1),);

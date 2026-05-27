@@ -24,53 +24,6 @@ Compared to other OSS geocoding alternatives:
 | Nominatim | Heavy PostgreSQL/PostGIS deployment | Static binary Packs, no required database |
 | Pelias | Elasticsearch and multi-service ops | Single Rust runtime, no service graph |
 
-## Architecture
-
-Builds write a binary Pack directly:
-
-```text
-OSM PBF / open address data
-  -> normalized typed record stream
-  -> binary Pack
-       -> record table
-       -> offset table
-       -> audit tables
-       -> manifest and build report
-  -> Rust runtime
-```
-
-The Pack is the runtime data source of truth. JSON is used for API responses,
-build reports, and CLI inspection output.
-
-## Commands
-
-Build a Pack:
-
-```powershell
-cargo run -p open-geocode -- build --input .\data\ontario.pbf --pack .\data\build\pack
-```
-
-Inspect a Pack:
-
-```powershell
-cargo run -p open-geocode -- inspect-pack --pack .\data\build\pack
-cargo run -p open-geocode -- inspect-pack --pack .\data\build\pack --layer address --limit 20
-cargo run -p open-geocode -- inspect-pack --pack .\data\build\pack --row 42
-cargo run -p open-geocode -- inspect-pack --pack .\data\build\pack --id osm:node:123
-```
-
-Search a Pack from the CLI:
-
-```powershell
-cargo run -p open-geocode -- search-pack --pack .\data\build\pack --query "King Street Toronto"
-```
-
-Serve the Runtime API and demo:
-
-```powershell
-cargo run -p open-geocode -- serve --pack .\data\build\pack --demo .\demo --bind 127.0.0.1:5173
-```
-
 ## Use Cases
 
 | Capability | Example use case |

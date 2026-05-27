@@ -10,8 +10,7 @@ use tantivy::{
 };
 
 use crate::{
-    pack::{PackReader, RecordId},
-    record::NormalizedRecord,
+    pack::{PackReader, RecordId, RecordSummary},
     text_index::{TextIndexFields, normalize_index_text, open_text_index},
 };
 
@@ -40,7 +39,7 @@ pub struct TextAutocompleteOptions {
 pub struct TextSearchHit {
     pub record_id: RecordId,
     pub score: Score,
-    pub record: NormalizedRecord,
+    pub record: RecordSummary,
 }
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -225,7 +224,7 @@ impl PackTextSearcher {
             .into_iter()
             .map(|(score, doc_address)| {
                 let record_id = self.record_id_from_doc_address(&searcher, doc_address)?;
-                let record = self.pack.read_record(record_id)?;
+                let record = self.pack.record_summary(record_id)?;
                 Ok(TextSearchHit {
                     record_id,
                     score,
@@ -298,24 +297,24 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "10 King Street, Toronto",
                 "10",
                 "King Street",
                 Some("Toronto"),
                 Some("M5V 1A1"),
-            )))
+            ))
             .expect("write king address");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:2",
                 "20 Queen Street, Toronto",
                 "20",
                 "Queen Street",
                 Some("Toronto"),
                 Some("M5V 1A1"),
-            )))
+            ))
             .expect("write queen address");
         writer
             .finish(&mut BuilderReport::default())
@@ -332,8 +331,8 @@ mod tests {
 
         assert!(!hits.is_empty());
         assert_eq!(hits[0].record_id, 0);
-        assert_eq!(hits[0].record.id(), "osm:node:1");
-        assert_eq!(hits[0].record.label(), "10 King Street, Toronto");
+        assert_eq!(hits[0].record.id, "osm:node:1");
+        assert_eq!(hits[0].record.label, "10 King Street, Toronto");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -345,20 +344,17 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "10 King Street, Toronto",
                 "10",
                 "King Street",
                 Some("Toronto"),
                 None,
-            )))
+            ))
             .expect("write address");
         writer
-            .write_record(NormalizedRecord::street(street_record(
-                "osm:way:9",
-                "King Street",
-            )))
+            .write_street(&street_record("osm:way:9", "King Street"))
             .expect("write street");
         writer
             .finish(&mut BuilderReport::default())
@@ -375,7 +371,7 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 1);
-        assert_eq!(hits[0].record.layer(), "street");
+        assert_eq!(hits[0].record.layer, "street");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -387,14 +383,14 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::postcode(PostcodeRecord {
+            .write_postcode(&PostcodeRecord {
                 id: "derived:osm:postcode:M5V".to_string(),
                 label: "M5V".to_string(),
                 name: "M5V".to_string(),
                 postcode: "M5V".to_string(),
                 geometry: point_geometry(-79.4, 43.6),
                 source: DerivedSourceProvenance::osm_address_records(2),
-            }))
+            })
             .expect("write postcode");
         writer
             .finish(&mut BuilderReport::default())
@@ -411,7 +407,7 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 0);
-        assert_eq!(hits[0].record.layer(), "postcode");
+        assert_eq!(hits[0].record.layer, "postcode");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -423,24 +419,24 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "10 King Street, Toronto",
                 "10",
                 "King Street",
                 Some("Toronto"),
                 Some("M5V 1A1"),
-            )))
+            ))
             .expect("write king address");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:2",
                 "20 Queen Street, Toronto",
                 "20",
                 "Queen Street",
                 Some("Toronto"),
                 None,
-            )))
+            ))
             .expect("write queen address");
         writer
             .finish(&mut BuilderReport::default())
@@ -457,7 +453,7 @@ mod tests {
 
         assert!(!hits.is_empty());
         assert_eq!(hits[0].record_id, 0);
-        assert_eq!(hits[0].record.label(), "10 King Street, Toronto");
+        assert_eq!(hits[0].record.label, "10 King Street, Toronto");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -469,14 +465,14 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "10 King Street, Toronto",
                 "10",
                 "King Street",
                 Some("Toronto"),
                 None,
-            )))
+            ))
             .expect("write king address");
         writer
             .finish(&mut BuilderReport::default())
@@ -504,20 +500,17 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "10 King Street, Toronto",
                 "10",
                 "King Street",
                 Some("Toronto"),
                 None,
-            )))
+            ))
             .expect("write address");
         writer
-            .write_record(NormalizedRecord::street(street_record(
-                "osm:way:9",
-                "King Street",
-            )))
+            .write_street(&street_record("osm:way:9", "King Street"))
             .expect("write street");
         writer
             .finish(&mut BuilderReport::default())
@@ -534,7 +527,7 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 1);
-        assert_eq!(hits[0].record.layer(), "street");
+        assert_eq!(hits[0].record.layer, "street");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -546,14 +539,14 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "221B Baker Street, London, NW1",
                 "221B",
                 "Baker Street",
                 Some("London"),
                 Some("NW1 6XE"),
-            )))
+            ))
             .expect("write baker address");
         writer
             .finish(&mut BuilderReport::default())
@@ -590,14 +583,14 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
+            .write_address(&address_record(
                 "osm:node:1",
                 "10 King Street, Toronto",
                 "10",
                 "King Street",
                 Some("Toronto"),
                 None,
-            )))
+            ))
             .expect("write address");
         writer
             .finish(&mut BuilderReport::default())

@@ -6,8 +6,8 @@ use crate::{
     builder::report::{BuilderReport, CandidateIssue},
     pack::RecordWriter,
     record::{
-        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, NormalizedRecord,
-        OsmObjectType, SourceProvenance,
+        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, OsmObjectType,
+        SourceProvenance,
     },
 };
 
@@ -109,9 +109,8 @@ pub(crate) fn write_interpolation_records(
         let end_anchor = &pair[1];
         match interpolation_record_from_segment(stub, &rule, start_anchor, end_anchor, &points) {
             Ok(record) => {
-                let record = NormalizedRecord::interpolation(record);
-                writer.write_record(record.clone())?;
-                report.accept(&record);
+                writer.write_interpolation(&record)?;
+                report.accept_interpolation();
             }
             Err(issue) => {
                 reject_interpolation(issue, stub, writer, report)?;
@@ -490,12 +489,12 @@ mod tests {
 
         assert_eq!(writer.records.len(), 2);
         assert_eq!(writer.records[0].layer(), "interpolation");
-        let NormalizedRecord::Interpolation(first) = &writer.records[0] else {
-            panic!("expected interpolation");
-        };
-        let NormalizedRecord::Interpolation(second) = &writer.records[1] else {
-            panic!("expected interpolation");
-        };
+        let first = writer.records[0]
+            .interpolation()
+            .expect("expected interpolation");
+        let second = writer.records[1]
+            .interpolation()
+            .expect("expected interpolation");
         assert_eq!(first.interpolation.start, 101);
         assert_eq!(second.interpolation.start, 103);
         assert!(writer.rejections.is_empty());

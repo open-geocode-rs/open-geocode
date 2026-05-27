@@ -450,10 +450,8 @@ fn pack_relative_path(pack_path: &Path, path: &Path) -> Result<String> {
 fn categorize_pack_file(path: &str) -> PackFileCategory {
     if path == "manifest.json" {
         PackFileCategory::Manifest
-    } else if path == "records/records.bin" {
+    } else if path.starts_with("records/") {
         PackFileCategory::Records
-    } else if path == "records/offsets.bin" {
-        PackFileCategory::Offsets
     } else if path.starts_with("audit/") {
         PackFileCategory::Audit
     } else if path.starts_with("text/") {
@@ -894,8 +892,8 @@ mod tests {
         builder::report::BuilderReport,
         pack::{PackWriter, RecordWriter},
         record::{
-            AddressComponents, AddressRecord, LocationPrecision, NormalizedRecord, OsmObjectType,
-            SourceProvenance, point_geometry,
+            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
+            point_geometry,
         },
     };
 
@@ -966,7 +964,7 @@ mod tests {
     fn write_test_pack(path: &Path) {
         let mut writer = PackWriter::create(path).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(AddressRecord {
+            .write_address(&AddressRecord {
                 id: "osm:node:1".to_string(),
                 label: "10 King Street, Toronto".to_string(),
                 name: "10 King Street".to_string(),
@@ -983,7 +981,7 @@ mod tests {
                 geometry: point_geometry(-79.4, 43.6),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(OsmObjectType::Node, 1),
-            }))
+            })
             .expect("write address");
         writer
             .finish(&mut BuilderReport::default())

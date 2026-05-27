@@ -182,14 +182,14 @@ fn inspect_pack(
     let output = if rejections {
         serde_json::to_value(reader.rejections(limit)?)?
     } else if let Some(row) = row {
-        serde_json::to_value(reader.read_record(row)?)?
+        reader.record_json(row)?
     } else if let Some(id) = id {
-        let Some(record) = reader.record_by_source_id(&id)? else {
+        let Some(record) = reader.record_json_by_source_id(&id)? else {
             bail!("record not found: {id}");
         };
-        serde_json::to_value(record)?
+        record
     } else if let Some(layer) = layer {
-        serde_json::to_value(reader.records_by_layer(&layer, limit)?)?
+        serde_json::to_value(reader.records_json_by_layer(&layer, limit)?)?
     } else {
         serde_json::to_value(reader.manifest())?
     };

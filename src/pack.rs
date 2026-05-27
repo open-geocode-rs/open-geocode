@@ -14,25 +14,35 @@ use crate::{
         progress::stage_progress,
         report::{BuilderReport, PackWriteTimings},
     },
-    record::{NormalizedRecord, RejectedRecord},
+    record::{
+        AddressRecord, InterpolationRecord, PlaceLayer, PlaceRecord, PostcodeRecord,
+        RejectedRecord, StreetRecord,
+    },
+    records_archive::{RecordsArchiveReader, RecordsArchiveWriter},
     spatial_index::{PackSpatialIndexWriter, SpatialIndexCommit},
     text_index::{
         TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit, TextIndexWriteMetrics,
     },
 };
 
+pub use crate::records_archive::{
+    ContextRecord, RecordPoint, RecordPointPrecision, RecordSource, RecordSummary,
+};
+
 pub type RecordId = u64;
 
 pub trait RecordWriter {
-    fn write_record(&mut self, record: NormalizedRecord) -> Result<RecordId>;
+    fn write_address(&mut self, record: &AddressRecord) -> Result<RecordId>;
+    fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId>;
+    fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<RecordId>;
+    fn write_street(&mut self, record: &StreetRecord) -> Result<RecordId>;
+    fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId>;
     fn write_rejection(&mut self, rejection: RejectedRecord) -> Result<()>;
 }
 
-#[derive(Debug)]
 pub struct PackWriter {
     path: PathBuf,
-    records: File,
-    offsets: File,
+    records: RecordsArchiveWriter,
     rejections: File,
     rejection_offsets: File,
     text_index: TantivyTextIndexWriter,
@@ -44,10 +54,20 @@ pub struct PackWriter {
     layer_counts: BTreeMap<String, u64>,
 }
 
-#[derive(Debug)]
 pub struct PackReader {
     path: PathBuf,
     manifest: PackManifest,
+    records: RecordsArchiveReader,
+}
+
+impl std::fmt::Debug for PackReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackReader")
+            .field("path", &self.path)
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,9 +145,7 @@ impl TextIndexTimingNanos {
     }
 }
 
-const PACK_SCHEMA_VERSION: u32 = 1;
-const RECORDS_MAGIC: &[u8; 8] = b"OGREC001";
-const OFFSETS_MAGIC: &[u8; 8] = b"OGOFF001";
+const PACK_SCHEMA_VERSION: u32 = 2;
 const REJECTIONS_MAGIC: &[u8; 8] = b"OGREJ001";
 const REJECTION_OFFSETS_MAGIC: &[u8; 8] = b"OGROF001";
 const OFFSET_HEADER_BYTES: u64 = 16;
@@ -151,13 +169,7 @@ impl PackWriter {
         fs::create_dir_all(path.join("audit"))
             .with_context(|| format!("failed to create {}", path.join("audit").display()))?;
 
-        let mut records = File::create(path.join("records").join("records.bin"))
-            .with_context(|| "failed to create records.bin")?;
-        records.write_all(RECORDS_MAGIC)?;
-
-        let mut offsets = File::create(path.join("records").join("offsets.bin"))
-            .with_context(|| "failed to create offsets.bin")?;
-        write_offset_header(&mut offsets, OFFSETS_MAGIC, 0)?;
+        let records = RecordsArchiveWriter::create(path.join("records"))?;
 
         let mut rejections = File::create(path.join("audit").join("rejections.bin"))
             .with_context(|| "failed to create rejections.bin")?;
@@ -172,7 +184,6 @@ impl PackWriter {
         Ok(Self {
             path,
             records,
-            offsets,
             rejections,
             rejection_offsets,
             text_index,
@@ -189,7 +200,6 @@ impl PackWriter {
         let runtime_finalize_started = Instant::now();
 
         let started = Instant::now();
-        write_offset_header(&mut self.offsets, OFFSETS_MAGIC, self.record_count)?;
         write_offset_header(
             &mut self.rejection_offsets,
             REJECTION_OFFSETS_MAGIC,
@@ -198,8 +208,7 @@ impl PackWriter {
         self.write_timings.final_offset_header_ms += elapsed_ms(started);
 
         let started = Instant::now();
-        self.records.flush()?;
-        self.offsets.flush()?;
+        self.records.finish()?;
         self.rejections.flush()?;
         self.rejection_offsets.flush()?;
         self.write_timings.table_flush_ms += elapsed_ms(started);
@@ -242,8 +251,8 @@ impl PackWriter {
         spatial_progress.finish_with_message("7/7 finalize spatial index complete");
 
         let started = Instant::now();
-        report.record_table_bytes = file_len(self.path.join("records").join("records.bin"))?;
-        report.offset_table_bytes = file_len(self.path.join("records").join("offsets.bin"))?;
+        report.record_table_bytes = dir_size(self.path.join("records"))?;
+        report.offset_table_bytes = 0;
         report.rejection_table_bytes = file_len(self.path.join("audit").join("rejections.bin"))?;
         report.rejection_offset_table_bytes =
             file_len(self.path.join("audit").join("rejection_offsets.bin"))?;
@@ -294,14 +303,13 @@ impl PackWriter {
     ) -> Result<PackManifest> {
         let mut files = BTreeMap::new();
         for relative in [
-            "records/records.bin",
-            "records/offsets.bin",
             "audit/rejections.bin",
             "audit/rejection_offsets.bin",
             "audit/build-report.json",
         ] {
             insert_pack_file(&mut files, &self.path, relative)?;
         }
+        insert_pack_files_under(&mut files, &self.path, "records")?;
         insert_pack_files_under(&mut files, &self.path, TEXT_INDEX_RELATIVE_PATH)?;
         insert_pack_files_under(&mut files, &self.path, &spatial_index_commit.relative_path)?;
 
@@ -354,35 +362,91 @@ impl PackWriter {
 }
 
 impl RecordWriter for PackWriter {
-    fn write_record(&mut self, record: NormalizedRecord) -> Result<RecordId> {
+    fn write_address(&mut self, record: &AddressRecord) -> Result<RecordId> {
         let record_id = self.record_count;
-        let layer = record.layer();
-        let layer_code = layer_code(layer)?;
 
         let started = Instant::now();
-        let bytes = rmp_serde::to_vec_named(&record).context("failed to encode record")?;
-        self.write_timings.record_encode_ms += elapsed_ms(started);
-
-        let started = Instant::now();
-        Self::append_chunk(
-            &mut self.records,
-            &mut self.offsets,
-            record_id,
-            layer_code,
-            &bytes,
-        )?;
+        self.records.write_address(record)?;
         self.write_timings.record_table_write_ms += elapsed_ms(started);
 
-        let text_index_metrics = self.text_index.add_record(record_id, &record)?;
+        let text_index_metrics = self.text_index.add_address(record_id, record)?;
         self.text_index_timing_nanos.record(text_index_metrics);
 
         let started = Instant::now();
-        self.spatial_index.add_record(record_id, &record)?;
+        self.spatial_index.add_address(record_id, record)?;
         self.write_timings.spatial_index_write_ms += elapsed_ms(started);
 
-        self.record_count += 1;
-        *self.layer_counts.entry(layer.to_string()).or_default() += 1;
-        Ok(record_id)
+        self.accept_record(record_id, "address")
+    }
+
+    fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
+        let record_id = self.record_count;
+        let layer_name = place_layer_name(layer);
+
+        let started = Instant::now();
+        self.records.write_place(record, layer)?;
+        self.write_timings.record_table_write_ms += elapsed_ms(started);
+
+        let text_index_metrics = self.text_index.add_place(record_id, record, layer)?;
+        self.text_index_timing_nanos.record(text_index_metrics);
+
+        let started = Instant::now();
+        self.spatial_index
+            .add_place(record_id, layer.into(), record);
+        self.write_timings.spatial_index_write_ms += elapsed_ms(started);
+
+        self.accept_record(record_id, layer_name)
+    }
+
+    fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<RecordId> {
+        let record_id = self.record_count;
+
+        let started = Instant::now();
+        self.records.write_interpolation(record)?;
+        self.write_timings.record_table_write_ms += elapsed_ms(started);
+
+        let text_index_metrics = self.text_index.add_interpolation(record_id, record)?;
+        self.text_index_timing_nanos.record(text_index_metrics);
+
+        let started = Instant::now();
+        self.spatial_index.add_interpolation(record_id, record);
+        self.write_timings.spatial_index_write_ms += elapsed_ms(started);
+
+        self.accept_record(record_id, "interpolation")
+    }
+
+    fn write_street(&mut self, record: &StreetRecord) -> Result<RecordId> {
+        let record_id = self.record_count;
+
+        let started = Instant::now();
+        self.records.write_street(record)?;
+        self.write_timings.record_table_write_ms += elapsed_ms(started);
+
+        let text_index_metrics = self.text_index.add_street(record_id, record)?;
+        self.text_index_timing_nanos.record(text_index_metrics);
+
+        let started = Instant::now();
+        self.spatial_index.add_street(record_id, record);
+        self.write_timings.spatial_index_write_ms += elapsed_ms(started);
+
+        self.accept_record(record_id, "street")
+    }
+
+    fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId> {
+        let record_id = self.record_count;
+
+        let started = Instant::now();
+        self.records.write_postcode(record)?;
+        self.write_timings.record_table_write_ms += elapsed_ms(started);
+
+        let text_index_metrics = self.text_index.add_postcode(record_id, record)?;
+        self.text_index_timing_nanos.record(text_index_metrics);
+
+        let started = Instant::now();
+        self.spatial_index.add_postcode(record_id, record)?;
+        self.write_timings.spatial_index_write_ms += elapsed_ms(started);
+
+        self.accept_record(record_id, "postcode")
     }
 
     fn write_rejection(&mut self, rejection: RejectedRecord) -> Result<()> {
@@ -412,25 +476,56 @@ impl RecordWriter for PackWriter {
     }
 }
 
+impl PackWriter {
+    fn accept_record(&mut self, record_id: RecordId, layer: &str) -> Result<RecordId> {
+        self.record_count += 1;
+        *self.layer_counts.entry(layer.to_string()).or_default() += 1;
+        Ok(record_id)
+    }
+}
+
 impl PackReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let manifest_path = path.join("manifest.json");
         let manifest_file = File::open(&manifest_path)
             .with_context(|| format!("failed to open {}", manifest_path.display()))?;
-        let manifest = serde_json::from_reader(manifest_file)
+        let manifest: PackManifest = serde_json::from_reader(manifest_file)
             .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-        Ok(Self { path, manifest })
+        if manifest.schema_version != PACK_SCHEMA_VERSION {
+            bail!(
+                "pack schema version {} is unsupported; rebuild pack for schema {}",
+                manifest.schema_version,
+                PACK_SCHEMA_VERSION
+            );
+        }
+
+        let records = RecordsArchiveReader::open(path.join("records"))?;
+        if records.len() != manifest.record_count {
+            bail!(
+                "records archive has {} rows but manifest declares {}",
+                records.len(),
+                manifest.record_count
+            );
+        }
+
+        Ok(Self {
+            path,
+            manifest,
+            records,
+        })
     }
 
     pub const fn manifest(&self) -> &PackManifest {
         &self.manifest
     }
 
-    pub fn read_record(&self, record_id: RecordId) -> Result<NormalizedRecord> {
-        let entry = self.record_offset(record_id)?;
-        let bytes = self.read_chunk("records/records.bin", RECORDS_MAGIC, entry)?;
-        rmp_serde::from_slice(&bytes).context("failed to decode record")
+    pub fn record_summary(&self, record_id: RecordId) -> Result<RecordSummary> {
+        self.records.summary(record_id)
+    }
+
+    pub fn record_json(&self, record_id: RecordId) -> Result<serde_json::Value> {
+        self.records.record_json(record_id)
     }
 
     pub fn read_rejection(&self, row: u64) -> Result<RejectedRecord> {
@@ -439,21 +534,12 @@ impl PackReader {
         rmp_serde::from_slice(&bytes).context("failed to decode rejection")
     }
 
-    pub fn records_by_layer(&self, layer: &str, limit: usize) -> Result<Vec<NormalizedRecord>> {
-        let wanted = layer_code(layer)?;
-        let count = offset_count(self.path.join("records").join("offsets.bin"), OFFSETS_MAGIC)?;
-        let mut records = Vec::new();
-        for record_id in 0..count {
-            let entry = self.record_offset(record_id)?;
-            if entry.layer_code != wanted {
-                continue;
-            }
-            records.push(self.read_record(record_id)?);
-            if limit > 0 && records.len() >= limit {
-                break;
-            }
-        }
-        Ok(records)
+    pub fn records_json_by_layer(
+        &self,
+        layer: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.records.records_json_by_layer(layer, limit)
     }
 
     pub fn rejections(&self, limit: usize) -> Result<Vec<RejectedRecord>> {
@@ -473,22 +559,30 @@ impl PackReader {
         Ok(rejections)
     }
 
-    pub fn record_by_source_id(&self, source_id: &str) -> Result<Option<NormalizedRecord>> {
+    pub fn record_json_by_source_id(&self, source_id: &str) -> Result<Option<serde_json::Value>> {
         for record_id in 0..self.manifest.record_count {
-            let record = self.read_record(record_id)?;
-            if record.id() == source_id {
-                return Ok(Some(record));
+            let summary = self.record_summary(record_id)?;
+            if summary.id == source_id {
+                return Ok(Some(self.record_json(record_id)?));
             }
         }
         Ok(None)
     }
 
-    fn record_offset(&self, record_id: RecordId) -> Result<OffsetEntry> {
-        read_offset_entry(
-            self.path.join("records").join("offsets.bin"),
-            OFFSETS_MAGIC,
-            record_id,
-        )
+    pub fn address(&self, record_id: RecordId) -> Result<Option<AddressRecord>> {
+        self.records.address(record_id)
+    }
+
+    pub fn interpolation(&self, record_id: RecordId) -> Result<Option<InterpolationRecord>> {
+        self.records.interpolation(record_id)
+    }
+
+    pub fn street(&self, record_id: RecordId) -> Result<Option<StreetRecord>> {
+        self.records.street(record_id)
+    }
+
+    pub fn context_record(&self, record_id: RecordId) -> Result<Option<ContextRecord>> {
+        self.records.context(record_id)
     }
 
     fn rejection_offset(&self, row: u64) -> Result<OffsetEntry> {
@@ -692,20 +786,105 @@ fn layer_code(layer: &str) -> Result<u16> {
     }
 }
 
+fn place_layer_name(layer: PlaceLayer) -> &'static str {
+    match layer {
+        PlaceLayer::Country => "country",
+        PlaceLayer::Region => "region",
+        PlaceLayer::District => "district",
+        PlaceLayer::Place => "place",
+        PlaceLayer::Locality => "locality",
+        PlaceLayer::Neighbourhood => "neighbourhood",
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
 
+    #[derive(Debug, Clone)]
+    pub(crate) enum CapturedRecord {
+        Address(AddressRecord),
+        Place(PlaceLayer, PlaceRecord),
+        Interpolation(InterpolationRecord),
+        Street(StreetRecord),
+        Postcode(PostcodeRecord),
+    }
+
+    impl CapturedRecord {
+        pub(crate) fn layer(&self) -> &'static str {
+            match self {
+                Self::Address(_) => "address",
+                Self::Place(layer, _) => place_layer_name(*layer),
+                Self::Interpolation(_) => "interpolation",
+                Self::Street(_) => "street",
+                Self::Postcode(_) => "postcode",
+            }
+        }
+
+        pub(crate) fn id(&self) -> &str {
+            match self {
+                Self::Address(record) => &record.id,
+                Self::Place(_, record) => &record.id,
+                Self::Interpolation(record) => &record.id,
+                Self::Street(record) => &record.id,
+                Self::Postcode(record) => &record.id,
+            }
+        }
+
+        pub(crate) fn label(&self) -> &str {
+            match self {
+                Self::Address(record) => &record.label,
+                Self::Place(_, record) => &record.label,
+                Self::Interpolation(record) => &record.label,
+                Self::Street(record) => &record.label,
+                Self::Postcode(record) => &record.label,
+            }
+        }
+
+        pub(crate) fn interpolation(&self) -> Option<&InterpolationRecord> {
+            match self {
+                Self::Interpolation(record) => Some(record),
+                _ => None,
+            }
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct MemoryRecordWriter {
-        pub(crate) records: Vec<NormalizedRecord>,
+        pub(crate) records: Vec<CapturedRecord>,
         pub(crate) rejections: Vec<RejectedRecord>,
     }
 
     impl RecordWriter for MemoryRecordWriter {
-        fn write_record(&mut self, record: NormalizedRecord) -> Result<RecordId> {
+        fn write_address(&mut self, record: &AddressRecord) -> Result<RecordId> {
             let record_id = self.records.len() as u64;
-            self.records.push(record);
+            self.records.push(CapturedRecord::Address(record.clone()));
+            Ok(record_id)
+        }
+
+        fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
+            let record_id = self.records.len() as u64;
+            self.records
+                .push(CapturedRecord::Place(layer, record.clone()));
+            Ok(record_id)
+        }
+
+        fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<RecordId> {
+            let record_id = self.records.len() as u64;
+            self.records
+                .push(CapturedRecord::Interpolation(record.clone()));
+            Ok(record_id)
+        }
+
+        fn write_street(&mut self, record: &StreetRecord) -> Result<RecordId> {
+            let record_id = self.records.len() as u64;
+            self.records.push(CapturedRecord::Street(record.clone()));
+            Ok(record_id)
+        }
+
+        fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId> {
+            let record_id = self.records.len() as u64;
+            self.records.push(CapturedRecord::Postcode(record.clone()));
             Ok(record_id)
         }
 
@@ -738,40 +917,35 @@ mod tests {
 
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_record(NormalizedRecord::address(address_record(
-                "osm:node:1",
-                "10 King Street",
-            )))
+            .write_address(&address_record("osm:node:1", "10 King Street"))
             .expect("write first");
         writer
-            .write_record(NormalizedRecord::address(address_record(
-                "osm:node:2",
-                "20 Queen Street",
-            )))
+            .write_address(&address_record("osm:node:2", "20 Queen Street"))
             .expect("write second");
         let mut report = BuilderReport::default();
         writer.finish(&mut report).expect("finish");
 
         let reader = PackReader::open(&temp_dir).expect("reader");
         assert_eq!(reader.manifest().record_count, 2);
-        assert_eq!(reader.read_record(1).expect("row 1").id(), "osm:node:2");
+        assert_eq!(reader.record_summary(1).expect("row 1").id, "osm:node:2");
         assert_eq!(
             reader
-                .record_by_source_id("osm:node:1")
+                .record_json_by_source_id("osm:node:1")
                 .expect("lookup")
                 .expect("record")
-                .label(),
-            "10 King Street"
+                .get("label")
+                .and_then(serde_json::Value::as_str),
+            Some("10 King Street")
         );
         assert_eq!(
             reader
-                .records_by_layer("address", 10)
+                .records_json_by_layer("address", 10)
                 .expect("layer records")
                 .len(),
             2
         );
-        assert!(report.record_table_bytes > 8);
-        assert!(report.offset_table_bytes > 16);
+        assert!(report.record_table_bytes > 0);
+        assert_eq!(report.offset_table_bytes, 0);
         assert!(report.text_index_bytes > 0);
         assert_eq!(report.text_index_document_count, 2);
         assert!(report.text_index_prefix.autocomplete_prefix_terms_total > 0);
@@ -812,6 +986,15 @@ mod tests {
                 .keys()
                 .any(|path| path.starts_with("text/tantivy/"))
         );
+        assert!(
+            reader
+                .manifest()
+                .files
+                .contains_key("records/RecordsArchive.archive")
+        );
+        assert!(reader.manifest().files.contains_key("records/records"));
+        assert!(reader.manifest().files.contains_key("records/strings"));
+        assert!(reader.manifest().files.contains_key("records/geometries"));
         assert!(
             reader
                 .manifest()
