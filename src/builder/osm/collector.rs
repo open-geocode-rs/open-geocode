@@ -109,7 +109,7 @@ pub(crate) fn discover_address_features(input: &Path) -> Result<DiscoveryResult>
     sort_discovery_chunk(&mut chunk);
 
     let mut report = BuilderReport {
-        schema_version: 9,
+        schema_version: 10,
         input: input.display().to_string(),
         input_bytes: input_bytes(input)?,
         scanned: chunk.scanned.clone(),

@@ -72,8 +72,6 @@ pub struct BuildMetricReport {
     pub record_store: RecordStoreBuildMetrics,
     pub text_index: TextIndexBuildMetrics,
     pub spatial_index: SpatialIndexBuildMetrics,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_prefix: Option<TextPrefixMetricSummary>,
     pub osm_scan: OsmScanMetrics,
     pub geometry_resolution: GeometryResolutionMetrics,
 }
@@ -117,8 +115,6 @@ pub struct TextIndexBuildMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_generation_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tantivy_document_build_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tantivy_add_document_ms: Option<u128>,
@@ -150,21 +146,6 @@ pub struct SpatialIndexBuildMetrics {
     pub cell_directory_build_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_write_ms: Option<u128>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct TextPrefixMetricSummary {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terms_total: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terms_avg_per_record: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terms_p95_per_record: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terms_max_per_record: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terms_cap_hit_count: Option<u64>,
-    pub terms_by_field: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -543,10 +524,6 @@ fn build_metrics(report: &Value) -> BuildMetricReport {
             bytes: value_at_u64(report, &["text_index_bytes"]),
             write_ms: value_at_u128(report, &["pack_write", "text_index_write_ms"]),
             projection_ms: value_at_u128(report, &["pack_write", "text_projection_ms"]),
-            prefix_generation_ms: value_at_u128(
-                report,
-                &["pack_write", "text_prefix_generation_ms"],
-            ),
             tantivy_document_build_ms: value_at_u128(
                 report,
                 &["pack_write", "tantivy_document_build_ms"],
@@ -582,7 +559,6 @@ fn build_metrics(report: &Value) -> BuildMetricReport {
             ),
             file_write_ms: value_at_u128(report, &["pack_write", "spatial_file_write_ms"]),
         },
-        text_prefix: text_prefix_metrics(report),
         osm_scan: OsmScanMetrics {
             dense_nodes: value_at_u64(report, &["scanned", "dense_nodes"]),
             nodes: value_at_u64(report, &["scanned", "nodes"]),
@@ -608,18 +584,6 @@ fn build_metrics(report: &Value) -> BuildMetricReport {
     }
 }
 
-fn text_prefix_metrics(report: &Value) -> Option<TextPrefixMetricSummary> {
-    let prefix = report.get("text_index_prefix")?;
-    Some(TextPrefixMetricSummary {
-        terms_total: value_at_u64(prefix, &["autocomplete_prefix_terms_total"]),
-        terms_avg_per_record: value_at_f64(prefix, &["autocomplete_prefix_terms_avg_per_record"]),
-        terms_p95_per_record: value_at_u64(prefix, &["autocomplete_prefix_terms_p95_per_record"]),
-        terms_max_per_record: value_at_u64(prefix, &["autocomplete_prefix_terms_max_per_record"]),
-        terms_cap_hit_count: value_at_u64(prefix, &["autocomplete_prefix_terms_cap_hit_count"]),
-        terms_by_field: object_u64_map(prefix.get("autocomplete_prefix_terms_by_field")),
-    })
-}
-
 fn value_at_u64(value: &Value, path: &[&str]) -> Option<u64> {
     let mut current = value;
     for key in path {
@@ -630,24 +594,6 @@ fn value_at_u64(value: &Value, path: &[&str]) -> Option<u64> {
 
 fn value_at_u128(value: &Value, path: &[&str]) -> Option<u128> {
     value_at_u64(value, path).map(u128::from)
-}
-
-fn value_at_f64(value: &Value, path: &[&str]) -> Option<f64> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    current.as_f64()
-}
-
-fn object_u64_map(value: Option<&Value>) -> BTreeMap<String, u64> {
-    let Some(object) = value.and_then(Value::as_object) else {
-        return BTreeMap::new();
-    };
-    object
-        .iter()
-        .filter_map(|(key, value)| value.as_u64().map(|number| (key.clone(), number)))
-        .collect()
 }
 
 fn rate_per_sec(count: Option<u64>, total_ms: Option<u128>) -> Option<f64> {

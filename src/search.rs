@@ -5,13 +5,15 @@ use serde::Serialize;
 use tantivy::{
     Index, IndexReader, Score, Searcher, Term,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
-    schema::IndexRecordOption,
+    query::{BooleanQuery, Occur, PhrasePrefixQuery, Query, QueryParser, TermQuery},
+    schema::{Field, IndexRecordOption},
 };
 
 use crate::{
     pack::{PackReader, RecordId, RecordSummary},
-    text_index::{TextIndexFields, normalize_index_text, open_text_index},
+    text_index::{
+        TEXT_INDEX_SCHEMA_VERSION, TextIndexFields, normalize_index_text, open_text_index,
+    },
 };
 
 pub struct PackTextSearcher {
@@ -44,11 +46,24 @@ pub struct TextSearchHit {
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
-const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 2;
+const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
+const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 
 impl PackTextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
         let pack = PackReader::open(&pack_path)?;
+        let text_index_manifest = pack
+            .manifest()
+            .text_index
+            .as_ref()
+            .context("pack manifest is missing text index metadata")?;
+        if text_index_manifest.schema_version != TEXT_INDEX_SCHEMA_VERSION {
+            bail!(
+                "text index schema version {} is unsupported; rebuild pack for schema {}",
+                text_index_manifest.schema_version,
+                TEXT_INDEX_SCHEMA_VERSION
+            );
+        }
         let index = open_text_index(&pack_path)?;
         let schema = index.schema();
         let fields = TextIndexFields::from_schema(&schema)?;
@@ -152,19 +167,34 @@ impl PackTextSearcher {
         query_text: &str,
         layer: Option<&str>,
     ) -> Result<Option<Box<dyn Query>>> {
-        let prefix_query = self.autocomplete_prefix_query(query_text)?;
-        let mut subqueries = Vec::new();
-
-        if let Some(complete_text) = autocomplete_complete_text(query_text) {
-            let mut query_parser = QueryParser::for_index(&self.index, self.search_fields());
-            query_parser.set_conjunction_by_default();
-            let complete_query = query_parser.parse_query(&complete_text).with_context(|| {
-                format!("failed to parse autocomplete complete terms {complete_text:?}")
-            })?;
-            subqueries.push((Occur::Must, complete_query));
+        let tokens = autocomplete_query_tokens(query_text);
+        if tokens.is_empty() {
+            return Ok(None);
         }
 
-        subqueries.push((Occur::Must, prefix_query));
+        let mut subqueries = Vec::new();
+
+        let subject_tokens = if tokens.len() > 1 && is_address_number_token(&tokens[0]) {
+            subqueries.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.address_number, &tokens[0]),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ));
+            &tokens[1..]
+        } else {
+            tokens.as_slice()
+        };
+
+        if subject_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        subqueries.push((
+            Occur::Must,
+            autocomplete_subject_query(self.fields.autocomplete_subject_text, subject_tokens),
+        ));
 
         if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
             subqueries.push((
@@ -177,27 +207,6 @@ impl PackTextSearcher {
         }
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
-    }
-
-    fn autocomplete_prefix_query(&self, query_text: &str) -> Result<Box<dyn Query>> {
-        let mut subqueries = Vec::new();
-        for term_text in autocomplete_prefix_terms(query_text) {
-            for field in [
-                self.fields.autocomplete_prefix,
-                self.fields.autocomplete_postcode_prefix,
-                self.fields.autocomplete_house_number_prefix,
-            ] {
-                subqueries.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(field, &term_text),
-                        IndexRecordOption::Basic,
-                    )) as Box<dyn Query>,
-                ));
-            }
-        }
-
-        Ok(Box::new(BooleanQuery::new(subqueries)))
     }
 
     fn record_id_from_doc_address(
@@ -248,31 +257,28 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
 }
 
-fn autocomplete_prefix_terms(query_text: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let full = query_text.trim();
-    if !full.is_empty() {
-        terms.push(full.to_string());
-    }
-
-    if let Some(last) = full.split_whitespace().last() {
-        if last.chars().count() >= MIN_AUTOCOMPLETE_QUERY_CHARS
-            && !terms.iter().any(|term| term == last)
-        {
-            terms.push(last.to_string());
-        }
-    }
-
-    terms
+fn autocomplete_query_tokens(query_text: &str) -> Vec<String> {
+    query_text
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
 }
 
-fn autocomplete_complete_text(query_text: &str) -> Option<String> {
-    let tokens = query_text.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() <= 1 {
-        None
-    } else {
-        Some(tokens[..tokens.len() - 1].join(" "))
-    }
+fn autocomplete_subject_query(field: Field, tokens: &[String]) -> Box<dyn Query> {
+    let terms = tokens
+        .iter()
+        .map(|token| Term::from_field_text(field, token))
+        .collect::<Vec<_>>();
+    let mut query = PhrasePrefixQuery::new(terms);
+    query.set_max_expansions(AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS);
+    Box::new(query)
+}
+
+fn is_address_number_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -533,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn autocompletes_postcode_and_house_number_prefixes() {
+    fn autocompletes_postcode_but_not_standalone_house_number_prefixes() {
         let temp_dir = temp_pack_path("autocomplete-postcode-house-number");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -541,8 +547,8 @@ mod tests {
         writer
             .write_address(&address_record(
                 "osm:node:1",
-                "221B Baker Street, London, NW1",
-                "221B",
+                "221 Baker Street, London, NW1",
+                "221",
                 "Baker Street",
                 Some("London"),
                 Some("NW1 6XE"),
@@ -569,15 +575,49 @@ mod tests {
             .expect("number autocomplete");
 
         assert_eq!(postcode_hits.len(), 1);
-        assert_eq!(number_hits.len(), 1);
+        assert!(number_hits.is_empty());
         assert_eq!(postcode_hits[0].record_id, 0);
-        assert_eq!(number_hits[0].record_id, 0);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
-    fn autocomplete_ignores_blank_and_single_character_queries() {
+    fn autocompletes_house_number_with_street_prefix() {
+        let temp_dir = temp_pack_path("autocomplete-number-street-prefix");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write_address(&address_record(
+                "osm:node:1",
+                "221 Baker Street, London, NW1",
+                "221",
+                "Baker Street",
+                Some("London"),
+                Some("NW1 6XE"),
+            ))
+            .expect("write baker address");
+        writer
+            .finish(&mut BuilderReport::default())
+            .expect("finish");
+
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let hits = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "221 bak".to_string(),
+                limit: 5,
+                layer: None,
+            })
+            .expect("number plus street autocomplete");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id, 0);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn autocomplete_ignores_blank_and_short_queries() {
         let temp_dir = temp_pack_path("autocomplete-short");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -616,6 +656,16 @@ mod tests {
                     layer: None,
                 })
                 .expect("single character autocomplete")
+                .is_empty()
+        );
+        assert!(
+            searcher
+                .autocomplete(TextAutocompleteOptions {
+                    query: "ki".to_string(),
+                    limit: 5,
+                    layer: None,
+                })
+                .expect("two character autocomplete")
                 .is_empty()
         );
 

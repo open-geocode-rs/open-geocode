@@ -118,7 +118,6 @@ struct OffsetEntry {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TextIndexTimingNanos {
     text_projection_ns: u128,
-    text_prefix_generation_ns: u128,
     tantivy_document_build_ns: u128,
     tantivy_add_document_ns: u128,
 }
@@ -126,21 +125,16 @@ struct TextIndexTimingNanos {
 impl TextIndexTimingNanos {
     fn record(&mut self, metrics: TextIndexWriteMetrics) {
         self.text_projection_ns += metrics.text_projection_ns;
-        self.text_prefix_generation_ns += metrics.text_prefix_generation_ns;
         self.tantivy_document_build_ns += metrics.tantivy_document_build_ns;
         self.tantivy_add_document_ns += metrics.tantivy_add_document_ns;
     }
 
     fn apply_to(self, timings: &mut PackWriteTimings) {
         timings.text_projection_ms = nanos_to_millis(self.text_projection_ns);
-        timings.text_prefix_generation_ms = nanos_to_millis(self.text_prefix_generation_ns);
         timings.tantivy_document_build_ms = nanos_to_millis(self.tantivy_document_build_ns);
         timings.tantivy_add_document_ms = nanos_to_millis(self.tantivy_add_document_ns);
         timings.text_index_write_ms = nanos_to_millis(
-            self.text_projection_ns
-                + self.text_prefix_generation_ns
-                + self.tantivy_document_build_ns
-                + self.tantivy_add_document_ns,
+            self.text_projection_ns + self.tantivy_document_build_ns + self.tantivy_add_document_ns,
         );
     }
 }
@@ -262,7 +256,6 @@ impl PackWriter {
         report.text_index_schema_version = text_index_commit.schema_version;
         report.text_index_document_count = text_index_commit.document_count;
         report.text_index_bytes = text_index_bytes;
-        report.text_index_prefix = self.text_index.prefix_stats();
         report.spatial_index_path = spatial_index_commit.relative_path.clone();
         report.spatial_index_schema_version = spatial_index_commit.schema_version;
         report.spatial_index_point_count = spatial_index_commit.point_count;
@@ -948,13 +941,6 @@ mod tests {
         assert_eq!(report.offset_table_bytes, 0);
         assert!(report.text_index_bytes > 0);
         assert_eq!(report.text_index_document_count, 2);
-        assert!(report.text_index_prefix.autocomplete_prefix_terms_total > 0);
-        assert!(
-            report
-                .text_index_prefix
-                .autocomplete_prefix_terms_by_layer
-                .contains_key("address")
-        );
         assert!(report.spatial_index_bytes > 0);
         assert_eq!(report.spatial_index_point_count, 2);
         assert_eq!(

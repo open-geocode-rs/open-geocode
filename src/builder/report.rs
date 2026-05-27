@@ -28,23 +28,11 @@ pub struct BuilderReport {
     pub text_index_schema_version: u32,
     pub text_index_document_count: u64,
     pub text_index_bytes: u64,
-    pub text_index_prefix: TextIndexPrefixStats,
     pub spatial_index_path: String,
     pub spatial_index_schema_version: u32,
     pub spatial_index_point_count: u64,
     pub spatial_index_segment_count: u64,
     pub spatial_index_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct TextIndexPrefixStats {
-    pub autocomplete_prefix_terms_total: u64,
-    pub autocomplete_prefix_terms_avg_per_record: f64,
-    pub autocomplete_prefix_terms_p95_per_record: u64,
-    pub autocomplete_prefix_terms_max_per_record: u64,
-    pub autocomplete_prefix_terms_cap_hit_count: u64,
-    pub autocomplete_prefix_terms_by_layer: BTreeMap<String, u64>,
-    pub autocomplete_prefix_terms_by_field: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -132,7 +120,6 @@ pub struct PackWriteTimings {
     pub record_table_write_ms: u128,
     pub text_index_write_ms: u128,
     pub text_projection_ms: u128,
-    pub text_prefix_generation_ms: u128,
     pub tantivy_document_build_ms: u128,
     pub tantivy_add_document_ms: u128,
     pub spatial_index_write_ms: u128,
