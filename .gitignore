@@ -7,7 +7,6 @@
 /packs/
 /tmp/
 /demo/data/*.js
-/bench-results/
 
 # Environment
 .env
