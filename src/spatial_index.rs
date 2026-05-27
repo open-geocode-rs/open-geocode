@@ -3,12 +3,14 @@ use std::{
     collections::BTreeSet,
     fmt,
     fs::{self, File},
-    io::Write,
+    io::{BufWriter, Write},
+    mem,
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
+use bytemuck::{Pod, Zeroable};
 use geojson::{Geometry, GeometryValue};
 use h3o::{CellIndex, LatLng, Resolution};
 use memmap2::{Mmap, MmapOptions};
@@ -19,6 +21,9 @@ use crate::{
     pack::RecordId,
     record::{NormalizedRecord, PlaceRecord},
 };
+
+#[cfg(not(target_endian = "little"))]
+compile_error!("open-geocode spatial pack files currently require little-endian targets");
 
 pub const SPATIAL_INDEX_V2_RELATIVE_DIR: &str = "spatial/v2";
 pub const SPATIAL_INDEX_SCHEMA_VERSION: u32 = 2;
@@ -44,6 +49,8 @@ const CELL_ENTRY_BYTES: usize = 40;
 const POINT_ENTRY_BYTES: usize = 17;
 const SEGMENT_ENTRY_BYTES: usize = 33;
 const REF_ENTRY_BYTES: usize = 4;
+const SPATIAL_FILE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const SPATIAL_ENCODE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 const FRACTION_SCALE: f64 = u32::MAX as f64;
@@ -205,7 +212,8 @@ impl fmt::Debug for CountedMmap {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 struct CellDirectoryEntry {
     h3_cell: u64,
     point_start: u64,
@@ -213,6 +221,9 @@ struct CellDirectoryEntry {
     segment_start: u64,
     segment_count: u64,
 }
+
+const _: () = assert!(mem::size_of::<CellDirectoryEntry>() == CELL_ENTRY_BYTES);
+const _: () = assert!(mem::size_of::<u32>() == REF_ENTRY_BYTES);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CellRefPair {
@@ -813,24 +824,23 @@ fn elapsed_ms(started: Instant) -> u128 {
 
 fn write_cells_file(path: &Path, entries: &[CellDirectoryEntry]) -> Result<()> {
     write_counted_file(path, V2_CELLS_MAGIC, entries.len() as u64, |file| {
-        for entry in entries {
-            file.write_all(&entry.h3_cell.to_le_bytes())?;
-            file.write_all(&entry.point_start.to_le_bytes())?;
-            file.write_all(&entry.point_count.to_le_bytes())?;
-            file.write_all(&entry.segment_start.to_le_bytes())?;
-            file.write_all(&entry.segment_count.to_le_bytes())?;
-        }
+        file.write_all(bytemuck::cast_slice(entries))?;
         Ok(())
     })
 }
 
 fn write_points_file(path: &Path, points: &[SpatialPointEntry]) -> Result<()> {
     write_counted_file(path, V2_POINTS_MAGIC, points.len() as u64, |file| {
+        let mut buffer = Vec::with_capacity(SPATIAL_ENCODE_BUFFER_BYTES);
         for point in points {
-            file.write_all(&point.record_id.to_le_bytes())?;
-            file.write_all(&[spatial_layer_code(point.layer)])?;
-            file.write_all(&quantize_coordinate(point.lon).to_le_bytes())?;
-            file.write_all(&quantize_coordinate(point.lat).to_le_bytes())?;
+            flush_if_full(&mut buffer, POINT_ENTRY_BYTES, file)?;
+            buffer.extend_from_slice(&point.record_id.to_le_bytes());
+            buffer.push(spatial_layer_code(point.layer));
+            buffer.extend_from_slice(&quantize_coordinate(point.lon).to_le_bytes());
+            buffer.extend_from_slice(&quantize_coordinate(point.lat).to_le_bytes());
+        }
+        if !buffer.is_empty() {
+            file.write_all(&buffer)?;
         }
         Ok(())
     })
@@ -838,15 +848,20 @@ fn write_points_file(path: &Path, points: &[SpatialPointEntry]) -> Result<()> {
 
 fn write_segments_file(path: &Path, segments: &[SpatialSegmentEntry]) -> Result<()> {
     write_counted_file(path, V2_SEGMENTS_MAGIC, segments.len() as u64, |file| {
+        let mut buffer = Vec::with_capacity(SPATIAL_ENCODE_BUFFER_BYTES);
         for segment in segments {
-            file.write_all(&segment.record_id.to_le_bytes())?;
-            file.write_all(&[spatial_layer_code(segment.layer)])?;
-            file.write_all(&quantize_coordinate(segment.start_lon).to_le_bytes())?;
-            file.write_all(&quantize_coordinate(segment.start_lat).to_le_bytes())?;
-            file.write_all(&quantize_coordinate(segment.end_lon).to_le_bytes())?;
-            file.write_all(&quantize_coordinate(segment.end_lat).to_le_bytes())?;
-            file.write_all(&quantize_fraction(segment.start_fraction).to_le_bytes())?;
-            file.write_all(&quantize_fraction(segment.end_fraction).to_le_bytes())?;
+            flush_if_full(&mut buffer, SEGMENT_ENTRY_BYTES, file)?;
+            buffer.extend_from_slice(&segment.record_id.to_le_bytes());
+            buffer.push(spatial_layer_code(segment.layer));
+            buffer.extend_from_slice(&quantize_coordinate(segment.start_lon).to_le_bytes());
+            buffer.extend_from_slice(&quantize_coordinate(segment.start_lat).to_le_bytes());
+            buffer.extend_from_slice(&quantize_coordinate(segment.end_lon).to_le_bytes());
+            buffer.extend_from_slice(&quantize_coordinate(segment.end_lat).to_le_bytes());
+            buffer.extend_from_slice(&quantize_fraction(segment.start_fraction).to_le_bytes());
+            buffer.extend_from_slice(&quantize_fraction(segment.end_fraction).to_le_bytes());
+        }
+        if !buffer.is_empty() {
+            file.write_all(&buffer)?;
         }
         Ok(())
     })
@@ -854,25 +869,36 @@ fn write_segments_file(path: &Path, segments: &[SpatialSegmentEntry]) -> Result<
 
 fn write_refs_file(path: &Path, magic: &[u8; 8], refs: &[u32]) -> Result<()> {
     write_counted_file(path, magic, refs.len() as u64, |file| {
-        for id in refs {
-            file.write_all(&id.to_le_bytes())?;
-        }
+        file.write_all(bytemuck::cast_slice(refs))?;
         Ok(())
     })
+}
+
+fn flush_if_full(
+    buffer: &mut Vec<u8>,
+    next_entry_bytes: usize,
+    file: &mut BufWriter<File>,
+) -> Result<()> {
+    if buffer.len() + next_entry_bytes > SPATIAL_ENCODE_BUFFER_BYTES {
+        file.write_all(buffer)?;
+        buffer.clear();
+    }
+    Ok(())
 }
 
 fn write_counted_file(
     path: &Path,
     magic: &[u8; 8],
     count: u64,
-    write_entries: impl FnOnce(&mut File) -> Result<()>,
+    write_entries: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let mut file =
+    let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut file = BufWriter::with_capacity(SPATIAL_FILE_BUFFER_BYTES, file);
     file.write_all(magic)?;
     file.write_all(&count.to_le_bytes())?;
     write_entries(&mut file)?;

@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
+bytemuck = { version = "1.21", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 geo = "0.33"
 geojson = "1.0"
