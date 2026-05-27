@@ -47,7 +47,7 @@ pub(crate) fn discover_address_features(
     writer: &mut dyn RecordWriter,
 ) -> Result<DiscoveryResult> {
     let mut report = BuilderReport {
-        schema_version: 7,
+        schema_version: 8,
         input: input.display().to_string(),
         input_bytes: input_bytes(input)?,
         ..BuilderReport::default()
@@ -59,7 +59,7 @@ pub(crate) fn discover_address_features(
     let mut address_node_tags = HashMap::new();
     let mut required_node_ids = HashSet::new();
     let mut write_error: Option<anyhow::Error> = None;
-    let (reader, progress) = element_reader_with_progress(input, "1/3 discover address features")?;
+    let (reader, progress) = element_reader_with_progress(input, "1/7 scan OSM features")?;
 
     reader
         .for_each(|element| match element {
@@ -357,7 +357,7 @@ pub(crate) fn discover_address_features(
             }
         })
         .with_context(|| format!("failed to parse {}", input.display()))?;
-    progress.finish_with_message("1/3 discover address features complete");
+    progress.finish_with_message("1/7 scan OSM features complete");
 
     if let Some(error) = write_error {
         return Err(error);

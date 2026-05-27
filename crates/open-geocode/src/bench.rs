@@ -46,9 +46,6 @@ pub struct PackMetricReport {
     pub bytes: PackByteMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildMetricReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_report: Option<Value>,
-    pub files: Vec<PackFileMetric>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,8 +68,119 @@ pub struct BuildMetricReport {
     pub accepted_records_per_sec: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected_records_per_sec: Option<f64>,
-    pub phases_ms: BTreeMap<String, u128>,
-    pub pack_write_ms: BTreeMap<String, u128>,
+    pub phases: BuildPhaseMetrics,
+    pub record_store: RecordStoreBuildMetrics,
+    pub text_index: TextIndexBuildMetrics,
+    pub spatial_index: SpatialIndexBuildMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_prefix: Option<TextPrefixMetricSummary>,
+    pub osm_scan: OsmScanMetrics,
+    pub geometry_resolution: GeometryResolutionMetrics,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct BuildPhaseMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_create_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osm_feature_scan_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_coordinate_resolution_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_emission_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_finalize_ms: Option<u128>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct RecordStoreBuildMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_encode_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_table_write_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_encode_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_table_write_ms: Option<u128>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct TextIndexBuildMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_generation_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tantivy_document_build_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tantivy_add_document_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_ms: Option<u128>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct SpatialIndexBuildMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_record_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalize_ms: Option<u128>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct TextPrefixMetricSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terms_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terms_avg_per_record: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terms_p95_per_record: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terms_max_per_record: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terms_cap_hit_count: Option<u64>,
+    pub terms_by_field: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct OsmScanMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_nodes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ways: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relations: Option<u64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct GeometryResolutionMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_way_stubs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpolation_way_stubs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street_way_stubs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_node_refs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_node_refs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,8 +391,6 @@ fn pack_metrics(pack_path: &Path, manifest: &PackManifest) -> Result<PackMetricR
         manifest: PackManifestSummary::from_manifest(manifest),
         bytes,
         build,
-        build_report,
-        files,
     })
 }
 
@@ -404,9 +510,89 @@ fn build_metrics(report: &Value) -> BuildMetricReport {
         input_mib_per_sec: rate_mib_per_sec(input_bytes, total_ms),
         accepted_records_per_sec: rate_per_sec(accepted_records, total_ms),
         rejected_records_per_sec: rate_per_sec(rejected_records, total_ms),
-        phases_ms: object_u128_map(report.get("phases")),
-        pack_write_ms: object_u128_map(report.get("pack_write")),
+        phases: BuildPhaseMetrics {
+            pack_create_ms: value_at_u128(report, &["phases", "pack_create_ms"]),
+            osm_feature_scan_ms: value_at_u128(report, &["phases", "discovery_ms"]),
+            node_coordinate_resolution_ms: value_at_u128(
+                report,
+                &["phases", "coordinate_resolution_ms"],
+            ),
+            record_emission_ms: value_at_u128(report, &["phases", "record_emission_ms"]),
+            pack_finalize_ms: value_at_u128(report, &["phases", "pack_finish_ms"]),
+        },
+        record_store: RecordStoreBuildMetrics {
+            record_encode_ms: value_at_u128(report, &["pack_write", "record_encode_ms"]),
+            record_table_write_ms: value_at_u128(report, &["pack_write", "record_table_write_ms"]),
+            rejection_encode_ms: value_at_u128(report, &["pack_write", "rejection_encode_ms"]),
+            rejection_table_write_ms: value_at_u128(
+                report,
+                &["pack_write", "rejection_table_write_ms"],
+            ),
+        },
+        text_index: TextIndexBuildMetrics {
+            schema_version: value_at_u64(report, &["text_index_schema_version"]),
+            document_count: value_at_u64(report, &["text_index_document_count"]),
+            bytes: value_at_u64(report, &["text_index_bytes"]),
+            write_ms: value_at_u128(report, &["pack_write", "text_index_write_ms"]),
+            projection_ms: value_at_u128(report, &["pack_write", "text_projection_ms"]),
+            prefix_generation_ms: value_at_u128(
+                report,
+                &["pack_write", "text_prefix_generation_ms"],
+            ),
+            tantivy_document_build_ms: value_at_u128(
+                report,
+                &["pack_write", "tantivy_document_build_ms"],
+            ),
+            tantivy_add_document_ms: value_at_u128(
+                report,
+                &["pack_write", "tantivy_add_document_ms"],
+            ),
+            commit_ms: value_at_u128(report, &["pack_write", "text_index_commit_ms"]),
+        },
+        spatial_index: SpatialIndexBuildMetrics {
+            schema_version: value_at_u64(report, &["spatial_index_schema_version"]),
+            point_count: value_at_u64(report, &["spatial_index_point_count"]),
+            segment_count: value_at_u64(report, &["spatial_index_segment_count"]),
+            bytes: value_at_u64(report, &["spatial_index_bytes"]),
+            add_record_ms: value_at_u128(report, &["pack_write", "spatial_index_write_ms"]),
+            finalize_ms: value_at_u128(report, &["pack_write", "spatial_index_finish_ms"]),
+        },
+        text_prefix: text_prefix_metrics(report),
+        osm_scan: OsmScanMetrics {
+            dense_nodes: value_at_u64(report, &["scanned", "dense_nodes"]),
+            nodes: value_at_u64(report, &["scanned", "nodes"]),
+            ways: value_at_u64(report, &["scanned", "ways"]),
+            relations: value_at_u64(report, &["scanned", "relations"]),
+        },
+        geometry_resolution: GeometryResolutionMetrics {
+            address_way_stubs: value_at_u64(report, &["geometry_resolution", "address_way_stubs"]),
+            interpolation_way_stubs: value_at_u64(
+                report,
+                &["geometry_resolution", "interpolation_way_stubs"],
+            ),
+            street_way_stubs: value_at_u64(report, &["geometry_resolution", "street_way_stubs"]),
+            required_node_refs: value_at_u64(
+                report,
+                &["geometry_resolution", "required_node_refs"],
+            ),
+            resolved_node_refs: value_at_u64(
+                report,
+                &["geometry_resolution", "resolved_node_refs"],
+            ),
+        },
     }
+}
+
+fn text_prefix_metrics(report: &Value) -> Option<TextPrefixMetricSummary> {
+    let prefix = report.get("text_index_prefix")?;
+    Some(TextPrefixMetricSummary {
+        terms_total: value_at_u64(prefix, &["autocomplete_prefix_terms_total"]),
+        terms_avg_per_record: value_at_f64(prefix, &["autocomplete_prefix_terms_avg_per_record"]),
+        terms_p95_per_record: value_at_u64(prefix, &["autocomplete_prefix_terms_p95_per_record"]),
+        terms_max_per_record: value_at_u64(prefix, &["autocomplete_prefix_terms_max_per_record"]),
+        terms_cap_hit_count: value_at_u64(prefix, &["autocomplete_prefix_terms_cap_hit_count"]),
+        terms_by_field: object_u64_map(prefix.get("autocomplete_prefix_terms_by_field")),
+    })
 }
 
 fn value_at_u64(value: &Value, path: &[&str]) -> Option<u64> {
@@ -421,13 +607,21 @@ fn value_at_u128(value: &Value, path: &[&str]) -> Option<u128> {
     value_at_u64(value, path).map(u128::from)
 }
 
-fn object_u128_map(value: Option<&Value>) -> BTreeMap<String, u128> {
+fn value_at_f64(value: &Value, path: &[&str]) -> Option<f64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_f64()
+}
+
+fn object_u64_map(value: Option<&Value>) -> BTreeMap<String, u64> {
     let Some(object) = value.and_then(Value::as_object) else {
         return BTreeMap::new();
     };
     object
         .iter()
-        .filter_map(|(key, value)| value.as_u64().map(|number| (key.clone(), number as u128)))
+        .filter_map(|(key, value)| value.as_u64().map(|number| (key.clone(), number)))
         .collect()
 }
 
@@ -698,7 +892,8 @@ mod tests {
         assert!(report.pack.bytes.total > 0);
         assert!(report.pack.bytes.record_store > 0);
         let build = report.pack.build.as_ref().expect("build metrics");
-        assert!(build.pack_write_ms.contains_key("runtime_finalize_ms"));
+        assert!(build.phases.pack_finalize_ms.is_some());
+        assert!(build.text_index.commit_ms.is_some());
         assert!(report.open.pack_reader_ms >= 0.0);
         assert_eq!(report.queries.search.case_count, 0);
 

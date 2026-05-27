@@ -3,10 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tantivy::{
-    Index, IndexReader, Score, TantivyDocument, Term,
+    Index, IndexReader, Score, Searcher, Term,
     collector::TopDocs,
     query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
-    schema::{IndexRecordOption, Value},
+    schema::IndexRecordOption,
 };
 
 use crate::{
@@ -119,8 +119,6 @@ impl PackTextSearcher {
         query_parser.set_field_boost(self.fields.name_text, 2.5);
         query_parser.set_field_boost(self.fields.address_number, 2.0);
         query_parser.set_field_boost(self.fields.postcode_exact, 2.0);
-        query_parser.set_field_boost(self.fields.street_text, 1.5);
-        query_parser.set_field_boost(self.fields.postcode_text, 1.5);
 
         let text_query = query_parser
             .parse_query(query_text)
@@ -144,16 +142,9 @@ impl PackTextSearcher {
         vec![
             self.fields.label_text,
             self.fields.name_text,
-            self.fields.all_text,
+            self.fields.content_text,
             self.fields.address_number,
-            self.fields.street_text,
-            self.fields.place_text,
-            self.fields.unit_text,
-            self.fields.locality_text,
-            self.fields.region_text,
-            self.fields.postcode_text,
             self.fields.postcode_exact,
-            self.fields.country_text,
         ]
     }
 
@@ -210,11 +201,19 @@ impl PackTextSearcher {
         Ok(Box::new(BooleanQuery::new(subqueries)))
     }
 
-    fn record_id_from_document(&self, document: &TantivyDocument) -> Result<RecordId> {
-        document
-            .get_first(self.fields.record_id)
-            .and_then(|value| value.as_u64())
-            .context("text index hit is missing stored record_id")
+    fn record_id_from_doc_address(
+        &self,
+        searcher: &Searcher,
+        doc_address: tantivy::DocAddress,
+    ) -> Result<RecordId> {
+        let record_id_reader = searcher
+            .segment_reader(doc_address.segment_ord)
+            .fast_fields()
+            .u64("record_id")?;
+        record_id_reader
+            .values_for_doc(doc_address.doc_id)
+            .next()
+            .context("text index hit is missing fast record_id")
     }
 
     fn hydrate_top_docs(
@@ -225,8 +224,7 @@ impl PackTextSearcher {
         top_docs
             .into_iter()
             .map(|(score, doc_address)| {
-                let document: TantivyDocument = searcher.doc(doc_address)?;
-                let record_id = self.record_id_from_document(&document)?;
+                let record_id = self.record_id_from_doc_address(&searcher, doc_address)?;
                 let record = self.pack.read_record(record_id)?;
                 Ok(TextSearchHit {
                     record_id,

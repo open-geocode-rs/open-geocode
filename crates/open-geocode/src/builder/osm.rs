@@ -93,7 +93,7 @@ fn emit_normalized_records(
     postcode_accumulator: &mut PostcodeAccumulator,
     report: &mut BuilderReport,
 ) -> Result<()> {
-    let progress = item_progress_bar(inputs.way_stubs.len() as u64, "3/3 emit way centroids");
+    let progress = item_progress_bar(inputs.way_stubs.len() as u64, "3/7 emit address centroids");
     for stub in inputs.way_stubs {
         let Some(points) = resolve_way_points(stub, inputs.node_locations) else {
             report.reject(CandidateIssue::WayWithoutResolvedNodes);
@@ -136,13 +136,13 @@ fn emit_normalized_records(
         }
         progress.inc(1);
     }
-    progress.finish_with_message("3/3 emit way centroids complete");
+    progress.finish_with_message("3/7 emit address centroids complete");
 
     postcode_accumulator.write_records(writer, report)?;
 
     let progress = item_progress_bar(
         inputs.interpolation_way_stubs.len() as u64,
-        "3/3 emit interpolation ranges",
+        "4/7 emit interpolation ranges",
     );
     for stub in inputs.interpolation_way_stubs {
         write_interpolation_records(
@@ -154,17 +154,17 @@ fn emit_normalized_records(
         )?;
         progress.inc(1);
     }
-    progress.finish_with_message("3/3 emit interpolation ranges complete");
+    progress.finish_with_message("4/7 emit interpolation ranges complete");
 
     let progress = item_progress_bar(
         inputs.street_way_stubs.len() as u64,
-        "3/3 emit street segments",
+        "5/7 emit street segments",
     );
     for stub in inputs.street_way_stubs {
         write_street_record(stub, inputs.node_locations, writer, report)?;
         progress.inc(1);
     }
-    progress.finish_with_message("3/3 emit street segments complete");
+    progress.finish_with_message("5/7 emit street segments complete");
     Ok(())
 }
 

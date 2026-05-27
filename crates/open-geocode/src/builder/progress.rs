@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use indicatif::{ProgressBar, ProgressStyle};
 
 pub(crate) fn byte_progress_bar(len: u64, message: &'static str) -> ProgressBar {
@@ -23,5 +25,16 @@ pub(crate) fn item_progress_bar(len: u64, message: &'static str) -> ProgressBar 
         .progress_chars("=> "),
     );
     progress.set_message(message);
+    progress
+}
+
+pub(crate) fn stage_progress(message: &'static str) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{msg:32} {spinner} elapsed {elapsed_precise}")
+            .expect("valid stage progress template"),
+    );
+    progress.set_message(message);
+    progress.enable_steady_tick(Duration::from_millis(120));
     progress
 }

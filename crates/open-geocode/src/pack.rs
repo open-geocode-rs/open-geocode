@@ -10,10 +10,15 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    builder::report::{BuilderReport, PackWriteTimings},
+    builder::{
+        progress::stage_progress,
+        report::{BuilderReport, PackWriteTimings},
+    },
     record::{NormalizedRecord, RejectedRecord},
     spatial_index::{PackSpatialIndexWriter, SpatialIndexCommit},
-    text_index::{TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit},
+    text_index::{
+        TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit, TextIndexWriteMetrics,
+    },
 };
 
 pub type RecordId = u64;
@@ -33,6 +38,7 @@ pub struct PackWriter {
     text_index: TantivyTextIndexWriter,
     spatial_index: PackSpatialIndexWriter,
     write_timings: PackWriteTimings,
+    text_index_timing_nanos: TextIndexTimingNanos,
     record_count: u64,
     rejection_count: u64,
     layer_counts: BTreeMap<String, u64>,
@@ -89,6 +95,36 @@ struct OffsetEntry {
     layer_code: u16,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TextIndexTimingNanos {
+    text_projection_ns: u128,
+    text_prefix_generation_ns: u128,
+    tantivy_document_build_ns: u128,
+    tantivy_add_document_ns: u128,
+}
+
+impl TextIndexTimingNanos {
+    fn record(&mut self, metrics: TextIndexWriteMetrics) {
+        self.text_projection_ns += metrics.text_projection_ns;
+        self.text_prefix_generation_ns += metrics.text_prefix_generation_ns;
+        self.tantivy_document_build_ns += metrics.tantivy_document_build_ns;
+        self.tantivy_add_document_ns += metrics.tantivy_add_document_ns;
+    }
+
+    fn apply_to(self, timings: &mut PackWriteTimings) {
+        timings.text_projection_ms = nanos_to_millis(self.text_projection_ns);
+        timings.text_prefix_generation_ms = nanos_to_millis(self.text_prefix_generation_ns);
+        timings.tantivy_document_build_ms = nanos_to_millis(self.tantivy_document_build_ns);
+        timings.tantivy_add_document_ms = nanos_to_millis(self.tantivy_add_document_ns);
+        timings.text_index_write_ms = nanos_to_millis(
+            self.text_projection_ns
+                + self.text_prefix_generation_ns
+                + self.tantivy_document_build_ns
+                + self.tantivy_add_document_ns,
+        );
+    }
+}
+
 const PACK_SCHEMA_VERSION: u32 = 1;
 const RECORDS_MAGIC: &[u8; 8] = b"OGREC001";
 const OFFSETS_MAGIC: &[u8; 8] = b"OGOFF001";
@@ -142,6 +178,7 @@ impl PackWriter {
             text_index,
             spatial_index: PackSpatialIndexWriter::default(),
             write_timings: PackWriteTimings::default(),
+            text_index_timing_nanos: TextIndexTimingNanos::default(),
             record_count: 0,
             rejection_count: 0,
             layer_counts: BTreeMap::new(),
@@ -167,6 +204,13 @@ impl PackWriter {
         self.rejection_offsets.flush()?;
         self.write_timings.table_flush_ms += elapsed_ms(started);
 
+        let text_progress = stage_progress("6/7 finalize text index");
+        let text_index_flush_metrics = self.text_index.flush()?;
+        self.text_index_timing_nanos
+            .record(text_index_flush_metrics);
+        self.text_index_timing_nanos
+            .apply_to(&mut self.write_timings);
+
         let started = Instant::now();
         let text_index_commit = self.text_index.commit()?;
         self.write_timings.text_index_commit_ms += elapsed_ms(started);
@@ -174,8 +218,10 @@ impl PackWriter {
         let started = Instant::now();
         let text_index_bytes = dir_size(self.path.join(TEXT_INDEX_RELATIVE_PATH))?;
         self.write_timings.text_index_size_ms += elapsed_ms(started);
+        text_progress.finish_with_message("6/7 finalize text index complete");
 
         let spatial_index = std::mem::take(&mut self.spatial_index);
+        let spatial_progress = stage_progress("7/7 finalize spatial index");
         let started = Instant::now();
         let spatial_index_commit = spatial_index.finish(&self.path)?;
         self.write_timings.spatial_index_finish_ms += elapsed_ms(started);
@@ -183,6 +229,7 @@ impl PackWriter {
         let started = Instant::now();
         let spatial_index_bytes = dir_size(self.path.join(&spatial_index_commit.relative_path))?;
         self.write_timings.spatial_index_size_ms += elapsed_ms(started);
+        spatial_progress.finish_with_message("7/7 finalize spatial index complete");
 
         let started = Instant::now();
         report.record_table_bytes = file_len(self.path.join("records").join("records.bin"))?;
@@ -196,6 +243,7 @@ impl PackWriter {
         report.text_index_schema_version = text_index_commit.schema_version;
         report.text_index_document_count = text_index_commit.document_count;
         report.text_index_bytes = text_index_bytes;
+        report.text_index_prefix = self.text_index.prefix_stats();
         report.spatial_index_path = spatial_index_commit.relative_path.clone();
         report.spatial_index_schema_version = spatial_index_commit.schema_version;
         report.spatial_index_point_count = spatial_index_commit.point_count;
@@ -315,9 +363,8 @@ impl RecordWriter for PackWriter {
         )?;
         self.write_timings.record_table_write_ms += elapsed_ms(started);
 
-        let started = Instant::now();
-        self.text_index.add_record(record_id, &record)?;
-        self.write_timings.text_index_write_ms += elapsed_ms(started);
+        let text_index_metrics = self.text_index.add_record(record_id, &record)?;
+        self.text_index_timing_nanos.record(text_index_metrics);
 
         let started = Instant::now();
         self.spatial_index.add_record(record_id, &record)?;
@@ -543,6 +590,10 @@ fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
 }
 
+fn nanos_to_millis(nanos: u128) -> u128 {
+    nanos / 1_000_000
+}
+
 fn file_len(path: impl AsRef<Path>) -> Result<u64> {
     let path = path.as_ref();
     Ok(fs::metadata(path)
@@ -659,7 +710,7 @@ pub(crate) mod test_support {
 mod tests {
     use std::{collections::BTreeMap, path::Path};
 
-    use tantivy::{TantivyDocument, collector::TopDocs, query::QueryParser, schema::Value};
+    use tantivy::{collector::TopDocs, query::QueryParser};
 
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
@@ -713,6 +764,13 @@ mod tests {
         assert!(report.offset_table_bytes > 16);
         assert!(report.text_index_bytes > 0);
         assert_eq!(report.text_index_document_count, 2);
+        assert!(report.text_index_prefix.autocomplete_prefix_terms_total > 0);
+        assert!(
+            report
+                .text_index_prefix
+                .autocomplete_prefix_terms_by_layer
+                .contains_key("address")
+        );
         assert!(report.spatial_index_bytes > 0);
         assert_eq!(report.spatial_index_point_count, 2);
         assert_eq!(
@@ -761,16 +819,19 @@ mod tests {
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
-        let query_parser = QueryParser::for_index(&index, vec![fields.all_text]);
+        let query_parser = QueryParser::for_index(&index, vec![fields.content_text]);
         let parsed_query = query_parser.parse_query(query)?;
         let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(1))?;
         let Some((_score, doc_address)) = top_docs.first() else {
             bail!("no text hit for {query}");
         };
-        let document: TantivyDocument = searcher.doc(*doc_address)?;
-        document
-            .get_first(fields.record_id)
-            .and_then(|value| value.as_u64())
+        let record_id_reader = searcher
+            .segment_reader(doc_address.segment_ord)
+            .fast_fields()
+            .u64("record_id")?;
+        record_id_reader
+            .values_for_doc(doc_address.doc_id)
+            .next()
             .with_context(|| format!("missing record_id for text hit {query}"))
     }
 

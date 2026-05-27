@@ -21,7 +21,7 @@ pub(crate) fn resolve_required_node_locations(
     required_node_ids: &HashSet<i64>,
 ) -> Result<HashMap<i64, (f64, f64)>> {
     let mut node_locations = HashMap::with_capacity(required_node_ids.len());
-    let (reader, progress) = element_reader_with_progress(input, "2/3 resolve required nodes")?;
+    let (reader, progress) = element_reader_with_progress(input, "2/7 resolve node coordinates")?;
 
     reader
         .for_each(|element| match element {
@@ -38,7 +38,7 @@ pub(crate) fn resolve_required_node_locations(
             Element::Way(_) | Element::Relation(_) => {}
         })
         .with_context(|| format!("failed to resolve node locations from {}", input.display()))?;
-    progress.finish_with_message("2/3 resolve required nodes complete");
+    progress.finish_with_message("2/7 resolve node coordinates complete");
 
     Ok(node_locations)
 }
