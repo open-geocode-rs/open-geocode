@@ -47,7 +47,7 @@ pub(crate) fn discover_address_features(
     writer: &mut dyn RecordWriter,
 ) -> Result<DiscoveryResult> {
     let mut report = BuilderReport {
-        schema_version: 8,
+        schema_version: 9,
         input: input.display().to_string(),
         input_bytes: input_bytes(input)?,
         ..BuilderReport::default()

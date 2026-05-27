@@ -1339,6 +1339,7 @@ dependencies = [
  "indicatif",
  "memmap2 0.9.10",
  "osmpbf",
+ "rayon",
  "rmp-serde",
  "serde",
  "serde_json",

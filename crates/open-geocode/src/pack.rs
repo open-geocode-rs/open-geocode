@@ -225,6 +225,16 @@ impl PackWriter {
         let started = Instant::now();
         let spatial_index_commit = spatial_index.finish(&self.path)?;
         self.write_timings.spatial_index_finish_ms += elapsed_ms(started);
+        self.write_timings.spatial_point_pair_generation_ms =
+            spatial_index_commit.build_timings.point_pair_generation_ms;
+        self.write_timings.spatial_segment_pair_generation_ms = spatial_index_commit
+            .build_timings
+            .segment_pair_generation_ms;
+        self.write_timings.spatial_pair_sort_dedupe_ms =
+            spatial_index_commit.build_timings.pair_sort_dedupe_ms;
+        self.write_timings.spatial_cell_directory_build_ms =
+            spatial_index_commit.build_timings.cell_directory_build_ms;
+        self.write_timings.spatial_file_write_ms = spatial_index_commit.build_timings.file_write_ms;
 
         let started = Instant::now();
         let spatial_index_bytes = dir_size(self.path.join(&spatial_index_commit.relative_path))?;

@@ -1,16 +1,18 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fmt,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
 use geojson::{Geometry, GeometryValue};
 use h3o::{CellIndex, LatLng, Resolution};
 use memmap2::{Mmap, MmapOptions};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -51,6 +53,7 @@ const H3_SEGMENT_SAMPLE_DIVISOR: f64 = 2.0;
 const H3_RADIUS_EXTRA_RING: u32 = 1;
 const H3_MAX_QUERY_K: u32 = 128;
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
+const SPATIAL_PAIR_CHUNK_SIZE: usize = 8_192;
 
 #[derive(Debug, Default)]
 pub struct PackSpatialIndexWriter {
@@ -64,6 +67,16 @@ pub struct SpatialIndexCommit {
     pub relative_path: String,
     pub point_count: u64,
     pub segment_count: u64,
+    pub build_timings: SpatialIndexBuildTimings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpatialIndexBuildTimings {
+    pub point_pair_generation_ms: u128,
+    pub segment_pair_generation_ms: u128,
+    pub pair_sort_dedupe_ms: u128,
+    pub cell_directory_build_ms: u128,
+    pub file_write_ms: u128,
 }
 
 pub struct PackSpatialIndexReader {
@@ -201,6 +214,12 @@ struct CellDirectoryEntry {
     segment_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CellRefPair {
+    h3_cell: u64,
+    id: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BuiltSegment {
     start: [f64; 2],
@@ -279,36 +298,30 @@ impl PackSpatialIndexWriter {
         let root = pack_path.join(SPATIAL_INDEX_V2_RELATIVE_DIR);
         fs::create_dir_all(&root)
             .with_context(|| format!("failed to create {}", root.display()))?;
+        let mut build_timings = SpatialIndexBuildTimings::default();
 
-        let mut cell_points = BTreeMap::<u64, Vec<u32>>::new();
-        let mut context_cell_points = BTreeMap::<u64, Vec<u32>>::new();
-        for (index, point) in self.points.iter().enumerate() {
-            let point_id = u32::try_from(index).context("too many spatial points for v2 index")?;
-            let fine_cell = h3_cell_id(point.lon, point.lat, H3_FINE_RESOLUTION)?;
-            cell_points.entry(fine_cell).or_default().push(point_id);
-            if is_context_layer(point.layer) {
-                let context_cell = h3_cell_id(point.lon, point.lat, H3_CONTEXT_RESOLUTION)?;
-                context_cell_points
-                    .entry(context_cell)
-                    .or_default()
-                    .push(point_id);
-            }
-        }
+        let started = Instant::now();
+        let (mut point_pairs, mut context_point_pairs) = build_point_pairs(&self.points)?;
+        build_timings.point_pair_generation_ms = elapsed_ms(started);
 
-        let mut cell_segments = BTreeMap::<u64, Vec<u32>>::new();
-        for (index, segment) in self.segments.iter().enumerate() {
-            let segment_id =
-                u32::try_from(index).context("too many spatial segments for v2 index")?;
-            for cell in h3_segment_cell_ids(segment, H3_FINE_RESOLUTION)? {
-                cell_segments.entry(cell).or_default().push(segment_id);
-            }
-        }
+        let started = Instant::now();
+        let mut segment_pairs = build_segment_pairs(&self.segments)?;
+        build_timings.segment_pair_generation_ms = elapsed_ms(started);
 
-        let (cells, point_refs, segment_refs) = build_cell_directory(cell_points, cell_segments);
+        let started = Instant::now();
+        sort_dedupe_cell_pairs(&mut point_pairs);
+        sort_dedupe_cell_pairs(&mut segment_pairs);
+        sort_dedupe_cell_pairs(&mut context_point_pairs);
+        build_timings.pair_sort_dedupe_ms = elapsed_ms(started);
+
+        let started = Instant::now();
+        let (cells, point_refs, segment_refs) = build_cell_directory(&point_pairs, &segment_pairs);
         let (context_cells, context_point_refs, context_segment_refs) =
-            build_cell_directory(context_cell_points, BTreeMap::new());
+            build_cell_directory(&context_point_pairs, &[]);
         debug_assert!(context_segment_refs.is_empty());
+        build_timings.cell_directory_build_ms = elapsed_ms(started);
 
+        let started = Instant::now();
         write_points_file(&root.join(V2_POINTS_FILE), &self.points)?;
         write_segments_file(&root.join(V2_SEGMENTS_FILE), &self.segments)?;
         write_cells_file(&root.join(V2_CELLS_FILE), &cells)?;
@@ -347,12 +360,14 @@ impl PackSpatialIndexWriter {
             .with_context(|| format!("failed to create {}", manifest_path.display()))?;
         serde_json::to_writer_pretty(manifest_file, &manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+        build_timings.file_write_ms = elapsed_ms(started);
 
         Ok(SpatialIndexCommit {
             schema_version: SPATIAL_INDEX_SCHEMA_VERSION,
             relative_path: SPATIAL_INDEX_V2_RELATIVE_DIR.to_string(),
             point_count,
             segment_count,
+            build_timings,
         })
     }
 
@@ -637,32 +652,100 @@ impl SpatialIndexV2Reader {
     }
 }
 
+fn build_point_pairs(points: &[SpatialPointEntry]) -> Result<(Vec<CellRefPair>, Vec<CellRefPair>)> {
+    let mut point_pairs = Vec::with_capacity(points.len());
+    let mut context_point_pairs = Vec::new();
+
+    for (index, point) in points.iter().enumerate() {
+        let point_id = u32::try_from(index).context("too many spatial points for v2 index")?;
+        point_pairs.push(CellRefPair {
+            h3_cell: h3_cell_id(point.lon, point.lat, H3_FINE_RESOLUTION)?,
+            id: point_id,
+        });
+        if is_context_layer(point.layer) {
+            context_point_pairs.push(CellRefPair {
+                h3_cell: h3_cell_id(point.lon, point.lat, H3_CONTEXT_RESOLUTION)?,
+                id: point_id,
+            });
+        }
+    }
+
+    Ok((point_pairs, context_point_pairs))
+}
+
+fn build_segment_pairs(segments: &[SpatialSegmentEntry]) -> Result<Vec<CellRefPair>> {
+    let chunks: Result<Vec<Vec<CellRefPair>>> = segments
+        .par_chunks(SPATIAL_PAIR_CHUNK_SIZE)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let mut pairs = Vec::with_capacity(chunk.len() * 3);
+            let base_index = chunk_index * SPATIAL_PAIR_CHUNK_SIZE;
+            for (offset, segment) in chunk.iter().enumerate() {
+                let segment_id = u32::try_from(base_index + offset)
+                    .context("too many spatial segments for v2 index")?;
+                for h3_cell in h3_segment_cell_ids(segment, H3_FINE_RESOLUTION)? {
+                    pairs.push(CellRefPair {
+                        h3_cell,
+                        id: segment_id,
+                    });
+                }
+            }
+            Ok(pairs)
+        })
+        .collect();
+
+    let chunks = chunks?;
+    let total_pairs = chunks.iter().map(Vec::len).sum();
+    let mut pairs = Vec::with_capacity(total_pairs);
+    for mut chunk in chunks {
+        pairs.append(&mut chunk);
+    }
+    Ok(pairs)
+}
+
+fn sort_dedupe_cell_pairs(pairs: &mut Vec<CellRefPair>) {
+    pairs.par_sort_unstable();
+    pairs.dedup();
+}
+
 fn build_cell_directory(
-    point_cells: BTreeMap<u64, Vec<u32>>,
-    segment_cells: BTreeMap<u64, Vec<u32>>,
+    point_pairs: &[CellRefPair],
+    segment_pairs: &[CellRefPair],
 ) -> (Vec<CellDirectoryEntry>, Vec<u32>, Vec<u32>) {
-    let all_cells = point_cells
-        .keys()
-        .chain(segment_cells.keys())
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut entries = Vec::with_capacity(all_cells.len());
+    let mut entries = Vec::new();
     let mut point_refs = Vec::new();
     let mut segment_refs = Vec::new();
-    for h3_cell in all_cells {
+    let mut point_index = 0;
+    let mut segment_index = 0;
+
+    while point_index < point_pairs.len() || segment_index < segment_pairs.len() {
+        let h3_cell = match (
+            point_pairs.get(point_index).map(|pair| pair.h3_cell),
+            segment_pairs.get(segment_index).map(|pair| pair.h3_cell),
+        ) {
+            (Some(point_cell), Some(segment_cell)) => point_cell.min(segment_cell),
+            (Some(point_cell), None) => point_cell,
+            (None, Some(segment_cell)) => segment_cell,
+            (None, None) => break,
+        };
+
         let point_start = point_refs.len() as u64;
-        if let Some(mut refs) = point_cells.get(&h3_cell).cloned() {
-            refs.sort_unstable();
-            refs.dedup();
-            point_refs.extend(refs);
+        while point_pairs
+            .get(point_index)
+            .is_some_and(|pair| pair.h3_cell == h3_cell)
+        {
+            point_refs.push(point_pairs[point_index].id);
+            point_index += 1;
         }
         let point_count = point_refs.len() as u64 - point_start;
 
         let segment_start = segment_refs.len() as u64;
-        if let Some(mut refs) = segment_cells.get(&h3_cell).cloned() {
-            refs.sort_unstable();
-            refs.dedup();
-            segment_refs.extend(refs);
+        while segment_pairs
+            .get(segment_index)
+            .is_some_and(|pair| pair.h3_cell == h3_cell)
+        {
+            segment_refs.push(segment_pairs[segment_index].id);
+            segment_index += 1;
         }
         let segment_count = segment_refs.len() as u64 - segment_start;
 
@@ -703,14 +786,16 @@ fn h3_segment_cell_ids(segment: &SpatialSegmentEntry, resolution: Resolution) ->
     );
     let step = (resolution.edge_length_m() / H3_SEGMENT_SAMPLE_DIVISOR).max(1.0);
     let sample_count = ((length / step).ceil() as usize).max(1);
-    let mut cells = BTreeSet::new();
+    let mut cells = Vec::with_capacity(sample_count + 1);
     for sample in 0..=sample_count {
         let t = sample as f64 / sample_count as f64;
         let lon = segment.start_lon + t * (segment.end_lon - segment.start_lon);
         let lat = segment.start_lat + t * (segment.end_lat - segment.start_lat);
-        cells.insert(h3_cell_id(lon, lat, resolution)?);
+        cells.push(h3_cell_id(lon, lat, resolution)?);
     }
-    Ok(cells.into_iter().collect())
+    cells.sort_unstable();
+    cells.dedup();
+    Ok(cells)
 }
 
 fn h3_radius_k(resolution: Resolution, radius_m: f64) -> u32 {
@@ -720,6 +805,10 @@ fn h3_radius_k(resolution: Resolution, radius_m: f64) -> u32 {
     ((radius_m / resolution.edge_length_m()).ceil() as u32)
         .saturating_add(H3_RADIUS_EXTRA_RING)
         .min(H3_MAX_QUERY_K)
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
 }
 
 fn write_cells_file(path: &Path, entries: &[CellDirectoryEntry]) -> Result<()> {

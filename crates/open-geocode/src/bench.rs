@@ -140,6 +140,16 @@ pub struct SpatialIndexBuildMetrics {
     pub add_record_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finalize_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_pair_generation_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_pair_generation_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_sort_dedupe_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_directory_build_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_write_ms: Option<u128>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -556,6 +566,23 @@ fn build_metrics(report: &Value) -> BuildMetricReport {
             bytes: value_at_u64(report, &["spatial_index_bytes"]),
             add_record_ms: value_at_u128(report, &["pack_write", "spatial_index_write_ms"]),
             finalize_ms: value_at_u128(report, &["pack_write", "spatial_index_finish_ms"]),
+            point_pair_generation_ms: value_at_u128(
+                report,
+                &["pack_write", "spatial_point_pair_generation_ms"],
+            ),
+            segment_pair_generation_ms: value_at_u128(
+                report,
+                &["pack_write", "spatial_segment_pair_generation_ms"],
+            ),
+            pair_sort_dedupe_ms: value_at_u128(
+                report,
+                &["pack_write", "spatial_pair_sort_dedupe_ms"],
+            ),
+            cell_directory_build_ms: value_at_u128(
+                report,
+                &["pack_write", "spatial_cell_directory_build_ms"],
+            ),
+            file_write_ms: value_at_u128(report, &["pack_write", "spatial_file_write_ms"]),
         },
         text_prefix: text_prefix_metrics(report),
         osm_scan: OsmScanMetrics {
