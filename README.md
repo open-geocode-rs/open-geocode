@@ -3,36 +3,51 @@
 Fast, lightweight, self-hosted geocoding in pure Rust.
 
 `open-geocode` is a minimal Rust-native geocoding engine for address search to
-geo coordinates and reverse geocoding from coordinates to address-first location
-context. It turns OpenStreetMap, open address data, and private location data
-into compact binary Packs that can be queried without a heavy database or search
-cluster.
+geo coordinates, Tantivy-backed autocomplete, and reverse geocoding from
+coordinates to address-first location context. It turns OpenStreetMap PBFs, open
+address data, and private location data into compact binary Packs that combine
+Flatdata record storage, a Tantivy text index, and an H3-backed mmap spatial
+index without a heavy database or search cluster.
+
+The Builder uses GeoRust primitives from `geo` and GeoJSON geometry semantics to
+normalize point addresses, street LineStrings, simple closed-way polygons,
+bounding boxes, centroids, and representative points before writing Pack-local
+records. Streets and address interpolation ranges are split into searchable
+segments; reverse geocoding then uses H3 neighbor-cell lookup, haversine distance
+gates, point-to-segment projection, and Record ID hydration to compose
+address-first results instead of returning raw nearby objects.
 
 Self-hosting is designed around a single Rust runtime for the HTTP API,
-parser/search engine, and Pack loading, not a PostGIS, Elasticsearch, Redis, or
-JVM stack.
+search, autocomplete, reverse geocoding, and Pack loading, not a PostGIS,
+Elasticsearch, Redis, or JVM stack. Text retrieval stays inside Tantivy with
+field-aware documents and native prefix queries; spatial lookup stays inside
+Pack files built from H3 cell directories and compact binary point/segment
+arrays.
 
 ## Why open-geocode?
 
 `open-geocode` focuses on pure OSS self-hosting, not paid third-party geocoding
-APIs or vendor-locked map platforms like Google Maps and MapBox.
+APIs or vendor-locked map platforms like Google Maps and MapBox. Its core shape
+is intentionally boring and inspectable: `osmpbf` ingestion, GeoRust geometry
+normalization, Tantivy search and typeahead, H3 spatial partitioning, address
+interpolation, and Pack-local audit metadata.
 
 Compared to other OSS geocoding alternatives:
 
 | Option | Tradeoff | open-geocode focus |
 |---|---|---|
-| Nominatim | Heavy PostgreSQL/PostGIS deployment | Static binary Packs, no required database |
-| Pelias | Elasticsearch and multi-service ops | Single Rust runtime, no service graph |
+| Nominatim | Heavy PostgreSQL/PostGIS deployment | Static binary Packs with Flatdata records and mmap spatial lookup |
+| Pelias | Elasticsearch and multi-service ops | Single Rust runtime with Tantivy text search and no service graph |
 
 ## Use Cases
 
 | Capability | Example use case |
 |---|---|
 | Forward geocoding | Turn customer, store, vendor, or service addresses into coordinates |
-| Reverse geocoding | Convert fleet, delivery, device, or field-work GPS pings into readable locations |
-| Autocomplete | Power address forms, checkout flows, internal tools, and store locators |
+| Reverse geocoding | Convert fleet, delivery, device, or field-work GPS pings into readable locations using H3 candidate lookup and address-first gates |
+| Autocomplete | Power address forms, checkout flows, internal tools, and store locators with Tantivy-native prefix queries |
 | Batch geocoding | Enrich CSVs, database tables, and large address lists without per-row API pricing |
-| Search optimization | Handle messy addresses, abbreviations, typos, partial queries, and ranked candidates |
+| Search optimization | Handle messy addresses, abbreviations, partial queries, field-aware matches, interpolation ranges, and ranked candidates |
 | Private data | Geocode internal addresses, custom places, service zones, or proprietary datasets |
 
 ## License
