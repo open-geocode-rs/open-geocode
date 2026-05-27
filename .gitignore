@@ -3,6 +3,7 @@
 
 # Generated data
 /data/
+/bench-results/
 /out/
 /packs/
 /tmp/
