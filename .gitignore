@@ -3,8 +3,11 @@
 
 # Generated data
 /data/
+/bench-results/
+/out/
 /packs/
 /tmp/
+/demo/data/*.js
 
 # Environment
 .env

@@ -1,95 +1,52 @@
 # open-geocode
 
-Fast, self-hosted geocoding for address search, autocomplete, reverse geocoding,
-and batch workflows.
+Fast, lightweight, self-hosted geocoding in pure Rust.
 
-`open-geocode` builds compact region packs from open and private location data,
-then serves geocoding APIs from a single Rust binary. It is designed for teams
-that need predictable infrastructure, private data handling, and clear result
-confidence for operational location workflows.
+`open-geocode` is a minimal Rust-native geocoding engine for address search to
+geo coordinates, Tantivy-backed autocomplete, and reverse geocoding from
+coordinates to address-first location context. It turns OpenStreetMap PBFs, open
+address data, and private location data into compact binary Packs that combine
+Flatdata record storage, a Tantivy text index, and an H3-backed mmap spatial
+index without a heavy database or search cluster.
 
-## Features
+Self-hosting is designed around a single Rust runtime for the HTTP API,
+search, autocomplete, reverse geocoding, and Pack loading, not a PostGIS,
+Elasticsearch, Redis, or JVM stack. Text retrieval stays inside Tantivy with
+field-aware documents and native prefix queries; spatial lookup stays inside
+Pack files built from H3 cell directories and compact binary point/segment
+arrays.
 
-- Forward geocoding for addresses, streets, postcodes, and admin areas
-- Reverse geocoding for GPS points, fleet events, delivery scans, and field work
-- Autocomplete for internal tools, store locators, and address forms
-- Batch geocoding for CSV files, tables, and API streams
-- Source, precision, and confidence metadata on every result
-- Static region packs built offline and served by a lightweight runtime
-- Embedded search powered by Tantivy
+## Why open-geocode?
 
-## Quick Start
+`open-geocode` focuses on pure OSS self-hosting, not paid third-party geocoding
+APIs or vendor-locked map platforms like Google Maps and MapBox. Its core shape
+is intentionally boring and inspectable: `osmpbf` ingestion, GeoRust geometry
+normalization, Tantivy search and typeahead, H3 spatial partitioning, address
+interpolation, and Pack-local audit metadata.
 
-Build a region pack:
+Compared to other OSS geocoding alternatives:
 
-```sh
-open-geocode build \
-  --input ./data \
-  --region us-ca \
-  --output ./packs/us-ca
-```
+| Option | Tradeoff | open-geocode focus |
+|---|---|---|
+| Nominatim | Heavy PostgreSQL/PostGIS deployment | Static binary Packs with Flatdata records and mmap spatial lookup |
+| Pelias | Elasticsearch and multi-service ops | Single Rust runtime with Tantivy text search and no service graph |
 
-Start the API server:
+## Use Cases
 
-```sh
-open-geocode serve ./packs/us-ca --listen 127.0.0.1:8080
-```
+| Capability | Example use case |
+|---|---|
+| Forward geocoding | Turn customer, store, vendor, or service addresses into coordinates |
+| Reverse geocoding | Convert fleet, delivery, device, or field-work GPS pings into readable locations using H3 candidate lookup and address-first gates |
+| Autocomplete | Power address forms, checkout flows, internal tools, and store locators with Tantivy-native prefix queries |
+| Batch geocoding | Enrich CSVs, database tables, and large address lists without per-row API pricing |
+| Search optimization | Handle messy addresses, abbreviations, partial queries, field-aware matches, interpolation ranges, and ranked candidates |
+| Private data | Geocode internal addresses, custom places, service zones, or proprietary datasets |
 
-Search for an address:
+## License
 
-```sh
-curl 'http://127.0.0.1:8080/search?q=1600+Amphitheatre+Parkway,+Mountain+View,+CA'
-```
+`open-geocode` is licensed under the [MIT License](LICENSE).
 
-Reverse geocode a point:
-
-```sh
-curl 'http://127.0.0.1:8080/reverse?lat=37.422&lon=-122.084'
-```
-
-Run a batch job:
-
-```sh
-open-geocode batch \
-  --pack ./packs/us-ca \
-  --input ./addresses.csv \
-  --output ./geocoded.csv
-```
-
-## Architecture
-
-```text
-source data
-  -> normalize
-  -> index
-  -> write region pack
-  -> serve search, reverse, autocomplete, and batch APIs
-```
-
-The offline builder handles imports, normalization, deduplication, scoring, and
-index creation. The runtime loads finished region packs and serves requests
-without PostgreSQL/PostGIS, Elasticsearch/OpenSearch, Redis, or JVM services.
-
-## Repository Layout
-
-```text
-Cargo.toml             # Cargo workspace
-rust-toolchain.toml    # Rust toolchain configuration
-crates/                # internal Rust crates
-benches/               # benchmark harnesses and scenarios
-docs/                  # product and architecture notes
-fixtures/              # test datasets and sample inputs
-docker/                # container and deployment assets
-.github/workflows/     # CI workflows
-```
-
-## Benchmarks
-
-Benchmarks track import time, disk size, memory usage, P50/P95 latency, QPS,
-batch throughput, match rate, and confidence calibration against established
-open-source geocoders.
-
-## Documentation
-
-- [Product thesis](docs/why.md)
-- [Architecture direction](docs/spec.md)
+Third-party code dependencies remain under their own OSS licenses. Generated
+Packs preserve source metadata needed for attribution and auditability; users are
+responsible for following the license terms of the geospatial data they build
+from.

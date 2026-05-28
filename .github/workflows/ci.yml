@@ -20,20 +20,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Detect workspace members
-        id: workspace
-        run: |
-          has_members=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json, sys; print('true' if json.load(sys.stdin)['workspace_members'] else 'false')")
-          echo "has_members=$has_members" >> "$GITHUB_OUTPUT"
-
       - name: Check formatting
-        if: steps.workspace.outputs.has_members == 'true'
         run: cargo fmt --check
 
       - name: Check lints
-        if: steps.workspace.outputs.has_members == 'true'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
-        if: steps.workspace.outputs.has_members == 'true'
-        run: cargo test --workspace
+        run: cargo test
