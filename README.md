@@ -2,27 +2,24 @@
 
 Fast, lightweight, self-hosted geocoding in pure Rust.
 
+## Summary
+
+`open-geocode` builds compact, self-hosted geocoding Packs from OpenStreetMap
+and other address data, then serves forward geocoding, autocomplete, batch
+lookup, and address-first reverse geocoding from a single Rust runtime.
+
+## Topics
+
+`rust` `geocoding` `geocoder` `reverse-geocoding` `forward-geocoding`
+`autocomplete` `openstreetmap` `osm-pbf` `geo` `georust` `h3` `tantivy`
+`flatdata` `self-hosted` `gis` `spatial-index` `address-search` `mmap`
+
 `open-geocode` is a minimal Rust-native geocoding engine for address search to
 geo coordinates, Tantivy-backed autocomplete, and reverse geocoding from
 coordinates to address-first location context. It turns OpenStreetMap PBFs, open
 address data, and private location data into compact binary Packs that combine
 Flatdata record storage, a Tantivy text index, and an H3-backed mmap spatial
 index without a heavy database or search cluster.
-
-The Builder uses GeoRust primitives from `geo` and GeoJSON geometry semantics to
-normalize point addresses, street LineStrings, simple closed-way polygons,
-bounding boxes, centroids, and representative points before writing Pack-local
-records. Streets and address interpolation ranges are split into searchable
-segments; reverse geocoding then uses H3 neighbor-cell lookup, haversine distance
-gates, point-to-segment projection, and Record ID hydration to compose
-address-first results instead of returning raw nearby objects.
-
-Self-hosting is designed around a single Rust runtime for the HTTP API,
-search, autocomplete, reverse geocoding, and Pack loading, not a PostGIS,
-Elasticsearch, Redis, or JVM stack. Text retrieval stays inside Tantivy with
-field-aware documents and native prefix queries; spatial lookup stays inside
-Pack files built from H3 cell directories and compact binary point/segment
-arrays.
 
 ## Why open-geocode?
 
