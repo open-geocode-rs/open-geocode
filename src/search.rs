@@ -338,7 +338,7 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.id, "osm:node:1");
-        assert_eq!(hits[0].record.label, "10 King Street, Toronto");
+        assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -459,7 +459,7 @@ mod tests {
 
         assert!(!hits.is_empty());
         assert_eq!(hits[0].record_id, 0);
-        assert_eq!(hits[0].record.label, "10 King Street, Toronto");
+        assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

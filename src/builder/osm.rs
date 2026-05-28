@@ -1,4 +1,5 @@
 mod address;
+mod boundary;
 mod collector;
 mod geometry;
 mod interpolation;
@@ -21,6 +22,10 @@ use crate::{
     record::{LocationPrecision, OsmObjectType},
 };
 use address::{AddressCandidate, write_candidate, write_rejected_record};
+use boundary::{
+    BoundaryContextRecordWriter, required_boundary_way_ids, resolve_boundary_member_way_refs,
+    write_boundary_records,
+};
 use collector::{
     AddressWayStub, CollectedRejection, PlaceNodeCandidate, discover_address_features,
 };
@@ -53,19 +58,34 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
     discovery.report.geometry_resolution.interpolation_way_stubs =
         discovery.interpolation_way_stubs.len();
     discovery.report.geometry_resolution.street_way_stubs = discovery.street_way_stubs.len();
-    discovery.report.geometry_resolution.required_node_refs = discovery.required_node_ids.len();
+
+    let boundary_way_ids = required_boundary_way_ids(&discovery.boundary_relation_stubs);
+    let boundary_member_ways = resolve_boundary_member_way_refs(&options.input, &boundary_way_ids)?;
+    let mut required_node_ids = discovery.required_node_ids.clone();
+    for node_refs in boundary_member_ways.values() {
+        required_node_ids.extend(node_refs.iter().copied());
+    }
+    discovery.report.geometry_resolution.required_node_refs = required_node_ids.len();
 
     let resolution_started = Instant::now();
-    let node_locations =
-        resolve_required_node_locations(&options.input, &discovery.required_node_ids)?;
+    let node_locations = resolve_required_node_locations(&options.input, &required_node_ids)?;
     discovery.report.phases.coordinate_resolution_ms = resolution_started.elapsed().as_millis();
     discovery.report.geometry_resolution.resolved_node_refs = node_locations.len();
     discovery.report.node_cache_entries = node_locations.len();
 
     let emission_started = Instant::now();
-    let mut postcode_accumulator = PostcodeAccumulator::default();
-    emit_normalized_records(
+    let boundary_index = write_boundary_records(
+        &discovery.boundary_way_stubs,
+        &discovery.boundary_relation_stubs,
+        &boundary_member_ways,
+        &node_locations,
         &mut pack_writer,
+        &mut discovery.report,
+    )?;
+    let mut postcode_accumulator = PostcodeAccumulator::default();
+    let mut context_writer = BoundaryContextRecordWriter::new(&mut pack_writer, &boundary_index);
+    emit_normalized_records(
+        &mut context_writer,
         EmissionInputs {
             place_node_candidates: &discovery.place_node_candidates,
             address_node_candidates: &discovery.address_node_candidates,
@@ -79,6 +99,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
         &mut postcode_accumulator,
         &mut discovery.report,
     )?;
+    drop(context_writer);
     discovery.report.phases.record_emission_ms = emission_started.elapsed().as_millis();
     discovery.report.phases.total_ms = total_started.elapsed().as_millis();
     pack_writer.finish(&mut discovery.report)?;
@@ -138,7 +159,15 @@ fn emit_normalized_records(
 
     for stub in inputs.way_stubs {
         let Some(points) = resolve_way_points(stub, inputs.node_locations) else {
-            report.reject(CandidateIssue::WayWithoutResolvedNodes);
+            report.reject_with_context(
+                CandidateIssue::WayWithoutResolvedNodes,
+                OsmObjectType::Way,
+                stub.object_id,
+                &stub.tags,
+                Some(&stub.tags),
+                Some("address"),
+                true,
+            );
             write_rejected_record(
                 CandidateIssue::WayWithoutResolvedNodes,
                 OsmObjectType::Way,
@@ -152,7 +181,15 @@ fn emit_normalized_records(
         };
 
         let Some((lat, lon)) = centroid(&points) else {
-            report.reject(CandidateIssue::WayWithoutResolvedNodes);
+            report.reject_with_context(
+                CandidateIssue::WayWithoutResolvedNodes,
+                OsmObjectType::Way,
+                stub.object_id,
+                &stub.tags,
+                Some(&stub.tags),
+                Some("address"),
+                true,
+            );
             write_rejected_record(
                 CandidateIssue::WayWithoutResolvedNodes,
                 OsmObjectType::Way,

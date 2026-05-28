@@ -60,6 +60,10 @@ enum Commands {
         /// Print rejected evidence instead of accepted records.
         #[arg(long)]
         rejections: bool,
+
+        /// Include materialized Boundary-Derived Context for --row or --id.
+        #[arg(long)]
+        context: bool,
     },
 
     /// Search a Pack text index and hydrate matching records.
@@ -151,7 +155,8 @@ async fn main() -> Result<()> {
             layer,
             limit,
             rejections,
-        } => inspect_pack(pack, row, id, layer, limit, rejections),
+            context,
+        } => inspect_pack(pack, row, id, layer, limit, rejections, context),
         Commands::SearchPack {
             pack,
             query,
@@ -177,17 +182,15 @@ fn inspect_pack(
     layer: Option<String>,
     limit: usize,
     rejections: bool,
+    include_context: bool,
 ) -> Result<()> {
     let reader = PackReader::open(pack)?;
     let output = if rejections {
         serde_json::to_value(reader.rejections(limit)?)?
     } else if let Some(row) = row {
-        reader.record_json(row)?
+        inspect_record_json(&reader, row, include_context)?
     } else if let Some(id) = id {
-        let Some(record) = reader.record_json_by_source_id(&id)? else {
-            bail!("record not found: {id}");
-        };
-        record
+        inspect_record_by_source_id_json(&reader, &id, include_context)?
     } else if let Some(layer) = layer {
         serde_json::to_value(reader.records_json_by_layer(&layer, limit)?)?
     } else {
@@ -195,6 +198,94 @@ fn inspect_pack(
     };
 
     write_json(output)
+}
+
+fn inspect_record_by_source_id_json(
+    reader: &PackReader,
+    source_id: &str,
+    include_context: bool,
+) -> Result<Value> {
+    for record_id in 0..reader.manifest().record_count {
+        let summary = reader.record_summary(record_id)?;
+        if summary.id == source_id {
+            return inspect_record_json(reader, record_id, include_context);
+        }
+    }
+    bail!("record not found: {source_id}")
+}
+
+fn inspect_record_json(
+    reader: &PackReader,
+    record_id: RecordId,
+    include_context: bool,
+) -> Result<Value> {
+    let mut value = reader.record_json(record_id)?;
+    if !include_context {
+        return Ok(value);
+    }
+
+    let boundary_context = boundary_context_json(reader, record_id)?;
+    let Some(object) = value.as_object_mut() else {
+        bail!("record JSON must be an object");
+    };
+    object.insert("boundary_context".to_string(), boundary_context);
+    Ok(value)
+}
+
+fn boundary_context_json(reader: &PackReader, record_id: RecordId) -> Result<Value> {
+    let Some(context) = reader.boundary_context(record_id)? else {
+        return Ok(serde_json::json!(null));
+    };
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "assignment_method".to_string(),
+        serde_json::json!(context.assignment_method),
+    );
+    object.insert("flags".to_string(), serde_json::json!(context.flags));
+
+    if let Some(tuple) = context.admin_context {
+        for (key, value) in [
+            ("country", tuple.country_record_id),
+            ("region", tuple.region_record_id),
+            ("district", tuple.district_record_id),
+            ("locality", tuple.locality_record_id),
+            ("neighbourhood", tuple.neighbourhood_record_id),
+            ("place", tuple.place_record_id),
+        ] {
+            if let Some(parent_id) = value
+                && let Some(record) = reader.context_record(parent_id)?
+            {
+                object.insert(
+                    key.to_string(),
+                    serde_json::json!({
+                        "record_id": parent_id,
+                        "id": record.id,
+                        "label": record.label,
+                        "name": record.name,
+                        "layer": record.layer,
+                    }),
+                );
+            }
+        }
+    }
+
+    if let Some(postcode_record_id) = context.postcode_record_id
+        && let Some(record) = reader.context_record(postcode_record_id)?
+    {
+        object.insert(
+            "postcode".to_string(),
+            serde_json::json!({
+                "record_id": postcode_record_id,
+                "id": record.id,
+                "label": record.label,
+                "name": record.name,
+                "layer": record.layer,
+                "postcode": record.postcode,
+            }),
+        );
+    }
+
+    Ok(Value::Object(object))
 }
 
 fn write_json(value: Value) -> Result<()> {

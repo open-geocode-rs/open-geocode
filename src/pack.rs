@@ -14,6 +14,10 @@ use crate::{
         progress::stage_progress,
         report::{BuilderReport, PackWriteTimings},
     },
+    context::{
+        AdminContextTuple, CONTEXT_RELATIVE_DIR, ContextCommit, PackContextReader,
+        PackContextWriter, ResolvedRecordContext,
+    },
     record::{
         AddressRecord, InterpolationRecord, PlaceLayer, PlaceRecord, PostcodeRecord,
         RejectedRecord, StreetRecord,
@@ -47,6 +51,7 @@ pub struct PackWriter {
     rejection_offsets: File,
     text_index: TantivyTextIndexWriter,
     spatial_index: PackSpatialIndexWriter,
+    context: PackContextWriter,
     write_timings: PackWriteTimings,
     text_index_timing_nanos: TextIndexTimingNanos,
     record_count: u64,
@@ -58,6 +63,7 @@ pub struct PackReader {
     path: PathBuf,
     manifest: PackManifest,
     records: RecordsArchiveReader,
+    context: Option<PackContextReader>,
 }
 
 impl std::fmt::Debug for PackReader {
@@ -82,6 +88,8 @@ pub struct PackManifest {
     pub text_index: Option<PackTextIndex>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spatial_index: Option<PackSpatialIndex>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_context: Option<PackBoundaryContext>,
     pub files: BTreeMap<String, PackFile>,
 }
 
@@ -99,6 +107,15 @@ pub struct PackSpatialIndex {
     pub schema_version: u32,
     pub point_count: u64,
     pub segment_count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackBoundaryContext {
+    pub path: String,
+    pub schema_version: u32,
+    pub admin_tuple_count: u64,
+    pub record_context_count: u64,
     pub bytes: u64,
 }
 
@@ -139,7 +156,7 @@ impl TextIndexTimingNanos {
     }
 }
 
-const PACK_SCHEMA_VERSION: u32 = 2;
+const PACK_SCHEMA_VERSION: u32 = 3;
 const REJECTIONS_MAGIC: &[u8; 8] = b"OGREJ001";
 const REJECTION_OFFSETS_MAGIC: &[u8; 8] = b"OGROF001";
 const OFFSET_HEADER_BYTES: u64 = 16;
@@ -182,6 +199,7 @@ impl PackWriter {
             rejection_offsets,
             text_index,
             spatial_index: PackSpatialIndexWriter::default(),
+            context: PackContextWriter::default(),
             write_timings: PackWriteTimings::default(),
             text_index_timing_nanos: TextIndexTimingNanos::default(),
             record_count: 0,
@@ -244,6 +262,9 @@ impl PackWriter {
         self.write_timings.spatial_index_size_ms += elapsed_ms(started);
         spatial_progress.finish_with_message("7/7 finalize spatial index complete");
 
+        let context = std::mem::take(&mut self.context);
+        let context_commit = context.finish(&self.path)?;
+
         let started = Instant::now();
         report.record_table_bytes = dir_size(self.path.join("records"))?;
         report.offset_table_bytes = 0;
@@ -277,6 +298,7 @@ impl PackWriter {
             text_index_bytes,
             spatial_index_commit,
             spatial_index_bytes,
+            context_commit,
         )?;
         let manifest_path = self.path.join("manifest.json");
         let manifest_file = File::create(&manifest_path)
@@ -293,6 +315,7 @@ impl PackWriter {
         text_index_bytes: u64,
         spatial_index_commit: SpatialIndexCommit,
         spatial_index_bytes: u64,
+        context_commit: ContextCommit,
     ) -> Result<PackManifest> {
         let mut files = BTreeMap::new();
         for relative in [
@@ -305,6 +328,7 @@ impl PackWriter {
         insert_pack_files_under(&mut files, &self.path, "records")?;
         insert_pack_files_under(&mut files, &self.path, TEXT_INDEX_RELATIVE_PATH)?;
         insert_pack_files_under(&mut files, &self.path, &spatial_index_commit.relative_path)?;
+        insert_pack_files_under(&mut files, &self.path, CONTEXT_RELATIVE_DIR)?;
 
         Ok(PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -328,6 +352,13 @@ impl PackWriter {
                 point_count: spatial_index_commit.point_count,
                 segment_count: spatial_index_commit.segment_count,
                 bytes: spatial_index_bytes,
+            }),
+            boundary_context: Some(PackBoundaryContext {
+                path: context_commit.relative_path,
+                schema_version: context_commit.schema_version,
+                admin_tuple_count: context_commit.admin_tuple_count,
+                record_context_count: context_commit.record_context_count,
+                bytes: context_commit.bytes,
             }),
             files,
         })
@@ -475,6 +506,17 @@ impl PackWriter {
         *self.layer_counts.entry(layer.to_string()).or_default() += 1;
         Ok(record_id)
     }
+
+    pub fn write_boundary_context(
+        &mut self,
+        record_id: RecordId,
+        admin_context: AdminContextTuple,
+        postcode_record_id: Option<RecordId>,
+        flags: u16,
+    ) {
+        self.context
+            .add_record_context(record_id, admin_context, postcode_record_id, flags);
+    }
 }
 
 impl PackReader {
@@ -502,10 +544,17 @@ impl PackReader {
             );
         }
 
+        let context = manifest
+            .boundary_context
+            .as_ref()
+            .map(|_| PackContextReader::open(&path))
+            .transpose()?;
+
         Ok(Self {
             path,
             manifest,
             records,
+            context,
         })
     }
 
@@ -576,6 +625,13 @@ impl PackReader {
 
     pub fn context_record(&self, record_id: RecordId) -> Result<Option<ContextRecord>> {
         self.records.context(record_id)
+    }
+
+    pub fn boundary_context(&self, record_id: RecordId) -> Result<Option<ResolvedRecordContext>> {
+        let Some(context) = &self.context else {
+            return Ok(None);
+        };
+        context.record_context(record_id)
     }
 
     fn rejection_offset(&self, row: u64) -> Result<OffsetEntry> {
@@ -1015,6 +1071,10 @@ mod tests {
     }
 
     fn address_record(id: &str, label: &str) -> AddressRecord {
+        let object_id = id
+            .strip_prefix("osm:node:")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1);
         AddressRecord {
             id: id.to_string(),
             label: label.to_string(),
@@ -1034,7 +1094,7 @@ mod tests {
             source: SourceProvenance {
                 dataset: "osm".to_string(),
                 object_type: OsmObjectType::Node,
-                object_id: 1,
+                object_id,
                 tags: Some(BTreeMap::new()),
             },
         }

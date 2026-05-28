@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod builder;
+pub mod context;
 pub mod pack;
 pub mod record;
 mod records_archive;

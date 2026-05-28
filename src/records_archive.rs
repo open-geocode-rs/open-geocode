@@ -1,11 +1,13 @@
 use std::{
-    fs::{self, File},
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
     io::{BufWriter, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use geojson::{Geometry, GeometryValue};
+use memmap2::MmapOptions;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -21,6 +23,8 @@ use crate::{
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 const FLATDATA_PADDING: [u8; 8] = [0; 8];
+const STRINGS_STAGING_FILE: &str = "strings.staging";
+const GEOMETRIES_STAGING_FILE: &str = "geometries.staging";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span {
@@ -90,8 +94,13 @@ pub struct RecordsArchiveWriter {
     builder: fd::RecordsArchiveBuilder,
     records: BufWriter<File>,
     record_bytes: u64,
-    strings: Vec<u8>,
-    geometries: Vec<u8>,
+    strings: BufWriter<File>,
+    strings_path: PathBuf,
+    strings_len: u64,
+    intern: HashMap<String, Span>,
+    geometries: BufWriter<File>,
+    geometries_path: PathBuf,
+    geometries_len: u64,
 }
 
 pub struct RecordsArchiveReader {
@@ -100,10 +109,10 @@ pub struct RecordsArchiveReader {
 
 impl RecordsArchiveWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+        let path = path.as_ref().to_path_buf();
+        fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
 
-        let storage = flatdata::FileResourceStorage::new(path);
+        let storage = flatdata::FileResourceStorage::new(&path);
         let builder = fd::RecordsArchiveBuilder::new(storage)
             .with_context(|| format!("failed to create records archive in {}", path.display()))?;
 
@@ -119,22 +128,41 @@ impl RecordsArchiveWriter {
         );
         records.write_all(&0_u64.to_le_bytes())?;
 
+        let strings_path = path.join(STRINGS_STAGING_FILE);
+        let strings = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&strings_path)
+                .with_context(|| format!("failed to create {}", strings_path.display()))?,
+        );
+        let geometries_path = path.join(GEOMETRIES_STAGING_FILE);
+        let geometries = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&geometries_path)
+                .with_context(|| format!("failed to create {}", geometries_path.display()))?,
+        );
+
         Ok(Self {
             builder,
             records,
             record_bytes: 0,
-            strings: Vec::new(),
-            geometries: Vec::new(),
+            strings,
+            strings_path,
+            strings_len: 0,
+            intern: HashMap::new(),
+            geometries,
+            geometries_path,
+            geometries_len: 0,
         })
     }
 
     pub fn write_address(&mut self, record: &AddressRecord) -> Result<()> {
-        let mut stored = self.stored_record(
-            fd::RecordLayer::Address,
-            &record.id,
-            &record.label,
-            &record.name,
-        )?;
+        let mut stored = self.stored_record(fd::RecordLayer::Address, &record.name)?;
         self.fill_osm_source(&mut stored, &record.source);
         self.fill_address_components(&mut stored, &record.address)?;
         stored.set_location_precision(location_precision_code(record.location_precision));
@@ -147,14 +175,9 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<()> {
-        let mut stored = self.stored_record(
-            place_record_layer(layer),
-            &record.id,
-            &record.label,
-            &record.name,
-        )?;
+        let mut stored = self.stored_record(place_record_layer(layer), &record.name)?;
         self.fill_osm_source(&mut stored, &record.source);
-        let place_type = self.push_text(&record.place_type)?;
+        let place_type = self.push_text_interned(&record.place_type)?;
         stored.set_place_type_start(place_type.start);
         stored.set_place_type_len(place_type.len);
         stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
@@ -167,19 +190,14 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<()> {
-        let mut stored = self.stored_record(
-            fd::RecordLayer::Postcode,
-            &record.id,
-            &record.label,
-            &record.name,
-        )?;
+        let mut stored = self.stored_record(fd::RecordLayer::Postcode, &record.name)?;
         stored.set_source_object(fd::SourceObject::Derived);
         stored.set_source_object_id(0);
         stored.set_derived_record_count(record.source.record_count);
-        let postcode = self.push_text(&record.postcode)?;
+        let postcode = self.push_text_interned(&record.postcode)?;
         stored.set_postcode_start(postcode.start);
         stored.set_postcode_len(postcode.len);
-        let derived_from = self.push_text(&record.source.derived_from)?;
+        let derived_from = self.push_text_interned(&record.source.derived_from)?;
         stored.set_derived_from_start(derived_from.start);
         stored.set_derived_from_len(derived_from.len);
         stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
@@ -192,18 +210,13 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<()> {
-        let mut stored = self.stored_record(
-            fd::RecordLayer::Interpolation,
-            &record.id,
-            &record.label,
-            &record.name,
-        )?;
+        let mut stored = self.stored_record(fd::RecordLayer::Interpolation, &record.name)?;
         self.fill_osm_source(&mut stored, &record.source);
         self.fill_interpolation_address_components(&mut stored, &record.address)?;
         stored.set_interpolation_start(record.interpolation.start);
         stored.set_interpolation_end(record.interpolation.end);
         stored.set_interpolation_step(record.interpolation.step);
-        let interpolation_type = self.push_text(&record.interpolation.kind)?;
+        let interpolation_type = self.push_text_interned(&record.interpolation.kind)?;
         stored.set_interpolation_type_start(interpolation_type.start);
         stored.set_interpolation_type_len(interpolation_type.len);
         let anchor_ids = self.push_text(&record.anchor_ids.join("\n"))?;
@@ -215,12 +228,7 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_street(&mut self, record: &StreetRecord) -> Result<()> {
-        let mut stored = self.stored_record(
-            fd::RecordLayer::Street,
-            &record.id,
-            &record.label,
-            &record.name,
-        )?;
+        let mut stored = self.stored_record(fd::RecordLayer::Street, &record.name)?;
         self.fill_osm_source(&mut stored, &record.source);
         stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
         self.fill_geometry(&mut stored, &record.geometry, record.representative_point)?;
@@ -234,30 +242,47 @@ impl RecordsArchiveWriter {
         self.records.write_all(&self.record_bytes.to_le_bytes())?;
         self.records.flush()?;
 
-        self.builder
-            .set_strings(&self.strings)
-            .context("failed to write records string arena")?;
-        self.builder
-            .set_geometries(&self.geometries)
-            .context("failed to write records geometry arena")?;
+        self.strings.flush().context("failed to flush strings staging")?;
+        self.geometries.flush().context("failed to flush geometries staging")?;
+
+        {
+            let strings_file = File::open(&self.strings_path).with_context(|| {
+                format!("failed to reopen {}", self.strings_path.display())
+            })?;
+            // SAFETY: file is read-only here and not concurrently modified.
+            let strings_map = unsafe { MmapOptions::new().map(&strings_file) }
+                .with_context(|| format!("failed to mmap {}", self.strings_path.display()))?;
+            self.builder
+                .set_strings(&strings_map)
+                .context("failed to write records string arena")?;
+        }
+        let _ = fs::remove_file(&self.strings_path);
+
+        {
+            let geometries_file = File::open(&self.geometries_path).with_context(|| {
+                format!("failed to reopen {}", self.geometries_path.display())
+            })?;
+            // SAFETY: file is read-only here and not concurrently modified.
+            let geometries_map = unsafe { MmapOptions::new().map(&geometries_file) }
+                .with_context(|| format!("failed to mmap {}", self.geometries_path.display()))?;
+            self.builder
+                .set_geometries(&geometries_map)
+                .context("failed to write records geometry arena")?;
+        }
+        let _ = fs::remove_file(&self.geometries_path);
         Ok(())
     }
 
-    fn stored_record(
-        &mut self,
-        layer: fd::RecordLayer,
-        id: &str,
-        label: &str,
-        name: &str,
-    ) -> Result<fd::StoredRecord> {
+    fn stored_record(&mut self, layer: fd::RecordLayer, name: &str) -> Result<fd::StoredRecord> {
         let mut stored = fd::StoredRecord::new();
         stored.set_layer(layer);
         stored.set_reserved(0);
-        let id = self.push_text(id)?;
-        let label = self.push_text(label)?;
+        // id and label are no longer stored; reader reconstructs them.
+        stored.set_id_start(0);
+        stored.set_id_len(0);
+        stored.set_label_start(0);
+        stored.set_label_len(0);
         let name = self.push_text(name)?;
-        set_span(&mut stored, "id", id)?;
-        set_span(&mut stored, "label", label)?;
         set_span(&mut stored, "name", name)?;
         Ok(stored)
     }
@@ -282,13 +307,13 @@ impl RecordsArchiveWriter {
         let number = self.push_text(&address.number)?;
         stored.set_number_start(number.start);
         stored.set_number_len(number.len);
-        self.set_optional_text(stored, TextField::Street, address.street.as_deref())?;
-        self.set_optional_text(stored, TextField::Place, address.place.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Street, address.street.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Place, address.place.as_deref())?;
         self.set_optional_text(stored, TextField::Unit, address.unit.as_deref())?;
-        self.set_optional_text(stored, TextField::Locality, address.locality.as_deref())?;
-        self.set_optional_text(stored, TextField::Region, address.region.as_deref())?;
-        self.set_optional_text(stored, TextField::Postcode, address.postcode.as_deref())?;
-        self.set_optional_text(stored, TextField::Country, address.country.as_deref())
+        self.set_optional_text_interned(stored, TextField::Locality, address.locality.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Region, address.region.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Postcode, address.postcode.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Country, address.country.as_deref())
     }
 
     fn fill_interpolation_address_components(
@@ -296,12 +321,12 @@ impl RecordsArchiveWriter {
         stored: &mut fd::StoredRecord,
         address: &InterpolationAddressComponents,
     ) -> Result<()> {
-        self.set_optional_text(stored, TextField::Street, address.street.as_deref())?;
-        self.set_optional_text(stored, TextField::Place, address.place.as_deref())?;
-        self.set_optional_text(stored, TextField::Locality, address.locality.as_deref())?;
-        self.set_optional_text(stored, TextField::Region, address.region.as_deref())?;
-        self.set_optional_text(stored, TextField::Postcode, address.postcode.as_deref())?;
-        self.set_optional_text(stored, TextField::Country, address.country.as_deref())
+        self.set_optional_text_interned(stored, TextField::Street, address.street.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Place, address.place.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Locality, address.locality.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Region, address.region.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Postcode, address.postcode.as_deref())?;
+        self.set_optional_text_interned(stored, TextField::Country, address.country.as_deref())
     }
 
     fn set_optional_text(
@@ -312,6 +337,20 @@ impl RecordsArchiveWriter {
     ) -> Result<()> {
         let span = match value {
             Some(value) => self.push_text(value)?,
+            None => Span::EMPTY,
+        };
+        set_optional_span(stored, field, span);
+        Ok(())
+    }
+
+    fn set_optional_text_interned(
+        &mut self,
+        stored: &mut fd::StoredRecord,
+        field: TextField,
+        value: Option<&str>,
+    ) -> Result<()> {
+        let span = match value {
+            Some(value) => self.push_text_interned(value)?,
             None => Span::EMPTY,
         };
         set_optional_span(stored, field, span);
@@ -346,28 +385,41 @@ impl RecordsArchiveWriter {
     }
 
     fn push_text(&mut self, value: &str) -> Result<Span> {
-        let start = self.strings.len() as u64;
+        let start = self.strings_len;
         let len = u32::try_from(value.len()).context("record text field exceeds 4 GiB")?;
-        self.strings.extend_from_slice(value.as_bytes());
+        self.strings.write_all(value.as_bytes())?;
+        self.strings_len += value.len() as u64;
         Ok(Span { start, len })
     }
 
+    fn push_text_interned(&mut self, value: &str) -> Result<Span> {
+        if let Some(&span) = self.intern.get(value) {
+            return Ok(span);
+        }
+        let span = self.push_text(value)?;
+        self.intern.insert(value.to_string(), span);
+        Ok(span)
+    }
+
     fn push_line_string(&mut self, coordinates: &[geojson::Position]) -> Result<Span> {
-        let start = self.geometries.len() as u64;
+        let start = self.geometries_len;
         let count =
             u32::try_from(coordinates.len()).context("line string has too many positions")?;
-        self.geometries.extend_from_slice(&count.to_le_bytes());
+        let mut written = 0u64;
+        self.geometries.write_all(&count.to_le_bytes())?;
+        written += 4;
         for position in coordinates {
             let [lon, lat, ..] = position.as_slice() else {
                 bail!("line string position is missing lon/lat");
             };
             self.geometries
-                .extend_from_slice(&quantize_coordinate(*lon)?.to_le_bytes());
+                .write_all(&quantize_coordinate(*lon)?.to_le_bytes())?;
             self.geometries
-                .extend_from_slice(&quantize_coordinate(*lat)?.to_le_bytes());
+                .write_all(&quantize_coordinate(*lat)?.to_le_bytes())?;
+            written += 16;
         }
-        let len = u32::try_from(self.geometries.len() as u64 - start)
-            .context("line string geometry exceeds 4 GiB")?;
+        self.geometries_len += written;
+        let len = u32::try_from(written).context("line string geometry exceeds 4 GiB")?;
         Ok(Span { start, len })
     }
 }
@@ -618,11 +670,129 @@ impl RecordsArchiveReader {
     }
 
     fn common_record(&self, stored: &fd::StoredRecord) -> Result<CommonRecord> {
-        Ok(CommonRecord {
-            id: self.required_text(stored.id_start(), stored.id_len(), "id")?,
-            label: self.required_text(stored.label_start(), stored.label_len(), "label")?,
-            name: self.required_text(stored.name_start(), stored.name_len(), "name")?,
-        })
+        let name = self.required_text(stored.name_start(), stored.name_len(), "name")?;
+        let id = self.rebuild_id(stored)?;
+        let label = self.rebuild_label(stored, &name)?;
+        Ok(CommonRecord { id, label, name })
+    }
+
+    fn rebuild_id(&self, stored: &fd::StoredRecord) -> Result<String> {
+        match stored.source_object() {
+            fd::SourceObject::Node => Ok(format!("osm:node:{}", stored.source_object_id())),
+            fd::SourceObject::Way => match stored.layer() {
+                fd::RecordLayer::Interpolation => self.rebuild_interpolation_id(stored),
+                _ => Ok(format!("osm:way:{}", stored.source_object_id())),
+            },
+            fd::SourceObject::Relation => {
+                Ok(format!("osm:relation:{}", stored.source_object_id()))
+            }
+            fd::SourceObject::Derived => match stored.layer() {
+                fd::RecordLayer::Postcode => {
+                    let postcode = self.required_text(
+                        stored.postcode_start(),
+                        stored.postcode_len(),
+                        "postcode",
+                    )?;
+                    Ok(format!("derived:osm:postcode:{}", id_component(&postcode)))
+                }
+                fd::RecordLayer::Country => {
+                    let place_type = self.required_text(
+                        stored.place_type_start(),
+                        stored.place_type_len(),
+                        "place_type",
+                    )?;
+                    let code = place_type
+                        .strip_prefix("derived_country:")
+                        .unwrap_or(&place_type);
+                    Ok(format!("derived:country:{code}"))
+                }
+                other => bail!("unexpected derived record layer: {other:?}"),
+            },
+        }
+    }
+
+    fn rebuild_interpolation_id(&self, stored: &fd::StoredRecord) -> Result<String> {
+        let anchors = self
+            .optional_text(stored.anchor_ids_start(), stored.anchor_ids_len())?
+            .context("interpolation record missing anchor_ids")?;
+        let mut parts = anchors.split('\n');
+        let low = parts
+            .next()
+            .and_then(|value| value.strip_prefix("osm:node:"))
+            .context("interpolation record missing low anchor id")?;
+        let high = parts
+            .next()
+            .and_then(|value| value.strip_prefix("osm:node:"))
+            .context("interpolation record missing high anchor id")?;
+        Ok(format!(
+            "osm:way:{}:interp:{low}-{high}",
+            stored.source_object_id()
+        ))
+    }
+
+    fn rebuild_label(&self, stored: &fd::StoredRecord, name: &str) -> Result<String> {
+        match stored.layer() {
+            fd::RecordLayer::Address => self.rebuild_address_label(stored),
+            fd::RecordLayer::Interpolation => self.rebuild_interpolation_label(stored, name),
+            _ => Ok(name.to_string()),
+        }
+    }
+
+    fn rebuild_address_label(&self, stored: &fd::StoredRecord) -> Result<String> {
+        let number =
+            self.required_text(stored.number_start(), stored.number_len(), "number")?;
+        let street = self.optional_text(stored.street_start(), stored.street_len())?;
+        let place = self.optional_text(stored.place_start(), stored.place_len())?;
+        let unit = self.optional_text(stored.unit_start(), stored.unit_len())?;
+        let locality = self.optional_text(stored.locality_start(), stored.locality_len())?;
+        let region = self.optional_text(stored.region_start(), stored.region_len())?;
+        let postcode = self.optional_text(stored.postcode_start(), stored.postcode_len())?;
+        let country = self.optional_text(stored.country_start(), stored.country_len())?;
+
+        let primary = [Some(number.as_str()), street.as_deref().or(place.as_deref())]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        Ok([
+            Some(primary.as_str()),
+            unit.as_deref(),
+            locality.as_deref(),
+            region.as_deref(),
+            postcode.as_deref(),
+            country.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", "))
+    }
+
+    fn rebuild_interpolation_label(
+        &self,
+        stored: &fd::StoredRecord,
+        name: &str,
+    ) -> Result<String> {
+        let kind = self.required_text(
+            stored.interpolation_type_start(),
+            stored.interpolation_type_len(),
+            "interpolation_type",
+        )?;
+        let start = stored.interpolation_start();
+        let end = stored.interpolation_end();
+        let locality = self.optional_text(stored.locality_start(), stored.locality_len())?;
+        let region = self.optional_text(stored.region_start(), stored.region_len())?;
+        let postcode = self.optional_text(stored.postcode_start(), stored.postcode_len())?;
+        let country = self.optional_text(stored.country_start(), stored.country_len())?;
+
+        let primary = format!("{name} {start}-{end} {kind}");
+        Ok([Some(primary), locality, region, postcode, country]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", "))
     }
 
     fn address_components(&self, stored: &fd::StoredRecord) -> Result<AddressComponents> {
@@ -969,6 +1139,18 @@ fn point_coordinates(geometry: &Geometry) -> Result<[f64; 2]> {
     Ok([*lon, *lat])
 }
 
+fn id_component(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
 fn quantize_coordinate(value: f64) -> Result<i64> {
     if !value.is_finite() {
         bail!("coordinate must be finite");
@@ -1023,7 +1205,10 @@ mod tests {
         let reader = RecordsArchiveReader::open(&temp_dir).expect("reader");
         let address = reader.address(0).expect("read").expect("address");
         assert_eq!(address.id, "osm:node:1");
-        assert_eq!(address.label, "10 King Street, Toronto, ON");
+        assert_eq!(
+            address.label,
+            "10 King Street, 1200, Toronto, ON, M5H, CA"
+        );
         assert_eq!(address.address.unit.as_deref(), Some("1200"));
         assert_eq!(address.location_precision, LocationPrecision::Point);
         assert_eq!(address.source.tags, None);

@@ -75,11 +75,15 @@ fn reject_street_geometry(
     writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<()> {
-    report.reject_with_tags(
+    let empty_addr_tags = BTreeMap::new();
+    report.reject_with_context(
         CandidateIssue::StreetUnresolvedGeometry,
         OsmObjectType::Way,
+        stub.object_id,
         &stub.tags,
-        &BTreeMap::new(),
+        Some(&empty_addr_tags),
+        Some("street"),
+        true,
     );
     write_rejected_record(
         CandidateIssue::StreetUnresolvedGeometry,

@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use osmpbf::Element;
+use osmpbf::{Element, RelMemberType};
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue, ScannedCounts},
@@ -14,6 +14,10 @@ use crate::{
 use super::{
     address::{
         AddressCandidate, collect_addr_tags_from_map, collect_clean_tags, validate_address_tags,
+    },
+    boundary::{
+        BoundaryRelationMember, BoundaryRelationStub, BoundaryWayStub, has_admin_boundary_tags,
+        relation_member_role,
     },
     interpolation::{InterpolationWayStub, has_interpolation_tag},
     pbf::{element_reader_with_progress, input_bytes},
@@ -55,6 +59,8 @@ pub(crate) struct DiscoveryResult {
     pub way_stubs: Vec<AddressWayStub>,
     pub interpolation_way_stubs: Vec<InterpolationWayStub>,
     pub street_way_stubs: Vec<StreetWayStub>,
+    pub boundary_way_stubs: Vec<BoundaryWayStub>,
+    pub boundary_relation_stubs: Vec<BoundaryRelationStub>,
     pub rejections: Vec<CollectedRejection>,
     pub address_node_tags: HashMap<i64, BTreeMap<String, String>>,
     pub required_node_ids: HashSet<i64>,
@@ -68,6 +74,8 @@ struct DiscoveryChunk {
     way_stubs: Vec<AddressWayStub>,
     interpolation_way_stubs: Vec<InterpolationWayStub>,
     street_way_stubs: Vec<StreetWayStub>,
+    boundary_way_stubs: Vec<BoundaryWayStub>,
+    boundary_relation_stubs: Vec<BoundaryRelationStub>,
     rejections: Vec<CollectedRejection>,
     address_node_tags: HashMap<i64, BTreeMap<String, String>>,
     required_node_ids: HashSet<i64>,
@@ -87,6 +95,9 @@ impl DiscoveryChunk {
         self.interpolation_way_stubs
             .extend(other.interpolation_way_stubs);
         self.street_way_stubs.extend(other.street_way_stubs);
+        self.boundary_way_stubs.extend(other.boundary_way_stubs);
+        self.boundary_relation_stubs
+            .extend(other.boundary_relation_stubs);
         self.rejections.extend(other.rejections);
         self.address_node_tags.extend(other.address_node_tags);
         self.required_node_ids.extend(other.required_node_ids);
@@ -109,23 +120,22 @@ pub(crate) fn discover_address_features(input: &Path) -> Result<DiscoveryResult>
     sort_discovery_chunk(&mut chunk);
 
     let mut report = BuilderReport {
-        schema_version: 10,
+        schema_version: 12,
         input: input.display().to_string(),
         input_bytes: input_bytes(input)?,
         scanned: chunk.scanned.clone(),
         ..BuilderReport::default()
     };
     for rejection in &chunk.rejections {
-        if let Some(addr_tags) = &rejection.addr_tags {
-            report.reject_with_tags(
-                rejection.issue,
-                rejection.object_type,
-                &rejection.tags,
-                addr_tags,
-            );
-        } else {
-            report.reject(rejection.issue);
-        }
+        report.reject_with_context(
+            rejection.issue,
+            rejection.object_type,
+            rejection.object_id,
+            &rejection.tags,
+            rejection.addr_tags.as_ref(),
+            rejection.layer_hint,
+            rejection.write_record,
+        );
     }
 
     Ok(DiscoveryResult {
@@ -135,6 +145,8 @@ pub(crate) fn discover_address_features(input: &Path) -> Result<DiscoveryResult>
         way_stubs: chunk.way_stubs,
         interpolation_way_stubs: chunk.interpolation_way_stubs,
         street_way_stubs: chunk.street_way_stubs,
+        boundary_way_stubs: chunk.boundary_way_stubs,
+        boundary_relation_stubs: chunk.boundary_relation_stubs,
         rejections: chunk
             .rejections
             .into_iter()
@@ -176,10 +188,24 @@ fn collect_element(element: Element<'_>) -> DiscoveryChunk {
         }
         Element::Relation(relation) => {
             chunk.scanned.relations += 1;
+            let members = relation
+                .members()
+                .filter_map(|member| {
+                    if member.member_type != RelMemberType::Way {
+                        return None;
+                    }
+                    let role = relation_member_role(member.role().unwrap_or_default())?;
+                    Some(BoundaryRelationMember {
+                        way_id: member.member_id,
+                        role,
+                    })
+                })
+                .collect::<Vec<_>>();
             collect_relation(
                 &mut chunk,
                 relation.id(),
                 collect_clean_tags(relation.tags()),
+                members,
             );
         }
     }
@@ -250,6 +276,18 @@ fn collect_way(
     all_tags: BTreeMap<String, String>,
     refs: impl Fn() -> Vec<i64>,
 ) {
+    if has_admin_boundary_tags(&all_tags) {
+        let node_refs = refs();
+        if !node_refs.is_empty() {
+            chunk.required_node_ids.extend(node_refs.iter().copied());
+            chunk.boundary_way_stubs.push(BoundaryWayStub {
+                object_id,
+                node_refs,
+                tags: all_tags.clone(),
+            });
+        }
+    }
+
     if has_highway_tag(&all_tags) {
         if street_name(&all_tags).is_some() {
             let node_refs = refs();
@@ -350,7 +388,19 @@ fn collect_relation(
     chunk: &mut DiscoveryChunk,
     object_id: i64,
     all_tags: BTreeMap<String, String>,
+    boundary_members: Vec<BoundaryRelationMember>,
 ) {
+    if has_admin_boundary_tags(&all_tags) {
+        if !boundary_members.is_empty() {
+            chunk.boundary_relation_stubs.push(BoundaryRelationStub {
+                object_id,
+                members: boundary_members,
+                tags: all_tags,
+            });
+        }
+        return;
+    }
+
     let tags = collect_addr_tags_from_map(&all_tags);
     if tags.is_empty() {
         return;
@@ -444,6 +494,10 @@ fn sort_discovery_chunk(chunk: &mut DiscoveryChunk) {
         .interpolation_way_stubs
         .sort_by_key(|stub| stub.object_id);
     chunk.street_way_stubs.sort_by_key(|stub| stub.object_id);
+    chunk.boundary_way_stubs.sort_by_key(|stub| stub.object_id);
+    chunk
+        .boundary_relation_stubs
+        .sort_by_key(|stub| stub.object_id);
     chunk.rejections.sort_by_key(|rejection| {
         (
             object_type_rank(rejection.object_type),

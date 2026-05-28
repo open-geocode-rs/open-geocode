@@ -373,7 +373,15 @@ fn reject_interpolation(
     report: &mut BuilderReport,
 ) -> Result<()> {
     let addr_tags = collect_addr_tags_from_map(&stub.tags);
-    report.reject_with_tags(issue, OsmObjectType::Way, &stub.tags, &addr_tags);
+    report.reject_with_context(
+        issue,
+        OsmObjectType::Way,
+        stub.object_id,
+        &stub.tags,
+        Some(&addr_tags),
+        Some("interpolation"),
+        true,
+    );
     write_rejected_record(
         issue,
         OsmObjectType::Way,

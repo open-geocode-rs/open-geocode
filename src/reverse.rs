@@ -165,6 +165,7 @@ impl PackReverseGeocoder {
             return Ok(None);
         };
 
+        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
         apply_address_context(context, &address.address);
         self.enrich_context(options, context, context_record_ids)?;
 
@@ -206,6 +207,7 @@ impl PackReverseGeocoder {
                 continue;
             };
             let number = estimated_number(&interpolation.interpolation, candidate.fraction);
+            self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
             apply_interpolation_context(context, &interpolation.address);
             self.enrich_context(options, context, context_record_ids)?;
             let primary = estimated_primary_label(number, &interpolation.address)
@@ -260,6 +262,7 @@ impl PackReverseGeocoder {
         };
 
         set_if_missing(&mut context.street, street.name.clone());
+        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
         self.enrich_context(options, context, context_record_ids)?;
 
         Ok(Some(ReverseGeocodeResult {
@@ -336,6 +339,34 @@ impl PackReverseGeocoder {
                 && apply_context_record(context, &record)
             {
                 context_record_ids.push(candidate.record_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn enrich_record_context(
+        &self,
+        record_id: RecordId,
+        context: &mut ReverseContext,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<()> {
+        let Some(boundary_context) = self.pack.boundary_context(record_id)? else {
+            return Ok(());
+        };
+        let mut seen = context_record_ids.iter().copied().collect::<BTreeSet<_>>();
+        let admin_ids = boundary_context
+            .admin_context
+            .into_iter()
+            .flat_map(|tuple| tuple.parent_record_ids());
+        let postcode_ids = boundary_context.postcode_record_id.into_iter();
+        for context_record_id in admin_ids.chain(postcode_ids) {
+            if !seen.insert(context_record_id) {
+                continue;
+            }
+            if let Some(record) = self.pack.context_record(context_record_id)?
+                && apply_context_record(context, &record)
+            {
+                context_record_ids.push(context_record_id);
             }
         }
         Ok(())
@@ -475,10 +506,11 @@ mod tests {
 
     use crate::{
         builder::report::BuilderReport,
+        context::AdminContextTuple,
         pack::{PackWriter, RecordWriter},
         record::{
-            AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance, StreetRecord,
-            point_geometry,
+            AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord,
+            SourceProvenance, StreetRecord, point_geometry,
         },
     };
 
@@ -559,6 +591,43 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
     }
 
+    #[test]
+    fn reverse_prefers_materialized_boundary_context_over_source_locality() {
+        let temp_dir = temp_pack_dir("boundary-context");
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let locality_id = writer
+            .write_place(&place_record(), PlaceLayer::Locality)
+            .expect("place");
+        let mut address = address_record();
+        address.address.locality = Some("North York".to_string());
+        let address_id = writer.write_address(&address).expect("address");
+        writer.write_boundary_context(
+            address_id,
+            AdminContextTuple {
+                locality_record_id: Some(locality_id),
+                ..AdminContextTuple::default()
+            },
+            None,
+            0,
+        );
+        let mut report = BuilderReport::default();
+        writer.finish(&mut report).expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let response = geocoder
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.0,
+                lat: 43.0,
+            })
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+        assert_eq!(result.evidence.context_record_ids, vec![locality_id]);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
     fn temp_pack_dir(label: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -588,6 +657,17 @@ mod tests {
             geometry: point_geometry(-79.0, 43.0),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(OsmObjectType::Node, 10),
+        }
+    }
+
+    fn place_record() -> PlaceRecord {
+        PlaceRecord {
+            id: "osm:relation:99".to_string(),
+            label: "Toronto".to_string(),
+            name: "Toronto".to_string(),
+            place_type: "admin_level:8".to_string(),
+            geometry: point_geometry(-79.0, 43.0),
+            source: SourceProvenance::osm(OsmObjectType::Relation, 99),
         }
     }
 

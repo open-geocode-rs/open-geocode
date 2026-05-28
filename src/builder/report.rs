@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use geojson::GeometryValue;
 use serde::{Deserialize, Serialize};
 
 use crate::record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer};
@@ -15,6 +16,8 @@ pub struct BuilderReport {
     pub rejected: RejectedCounts,
     pub disposition: CandidateDispositionCounts,
     pub validation: ValidationAuditCounts,
+    pub quality: AcceptedQualityReport,
+    pub triage: RejectionTriageReport,
     pub geometry_resolution: GeometryResolutionCounts,
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
@@ -77,6 +80,78 @@ pub struct ValidationAuditCounts {
     pub unsupported_relation: IssueAuditCounts,
     pub unresolved_geometry: IssueAuditCounts,
     pub interpolation: IssueAuditCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AcceptedQualityReport {
+    pub addresses: AcceptedAddressQuality,
+    pub samples: BTreeMap<String, Vec<AcceptedRecordSample>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AcceptedAddressQuality {
+    pub total: u64,
+    pub has_street: u64,
+    pub has_place: u64,
+    pub has_unit: u64,
+    pub has_locality: u64,
+    pub missing_locality: u64,
+    pub has_region: u64,
+    pub missing_region: u64,
+    pub has_postcode: u64,
+    pub missing_postcode: u64,
+    pub has_country: u64,
+    pub missing_country: u64,
+    pub has_full_admin_context: u64,
+    pub missing_any_admin_context: u64,
+    pub enrichable_by_point: u64,
+    pub not_enrichable_by_point: u64,
+    pub by_location_precision: BTreeMap<String, u64>,
+    pub by_context_shape: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptedRecordSample {
+    pub bucket: String,
+    pub layer: String,
+    pub id: String,
+    pub label: String,
+    pub source_id: String,
+    pub object_type: OsmObjectType,
+    pub object_id: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_fields: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RejectionTriageReport {
+    pub by_bucket: BTreeMap<String, u64>,
+    pub by_reason_and_bucket: BTreeMap<String, BTreeMap<String, u64>>,
+    pub street_name_gaps: StreetNameGapCounts,
+    pub samples: BTreeMap<String, Vec<RejectionSample>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StreetNameGapCounts {
+    pub by_highway: BTreeMap<String, u64>,
+    pub by_service: BTreeMap<String, u64>,
+    pub by_bucket: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectionSample {
+    pub reason: String,
+    pub bucket: String,
+    pub note: String,
+    pub object_type: OsmObjectType,
+    pub object_id: i64,
+    pub source_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_hint: Option<String>,
+    pub writes_rejection_record: bool,
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -225,8 +300,20 @@ enum CandidateDisposition {
     UnresolvedGeometry,
 }
 
+struct RejectionTriage {
+    bucket: &'static str,
+    note: &'static str,
+}
+
+const MAX_REJECTION_SAMPLES_PER_REASON_BUCKET: usize = 5;
+const MAX_ACCEPTED_QUALITY_SAMPLES_PER_BUCKET: usize = 5;
+
 impl BuilderReport {
-    pub(crate) fn accept_address(&mut self, address: &AddressRecord) {
+    pub(crate) fn accept_address_with_tags(
+        &mut self,
+        address: &AddressRecord,
+        source_tags: Option<&BTreeMap<String, String>>,
+    ) {
         self.accept_layer("address");
         match address.location_precision() {
             LocationPrecision::Point => self.accepted.node_addresses += 1,
@@ -245,6 +332,7 @@ impl BuilderReport {
         if address.address.country.is_some() {
             self.completeness.country += 1;
         }
+        self.record_address_quality(address, source_tags);
     }
 
     pub(crate) fn accept_interpolation(&mut self) {
@@ -272,19 +360,157 @@ impl BuilderReport {
         *self.accepted.by_layer.entry(layer.to_string()).or_default() += 1;
     }
 
-    pub(crate) fn reject(&mut self, issue: CandidateIssue) {
-        self.record_rejection(issue);
+    fn record_address_quality(
+        &mut self,
+        address: &AddressRecord,
+        source_tags: Option<&BTreeMap<String, String>>,
+    ) {
+        let missing_admin_fields = missing_admin_context_fields(address);
+        let not_enrichable_by_point = point_coordinates(&address.geometry).is_none();
+        let missing_postcode = address.address.postcode.is_none();
+        let has_complete_source_context = address.address.locality.is_some()
+            && address.address.region.is_some()
+            && address.address.postcode.is_some()
+            && address.address.country.is_some();
+
+        {
+            let quality = &mut self.quality.addresses;
+            quality.total += 1;
+
+            if address.address.street.is_some() {
+                quality.has_street += 1;
+            }
+            if address.address.place.is_some() {
+                quality.has_place += 1;
+            }
+            if address.address.unit.is_some() {
+                quality.has_unit += 1;
+            }
+            count_option(
+                address.address.locality.as_deref(),
+                &mut quality.has_locality,
+                &mut quality.missing_locality,
+            );
+            count_option(
+                address.address.region.as_deref(),
+                &mut quality.has_region,
+                &mut quality.missing_region,
+            );
+            count_option(
+                address.address.postcode.as_deref(),
+                &mut quality.has_postcode,
+                &mut quality.missing_postcode,
+            );
+            count_option(
+                address.address.country.as_deref(),
+                &mut quality.has_country,
+                &mut quality.missing_country,
+            );
+
+            if missing_admin_fields.is_empty() {
+                quality.has_full_admin_context += 1;
+            } else {
+                quality.missing_any_admin_context += 1;
+            }
+
+            if not_enrichable_by_point {
+                quality.not_enrichable_by_point += 1;
+            } else {
+                quality.enrichable_by_point += 1;
+            }
+
+            *quality
+                .by_location_precision
+                .entry(location_precision_name(address.location_precision()).to_string())
+                .or_default() += 1;
+            *quality
+                .by_context_shape
+                .entry(address_context_shape(address))
+                .or_default() += 1;
+        }
+
+        if not_enrichable_by_point {
+            self.accepted_sample(
+                "address/not_enrichable_by_point",
+                address,
+                source_tags,
+                vec!["point_geometry".to_string()],
+            );
+        }
+
+        if !missing_admin_fields.is_empty() {
+            self.accepted_sample(
+                "address/missing_admin_context",
+                address,
+                source_tags,
+                missing_admin_fields,
+            );
+        }
+        if missing_postcode {
+            self.accepted_sample(
+                "address/missing_postcode",
+                address,
+                source_tags,
+                vec!["postcode".to_string()],
+            );
+        }
+        if has_complete_source_context {
+            self.accepted_sample(
+                "address/complete_source_context",
+                address,
+                source_tags,
+                Vec::new(),
+            );
+        }
     }
 
-    pub(crate) fn reject_with_tags(
+    fn accepted_sample(
+        &mut self,
+        bucket: &str,
+        address: &AddressRecord,
+        source_tags: Option<&BTreeMap<String, String>>,
+        missing_fields: Vec<String>,
+    ) {
+        let samples = self.quality.samples.entry(bucket.to_string()).or_default();
+        if samples.len() >= MAX_ACCEPTED_QUALITY_SAMPLES_PER_BUCKET {
+            return;
+        }
+
+        samples.push(AcceptedRecordSample {
+            bucket: bucket.to_string(),
+            layer: "address".to_string(),
+            id: address.id.clone(),
+            label: address.label.clone(),
+            source_id: source_id(address.source.object_type, address.source.object_id),
+            object_type: address.source.object_type,
+            object_id: address.source.object_id,
+            missing_fields,
+            tags: source_tags.cloned().unwrap_or_default(),
+        });
+    }
+
+    pub(crate) fn reject_with_context(
         &mut self,
         issue: CandidateIssue,
         object_type: OsmObjectType,
+        object_id: i64,
         all_tags: &BTreeMap<String, String>,
-        addr_tags: &BTreeMap<String, String>,
+        addr_tags: Option<&BTreeMap<String, String>>,
+        layer_hint: Option<&str>,
+        writes_rejection_record: bool,
     ) {
         self.record_rejection(issue);
-        self.audit_rejection(issue, object_type, all_tags, addr_tags);
+        if let Some(addr_tags) = addr_tags {
+            self.audit_rejection(issue, object_type, all_tags, addr_tags);
+        }
+        self.triage_rejection(
+            issue,
+            object_type,
+            object_id,
+            all_tags,
+            layer_hint,
+            writes_rejection_record,
+        );
     }
 
     fn record_rejection(&mut self, issue: CandidateIssue) {
@@ -369,6 +595,306 @@ impl BuilderReport {
                 .or_default() += 1;
         }
     }
+
+    fn triage_rejection(
+        &mut self,
+        issue: CandidateIssue,
+        object_type: OsmObjectType,
+        object_id: i64,
+        all_tags: &BTreeMap<String, String>,
+        layer_hint: Option<&str>,
+        writes_rejection_record: bool,
+    ) {
+        let triage = rejection_triage(issue, all_tags);
+        let reason = issue.as_str();
+        *self
+            .triage
+            .by_bucket
+            .entry(triage.bucket.to_string())
+            .or_default() += 1;
+        *self
+            .triage
+            .by_reason_and_bucket
+            .entry(reason.to_string())
+            .or_default()
+            .entry(triage.bucket.to_string())
+            .or_default() += 1;
+
+        if matches!(
+            issue,
+            CandidateIssue::StreetMissingName | CandidateIssue::StreetRefOnlyName
+        ) {
+            record_street_name_gap_counts(
+                &mut self.triage.street_name_gaps,
+                all_tags,
+                triage.bucket,
+            );
+        }
+
+        let sample_key = format!("{reason}/{}", triage.bucket);
+        let samples = self.triage.samples.entry(sample_key).or_default();
+        if samples.len() < MAX_REJECTION_SAMPLES_PER_REASON_BUCKET {
+            samples.push(RejectionSample {
+                reason: reason.to_string(),
+                bucket: triage.bucket.to_string(),
+                note: triage.note.to_string(),
+                object_type,
+                object_id,
+                source_id: source_id(object_type, object_id),
+                layer_hint: layer_hint.map(str::to_string),
+                writes_rejection_record,
+                tags: all_tags.clone(),
+            });
+        }
+    }
+}
+
+fn source_id(object_type: OsmObjectType, object_id: i64) -> String {
+    format!("osm:{}:{object_id}", object_type_name(object_type))
+}
+
+fn count_option(value: Option<&str>, present: &mut u64, missing: &mut u64) {
+    if value.is_some_and(|value| !value.trim().is_empty()) {
+        *present += 1;
+    } else {
+        *missing += 1;
+    }
+}
+
+fn missing_admin_context_fields(address: &AddressRecord) -> Vec<String> {
+    let mut missing = Vec::new();
+    if address.address.locality.is_none() {
+        missing.push("locality".to_string());
+    }
+    if address.address.region.is_none() {
+        missing.push("region".to_string());
+    }
+    if address.address.country.is_none() {
+        missing.push("country".to_string());
+    }
+    missing
+}
+
+fn address_context_shape(address: &AddressRecord) -> String {
+    let mut parts = vec!["number"];
+    if address.address.street.is_some() {
+        parts.push("street");
+    }
+    if address.address.place.is_some() {
+        parts.push("place");
+    }
+    if address.address.unit.is_some() {
+        parts.push("unit");
+    }
+    if address.address.locality.is_some() {
+        parts.push("locality");
+    }
+    if address.address.region.is_some() {
+        parts.push("region");
+    }
+    if address.address.postcode.is_some() {
+        parts.push("postcode");
+    }
+    if address.address.country.is_some() {
+        parts.push("country");
+    }
+    parts.join("+")
+}
+
+fn location_precision_name(precision: LocationPrecision) -> &'static str {
+    match precision {
+        LocationPrecision::Point => "point",
+        LocationPrecision::Centroid => "centroid",
+    }
+}
+
+fn point_coordinates(geometry: &geojson::Geometry) -> Option<(f64, f64)> {
+    let GeometryValue::Point { coordinates } = &geometry.value else {
+        return None;
+    };
+    let [lon, lat, ..] = coordinates.as_slice() else {
+        return None;
+    };
+    if lon.is_finite() && lat.is_finite() {
+        Some((*lon, *lat))
+    } else {
+        None
+    }
+}
+
+fn rejection_triage(issue: CandidateIssue, tags: &BTreeMap<String, String>) -> RejectionTriage {
+    match issue {
+        CandidateIssue::StreetMissingName => unnamed_highway_triage(tags),
+        CandidateIssue::StreetRefOnlyName => RejectionTriage {
+            bucket: "needs_model_decision",
+            note: "highway has ref=* but no name=*; it may be useful for route-number search, but is not a reliable address street name",
+        },
+        CandidateIssue::MissingHouseNumber => RejectionTriage {
+            bucket: "likely_usable_missing_source_data",
+            note: "object has street/place address context but no house number; needs better address source data to become a specific address",
+        },
+        CandidateIssue::MissingStreetOrPlace => RejectionTriage {
+            bucket: "likely_usable_missing_source_data",
+            note: "object has a house number but no street/place; could be recoverable only with street inference or better source data",
+        },
+        CandidateIssue::UnsupportedRelation | CandidateIssue::InterpolationUnsupportedObject => {
+            RejectionTriage {
+                bucket: "needs_parser_support",
+                note: "source object may be useful, but the current builder does not support this OSM object shape for the layer",
+            }
+        }
+        CandidateIssue::WayWithoutResolvedNodes
+        | CandidateIssue::InterpolationWayWithoutNodes
+        | CandidateIssue::InterpolationUnresolvedGeometry
+        | CandidateIssue::StreetUnresolvedGeometry => RejectionTriage {
+            bucket: "needs_geometry_resolution",
+            note: "source object has useful tags but geometry could not be resolved into a usable point or line",
+        },
+        CandidateIssue::InterpolationUnsupportedValue
+        | CandidateIssue::InterpolationMissingAnchors
+        | CandidateIssue::InterpolationInsufficientNumericAnchors
+        | CandidateIssue::InterpolationMissingStreetOrPlace
+        | CandidateIssue::InterpolationAnchorStreetMismatch
+        | CandidateIssue::InterpolationInvalidNumberRange
+        | CandidateIssue::InterpolationInvalidParity
+        | CandidateIssue::InterpolationNonNumericAnchor => RejectionTriage {
+            bucket: "invalid_source_data",
+            note: "interpolation tags are incomplete or internally inconsistent; boundaries cannot repair this",
+        },
+        CandidateIssue::PlaceMissingName => RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "place=* without a usable name cannot be returned as a named geocoding result",
+        },
+        CandidateIssue::PlaceUnsupportedValue => RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "place=* value is outside the current address-first place/admin layers",
+        },
+    }
+}
+
+fn unnamed_highway_triage(tags: &BTreeMap<String, String>) -> RejectionTriage {
+    if tags.contains_key("addr:housenumber") {
+        return RejectionTriage {
+            bucket: "not_a_street_gap_address_processed_separately",
+            note: "unnamed highway also carries address tags; review the address rejection or acceptance separately",
+        };
+    }
+
+    let Some(highway) = tag(tags, "highway").map(normalize_tag_value) else {
+        return RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "street-name rejection without a highway value is not useful as a geocoding street",
+        };
+    };
+
+    if is_lifecycle_or_non_current(tags, &highway) {
+        return RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "non-current or construction highway without a name is not useful for address geocoding",
+        };
+    }
+
+    if highway == "service" {
+        return RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "unnamed service roads, driveways, alleys, and parking aisles are usually not addressable geocoding streets",
+        };
+    }
+
+    if is_minor_path_highway(&highway) {
+        return RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "unnamed path-like highway is usually not useful as an address geocoding street",
+        };
+    }
+
+    if is_addressable_road_highway(&highway) {
+        return RejectionTriage {
+            bucket: "likely_usable_missing_source_data",
+            note: "unnamed addressable-looking road; likely needs an OSM fix or external road centerline source",
+        };
+    }
+
+    RejectionTriage {
+        bucket: "needs_review",
+        note: "unnamed highway type is not clearly noise or clearly addressable; inspect samples before deciding",
+    }
+}
+
+fn record_street_name_gap_counts(
+    counts: &mut StreetNameGapCounts,
+    tags: &BTreeMap<String, String>,
+    bucket: &str,
+) {
+    *counts.by_bucket.entry(bucket.to_string()).or_default() += 1;
+    let highway = tag(tags, "highway")
+        .map(normalize_tag_value)
+        .unwrap_or_else(|| "missing".to_string());
+    *counts.by_highway.entry(highway).or_default() += 1;
+    if let Some(service) = tag(tags, "service").map(normalize_tag_value) {
+        *counts.by_service.entry(service).or_default() += 1;
+    }
+}
+
+fn tag<'a>(tags: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    tags.get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_tag_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn is_lifecycle_or_non_current(tags: &BTreeMap<String, String>, highway: &str) -> bool {
+    matches!(highway, "construction" | "proposed")
+        || tags.contains_key("construction")
+        || tags.contains_key("proposed")
+        || tags.contains_key("abandoned")
+        || tags.contains_key("disused")
+        || tags.contains_key("razed")
+}
+
+fn is_minor_path_highway(highway: &str) -> bool {
+    matches!(
+        highway,
+        "bridleway"
+            | "bus_stop"
+            | "corridor"
+            | "crossing"
+            | "cycleway"
+            | "elevator"
+            | "escape"
+            | "footway"
+            | "give_way"
+            | "path"
+            | "platform"
+            | "raceway"
+            | "rest_area"
+            | "speed_camera"
+            | "steps"
+            | "stop"
+            | "street_lamp"
+            | "track"
+            | "trailhead"
+            | "traffic_mirror"
+            | "traffic_signals"
+    )
+}
+
+fn is_addressable_road_highway(highway: &str) -> bool {
+    matches!(
+        highway,
+        "living_street"
+            | "motorway"
+            | "primary"
+            | "residential"
+            | "road"
+            | "secondary"
+            | "tertiary"
+            | "trunk"
+            | "unclassified"
+    )
 }
 
 fn address_shape(issue: CandidateIssue, addr_tags: &BTreeMap<String, String>) -> &'static str {
@@ -498,7 +1024,106 @@ const POI_CONTEXT_KEYS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use crate::record::{AddressComponents, SourceProvenance, point_geometry};
+
     use super::*;
+
+    #[test]
+    fn records_accepted_address_quality_and_samples_missing_context() {
+        let address = address_record(
+            "osm:node:10",
+            10,
+            Some("King Street"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let tags = BTreeMap::from([
+            ("addr:housenumber".to_string(), "10".to_string()),
+            ("addr:street".to_string(), "King Street".to_string()),
+        ]);
+        let mut report = BuilderReport::default();
+
+        report.accept_address_with_tags(&address, Some(&tags));
+
+        assert_eq!(report.quality.addresses.total, 1);
+        assert_eq!(report.quality.addresses.has_street, 1);
+        assert_eq!(report.quality.addresses.missing_locality, 1);
+        assert_eq!(report.quality.addresses.missing_region, 1);
+        assert_eq!(report.quality.addresses.missing_postcode, 1);
+        assert_eq!(report.quality.addresses.missing_country, 1);
+        assert_eq!(report.quality.addresses.missing_any_admin_context, 1);
+        assert_eq!(report.quality.addresses.enrichable_by_point, 1);
+        assert_eq!(
+            report
+                .quality
+                .addresses
+                .by_context_shape
+                .get("number+street"),
+            Some(&1)
+        );
+
+        let admin_samples = report
+            .quality
+            .samples
+            .get("address/missing_admin_context")
+            .expect("missing admin sample");
+        assert_eq!(admin_samples.len(), 1);
+        assert_eq!(admin_samples[0].source_id, "osm:node:10");
+        assert_eq!(
+            admin_samples[0].missing_fields,
+            vec![
+                "locality".to_string(),
+                "region".to_string(),
+                "country".to_string()
+            ]
+        );
+        assert_eq!(
+            admin_samples[0].tags.get("addr:street"),
+            Some(&"King Street".to_string())
+        );
+        assert!(
+            report
+                .quality
+                .samples
+                .contains_key("address/missing_postcode")
+        );
+    }
+
+    #[test]
+    fn records_accepted_address_quality_for_complete_source_context() {
+        let address = address_record(
+            "osm:node:20",
+            20,
+            Some("King Street"),
+            Some("Toronto"),
+            Some("Ontario"),
+            Some("M5V"),
+            Some("CA"),
+        );
+        let mut report = BuilderReport::default();
+
+        report.accept_address_with_tags(&address, None);
+
+        assert_eq!(report.quality.addresses.total, 1);
+        assert_eq!(report.quality.addresses.has_locality, 1);
+        assert_eq!(report.quality.addresses.has_region, 1);
+        assert_eq!(report.quality.addresses.has_postcode, 1);
+        assert_eq!(report.quality.addresses.has_country, 1);
+        assert_eq!(report.quality.addresses.has_full_admin_context, 1);
+        assert_eq!(report.quality.addresses.missing_any_admin_context, 0);
+        assert_eq!(
+            report.quality.addresses.by_location_precision.get("point"),
+            Some(&1)
+        );
+        assert!(
+            report
+                .quality
+                .samples
+                .contains_key("address/complete_source_context")
+        );
+    }
 
     #[test]
     fn audits_missing_housenumber_by_shape_and_feature_context() {
@@ -511,11 +1136,14 @@ mod tests {
         let addr_tags = BTreeMap::from([("addr:street".to_string(), "King Street".to_string())]);
         let mut report = BuilderReport::default();
 
-        report.reject_with_tags(
+        report.reject_with_context(
             CandidateIssue::MissingHouseNumber,
             OsmObjectType::Way,
+            77,
             &all_tags,
-            &addr_tags,
+            Some(&addr_tags),
+            Some("address"),
+            true,
         );
 
         assert_eq!(
@@ -550,5 +1178,173 @@ mod tests {
                 .get("named_feature"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn triages_unnamed_service_highway_as_not_useful_with_sample() {
+        let tags = BTreeMap::from([
+            ("highway".to_string(), "service".to_string()),
+            ("service".to_string(), "parking_aisle".to_string()),
+        ]);
+        let mut report = BuilderReport::default();
+
+        report.reject_with_context(
+            CandidateIssue::StreetMissingName,
+            OsmObjectType::Way,
+            42,
+            &tags,
+            None,
+            Some("street"),
+            false,
+        );
+
+        assert_eq!(
+            report
+                .triage
+                .by_reason_and_bucket
+                .get("street_missing_name")
+                .and_then(|counts| counts.get("likely_not_useful_for_geocoding")),
+            Some(&1)
+        );
+        assert_eq!(
+            report.triage.street_name_gaps.by_highway.get("service"),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .triage
+                .street_name_gaps
+                .by_service
+                .get("parking_aisle"),
+            Some(&1)
+        );
+
+        let samples = report
+            .triage
+            .samples
+            .get("street_missing_name/likely_not_useful_for_geocoding")
+            .expect("sample bucket");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].source_id, "osm:way:42");
+        assert_eq!(samples[0].layer_hint.as_deref(), Some("street"));
+        assert!(!samples[0].writes_rejection_record);
+    }
+
+    #[test]
+    fn triages_unnamed_residential_highway_as_recoverable_gap() {
+        let tags = BTreeMap::from([("highway".to_string(), "residential".to_string())]);
+        let mut report = BuilderReport::default();
+
+        report.reject_with_context(
+            CandidateIssue::StreetMissingName,
+            OsmObjectType::Way,
+            99,
+            &tags,
+            None,
+            Some("street"),
+            false,
+        );
+
+        assert_eq!(
+            report
+                .triage
+                .by_bucket
+                .get("likely_usable_missing_source_data"),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .triage
+                .street_name_gaps
+                .by_bucket
+                .get("likely_usable_missing_source_data"),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .triage
+                .samples
+                .get("street_missing_name/likely_usable_missing_source_data")
+                .and_then(|samples| samples.first())
+                .map(|sample| sample.tags.get("highway")),
+            Some(Some(&"residential".to_string()))
+        );
+    }
+
+    #[test]
+    fn caps_rejection_samples_per_reason_bucket() {
+        let tags = BTreeMap::from([("highway".to_string(), "residential".to_string())]);
+        let mut report = BuilderReport::default();
+
+        for object_id in 0..10 {
+            report.reject_with_context(
+                CandidateIssue::StreetMissingName,
+                OsmObjectType::Way,
+                object_id,
+                &tags,
+                None,
+                Some("street"),
+                false,
+            );
+        }
+
+        assert_eq!(
+            report
+                .triage
+                .samples
+                .get("street_missing_name/likely_usable_missing_source_data")
+                .map(Vec::len),
+            Some(MAX_REJECTION_SAMPLES_PER_REASON_BUCKET)
+        );
+        assert_eq!(
+            report
+                .triage
+                .by_bucket
+                .get("likely_usable_missing_source_data"),
+            Some(&10)
+        );
+    }
+
+    fn address_record(
+        id: &str,
+        object_id: i64,
+        street: Option<&str>,
+        locality: Option<&str>,
+        region: Option<&str>,
+        postcode: Option<&str>,
+        country: Option<&str>,
+    ) -> AddressRecord {
+        let street = street.map(str::to_string);
+        let label = [
+            Some("10".to_string()),
+            street.clone(),
+            locality.map(str::to_string),
+            region.map(str::to_string),
+            postcode.map(str::to_string),
+            country.map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+        AddressRecord {
+            id: id.to_string(),
+            label,
+            name: "10 King Street".to_string(),
+            address: AddressComponents {
+                number: "10".to_string(),
+                street,
+                place: None,
+                unit: None,
+                locality: locality.map(str::to_string),
+                region: region.map(str::to_string),
+                postcode: postcode.map(str::to_string),
+                country: country.map(str::to_string),
+            },
+            geometry: point_geometry(-79.3832, 43.6532),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+        }
     }
 }

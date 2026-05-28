@@ -38,14 +38,23 @@ pub(crate) fn write_candidate(
     writer: &mut dyn RecordWriter,
     report: &mut BuilderReport,
 ) -> Result<Option<AddressRecord>> {
+    let report_candidate = candidate.clone();
     match address_record_from_candidate(candidate) {
         Ok(record) => {
             writer.write_address(&record)?;
-            report.accept_address(&record);
+            report.accept_address_with_tags(&record, Some(&report_candidate.tags));
             Ok(Some(record))
         }
         Err(issue) => {
-            report.reject(issue);
+            report.reject_with_context(
+                issue,
+                report_candidate.object_type,
+                report_candidate.object_id,
+                &report_candidate.tags,
+                Some(&report_candidate.tags),
+                Some("address"),
+                false,
+            );
             Ok(None)
         }
     }

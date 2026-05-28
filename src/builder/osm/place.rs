@@ -25,7 +25,15 @@ pub(crate) fn write_place_node(
             writer.write_place(&record, layer)?;
             report.accept_place(layer);
         }
-        Err(issue) => report.reject(issue),
+        Err(issue) => report.reject_with_context(
+            issue,
+            OsmObjectType::Node,
+            object_id,
+            tags,
+            None,
+            Some("place"),
+            false,
+        ),
     }
     Ok(())
 }

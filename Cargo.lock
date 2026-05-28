@@ -1380,6 +1380,7 @@ dependencies = [
  "osmpbf",
  "rayon",
  "rmp-serde",
+ "rstar 0.12.2",
  "serde",
  "serde_json",
  "tantivy",
