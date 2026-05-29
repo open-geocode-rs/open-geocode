@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 
 use geojson::{Geometry, GeometryValue};
-use serde::{
-    Deserialize, Serialize, Serializer,
-    ser::SerializeStruct,
-};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::labels;
 

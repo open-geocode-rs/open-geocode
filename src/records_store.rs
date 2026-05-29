@@ -395,8 +395,7 @@ impl RecordsStore {
 }
 
 fn map_file(path: &Path) -> Result<Mmap> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     // SAFETY: pack files are immutable once built and the map is read-only.
     unsafe { MmapOptions::new().map(&file) }
         .with_context(|| format!("failed to mmap {}", path.display()))

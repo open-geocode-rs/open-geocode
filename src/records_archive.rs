@@ -18,9 +18,9 @@ use crate::{
         PlaceRecord, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
     },
     records_store::{
-        AddressEntry, EntryKind, GeometryType, InterpolationEntry, LocationPrecisionCode,
-        PlaceEntry, PostcodeEntry, RecordsStore, SourceObject, StreetEntry, pack_directory_entry,
-        self as store,
+        self as store, AddressEntry, EntryKind, GeometryType, InterpolationEntry,
+        LocationPrecisionCode, PlaceEntry, PostcodeEntry, RecordsStore, SourceObject, StreetEntry,
+        pack_directory_entry,
     },
 };
 
@@ -112,8 +112,7 @@ pub struct RecordsArchiveReader {
 impl RecordsArchiveWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        fs::create_dir_all(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
 
         let directory = create_with_header(
             &path.join(store::DIRECTORY_FILE),
@@ -159,7 +158,8 @@ impl RecordsArchiveWriter {
         let region = self.opt_interned(address.region.as_deref())?;
         let postcode = self.opt_interned(address.postcode.as_deref())?;
         let country = self.opt_interned(address.country.as_deref())?;
-        let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+        let geometry =
+            self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
 
         let entry = AddressEntry {
             source_object_id: record.source.object_id,
@@ -194,7 +194,8 @@ impl RecordsArchiveWriter {
     pub fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
         let name = self.push_text_interned(&record.name)?;
         let place_type = self.push_text_interned(&record.place_type)?;
-        let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+        let geometry =
+            self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
 
         let entry = PlaceEntry {
             source_object_id: record.source.object_id,
@@ -218,7 +219,8 @@ impl RecordsArchiveWriter {
     pub fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId> {
         let postcode = self.push_text_interned(&record.postcode)?;
         let derived_from = self.push_text_interned(&record.source.derived_from)?;
-        let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+        let geometry =
+            self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
 
         let entry = PostcodeEntry {
             derived_record_count: record.source.record_count,
@@ -304,7 +306,9 @@ impl RecordsArchiveWriter {
 
     pub fn finish(&mut self) -> Result<()> {
         // Backfill the directory header: record_count then blob_len.
-        self.directory.flush().context("failed to flush records directory")?;
+        self.directory
+            .flush()
+            .context("failed to flush records directory")?;
         self.directory.seek(SeekFrom::Start(8))?;
         self.directory.write_all(&self.record_count.to_le_bytes())?;
         self.directory.write_all(&self.blob_len.to_le_bytes())?;
@@ -316,7 +320,11 @@ impl RecordsArchiveWriter {
 
         backfill_len(&mut self.blob, self.blob_len, "records blob")?;
         backfill_len(&mut self.strings, self.strings_len, "records strings")?;
-        backfill_len(&mut self.geometries, self.geometries_len, "records geometries")?;
+        backfill_len(
+            &mut self.geometries,
+            self.geometries_len,
+            "records geometries",
+        )?;
         Ok(())
     }
 
@@ -849,7 +857,9 @@ fn create_with_header(
 }
 
 fn backfill_len(writer: &mut BufWriter<File>, value: u64, name: &str) -> Result<()> {
-    writer.flush().with_context(|| format!("failed to flush {name}"))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {name}"))?;
     writer.seek(SeekFrom::Start(8))?;
     writer.write_all(&value.to_le_bytes())?;
     writer.flush()?;
@@ -858,8 +868,7 @@ fn backfill_len(writer: &mut BufWriter<File>, value: u64, name: &str) -> Result<
 }
 
 fn cast_entry<T: bytemuck::AnyBitPattern>(bytes: &[u8]) -> Result<&T> {
-    bytemuck::try_from_bytes(bytes)
-        .map_err(|err| anyhow!("record entry layout mismatch: {err}"))
+    bytemuck::try_from_bytes(bytes).map_err(|err| anyhow!("record entry layout mismatch: {err}"))
 }
 
 fn slice_arena<'a>(arena: &'a [u8], start: u64, len: u32, field: &str) -> Result<&'a [u8]> {

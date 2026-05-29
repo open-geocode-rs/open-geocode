@@ -5,10 +5,7 @@ use crate::record::{
 pub fn address_name(components: &AddressComponents) -> String {
     [
         Some(components.number.as_str()),
-        components
-            .street
-            .as_deref()
-            .or(components.place.as_deref()),
+        components.street.as_deref().or(components.place.as_deref()),
     ]
     .into_iter()
     .flatten()
@@ -47,7 +44,12 @@ pub fn interpolation_label(
     range: &InterpolationRange,
     components: &InterpolationAddressComponents,
 ) -> String {
-    let primary = format!("{name} {start}-{end} {kind}", start = range.start, end = range.end, kind = range.kind);
+    let primary = format!(
+        "{name} {start}-{end} {kind}",
+        start = range.start,
+        end = range.end,
+        kind = range.kind
+    );
     [
         Some(primary),
         components.locality.clone(),

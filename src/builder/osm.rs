@@ -99,7 +99,6 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<()> {
         &mut postcode_accumulator,
         &mut discovery.report,
     )?;
-    drop(context_writer);
     discovery.report.phases.record_emission_ms = emission_started.elapsed().as_millis();
     discovery.report.phases.total_ms = total_started.elapsed().as_millis();
     pack_writer.finish(&mut discovery.report)?;

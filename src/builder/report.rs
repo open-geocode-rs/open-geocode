@@ -489,6 +489,10 @@ impl BuilderReport {
         });
     }
 
+    // The rejection-audit path genuinely needs the full object/tag context to
+    // triage and record a rejection; bundling it into a struct would only move
+    // the arguments around.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reject_with_context(
         &mut self,
         issue: CandidateIssue,
