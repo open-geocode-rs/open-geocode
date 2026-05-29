@@ -1,13 +1,12 @@
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufWriter, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use geojson::{Geometry, GeometryValue};
-use memmap2::MmapOptions;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -18,13 +17,14 @@ use crate::{
         InterpolationRange, InterpolationRecord, LocationPrecision, OsmObjectType, PlaceLayer,
         PlaceRecord, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
     },
-    records_flatdata::open_geocode as fd,
+    records_store::{
+        AddressEntry, EntryKind, GeometryType, InterpolationEntry, LocationPrecisionCode,
+        PlaceEntry, PostcodeEntry, RecordsStore, SourceObject, StreetEntry, pack_directory_entry,
+        self as store,
+    },
 };
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
-const FLATDATA_PADDING: [u8; 8] = [0; 8];
-const STRINGS_STAGING_FILE: &str = "strings.staging";
-const GEOMETRIES_STAGING_FILE: &str = "geometries.staging";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span {
@@ -84,301 +84,298 @@ pub struct ContextRecord {
     pub point: Option<RecordPoint>,
 }
 
+/// Common geometry/representative-point fields shared by every entry.
+struct GeometryFields {
+    display_lon: i64,
+    display_lat: i64,
+    geometry_type: u8,
+    geometry_start: u64,
+    geometry_len: u32,
+}
+
 pub struct RecordsArchiveWriter {
-    builder: fd::RecordsArchiveBuilder,
-    records: BufWriter<File>,
-    record_bytes: u64,
+    directory: BufWriter<File>,
+    blob: BufWriter<File>,
     strings: BufWriter<File>,
-    strings_path: PathBuf,
-    strings_len: u64,
-    intern: HashMap<String, Span>,
     geometries: BufWriter<File>,
-    geometries_path: PathBuf,
+    record_count: u64,
+    blob_len: u64,
+    strings_len: u64,
     geometries_len: u64,
+    intern: HashMap<String, Span>,
 }
 
 pub struct RecordsArchiveReader {
-    archive: fd::RecordsArchive,
+    store: RecordsStore,
 }
 
 impl RecordsArchiveWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
+        let path = path.as_ref();
+        fs::create_dir_all(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
 
-        let storage = flatdata::FileResourceStorage::new(&path);
-        let builder = fd::RecordsArchiveBuilder::new(storage)
-            .with_context(|| format!("failed to create records archive in {}", path.display()))?;
-
-        let schema_path = path.join("records.schema");
-        let mut schema = File::create(&schema_path)
-            .with_context(|| format!("failed to create {}", schema_path.display()))?;
-        schema.write_all(fd::schema::records_archive::resources::RECORDS.as_bytes())?;
-
-        let records_path = path.join("records");
-        let mut records = BufWriter::new(
-            File::create(&records_path)
-                .with_context(|| format!("failed to create {}", records_path.display()))?,
-        );
-        records.write_all(&0_u64.to_le_bytes())?;
-
-        let strings_path = path.join(STRINGS_STAGING_FILE);
-        let strings = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&strings_path)
-                .with_context(|| format!("failed to create {}", strings_path.display()))?,
-        );
-        let geometries_path = path.join(GEOMETRIES_STAGING_FILE);
-        let geometries = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&geometries_path)
-                .with_context(|| format!("failed to create {}", geometries_path.display()))?,
-        );
+        let directory = create_with_header(
+            &path.join(store::DIRECTORY_FILE),
+            store::DIRECTORY_MAGIC,
+            store::DIRECTORY_HEADER_BYTES - 8,
+        )?;
+        let blob = create_with_header(
+            &path.join(store::BLOB_FILE),
+            store::BLOB_MAGIC,
+            store::ARENA_HEADER_BYTES - 8,
+        )?;
+        let strings = create_with_header(
+            &path.join(store::STRINGS_FILE),
+            store::STRINGS_MAGIC,
+            store::ARENA_HEADER_BYTES - 8,
+        )?;
+        let geometries = create_with_header(
+            &path.join(store::GEOMETRIES_FILE),
+            store::GEOMETRIES_MAGIC,
+            store::ARENA_HEADER_BYTES - 8,
+        )?;
 
         Ok(Self {
-            builder,
-            records,
-            record_bytes: 0,
+            directory,
+            blob,
             strings,
-            strings_path,
-            strings_len: 0,
-            intern: HashMap::new(),
             geometries,
-            geometries_path,
+            record_count: 0,
+            blob_len: 0,
+            strings_len: 0,
             geometries_len: 0,
+            intern: HashMap::new(),
         })
     }
 
-    pub fn write_address(&mut self, record: &AddressRecord) -> Result<()> {
-        let name = record.name();
-        let mut stored = self.stored_record(fd::RecordLayer::Address, &name)?;
-        self.fill_osm_source(&mut stored, &record.source);
-        self.fill_address_components(&mut stored, &record.address)?;
-        stored.set_location_precision(location_precision_code(record.location_precision));
-        self.fill_geometry(
-            &mut stored,
-            &record.geometry,
-            point_coordinates(&record.geometry)?,
-        )?;
-        self.write_stored_record(&stored)
+    pub fn write_address(&mut self, record: &AddressRecord) -> Result<RecordId> {
+        let address = &record.address;
+        let number = self.push_text(&address.number)?;
+        let street = self.opt_interned(address.street.as_deref())?;
+        let place = self.opt_interned(address.place.as_deref())?;
+        let unit = self.opt_text(address.unit.as_deref())?;
+        let locality = self.opt_interned(address.locality.as_deref())?;
+        let region = self.opt_interned(address.region.as_deref())?;
+        let postcode = self.opt_interned(address.postcode.as_deref())?;
+        let country = self.opt_interned(address.country.as_deref())?;
+        let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+
+        let entry = AddressEntry {
+            source_object_id: record.source.object_id,
+            display_lon: geometry.display_lon,
+            display_lat: geometry.display_lat,
+            geometry_start: geometry.geometry_start,
+            number_start: number.start,
+            street_start: street.start,
+            place_start: place.start,
+            unit_start: unit.start,
+            locality_start: locality.start,
+            region_start: region.start,
+            postcode_start: postcode.start,
+            country_start: country.start,
+            geometry_len: geometry.geometry_len,
+            number_len: number.len,
+            street_len: street.len,
+            place_len: place.len,
+            unit_len: unit.len,
+            locality_len: locality.len,
+            region_len: region.len,
+            postcode_len: postcode.len,
+            country_len: country.len,
+            source_object: source_object_code(record.source.object_type) as u8,
+            geometry_type: geometry.geometry_type,
+            location_precision: location_precision_code(record.location_precision) as u8,
+            _pad: [0; 1],
+        };
+        self.push_entry(EntryKind::Address, &entry)
     }
 
-    pub fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<()> {
-        let mut stored = self.stored_record(place_record_layer(layer), &record.name)?;
-        self.fill_osm_source(&mut stored, &record.source);
+    pub fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
+        let name = self.push_text(&record.name)?;
         let place_type = self.push_text_interned(&record.place_type)?;
-        stored.set_place_type_start(place_type.start);
-        stored.set_place_type_len(place_type.len);
-        stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
-        self.fill_geometry(
-            &mut stored,
-            &record.geometry,
-            point_coordinates(&record.geometry)?,
-        )?;
-        self.write_stored_record(&stored)
+        let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+
+        let entry = PlaceEntry {
+            source_object_id: record.source.object_id,
+            display_lon: geometry.display_lon,
+            display_lat: geometry.display_lat,
+            geometry_start: geometry.geometry_start,
+            name_start: name.start,
+            place_type_start: place_type.start,
+            geometry_len: geometry.geometry_len,
+            name_len: name.len,
+            place_type_len: place_type.len,
+            source_object: source_object_code(record.source.object_type) as u8,
+            geometry_type: geometry.geometry_type,
+            location_precision: LocationPrecisionCode::Centroid as u8,
+            place_layer: place_layer_code(layer),
+        };
+        self.push_entry(EntryKind::Place, &entry)
     }
 
-    pub fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<()> {
-        let name = record.name();
-        let mut stored = self.stored_record(fd::RecordLayer::Postcode, &name)?;
-        stored.set_source_object(fd::SourceObject::Derived);
-        stored.set_source_object_id(0);
-        stored.set_derived_record_count(record.source.record_count);
+    pub fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId> {
         let postcode = self.push_text_interned(&record.postcode)?;
-        stored.set_postcode_start(postcode.start);
-        stored.set_postcode_len(postcode.len);
         let derived_from = self.push_text_interned(&record.source.derived_from)?;
-        stored.set_derived_from_start(derived_from.start);
-        stored.set_derived_from_len(derived_from.len);
-        stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
-        self.fill_geometry(
-            &mut stored,
-            &record.geometry,
-            point_coordinates(&record.geometry)?,
-        )?;
-        self.write_stored_record(&stored)
+        let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+
+        let entry = PostcodeEntry {
+            derived_record_count: record.source.record_count,
+            display_lon: geometry.display_lon,
+            display_lat: geometry.display_lat,
+            geometry_start: geometry.geometry_start,
+            postcode_start: postcode.start,
+            derived_from_start: derived_from.start,
+            geometry_len: geometry.geometry_len,
+            postcode_len: postcode.len,
+            derived_from_len: derived_from.len,
+            geometry_type: geometry.geometry_type,
+            location_precision: LocationPrecisionCode::Centroid as u8,
+            _pad: [0; 2],
+        };
+        self.push_entry(EntryKind::Postcode, &entry)
     }
 
-    pub fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<()> {
-        let name = record.name();
-        let mut stored = self.stored_record(fd::RecordLayer::Interpolation, &name)?;
-        self.fill_osm_source(&mut stored, &record.source);
-        self.fill_interpolation_address_components(&mut stored, &record.address)?;
-        stored.set_interpolation_start(record.interpolation.start);
-        stored.set_interpolation_end(record.interpolation.end);
-        stored.set_interpolation_step(record.interpolation.step);
+    pub fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<RecordId> {
+        let address = &record.address;
+        let street = self.opt_interned(address.street.as_deref())?;
+        let place = self.opt_interned(address.place.as_deref())?;
+        let locality = self.opt_interned(address.locality.as_deref())?;
+        let region = self.opt_interned(address.region.as_deref())?;
+        let postcode = self.opt_interned(address.postcode.as_deref())?;
+        let country = self.opt_interned(address.country.as_deref())?;
         let interpolation_type = self.push_text_interned(&record.interpolation.kind)?;
-        stored.set_interpolation_type_start(interpolation_type.start);
-        stored.set_interpolation_type_len(interpolation_type.len);
         let anchor_ids = self.push_text(&record.anchor_ids.join("\n"))?;
-        stored.set_anchor_ids_start(anchor_ids.start);
-        stored.set_anchor_ids_len(anchor_ids.len);
-        stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
-        self.fill_geometry(&mut stored, &record.geometry, record.representative_point)?;
-        self.write_stored_record(&stored)
+        let geometry = self.encode_geometry(&record.geometry, record.representative_point)?;
+
+        let entry = InterpolationEntry {
+            source_object_id: record.source.object_id,
+            display_lon: geometry.display_lon,
+            display_lat: geometry.display_lat,
+            geometry_start: geometry.geometry_start,
+            street_start: street.start,
+            place_start: place.start,
+            locality_start: locality.start,
+            region_start: region.start,
+            postcode_start: postcode.start,
+            country_start: country.start,
+            interpolation_type_start: interpolation_type.start,
+            anchor_ids_start: anchor_ids.start,
+            geometry_len: geometry.geometry_len,
+            street_len: street.len,
+            place_len: place.len,
+            locality_len: locality.len,
+            region_len: region.len,
+            postcode_len: postcode.len,
+            country_len: country.len,
+            interpolation_type_len: interpolation_type.len,
+            anchor_ids_len: anchor_ids.len,
+            interpolation_start: record.interpolation.start,
+            interpolation_end: record.interpolation.end,
+            interpolation_step: record.interpolation.step,
+            source_object: source_object_code(record.source.object_type) as u8,
+            geometry_type: geometry.geometry_type,
+            location_precision: LocationPrecisionCode::Centroid as u8,
+            _pad: [0; 5],
+        };
+        self.push_entry(EntryKind::Interpolation, &entry)
     }
 
-    pub fn write_street(&mut self, record: &StreetRecord) -> Result<()> {
-        let mut stored = self.stored_record(fd::RecordLayer::Street, &record.name)?;
-        self.fill_osm_source(&mut stored, &record.source);
-        stored.set_location_precision(fd::LocationPrecisionCode::Centroid);
-        self.fill_geometry(&mut stored, &record.geometry, record.representative_point)?;
-        self.write_stored_record(&stored)
+    pub fn write_street(&mut self, record: &StreetRecord) -> Result<RecordId> {
+        let name = self.push_text(&record.name)?;
+        let geometry = self.encode_geometry(&record.geometry, record.representative_point)?;
+
+        let entry = StreetEntry {
+            source_object_id: record.source.object_id,
+            display_lon: geometry.display_lon,
+            display_lat: geometry.display_lat,
+            geometry_start: geometry.geometry_start,
+            name_start: name.start,
+            geometry_len: geometry.geometry_len,
+            name_len: name.len,
+            source_object: source_object_code(record.source.object_type) as u8,
+            geometry_type: geometry.geometry_type,
+            location_precision: LocationPrecisionCode::Centroid as u8,
+            _pad: [0; 5],
+        };
+        self.push_entry(EntryKind::Street, &entry)
     }
 
     pub fn finish(&mut self) -> Result<()> {
-        self.records.write_all(&FLATDATA_PADDING)?;
-        self.records.flush()?;
-        self.records.seek(SeekFrom::Start(0))?;
-        self.records.write_all(&self.record_bytes.to_le_bytes())?;
-        self.records.flush()?;
+        // Backfill the directory header: record_count then blob_len.
+        self.directory.flush().context("failed to flush records directory")?;
+        self.directory.seek(SeekFrom::Start(8))?;
+        self.directory.write_all(&self.record_count.to_le_bytes())?;
+        self.directory.write_all(&self.blob_len.to_le_bytes())?;
+        self.directory.flush()?;
+        // sync_all commits the final file size to the directory entry so later
+        // metadata reads (e.g. the build report's dir_size) see it while these
+        // handles are still open.
+        self.directory.get_ref().sync_all()?;
 
-        self.strings.flush().context("failed to flush strings staging")?;
-        self.geometries.flush().context("failed to flush geometries staging")?;
-
-        {
-            let strings_file = File::open(&self.strings_path).with_context(|| {
-                format!("failed to reopen {}", self.strings_path.display())
-            })?;
-            // SAFETY: file is read-only here and not concurrently modified.
-            let strings_map = unsafe { MmapOptions::new().map(&strings_file) }
-                .with_context(|| format!("failed to mmap {}", self.strings_path.display()))?;
-            self.builder
-                .set_strings(&strings_map)
-                .context("failed to write records string arena")?;
-        }
-        let _ = fs::remove_file(&self.strings_path);
-
-        {
-            let geometries_file = File::open(&self.geometries_path).with_context(|| {
-                format!("failed to reopen {}", self.geometries_path.display())
-            })?;
-            // SAFETY: file is read-only here and not concurrently modified.
-            let geometries_map = unsafe { MmapOptions::new().map(&geometries_file) }
-                .with_context(|| format!("failed to mmap {}", self.geometries_path.display()))?;
-            self.builder
-                .set_geometries(&geometries_map)
-                .context("failed to write records geometry arena")?;
-        }
-        let _ = fs::remove_file(&self.geometries_path);
+        backfill_len(&mut self.blob, self.blob_len, "records blob")?;
+        backfill_len(&mut self.strings, self.strings_len, "records strings")?;
+        backfill_len(&mut self.geometries, self.geometries_len, "records geometries")?;
         Ok(())
     }
 
-    fn stored_record(&mut self, layer: fd::RecordLayer, name: &str) -> Result<fd::StoredRecord> {
-        let mut stored = fd::StoredRecord::new();
-        stored.set_layer(layer);
-        stored.set_reserved(0);
-        // id and label are no longer stored; reader reconstructs them.
-        stored.set_id_start(0);
-        stored.set_id_len(0);
-        stored.set_label_start(0);
-        stored.set_label_len(0);
-        let name = self.push_text(name)?;
-        set_span(&mut stored, "name", name)?;
-        Ok(stored)
-    }
-
-    fn write_stored_record(&mut self, stored: &fd::StoredRecord) -> Result<()> {
-        self.records.write_all(stored.as_bytes())?;
-        self.record_bytes += stored.as_bytes().len() as u64;
-        Ok(())
-    }
-
-    fn fill_osm_source(&self, stored: &mut fd::StoredRecord, source: &SourceProvenance) {
-        stored.set_source_object(source_object_code(source.object_type));
-        stored.set_source_object_id(source.object_id);
-        stored.set_derived_record_count(0);
-    }
-
-    fn fill_address_components(
+    fn push_entry<T: bytemuck::NoUninit>(
         &mut self,
-        stored: &mut fd::StoredRecord,
-        address: &AddressComponents,
-    ) -> Result<()> {
-        let number = self.push_text(&address.number)?;
-        stored.set_number_start(number.start);
-        stored.set_number_len(number.len);
-        self.set_optional_text_interned(stored, TextField::Street, address.street.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Place, address.place.as_deref())?;
-        self.set_optional_text(stored, TextField::Unit, address.unit.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Locality, address.locality.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Region, address.region.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Postcode, address.postcode.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Country, address.country.as_deref())
+        kind: EntryKind,
+        entry: &T,
+    ) -> Result<RecordId> {
+        let offset = self.blob_len;
+        let bytes = bytemuck::bytes_of(entry);
+        self.blob.write_all(bytes)?;
+        self.blob_len += bytes.len() as u64;
+        let packed = pack_directory_entry(kind, offset)?;
+        self.directory.write_all(&packed.to_le_bytes())?;
+        let id = self.record_count;
+        self.record_count += 1;
+        Ok(id)
     }
 
-    fn fill_interpolation_address_components(
+    fn encode_geometry(
         &mut self,
-        stored: &mut fd::StoredRecord,
-        address: &InterpolationAddressComponents,
-    ) -> Result<()> {
-        self.set_optional_text_interned(stored, TextField::Street, address.street.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Place, address.place.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Locality, address.locality.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Region, address.region.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Postcode, address.postcode.as_deref())?;
-        self.set_optional_text_interned(stored, TextField::Country, address.country.as_deref())
-    }
-
-    fn set_optional_text(
-        &mut self,
-        stored: &mut fd::StoredRecord,
-        field: TextField,
-        value: Option<&str>,
-    ) -> Result<()> {
-        let span = match value {
-            Some(value) => self.push_text(value)?,
-            None => Span::EMPTY,
-        };
-        set_optional_span(stored, field, span);
-        Ok(())
-    }
-
-    fn set_optional_text_interned(
-        &mut self,
-        stored: &mut fd::StoredRecord,
-        field: TextField,
-        value: Option<&str>,
-    ) -> Result<()> {
-        let span = match value {
-            Some(value) => self.push_text_interned(value)?,
-            None => Span::EMPTY,
-        };
-        set_optional_span(stored, field, span);
-        Ok(())
-    }
-
-    fn fill_geometry(
-        &mut self,
-        stored: &mut fd::StoredRecord,
         geometry: &Geometry,
         display_point: [f64; 2],
-    ) -> Result<()> {
-        stored.set_display_lon(quantize_coordinate(display_point[0])?);
-        stored.set_display_lat(quantize_coordinate(display_point[1])?);
-
+    ) -> Result<GeometryFields> {
+        let display_lon = quantize_coordinate(display_point[0])?;
+        let display_lat = quantize_coordinate(display_point[1])?;
         match &geometry.value {
-            GeometryValue::Point { .. } => {
-                stored.set_geometry_type(fd::GeometryType::Point);
-                stored.set_geometry_start(0);
-                stored.set_geometry_len(0);
-            }
+            GeometryValue::Point { .. } => Ok(GeometryFields {
+                display_lon,
+                display_lat,
+                geometry_type: GeometryType::Point as u8,
+                geometry_start: 0,
+                geometry_len: 0,
+            }),
             GeometryValue::LineString { coordinates } => {
-                stored.set_geometry_type(fd::GeometryType::Linestring);
                 let span = self.push_line_string(coordinates)?;
-                stored.set_geometry_start(span.start);
-                stored.set_geometry_len(span.len);
+                Ok(GeometryFields {
+                    display_lon,
+                    display_lat,
+                    geometry_type: GeometryType::Linestring as u8,
+                    geometry_start: span.start,
+                    geometry_len: span.len,
+                })
             }
             other => bail!("unsupported stored record geometry: {other:?}"),
         }
+    }
 
-        Ok(())
+    fn opt_text(&mut self, value: Option<&str>) -> Result<Span> {
+        match value {
+            Some(value) => self.push_text(value),
+            None => Ok(Span::EMPTY),
+        }
+    }
+
+    fn opt_interned(&mut self, value: Option<&str>) -> Result<Span> {
+        match value {
+            Some(value) => self.push_text_interned(value),
+            None => Ok(Span::EMPTY),
+        }
     }
 
     fn push_text(&mut self, value: &str) -> Result<Span> {
@@ -421,35 +418,92 @@ impl RecordsArchiveWriter {
     }
 }
 
+/// A decoded record together with the layer name resolved from its entry kind.
+enum Decoded {
+    Address(AddressRecord),
+    Street(StreetRecord),
+    Place(PlaceRecord),
+    Postcode(PostcodeRecord),
+    Interpolation(InterpolationRecord),
+}
+
+impl Decoded {
+    fn id(&self) -> String {
+        match self {
+            Decoded::Address(record) => record.id(),
+            Decoded::Street(record) => record.id(),
+            Decoded::Place(record) => record.id(),
+            Decoded::Postcode(record) => record.id(),
+            Decoded::Interpolation(record) => record.id(),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Decoded::Address(record) => record.label(),
+            Decoded::Street(record) => record.label(),
+            Decoded::Place(record) => record.label(),
+            Decoded::Postcode(record) => record.label(),
+            Decoded::Interpolation(record) => record.label(),
+        }
+    }
+}
+
+struct FullRecord {
+    decoded: Decoded,
+    layer: &'static str,
+    point: RecordPoint,
+    source: RecordSource,
+}
+
 impl RecordsArchiveReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let storage = flatdata::FileResourceStorage::new(path);
-        let archive = fd::RecordsArchive::open(storage)
-            .with_context(|| format!("failed to open records archive in {}", path.display()))?;
-        Ok(Self { archive })
+        Ok(Self {
+            store: RecordsStore::open(path.as_ref())?,
+        })
     }
 
     pub fn len(&self) -> u64 {
-        self.archive.records().len() as u64
+        self.store.record_count()
     }
 
     pub fn summary(&self, record_id: RecordId) -> Result<RecordSummary> {
-        self.summary_from_stored(self.stored(record_id)?)
+        let full = self.decode_full(record_id)?;
+        Ok(RecordSummary {
+            id: full.decoded.id(),
+            layer: full.layer.to_string(),
+            label: full.decoded.label(),
+            point: Some(full.point),
+            source: full.source,
+        })
     }
 
     pub fn record_json(&self, record_id: RecordId) -> Result<Value> {
-        self.record_json_from_stored(self.stored(record_id)?)
+        let full = self.decode_full(record_id)?;
+        match &full.decoded {
+            Decoded::Address(record) => record_json(full.layer, record),
+            Decoded::Street(record) => record_json(full.layer, record),
+            Decoded::Place(record) => record_json(full.layer, record),
+            Decoded::Postcode(record) => record_json(full.layer, record),
+            Decoded::Interpolation(record) => record_json(full.layer, record),
+        }
     }
 
     pub fn records_json_by_layer(&self, layer: &str, limit: usize) -> Result<Vec<Value>> {
-        let wanted = layer_code(layer)?;
+        let (wanted_kind, wanted_place) = layer_filter(layer)?;
         let mut records = Vec::new();
-        for stored in self.archive.records() {
-            if stored.layer() != wanted {
+        for record_id in 0..self.store.record_count() {
+            let (kind, bytes) = self.store.entry(record_id)?;
+            if kind != wanted_kind {
                 continue;
             }
-            records.push(self.record_json_from_stored(stored)?);
+            if let Some(place_layer) = wanted_place {
+                let entry: &PlaceEntry = cast_entry(bytes)?;
+                if decode_place_layer_code(entry.place_layer)? != place_layer {
+                    continue;
+                }
+            }
+            records.push(self.record_json(record_id)?);
             if limit > 0 && records.len() >= limit {
                 break;
             }
@@ -458,306 +512,290 @@ impl RecordsArchiveReader {
     }
 
     pub fn address(&self, record_id: RecordId) -> Result<Option<AddressRecord>> {
-        let stored = self.stored(record_id)?;
-        if stored.layer() != fd::RecordLayer::Address {
+        let (kind, bytes) = self.store.entry(record_id)?;
+        if kind != EntryKind::Address {
             return Ok(None);
         }
-        Ok(Some(self.decode_address(stored)?))
+        Ok(Some(self.decode_address(cast_entry(bytes)?)?))
     }
 
     pub fn interpolation(&self, record_id: RecordId) -> Result<Option<InterpolationRecord>> {
-        let stored = self.stored(record_id)?;
-        if stored.layer() != fd::RecordLayer::Interpolation {
+        let (kind, bytes) = self.store.entry(record_id)?;
+        if kind != EntryKind::Interpolation {
             return Ok(None);
         }
-        Ok(Some(self.decode_interpolation(stored)?))
+        Ok(Some(self.decode_interpolation(cast_entry(bytes)?)?))
     }
 
     pub fn street(&self, record_id: RecordId) -> Result<Option<StreetRecord>> {
-        let stored = self.stored(record_id)?;
-        if stored.layer() != fd::RecordLayer::Street {
+        let (kind, bytes) = self.store.entry(record_id)?;
+        if kind != EntryKind::Street {
             return Ok(None);
         }
-        Ok(Some(self.decode_street(stored)?))
+        Ok(Some(self.decode_street(cast_entry(bytes)?)?))
     }
 
     pub fn context(&self, record_id: RecordId) -> Result<Option<ContextRecord>> {
-        let stored = self.stored(record_id)?;
-        self.context_from_stored(stored)
-    }
-
-    fn stored(&self, record_id: RecordId) -> Result<&fd::StoredRecord> {
-        let index = usize::try_from(record_id)
-            .with_context(|| format!("record id {record_id} is too large"))?;
-        let stored = self
-            .archive
-            .records()
-            .get(index)
-            .with_context(|| format!("record row {record_id} is out of range"))?;
-        self.validate(stored)?;
-        Ok(stored)
-    }
-
-    fn validate(&self, stored: &fd::StoredRecord) -> Result<()> {
-        if stored.reserved() != 0 {
-            bail!("stored record reserved bits are non-zero");
-        }
-        record_layer_name(stored.layer())?;
-        Ok(())
-    }
-
-    fn summary_from_stored(&self, stored: &fd::StoredRecord) -> Result<RecordSummary> {
-        let (id, label) = self.id_and_label(stored)?;
-        Ok(RecordSummary {
-            id,
-            layer: record_layer_name(stored.layer())?.to_string(),
-            label,
-            point: Some(record_point(stored)?),
-            source: self.record_source(stored)?,
-        })
-    }
-
-    fn id_and_label(&self, stored: &fd::StoredRecord) -> Result<(String, String)> {
-        match stored.layer() {
-            fd::RecordLayer::Address => {
-                let record = self.decode_address(stored)?;
-                Ok((record.id(), record.label()))
-            }
-            fd::RecordLayer::Interpolation => {
-                let record = self.decode_interpolation(stored)?;
-                Ok((record.id(), record.label()))
-            }
-            fd::RecordLayer::Street => {
-                let record = self.decode_street(stored)?;
-                Ok((record.id(), record.label()))
-            }
-            fd::RecordLayer::Postcode => {
-                let record = self.decode_postcode(stored)?;
-                Ok((record.id(), record.label()))
-            }
-            other if is_place_layer_value(&other) => {
-                let (_, record) = self.decode_place(stored)?;
-                Ok((record.id(), record.label()))
-            }
-            other => bail!("unsupported record layer in archive: {other:?}"),
-        }
-    }
-
-    fn record_json_from_stored(&self, stored: &fd::StoredRecord) -> Result<Value> {
-        match stored.layer() {
-            fd::RecordLayer::Address => record_json(
-                record_layer_name(stored.layer())?,
-                &self.decode_address(stored)?,
-            ),
-            fd::RecordLayer::Country
-            | fd::RecordLayer::District
-            | fd::RecordLayer::Locality
-            | fd::RecordLayer::Neighbourhood
-            | fd::RecordLayer::Place
-            | fd::RecordLayer::Region => {
-                let (_, record) = self.decode_place(stored)?;
-                record_json(record_layer_name(stored.layer())?, &record)
-            }
-            fd::RecordLayer::Postcode => record_json(
-                record_layer_name(stored.layer())?,
-                &self.decode_postcode(stored)?,
-            ),
-            fd::RecordLayer::Interpolation => record_json(
-                record_layer_name(stored.layer())?,
-                &self.decode_interpolation(stored)?,
-            ),
-            fd::RecordLayer::Street => record_json(
-                record_layer_name(stored.layer())?,
-                &self.decode_street(stored)?,
-            ),
-            other => bail!("unsupported record layer in archive: {other:?}"),
-        }
-    }
-
-    fn decode_address(&self, stored: &fd::StoredRecord) -> Result<AddressRecord> {
-        Ok(AddressRecord {
-            address: self.address_components(stored)?,
-            geometry: self.decode_geometry(stored)?,
-            location_precision: decode_location_precision(stored.location_precision())?,
-            source: self.decode_osm_source(stored)?,
-        })
-    }
-
-    fn decode_place(&self, stored: &fd::StoredRecord) -> Result<(PlaceLayer, PlaceRecord)> {
-        let name = self.read_name(stored)?;
-        Ok((
-            decode_place_layer(stored.layer())?,
-            PlaceRecord {
-                name,
-                place_type: self.required_text(
-                    stored.place_type_start(),
-                    stored.place_type_len(),
-                    "place_type",
-                )?,
-                geometry: self.decode_geometry(stored)?,
-                source: self.decode_osm_source(stored)?,
-            },
-        ))
-    }
-
-    fn decode_postcode(&self, stored: &fd::StoredRecord) -> Result<PostcodeRecord> {
-        Ok(PostcodeRecord {
-            postcode: self.required_text(
-                stored.postcode_start(),
-                stored.postcode_len(),
-                "postcode",
-            )?,
-            geometry: self.decode_geometry(stored)?,
-            source: self.derived_source(stored)?,
-        })
-    }
-
-    fn decode_interpolation(&self, stored: &fd::StoredRecord) -> Result<InterpolationRecord> {
-        let anchor_ids = self
-            .optional_text(stored.anchor_ids_start(), stored.anchor_ids_len())?
-            .map(|value| value.split('\n').map(str::to_string).collect())
-            .unwrap_or_default();
-        Ok(InterpolationRecord {
-            address: self.interpolation_address_components(stored)?,
-            interpolation: InterpolationRange {
-                kind: self.required_text(
-                    stored.interpolation_type_start(),
-                    stored.interpolation_type_len(),
-                    "interpolation_type",
-                )?,
-                start: stored.interpolation_start(),
-                end: stored.interpolation_end(),
-                step: stored.interpolation_step(),
-            },
-            anchor_ids,
-            representative_point: display_point(stored),
-            geometry: self.decode_geometry(stored)?,
-            source: self.decode_osm_source(stored)?,
-        })
-    }
-
-    fn decode_street(&self, stored: &fd::StoredRecord) -> Result<StreetRecord> {
-        let name = self.read_name(stored)?;
-        Ok(StreetRecord {
-            name,
-            geometry: self.decode_geometry(stored)?,
-            representative_point: display_point(stored),
-            source: self.decode_osm_source(stored)?,
-        })
-    }
-
-    fn context_from_stored(&self, stored: &fd::StoredRecord) -> Result<Option<ContextRecord>> {
-        match stored.layer() {
-            fd::RecordLayer::Postcode => {
-                let postcode = self.decode_postcode(stored)?;
-                Ok(Some(ContextRecord {
-                    id: postcode.id(),
-                    layer: "postcode".to_string(),
-                    label: postcode.label(),
-                    name: postcode.name(),
-                    postcode: Some(postcode.postcode),
-                    point: Some(record_point(stored)?),
-                }))
-            }
-            other if is_place_layer_value(&other) => {
-                let (place_layer, place) = self.decode_place(stored)?;
-                let _ = place_layer;
-                Ok(Some(ContextRecord {
-                    id: place.id(),
-                    layer: record_layer_name(stored.layer())?.to_string(),
-                    label: place.label(),
-                    name: place.name.clone(),
-                    postcode: None,
-                    point: Some(record_point(stored)?),
-                }))
-            }
+        let full = self.decode_full(record_id)?;
+        match &full.decoded {
+            Decoded::Postcode(postcode) => Ok(Some(ContextRecord {
+                id: postcode.id(),
+                layer: "postcode".to_string(),
+                label: postcode.label(),
+                name: postcode.name(),
+                postcode: Some(postcode.postcode.clone()),
+                point: Some(full.point),
+            })),
+            Decoded::Place(place) => Ok(Some(ContextRecord {
+                id: place.id(),
+                layer: full.layer.to_string(),
+                label: place.label(),
+                name: place.name.clone(),
+                postcode: None,
+                point: Some(full.point),
+            })),
             _ => Ok(None),
         }
     }
 
-    fn read_name(&self, stored: &fd::StoredRecord) -> Result<String> {
-        self.required_text(stored.name_start(), stored.name_len(), "name")
-    }
-
-    fn address_components(&self, stored: &fd::StoredRecord) -> Result<AddressComponents> {
-        Ok(AddressComponents {
-            number: self.required_text(stored.number_start(), stored.number_len(), "number")?,
-            street: self.optional_text(stored.street_start(), stored.street_len())?,
-            place: self.optional_text(stored.place_start(), stored.place_len())?,
-            unit: self.optional_text(stored.unit_start(), stored.unit_len())?,
-            locality: self.optional_text(stored.locality_start(), stored.locality_len())?,
-            region: self.optional_text(stored.region_start(), stored.region_len())?,
-            postcode: self.optional_text(stored.postcode_start(), stored.postcode_len())?,
-            country: self.optional_text(stored.country_start(), stored.country_len())?,
-        })
-    }
-
-    fn interpolation_address_components(
-        &self,
-        stored: &fd::StoredRecord,
-    ) -> Result<InterpolationAddressComponents> {
-        Ok(InterpolationAddressComponents {
-            street: self.optional_text(stored.street_start(), stored.street_len())?,
-            place: self.optional_text(stored.place_start(), stored.place_len())?,
-            locality: self.optional_text(stored.locality_start(), stored.locality_len())?,
-            region: self.optional_text(stored.region_start(), stored.region_len())?,
-            postcode: self.optional_text(stored.postcode_start(), stored.postcode_len())?,
-            country: self.optional_text(stored.country_start(), stored.country_len())?,
-        })
-    }
-
-    fn record_source(&self, stored: &fd::StoredRecord) -> Result<RecordSource> {
-        match stored.source_object() {
-            fd::SourceObject::Derived => {
-                let source = self.derived_source(stored)?;
-                Ok(RecordSource {
-                    dataset: source.dataset,
-                    object_type: None,
-                    object_id: None,
-                    derived_from: Some(source.derived_from),
-                    record_count: Some(source.record_count),
-                })
+    fn decode_full(&self, record_id: RecordId) -> Result<FullRecord> {
+        let (kind, bytes) = self.store.entry(record_id)?;
+        Ok(match kind {
+            EntryKind::Address => {
+                let entry: &AddressEntry = cast_entry(bytes)?;
+                FullRecord {
+                    decoded: Decoded::Address(self.decode_address(entry)?),
+                    layer: "address",
+                    point: record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                    source: osm_source(entry.source_object, entry.source_object_id)?,
+                }
             }
-            source_object => Ok(RecordSource {
-                dataset: "osm".to_string(),
-                object_type: Some(decode_source_object(source_object)?),
-                object_id: Some(stored.source_object_id()),
-                derived_from: None,
-                record_count: None,
-            }),
-        }
-    }
-
-    fn derived_source(&self, stored: &fd::StoredRecord) -> Result<DerivedSourceProvenance> {
-        Ok(DerivedSourceProvenance {
-            dataset: "osm".to_string(),
-            derived_from: self.required_text(
-                stored.derived_from_start(),
-                stored.derived_from_len(),
-                "derived_from",
-            )?,
-            record_count: stored.derived_record_count(),
+            EntryKind::Street => {
+                let entry: &StreetEntry = cast_entry(bytes)?;
+                FullRecord {
+                    decoded: Decoded::Street(self.decode_street(entry)?),
+                    layer: "street",
+                    point: record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                    source: osm_source(entry.source_object, entry.source_object_id)?,
+                }
+            }
+            EntryKind::Place => {
+                let entry: &PlaceEntry = cast_entry(bytes)?;
+                let (place_layer, record) = self.decode_place(entry)?;
+                FullRecord {
+                    layer: place_layer_name(place_layer),
+                    point: record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                    source: osm_source(entry.source_object, entry.source_object_id)?,
+                    decoded: Decoded::Place(record),
+                }
+            }
+            EntryKind::Postcode => {
+                let entry: &PostcodeEntry = cast_entry(bytes)?;
+                FullRecord {
+                    decoded: Decoded::Postcode(self.decode_postcode(entry)?),
+                    layer: "postcode",
+                    point: record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                    source: self.derived_source_record(entry)?,
+                }
+            }
+            EntryKind::Interpolation => {
+                let entry: &InterpolationEntry = cast_entry(bytes)?;
+                FullRecord {
+                    decoded: Decoded::Interpolation(self.decode_interpolation(entry)?),
+                    layer: "interpolation",
+                    point: record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                    source: osm_source(entry.source_object, entry.source_object_id)?,
+                }
+            }
         })
     }
 
-    fn decode_geometry(&self, stored: &fd::StoredRecord) -> Result<Geometry> {
-        match stored.geometry_type() {
-            fd::GeometryType::Point => Ok(point_geometry(
-                dequantize_coordinate(stored.display_lon()),
-                dequantize_coordinate(stored.display_lat()),
+    fn decode_address(&self, entry: &AddressEntry) -> Result<AddressRecord> {
+        Ok(AddressRecord {
+            address: AddressComponents {
+                number: self.required_text(entry.number_start, entry.number_len, "number")?,
+                street: self.optional_text(entry.street_start, entry.street_len)?,
+                place: self.optional_text(entry.place_start, entry.place_len)?,
+                unit: self.optional_text(entry.unit_start, entry.unit_len)?,
+                locality: self.optional_text(entry.locality_start, entry.locality_len)?,
+                region: self.optional_text(entry.region_start, entry.region_len)?,
+                postcode: self.optional_text(entry.postcode_start, entry.postcode_len)?,
+                country: self.optional_text(entry.country_start, entry.country_len)?,
+            },
+            geometry: self.decode_geometry(
+                entry.geometry_type,
+                entry.geometry_start,
+                entry.geometry_len,
+                entry.display_lon,
+                entry.display_lat,
+            )?,
+            location_precision: decode_location_precision(LocationPrecisionCode::from_u8(
+                entry.location_precision,
+            )?)?,
+            source: osm_provenance(entry.source_object, entry.source_object_id)?,
+        })
+    }
+
+    fn decode_street(&self, entry: &StreetEntry) -> Result<StreetRecord> {
+        Ok(StreetRecord {
+            name: self.required_text(entry.name_start, entry.name_len, "name")?,
+            geometry: self.decode_geometry(
+                entry.geometry_type,
+                entry.geometry_start,
+                entry.geometry_len,
+                entry.display_lon,
+                entry.display_lat,
+            )?,
+            representative_point: [
+                dequantize_coordinate(entry.display_lon),
+                dequantize_coordinate(entry.display_lat),
+            ],
+            source: osm_provenance(entry.source_object, entry.source_object_id)?,
+        })
+    }
+
+    fn decode_place(&self, entry: &PlaceEntry) -> Result<(PlaceLayer, PlaceRecord)> {
+        Ok((
+            decode_place_layer_code(entry.place_layer)?,
+            PlaceRecord {
+                name: self.required_text(entry.name_start, entry.name_len, "name")?,
+                place_type: self.required_text(
+                    entry.place_type_start,
+                    entry.place_type_len,
+                    "place_type",
+                )?,
+                geometry: self.decode_geometry(
+                    entry.geometry_type,
+                    entry.geometry_start,
+                    entry.geometry_len,
+                    entry.display_lon,
+                    entry.display_lat,
+                )?,
+                source: osm_provenance(entry.source_object, entry.source_object_id)?,
+            },
+        ))
+    }
+
+    fn decode_postcode(&self, entry: &PostcodeEntry) -> Result<PostcodeRecord> {
+        Ok(PostcodeRecord {
+            postcode: self.required_text(entry.postcode_start, entry.postcode_len, "postcode")?,
+            geometry: self.decode_geometry(
+                entry.geometry_type,
+                entry.geometry_start,
+                entry.geometry_len,
+                entry.display_lon,
+                entry.display_lat,
+            )?,
+            source: DerivedSourceProvenance {
+                dataset: "osm".to_string(),
+                derived_from: self.required_text(
+                    entry.derived_from_start,
+                    entry.derived_from_len,
+                    "derived_from",
+                )?,
+                record_count: entry.derived_record_count,
+            },
+        })
+    }
+
+    fn decode_interpolation(&self, entry: &InterpolationEntry) -> Result<InterpolationRecord> {
+        let anchor_ids = self
+            .optional_text(entry.anchor_ids_start, entry.anchor_ids_len)?
+            .map(|value| value.split('\n').map(str::to_string).collect())
+            .unwrap_or_default();
+        Ok(InterpolationRecord {
+            address: InterpolationAddressComponents {
+                street: self.optional_text(entry.street_start, entry.street_len)?,
+                place: self.optional_text(entry.place_start, entry.place_len)?,
+                locality: self.optional_text(entry.locality_start, entry.locality_len)?,
+                region: self.optional_text(entry.region_start, entry.region_len)?,
+                postcode: self.optional_text(entry.postcode_start, entry.postcode_len)?,
+                country: self.optional_text(entry.country_start, entry.country_len)?,
+            },
+            interpolation: InterpolationRange {
+                kind: self.required_text(
+                    entry.interpolation_type_start,
+                    entry.interpolation_type_len,
+                    "interpolation_type",
+                )?,
+                start: entry.interpolation_start,
+                end: entry.interpolation_end,
+                step: entry.interpolation_step,
+            },
+            anchor_ids,
+            representative_point: [
+                dequantize_coordinate(entry.display_lon),
+                dequantize_coordinate(entry.display_lat),
+            ],
+            geometry: self.decode_geometry(
+                entry.geometry_type,
+                entry.geometry_start,
+                entry.geometry_len,
+                entry.display_lon,
+                entry.display_lat,
+            )?,
+            source: osm_provenance(entry.source_object, entry.source_object_id)?,
+        })
+    }
+
+    fn derived_source_record(&self, entry: &PostcodeEntry) -> Result<RecordSource> {
+        Ok(RecordSource {
+            dataset: "osm".to_string(),
+            object_type: None,
+            object_id: None,
+            derived_from: Some(self.required_text(
+                entry.derived_from_start,
+                entry.derived_from_len,
+                "derived_from",
+            )?),
+            record_count: Some(entry.derived_record_count),
+        })
+    }
+
+    fn decode_geometry(
+        &self,
+        geometry_type: u8,
+        geometry_start: u64,
+        geometry_len: u32,
+        display_lon: i64,
+        display_lat: i64,
+    ) -> Result<Geometry> {
+        match GeometryType::from_u8(geometry_type)? {
+            GeometryType::Point => Ok(point_geometry(
+                dequantize_coordinate(display_lon),
+                dequantize_coordinate(display_lat),
             )),
-            fd::GeometryType::Linestring => self.decode_line_string(stored),
-            other => bail!("unsupported geometry type in archive: {other:?}"),
+            GeometryType::Linestring => self.decode_line_string(geometry_start, geometry_len),
         }
     }
 
-    fn decode_line_string(&self, stored: &fd::StoredRecord) -> Result<Geometry> {
-        let bytes = self.bytes(
-            self.archive.geometries().as_bytes(),
-            stored.geometry_start(),
-            stored.geometry_len(),
-            "geometry",
-        )?;
+    fn decode_line_string(&self, start: u64, len: u32) -> Result<Geometry> {
+        let bytes = slice_arena(self.store.geometries(), start, len, "geometry")?;
         if bytes.len() < 4 {
             bail!("stored line string geometry is missing its point count");
         }
@@ -783,17 +821,8 @@ impl RecordsArchiveReader {
         Ok(Geometry::new(GeometryValue::LineString { coordinates }))
     }
 
-    fn decode_osm_source(&self, stored: &fd::StoredRecord) -> Result<SourceProvenance> {
-        Ok(SourceProvenance {
-            dataset: "osm".to_string(),
-            object_type: decode_source_object(stored.source_object())?,
-            object_id: stored.source_object_id(),
-            tags: None,
-        })
-    }
-
     fn required_text(&self, start: u64, len: u32, field: &str) -> Result<String> {
-        let bytes = self.bytes(self.archive.strings().as_bytes(), start, len, field)?;
+        let bytes = slice_arena(self.store.strings(), start, len, field)?;
         String::from_utf8(bytes.to_vec()).with_context(|| format!("{field} is not valid UTF-8"))
     }
 
@@ -803,81 +832,44 @@ impl RecordsArchiveReader {
         }
         Ok(Some(self.required_text(start, len, "optional text")?))
     }
-
-    fn bytes<'a>(&self, arena: &'a [u8], start: u64, len: u32, field: &str) -> Result<&'a [u8]> {
-        let start =
-            usize::try_from(start).with_context(|| format!("{field} offset is too large"))?;
-        let len = len as usize;
-        let end = start
-            .checked_add(len)
-            .with_context(|| format!("{field} range overflows"))?;
-        arena
-            .get(start..end)
-            .with_context(|| format!("{field} range {start}..{end} is outside archive arena"))
-    }
 }
 
-fn set_span(stored: &mut fd::StoredRecord, field: &str, span: Span) -> Result<()> {
-    match field {
-        "id" => {
-            stored.set_id_start(span.start);
-            stored.set_id_len(span.len);
-        }
-        "label" => {
-            stored.set_label_start(span.start);
-            stored.set_label_len(span.len);
-        }
-        "name" => {
-            stored.set_name_start(span.start);
-            stored.set_name_len(span.len);
-        }
-        other => bail!("unsupported stored text field: {other}"),
-    }
+fn create_with_header(
+    path: &Path,
+    magic: &[u8; 8],
+    placeholder_bytes: usize,
+) -> Result<BufWriter<File>> {
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(magic)?;
+    writer.write_all(&vec![0u8; placeholder_bytes])?;
+    Ok(writer)
+}
+
+fn backfill_len(writer: &mut BufWriter<File>, value: u64, name: &str) -> Result<()> {
+    writer.flush().with_context(|| format!("failed to flush {name}"))?;
+    writer.seek(SeekFrom::Start(8))?;
+    writer.write_all(&value.to_le_bytes())?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextField {
-    Street,
-    Place,
-    Unit,
-    Locality,
-    Region,
-    Postcode,
-    Country,
+fn cast_entry<T: bytemuck::AnyBitPattern>(bytes: &[u8]) -> Result<&T> {
+    bytemuck::try_from_bytes(bytes)
+        .map_err(|err| anyhow!("record entry layout mismatch: {err}"))
 }
 
-fn set_optional_span(stored: &mut fd::StoredRecord, field: TextField, span: Span) {
-    match field {
-        TextField::Street => {
-            stored.set_street_start(span.start);
-            stored.set_street_len(span.len);
-        }
-        TextField::Place => {
-            stored.set_place_start(span.start);
-            stored.set_place_len(span.len);
-        }
-        TextField::Unit => {
-            stored.set_unit_start(span.start);
-            stored.set_unit_len(span.len);
-        }
-        TextField::Locality => {
-            stored.set_locality_start(span.start);
-            stored.set_locality_len(span.len);
-        }
-        TextField::Region => {
-            stored.set_region_start(span.start);
-            stored.set_region_len(span.len);
-        }
-        TextField::Postcode => {
-            stored.set_postcode_start(span.start);
-            stored.set_postcode_len(span.len);
-        }
-        TextField::Country => {
-            stored.set_country_start(span.start);
-            stored.set_country_len(span.len);
-        }
-    }
+fn slice_arena<'a>(arena: &'a [u8], start: u64, len: u32, field: &str) -> Result<&'a [u8]> {
+    let start = usize::try_from(start).with_context(|| format!("{field} offset is too large"))?;
+    let len = len as usize;
+    let end = start
+        .checked_add(len)
+        .with_context(|| format!("{field} range overflows"))?;
+    arena
+        .get(start..end)
+        .with_context(|| format!("{field} range {start}..{end} is outside archive arena"))
 }
 
 fn record_json(layer: &str, record: &impl Serialize) -> Result<Value> {
@@ -889,128 +881,127 @@ fn record_json(layer: &str, record: &impl Serialize) -> Result<Value> {
     Ok(value)
 }
 
-fn layer_code(layer: &str) -> Result<fd::RecordLayer> {
-    match layer {
-        "address" => Ok(fd::RecordLayer::Address),
-        "country" => Ok(fd::RecordLayer::Country),
-        "district" => Ok(fd::RecordLayer::District),
-        "interpolation" => Ok(fd::RecordLayer::Interpolation),
-        "locality" => Ok(fd::RecordLayer::Locality),
-        "neighbourhood" => Ok(fd::RecordLayer::Neighbourhood),
-        "place" => Ok(fd::RecordLayer::Place),
-        "postcode" => Ok(fd::RecordLayer::Postcode),
-        "region" => Ok(fd::RecordLayer::Region),
-        "street" => Ok(fd::RecordLayer::Street),
-        other => bail!("unknown record layer: {other}"),
-    }
-}
-
-fn record_layer_name(layer: fd::RecordLayer) -> Result<&'static str> {
-    match layer {
-        fd::RecordLayer::Address => Ok("address"),
-        fd::RecordLayer::Country => Ok("country"),
-        fd::RecordLayer::District => Ok("district"),
-        fd::RecordLayer::Interpolation => Ok("interpolation"),
-        fd::RecordLayer::Locality => Ok("locality"),
-        fd::RecordLayer::Neighbourhood => Ok("neighbourhood"),
-        fd::RecordLayer::Place => Ok("place"),
-        fd::RecordLayer::Postcode => Ok("postcode"),
-        fd::RecordLayer::Region => Ok("region"),
-        fd::RecordLayer::Street => Ok("street"),
-        other => bail!("unsupported record layer in archive: {other:?}"),
-    }
-}
-
-fn place_record_layer(layer: PlaceLayer) -> fd::RecordLayer {
-    match layer {
-        PlaceLayer::Country => fd::RecordLayer::Country,
-        PlaceLayer::Region => fd::RecordLayer::Region,
-        PlaceLayer::District => fd::RecordLayer::District,
-        PlaceLayer::Place => fd::RecordLayer::Place,
-        PlaceLayer::Locality => fd::RecordLayer::Locality,
-        PlaceLayer::Neighbourhood => fd::RecordLayer::Neighbourhood,
-    }
-}
-
-fn is_place_layer_value(layer: &fd::RecordLayer) -> bool {
-    matches!(
-        layer,
-        fd::RecordLayer::Country
-            | fd::RecordLayer::District
-            | fd::RecordLayer::Locality
-            | fd::RecordLayer::Neighbourhood
-            | fd::RecordLayer::Place
-            | fd::RecordLayer::Region
-    )
-}
-
-fn decode_place_layer(layer: fd::RecordLayer) -> Result<PlaceLayer> {
-    match layer {
-        fd::RecordLayer::Country => Ok(PlaceLayer::Country),
-        fd::RecordLayer::District => Ok(PlaceLayer::District),
-        fd::RecordLayer::Locality => Ok(PlaceLayer::Locality),
-        fd::RecordLayer::Neighbourhood => Ok(PlaceLayer::Neighbourhood),
-        fd::RecordLayer::Place => Ok(PlaceLayer::Place),
-        fd::RecordLayer::Region => Ok(PlaceLayer::Region),
-        other => bail!("record layer {other:?} is not a place layer"),
-    }
-}
-
-fn record_point(stored: &fd::StoredRecord) -> Result<RecordPoint> {
+fn record_point(
+    geometry_type: u8,
+    location_precision: u8,
+    display_lon: i64,
+    display_lat: i64,
+) -> Result<RecordPoint> {
     Ok(RecordPoint {
-        lon: dequantize_coordinate(stored.display_lon()),
-        lat: dequantize_coordinate(stored.display_lat()),
-        precision: point_precision(stored)?,
+        lon: dequantize_coordinate(display_lon),
+        lat: dequantize_coordinate(display_lat),
+        precision: point_precision(geometry_type, location_precision)?,
     })
 }
 
-fn display_point(stored: &fd::StoredRecord) -> [f64; 2] {
-    [
-        dequantize_coordinate(stored.display_lon()),
-        dequantize_coordinate(stored.display_lat()),
-    ]
-}
-
-fn point_precision(stored: &fd::StoredRecord) -> Result<RecordPointPrecision> {
-    if stored.geometry_type() == fd::GeometryType::Linestring {
+fn point_precision(geometry_type: u8, location_precision: u8) -> Result<RecordPointPrecision> {
+    if GeometryType::from_u8(geometry_type)? == GeometryType::Linestring {
         return Ok(RecordPointPrecision::RepresentativePoint);
     }
-    match decode_location_precision(stored.location_precision())? {
+    match decode_location_precision(LocationPrecisionCode::from_u8(location_precision)?)? {
         LocationPrecision::Point => Ok(RecordPointPrecision::Point),
         LocationPrecision::Centroid => Ok(RecordPointPrecision::Centroid),
     }
 }
 
-fn source_object_code(object_type: OsmObjectType) -> fd::SourceObject {
+fn osm_source(source_object: u8, object_id: i64) -> Result<RecordSource> {
+    Ok(RecordSource {
+        dataset: "osm".to_string(),
+        object_type: Some(decode_source_object(SourceObject::from_u8(source_object)?)?),
+        object_id: Some(object_id),
+        derived_from: None,
+        record_count: None,
+    })
+}
+
+fn osm_provenance(source_object: u8, object_id: i64) -> Result<SourceProvenance> {
+    Ok(SourceProvenance {
+        dataset: "osm".to_string(),
+        object_type: decode_source_object(SourceObject::from_u8(source_object)?)?,
+        object_id,
+        tags: None,
+    })
+}
+
+fn source_object_code(object_type: OsmObjectType) -> SourceObject {
     match object_type {
-        OsmObjectType::Node => fd::SourceObject::Node,
-        OsmObjectType::Way => fd::SourceObject::Way,
-        OsmObjectType::Relation => fd::SourceObject::Relation,
+        OsmObjectType::Node => SourceObject::Node,
+        OsmObjectType::Way => SourceObject::Way,
+        OsmObjectType::Relation => SourceObject::Relation,
     }
 }
 
-fn decode_source_object(source_object: fd::SourceObject) -> Result<OsmObjectType> {
+fn decode_source_object(source_object: SourceObject) -> Result<OsmObjectType> {
     match source_object {
-        fd::SourceObject::Node => Ok(OsmObjectType::Node),
-        fd::SourceObject::Way => Ok(OsmObjectType::Way),
-        fd::SourceObject::Relation => Ok(OsmObjectType::Relation),
-        fd::SourceObject::Derived => bail!("derived source is not an OSM object"),
+        SourceObject::Node => Ok(OsmObjectType::Node),
+        SourceObject::Way => Ok(OsmObjectType::Way),
+        SourceObject::Relation => Ok(OsmObjectType::Relation),
+        SourceObject::Derived => bail!("derived source is not an OSM object"),
     }
 }
 
-fn location_precision_code(precision: LocationPrecision) -> fd::LocationPrecisionCode {
+fn location_precision_code(precision: LocationPrecision) -> LocationPrecisionCode {
     match precision {
-        LocationPrecision::Point => fd::LocationPrecisionCode::Point,
-        LocationPrecision::Centroid => fd::LocationPrecisionCode::Centroid,
+        LocationPrecision::Point => LocationPrecisionCode::Point,
+        LocationPrecision::Centroid => LocationPrecisionCode::Centroid,
     }
 }
 
-fn decode_location_precision(precision: fd::LocationPrecisionCode) -> Result<LocationPrecision> {
+fn decode_location_precision(precision: LocationPrecisionCode) -> Result<LocationPrecision> {
     match precision {
-        fd::LocationPrecisionCode::Point => Ok(LocationPrecision::Point),
-        fd::LocationPrecisionCode::Centroid => Ok(LocationPrecision::Centroid),
-        other => bail!("unsupported location precision in archive: {other:?}"),
+        LocationPrecisionCode::Point => Ok(LocationPrecision::Point),
+        LocationPrecisionCode::Centroid => Ok(LocationPrecision::Centroid),
     }
+}
+
+fn place_layer_code(layer: PlaceLayer) -> u8 {
+    match layer {
+        PlaceLayer::Country => 0,
+        PlaceLayer::Region => 1,
+        PlaceLayer::District => 2,
+        PlaceLayer::Place => 3,
+        PlaceLayer::Locality => 4,
+        PlaceLayer::Neighbourhood => 5,
+    }
+}
+
+fn decode_place_layer_code(code: u8) -> Result<PlaceLayer> {
+    Ok(match code {
+        0 => PlaceLayer::Country,
+        1 => PlaceLayer::Region,
+        2 => PlaceLayer::District,
+        3 => PlaceLayer::Place,
+        4 => PlaceLayer::Locality,
+        5 => PlaceLayer::Neighbourhood,
+        other => bail!("unknown place layer code {other}"),
+    })
+}
+
+fn place_layer_name(layer: PlaceLayer) -> &'static str {
+    match layer {
+        PlaceLayer::Country => "country",
+        PlaceLayer::Region => "region",
+        PlaceLayer::District => "district",
+        PlaceLayer::Place => "place",
+        PlaceLayer::Locality => "locality",
+        PlaceLayer::Neighbourhood => "neighbourhood",
+    }
+}
+
+fn layer_filter(layer: &str) -> Result<(EntryKind, Option<PlaceLayer>)> {
+    Ok(match layer {
+        "address" => (EntryKind::Address, None),
+        "street" => (EntryKind::Street, None),
+        "postcode" => (EntryKind::Postcode, None),
+        "interpolation" => (EntryKind::Interpolation, None),
+        "country" => (EntryKind::Place, Some(PlaceLayer::Country)),
+        "region" => (EntryKind::Place, Some(PlaceLayer::Region)),
+        "district" => (EntryKind::Place, Some(PlaceLayer::District)),
+        "place" => (EntryKind::Place, Some(PlaceLayer::Place)),
+        "locality" => (EntryKind::Place, Some(PlaceLayer::Locality)),
+        "neighbourhood" => (EntryKind::Place, Some(PlaceLayer::Neighbourhood)),
+        other => bail!("unknown record layer: {other}"),
+    })
 }
 
 fn point_coordinates(geometry: &Geometry) -> Result<[f64; 2]> {

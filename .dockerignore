@@ -1,0 +1,9 @@
+# Build context excludes for the benchmark-arena Docker image.
+# Keep the context small: ship only Cargo manifests, src, and demo.
+/target
+/data
+/reports
+.git
+.github
+*.log
+**/*.md

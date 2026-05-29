@@ -5,8 +5,7 @@ pub mod labels;
 pub mod pack;
 pub mod record;
 mod records_archive;
-#[allow(dead_code, mismatched_lifetime_syntaxes)]
-mod records_flatdata;
+mod records_store;
 pub mod reverse;
 pub mod runtime;
 pub mod search;

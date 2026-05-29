@@ -156,7 +156,7 @@ impl TextIndexTimingNanos {
     }
 }
 
-const PACK_SCHEMA_VERSION: u32 = 3;
+const PACK_SCHEMA_VERSION: u32 = 4;
 const REJECTIONS_MAGIC: &[u8; 8] = b"OGREJ001";
 const REJECTION_OFFSETS_MAGIC: &[u8; 8] = b"OGROF001";
 const OFFSET_HEADER_BYTES: u64 = 16;
@@ -1028,13 +1028,8 @@ mod tests {
                 .keys()
                 .any(|path| path.starts_with("text/tantivy/"))
         );
-        assert!(
-            reader
-                .manifest()
-                .files
-                .contains_key("records/RecordsArchive.archive")
-        );
-        assert!(reader.manifest().files.contains_key("records/records"));
+        assert!(reader.manifest().files.contains_key("records/directory"));
+        assert!(reader.manifest().files.contains_key("records/blob"));
         assert!(reader.manifest().files.contains_key("records/strings"));
         assert!(reader.manifest().files.contains_key("records/geometries"));
         assert!(
