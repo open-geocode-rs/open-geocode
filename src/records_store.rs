@@ -127,16 +127,18 @@ impl LocationPrecisionCode {
 }
 
 // Each `*Entry` is `#[repr(C)]` with fields ordered by descending alignment
-// (i64/u64, then u32, then u8) and an explicit trailing pad so there is no
-// implicit padding and `size % 8 == 0`. A `len == 0` text span means "absent".
+// (i64/u64, then i32/u32, then u16, then u8) and an explicit trailing pad so
+// there is no implicit padding and `size % 8 == 0`. A `len == 0` text span
+// means "absent". Coordinates are quantized at 1e7 (~1cm) and fit in `i32`
+// (|180 * 1e7| < i32::MAX). Text span lengths are `u16` (a single field value
+// never approaches 64 KiB); only `geometry_len` stays `u32` since one
+// linestring can exceed 64 KiB.
 
 /// Address row: number plus optional street/place/unit/locality/region/postcode/country.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct AddressEntry {
     pub source_object_id: i64,
-    pub display_lon: i64,
-    pub display_lat: i64,
     pub geometry_start: u64,
     pub number_start: u64,
     pub street_start: u64,
@@ -146,15 +148,17 @@ pub struct AddressEntry {
     pub region_start: u64,
     pub postcode_start: u64,
     pub country_start: u64,
+    pub display_lon: i32,
+    pub display_lat: i32,
     pub geometry_len: u32,
-    pub number_len: u32,
-    pub street_len: u32,
-    pub place_len: u32,
-    pub unit_len: u32,
-    pub locality_len: u32,
-    pub region_len: u32,
-    pub postcode_len: u32,
-    pub country_len: u32,
+    pub number_len: u16,
+    pub street_len: u16,
+    pub place_len: u16,
+    pub unit_len: u16,
+    pub locality_len: u16,
+    pub region_len: u16,
+    pub postcode_len: u16,
+    pub country_len: u16,
     pub source_object: u8,
     pub geometry_type: u8,
     pub location_precision: u8,
@@ -166,16 +170,16 @@ pub struct AddressEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct StreetEntry {
     pub source_object_id: i64,
-    pub display_lon: i64,
-    pub display_lat: i64,
     pub geometry_start: u64,
     pub name_start: u64,
+    pub display_lon: i32,
+    pub display_lat: i32,
     pub geometry_len: u32,
-    pub name_len: u32,
+    pub name_len: u16,
     pub source_object: u8,
     pub geometry_type: u8,
     pub location_precision: u8,
-    pub _pad: [u8; 5],
+    pub _pad: [u8; 7],
 }
 
 /// Place row: name + place_type, with the specific place layer in `place_layer`.
@@ -183,18 +187,19 @@ pub struct StreetEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct PlaceEntry {
     pub source_object_id: i64,
-    pub display_lon: i64,
-    pub display_lat: i64,
     pub geometry_start: u64,
     pub name_start: u64,
     pub place_type_start: u64,
+    pub display_lon: i32,
+    pub display_lat: i32,
     pub geometry_len: u32,
-    pub name_len: u32,
-    pub place_type_len: u32,
+    pub name_len: u16,
+    pub place_type_len: u16,
     pub source_object: u8,
     pub geometry_type: u8,
     pub location_precision: u8,
     pub place_layer: u8,
+    pub _pad: [u8; 4],
 }
 
 /// Postcode row: always a derived source, so the OSM object id is not stored.
@@ -202,17 +207,17 @@ pub struct PlaceEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct PostcodeEntry {
     pub derived_record_count: u64,
-    pub display_lon: i64,
-    pub display_lat: i64,
     pub geometry_start: u64,
     pub postcode_start: u64,
     pub derived_from_start: u64,
+    pub display_lon: i32,
+    pub display_lat: i32,
     pub geometry_len: u32,
-    pub postcode_len: u32,
-    pub derived_from_len: u32,
+    pub postcode_len: u16,
+    pub derived_from_len: u16,
     pub geometry_type: u8,
     pub location_precision: u8,
-    pub _pad: [u8; 2],
+    pub _pad: [u8; 6],
 }
 
 /// Interpolation row: street-level address parts plus the interpolation range
@@ -221,8 +226,6 @@ pub struct PostcodeEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct InterpolationEntry {
     pub source_object_id: i64,
-    pub display_lon: i64,
-    pub display_lat: i64,
     pub geometry_start: u64,
     pub street_start: u64,
     pub place_start: u64,
@@ -232,18 +235,20 @@ pub struct InterpolationEntry {
     pub country_start: u64,
     pub interpolation_type_start: u64,
     pub anchor_ids_start: u64,
+    pub display_lon: i32,
+    pub display_lat: i32,
     pub geometry_len: u32,
-    pub street_len: u32,
-    pub place_len: u32,
-    pub locality_len: u32,
-    pub region_len: u32,
-    pub postcode_len: u32,
-    pub country_len: u32,
-    pub interpolation_type_len: u32,
-    pub anchor_ids_len: u32,
     pub interpolation_start: u32,
     pub interpolation_end: u32,
     pub interpolation_step: u32,
+    pub street_len: u16,
+    pub place_len: u16,
+    pub locality_len: u16,
+    pub region_len: u16,
+    pub postcode_len: u16,
+    pub country_len: u16,
+    pub interpolation_type_len: u16,
+    pub anchor_ids_len: u16,
     pub source_object: u8,
     pub geometry_type: u8,
     pub location_precision: u8,
@@ -252,11 +257,11 @@ pub struct InterpolationEntry {
 
 // No implicit padding, every entry an 8-byte multiple. If any of these fail,
 // the bytemuck casts in the reader/writer would be unsound.
-const _: () = assert!(mem::size_of::<AddressEntry>() == 136);
-const _: () = assert!(mem::size_of::<StreetEntry>() == 56);
-const _: () = assert!(mem::size_of::<PlaceEntry>() == 64);
-const _: () = assert!(mem::size_of::<PostcodeEntry>() == 64);
-const _: () = assert!(mem::size_of::<InterpolationEntry>() == 152);
+const _: () = assert!(mem::size_of::<AddressEntry>() == 112);
+const _: () = assert!(mem::size_of::<StreetEntry>() == 48);
+const _: () = assert!(mem::size_of::<PlaceEntry>() == 56);
+const _: () = assert!(mem::size_of::<PostcodeEntry>() == 56);
+const _: () = assert!(mem::size_of::<InterpolationEntry>() == 128);
 const _: () = assert!(mem::size_of::<AddressEntry>() % 8 == 0);
 const _: () = assert!(mem::size_of::<StreetEntry>() % 8 == 0);
 const _: () = assert!(mem::size_of::<PlaceEntry>() % 8 == 0);

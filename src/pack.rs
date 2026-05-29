@@ -156,7 +156,7 @@ impl TextIndexTimingNanos {
     }
 }
 
-const PACK_SCHEMA_VERSION: u32 = 4;
+const PACK_SCHEMA_VERSION: u32 = 5;
 const REJECTIONS_MAGIC: &[u8; 8] = b"OGREJ001";
 const REJECTION_OFFSETS_MAGIC: &[u8; 8] = b"OGROF001";
 const OFFSET_HEADER_BYTES: u64 = 16;

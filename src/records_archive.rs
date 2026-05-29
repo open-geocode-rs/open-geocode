@@ -86,8 +86,8 @@ pub struct ContextRecord {
 
 /// Common geometry/representative-point fields shared by every entry.
 struct GeometryFields {
-    display_lon: i64,
-    display_lat: i64,
+    display_lon: i32,
+    display_lat: i32,
     geometry_type: u8,
     geometry_start: u64,
     geometry_len: u32,
@@ -175,14 +175,14 @@ impl RecordsArchiveWriter {
             postcode_start: postcode.start,
             country_start: country.start,
             geometry_len: geometry.geometry_len,
-            number_len: number.len,
-            street_len: street.len,
-            place_len: place.len,
-            unit_len: unit.len,
-            locality_len: locality.len,
-            region_len: region.len,
-            postcode_len: postcode.len,
-            country_len: country.len,
+            number_len: len16(number.len, "number")?,
+            street_len: len16(street.len, "street")?,
+            place_len: len16(place.len, "place")?,
+            unit_len: len16(unit.len, "unit")?,
+            locality_len: len16(locality.len, "locality")?,
+            region_len: len16(region.len, "region")?,
+            postcode_len: len16(postcode.len, "postcode")?,
+            country_len: len16(country.len, "country")?,
             source_object: source_object_code(record.source.object_type) as u8,
             geometry_type: geometry.geometry_type,
             location_precision: location_precision_code(record.location_precision) as u8,
@@ -192,7 +192,7 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
-        let name = self.push_text(&record.name)?;
+        let name = self.push_text_interned(&record.name)?;
         let place_type = self.push_text_interned(&record.place_type)?;
         let geometry = self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
 
@@ -204,12 +204,13 @@ impl RecordsArchiveWriter {
             name_start: name.start,
             place_type_start: place_type.start,
             geometry_len: geometry.geometry_len,
-            name_len: name.len,
-            place_type_len: place_type.len,
+            name_len: len16(name.len, "name")?,
+            place_type_len: len16(place_type.len, "place_type")?,
             source_object: source_object_code(record.source.object_type) as u8,
             geometry_type: geometry.geometry_type,
             location_precision: LocationPrecisionCode::Centroid as u8,
             place_layer: place_layer_code(layer),
+            _pad: [0; 4],
         };
         self.push_entry(EntryKind::Place, &entry)
     }
@@ -227,11 +228,11 @@ impl RecordsArchiveWriter {
             postcode_start: postcode.start,
             derived_from_start: derived_from.start,
             geometry_len: geometry.geometry_len,
-            postcode_len: postcode.len,
-            derived_from_len: derived_from.len,
+            postcode_len: len16(postcode.len, "postcode")?,
+            derived_from_len: len16(derived_from.len, "derived_from")?,
             geometry_type: geometry.geometry_type,
             location_precision: LocationPrecisionCode::Centroid as u8,
-            _pad: [0; 2],
+            _pad: [0; 6],
         };
         self.push_entry(EntryKind::Postcode, &entry)
     }
@@ -262,14 +263,14 @@ impl RecordsArchiveWriter {
             interpolation_type_start: interpolation_type.start,
             anchor_ids_start: anchor_ids.start,
             geometry_len: geometry.geometry_len,
-            street_len: street.len,
-            place_len: place.len,
-            locality_len: locality.len,
-            region_len: region.len,
-            postcode_len: postcode.len,
-            country_len: country.len,
-            interpolation_type_len: interpolation_type.len,
-            anchor_ids_len: anchor_ids.len,
+            street_len: len16(street.len, "street")?,
+            place_len: len16(place.len, "place")?,
+            locality_len: len16(locality.len, "locality")?,
+            region_len: len16(region.len, "region")?,
+            postcode_len: len16(postcode.len, "postcode")?,
+            country_len: len16(country.len, "country")?,
+            interpolation_type_len: len16(interpolation_type.len, "interpolation_type")?,
+            anchor_ids_len: len16(anchor_ids.len, "anchor_ids")?,
             interpolation_start: record.interpolation.start,
             interpolation_end: record.interpolation.end,
             interpolation_step: record.interpolation.step,
@@ -282,7 +283,7 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_street(&mut self, record: &StreetRecord) -> Result<RecordId> {
-        let name = self.push_text(&record.name)?;
+        let name = self.push_text_interned(&record.name)?;
         let geometry = self.encode_geometry(&record.geometry, record.representative_point)?;
 
         let entry = StreetEntry {
@@ -292,11 +293,11 @@ impl RecordsArchiveWriter {
             geometry_start: geometry.geometry_start,
             name_start: name.start,
             geometry_len: geometry.geometry_len,
-            name_len: name.len,
+            name_len: len16(name.len, "name")?,
             source_object: source_object_code(record.source.object_type) as u8,
             geometry_type: geometry.geometry_type,
             location_precision: LocationPrecisionCode::Centroid as u8,
-            _pad: [0; 5],
+            _pad: [0; 7],
         };
         self.push_entry(EntryKind::Street, &entry)
     }
@@ -410,7 +411,7 @@ impl RecordsArchiveWriter {
                 .write_all(&quantize_coordinate(*lon)?.to_le_bytes())?;
             self.geometries
                 .write_all(&quantize_coordinate(*lat)?.to_le_bytes())?;
-            written += 16;
+            written += 8;
         }
         self.geometries_len += written;
         let len = u32::try_from(written).context("line string geometry exceeds 4 GiB")?;
@@ -782,8 +783,8 @@ impl RecordsArchiveReader {
         geometry_type: u8,
         geometry_start: u64,
         geometry_len: u32,
-        display_lon: i64,
-        display_lat: i64,
+        display_lon: i32,
+        display_lat: i32,
     ) -> Result<Geometry> {
         match GeometryType::from_u8(geometry_type)? {
             GeometryType::Point => Ok(point_geometry(
@@ -800,7 +801,7 @@ impl RecordsArchiveReader {
             bail!("stored line string geometry is missing its point count");
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().expect("count slice")) as usize;
-        let expected = 4 + count * 16;
+        let expected = 4 + count * 8;
         if bytes.len() != expected {
             bail!(
                 "stored line string geometry has {} bytes, expected {expected}",
@@ -811,22 +812,22 @@ impl RecordsArchiveReader {
         let mut coordinates = Vec::with_capacity(count);
         let mut offset = 4;
         for _ in 0..count {
-            let lon = i64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("lon slice"));
-            offset += 8;
-            let lat = i64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("lat slice"));
-            offset += 8;
+            let lon = i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("lon slice"));
+            offset += 4;
+            let lat = i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("lat slice"));
+            offset += 4;
             coordinates.push(vec![dequantize_coordinate(lon), dequantize_coordinate(lat)].into());
         }
 
         Ok(Geometry::new(GeometryValue::LineString { coordinates }))
     }
 
-    fn required_text(&self, start: u64, len: u32, field: &str) -> Result<String> {
-        let bytes = slice_arena(self.store.strings(), start, len, field)?;
+    fn required_text(&self, start: u64, len: u16, field: &str) -> Result<String> {
+        let bytes = slice_arena(self.store.strings(), start, u32::from(len), field)?;
         String::from_utf8(bytes.to_vec()).with_context(|| format!("{field} is not valid UTF-8"))
     }
 
-    fn optional_text(&self, start: u64, len: u32) -> Result<Option<String>> {
+    fn optional_text(&self, start: u64, len: u16) -> Result<Option<String>> {
         if len == 0 {
             return Ok(None);
         }
@@ -884,8 +885,8 @@ fn record_json(layer: &str, record: &impl Serialize) -> Result<Value> {
 fn record_point(
     geometry_type: u8,
     location_precision: u8,
-    display_lon: i64,
-    display_lat: i64,
+    display_lon: i32,
+    display_lat: i32,
 ) -> Result<RecordPoint> {
     Ok(RecordPoint {
         lon: dequantize_coordinate(display_lon),
@@ -1014,15 +1015,23 @@ fn point_coordinates(geometry: &Geometry) -> Result<[f64; 2]> {
     Ok([*lon, *lat])
 }
 
-fn quantize_coordinate(value: f64) -> Result<i64> {
+fn quantize_coordinate(value: f64) -> Result<i32> {
     if !value.is_finite() {
         bail!("coordinate must be finite");
     }
-    Ok((value * COORDINATE_SCALE).round() as i64)
+    let scaled = (value * COORDINATE_SCALE).round();
+    if scaled < i32::MIN as f64 || scaled > i32::MAX as f64 {
+        bail!("coordinate {value} is out of range");
+    }
+    Ok(scaled as i32)
 }
 
-fn dequantize_coordinate(value: i64) -> f64 {
+fn dequantize_coordinate(value: i32) -> f64 {
     value as f64 / COORDINATE_SCALE
+}
+
+fn len16(len: u32, field: &str) -> Result<u16> {
+    u16::try_from(len).with_context(|| format!("{field} text field exceeds 64 KiB"))
 }
 
 #[cfg(test)]

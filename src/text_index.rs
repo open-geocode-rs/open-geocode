@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
     indexer::UserOperation,
+    merge_policy::NoMergePolicy,
     schema::{FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions},
 };
 
@@ -29,6 +30,7 @@ const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 
 pub struct TantivyTextIndexWriter {
     writer: IndexWriter,
+    index: Index,
     fields: TextIndexFields,
     pending_documents: Vec<TantivyDocument>,
     document_count: u64,
@@ -98,8 +100,13 @@ impl TantivyTextIndexWriter {
         let writer = index
             .writer(INDEX_MEMORY_BUDGET_BYTES)
             .context("failed to create Tantivy index writer")?;
+        // Disable background auto-merges during the build so the only merge is
+        // the single deterministic one we force in `commit()`. This avoids
+        // races with in-flight merges and yields a minimal, reproducible index.
+        writer.set_merge_policy(Box::new(NoMergePolicy));
         Ok(Self {
             writer,
+            index,
             fields,
             pending_documents: Vec::with_capacity(TEXT_INDEX_BATCH_SIZE),
             document_count: 0,
@@ -212,10 +219,37 @@ impl TantivyTextIndexWriter {
         self.writer
             .commit()
             .context("failed to commit Tantivy text index")?;
+        self.merge_to_single_segment()?;
         Ok(TextIndexCommit {
             schema_version: TEXT_INDEX_SCHEMA_VERSION,
             document_count: self.document_count,
         })
+    }
+
+    /// Collapse the committed segments into one and drop the stale segment
+    /// files. With auto-merge disabled, the build leaves several segments, each
+    /// carrying its own term dictionary and store; merging unifies them so the
+    /// on-disk index is minimal and deterministic instead of varying with how
+    /// far the background merger happened to get.
+    fn merge_to_single_segment(&mut self) -> Result<()> {
+        let segment_ids = self
+            .index
+            .searchable_segment_ids()
+            .context("failed to list text index segments")?;
+        if segment_ids.len() > 1 {
+            self.writer
+                .merge(&segment_ids)
+                .wait()
+                .context("failed to merge text index segments")?;
+            self.writer
+                .commit()
+                .context("failed to commit merged text index")?;
+        }
+        self.writer
+            .garbage_collect_files()
+            .wait()
+            .context("failed to garbage collect text index files")?;
+        Ok(())
     }
 }
 
