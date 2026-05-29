@@ -390,9 +390,6 @@ mod tests {
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
             .write_postcode(&PostcodeRecord {
-                id: "derived:osm:postcode:M5V".to_string(),
-                label: "M5V".to_string(),
-                name: "M5V".to_string(),
                 postcode: "M5V".to_string(),
                 geometry: point_geometry(-79.4, 43.6),
                 source: DerivedSourceProvenance::osm_address_records(2),
@@ -678,16 +675,17 @@ mod tests {
 
     fn address_record(
         id: &str,
-        label: &str,
+        _label: &str,
         number: &str,
         street: &str,
         locality: Option<&str>,
         postcode: Option<&str>,
     ) -> AddressRecord {
+        let object_id = id
+            .strip_prefix("osm:node:")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1);
         AddressRecord {
-            id: id.to_string(),
-            label: label.to_string(),
-            name: label.to_string(),
             address: AddressComponents {
                 number: number.to_string(),
                 street: Some(street.to_string()),
@@ -703,23 +701,25 @@ mod tests {
             source: SourceProvenance {
                 dataset: "osm".to_string(),
                 object_type: OsmObjectType::Node,
-                object_id: 1,
+                object_id,
                 tags: Some(BTreeMap::new()),
             },
         }
     }
 
     fn street_record(id: &str, label: &str) -> StreetRecord {
+        let object_id = id
+            .strip_prefix("osm:way:")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(9);
         StreetRecord {
-            id: id.to_string(),
-            label: label.to_string(),
             name: label.to_string(),
             geometry: point_geometry(-79.0, 43.0),
             representative_point: [-79.0, 43.0],
             source: SourceProvenance {
                 dataset: "osm".to_string(),
                 object_type: OsmObjectType::Way,
-                object_id: 9,
+                object_id,
                 tags: Some(BTreeMap::new()),
             },
         }

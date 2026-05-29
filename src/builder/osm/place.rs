@@ -50,8 +50,6 @@ fn place_record_from_node(
 
     Ok((
         PlaceRecord {
-            id: format!("osm:node:{object_id}"),
-            label: name.clone(),
             name,
             place_type,
             geometry: point_geometry(lon, lat),
@@ -110,8 +108,8 @@ mod tests {
         let (record, layer) = place_record_from_node(42, 43.6532, -79.3832, &tags).expect("place");
 
         assert_eq!(layer, PlaceLayer::Locality);
-        assert_eq!(record.id, "osm:node:42");
-        assert_eq!(record.label, "Toronto");
+        assert_eq!(record.id(), "osm:node:42");
+        assert_eq!(record.label(), "Toronto");
         assert_eq!(record.name, "Toronto");
         assert_eq!(record.place_type, "city");
         assert_eq!(record.source.object_type, OsmObjectType::Node);

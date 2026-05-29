@@ -69,9 +69,6 @@ impl PostcodeGroup {
         let lon = self.lon_sum / self.record_count as f64;
         let lat = self.lat_sum / self.record_count as f64;
         PostcodeRecord {
-            id: format!("derived:osm:postcode:{}", id_component(&self.postcode)),
-            label: self.postcode.clone(),
-            name: self.postcode.clone(),
             postcode: self.postcode.clone(),
             geometry: point_geometry(lon, lat),
             source: DerivedSourceProvenance::osm_address_records(self.record_count),
@@ -105,18 +102,6 @@ fn clean_postcode(value: &str) -> Option<String> {
     }
 }
 
-fn id_component(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::record::{
@@ -138,8 +123,8 @@ mod tests {
         let group = accumulator.groups.get("M5V 2T6").expect("group");
         let record = group.to_record();
 
-        assert_eq!(record.id, "derived:osm:postcode:M5V%202T6");
-        assert_eq!(record.label, "M5V 2T6");
+        assert_eq!(record.id(), "derived:osm:postcode:M5V%202T6");
+        assert_eq!(record.label(), "M5V 2T6");
         assert_eq!(record.source.derived_from, "accepted_address_records");
         assert_eq!(record.source.record_count, 2);
         match record.geometry.value {
@@ -156,11 +141,8 @@ mod tests {
         assert_eq!(clean_postcode("---"), None);
     }
 
-    fn address_record(id: &str, postcode: &str, lon: f64, lat: f64) -> AddressRecord {
+    fn address_record(_id: &str, postcode: &str, lon: f64, lat: f64) -> AddressRecord {
         AddressRecord {
-            id: id.to_string(),
-            label: id.to_string(),
-            name: id.to_string(),
             address: AddressComponents {
                 number: "1".to_string(),
                 street: Some("King Street".to_string()),

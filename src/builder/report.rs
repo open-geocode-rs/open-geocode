@@ -479,8 +479,8 @@ impl BuilderReport {
         samples.push(AcceptedRecordSample {
             bucket: bucket.to_string(),
             layer: "address".to_string(),
-            id: address.id.clone(),
-            label: address.label.clone(),
+            id: address.id(),
+            label: address.label(),
             source_id: source_id(address.source.object_type, address.source.object_id),
             object_type: address.source.object_type,
             object_id: address.source.object_id,
@@ -1306,7 +1306,7 @@ mod tests {
     }
 
     fn address_record(
-        id: &str,
+        _id: &str,
         object_id: i64,
         street: Option<&str>,
         locality: Option<&str>,
@@ -1315,23 +1315,7 @@ mod tests {
         country: Option<&str>,
     ) -> AddressRecord {
         let street = street.map(str::to_string);
-        let label = [
-            Some("10".to_string()),
-            street.clone(),
-            locality.map(str::to_string),
-            region.map(str::to_string),
-            postcode.map(str::to_string),
-            country.map(str::to_string),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
-
         AddressRecord {
-            id: id.to_string(),
-            label,
-            name: "10 King Street".to_string(),
             address: AddressComponents {
                 number: "10".to_string(),
                 street,

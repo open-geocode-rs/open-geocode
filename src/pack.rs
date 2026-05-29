@@ -870,23 +870,23 @@ pub(crate) mod test_support {
             }
         }
 
-        pub(crate) fn id(&self) -> &str {
+        pub(crate) fn id(&self) -> String {
             match self {
-                Self::Address(record) => &record.id,
-                Self::Place(_, record) => &record.id,
-                Self::Interpolation(record) => &record.id,
-                Self::Street(record) => &record.id,
-                Self::Postcode(record) => &record.id,
+                Self::Address(record) => record.id(),
+                Self::Place(_, record) => record.id(),
+                Self::Interpolation(record) => record.id(),
+                Self::Street(record) => record.id(),
+                Self::Postcode(record) => record.id(),
             }
         }
 
-        pub(crate) fn label(&self) -> &str {
+        pub(crate) fn label(&self) -> String {
             match self {
-                Self::Address(record) => &record.label,
-                Self::Place(_, record) => &record.label,
-                Self::Interpolation(record) => &record.label,
-                Self::Street(record) => &record.label,
-                Self::Postcode(record) => &record.label,
+                Self::Address(record) => record.label(),
+                Self::Place(_, record) => record.label(),
+                Self::Interpolation(record) => record.label(),
+                Self::Street(record) => record.label(),
+                Self::Postcode(record) => record.label(),
             }
         }
 
@@ -1070,18 +1070,20 @@ mod tests {
             .with_context(|| format!("missing record_id for text hit {query}"))
     }
 
-    fn address_record(id: &str, label: &str) -> AddressRecord {
+    fn address_record(id: &str, name_hint: &str) -> AddressRecord {
         let object_id = id
             .strip_prefix("osm:node:")
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(1);
+        // Parse "<number> <street>" from name_hint so the canonical label matches
+        // what the test wants to find via text search.
+        let mut parts = name_hint.splitn(2, ' ');
+        let number = parts.next().unwrap_or("10").to_string();
+        let street = parts.next().unwrap_or("King Street").to_string();
         AddressRecord {
-            id: id.to_string(),
-            label: label.to_string(),
-            name: label.to_string(),
             address: AddressComponents {
-                number: "10".to_string(),
-                street: Some("King Street".to_string()),
+                number,
+                street: Some(street),
                 place: None,
                 unit: None,
                 locality: None,

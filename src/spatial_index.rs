@@ -1235,9 +1235,6 @@ mod tests {
     fn indexes_and_queries_address_points() {
         let mut writer = PackSpatialIndexWriter::default();
         let record = AddressRecord {
-            id: "osm:node:1".to_string(),
-            label: "10 King Street".to_string(),
-            name: "10 King Street".to_string(),
             address: AddressComponents {
                 number: "10".to_string(),
                 street: Some("King Street".to_string()),
@@ -1279,9 +1276,6 @@ mod tests {
     fn indexes_context_points_with_coarse_h3_cells() {
         let mut writer = PackSpatialIndexWriter::default();
         let record = PostcodeRecord {
-            id: "derived:postcode:m5v".to_string(),
-            label: "M5V".to_string(),
-            name: "M5V".to_string(),
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(1),
@@ -1308,8 +1302,6 @@ mod tests {
     fn indexes_line_segments_with_fraction() {
         let mut writer = PackSpatialIndexWriter::default();
         let record = StreetRecord {
-            id: "osm:way:1".to_string(),
-            label: "King Street".to_string(),
             name: "King Street".to_string(),
             geometry: Geometry::new(GeometryValue::LineString {
                 coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],

@@ -84,12 +84,6 @@ pub struct ContextRecord {
     pub point: Option<RecordPoint>,
 }
 
-struct CommonRecord {
-    id: String,
-    label: String,
-    name: String,
-}
-
 pub struct RecordsArchiveWriter {
     builder: fd::RecordsArchiveBuilder,
     records: BufWriter<File>,
@@ -162,7 +156,8 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_address(&mut self, record: &AddressRecord) -> Result<()> {
-        let mut stored = self.stored_record(fd::RecordLayer::Address, &record.name)?;
+        let name = record.name();
+        let mut stored = self.stored_record(fd::RecordLayer::Address, &name)?;
         self.fill_osm_source(&mut stored, &record.source);
         self.fill_address_components(&mut stored, &record.address)?;
         stored.set_location_precision(location_precision_code(record.location_precision));
@@ -190,7 +185,8 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<()> {
-        let mut stored = self.stored_record(fd::RecordLayer::Postcode, &record.name)?;
+        let name = record.name();
+        let mut stored = self.stored_record(fd::RecordLayer::Postcode, &name)?;
         stored.set_source_object(fd::SourceObject::Derived);
         stored.set_source_object_id(0);
         stored.set_derived_record_count(record.source.record_count);
@@ -210,7 +206,8 @@ impl RecordsArchiveWriter {
     }
 
     pub fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<()> {
-        let mut stored = self.stored_record(fd::RecordLayer::Interpolation, &record.name)?;
+        let name = record.name();
+        let mut stored = self.stored_record(fd::RecordLayer::Interpolation, &name)?;
         self.fill_osm_source(&mut stored, &record.source);
         self.fill_interpolation_address_components(&mut stored, &record.address)?;
         stored.set_interpolation_start(record.interpolation.start);
@@ -510,14 +507,40 @@ impl RecordsArchiveReader {
     }
 
     fn summary_from_stored(&self, stored: &fd::StoredRecord) -> Result<RecordSummary> {
-        let common = self.common_record(stored)?;
+        let (id, label) = self.id_and_label(stored)?;
         Ok(RecordSummary {
-            id: common.id,
+            id,
             layer: record_layer_name(stored.layer())?.to_string(),
-            label: common.label,
+            label,
             point: Some(record_point(stored)?),
             source: self.record_source(stored)?,
         })
+    }
+
+    fn id_and_label(&self, stored: &fd::StoredRecord) -> Result<(String, String)> {
+        match stored.layer() {
+            fd::RecordLayer::Address => {
+                let record = self.decode_address(stored)?;
+                Ok((record.id(), record.label()))
+            }
+            fd::RecordLayer::Interpolation => {
+                let record = self.decode_interpolation(stored)?;
+                Ok((record.id(), record.label()))
+            }
+            fd::RecordLayer::Street => {
+                let record = self.decode_street(stored)?;
+                Ok((record.id(), record.label()))
+            }
+            fd::RecordLayer::Postcode => {
+                let record = self.decode_postcode(stored)?;
+                Ok((record.id(), record.label()))
+            }
+            other if is_place_layer_value(&other) => {
+                let (_, record) = self.decode_place(stored)?;
+                Ok((record.id(), record.label()))
+            }
+            other => bail!("unsupported record layer in archive: {other:?}"),
+        }
     }
 
     fn record_json_from_stored(&self, stored: &fd::StoredRecord) -> Result<Value> {
@@ -552,11 +575,7 @@ impl RecordsArchiveReader {
     }
 
     fn decode_address(&self, stored: &fd::StoredRecord) -> Result<AddressRecord> {
-        let common = self.common_record(stored)?;
         Ok(AddressRecord {
-            id: common.id,
-            label: common.label,
-            name: common.name,
             address: self.address_components(stored)?,
             geometry: self.decode_geometry(stored)?,
             location_precision: decode_location_precision(stored.location_precision())?,
@@ -565,13 +584,11 @@ impl RecordsArchiveReader {
     }
 
     fn decode_place(&self, stored: &fd::StoredRecord) -> Result<(PlaceLayer, PlaceRecord)> {
-        let common = self.common_record(stored)?;
+        let name = self.read_name(stored)?;
         Ok((
             decode_place_layer(stored.layer())?,
             PlaceRecord {
-                id: common.id,
-                label: common.label,
-                name: common.name,
+                name,
                 place_type: self.required_text(
                     stored.place_type_start(),
                     stored.place_type_len(),
@@ -584,11 +601,7 @@ impl RecordsArchiveReader {
     }
 
     fn decode_postcode(&self, stored: &fd::StoredRecord) -> Result<PostcodeRecord> {
-        let common = self.common_record(stored)?;
         Ok(PostcodeRecord {
-            id: common.id,
-            label: common.label,
-            name: common.name,
             postcode: self.required_text(
                 stored.postcode_start(),
                 stored.postcode_len(),
@@ -600,15 +613,11 @@ impl RecordsArchiveReader {
     }
 
     fn decode_interpolation(&self, stored: &fd::StoredRecord) -> Result<InterpolationRecord> {
-        let common = self.common_record(stored)?;
         let anchor_ids = self
             .optional_text(stored.anchor_ids_start(), stored.anchor_ids_len())?
             .map(|value| value.split('\n').map(str::to_string).collect())
             .unwrap_or_default();
         Ok(InterpolationRecord {
-            id: common.id,
-            label: common.label,
-            name: common.name,
             address: self.interpolation_address_components(stored)?,
             interpolation: InterpolationRange {
                 kind: self.required_text(
@@ -628,11 +637,9 @@ impl RecordsArchiveReader {
     }
 
     fn decode_street(&self, stored: &fd::StoredRecord) -> Result<StreetRecord> {
-        let common = self.common_record(stored)?;
+        let name = self.read_name(stored)?;
         Ok(StreetRecord {
-            id: common.id,
-            label: common.label,
-            name: common.name,
+            name,
             geometry: self.decode_geometry(stored)?,
             representative_point: display_point(stored),
             source: self.decode_osm_source(stored)?,
@@ -640,159 +647,36 @@ impl RecordsArchiveReader {
     }
 
     fn context_from_stored(&self, stored: &fd::StoredRecord) -> Result<Option<ContextRecord>> {
-        let Some(postcode) = (stored.layer() == fd::RecordLayer::Postcode)
-            .then(|| self.required_text(stored.postcode_start(), stored.postcode_len(), "postcode"))
-            .transpose()?
-        else {
-            if !is_place_layer(stored.layer()) {
-                return Ok(None);
-            }
-            let common = self.common_record(stored)?;
-            return Ok(Some(ContextRecord {
-                id: common.id,
-                layer: record_layer_name(stored.layer())?.to_string(),
-                label: common.label,
-                name: common.name,
-                postcode: None,
-                point: Some(record_point(stored)?),
-            }));
-        };
-
-        let common = self.common_record(stored)?;
-        Ok(Some(ContextRecord {
-            id: common.id,
-            layer: "postcode".to_string(),
-            label: common.label,
-            name: common.name,
-            postcode: Some(postcode),
-            point: Some(record_point(stored)?),
-        }))
-    }
-
-    fn common_record(&self, stored: &fd::StoredRecord) -> Result<CommonRecord> {
-        let name = self.required_text(stored.name_start(), stored.name_len(), "name")?;
-        let id = self.rebuild_id(stored)?;
-        let label = self.rebuild_label(stored, &name)?;
-        Ok(CommonRecord { id, label, name })
-    }
-
-    fn rebuild_id(&self, stored: &fd::StoredRecord) -> Result<String> {
-        match stored.source_object() {
-            fd::SourceObject::Node => Ok(format!("osm:node:{}", stored.source_object_id())),
-            fd::SourceObject::Way => match stored.layer() {
-                fd::RecordLayer::Interpolation => self.rebuild_interpolation_id(stored),
-                _ => Ok(format!("osm:way:{}", stored.source_object_id())),
-            },
-            fd::SourceObject::Relation => {
-                Ok(format!("osm:relation:{}", stored.source_object_id()))
-            }
-            fd::SourceObject::Derived => match stored.layer() {
-                fd::RecordLayer::Postcode => {
-                    let postcode = self.required_text(
-                        stored.postcode_start(),
-                        stored.postcode_len(),
-                        "postcode",
-                    )?;
-                    Ok(format!("derived:osm:postcode:{}", id_component(&postcode)))
-                }
-                fd::RecordLayer::Country => {
-                    let place_type = self.required_text(
-                        stored.place_type_start(),
-                        stored.place_type_len(),
-                        "place_type",
-                    )?;
-                    let code = place_type
-                        .strip_prefix("derived_country:")
-                        .unwrap_or(&place_type);
-                    Ok(format!("derived:country:{code}"))
-                }
-                other => bail!("unexpected derived record layer: {other:?}"),
-            },
-        }
-    }
-
-    fn rebuild_interpolation_id(&self, stored: &fd::StoredRecord) -> Result<String> {
-        let anchors = self
-            .optional_text(stored.anchor_ids_start(), stored.anchor_ids_len())?
-            .context("interpolation record missing anchor_ids")?;
-        let mut parts = anchors.split('\n');
-        let low = parts
-            .next()
-            .and_then(|value| value.strip_prefix("osm:node:"))
-            .context("interpolation record missing low anchor id")?;
-        let high = parts
-            .next()
-            .and_then(|value| value.strip_prefix("osm:node:"))
-            .context("interpolation record missing high anchor id")?;
-        Ok(format!(
-            "osm:way:{}:interp:{low}-{high}",
-            stored.source_object_id()
-        ))
-    }
-
-    fn rebuild_label(&self, stored: &fd::StoredRecord, name: &str) -> Result<String> {
         match stored.layer() {
-            fd::RecordLayer::Address => self.rebuild_address_label(stored),
-            fd::RecordLayer::Interpolation => self.rebuild_interpolation_label(stored, name),
-            _ => Ok(name.to_string()),
+            fd::RecordLayer::Postcode => {
+                let postcode = self.decode_postcode(stored)?;
+                Ok(Some(ContextRecord {
+                    id: postcode.id(),
+                    layer: "postcode".to_string(),
+                    label: postcode.label(),
+                    name: postcode.name(),
+                    postcode: Some(postcode.postcode),
+                    point: Some(record_point(stored)?),
+                }))
+            }
+            other if is_place_layer_value(&other) => {
+                let (place_layer, place) = self.decode_place(stored)?;
+                let _ = place_layer;
+                Ok(Some(ContextRecord {
+                    id: place.id(),
+                    layer: record_layer_name(stored.layer())?.to_string(),
+                    label: place.label(),
+                    name: place.name.clone(),
+                    postcode: None,
+                    point: Some(record_point(stored)?),
+                }))
+            }
+            _ => Ok(None),
         }
     }
 
-    fn rebuild_address_label(&self, stored: &fd::StoredRecord) -> Result<String> {
-        let number =
-            self.required_text(stored.number_start(), stored.number_len(), "number")?;
-        let street = self.optional_text(stored.street_start(), stored.street_len())?;
-        let place = self.optional_text(stored.place_start(), stored.place_len())?;
-        let unit = self.optional_text(stored.unit_start(), stored.unit_len())?;
-        let locality = self.optional_text(stored.locality_start(), stored.locality_len())?;
-        let region = self.optional_text(stored.region_start(), stored.region_len())?;
-        let postcode = self.optional_text(stored.postcode_start(), stored.postcode_len())?;
-        let country = self.optional_text(stored.country_start(), stored.country_len())?;
-
-        let primary = [Some(number.as_str()), street.as_deref().or(place.as_deref())]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        Ok([
-            Some(primary.as_str()),
-            unit.as_deref(),
-            locality.as_deref(),
-            region.as_deref(),
-            postcode.as_deref(),
-            country.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(", "))
-    }
-
-    fn rebuild_interpolation_label(
-        &self,
-        stored: &fd::StoredRecord,
-        name: &str,
-    ) -> Result<String> {
-        let kind = self.required_text(
-            stored.interpolation_type_start(),
-            stored.interpolation_type_len(),
-            "interpolation_type",
-        )?;
-        let start = stored.interpolation_start();
-        let end = stored.interpolation_end();
-        let locality = self.optional_text(stored.locality_start(), stored.locality_len())?;
-        let region = self.optional_text(stored.region_start(), stored.region_len())?;
-        let postcode = self.optional_text(stored.postcode_start(), stored.postcode_len())?;
-        let country = self.optional_text(stored.country_start(), stored.country_len())?;
-
-        let primary = format!("{name} {start}-{end} {kind}");
-        Ok([Some(primary), locality, region, postcode, country]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(", "))
+    fn read_name(&self, stored: &fd::StoredRecord) -> Result<String> {
+        self.required_text(stored.name_start(), stored.name_len(), "name")
     }
 
     fn address_components(&self, stored: &fd::StoredRecord) -> Result<AddressComponents> {
@@ -1048,7 +932,7 @@ fn place_record_layer(layer: PlaceLayer) -> fd::RecordLayer {
     }
 }
 
-fn is_place_layer(layer: fd::RecordLayer) -> bool {
+fn is_place_layer_value(layer: &fd::RecordLayer) -> bool {
     matches!(
         layer,
         fd::RecordLayer::Country
@@ -1139,18 +1023,6 @@ fn point_coordinates(geometry: &Geometry) -> Result<[f64; 2]> {
     Ok([*lon, *lat])
 }
 
-fn id_component(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
-        })
-        .collect()
-}
-
 fn quantize_coordinate(value: f64) -> Result<i64> {
     if !value.is_finite() {
         bail!("coordinate must be finite");
@@ -1177,9 +1049,6 @@ mod tests {
 
         let mut writer = RecordsArchiveWriter::create(&temp_dir).expect("writer");
         let record = AddressRecord {
-            id: "osm:node:1".to_string(),
-            label: "10 King Street, Toronto, ON".to_string(),
-            name: "10 King Street".to_string(),
             address: AddressComponents {
                 number: "10".to_string(),
                 street: Some("King Street".to_string()),
@@ -1204,9 +1073,9 @@ mod tests {
 
         let reader = RecordsArchiveReader::open(&temp_dir).expect("reader");
         let address = reader.address(0).expect("read").expect("address");
-        assert_eq!(address.id, "osm:node:1");
+        assert_eq!(address.id(), "osm:node:1");
         assert_eq!(
-            address.label,
+            address.label(),
             "10 King Street, 1200, Toronto, ON, M5H, CA"
         );
         assert_eq!(address.address.unit.as_deref(), Some("1200"));
@@ -1223,8 +1092,6 @@ mod tests {
 
         let mut writer = RecordsArchiveWriter::create(&temp_dir).expect("writer");
         let record = StreetRecord {
-            id: "osm:way:9".to_string(),
-            label: "King Street".to_string(),
             name: "King Street".to_string(),
             geometry: Geometry::new(GeometryValue::LineString {
                 coordinates: vec![vec![-79.4, 43.6].into(), vec![-79.3, 43.7].into()],

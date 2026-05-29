@@ -140,12 +140,9 @@ fn interpolation_record_from_segment(
     validate_range(low_anchor.number, high_anchor.number, rule)?;
 
     let address = segment_address(&stub.tags, &low_anchor.tags, &high_anchor.tags)?;
-    let name = address
-        .street
-        .as_deref()
-        .or(address.place.as_deref())
-        .ok_or(CandidateIssue::InterpolationMissingStreetOrPlace)?
-        .to_string();
+    if address.street.is_none() && address.place.is_none() {
+        return Err(CandidateIssue::InterpolationMissingStreetOrPlace);
+    }
 
     let segment_points = segment_points_between(points, first_anchor.index, second_anchor.index)
         .ok_or(CandidateIssue::InterpolationUnresolvedGeometry)?;
@@ -157,19 +154,12 @@ fn interpolation_record_from_segment(
     let built = line_string_geometry(&segment_points)
         .ok_or(CandidateIssue::InterpolationUnresolvedGeometry)?;
 
-    let label = build_label(&name, low_anchor.number, high_anchor.number, rule, &address);
     let anchor_ids = vec![
         format!("osm:node:{}", low_anchor.node_id),
         format!("osm:node:{}", high_anchor.node_id),
     ];
 
     Ok(InterpolationRecord {
-        id: format!(
-            "osm:way:{}:interp:{}-{}",
-            stub.object_id, low_anchor.node_id, high_anchor.node_id
-        ),
-        label,
-        name,
         address,
         interpolation: InterpolationRange {
             kind: rule.kind.clone(),
@@ -390,26 +380,6 @@ fn reject_interpolation(
         Some("interpolation"),
         writer,
     )
-}
-
-fn build_label(
-    name: &str,
-    start: u32,
-    end: u32,
-    rule: &InterpolationRule,
-    address: &InterpolationAddressComponents,
-) -> String {
-    [
-        Some(format!("{name} {start}-{end} {}", rule.kind)),
-        address.locality.clone(),
-        address.region.clone(),
-        address.postcode.clone(),
-        address.country.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(", ")
 }
 
 fn parse_house_number(value: &str) -> Option<u32> {

@@ -61,8 +61,6 @@ fn street_record_from_stub(
     let built = line_string_geometry(&points)?;
 
     Some(StreetRecord {
-        id: format!("osm:way:{}", stub.object_id),
-        label: name.clone(),
         name,
         geometry: built.geometry,
         representative_point: built.representative_point,
@@ -130,8 +128,8 @@ mod tests {
 
         let record = street_record_from_stub(&stub, &node_locations).expect("street record");
 
-        assert_eq!(record.id, "osm:way:99");
-        assert_eq!(record.label, "King Street");
+        assert_eq!(record.id(), "osm:way:99");
+        assert_eq!(record.label(), "King Street");
         assert_eq!(record.name, "King Street");
         assert!((record.representative_point[0] - -79.385).abs() < 0.000001);
         assert!((record.representative_point[1] - 43.65).abs() < 0.000001);

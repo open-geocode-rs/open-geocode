@@ -911,9 +911,6 @@ mod tests {
         let mut writer = PackWriter::create(path).expect("writer");
         writer
             .write_address(&AddressRecord {
-                id: "osm:node:1".to_string(),
-                label: "10 King Street, Toronto".to_string(),
-                name: "10 King Street".to_string(),
                 address: AddressComponents {
                     number: "10".to_string(),
                     street: Some("King Street".to_string()),

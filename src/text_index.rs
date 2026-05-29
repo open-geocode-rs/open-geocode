@@ -281,8 +281,8 @@ impl TextIndexDocument {
 
     fn project_address(record_id: RecordId, address: &AddressRecord) -> TextIndexProjection {
         let mut builder = ProjectionBuilder::new(record_id, "address");
-        builder.label_for_search(&address.label);
-        builder.name_for_search(&address.name);
+        builder.label_for_search(&address.label());
+        builder.name_for_search(&address.name());
         builder.address(&address.address);
         builder.build()
     }
@@ -292,30 +292,30 @@ impl TextIndexDocument {
         interpolation: &InterpolationRecord,
     ) -> TextIndexProjection {
         let mut builder = ProjectionBuilder::new(record_id, "interpolation");
-        builder.label_for_search(&interpolation.label);
-        builder.name_for_search(&interpolation.name);
+        builder.label_for_search(&interpolation.label());
+        builder.name_for_search(&interpolation.name());
         builder.interpolation_address(&interpolation.address);
         builder.build()
     }
 
     fn project_street(record_id: RecordId, street: &StreetRecord) -> TextIndexProjection {
         let mut builder = ProjectionBuilder::new(record_id, "street");
-        builder.label(&street.label);
+        builder.label(&street.label());
         builder.name(&street.name);
         builder.build()
     }
 
     fn project_postcode(record_id: RecordId, postcode: &PostcodeRecord) -> TextIndexProjection {
         let mut builder = ProjectionBuilder::new(record_id, "postcode");
-        builder.label_for_search(&postcode.label);
-        builder.name_for_search(&postcode.name);
+        builder.label_for_search(&postcode.label());
+        builder.name_for_search(&postcode.name());
         builder.postcode(&postcode.postcode);
         builder.build()
     }
 
     fn project_place(record_id: RecordId, layer: &str, place: &PlaceRecord) -> TextIndexProjection {
         let mut builder = ProjectionBuilder::new(record_id, layer);
-        builder.label(&place.label);
+        builder.label(&place.label());
         builder.name(&place.name);
         builder.build()
     }
@@ -609,9 +609,6 @@ mod tests {
     #[test]
     fn projects_address_fields_for_search() {
         let record = AddressRecord {
-            id: "osm:node:123".to_string(),
-            label: "221B Baker Street, London, NW1".to_string(),
-            name: "221B Baker Street".to_string(),
             address: AddressComponents {
                 number: "221B".to_string(),
                 street: Some("Baker Street".to_string()),
@@ -640,9 +637,6 @@ mod tests {
     #[test]
     fn projects_interpolation_without_indexing_range_fields() {
         let record = crate::record::InterpolationRecord {
-            id: "osm:way:9:interp:1-2".to_string(),
-            label: "Baker Street 1-99 odd, London".to_string(),
-            name: "Baker Street".to_string(),
             address: InterpolationAddressComponents {
                 street: Some("Baker Street".to_string()),
                 place: None,
@@ -674,16 +668,11 @@ mod tests {
     #[test]
     fn projects_postcodes_and_place_layers() {
         let postcode = PostcodeRecord {
-            id: "derived:osm:postcode:M5V".to_string(),
-            label: "M5V".to_string(),
-            name: "M5V".to_string(),
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(2),
         };
         let place = PlaceRecord {
-            id: "osm:node:1".to_string(),
-            label: "Toronto".to_string(),
             name: "Toronto".to_string(),
             place_type: "city".to_string(),
             geometry: point_geometry(-79.4, 43.6),

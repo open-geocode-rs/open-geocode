@@ -444,8 +444,6 @@ fn write_derived_country_records(
     sources.sort_by(|left, right| left.code.cmp(&right.code));
     for source in sources {
         let record = PlaceRecord {
-            id: format!("derived:country:{}", source.code),
-            label: source.name.clone(),
             name: source.name.clone(),
             place_type: format!("derived_country:{}", source.code),
             geometry: point_geometry(
@@ -470,8 +468,6 @@ fn write_boundary_place_record(
     report: &mut BuilderReport,
 ) -> Result<RecordId> {
     let record = PlaceRecord {
-        id: format!("osm:{}:{object_id}", osm_object_type_name(object_type)),
-        label: boundary.name.clone(),
         name: boundary.name.clone(),
         place_type: format!("admin_level:{}", boundary.admin_level),
         geometry: point_geometry(
@@ -847,14 +843,6 @@ fn source_type_rank(object_type: OsmObjectType) -> u8 {
         OsmObjectType::Relation => 0,
         OsmObjectType::Way => 1,
         OsmObjectType::Node => 2,
-    }
-}
-
-fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
-    match object_type {
-        OsmObjectType::Node => "node",
-        OsmObjectType::Way => "way",
-        OsmObjectType::Relation => "relation",
     }
 }
 

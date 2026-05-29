@@ -21,18 +21,6 @@ pub(crate) struct AddressCandidate {
     pub tags: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LabelParts<'a> {
-    house_number: &'a str,
-    street: Option<&'a str>,
-    place: Option<&'a str>,
-    unit: Option<&'a str>,
-    city: Option<&'a str>,
-    state: Option<&'a str>,
-    postcode: Option<&'a str>,
-    country: Option<&'a str>,
-}
-
 pub(crate) fn write_candidate(
     candidate: AddressCandidate,
     writer: &mut dyn RecordWriter,
@@ -93,33 +81,8 @@ pub(crate) fn address_record_from_candidate(
     let postcode = tag_value(&candidate.tags, "addr:postcode");
     let state = tag_value(&candidate.tags, "addr:state");
     let country = tag_value(&candidate.tags, "addr:country");
-    let name = [
-        Some(house_number.as_str()),
-        street.as_deref().or(place.as_deref()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" ");
-    let label = build_label(LabelParts {
-        house_number: &house_number,
-        street: street.as_deref(),
-        place: place.as_deref(),
-        unit: unit.as_deref(),
-        city: city.as_deref(),
-        state: state.as_deref(),
-        postcode: postcode.as_deref(),
-        country: country.as_deref(),
-    });
 
     Ok(AddressRecord {
-        id: format!(
-            "osm:{}:{}",
-            osm_object_type_name(candidate.object_type),
-            candidate.object_id
-        ),
-        label,
-        name,
         address: AddressComponents {
             number: house_number,
             street,
@@ -184,36 +147,6 @@ fn clean_text(value: &str) -> Option<String> {
     }
 }
 
-fn build_label(parts: LabelParts<'_>) -> String {
-    let primary = [Some(parts.house_number), parts.street.or(parts.place)]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    [
-        Some(primary.as_str()),
-        parts.unit,
-        parts.city,
-        parts.state,
-        parts.postcode,
-        parts.country,
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join(", ")
-}
-
-fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
-    match object_type {
-        OsmObjectType::Node => "node",
-        OsmObjectType::Way => "way",
-        OsmObjectType::Relation => "relation",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use geojson::GeometryValue;
@@ -241,9 +174,9 @@ mod tests {
 
         let record = address_record_from_candidate(candidate).expect("record should be accepted");
 
-        assert_eq!(record.id, "osm:node:42");
-        assert_eq!(record.label, "10 King Street, Toronto, ON, CA");
-        assert_eq!(record.name, "10 King Street");
+        assert_eq!(record.id(), "osm:node:42");
+        assert_eq!(record.label(), "10 King Street, Toronto, ON, CA");
+        assert_eq!(record.name(), "10 King Street");
         assert_eq!(record.address.street.as_deref(), Some("King Street"));
         assert_eq!(record.address.locality.as_deref(), Some("Toronto"));
         assert_eq!(record.address.region.as_deref(), Some("ON"));

@@ -171,9 +171,9 @@ impl PackReverseGeocoder {
 
         Ok(Some(ReverseGeocodeResult {
             match_kind: ReverseMatchKind::ExplicitAddress,
-            label: address.label,
+            label: address.label(),
             primary_record_id: Some(candidate.record_id),
-            id: Some(address.id),
+            id: Some(address.id()),
             layer: Some("address".to_string()),
             distance_m: Some(candidate.distance_m),
             point: Some(ReversePoint {
@@ -211,13 +211,13 @@ impl PackReverseGeocoder {
             apply_interpolation_context(context, &interpolation.address);
             self.enrich_context(options, context, context_record_ids)?;
             let primary = estimated_primary_label(number, &interpolation.address)
-                .unwrap_or_else(|| format!("{} {}", number, interpolation.name));
+                .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
 
             return Ok(Some(ReverseGeocodeResult {
                 match_kind: ReverseMatchKind::EstimatedAddress,
                 label: compose_label(&primary, context),
                 primary_record_id: Some(candidate.record_id),
-                id: Some(interpolation.id),
+                id: Some(interpolation.id()),
                 layer: Some("interpolation".to_string()),
                 distance_m: Some(candidate.distance_m),
                 point: Some(ReversePoint {
@@ -267,9 +267,9 @@ impl PackReverseGeocoder {
 
         Ok(Some(ReverseGeocodeResult {
             match_kind: ReverseMatchKind::NearestStreet,
-            label: compose_label(&street.label, context),
+            label: compose_label(&street.label(), context),
             primary_record_id: Some(candidate.record_id),
-            id: Some(street.id),
+            id: Some(street.id()),
             layer: Some("street".to_string()),
             distance_m: Some(candidate.distance_m),
             point: Some(ReversePoint {
@@ -641,9 +641,6 @@ mod tests {
 
     fn address_record() -> AddressRecord {
         AddressRecord {
-            id: "osm:node:10".to_string(),
-            label: "10 Queen Street, Toronto".to_string(),
-            name: "10 Queen Street".to_string(),
             address: AddressComponents {
                 number: "10".to_string(),
                 street: Some("Queen Street".to_string()),
@@ -662,8 +659,6 @@ mod tests {
 
     fn place_record() -> PlaceRecord {
         PlaceRecord {
-            id: "osm:relation:99".to_string(),
-            label: "Toronto".to_string(),
             name: "Toronto".to_string(),
             place_type: "admin_level:8".to_string(),
             geometry: point_geometry(-79.0, 43.0),
@@ -673,9 +668,6 @@ mod tests {
 
     fn interpolation_record() -> crate::record::InterpolationRecord {
         crate::record::InterpolationRecord {
-            id: "osm:way:20:interp:2-98".to_string(),
-            label: "Queen Street 2-98 even".to_string(),
-            name: "Queen Street".to_string(),
             address: InterpolationAddressComponents {
                 street: Some("Queen Street".to_string()),
                 place: None,
@@ -699,8 +691,6 @@ mod tests {
 
     fn street_record() -> StreetRecord {
         StreetRecord {
-            id: "osm:way:30".to_string(),
-            label: "Queen Street".to_string(),
             name: "Queen Street".to_string(),
             geometry: line_geometry(),
             representative_point: [-79.0, 43.0005],
