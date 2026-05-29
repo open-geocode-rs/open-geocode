@@ -11,6 +11,7 @@ use crate::{
 use super::{
     address::write_rejected_record,
     geometry::{line_string_geometry, resolve_node_ref_points},
+    tags::OsmTags,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,15 +22,15 @@ pub(crate) struct StreetWayStub {
 }
 
 pub(crate) fn has_highway_tag(tags: &BTreeMap<String, String>) -> bool {
-    tag_value(tags, "highway").is_some()
+    tags.has("highway")
 }
 
 pub(crate) fn street_name(tags: &BTreeMap<String, String>) -> Option<String> {
-    tag_value(tags, "name")
+    tags.cleaned("name")
 }
 
 pub(crate) fn missing_street_name_issue(tags: &BTreeMap<String, String>) -> CandidateIssue {
-    if tag_value(tags, "ref").is_some() {
+    if tags.has("ref") {
         CandidateIssue::StreetRefOnlyName
     } else {
         CandidateIssue::StreetMissingName
@@ -91,19 +92,6 @@ fn reject_street_geometry(
         Some("street"),
         writer,
     )
-}
-
-fn tag_value(tags: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    tags.get(key).and_then(|value| clean_text(value))
-}
-
-fn clean_text(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
 }
 
 #[cfg(test)]

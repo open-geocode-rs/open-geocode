@@ -6,10 +6,13 @@ use crate::{
     builder::report::{BuilderReport, CandidateIssue},
     pack::RecordWriter,
     record::{OsmObjectType, PlaceLayer, PlaceRecord, SourceProvenance, point_geometry},
+    util::text::normalize_for_compare,
 };
 
+use super::tags::OsmTags;
+
 pub(crate) fn has_place_tag(tags: &BTreeMap<String, String>) -> bool {
-    tag_value(tags, "place").is_some()
+    tags.has("place")
 }
 
 pub(crate) fn write_place_node(
@@ -44,9 +47,9 @@ fn place_record_from_node(
     lon: f64,
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<(PlaceRecord, PlaceLayer), CandidateIssue> {
-    let place_type = tag_value(tags, "place").ok_or(CandidateIssue::PlaceUnsupportedValue)?;
+    let place_type = tags.cleaned("place").ok_or(CandidateIssue::PlaceUnsupportedValue)?;
     let layer = place_layer(&place_type).ok_or(CandidateIssue::PlaceUnsupportedValue)?;
-    let name = tag_value(tags, "name").ok_or(CandidateIssue::PlaceMissingName)?;
+    let name = tags.cleaned("name").ok_or(CandidateIssue::PlaceMissingName)?;
 
     Ok((
         PlaceRecord {
@@ -69,27 +72,6 @@ fn place_layer(place_type: &str) -> Option<PlaceLayer> {
         "island" | "islet" | "farm" | "isolated_dwelling" => Some(PlaceLayer::Place),
         _ => None,
     }
-}
-
-fn tag_value(tags: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    tags.get(key).and_then(|value| clean_text(value))
-}
-
-fn clean_text(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
-}
-
-fn normalize_for_compare(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
 }
 
 #[cfg(test)]

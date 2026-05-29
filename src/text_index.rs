@@ -19,6 +19,7 @@ use crate::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
         PlaceLayer, PlaceRecord, PostcodeRecord, StreetRecord,
     },
+    util::text::collapse_whitespace,
 };
 
 pub const TEXT_INDEX_RELATIVE_PATH: &str = "text/tantivy";
@@ -130,8 +131,7 @@ impl TantivyTextIndexWriter {
         layer: PlaceLayer,
     ) -> Result<TextIndexWriteMetrics> {
         let started = Instant::now();
-        let projected =
-            TextIndexDocument::project_place(record_id, place_layer_name(layer), record);
+        let projected = TextIndexDocument::project_place(record_id, layer.as_str(), record);
         self.add_projection(projected, elapsed_ns(started))
     }
 
@@ -420,17 +420,6 @@ fn exact_string_options() -> TextOptions {
     )
 }
 
-fn place_layer_name(layer: PlaceLayer) -> &'static str {
-    match layer {
-        PlaceLayer::Country => "country",
-        PlaceLayer::Region => "region",
-        PlaceLayer::District => "district",
-        PlaceLayer::Place => "place",
-        PlaceLayer::Locality => "locality",
-        PlaceLayer::Neighbourhood => "neighbourhood",
-    }
-}
-
 #[derive(Debug)]
 struct ProjectionBuilder {
     projected: TextIndexDocument,
@@ -457,29 +446,29 @@ impl ProjectionBuilder {
     }
 
     fn label(&mut self, value: &str) {
-        self.projected.label = clean_text(value);
+        self.projected.label = collapse_whitespace(value);
         self.add_content_text(value);
         self.add_autocomplete_subject_text(value);
     }
 
     fn name(&mut self, value: &str) {
-        self.projected.name = clean_text(value);
+        self.projected.name = collapse_whitespace(value);
         self.add_content_text(value);
         self.add_autocomplete_subject_text(value);
     }
 
     fn label_for_search(&mut self, value: &str) {
-        self.projected.label = clean_text(value);
+        self.projected.label = collapse_whitespace(value);
         self.add_content_text(value);
     }
 
     fn name_for_search(&mut self, value: &str) {
-        self.projected.name = clean_text(value);
+        self.projected.name = collapse_whitespace(value);
         self.add_content_text(value);
     }
 
     fn address(&mut self, address: &AddressComponents) {
-        self.projected.address_number = clean_text(&address.number);
+        self.projected.address_number = collapse_whitespace(&address.number);
         self.add_content_text(&address.number);
         self.add_optional_content_text(address.street.as_deref());
         self.add_optional_content_text(address.place.as_deref());
@@ -503,33 +492,33 @@ impl ProjectionBuilder {
     }
 
     fn postcode(&mut self, value: &str) {
-        self.projected.postcode = clean_text(value);
+        self.projected.postcode = collapse_whitespace(value);
         self.add_content_text(value);
         self.add_postcode_subject_text(value);
     }
 
     fn add_optional_autocomplete_text(&mut self, value: Option<&str>) {
-        let Some(cleaned) = value.and_then(clean_text) else {
+        let Some(cleaned) = value.and_then(collapse_whitespace) else {
             return;
         };
         self.add_autocomplete_subject_text(&cleaned);
     }
 
     fn add_optional_content_text(&mut self, value: Option<&str>) {
-        if let Some(cleaned) = value.and_then(clean_text) {
+        if let Some(cleaned) = value.and_then(collapse_whitespace) {
             self.add_content_text(&cleaned);
         }
     }
 
     fn add_optional_postcode_text(&mut self, value: Option<&str>) -> Option<String> {
-        let cleaned = value.and_then(clean_text)?;
+        let cleaned = value.and_then(collapse_whitespace)?;
         self.add_content_text(&cleaned);
         self.add_postcode_subject_text(&cleaned);
         Some(cleaned)
     }
 
     fn add_optional_postcode_for_search(&mut self, value: Option<&str>) -> Option<String> {
-        let cleaned = value.and_then(clean_text)?;
+        let cleaned = value.and_then(collapse_whitespace)?;
         self.add_content_text(&cleaned);
         Some(cleaned)
     }
@@ -571,7 +560,7 @@ impl ProjectionBuilder {
 }
 
 fn add_text_if_present(document: &mut TantivyDocument, field: Field, value: Option<&str>) {
-    if let Some(value) = value.and_then(clean_text) {
+    if let Some(value) = value.and_then(collapse_whitespace) {
         document.add_text(field, value);
     }
 }
@@ -583,15 +572,6 @@ fn add_normalized_text_if_present(
 ) {
     if let Some(value) = value.and_then(normalize_index_text) {
         document.add_text(field, value);
-    }
-}
-
-fn clean_text(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
     }
 }
 
@@ -720,8 +700,7 @@ mod tests {
 
         let postcode = TextIndexDocument::project_postcode(1, &postcode).document;
         let place =
-            TextIndexDocument::project_place(2, place_layer_name(PlaceLayer::Locality), &place)
-                .document;
+            TextIndexDocument::project_place(2, PlaceLayer::Locality.as_str(), &place).document;
 
         assert_eq!(postcode.postcode.as_deref(), Some("M5V"));
         assert_eq!(place.layer, "locality");

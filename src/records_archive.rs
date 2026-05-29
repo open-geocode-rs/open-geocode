@@ -22,6 +22,7 @@ use crate::{
         LocationPrecisionCode, PlaceEntry, PostcodeEntry, RecordsStore, SourceObject, StreetEntry,
         pack_directory_entry,
     },
+    util::geo::point_lon_lat,
 };
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
@@ -158,8 +159,9 @@ impl RecordsArchiveWriter {
         let region = self.opt_interned(address.region.as_deref())?;
         let postcode = self.opt_interned(address.postcode.as_deref())?;
         let country = self.opt_interned(address.country.as_deref())?;
-        let geometry =
-            self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+        let display_point =
+            point_lon_lat(&record.geometry).context("expected finite point geometry")?;
+        let geometry = self.encode_geometry(&record.geometry, display_point)?;
 
         let entry = AddressEntry {
             source_object_id: record.source.object_id,
@@ -194,8 +196,9 @@ impl RecordsArchiveWriter {
     pub fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
         let name = self.push_text_interned(&record.name)?;
         let place_type = self.push_text_interned(&record.place_type)?;
-        let geometry =
-            self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+        let display_point =
+            point_lon_lat(&record.geometry).context("expected finite point geometry")?;
+        let geometry = self.encode_geometry(&record.geometry, display_point)?;
 
         let entry = PlaceEntry {
             source_object_id: record.source.object_id,
@@ -219,8 +222,9 @@ impl RecordsArchiveWriter {
     pub fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId> {
         let postcode = self.push_text_interned(&record.postcode)?;
         let derived_from = self.push_text_interned(&record.source.derived_from)?;
-        let geometry =
-            self.encode_geometry(&record.geometry, point_coordinates(&record.geometry)?)?;
+        let display_point =
+            point_lon_lat(&record.geometry).context("expected finite point geometry")?;
+        let geometry = self.encode_geometry(&record.geometry, display_point)?;
 
         let entry = PostcodeEntry {
             derived_record_count: record.source.record_count,
@@ -602,7 +606,7 @@ impl RecordsArchiveReader {
                 let entry: &PlaceEntry = cast_entry(bytes)?;
                 let (place_layer, record) = self.decode_place(entry)?;
                 FullRecord {
-                    layer: place_layer_name(place_layer),
+                    layer: place_layer.as_str(),
                     point: record_point(
                         entry.geometry_type,
                         entry.location_precision,
@@ -987,17 +991,6 @@ fn decode_place_layer_code(code: u8) -> Result<PlaceLayer> {
     })
 }
 
-fn place_layer_name(layer: PlaceLayer) -> &'static str {
-    match layer {
-        PlaceLayer::Country => "country",
-        PlaceLayer::Region => "region",
-        PlaceLayer::District => "district",
-        PlaceLayer::Place => "place",
-        PlaceLayer::Locality => "locality",
-        PlaceLayer::Neighbourhood => "neighbourhood",
-    }
-}
-
 fn layer_filter(layer: &str) -> Result<(EntryKind, Option<PlaceLayer>)> {
     Ok(match layer {
         "address" => (EntryKind::Address, None),
@@ -1012,16 +1005,6 @@ fn layer_filter(layer: &str) -> Result<(EntryKind, Option<PlaceLayer>)> {
         "neighbourhood" => (EntryKind::Place, Some(PlaceLayer::Neighbourhood)),
         other => bail!("unknown record layer: {other}"),
     })
-}
-
-fn point_coordinates(geometry: &Geometry) -> Result<[f64; 2]> {
-    let GeometryValue::Point { coordinates } = &geometry.value else {
-        bail!("expected point geometry");
-    };
-    let [lon, lat, ..] = coordinates.as_slice() else {
-        bail!("point geometry is missing lon/lat");
-    };
-    Ok([*lon, *lat])
 }
 
 fn quantize_coordinate(value: f64) -> Result<i32> {

@@ -9,11 +9,13 @@ use crate::{
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, OsmObjectType,
         SourceProvenance,
     },
+    util::text::normalize_for_compare,
 };
 
 use super::{
     address::{collect_addr_tags_from_map, write_rejected_record},
     geometry::{line_string_geometry, resolve_node_ref_points},
+    tags::OsmTags,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +47,7 @@ struct Anchor {
 }
 
 pub(crate) fn has_interpolation_tag(tags: &BTreeMap<String, String>) -> bool {
-    tag_value(tags, "addr:interpolation").is_some()
+    tags.has("addr:interpolation")
 }
 
 pub(crate) fn write_interpolation_records(
@@ -184,7 +186,7 @@ fn numeric_anchors(
         let Some(tags) = address_node_tags.get(node_id) else {
             continue;
         };
-        let Some(house_number) = tag_value(tags, "addr:housenumber") else {
+        let Some(house_number) = tags.cleaned("addr:housenumber") else {
             continue;
         };
         found_housenumber = true;
@@ -209,7 +211,7 @@ fn numeric_anchors(
 fn interpolation_rule(
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<InterpolationRule, CandidateIssue> {
-    let value = tag_value(tags, "addr:interpolation")
+    let value = tags.cleaned("addr:interpolation")
         .ok_or(CandidateIssue::InterpolationUnsupportedValue)?;
     let normalized = value.to_ascii_lowercase();
     match normalized.as_str() {
@@ -294,9 +296,9 @@ fn required_context(
     start_tags: &BTreeMap<String, String>,
     end_tags: &BTreeMap<String, String>,
 ) -> std::result::Result<Option<String>, CandidateIssue> {
-    let way = tag_value(way_tags, key);
-    let start = tag_value(start_tags, key);
-    let end = tag_value(end_tags, key);
+    let way = way_tags.cleaned(key);
+    let start = start_tags.cleaned(key);
+    let end = end_tags.cleaned(key);
 
     if let Some(way_value) = way {
         for anchor_value in [start.as_deref(), end.as_deref()].into_iter().flatten() {
@@ -327,7 +329,7 @@ fn optional_context(
 ) -> Option<String> {
     let values = [way_tags, start_tags, end_tags]
         .into_iter()
-        .filter_map(|tags| tag_value(tags, key))
+        .filter_map(|tags| tags.cleaned(key))
         .collect::<Vec<_>>();
     if values.is_empty() {
         return None;
@@ -389,27 +391,6 @@ fn parse_house_number(value: &str) -> Option<u32> {
     }
     let number = value.parse::<u32>().ok()?;
     if number == 0 { None } else { Some(number) }
-}
-
-fn tag_value(tags: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    tags.get(key).and_then(|value| clean_text(value))
-}
-
-fn clean_text(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
-}
-
-fn normalize_for_compare(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
 }
 
 #[cfg(test)]

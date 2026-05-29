@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
-use geojson::GeometryValue;
 use serde::{Deserialize, Serialize};
 
-use crate::record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer};
+use crate::{
+    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer},
+    util::geo::point_lon_lat,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -351,7 +353,7 @@ impl BuilderReport {
     }
 
     pub(crate) fn accept_place(&mut self, layer: PlaceLayer) {
-        self.accept_layer(place_layer_name(layer));
+        self.accept_layer(layer.as_str());
         self.accepted.place_nodes += 1;
     }
 
@@ -366,7 +368,7 @@ impl BuilderReport {
         source_tags: Option<&BTreeMap<String, String>>,
     ) {
         let missing_admin_fields = missing_admin_context_fields(address);
-        let not_enrichable_by_point = point_coordinates(&address.geometry).is_none();
+        let not_enrichable_by_point = point_lon_lat(&address.geometry).is_none();
         let missing_postcode = address.address.postcode.is_none();
         let has_complete_source_context = address.address.locality.is_some()
             && address.address.region.is_some()
@@ -712,20 +714,6 @@ fn location_precision_name(precision: LocationPrecision) -> &'static str {
     }
 }
 
-fn point_coordinates(geometry: &geojson::Geometry) -> Option<(f64, f64)> {
-    let GeometryValue::Point { coordinates } = &geometry.value else {
-        return None;
-    };
-    let [lon, lat, ..] = coordinates.as_slice() else {
-        return None;
-    };
-    if lon.is_finite() && lat.is_finite() {
-        Some((*lon, *lat))
-    } else {
-        None
-    }
-}
-
 fn rejection_triage(issue: CandidateIssue, tags: &BTreeMap<String, String>) -> RejectionTriage {
     match issue {
         CandidateIssue::StreetMissingName => unnamed_highway_triage(tags),
@@ -993,17 +981,6 @@ fn object_type_name(object_type: OsmObjectType) -> &'static str {
         OsmObjectType::Node => "node",
         OsmObjectType::Way => "way",
         OsmObjectType::Relation => "relation",
-    }
-}
-
-fn place_layer_name(layer: PlaceLayer) -> &'static str {
-    match layer {
-        PlaceLayer::Country => "country",
-        PlaceLayer::Region => "region",
-        PlaceLayer::District => "district",
-        PlaceLayer::Place => "place",
-        PlaceLayer::Locality => "locality",
-        PlaceLayer::Neighbourhood => "neighbourhood",
     }
 }
 

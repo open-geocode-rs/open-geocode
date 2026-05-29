@@ -11,3 +11,4 @@ pub mod runtime;
 pub mod search;
 pub mod spatial_index;
 pub mod text_index;
+mod util;

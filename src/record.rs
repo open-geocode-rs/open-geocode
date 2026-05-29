@@ -56,6 +56,19 @@ pub enum PlaceLayer {
     Neighbourhood,
 }
 
+impl PlaceLayer {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PlaceLayer::Country => "country",
+            PlaceLayer::Region => "region",
+            PlaceLayer::District => "district",
+            PlaceLayer::Place => "place",
+            PlaceLayer::Locality => "locality",
+            PlaceLayer::Neighbourhood => "neighbourhood",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AddressComponents {
     pub number: String,

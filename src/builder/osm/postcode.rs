@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use geojson::GeometryValue;
 
 use crate::{
     builder::report::BuilderReport,
     pack::RecordWriter,
     record::{AddressRecord, DerivedSourceProvenance, PostcodeRecord, point_geometry},
+    util::geo::point_lon_lat,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -27,7 +27,7 @@ impl PostcodeAccumulator {
         let Some(postcode) = address.address.postcode.as_deref().and_then(clean_postcode) else {
             return;
         };
-        let Some((lon, lat)) = point_coordinates(address) else {
+        let Some([lon, lat]) = point_lon_lat(&address.geometry) else {
             return;
         };
 
@@ -76,15 +76,6 @@ impl PostcodeGroup {
     }
 }
 
-fn point_coordinates(address: &AddressRecord) -> Option<(f64, f64)> {
-    match &address.geometry.value {
-        GeometryValue::Point { coordinates } if coordinates.len() == 2 => {
-            Some((coordinates[0], coordinates[1]))
-        }
-        _ => None,
-    }
-}
-
 fn clean_postcode(value: &str) -> Option<String> {
     let cleaned = value
         .split_whitespace()
@@ -104,6 +95,8 @@ fn clean_postcode(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use geojson::GeometryValue;
+
     use crate::record::{
         AddressComponents, LocationPrecision, OsmObjectType, SourceProvenance, point_geometry,
     };

@@ -7,6 +7,7 @@ mod pbf;
 mod place;
 mod postcode;
 mod street;
+mod tags;
 
 use std::{
     collections::{BTreeMap, HashMap},

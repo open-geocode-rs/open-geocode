@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use geo::{
     Area, BoundingRect, Centroid, Contains, Covers, LineString, MultiPolygon, Point, Polygon, Rect,
 };
-use geojson::GeometryValue;
 use osmpbf::Element;
 use rstar::{AABB, RTree, RTreeObject};
 
@@ -20,9 +19,10 @@ use crate::{
         AddressRecord, InterpolationRecord, OsmObjectType, PlaceLayer, PlaceRecord, PostcodeRecord,
         SourceProvenance, StreetRecord, point_geometry,
     },
+    util::{geo::point_lon_lat, text::normalize_for_compare},
 };
 
-use super::pbf::element_reader_with_progress;
+use super::{pbf::element_reader_with_progress, tags::OsmTags};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundaryWayStub {
@@ -154,7 +154,7 @@ impl RecordWriter for BoundaryContextRecordWriter<'_> {
         let record_id = self.inner.write_address(record)?;
         self.write_context(
             record_id,
-            point_coordinates(&record.geometry),
+            point_lon_lat(&record.geometry),
             SourceContext {
                 country: record.address.country.as_deref(),
                 region: record.address.region.as_deref(),
@@ -170,7 +170,7 @@ impl RecordWriter for BoundaryContextRecordWriter<'_> {
         let record_id = self.inner.write_place(record, layer)?;
         self.write_context(
             record_id,
-            point_coordinates(&record.geometry),
+            point_lon_lat(&record.geometry),
             SourceContext {
                 place: Some(&record.name),
                 ..SourceContext::default()
@@ -209,7 +209,7 @@ impl RecordWriter for BoundaryContextRecordWriter<'_> {
         let record_id = self.inner.write_postcode(record)?;
         self.write_context(
             record_id,
-            point_coordinates(&record.geometry),
+            point_lon_lat(&record.geometry),
             SourceContext::default(),
         );
         Ok(record_id)
@@ -309,7 +309,7 @@ pub(crate) fn has_admin_boundary_tags(tags: &BTreeMap<String, String>) -> bool {
 }
 
 pub(crate) fn relation_member_role(value: &str) -> Option<BoundaryMemberRole> {
-    match normalize(value).as_str() {
+    match normalize_for_compare(value).as_str() {
         "" | "outer" => Some(BoundaryMemberRole::Outer),
         "inner" => Some(BoundaryMemberRole::Inner),
         _ => None,
@@ -679,24 +679,24 @@ fn join_segment(ring: &mut Vec<i64>, mut segment: Vec<i64>) {
 }
 
 fn admin_boundary_parts(tags: &BTreeMap<String, String>) -> Option<(PlaceLayer, u8, String)> {
-    if tag_value(tags, "boundary").as_deref() != Some("administrative") {
+    if tags.cleaned("boundary").as_deref() != Some("administrative") {
         return None;
     }
-    let admin_level = tag_value(tags, "admin_level")?.parse::<u8>().ok()?;
+    let admin_level = tags.cleaned("admin_level")?.parse::<u8>().ok()?;
     let layer = admin_level_layer(admin_level)?;
-    let name = tag_value(tags, "name")?;
+    let name = tags.cleaned("name")?;
     Some((layer, admin_level, name))
 }
 
 fn country_code_from_tags(tags: &BTreeMap<String, String>, layer: PlaceLayer) -> Option<String> {
     if layer == PlaceLayer::Country {
-        return tag_value(tags, "ISO3166-1:alpha2")
-            .or_else(|| tag_value(tags, "country_code"))
+        return tags.cleaned("ISO3166-1:alpha2")
+            .or_else(|| tags.cleaned("country_code"))
             .map(|value| value.to_ascii_uppercase());
     }
 
     if layer == PlaceLayer::Region {
-        let iso = tag_value(tags, "ISO3166-2")?;
+        let iso = tags.cleaned("ISO3166-2")?;
         let (country, _) = iso.split_once('-')?;
         if country.len() == 2
             && country
@@ -803,39 +803,8 @@ fn envelope_from_rect(rect: Rect<f64>) -> AABB<[f64; 2]> {
     AABB::from_corners([rect.min().x, rect.min().y], [rect.max().x, rect.max().y])
 }
 
-fn point_coordinates(geometry: &geojson::Geometry) -> Option<[f64; 2]> {
-    let GeometryValue::Point { coordinates } = &geometry.value else {
-        return None;
-    };
-    let [lon, lat, ..] = coordinates.as_slice() else {
-        return None;
-    };
-    Some([*lon, *lat])
-}
-
-fn tag_value(tags: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    tags.get(key).and_then(|value| clean_text(value))
-}
-
-fn clean_text(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
-}
-
-fn normalize(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
 fn same_text(left: &str, right: &str) -> bool {
-    normalize(left) == normalize(right)
+    normalize_for_compare(left) == normalize_for_compare(right)
 }
 
 fn source_type_rank(object_type: OsmObjectType) -> u8 {

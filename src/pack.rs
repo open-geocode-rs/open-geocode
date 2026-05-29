@@ -27,6 +27,7 @@ use crate::{
     text_index::{
         TEXT_INDEX_RELATIVE_PATH, TantivyTextIndexWriter, TextIndexCommit, TextIndexWriteMetrics,
     },
+    util::fs::dir_size,
 };
 
 pub use crate::records_archive::{
@@ -405,7 +406,7 @@ impl RecordWriter for PackWriter {
 
     fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
         let record_id = self.record_count;
-        let layer_name = place_layer_name(layer);
+        let layer_name = layer.as_str();
 
         let started = Instant::now();
         self.records.write_place(record, layer)?;
@@ -754,21 +755,6 @@ fn file_len(path: impl AsRef<Path>) -> Result<u64> {
         .len())
 }
 
-fn dir_size(path: impl AsRef<Path>) -> Result<u64> {
-    let path = path.as_ref();
-    let mut bytes = 0;
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            bytes += dir_size(entry.path())?;
-        } else if metadata.is_file() {
-            bytes += metadata.len();
-        }
-    }
-    Ok(bytes)
-}
-
 fn insert_pack_file(
     files: &mut BTreeMap<String, PackFile>,
     pack_path: &Path,
@@ -835,17 +821,6 @@ fn layer_code(layer: &str) -> Result<u16> {
     }
 }
 
-fn place_layer_name(layer: PlaceLayer) -> &'static str {
-    match layer {
-        PlaceLayer::Country => "country",
-        PlaceLayer::Region => "region",
-        PlaceLayer::District => "district",
-        PlaceLayer::Place => "place",
-        PlaceLayer::Locality => "locality",
-        PlaceLayer::Neighbourhood => "neighbourhood",
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -863,7 +838,7 @@ pub(crate) mod test_support {
         pub(crate) fn layer(&self) -> &'static str {
             match self {
                 Self::Address(_) => "address",
-                Self::Place(layer, _) => place_layer_name(*layer),
+                Self::Place(layer, _) => layer.as_str(),
                 Self::Interpolation(_) => "interpolation",
                 Self::Street(_) => "street",
                 Self::Postcode(_) => "postcode",

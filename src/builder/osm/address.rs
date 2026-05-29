@@ -9,7 +9,10 @@ use crate::{
         AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, RejectedRecord,
         SourceProvenance, point_geometry,
     },
+    util::text::collapse_whitespace,
 };
+
+use super::tags::OsmTags;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AddressCandidate {
@@ -68,19 +71,19 @@ pub(crate) fn address_record_from_candidate(
     candidate: AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
     let house_number =
-        tag_value(&candidate.tags, "addr:housenumber").ok_or(CandidateIssue::MissingHouseNumber)?;
-    let street = tag_value(&candidate.tags, "addr:street");
-    let place = tag_value(&candidate.tags, "addr:place");
+        candidate.tags.cleaned("addr:housenumber").ok_or(CandidateIssue::MissingHouseNumber)?;
+    let street = candidate.tags.cleaned("addr:street");
+    let place = candidate.tags.cleaned("addr:place");
 
     if street.is_none() && place.is_none() {
         return Err(CandidateIssue::MissingStreetOrPlace);
     }
 
-    let unit = tag_value(&candidate.tags, "addr:unit");
-    let city = tag_value(&candidate.tags, "addr:city");
-    let postcode = tag_value(&candidate.tags, "addr:postcode");
-    let state = tag_value(&candidate.tags, "addr:state");
-    let country = tag_value(&candidate.tags, "addr:country");
+    let unit = candidate.tags.cleaned("addr:unit");
+    let city = candidate.tags.cleaned("addr:city");
+    let postcode = candidate.tags.cleaned("addr:postcode");
+    let state = candidate.tags.cleaned("addr:state");
+    let country = candidate.tags.cleaned("addr:country");
 
     Ok(AddressRecord {
         address: AddressComponents {
@@ -103,7 +106,7 @@ pub(crate) fn collect_clean_tags<'a>(
     tags: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> BTreeMap<String, String> {
     tags.filter_map(|(key, value)| {
-        let value = clean_text(value)?;
+        let value = collapse_whitespace(value)?;
         Some((key.to_string(), value))
     })
     .collect()
@@ -125,26 +128,13 @@ pub(crate) fn collect_addr_tags_from_map(
 pub(crate) fn validate_address_tags(
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<(), CandidateIssue> {
-    if tag_value(tags, "addr:housenumber").is_none() {
+    if !tags.has("addr:housenumber") {
         return Err(CandidateIssue::MissingHouseNumber);
     }
-    if tag_value(tags, "addr:street").is_none() && tag_value(tags, "addr:place").is_none() {
+    if !tags.has("addr:street") && !tags.has("addr:place") {
         return Err(CandidateIssue::MissingStreetOrPlace);
     }
     Ok(())
-}
-
-fn tag_value(tags: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    tags.get(key).and_then(|value| clean_text(value))
-}
-
-fn clean_text(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
 }
 
 #[cfg(test)]

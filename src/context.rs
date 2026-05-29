@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::pack::RecordId;
+use crate::{pack::RecordId, util::fs::dir_size};
 
 pub const CONTEXT_RELATIVE_DIR: &str = "context/v1";
 pub const CONTEXT_SCHEMA_VERSION: u32 = 1;
@@ -422,20 +422,6 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let array: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
     Some(u16::from_le_bytes(array))
-}
-
-fn dir_size(path: &Path) -> Result<u64> {
-    let mut bytes = 0;
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            bytes += dir_size(&entry.path())?;
-        } else if metadata.is_file() {
-            bytes += metadata.len();
-        }
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]

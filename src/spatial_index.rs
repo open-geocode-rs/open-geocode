@@ -22,6 +22,7 @@ use crate::{
     record::{
         AddressRecord, InterpolationRecord, PlaceLayer, PlaceRecord, PostcodeRecord, StreetRecord,
     },
+    util::geo::point_lon_lat,
 };
 
 #[cfg(not(target_endian = "little"))]
@@ -264,7 +265,7 @@ struct SegmentProjection {
 
 impl PackSpatialIndexWriter {
     pub fn add_address(&mut self, record_id: RecordId, record: &AddressRecord) -> Result<()> {
-        if let Some((lon, lat)) = point_coordinates(&record.geometry) {
+        if let Some([lon, lat]) = point_lon_lat(&record.geometry) {
             self.points.push(SpatialPointEntry {
                 record_id,
                 layer: SpatialLayer::Address,
@@ -284,7 +285,7 @@ impl PackSpatialIndexWriter {
     }
 
     pub fn add_postcode(&mut self, record_id: RecordId, record: &PostcodeRecord) -> Result<()> {
-        if let Some((lon, lat)) = point_coordinates(&record.geometry) {
+        if let Some([lon, lat]) = point_lon_lat(&record.geometry) {
             self.points.push(SpatialPointEntry {
                 record_id,
                 layer: SpatialLayer::Postcode,
@@ -383,7 +384,7 @@ impl PackSpatialIndexWriter {
     }
 
     fn add_place_point(&mut self, record_id: RecordId, layer: SpatialLayer, record: &PlaceRecord) {
-        if let Some((lon, lat)) = point_coordinates(&record.geometry) {
+        if let Some([lon, lat]) = point_lon_lat(&record.geometry) {
             self.points.push(SpatialPointEntry {
                 record_id,
                 layer,
@@ -1062,20 +1063,6 @@ fn spatial_layer_from_code(value: u8) -> Option<SpatialLayer> {
         9 => Some(SpatialLayer::Region),
         10 => Some(SpatialLayer::Street),
         _ => None,
-    }
-}
-
-fn point_coordinates(geometry: &Geometry) -> Option<(f64, f64)> {
-    let GeometryValue::Point { coordinates } = &geometry.value else {
-        return None;
-    };
-    let [lon, lat, ..] = coordinates.as_slice() else {
-        return None;
-    };
-    if lon.is_finite() && lat.is_finite() {
-        Some((*lon, *lat))
-    } else {
-        None
     }
 }
 
