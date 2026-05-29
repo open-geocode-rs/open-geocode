@@ -690,7 +690,8 @@ fn admin_boundary_parts(tags: &BTreeMap<String, String>) -> Option<(PlaceLayer, 
 
 fn country_code_from_tags(tags: &BTreeMap<String, String>, layer: PlaceLayer) -> Option<String> {
     if layer == PlaceLayer::Country {
-        return tags.cleaned("ISO3166-1:alpha2")
+        return tags
+            .cleaned("ISO3166-1:alpha2")
             .or_else(|| tags.cleaned("country_code"))
             .map(|value| value.to_ascii_uppercase());
     }

@@ -47,9 +47,13 @@ fn place_record_from_node(
     lon: f64,
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<(PlaceRecord, PlaceLayer), CandidateIssue> {
-    let place_type = tags.cleaned("place").ok_or(CandidateIssue::PlaceUnsupportedValue)?;
+    let place_type = tags
+        .cleaned("place")
+        .ok_or(CandidateIssue::PlaceUnsupportedValue)?;
     let layer = place_layer(&place_type).ok_or(CandidateIssue::PlaceUnsupportedValue)?;
-    let name = tags.cleaned("name").ok_or(CandidateIssue::PlaceMissingName)?;
+    let name = tags
+        .cleaned("name")
+        .ok_or(CandidateIssue::PlaceMissingName)?;
 
     Ok((
         PlaceRecord {

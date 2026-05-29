@@ -70,8 +70,10 @@ pub(crate) fn write_rejected_record(
 pub(crate) fn address_record_from_candidate(
     candidate: AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
-    let house_number =
-        candidate.tags.cleaned("addr:housenumber").ok_or(CandidateIssue::MissingHouseNumber)?;
+    let house_number = candidate
+        .tags
+        .cleaned("addr:housenumber")
+        .ok_or(CandidateIssue::MissingHouseNumber)?;
     let street = candidate.tags.cleaned("addr:street");
     let place = candidate.tags.cleaned("addr:place");
 

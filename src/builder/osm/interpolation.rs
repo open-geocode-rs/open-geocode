@@ -211,7 +211,8 @@ fn numeric_anchors(
 fn interpolation_rule(
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<InterpolationRule, CandidateIssue> {
-    let value = tags.cleaned("addr:interpolation")
+    let value = tags
+        .cleaned("addr:interpolation")
         .ok_or(CandidateIssue::InterpolationUnsupportedValue)?;
     let normalized = value.to_ascii_lowercase();
     match normalized.as_str() {

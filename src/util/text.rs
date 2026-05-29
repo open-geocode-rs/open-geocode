@@ -20,7 +20,10 @@ mod tests {
 
     #[test]
     fn collapses_internal_and_edge_whitespace() {
-        assert_eq!(collapse_whitespace("  King   Street "), Some("King Street".to_string()));
+        assert_eq!(
+            collapse_whitespace("  King   Street "),
+            Some("King Street".to_string())
+        );
         assert_eq!(collapse_whitespace("   "), None);
         assert_eq!(collapse_whitespace(""), None);
     }

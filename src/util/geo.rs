@@ -21,7 +21,10 @@ mod tests {
 
     #[test]
     fn reads_finite_point() {
-        assert_eq!(point_lon_lat(&point_geometry(-79.0, 43.0)), Some([-79.0, 43.0]));
+        assert_eq!(
+            point_lon_lat(&point_geometry(-79.0, 43.0)),
+            Some([-79.0, 43.0])
+        );
     }
 
     #[test]

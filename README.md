@@ -2,12 +2,11 @@
 
 Fast, lightweight, self-hosted geocoding in pure Rust.
 
-`open-geocode` is a minimal Rust-native geocoding engine for address search to
-geo coordinates, Tantivy-backed autocomplete, and reverse geocoding from
-coordinates to address-first location context. It turns OpenStreetMap PBFs, open
-address data, and private location data into compact binary Packs that combine
-Flatdata record storage, a Tantivy text index, and an H3-backed mmap spatial
-index without a heavy database or search cluster.
+`open-geocode` is a minimal Rust-native geocoding engine: address search,
+Tantivy-backed autocomplete, and reverse geocoding from coordinates to
+address-first location context. It turns OpenStreetMap PBF extracts into compact
+binary Packs — a memory-mapped record store, a Tantivy text index, and an
+H3-backed mmap spatial index — with no database or search cluster to run.
 
 ## Why open-geocode?
 
@@ -20,7 +19,7 @@ Compared to other OSS geocoding alternatives:
 
 | Option | Tradeoff | open-geocode focus |
 |---|---|---|
-| Nominatim | Heavy PostgreSQL/PostGIS deployment | Static binary Packs with Flatdata records and mmap spatial lookup |
+| Nominatim | Heavy PostgreSQL/PostGIS deployment | Static binary Packs with memory-mapped records and spatial lookup |
 | Pelias | Elasticsearch and multi-service ops | Single Rust runtime with Tantivy text search and no service graph |
 
 ## Use Cases
