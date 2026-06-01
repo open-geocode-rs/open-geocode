@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, task};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     pack::{RecordPoint, RecordPointPrecision, RecordSource},
@@ -24,6 +24,7 @@ pub struct ServeOptions {
     pub pack: PathBuf,
     pub demo: PathBuf,
     pub bind: SocketAddr,
+    pub basemap: PathBuf,
 }
 
 #[derive(Clone)]
@@ -122,10 +123,26 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         searcher: Arc::new(searcher),
         reverse_geocoder: Arc::new(reverse_geocoder),
     };
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/search", get(search))
         .route("/autocomplete", get(autocomplete))
-        .route("/reverse", get(reverse))
+        .route("/reverse", get(reverse));
+
+    // The basemap PMTiles lives with the other data artifacts (not in the demo
+    // dir), so serve it explicitly. ServeFile honors HTTP range requests, which
+    // is exactly what the PMTiles client uses. Skip it if the file is absent so
+    // a fresh clone without a basemap still serves the API and demo.
+    if options.basemap.exists() {
+        app = app.route_service("/basemap.pmtiles", ServeFile::new(&options.basemap));
+        println!("Serving basemap {}", options.basemap.display());
+    } else {
+        eprintln!(
+            "basemap {} not found; serving demo without a basemap",
+            options.basemap.display()
+        );
+    }
+
+    let app = app
         .fallback_service(ServeDir::new(&options.demo).append_index_html_on_directories(true))
         .with_state(state);
 

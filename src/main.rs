@@ -139,6 +139,11 @@ enum Commands {
         /// Address and port to bind.
         #[arg(long, default_value = "127.0.0.1:5173")]
         bind: SocketAddr,
+
+        /// Basemap PMTiles archive to serve at /basemap.pmtiles. Skipped if the
+        /// file is absent, so the demo still runs without a local basemap.
+        #[arg(long, default_value = "data/ontario.pmtiles")]
+        basemap: PathBuf,
     },
 }
 
@@ -171,7 +176,20 @@ async fn main() -> Result<()> {
             warmup,
             output,
         } => bench_pack(pack, queries, iterations, warmup, output),
-        Commands::Serve { pack, demo, bind } => serve(ServeOptions { pack, demo, bind }).await,
+        Commands::Serve {
+            pack,
+            demo,
+            bind,
+            basemap,
+        } => {
+            serve(ServeOptions {
+                pack,
+                demo,
+                bind,
+                basemap,
+            })
+            .await
+        }
     }
 }
 

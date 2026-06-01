@@ -56,19 +56,19 @@ Host: 24-core / 32 GB, Windows 11 + Docker Desktop:
 | | open-geocode | Pelias | Nominatim |
 | --- | ---: | ---: | ---: |
 | Deployable footprint | **1.28 GiB** | 5.88 GiB | 5.92 GiB |
-| RAM while serving | **0.03 GiB** ¹ | 4.60 GiB | 2.75 GiB |
+| RAM while serving | **~1.2 GiB** ¹ | 4.60 GiB | 2.75 GiB |
 | Forward service-time p50 / p99 | **1.0 / 2.0 ms** | 11.5 / 67.6 ms | 40.0 / 1384.7 ms |
 | Reverse service-time p50 / p99 | **1.0 / 1.5 ms** | 5.0 / 9.5 ms | 7.5 / 14.2 ms |
 | Forward throughput (req/s @ p99<100ms) | **1000** ² | 100 | 25 |
 | Reverse throughput (req/s @ p99<100ms) | **1000** ² | 500 | 100 |
 | Addresses indexed | 2,032,851 | 2,036,529 | 2,037,682 |
 
-Single binary, no database or cluster: **~4.6× smaller on disk, far less resident
-RAM, ~10–40× higher forward throughput, sub-millisecond latency.**
+Single binary, no database or cluster: **~4.6× smaller on disk, lower memory use,
+~10–40× higher forward throughput, sub-millisecond latency.**
 
 ### Notes
 
-- ¹ open-geocode's pack is memory-mapped, so RSS under-counts its working set (~1.2 GB page cache); resident memory is still far below the others.
+- ¹ open-geocode memory-maps its pack, so process RSS is only ~0.03 GiB but ~1.2 GiB figure is the working set: resident in the OS page cache
 - ² open-geocode's true throughput ceiling is higher; the load grid stopped at 1000.
 - Engines do unequal work per query (Pelias libpostal parsing, Nominatim hierarchy); reported, not corrected.
 - Nominatim's forward p99 is a genuine heavy tail under the cap (p50 is 40 ms), not overload.
