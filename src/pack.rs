@@ -287,6 +287,7 @@ impl PackWriter {
         report.phases.pack_finish_ms = self.write_timings.runtime_finalize_ms;
         report.phases.total_ms += self.write_timings.runtime_finalize_ms;
         report.pack_write = self.write_timings.clone();
+        report.finalize_throughput();
 
         let report_path = self.path.join("audit").join("build-report.json");
         let report_file = File::create(&report_path)

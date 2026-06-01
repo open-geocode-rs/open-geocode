@@ -19,7 +19,7 @@ pub(crate) fn item_progress_bar(len: u64, message: &'static str) -> ProgressBar 
     let progress = ProgressBar::new(len);
     progress.set_style(
         ProgressStyle::with_template(
-            "{msg:32} [{bar:40.cyan/blue}] {percent:>3}% {pos}/{len} elapsed {elapsed_precise}",
+            "{msg:32} [{bar:40.cyan/blue}] {percent:>3}% {pos}/{len} {per_sec} elapsed {elapsed_precise}",
         )
         .expect("valid item progress template")
         .progress_chars("=> "),

@@ -23,6 +23,7 @@ pub struct BuilderReport {
     pub geometry_resolution: GeometryResolutionCounts,
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
+    pub throughput: Throughput,
     pub pack_write: PackWriteTimings,
     pub node_cache_entries: usize,
     pub record_table_bytes: u64,
@@ -38,6 +39,27 @@ pub struct BuilderReport {
     pub spatial_index_point_count: u64,
     pub spatial_index_segment_count: u64,
     pub spatial_index_bytes: u64,
+}
+
+impl BuilderReport {
+    /// Derive build throughput from the final wall-clock and record counts.
+    /// Call once `phases.total_ms` is final (i.e. after pack finalize).
+    pub(crate) fn finalize_throughput(&mut self) {
+        let secs = self.phases.total_ms as f64 / 1000.0;
+        if secs <= 0.0 {
+            return;
+        }
+        self.throughput.records_per_sec = self.text_index_document_count as f64 / secs;
+        self.throughput.addresses_per_sec =
+            *self.accepted.by_layer.get("address").unwrap_or(&0) as f64 / secs;
+    }
+}
+
+/// Build throughput derived from `phases.total_ms` (records/addresses per second).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Throughput {
+    pub records_per_sec: f64,
+    pub addresses_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

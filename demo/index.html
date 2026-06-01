@@ -653,9 +653,15 @@
       let currentReverse = null;
       let searchDebounce = null;
 
+      // Ontario-only demo: lock the map to the province so users can't pan or
+      // zoom out to areas the pack has no data for. Bounds are Ontario's bbox.
+      const ontarioBounds = L.latLngBounds([41.6, -95.2], [57.0, -74.3]);
       const map = L.map("map", {
         preferCanvas: true,
         zoomControl: false,
+        maxBounds: ontarioBounds,
+        maxBoundsViscosity: 1.0,
+        minZoom: 5,
       }).setView([43.6532, -79.3832], 11);
 
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
