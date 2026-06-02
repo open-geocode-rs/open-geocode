@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+description = "Lightweight geocoding engine: build a binary Pack from OSM extracts and serve search, autocomplete, and reverse geocoding from a single Rust runtime."
+repository = "https://github.com/abhigyaan-jha/open-geocode"
+readme = "README.md"
+keywords = ["geocoding", "geocoder", "osm", "gis", "geospatial"]
+categories = ["science::geo", "command-line-utilities"]
+# Publish-time packaging (crates.io ~10 MB limit). Uncomment before `cargo
+# publish`; verify the demo still serves once data artifacts are excluded.
+# exclude = ["data/", "demo/vendor/", "docs/", "*.pmtiles"]
 
 [dependencies]
 anyhow = "1.0"
@@ -23,4 +31,6 @@ serde_json = "1.0"
 rmp-serde = "1.3"
 tantivy = "0.25.0"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
+uuid = { version = "1", features = ["v4"] }

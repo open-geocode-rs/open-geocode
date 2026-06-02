@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod builder;
 pub mod context;
+mod http;
 pub mod labels;
 pub mod pack;
 pub mod record;

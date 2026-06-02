@@ -1367,7 +1367,9 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tokio",
+ "tower",
  "tower-http",
+ "uuid",
 ]
 
 [[package]]

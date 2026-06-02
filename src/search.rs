@@ -44,8 +44,8 @@ pub struct TextSearchHit {
     pub record: RecordSummary,
 }
 
-const DEFAULT_SEARCH_LIMIT: usize = 10;
-const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 
