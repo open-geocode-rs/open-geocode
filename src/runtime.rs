@@ -10,9 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Extension, Json, Router,
-    extract::{Query, Request, State},
+    extract::{Query, State},
     handler::{Handler, HandlerWithoutStateExt},
-    http::{HeaderMap, Method},
     middleware,
     routing::{MethodFilter, MethodRouter, on},
 };
@@ -22,7 +21,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     http::{
-        bounds, health, method, pmtiles_guard,
+        bounds, health, method,
         problem::{Problem, classify_search_error},
         request_id::{self, RequestId},
     },
@@ -170,25 +169,16 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
         .route("/readyz", get_only(health::readyz));
 
     // The basemap PMTiles lives with the other data artifacts (not in the demo
-    // dir), so serve it explicitly behind the full-file fetch guard. Skip it if
-    // the file is absent so a fresh clone without a basemap still serves the API.
+    // dir), so serve it explicitly. ServeFile honors HTTP range requests, which
+    // is what the PMTiles client uses. Skip it if the file is absent so a fresh
+    // clone without a basemap still serves the API and demo.
+    //
+    // This is served raw: egress/abuse protection for PMTiles is a
+    // deployment-layer concern (nginx serves and guards the file in the public
+    // demo deployment, see ADR 0017 Decisions 6/9/35a), not the engine's. The
+    // bare binary hands back the file with native range support and no policy.
     if basemap.exists() {
-        let serve_file = ServeFile::new(basemap);
-        app = app.route(
-            "/basemap.pmtiles",
-            on(
-                MethodFilter::GET.or(MethodFilter::HEAD),
-                move |method: Method,
-                      headers: HeaderMap,
-                      request_id: Option<Extension<RequestId>>,
-                      request: Request| {
-                    let serve_file = serve_file.clone();
-                    async move {
-                        pmtiles_guard::serve(serve_file, method, headers, request_id, request).await
-                    }
-                },
-            ),
-        );
+        app = app.route_service("/basemap.pmtiles", ServeFile::new(basemap));
         println!("Serving basemap {}", basemap.display());
     } else {
         eprintln!(
@@ -702,43 +692,20 @@ mod router_tests {
     }
 
     #[tokio::test]
-    async fn pmtiles_guard_requires_bounded_range() {
-        let pack = temp_path("pmtiles");
+    async fn basemap_is_served_raw_with_range_support() {
+        // The runtime serves the basemap raw: range requests work natively and
+        // there is deliberately no full-file fetch guard here (that is a
+        // deployment-layer concern, ADR 0017 Decision 35a). The bare binary hands
+        // back exactly what was asked for.
+        let pack = temp_path("basemap");
         write_pack(&pack);
-        let demo = temp_path("pmtiles-demo");
-
-        // A basemap larger than the range-span cap, so a whole-file range
-        // exceeds it (a real archive is multi-gigabyte).
-        let basemap = temp_path("pmtiles-basemap.pmtiles");
-        std::fs::write(&basemap, vec![0u8; 2_000_000]).expect("write basemap");
+        let demo = temp_path("basemap-demo");
+        let basemap = temp_path("basemap.pmtiles");
+        std::fs::write(&basemap, vec![0u8; 600_000]).expect("write basemap");
 
         let router = build_router(state_for(&pack, true), &demo, &basemap);
 
-        // Range-less GET -> 413, not a full-archive 200.
-        let reply = send(router.clone(), request("GET", "/basemap.pmtiles")).await;
-        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(reply.json()["error_code"], "range_required");
-
-        // Open-ended range -> 413.
-        let mut req = request("GET", "/basemap.pmtiles");
-        req.headers_mut()
-            .insert(header::RANGE, header::HeaderValue::from_static("bytes=0-"));
-        assert_eq!(
-            send(router.clone(), req).await.status,
-            StatusCode::PAYLOAD_TOO_LARGE
-        );
-
-        // Whole-file range exceeding the span cap -> 413 range_too_large.
-        let mut req = request("GET", "/basemap.pmtiles");
-        req.headers_mut().insert(
-            header::RANGE,
-            header::HeaderValue::from_static("bytes=0-1999999"),
-        );
-        let reply = send(router.clone(), req).await;
-        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(reply.json()["error_code"], "range_too_large");
-
-        // A valid bounded range (the demo's header read) -> 206 with that many bytes.
+        // A bounded range is honored as a 206 with exactly the requested bytes.
         let mut req = request("GET", "/basemap.pmtiles");
         req.headers_mut().insert(
             header::RANGE,
@@ -748,13 +715,14 @@ mod router_tests {
         assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(reply.body.len(), 512_000);
 
-        // HEAD is allowed without a Range.
-        let reply = send(router.clone(), request("HEAD", "/basemap.pmtiles")).await;
+        // A Range-less GET returns the whole file (200) — raw, unguarded.
+        let reply = send(router.clone(), request("GET", "/basemap.pmtiles")).await;
         assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.body.len(), 600_000);
 
-        // POST is rejected as 405.
-        let reply = send(router, request("POST", "/basemap.pmtiles")).await;
-        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+        // HEAD works too.
+        let reply = send(router, request("HEAD", "/basemap.pmtiles")).await;
+        assert_eq!(reply.status, StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&pack);
         let _ = std::fs::remove_file(&basemap);

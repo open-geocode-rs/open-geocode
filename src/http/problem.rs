@@ -145,34 +145,11 @@ impl Problem {
         problem
     }
 
-    // --- 413 / 414 / 429 ---------------------------------------------------
-
-    pub(crate) fn payload_too_large(error_code: &str, detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::PAYLOAD_TOO_LARGE, error_code).with_detail(detail)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn uri_too_long() -> Self {
-        Self::new(StatusCode::URI_TOO_LONG, "uri_too_long").with_detail("request URI is too long")
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn too_many_requests() -> Self {
-        Self::new(StatusCode::TOO_MANY_REQUESTS, "too_many_requests")
-            .with_detail("rate limit exceeded")
-    }
-
-    // --- 500 / 503 ---------------------------------------------------------
+    // --- 500 ---------------------------------------------------------------
 
     /// A generic 500. Carries no detail so internal errors never leak.
     pub(crate) fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn unavailable() -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
-            .with_detail("runtime is not ready")
     }
 }
 
