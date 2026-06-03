@@ -7,10 +7,6 @@
 /out/
 /packs/
 /tmp/
-/demo/data/*.js
-
-# Vendored demo frontend assets (regenerable; fetch via demo/fetch-vendor.ps1)
-/demo/vendor/
 
 # Environment
 .env

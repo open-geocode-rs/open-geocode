@@ -12,15 +12,16 @@ Generate the Pack from the repo root:
 Serve the Runtime API and static demo from one process:
 
 ```powershell
-cargo run -p open-geocode -- serve --pack .\data\build\pack --demo .\demo --bind 127.0.0.1:5173
+cargo run -p open-geocode -- serve --pack .\data\build\pack --demo .\demo --bind 127.0.0.1:8080
 ```
 
 Then open:
 
 ```text
-http://localhost:5173
+http://localhost:8080
 ```
 
-The browser calls `/search` from the command input and calls `/reverse` when the
-map is clicked. It does not load a generated address bundle or a Pack into the
-browser.
+The browser calls `/autocomplete` as you type, `/search` on submit, and
+`/reverse` when the map is clicked. Leaflet and the OpenStreetMap tiles load from
+a CDN (pinned with SRI hashes); nothing else is bundled — no Pack or address data
+is loaded into the browser.

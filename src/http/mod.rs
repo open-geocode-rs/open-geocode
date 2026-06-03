@@ -6,9 +6,10 @@
 //! geocoder and Pack so the boundary contract can evolve without touching query
 //! behavior.
 //!
-//! Note: PMTiles egress/abuse protection is intentionally NOT here. It is a
-//! deployment-layer concern handled by nginx in the public demo (ADR 0017
-//! Decision 35a); the bundled Runtime serves the basemap file raw.
+//! Note: PMTiles egress/abuse protection is intentionally NOT here. In the
+//! public demo the basemap is served from Cloudflare R2, whose free egress
+//! makes it a non-issue (ADR 0017 Decisions 6/35a, amended 2026-06-03); the
+//! bundled Runtime serves the basemap file raw as a local-dev convenience.
 
 pub(crate) mod bounds;
 pub(crate) mod health;

@@ -151,9 +151,10 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 }
 
 /// Assemble the public-demo router with its boundary policy: method-restricted
-/// routes (ADR 0017 Decision 27), the PMTiles full-file fetch guard
-/// (Decision 35a), Problem Details 404/405 fallbacks (Decisions 27, 37), and
-/// request-id propagation (Decision 30).
+/// routes (ADR 0017 Decision 27), Problem Details 404/405 fallbacks
+/// (Decisions 27, 37), and request-id propagation (Decision 30). The basemap is
+/// served raw with no guard — in the deployed topology PMTiles is served from
+/// Cloudflare R2, not the Runtime (Decisions 6/35a, amended 2026-06-03).
 ///
 /// Split out from [`serve`] so it can be exercised without binding a socket.
 pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Router {
@@ -173,10 +174,11 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     // is what the PMTiles client uses. Skip it if the file is absent so a fresh
     // clone without a basemap still serves the API and demo.
     //
-    // This is served raw: egress/abuse protection for PMTiles is a
-    // deployment-layer concern (nginx serves and guards the file in the public
-    // demo deployment, see ADR 0017 Decisions 6/9/35a), not the engine's. The
-    // bare binary hands back the file with native range support and no policy.
+    // This is served raw and is a local-dev convenience only. In the public
+    // demo the basemap is served from Cloudflare R2, not the Runtime (ADR 0017
+    // Decisions 6/7/8, amended 2026-06-03); R2's free egress makes PMTiles
+    // abuse protection a non-issue. The bare binary hands back the file with
+    // native range support and no policy.
     if basemap.exists() {
         app = app.route_service("/basemap.pmtiles", ServeFile::new(basemap));
         println!("Serving basemap {}", basemap.display());

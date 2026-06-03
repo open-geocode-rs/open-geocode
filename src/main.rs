@@ -137,7 +137,7 @@ enum Commands {
         demo: PathBuf,
 
         /// Address and port to bind.
-        #[arg(long, default_value = "127.0.0.1:5173")]
+        #[arg(long, default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
 
         /// Basemap PMTiles archive to serve at /basemap.pmtiles. Skipped if the

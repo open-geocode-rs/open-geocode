@@ -1,9 +1,11 @@
 //! Runtime request bounds (ADR 0017 Decision 26).
 //!
-//! Cloudflare and Nginx reduce bad traffic before it reaches the Runtime, but the
-//! Runtime must still defend itself if proxy rules change or a route is exposed
-//! differently. These are deliberately conservative, hardcoded limits for the
-//! non-commercial public demo.
+//! Cloudflare reduces bad traffic before it reaches the Runtime, but the Runtime
+//! must still defend itself if edge rules change or a route is exposed
+//! differently — and, since cloudflared connects directly to the Runtime with no
+//! Nginx layer (ADR 0017 amended 2026-06-03b), the Runtime is the only
+//! server-side enforcement point. These are deliberately conservative, hardcoded
+//! limits for the non-commercial public demo.
 
 use crate::http::problem::{InvalidParam, Problem};
 use crate::search::MAX_AUTOCOMPLETE_LIMIT;

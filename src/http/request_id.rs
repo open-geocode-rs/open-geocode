@@ -1,9 +1,11 @@
 //! Request-id propagation (ADR 0017 Decision 30).
 //!
-//! Every public-demo request gets an id that flows through Nginx, the Runtime,
-//! and Problem Details responses. Prefer an upstream id (Cloudflare `cf-ray`,
-//! then a generic `x-request-id`) if present; otherwise generate one. Incoming
-//! values are sanitized because clients can spoof ordinary headers (Decision 24).
+//! Every public-demo request gets an id that flows through Cloudflare, the
+//! Runtime, and Problem Details responses. Prefer an upstream id (Cloudflare
+//! `cf-ray`, then a generic `x-request-id`) if present; otherwise generate one.
+//! Incoming values are sanitized because clients can spoof ordinary headers
+//! (Decision 24). (cloudflared connects directly to the Runtime; there is no
+//! Nginx hop — ADR 0017 amended 2026-06-03b.)
 
 use axum::{extract::Request, http::HeaderValue, middleware::Next, response::Response};
 
