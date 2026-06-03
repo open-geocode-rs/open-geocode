@@ -33,7 +33,6 @@ const clearReverse = document.querySelector("#clear-reverse");
 const zoomInButton = document.querySelector("#zoom-in");
 const zoomOutButton = document.querySelector("#zoom-out");
 
-const markerById = new Map();
 let searchMarkers = [];
 let reverseMarkers = [];
 let reverseLine = null;
@@ -75,7 +74,6 @@ updateZoomControls();
 function clearMapResults() {
   for (const marker of searchMarkers) marker.remove();
   searchMarkers = [];
-  markerById.clear();
 }
 
 function escapeHtml(value) {
@@ -150,28 +148,11 @@ clearSearch.addEventListener("click", () => {
 
 clearReverse.addEventListener("click", clearReverseResult);
 
-document.addEventListener(
-  "click",
-  (event) => {
-    const clearButton = event.target.closest?.("[data-clear-reverse]");
-    if (clearButton) {
-      event.preventDefault();
-      event.stopPropagation();
-      clearReverseResult();
-      return;
-    }
-
-    const popupCloseButton = event.target.closest?.("[data-close-popup]");
-    if (popupCloseButton) {
-      event.preventDefault();
-      event.stopPropagation();
-      closeSearchPopups();
-    }
-  },
-  true,
-);
-
 async function runQuery(query, mode) {
+  // Forward and reverse search are mutually exclusive in the UI — starting a
+  // forward query clears any active reverse result.
+  clearReverseResult();
+
   lastQuery = query;
   currentSearch?.abort();
   const controller = new AbortController();
@@ -246,7 +227,6 @@ function renderResults(results, options = {}) {
     if (result.point) {
       const marker = makeResultMarker(result).addTo(map);
       searchMarkers.push(marker);
-      markerById.set(result.record_id, marker);
     }
   }
 
@@ -264,35 +244,30 @@ function renderResults(results, options = {}) {
 }
 
 function makeResultMarker(result) {
-  const { lat, lon, precision } = result.point;
-  const modifier =
-    precision === "representative_point"
-      ? "is-representative"
-      : precision === "centroid"
-        ? "is-centroid"
-        : "is-point";
-  const size = modifier === "is-representative" ? 13 : modifier === "is-centroid" ? 11 : 9;
-  const marker = L.marker([lat, lon], {
+  const { lat, lon } = result.point;
+  return L.marker([lat, lon], {
     icon: L.divIcon({
-      className: "result-pin-divicon",
-      html: `<div class="result-pin-marker ${modifier}"></div>`,
-      iconSize: [size, size],
-      iconAnchor: [size / 2, size / 2],
+      className: "reverse-marker-divicon",
+      html: `<div class="reverse-marker">${icon("map-pin", "reverse-marker-svg")}</div>`,
+      iconSize: [32, 32],
+      iconAnchor: [16, 32],
     }),
   });
-  marker.bindPopup(searchPopup(result.label), { closeButton: false, offset: [0, -size / 2] });
-  return marker;
 }
 
 async function runReverse(latlng) {
+  // Reverse and forward search are mutually exclusive in the UI — starting a
+  // reverse lookup clears any active forward search.
+  clearForwardSearch();
+
   currentReverse?.abort();
   const controller = new AbortController();
   currentReverse = controller;
   clearReverseLayers();
   setReverseLoading();
 
-  // Drop the marker immediately, but show the popup only once the lookup
-  // completes — the "Searching" feedback lives in the side panel, not the map.
+  // Drop the marker immediately; the resolved address shows in the reverse
+  // panel under the search bar, so the map just needs the marker.
   const origin = makeReverseOriginMarker(latlng).addTo(map);
   reverseMarkers.push(origin);
 
@@ -307,10 +282,10 @@ async function runReverse(latlng) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error("Address unavailable");
-    renderReverse(payload, latlng, origin);
+    renderReverse(payload, latlng);
   } catch (error) {
     if (error.name === "AbortError") return;
-    renderReverseError("Address unavailable", origin);
+    renderReverseError("Address unavailable");
   } finally {
     if (currentReverse === controller) {
       currentReverse = null;
@@ -324,20 +299,18 @@ function setReverseLoading() {
   reverseLabel.textContent = "Searching";
 }
 
-function renderReverse(payload, latlng, origin) {
+function renderReverse(payload, latlng) {
   const result = payload.result;
   if (!result) {
     reversePanel.hidden = false;
     reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
     reverseLabel.textContent = "No address found";
-    origin.bindPopup(reversePopup("No address found"), { closeButton: false, offset: [0, -28] }).openPopup();
     return;
   }
 
   reversePanel.hidden = false;
   reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
   reverseLabel.textContent = result.label;
-  origin.bindPopup(reversePopup(result.label), { closeButton: false, offset: [0, -28] }).openPopup();
 
   if (result.point) {
     const target = makeReverseTargetMarker(result).addTo(map);
@@ -357,10 +330,9 @@ function renderReverse(payload, latlng, origin) {
   }
 }
 
-function renderReverseError(message, origin) {
+function renderReverseError(message) {
   reversePanel.hidden = false;
   reverseLabel.textContent = message;
-  origin.bindPopup(reversePopup(message), { closeButton: false, offset: [0, -28] }).openPopup();
 }
 
 function makeReverseOriginMarker(latlng) {
@@ -385,24 +357,6 @@ function makeReverseTargetMarker(result) {
   });
 }
 
-function reversePopup(title) {
-  return `<div class="popup-body">
-    <p class="popup-title">${escapeHtml(title)}</p>
-    <button class="popup-close" type="button" aria-label="Clear reverse result" data-clear-reverse>
-      ${icon("x")}
-    </button>
-  </div>`;
-}
-
-function searchPopup(title) {
-  return `<div class="popup-body">
-    <p class="popup-title">${escapeHtml(title)}</p>
-    <button class="popup-close" type="button" aria-label="Close popup" data-close-popup>
-      ${icon("x")}
-    </button>
-  </div>`;
-}
-
 function selectResult(result) {
   searchInput.value = result.label;
   clearSearch.hidden = false;
@@ -414,14 +368,6 @@ function selectResult(result) {
   if (result.point) {
     map.flyTo([result.point.lat, result.point.lon], Math.max(map.getZoom(), 16), { duration: 0.45 });
   }
-  const marker = markerById.get(result.record_id);
-  if (marker && !marker.isPopupOpen()) {
-    marker.openPopup();
-  }
-}
-
-function closeSearchPopups() {
-  for (const marker of searchMarkers) marker.closePopup();
 }
 
 function clearReverseLayers() {
@@ -439,6 +385,12 @@ function clearReverseResult() {
   clearReverseLayers();
   reversePanel.hidden = true;
   reverseLabel.textContent = "";
+}
+
+function clearForwardSearch() {
+  searchInput.value = "";
+  clearSearch.hidden = true;
+  clearResults();
 }
 
 function clearResults() {

@@ -293,34 +293,6 @@ body {
   color: hsl(var(--accent-foreground));
 }
 
-/* Leaflet popup styling, matched to the command palette look. */
-.leaflet-popup-content-wrapper {
-  padding: 0;
-  border-radius: 8px;
-  box-shadow: 0 3px 14px rgb(0 0 0 / 0.22);
-  background: hsl(var(--popover));
-  color: hsl(var(--foreground));
-}
-
-.leaflet-popup-content {
-  margin: 0;
-}
-
-/* Leaflet sets `margin: 17px 0` on popup <p> at higher specificity than
-   .popup-title, which pushes the title down away from the close button.
-   Zero it here (same specificity, later in the cascade, so this wins). */
-.leaflet-popup-content p {
-  margin: 0;
-}
-
-.leaflet-popup-tip {
-  background: hsl(var(--popover));
-}
-
-.leaflet-container a.leaflet-popup-close-button {
-  display: none;
-}
-
 .leaflet-container {
   font: inherit;
   background: #dfe7df;
@@ -330,73 +302,6 @@ body {
 .leaflet-div-icon {
   background: transparent;
   border: none;
-}
-
-.popup-body {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 10px 12px;
-}
-
-.popup-title {
-  flex: 1 1 auto;
-  max-width: 240px;
-  min-width: 0;
-  margin: 0;
-  font-weight: 400;
-  line-height: 1.25;
-}
-
-.popup-close {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  border-radius: calc(var(--radius) - 2px);
-  background: transparent;
-  color: hsl(var(--muted-foreground));
-  cursor: pointer;
-}
-
-.popup-close:hover,
-.popup-close:focus-visible {
-  outline: 0;
-  background: hsl(var(--accent));
-  color: hsl(var(--accent-foreground));
-}
-
-/* Result point markers, styled by point precision. */
-.result-pin-marker {
-  box-sizing: border-box;
-  border-radius: 50%;
-  cursor: pointer;
-}
-
-.result-pin-marker.is-point {
-  width: 9px;
-  height: 9px;
-  background: #0f8b8d;
-  border: 1px solid #075f61;
-}
-
-.result-pin-marker.is-centroid {
-  width: 11px;
-  height: 11px;
-  background: #d95d39;
-  border: 1px solid #8f2f21;
-}
-
-.result-pin-marker.is-representative {
-  width: 13px;
-  height: 13px;
-  background: #375e97;
-  border: 1.5px solid #253f68;
 }
 
 .reverse-target-marker {
