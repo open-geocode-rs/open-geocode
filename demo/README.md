@@ -21,7 +21,6 @@ Then open:
 http://localhost:8080
 ```
 
-The browser calls `/autocomplete` as you type, `/search` on submit, and
-`/reverse` when the map is clicked. Leaflet and the OpenStreetMap tiles load from
-a CDN (pinned with SRI hashes); nothing else is bundled — no Pack or address data
-is loaded into the browser.
+The browser calls `/search` from the command input and calls `/reverse` when the
+map is clicked. It does not load a generated address bundle or a Pack into the
+browser.

@@ -42,10 +42,6 @@ Building the Ontario pack (~940 MB PBF) takes about 4.5 minutes (~7,500 addresse
    cargo run --release -- serve --pack data/pack
    ```
 
-   Then open `http://127.0.0.1:8080` — the demo (Leaflet + OpenStreetMap tiles)
-   runs straight from the Runtime binary; type to search, click the map to
-   reverse-geocode.
-
 ## Hosted demo
 
 The public live demo and its Cloudflare Worker + Tunnel + VM deployment live in a

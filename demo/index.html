@@ -3,34 +3,59 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>open-geocode demo</title>
-    <!-- Leaflet from CDN, pinned with Subresource Integrity (SRI) hashes so the
-         browser verifies the files weren't tampered with. No build step. -->
+    <title>open-geocode Demo</title>
     <link
       rel="stylesheet"
       href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIINfQb2H3H1QPuQX1VQlD/9aTcHn1LwD8E="
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin=""
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div id="map" aria-label="Geocoding results map"></div>
+    <div id="map" aria-label="Address search map"></div>
 
     <aside class="panel" aria-label="Address search">
-      <form id="form" autocomplete="off">
-        <input
-          id="q"
-          type="text"
-          placeholder="Search an address…"
-          aria-label="Search addresses"
-          spellcheck="false"
-        />
+      <form id="search-form" class="command" aria-label="Address search">
+        <div class="command-input-wrapper">
+          <span id="search-icon" class="command-icon"></span>
+          <input
+            id="search-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Search addresses"
+            aria-controls="results"
+          />
+          <button id="clear-search" class="command-clear" type="button" aria-label="Clear search" hidden></button>
+        </div>
+        <section class="command-list" aria-live="polite">
+          <div id="status" class="command-empty" hidden></div>
+          <div id="reverse-panel" class="command-group reverse-command" aria-live="polite" hidden>
+            <div class="command-item reverse-item" role="status">
+              <span id="reverse-icon" class="command-item-icon reverse-pin"></span>
+              <span class="command-item-content">
+                <span id="reverse-label" class="command-item-label"></span>
+              </span>
+              <button
+                id="clear-reverse"
+                class="command-item-action"
+                type="button"
+                aria-label="Clear reverse result"
+              ></button>
+            </div>
+          </div>
+          <div id="results-group" class="command-group" hidden>
+            <ul id="results" class="command-items" role="listbox" aria-label="Address results"></ul>
+          </div>
+        </section>
       </form>
-      <p id="status" class="status" hidden></p>
-      <ul id="results" class="results" aria-label="Results"></ul>
-      <p class="hint">Type to search · click the map to reverse-geocode</p>
     </aside>
+
+    <div class="map-controls" aria-label="Map controls">
+      <button id="zoom-in" class="map-control" type="button" aria-label="Zoom in"></button>
+      <button id="zoom-out" class="map-control" type="button" aria-label="Zoom out"></button>
+    </div>
 
     <script
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
