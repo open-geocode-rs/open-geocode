@@ -1,14 +1,30 @@
-// open-geocode demo: searches a finished Pack through the Runtime API and shows
-// results on an OpenStreetMap basemap (Leaflet). `open-geocode serve` serves both
-// this UI and the API (/search, /autocomplete, /reverse) on the same origin, so
-// API_BASE is empty. Tiles come from OpenStreetMap (config.js) — no self-hosting.
+// Protomaps basemap themes — used only by the self-hosted Protomaps style path
+// (protomapsStyle below); the OpenFreeMap default never calls it. Loaded from a
+// CDN as an ES module (SRI isn't available on bare module imports).
+import { layers, namedFlavor } from "https://esm.sh/@protomaps/basemaps@5.7.2";
 
+// The app's mount, derived from the document <base> (index.html). At
+// ajha.ca/open-geocode this is "/open-geocode/"; at the root it is "/".
+//   BASE — root-relative path ("/open-geocode/"), fine for fetch().
+//   ABS  — fully absolute ("https://host/open-geocode/"). MapLibre requires
+//          ABSOLUTE urls for sprite/glyphs (it throws on relative), so the map
+//          style is built from ABS. Both are mount-agnostic.
+const BASE = new URL(".", document.baseURI).pathname;
+const ABS = new URL(".", document.baseURI).href;
+
+// Public, per-environment config (config.js) selects how this one UI talks to its
+// two interchangeable backends; the SAME code below runs for both.
 const cfg = window.OPEN_GEOCODE_CONFIG ?? {};
-const API_BASE = cfg.apiBase ?? "";
-const TILE_URL = cfg.tileUrl ?? "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-const TILE_ATTRIBUTION =
-  cfg.tileAttribution ??
-  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors';
+
+// API base. `open-geocode serve` hosts the UI and the API (/search,
+// /autocomplete, /reverse) on the same origin at the root, so config sets
+// apiBase:"". When omitted it falls back to <BASE>api, for a mount that serves
+// the API under the app's own path.
+const API_BASE = cfg.apiBase ?? `${BASE}api`;
+
+// PMTiles URL for the self-hosted Protomaps basemap (deployed demo only); unused
+// when config supplies a hosted styleUrl (see the map style below).
+const PMTILES_URL = cfg.pmtilesUrl;
 
 // Forward search and autocomplete are the same request flow; they differ
 // only in endpoint, the response field, and how results fit the map.
@@ -28,37 +44,104 @@ const resultsGroup = document.querySelector("#results-group");
 const resultsList = document.querySelector("#results");
 const reversePanel = document.querySelector("#reverse-panel");
 const reverseLabel = document.querySelector("#reverse-label");
+const reverseCoords = document.querySelector("#reverse-coords");
 const reverseIcon = document.querySelector("#reverse-icon");
 const clearReverse = document.querySelector("#clear-reverse");
 const zoomInButton = document.querySelector("#zoom-in");
 const zoomOutButton = document.querySelector("#zoom-out");
 
+const emptyFeatureCollection = { type: "FeatureCollection", features: [] };
+const markerById = new Map();
 let searchMarkers = [];
 let reverseMarkers = [];
-let reverseLine = null;
 let currentSearch = null;
 let currentReverse = null;
 let searchDebounce = null;
 let collapsedResults = false;
 let lastQuery = "";
 
-// Ontario-only demo: lock the map to the province so users can't pan or zoom out
-// to areas the Pack has no data for. Leaflet bounds are [[south, west], [north, east]].
-const ontarioBounds = L.latLngBounds([41.6, -95.2], [57.0, -74.3]);
-const map = L.map("map", {
-  zoomControl: false, // custom zoom buttons live in .map-controls
+// Read the PMTiles archive via HTTP range requests.
+const protocol = new pmtiles.Protocol();
+maplibregl.addProtocol("pmtiles", protocol.tile);
+
+// Ontario-only demo: lock the map to the province so users can't pan or
+// zoom out to areas the pack has no data for. Bounds are Ontario's bbox.
+const ontarioBounds = [
+  [-95.2, 41.6],
+  [-74.3, 57.0],
+];
+// The basemap style — two interchangeable forms, picked by config; the rest of
+// this file is identical either way (it adds its own sources/markers ON TOP of
+// whichever base style loads):
+//   - cfg.styleUrl — a hosted, keyless MapLibre style (this demo uses
+//     OpenFreeMap). No key, no account, no self-hosted tiles.
+//   - otherwise    — an inline style built from a Protomaps PMTiles archive
+//     (cfg.pmtilesUrl) with vendored glyphs/sprites, for self-hosting the tiles.
+function protomapsStyle() {
+  return {
+    version: 8,
+    // ABSOLUTE urls (MapLibre rejects relative sprite/glyphs). ABS already
+    // includes the mount, so these resolve under it; the {fontstack}/{range}
+    // placeholders are kept literal — only the path is prefixed.
+    glyphs: `${ABS}vendor/fonts/{fontstack}/{range}.pbf`,
+    sprite: `${ABS}vendor/sprites/v4/light`,
+    sources: {
+      protomaps: {
+        type: "vector",
+        url: `pmtiles://${PMTILES_URL}`,
+        // Resource-qualified: OSM provides the map DATA (required under ODbL —
+        // must credit "OpenStreetMap contributors" + link the copyright page);
+        // Protomaps builds the basemap TILES/style from it (credited by request).
+        attribution:
+          'Map data &copy; <a href="https://openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors &middot; Basemap tiles &copy; <a href="https://protomaps.com" target="_blank" rel="noopener">Protomaps</a>',
+      },
+    },
+    layers: layers("protomaps", namedFlavor("light"), { lang: "en" }),
+  };
+}
+
+const map = new maplibregl.Map({
+  container: "map",
+  // We add our own compact AttributionControl below (bottom-left) instead of the
+  // default; the brandmark sits bottom-center and the zoom controls bottom-right.
+  attributionControl: false,
+  style: cfg.styleUrl ?? protomapsStyle(),
+  center: [-79.3832, 43.6532],
+  zoom: 11,
   minZoom: 5,
   maxZoom: 18,
   maxBounds: ontarioBounds,
-  maxBoundsViscosity: 1,
-}).setView([43.6532, -79.3832], 11);
+});
 
-L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION }).addTo(map);
-// Attribution bottom-left so it doesn't sit under the bottom-right zoom controls.
-map.attributionControl.setPosition("bottomleft");
+map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
+
+// MapLibre renders the compact attribution EXPANDED by default (it only auto-
+// collapses once you drag the map). Collapse it to just the (i) on load so it
+// starts unobtrusive; it still opens on click — which OSM's guidelines allow.
+// The control is a <details open> element with a toggle class.
+const attribControl = map.getContainer().querySelector(".maplibregl-ctrl-attrib");
+attribControl?.classList.remove("maplibregl-compact-show");
+attribControl?.removeAttribute("open");
+
+map.on("load", () => {
+  map.addSource("reverse-line", { type: "geojson", data: emptyFeatureCollection });
+  map.addLayer({
+    id: "reverse-line",
+    type: "line",
+    source: "reverse-line",
+    layout: { "line-cap": "round" },
+    paint: {
+      "line-color": "#64748b",
+      "line-opacity": 0.42,
+      "line-width": 1.5,
+      "line-dasharray": [2, 4],
+    },
+  });
+  updateZoomControls();
+});
 
 map.on("zoom", updateZoomControls);
-map.on("click", (event) => runReverse(event.latlng));
+map.on("click", (event) => runReverse(event.lngLat));
 
 searchIcon.innerHTML = icon("search");
 clearSearch.innerHTML = icon("x");
@@ -74,6 +157,7 @@ updateZoomControls();
 function clearMapResults() {
   for (const marker of searchMarkers) marker.remove();
   searchMarkers = [];
+  markerById.clear();
 }
 
 function escapeHtml(value) {
@@ -148,11 +232,28 @@ clearSearch.addEventListener("click", () => {
 
 clearReverse.addEventListener("click", clearReverseResult);
 
-async function runQuery(query, mode) {
-  // Forward and reverse search are mutually exclusive in the UI — starting a
-  // forward query clears any active reverse result.
-  clearReverseResult();
+document.addEventListener(
+  "click",
+  (event) => {
+    const clearButton = event.target.closest?.("[data-clear-reverse]");
+    if (clearButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      clearReverseResult();
+      return;
+    }
 
+    const popupCloseButton = event.target.closest?.("[data-close-popup]");
+    if (popupCloseButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeSearchPopups();
+    }
+  },
+  true,
+);
+
+async function runQuery(query, mode) {
   lastQuery = query;
   currentSearch?.abort();
   const controller = new AbortController();
@@ -227,6 +328,7 @@ function renderResults(results, options = {}) {
     if (result.point) {
       const marker = makeResultMarker(result).addTo(map);
       searchMarkers.push(marker);
+      markerById.set(result.record_id, marker);
     }
   }
 
@@ -236,44 +338,56 @@ function renderResults(results, options = {}) {
 
   if (pointResults.length === 1) {
     const { lat, lon } = pointResults[0].point;
-    map.flyTo([lat, lon], Math.max(map.getZoom(), 15), { duration: 0.35 });
+    map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), 15), duration: 0.35 * 1000 });
   } else if (pointResults.length > 1) {
-    const bounds = L.latLngBounds(pointResults.map((result) => [result.point.lat, result.point.lon]));
-    map.fitBounds(bounds, { padding: [42, 42], maxZoom: 13 });
+    const bounds = new maplibregl.LngLatBounds();
+    for (const result of pointResults) {
+      bounds.extend([result.point.lon, result.point.lat]);
+    }
+    map.fitBounds(bounds, { padding: 42, maxZoom: 13, duration: 350 });
   }
 }
 
 function makeResultMarker(result) {
-  const { lat, lon } = result.point;
-  return L.marker([lat, lon], {
-    icon: L.divIcon({
-      className: "reverse-marker-divicon",
-      html: `<div class="reverse-marker">${icon("map-pin", "reverse-marker-svg")}</div>`,
-      iconSize: [32, 32],
-      iconAnchor: [16, 32],
-    }),
-  });
+  const { lat, lon, precision } = result.point;
+  const modifier =
+    precision === "representative_point"
+      ? "is-representative"
+      : precision === "centroid"
+        ? "is-centroid"
+        : "is-point";
+  const element = document.createElement("div");
+  element.className = `result-pin-marker ${modifier}`;
+  const marker = new maplibregl.Marker({ element }).setLngLat([lon, lat]);
+  const popup = new maplibregl.Popup({
+    offset: 12,
+    closeButton: false,
+    maxWidth: "280px",
+  }).setHTML(searchPopup(result.label));
+  marker.setPopup(popup);
+  return marker;
 }
 
-async function runReverse(latlng) {
-  // Reverse and forward search are mutually exclusive in the UI — starting a
-  // reverse lookup clears any active forward search.
-  clearForwardSearch();
-
+async function runReverse(lngLat) {
   currentReverse?.abort();
   const controller = new AbortController();
   currentReverse = controller;
   clearReverseLayers();
-  setReverseLoading();
+  setReverseLoading(lngLat);
 
-  // Drop the marker immediately; the resolved address shows in the reverse
-  // panel under the search bar, so the map just needs the marker.
-  const origin = makeReverseOriginMarker(latlng).addTo(map);
+  const origin = makeReverseOriginMarker(lngLat).addTo(map);
   reverseMarkers.push(origin);
+  const popup = new maplibregl.Popup({
+    offset: [0, -28],
+    closeButton: false,
+    maxWidth: "280px",
+  }).setHTML(reversePopup("Searching"));
+  origin.setPopup(popup);
+  origin.togglePopup();
 
   const params = new URLSearchParams({
-    lon: latlng.lng.toFixed(7),
-    lat: latlng.lat.toFixed(7),
+    lon: lngLat.lng.toFixed(7),
+    lat: lngLat.lat.toFixed(7),
   });
 
   try {
@@ -282,10 +396,10 @@ async function runReverse(latlng) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error("Address unavailable");
-    renderReverse(payload, latlng);
+    renderReverse(payload, lngLat, origin);
   } catch (error) {
     if (error.name === "AbortError") return;
-    renderReverseError("Address unavailable");
+    renderReverseError("Address unavailable", lngLat, origin);
   } finally {
     if (currentReverse === controller) {
       currentReverse = null;
@@ -293,68 +407,109 @@ async function runReverse(latlng) {
   }
 }
 
-function setReverseLoading() {
+function setReverseLoading(lngLat) {
   reversePanel.hidden = false;
   reverseIcon.innerHTML = spinner("command-item-svg");
   reverseLabel.textContent = "Searching";
+  // The clicked coordinates are known immediately and stay shown for the whole
+  // lifetime of the result — they never depend on the reverse API succeeding.
+  showReverseCoords(lngLat.lat, lngLat.lng);
 }
 
-function renderReverse(payload, latlng) {
+function formatCoords(lat, lon) {
+  return `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+}
+
+function showReverseCoords(lat, lon) {
+  reverseCoords.textContent = formatCoords(lat, lon);
+  reverseCoords.hidden = false;
+}
+
+function hideReverseCoords() {
+  reverseCoords.textContent = "";
+  reverseCoords.hidden = true;
+}
+
+function renderReverse(payload, lngLat, origin) {
   const result = payload.result;
+  const popup = origin.getPopup();
+  // Clicked coordinates are shown regardless of whether an address was found.
+  showReverseCoords(lngLat.lat, lngLat.lng);
   if (!result) {
     reversePanel.hidden = false;
     reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
     reverseLabel.textContent = "No address found";
+    popup.setHTML(reversePopup("No address found"));
     return;
   }
 
   reversePanel.hidden = false;
   reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
   reverseLabel.textContent = result.label;
+  popup.setHTML(reversePopup(result.label));
 
   if (result.point) {
     const target = makeReverseTargetMarker(result).addTo(map);
     reverseMarkers.push(target);
 
     const movedFarEnough =
-      Math.abs(result.point.lon - latlng.lng) > 1e-6 || Math.abs(result.point.lat - latlng.lat) > 1e-6;
+      Math.abs(result.point.lon - lngLat.lng) > 1e-6 || Math.abs(result.point.lat - lngLat.lat) > 1e-6;
     if (movedFarEnough) {
-      reverseLine = L.polyline(
-        [
-          [latlng.lat, latlng.lng],
-          [result.point.lat, result.point.lon],
-        ],
-        { color: "#64748b", weight: 1.5, opacity: 0.42, dashArray: "2 6", lineCap: "round" },
-      ).addTo(map);
+      map.getSource("reverse-line")?.setData({
+        type: "Feature",
+        properties: {},
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [lngLat.lng, lngLat.lat],
+            [result.point.lon, result.point.lat],
+          ],
+        },
+      });
     }
   }
 }
 
-function renderReverseError(message) {
+function renderReverseError(message, lngLat, origin) {
+  // The address lookup failed, but the click's coordinates are still valid:
+  // stop the spinner (swap the loader for the pin), keep the coords in the
+  // panel, and show the plain coordinates on the pin instead of "Searching".
   reversePanel.hidden = false;
+  reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
   reverseLabel.textContent = message;
+  showReverseCoords(lngLat.lat, lngLat.lng);
+  origin.getPopup().setHTML(reversePopup(formatCoords(lngLat.lat, lngLat.lng)));
 }
 
-function makeReverseOriginMarker(latlng) {
-  return L.marker([latlng.lat, latlng.lng], {
-    icon: L.divIcon({
-      className: "reverse-marker-divicon",
-      html: `<div class="reverse-marker">${icon("map-pin", "reverse-marker-svg")}</div>`,
-      iconSize: [32, 32],
-      iconAnchor: [16, 32],
-    }),
-  });
+function makeReverseOriginMarker(lngLat) {
+  const element = document.createElement("div");
+  element.className = "reverse-marker";
+  element.innerHTML = icon("map-pin", "reverse-marker-svg");
+  return new maplibregl.Marker({ element, anchor: "bottom" }).setLngLat(lngLat);
 }
 
 function makeReverseTargetMarker(result) {
-  return L.marker([result.point.lat, result.point.lon], {
-    icon: L.divIcon({
-      className: "reverse-target-divicon",
-      html: `<div class="reverse-target-marker"></div>`,
-      iconSize: [12, 12],
-      iconAnchor: [6, 6],
-    }),
-  });
+  const element = document.createElement("div");
+  element.className = "reverse-target-marker";
+  return new maplibregl.Marker({ element }).setLngLat([result.point.lon, result.point.lat]);
+}
+
+function reversePopup(title) {
+  return `<div class="popup-body">
+    <p class="popup-title">${escapeHtml(title)}</p>
+    <button class="popup-close" type="button" aria-label="Clear reverse result" data-clear-reverse>
+      ${icon("x")}
+    </button>
+  </div>`;
+}
+
+function searchPopup(title) {
+  return `<div class="popup-body">
+    <p class="popup-title">${escapeHtml(title)}</p>
+    <button class="popup-close" type="button" aria-label="Close popup" data-close-popup>
+      ${icon("x")}
+    </button>
+  </div>`;
 }
 
 function selectResult(result) {
@@ -366,17 +521,32 @@ function selectResult(result) {
   resultsList.hidden = true;
   collapsedResults = true;
   if (result.point) {
-    map.flyTo([result.point.lat, result.point.lon], Math.max(map.getZoom(), 16), { duration: 0.45 });
+    map.flyTo({
+      center: [result.point.lon, result.point.lat],
+      zoom: Math.max(map.getZoom(), 16),
+      duration: 0.45 * 1000,
+    });
+  }
+  const marker = markerById.get(result.record_id);
+  const popup = marker?.getPopup();
+  if (marker && popup && !popup.isOpen()) {
+    marker.togglePopup();
+  }
+}
+
+function closeSearchPopups() {
+  for (const marker of searchMarkers) {
+    const popup = marker.getPopup();
+    if (popup && popup.isOpen()) {
+      marker.togglePopup();
+    }
   }
 }
 
 function clearReverseLayers() {
   for (const marker of reverseMarkers) marker.remove();
   reverseMarkers = [];
-  if (reverseLine) {
-    reverseLine.remove();
-    reverseLine = null;
-  }
+  map.getSource("reverse-line")?.setData(emptyFeatureCollection);
 }
 
 function clearReverseResult() {
@@ -385,12 +555,7 @@ function clearReverseResult() {
   clearReverseLayers();
   reversePanel.hidden = true;
   reverseLabel.textContent = "";
-}
-
-function clearForwardSearch() {
-  searchInput.value = "";
-  clearSearch.hidden = true;
-  clearResults();
+  hideReverseCoords();
 }
 
 function clearResults() {

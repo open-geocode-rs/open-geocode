@@ -251,6 +251,19 @@ body {
   white-space: nowrap;
 }
 
+/* Secondary line under a label, e.g. the lat/lon of a reverse-geocoded address. */
+.command-item-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.3;
+  color: hsl(var(--muted-foreground));
+  font-variant-numeric: tabular-nums;
+}
+
+.command-item-sub[hidden] {
+  display: none;
+}
+
 .result-pin,
 .reverse-pin {
   color: hsl(var(--primary));
@@ -293,15 +306,87 @@ body {
   color: hsl(var(--accent-foreground));
 }
 
-.leaflet-container {
-  font: inherit;
-  background: #dfe7df;
+/* MapLibre popup styling, matched to the command palette look. */
+.maplibregl-popup {
+  z-index: 600;
 }
 
-/* divIcon markers render only their inner element, not Leaflet's default box. */
-.leaflet-div-icon {
+.maplibregl-popup-content {
+  padding: 0;
+  border-radius: 8px;
+  box-shadow: 0 3px 14px rgb(0 0 0 / 0.22);
+  background: hsl(var(--popover));
+  color: hsl(var(--foreground));
+}
+
+.maplibregl-popup-close-button {
+  display: none;
+}
+
+.popup-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 12px 14px;
+}
+
+.popup-title {
+  flex: 1 1 auto;
+  max-width: 240px;
+  min-width: 0;
+  margin: 0;
+  font-weight: 400;
+  line-height: 1.25;
+}
+
+.popup-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -4px -8px -4px 0;
+  padding: 0;
+  border: 0;
+  border-radius: calc(var(--radius) - 2px);
   background: transparent;
-  border: none;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+}
+
+.popup-close:hover,
+.popup-close:focus-visible {
+  outline: 0;
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+}
+
+/* Result point markers, styled by point precision. */
+.result-pin-marker {
+  box-sizing: border-box;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.result-pin-marker.is-point {
+  width: 9px;
+  height: 9px;
+  background: #0f8b8d;
+  border: 1px solid #075f61;
+}
+
+.result-pin-marker.is-centroid {
+  width: 11px;
+  height: 11px;
+  background: #d95d39;
+  border: 1px solid #8f2f21;
+}
+
+.result-pin-marker.is-representative {
+  width: 13px;
+  height: 13px;
+  background: #375e97;
+  border: 1.5px solid #253f68;
 }
 
 .reverse-target-marker {
@@ -376,6 +461,42 @@ body {
   opacity: 0.5;
 }
 
+/* Google-Maps-style wordmark, bottom-center, sitting just above the attribution
+   bar. No box and no blur — a crisp 1px white outline hugs the glyph edges
+   (8-direction zero-blur text-shadow) so it reads over any basemap with solid
+   edges. Label only (pointer-events: none) so it never blocks map dragging;
+   below the search panel (z 500) so a long results list covers it. */
+.brandmark {
+  position: absolute;
+  z-index: 400;
+  bottom: 36px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #4b5563;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+  text-shadow:
+    -1px -1px 0 #fff, 1px -1px 0 #fff,
+    -1px 1px 0 #fff, 1px 1px 0 #fff,
+    0 -1px 0 #fff, 0 1px 0 #fff,
+    -1px 0 0 #fff, 1px 0 0 #fff;
+}
+
+/* Data attribution: keep it tiny and never let the expanded text overflow the
+   viewport on a phone. Compact mode already collapses it to an (i) toggle. */
+.maplibregl-ctrl-attrib-inner {
+  font-size: 11px;
+}
+
+.maplibregl-ctrl-attrib {
+  max-width: calc(100vw - 24px);
+}
+
 @media (max-width: 560px) {
   .panel {
     top: 10px;
@@ -387,8 +508,23 @@ body {
     white-space: normal;
   }
 
+  /* 16px stops iOS Safari from auto-zooming (which clamps/shifts the layout)
+     when the search field is focused. */
+  #search-input {
+    font-size: 16px;
+  }
+
   .map-controls {
     right: 10px;
     bottom: 24px;
+  }
+
+  .brandmark {
+    bottom: 42px;
+    font-size: 14px;
+  }
+
+  .maplibregl-ctrl-attrib-inner {
+    font-size: 10px;
   }
 }
