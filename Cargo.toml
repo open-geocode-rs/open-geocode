@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "Lightweight geocoding engine: build a binary Pack from OSM extracts and serve search, autocomplete, and reverse geocoding from a single Rust runtime."
-repository = "https://github.com/abhigyaan-jha/open-geocode"
+repository = "https://github.com/open-geocode-rs/open-geocode"
 readme = "README.md"
 keywords = ["geocoding", "geocoder", "osm", "gis", "geospatial"]
 categories = ["science::geo", "command-line-utilities"]
@@ -37,3 +37,8 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 # Used only by the in-crate router tests to drive the Router via `oneshot`.
 tower = { version = "0.5", features = ["util"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
