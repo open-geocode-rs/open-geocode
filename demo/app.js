@@ -4,13 +4,9 @@
 import { layers, namedFlavor } from "https://esm.sh/@protomaps/basemaps@5.7.2";
 
 // The app's mount, derived from the document <base> (index.html). At
-// ajha.ca/open-geocode this is "/open-geocode/"; at the root it is "/".
-//   BASE — root-relative path ("/open-geocode/"), fine for fetch().
-//   ABS  — fully absolute ("https://host/open-geocode/"). MapLibre requires
-//          ABSOLUTE urls for sprite/glyphs (it throws on relative), so the map
-//          style is built from ABS. Both are mount-agnostic.
+// ajha.ca/open-geocode this is "/open-geocode/"; at the root it is "/". A
+// root-relative path, fine for fetch().
 const BASE = new URL(".", document.baseURI).pathname;
-const ABS = new URL(".", document.baseURI).href;
 
 // Public, per-environment config (config.js) selects how this one UI talks to its
 // two interchangeable backends; the SAME code below runs for both.
@@ -76,15 +72,14 @@ const ontarioBounds = [
 //   - cfg.styleUrl — a hosted, keyless MapLibre style (this demo uses
 //     OpenFreeMap). No key, no account, no self-hosted tiles.
 //   - otherwise    — an inline style built from a Protomaps PMTiles archive
-//     (cfg.pmtilesUrl) with vendored glyphs/sprites, for self-hosting the tiles.
+//     (cfg.pmtilesUrl); glyphs/sprites come from Protomaps' hosted assets (CDN).
 function protomapsStyle() {
   return {
     version: 8,
-    // ABSOLUTE urls (MapLibre rejects relative sprite/glyphs). ABS already
-    // includes the mount, so these resolve under it; the {fontstack}/{range}
-    // placeholders are kept literal — only the path is prefixed.
-    glyphs: `${ABS}vendor/fonts/{fontstack}/{range}.pbf`,
-    sprite: `${ABS}vendor/sprites/v4/light`,
+    // Glyphs + sprites from Protomaps' hosted assets (CDN). They're map data, not
+    // code, so nothing is self-hosted here — only the tiles (cfg.pmtilesUrl) are.
+    glyphs: "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf",
+    sprite: "https://protomaps.github.io/basemaps-assets/sprites/v4/light",
     sources: {
       protomaps: {
         type: "vector",
