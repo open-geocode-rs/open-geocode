@@ -93,7 +93,8 @@ body {
   color: hsl(var(--muted-foreground));
 }
 
-#search-input {
+#search-input,
+#locator-input {
   flex: 1 1 auto;
   min-width: 0;
   height: 44px;
@@ -105,7 +106,8 @@ body {
   font-size: 14px;
 }
 
-#search-input::placeholder {
+#search-input::placeholder,
+#locator-input::placeholder {
   color: hsl(var(--muted-foreground));
 }
 
@@ -283,6 +285,47 @@ body {
   color: hsl(var(--foreground));
 }
 
+.store-panel {
+  width: min(440px, calc(100vw - 32px));
+}
+
+.store-panel .command-list {
+  max-height: min(680px, calc(100vh - 90px));
+}
+
+.store-panel .command-empty {
+  justify-content: flex-start;
+  padding: 10px 16px;
+  border-top: 1px solid hsl(var(--border));
+  color: hsl(var(--foreground));
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+}
+
+.store-items .store-item {
+  align-items: flex-start;
+  min-height: 124px;
+  padding: 14px 12px;
+}
+
+.store-items .store-item[aria-selected="true"] {
+  background: hsl(var(--accent));
+}
+
+.store-items .store-item .command-item-label {
+  white-space: normal;
+}
+
+.store-pin {
+  color: #d93025;
+}
+
+.store-open {
+  color: #137333;
+  font-weight: 500;
+}
+
 .command-item-action {
   flex: 0 0 auto;
   display: inline-flex;
@@ -337,6 +380,22 @@ body {
   margin: 0;
   font-weight: 400;
   line-height: 1.25;
+}
+
+.popup-title-main,
+.popup-title-sub {
+  display: block;
+}
+
+.popup-title-main {
+  font-weight: 600;
+}
+
+.popup-title-sub {
+  margin-top: 3px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .popup-close {
@@ -412,6 +471,35 @@ body {
   width: 30px;
   height: 30px;
   filter: drop-shadow(0 2px 3px rgb(0 0 0 / 0.2));
+}
+
+.store-pin-marker {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: #d93025;
+  cursor: pointer;
+}
+
+.store-pin-marker.is-selected {
+  color: #a52714;
+}
+
+.store-pin-marker-svg {
+  width: 32px;
+  height: 32px;
+  filter: drop-shadow(0 2px 3px rgb(0 0 0 / 0.24));
+}
+
+.locator-origin-marker {
+  box-sizing: border-box;
+  width: 13px;
+  height: 13px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #0f8b8d;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.34);
 }
 
 .map-controls {
@@ -510,7 +598,8 @@ body {
 
   /* 16px stops iOS Safari from auto-zooming (which clamps/shifts the layout)
      when the search field is focused. */
-  #search-input {
+  #search-input,
+  #locator-input {
     font-size: 16px;
   }
 

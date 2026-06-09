@@ -1,26 +1,12 @@
-// Protomaps basemap themes — used only by the self-hosted Protomaps style path
-// (protomapsStyle below); the OpenFreeMap default never calls it. Loaded from a
-// CDN as an ES module (SRI isn't available on bare module imports).
-import { layers, namedFlavor } from "https://esm.sh/@protomaps/basemaps@5.7.2";
-
-// The app's mount, derived from the document <base> (index.html). At
-// ajha.ca/open-geocode this is "/open-geocode/"; at the root it is "/". A
-// root-relative path, fine for fetch().
-const BASE = new URL(".", document.baseURI).pathname;
-
-// Public, per-environment config (config.js) selects how this one UI talks to its
-// two interchangeable backends; the SAME code below runs for both.
-const cfg = window.OPEN_GEOCODE_CONFIG ?? {};
-
-// API base. `open-geocode serve` hosts the UI and the API (/search,
-// /autocomplete, /reverse) on the same origin at the root, so config sets
-// apiBase:"". When omitted it falls back to <BASE>api, for a mount that serves
-// the API under the app's own path.
-const API_BASE = cfg.apiBase ?? `${BASE}api`;
-
-// PMTiles URL for the self-hosted Protomaps basemap (deployed demo only); unused
-// when config supplies a hosted styleUrl (see the map style below).
-const PMTILES_URL = cfg.pmtilesUrl;
+import {
+  API_BASE,
+  createDemoMap,
+  emptyFeatureCollection,
+  escapeHtml,
+  icon,
+  spinner,
+  syncZoomControls,
+} from "./shared.js";
 
 // Forward search and autocomplete are the same request flow; they differ
 // only in endpoint, the response field, and how results fit the map.
@@ -46,7 +32,6 @@ const clearReverse = document.querySelector("#clear-reverse");
 const zoomInButton = document.querySelector("#zoom-in");
 const zoomOutButton = document.querySelector("#zoom-out");
 
-const emptyFeatureCollection = { type: "FeatureCollection", features: [] };
 const markerById = new Map();
 let searchMarkers = [];
 let reverseMarkers = [];
@@ -56,67 +41,7 @@ let searchDebounce = null;
 let collapsedResults = false;
 let lastQuery = "";
 
-// Read the PMTiles archive via HTTP range requests.
-const protocol = new pmtiles.Protocol();
-maplibregl.addProtocol("pmtiles", protocol.tile);
-
-// Ontario-only demo: lock the map to the province so users can't pan or
-// zoom out to areas the pack has no data for. Bounds are Ontario's bbox.
-const ontarioBounds = [
-  [-95.2, 41.6],
-  [-74.3, 57.0],
-];
-// The basemap style — two interchangeable forms, picked by config; the rest of
-// this file is identical either way (it adds its own sources/markers ON TOP of
-// whichever base style loads):
-//   - cfg.styleUrl — a hosted, keyless MapLibre style (this demo uses
-//     OpenFreeMap). No key, no account, no self-hosted tiles.
-//   - otherwise    — an inline style built from a Protomaps PMTiles archive
-//     (cfg.pmtilesUrl); glyphs/sprites come from Protomaps' hosted assets (CDN).
-function protomapsStyle() {
-  return {
-    version: 8,
-    // Glyphs + sprites from Protomaps' hosted assets (CDN). They're map data, not
-    // code, so nothing is self-hosted here — only the tiles (cfg.pmtilesUrl) are.
-    glyphs: "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf",
-    sprite: "https://protomaps.github.io/basemaps-assets/sprites/v4/light",
-    sources: {
-      protomaps: {
-        type: "vector",
-        url: `pmtiles://${PMTILES_URL}`,
-        // Resource-qualified: OSM provides the map DATA (required under ODbL —
-        // must credit "OpenStreetMap contributors" + link the copyright page);
-        // Protomaps builds the basemap TILES/style from it (credited by request).
-        attribution:
-          'Map data &copy; <a href="https://openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors &middot; Basemap tiles &copy; <a href="https://protomaps.com" target="_blank" rel="noopener">Protomaps</a>',
-      },
-    },
-    layers: layers("protomaps", namedFlavor("light"), { lang: "en" }),
-  };
-}
-
-const map = new maplibregl.Map({
-  container: "map",
-  // We add our own compact AttributionControl below (bottom-left) instead of the
-  // default; the brandmark sits bottom-center and the zoom controls bottom-right.
-  attributionControl: false,
-  style: cfg.styleUrl ?? protomapsStyle(),
-  center: [-79.3832, 43.6532],
-  zoom: 11,
-  minZoom: 5,
-  maxZoom: 18,
-  maxBounds: ontarioBounds,
-});
-
-map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
-
-// MapLibre renders the compact attribution EXPANDED by default (it only auto-
-// collapses once you drag the map). Collapse it to just the (i) on load so it
-// starts unobtrusive; it still opens on click — which OSM's guidelines allow.
-// The control is a <details open> element with a toggle class.
-const attribControl = map.getContainer().querySelector(".maplibregl-ctrl-attrib");
-attribControl?.classList.remove("maplibregl-compact-show");
-attribControl?.removeAttribute("open");
+const map = createDemoMap();
 
 map.on("load", () => {
   map.addSource("reverse-line", { type: "geojson", data: emptyFeatureCollection });
@@ -153,15 +78,6 @@ function clearMapResults() {
   for (const marker of searchMarkers) marker.remove();
   searchMarkers = [];
   markerById.clear();
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
 
 searchInput.addEventListener("input", () => {
@@ -574,47 +490,6 @@ function setSearchLoading(isLoading) {
   searchIcon.innerHTML = isLoading ? spinner() : icon("search");
 }
 
-function spinner(className = "spinner") {
-  return `<svg
-    role="status"
-    aria-label="Loading"
-    class="${className} spinner"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-    stroke-width="2"
-  >
-    <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-  </svg>`;
-}
-
 function updateZoomControls() {
-  zoomInButton.disabled = map.getZoom() >= map.getMaxZoom();
-  zoomOutButton.disabled = map.getZoom() <= map.getMinZoom();
-}
-
-function icon(name, className = "icon") {
-  const body = {
-    "map-pin": `
-      <path d="M20 10c0 4.9-5.1 9.3-7.1 10.8a1.5 1.5 0 0 1-1.8 0C9.1 19.3 4 14.9 4 10a8 8 0 0 1 16 0Z" />
-      <circle cx="12" cy="10" r="3" />
-    `,
-    search: `<path d="m21 21-4.2-4.2m1.2-5.3a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z" />`,
-    minus: `<path d="M5 12h14" />`,
-    plus: `<path d="M5 12h14" /><path d="M12 5v14" />`,
-    x: `<path d="M18 6 6 18" /><path d="m6 6 12 12" />`,
-  }[name] ?? "";
-
-  return `<svg
-    class="${className}"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-    stroke-width="2"
-    aria-hidden="true"
-  >${body}</svg>`;
+  syncZoomControls(map, zoomInButton, zoomOutButton);
 }

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>open-geocode Store Locator Demo</title>
+    <!-- `open-geocode serve --demo` hosts this UI at the root. The deployed
+         demo can change only this href when mounted at a sub-path. -->
+    <base href="/" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css"
+      integrity="sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK"
+      crossorigin="anonymous"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="map" aria-label="Pharmacy store locator map"></div>
+
+    <aside class="panel store-panel" aria-label="Pharmacy store locator">
+      <form id="locator-form" class="command" aria-label="Find pharmacies near an address">
+        <div class="command-input-wrapper">
+          <span id="locator-icon" class="command-icon"></span>
+          <input
+            id="locator-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Enter an address"
+            aria-controls="store-results"
+          />
+          <button id="clear-locator" class="command-clear" type="button" aria-label="Clear search" hidden></button>
+        </div>
+        <section class="command-list" aria-live="polite">
+          <div id="locator-status" class="command-empty" hidden></div>
+          <div id="store-results-group" class="command-group">
+            <ul
+              id="store-results"
+              class="command-items store-items"
+              role="listbox"
+              aria-label="Address and pharmacy results"
+            ></ul>
+          </div>
+        </section>
+      </form>
+    </aside>
+
+    <div class="map-controls" aria-label="Map controls">
+      <button id="zoom-in" class="map-control" type="button" aria-label="Zoom in"></button>
+      <button id="zoom-out" class="map-control" type="button" aria-label="Zoom out"></button>
+    </div>
+
+    <div class="brandmark" aria-label="open-geocode">Open-Geocode</div>
+
+    <script
+      src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.js"
+      integrity="sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp"
+      crossorigin="anonymous"
+    ></script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/pmtiles@4.4.1/dist/pmtiles.js"
+      integrity="sha384-iS2/cbFYol4NsEeda4mW6N/8wPMOT6pv2eY+GNYSJRqVC4nbJECP1+mg6D2T8wT/"
+      crossorigin="anonymous"
+    ></script>
+    <script src="config.js"></script>
+    <script type="module" src="store-locator.js"></script>
+  </body>
+</html>
