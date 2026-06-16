@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod bench;
 pub mod builder;
 pub mod context;

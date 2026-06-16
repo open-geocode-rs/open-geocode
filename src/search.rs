@@ -44,6 +44,22 @@ pub struct TextSearchHit {
     pub record: RecordSummary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressGeocodeOptions {
+    pub address: String,
+    pub locality: Option<String>,
+    pub region: Option<String>,
+    pub postcode: Option<String>,
+    pub limit: usize,
+    pub layer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AddressGeocodeHit {
+    pub query: String,
+    pub hit: TextSearchHit,
+}
+
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
@@ -87,13 +103,38 @@ impl PackTextSearcher {
             bail!("search query cannot be empty");
         }
 
-        let query = self.build_query(query_text, options.layer.as_deref())?;
-        let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit))
-            .with_context(|| format!("failed to search text index for {query_text:?}"))?;
+        let (_, hits) = self.search_variants(query_text, options.layer.as_deref(), limit)?;
+        Ok(hits)
+    }
 
-        self.hydrate_top_docs(top_docs)
+    pub fn geocode_address(
+        &self,
+        options: AddressGeocodeOptions,
+    ) -> Result<Option<AddressGeocodeHit>> {
+        let limit = effective_limit(options.limit);
+        if limit == 0 {
+            return Ok(None);
+        }
+
+        let address = options.address.trim();
+        if address.is_empty() {
+            return Ok(None);
+        }
+
+        for candidate in address_geocode_candidates(address, options.postcode.as_deref()) {
+            let (query, hits) =
+                self.search_variants(&candidate, options.layer.as_deref(), limit)?;
+            for hit in hits {
+                if hit.record.point.is_none() {
+                    continue;
+                }
+                if self.hit_matches_address_context(&hit, &options)? {
+                    return Ok(Some(AddressGeocodeHit { query, hit }));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn autocomplete(&self, options: TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
@@ -150,6 +191,113 @@ impl PackTextSearcher {
             (Occur::Must, text_query),
             (Occur::Must, Box::new(layer_query)),
         ])))
+    }
+
+    fn search_variants(
+        &self,
+        query_text: &str,
+        layer: Option<&str>,
+        limit: usize,
+    ) -> Result<(String, Vec<TextSearchHit>)> {
+        let mut last_query = query_text.trim().to_string();
+        let mut parse_error = None;
+        for variant in search_query_variants(query_text) {
+            last_query = variant.clone();
+            let query = match self.build_query(&variant, layer) {
+                Ok(query) => query,
+                Err(error) => {
+                    parse_error = Some(error);
+                    continue;
+                }
+            };
+            let searcher = self.reader.searcher();
+            let top_docs = searcher
+                .search(&query, &TopDocs::with_limit(limit))
+                .with_context(|| format!("failed to search text index for {variant:?}"))?;
+            let hits = self.hydrate_top_docs(top_docs)?;
+            if !hits.is_empty() {
+                return Ok((variant, hits));
+            }
+        }
+
+        if let Some(error) = parse_error {
+            if search_query_variants(query_text).is_empty() {
+                return Err(error);
+            }
+        }
+
+        Ok((last_query, Vec::new()))
+    }
+
+    fn hit_matches_address_context(
+        &self,
+        hit: &TextSearchHit,
+        options: &AddressGeocodeOptions,
+    ) -> Result<bool> {
+        let desired_region = normalized_for_match(options.region.as_deref());
+        let desired_locality = normalized_for_match(options.locality.as_deref());
+        let desired_postcode = normalized_postcode_for_match(options.postcode.as_deref());
+        if desired_region.is_none() && desired_locality.is_none() && desired_postcode.is_none() {
+            return Ok(true);
+        }
+
+        let Some(context) = self.pack.boundary_context(hit.record_id)? else {
+            return Ok(desired_region.is_none() && desired_locality.is_none());
+        };
+
+        let mut admin_labels = Vec::new();
+        if let Some(tuple) = context.admin_context {
+            for (layer, record_id) in [
+                ("country", tuple.country_record_id),
+                ("region", tuple.region_record_id),
+                ("district", tuple.district_record_id),
+                ("locality", tuple.locality_record_id),
+                ("neighbourhood", tuple.neighbourhood_record_id),
+                ("place", tuple.place_record_id),
+            ] {
+                if let Some(record_id) = record_id
+                    && let Some(record) = self.pack.context_record(record_id)?
+                {
+                    admin_labels.push((
+                        layer,
+                        normalized_for_match(Some(&record.label)),
+                        normalized_for_match(Some(&record.name)),
+                    ));
+                }
+            }
+        }
+
+        if let Some(region) = desired_region
+            && !admin_labels.iter().any(|(layer, label, name)| {
+                *layer == "region"
+                    && (label.as_deref() == Some(region.as_str())
+                        || name.as_deref() == Some(region.as_str()))
+            })
+        {
+            return Ok(false);
+        }
+
+        if let Some(locality) = desired_locality {
+            let locality_layers = ["district", "locality", "neighbourhood", "place"];
+            if !admin_labels.iter().any(|(layer, label, name)| {
+                locality_layers.contains(layer)
+                    && (label.as_deref() == Some(locality.as_str())
+                        || name.as_deref() == Some(locality.as_str()))
+            }) {
+                return Ok(false);
+            }
+        }
+
+        if let Some(postcode) = desired_postcode
+            && let Some(postcode_record_id) = context.postcode_record_id
+            && let Some(record) = self.pack.context_record(postcode_record_id)?
+            && normalized_postcode_for_match(record.postcode.as_deref()).as_deref()
+                != Some(postcode.as_str())
+        {
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     fn search_fields(&self) -> Vec<tantivy::schema::Field> {
@@ -257,6 +405,169 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
 }
 
+fn address_geocode_candidates(address: &str, postcode: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(postcode) = postcode.and_then(normalize_index_text)
+        && let Some(address) = meaningful_address_query(address)
+    {
+        candidates.push(format!("{address} {postcode}"));
+    }
+    candidates.push(address.to_string());
+    unique_strings(candidates)
+}
+
+fn meaningful_address_query(address: &str) -> Option<String> {
+    let normalized = normalize_index_text(address)?;
+    let expanded = expand_address_abbreviations(&normalized);
+    strip_unit_terms(&expanded)
+}
+
+fn search_query_variants(query_text: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    if let Some(cleaned) = collapse_query(query_text) {
+        variants.push(cleaned);
+    }
+    if let Some(normalized) = normalize_index_text(query_text) {
+        variants.push(normalized.clone());
+        let expanded = expand_address_abbreviations(&normalized);
+        variants.push(expanded.clone());
+        if let Some(without_unit) = strip_unit_terms(&expanded) {
+            variants.push(without_unit);
+        }
+    }
+    unique_strings(variants)
+}
+
+fn collapse_query(value: &str) -> Option<String> {
+    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn expand_address_abbreviations(value: &str) -> String {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let mut expanded = Vec::with_capacity(tokens.len());
+    for (index, token) in tokens.iter().enumerate() {
+        let replacement = match *token {
+            "ave" | "av" => Some("avenue"),
+            "blvd" => Some("boulevard"),
+            "cir" => Some("circle"),
+            "ct" | "crt" => Some("court"),
+            "cres" => Some("crescent"),
+            "dr" => Some("drive"),
+            "hwy" => Some("highway"),
+            "ln" => Some("lane"),
+            "pkwy" => Some("parkway"),
+            "pl" => Some("place"),
+            "rd" => Some("road"),
+            "sq" => Some("square"),
+            "st" if index > 0 && !is_numeric_token(tokens[index - 1]) => Some("street"),
+            "ter" | "terr" => Some("terrace"),
+            "trl" | "tr" => Some("trail"),
+            "wy" => Some("way"),
+            "e" if previous_token_is_street_type(&expanded) => Some("east"),
+            "n" if previous_token_is_street_type(&expanded) => Some("north"),
+            "s" if previous_token_is_street_type(&expanded) => Some("south"),
+            "w" if previous_token_is_street_type(&expanded) => Some("west"),
+            _ => None,
+        };
+        expanded.push(replacement.unwrap_or(*token));
+    }
+    expanded.join(" ")
+}
+
+fn previous_token_is_street_type(tokens: &[&str]) -> bool {
+    tokens.last().is_some_and(|token| {
+        matches!(
+            *token,
+            "avenue"
+                | "boulevard"
+                | "circle"
+                | "court"
+                | "crescent"
+                | "drive"
+                | "highway"
+                | "lane"
+                | "parkway"
+                | "place"
+                | "road"
+                | "square"
+                | "street"
+                | "terrace"
+                | "trail"
+                | "way"
+        )
+    })
+}
+
+fn strip_unit_terms(value: &str) -> Option<String> {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let mut stripped = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if is_unit_designator(tokens[index]) {
+            index += 1;
+            if index < tokens.len() && is_unit_value_token(tokens[index]) {
+                index += 1;
+            }
+            continue;
+        }
+        stripped.push(tokens[index]);
+        index += 1;
+    }
+
+    if stripped.len() > 2 && is_numeric_token(stripped[0]) && is_numeric_token(stripped[1]) {
+        stripped.remove(0);
+    }
+
+    let stripped = stripped.join(" ");
+    (!stripped.is_empty()).then_some(stripped)
+}
+
+fn is_unit_designator(token: &str) -> bool {
+    matches!(
+        token,
+        "apt"
+            | "apartment"
+            | "bldg"
+            | "building"
+            | "dept"
+            | "department"
+            | "fl"
+            | "floor"
+            | "rm"
+            | "room"
+            | "ste"
+            | "suite"
+            | "unit"
+    )
+}
+
+fn is_unit_value_token(token: &str) -> bool {
+    token.chars().any(|character| character.is_ascii_digit())
+}
+
+fn is_numeric_token(token: &str) -> bool {
+    token.chars().all(|character| character.is_ascii_digit())
+}
+
+fn normalized_for_match(value: Option<&str>) -> Option<String> {
+    normalize_index_text(value?.trim())
+}
+
+fn normalized_postcode_for_match(value: Option<&str>) -> Option<String> {
+    normalized_for_match(value).map(|value| value.split_whitespace().collect())
+}
+
+fn unique_strings(values: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for value in values {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
 fn autocomplete_query_tokens(query_text: &str) -> Vec<String> {
     query_text
         .split_whitespace()
@@ -295,6 +606,27 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn search_query_variants_expand_common_address_abbreviations() {
+        let variants = search_query_variants("33 Princess St Suite 170");
+        assert!(variants.contains(&"33 princess street suite 170".to_string()));
+        assert!(variants.contains(&"33 princess street".to_string()));
+    }
+
+    #[test]
+    fn search_query_variants_strip_leading_unit_numbers() {
+        let variants = search_query_variants("306-1333 Sheppard Ave E");
+        assert!(variants.contains(&"306 1333 sheppard avenue east".to_string()));
+        assert!(variants.contains(&"1333 sheppard avenue east".to_string()));
+    }
+
+    #[test]
+    fn search_query_variants_do_not_treat_initial_saint_as_street() {
+        let variants = search_query_variants("St Clair Ave W");
+        assert!(variants.contains(&"st clair avenue west".to_string()));
+        assert!(!variants.contains(&"street clair avenue west".to_string()));
+    }
 
     #[test]
     fn searches_and_hydrates_records_from_pack() {

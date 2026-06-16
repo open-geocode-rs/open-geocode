@@ -1,10 +1,11 @@
 use std::{fs::File, net::SocketAddr, path::PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
 use open_geocode::{
+    batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
     bench::{PackBenchmarkOptions, benchmark_pack},
     builder::{BuildOsmOptions, build_osm_pack},
     pack::{PackReader, RecordId},
@@ -126,6 +127,74 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Geocode CSV rows into lat/lon columns using a Pack text index.
+    #[command(name = "batch-geocode")]
+    BatchGeocode {
+        /// Binary Pack directory. Required with --address-fields.
+        #[arg(long)]
+        pack: Option<PathBuf>,
+
+        /// Input CSV path.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Clean output CSV path. Input columns are preserved and lat/lon are added or filled.
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Audit CSV path.
+        #[arg(long)]
+        audit: PathBuf,
+
+        /// Comma-separated address columns to try as one query candidate. Repeat for fallbacks.
+        #[arg(long = "address-fields")]
+        address_fields: Vec<String>,
+
+        /// Optional locality/city column used for engine context validation.
+        #[arg(long)]
+        locality_field: Option<String>,
+
+        /// Optional region/province/state column used for engine context validation.
+        #[arg(long)]
+        region_field: Option<String>,
+
+        /// Optional postal-code column used for engine context validation.
+        #[arg(long)]
+        postcode_field: Option<String>,
+
+        /// Optional layer filter passed to the engine searcher.
+        #[arg(long)]
+        layer: Option<String>,
+
+        /// Number of engine candidates to inspect per query. Use 0 for the engine default.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        /// Latitude output column name.
+        #[arg(long, default_value = "lat")]
+        lat_column: String,
+
+        /// Longitude output column name.
+        #[arg(long, default_value = "lon")]
+        lon_column: String,
+
+        /// Copy coordinates from another CSV instead of geocoding address fields.
+        #[arg(long)]
+        join_coordinates_from: Option<PathBuf>,
+
+        /// Key column used with --join-coordinates-from.
+        #[arg(long)]
+        join_key: Option<String>,
+
+        /// Latitude column in the joined CSV.
+        #[arg(long, default_value = "lat")]
+        join_lat_column: String,
+
+        /// Longitude column in the joined CSV.
+        #[arg(long, default_value = "lon")]
+        join_lon_column: String,
+    },
+
     /// Serve the Runtime HTTP API and static demo files.
     Serve {
         /// Binary Pack directory.
@@ -176,6 +245,41 @@ async fn main() -> Result<()> {
             warmup,
             output,
         } => bench_pack(pack, queries, iterations, warmup, output),
+        Commands::BatchGeocode {
+            pack,
+            input,
+            output,
+            audit,
+            address_fields,
+            locality_field,
+            region_field,
+            postcode_field,
+            layer,
+            limit,
+            lat_column,
+            lon_column,
+            join_coordinates_from,
+            join_key,
+            join_lat_column,
+            join_lon_column,
+        } => batch_geocode(
+            pack,
+            input,
+            output,
+            audit,
+            address_fields,
+            locality_field,
+            region_field,
+            postcode_field,
+            layer,
+            limit,
+            lat_column,
+            lon_column,
+            join_coordinates_from,
+            join_key,
+            join_lat_column,
+            join_lon_column,
+        ),
         Commands::Serve {
             pack,
             demo,
@@ -361,4 +465,58 @@ fn bench_pack(
     } else {
         write_json(value)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_geocode(
+    pack: Option<PathBuf>,
+    input: PathBuf,
+    output: PathBuf,
+    audit: PathBuf,
+    address_fields: Vec<String>,
+    locality_field: Option<String>,
+    region_field: Option<String>,
+    postcode_field: Option<String>,
+    layer: Option<String>,
+    limit: usize,
+    lat_column: String,
+    lon_column: String,
+    join_coordinates_from: Option<PathBuf>,
+    join_key: Option<String>,
+    join_lat_column: String,
+    join_lon_column: String,
+) -> Result<()> {
+    let address_field_groups = parse_field_groups(&address_fields)?;
+    let join = if let Some(path) = join_coordinates_from {
+        let key_column = join_key.context("--join-key is required with --join-coordinates-from")?;
+        Some(CoordinateJoinOptions {
+            path,
+            key_column,
+            lat_column: join_lat_column,
+            lon_column: join_lon_column,
+        })
+    } else {
+        None
+    };
+    let report = run_batch_geocode(BatchGeocodeOptions {
+        pack,
+        input,
+        output: output.clone(),
+        audit: audit.clone(),
+        address_field_groups,
+        locality_field,
+        region_field,
+        postcode_field,
+        layer,
+        limit,
+        lat_column,
+        lon_column,
+        join,
+    })?;
+    write_json(serde_json::json!({
+        "rows": report.rows,
+        "resolved": report.resolved,
+        "output": output.display().to_string(),
+        "audit": audit.display().to_string(),
+    }))
 }
