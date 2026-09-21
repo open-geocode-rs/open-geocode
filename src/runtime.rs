@@ -25,7 +25,7 @@ use crate::{
         problem::{Problem, classify_search_error},
         request_id::{self, RequestId},
     },
-    pack::{RecordPoint, RecordPointPrecision, RecordSource},
+    pack::{PackReader, RecordPoint, RecordPointPrecision, RecordSource},
     record::OsmObjectType,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseGeocodeResponse},
     search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
@@ -47,6 +47,17 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    fn open(path: &Path) -> Result<Self> {
+        let pack = Arc::new(PackReader::open(path)?);
+        let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+        let reverse_geocoder = PackReverseGeocoder::from_pack(pack)?;
+        Ok(Self {
+            searcher: Arc::new(searcher),
+            reverse_geocoder: Arc::new(reverse_geocoder),
+            ready: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
     /// True once the Pack is loaded and the Runtime can answer API traffic
     /// (ADR 0017 Decision 28).
     pub(crate) fn is_ready(&self) -> bool {
@@ -121,21 +132,8 @@ pub struct SearchApiSource {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let generation = crate::pack::resolve_pack_path(&options.pack)?;
-    let searcher = PackTextSearcher::open(&generation)
+    let state = AppState::open(&options.pack)
         .with_context(|| format!("failed to open Pack {}", options.pack.display()))?;
-    let reverse_geocoder = PackReverseGeocoder::open(&generation).with_context(|| {
-        format!(
-            "failed to open Pack Spatial Index {}",
-            options.pack.display()
-        )
-    })?;
-    // Both opens succeeded, so the Runtime is ready to answer API traffic.
-    let state = AppState {
-        searcher: Arc::new(searcher),
-        reverse_geocoder: Arc::new(reverse_geocoder),
-        ready: Arc::new(AtomicBool::new(true)),
-    };
     let app = build_router(state, &options.demo, &options.basemap);
 
     let listener = TcpListener::bind(options.bind)
@@ -500,13 +498,9 @@ mod router_tests {
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {
-        let searcher = PackTextSearcher::open(pack_dir).expect("searcher");
-        let reverse_geocoder = PackReverseGeocoder::open(pack_dir).expect("reverse geocoder");
-        AppState {
-            searcher: Arc::new(searcher),
-            reverse_geocoder: Arc::new(reverse_geocoder),
-            ready: Arc::new(AtomicBool::new(ready)),
-        }
+        let state = AppState::open(pack_dir).expect("open shared pack");
+        state.ready.store(ready, Ordering::Release);
+        state
     }
 
     fn request(method: &str, uri: &str) -> Request<Body> {

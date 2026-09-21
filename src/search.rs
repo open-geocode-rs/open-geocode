@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub struct PackTextSearcher {
-    pack: PackReader,
+    pack: Arc<PackReader>,
     index: Index,
     reader: IndexReader,
     fields: TextIndexFields,
@@ -51,7 +51,11 @@ const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 
 impl PackTextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack = PackReader::open(&pack_path)?;
+        Self::from_pack(Arc::new(PackReader::open(pack_path)?))
+    }
+
+    /// Open the text index using an existing shared pack reader.
+    pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
         let text_index_manifest = pack
             .manifest()
             .text_index
