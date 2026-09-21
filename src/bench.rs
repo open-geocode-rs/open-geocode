@@ -328,10 +328,10 @@ pub fn benchmark_pack(options: PackBenchmarkOptions) -> Result<PackBenchmarkRepo
     let fixture = read_fixture(options.queries.as_deref())?;
 
     let (reader, pack_reader_ms) = measure_value(|| PackReader::open(&options.pack))?;
-    let pack = pack_metrics(&options.pack, reader.manifest())?;
-    let (searcher, text_searcher_ms) = measure_value(|| PackTextSearcher::open(&options.pack))?;
+    let pack = pack_metrics(reader.path(), reader.manifest())?;
+    let (searcher, text_searcher_ms) = measure_value(|| PackTextSearcher::open(reader.path()))?;
     let (reverse_geocoder, reverse_geocoder_ms) =
-        measure_value(|| PackReverseGeocoder::open(&options.pack))?;
+        measure_value(|| PackReverseGeocoder::open(reader.path()))?;
 
     let queries = QueryBenchmarkReport {
         search: benchmark_search_cases(&searcher, &fixture.search, iterations, warmup)?,

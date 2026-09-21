@@ -121,9 +121,10 @@ pub struct SearchApiSource {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let searcher = PackTextSearcher::open(&options.pack)
+    let generation = crate::pack::resolve_pack_path(&options.pack)?;
+    let searcher = PackTextSearcher::open(&generation)
         .with_context(|| format!("failed to open Pack {}", options.pack.display()))?;
-    let reverse_geocoder = PackReverseGeocoder::open(&options.pack).with_context(|| {
+    let reverse_geocoder = PackReverseGeocoder::open(&generation).with_context(|| {
         format!(
             "failed to open Pack Spatial Index {}",
             options.pack.display()

@@ -64,7 +64,7 @@ impl PackTextSearcher {
                 TEXT_INDEX_SCHEMA_VERSION
             );
         }
-        let index = open_text_index(&pack_path)?;
+        let index = open_text_index(pack.path())?;
         let schema = index.schema();
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;

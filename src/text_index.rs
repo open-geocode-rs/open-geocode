@@ -360,7 +360,7 @@ pub fn text_index_path(pack_path: impl AsRef<Path>) -> PathBuf {
 }
 
 pub fn open_text_index(pack_path: impl AsRef<Path>) -> Result<Index> {
-    let path = text_index_path(pack_path);
+    let path = text_index_path(crate::pack::resolve_pack_path(pack_path)?);
     Index::open_in_dir(&path)
         .with_context(|| format!("failed to open Tantivy index {}", path.display()))
 }

@@ -112,10 +112,10 @@ pub struct ReverseEvidence {
 
 impl PackReverseGeocoder {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack_path = pack_path.as_ref();
+        let pack_path = crate::pack::resolve_pack_path(pack_path)?;
         Ok(Self {
-            pack: PackReader::open(pack_path)?,
-            spatial: PackSpatialIndexReader::open(pack_path)?,
+            pack: PackReader::open(&pack_path)?,
+            spatial: PackSpatialIndexReader::open(&pack_path)?,
         })
     }
 

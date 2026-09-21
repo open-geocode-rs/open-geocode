@@ -415,9 +415,9 @@ impl PackSpatialIndexWriter {
 
 impl PackSpatialIndexReader {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack_path = pack_path.as_ref();
+        let pack_path = crate::pack::resolve_pack_path(pack_path)?;
         Ok(Self {
-            index: SpatialIndexV2Reader::open(pack_path)?,
+            index: SpatialIndexV2Reader::open(&pack_path)?,
         })
     }
 

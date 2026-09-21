@@ -42,6 +42,15 @@ Building the Ontario pack (~940 MB PBF) takes about 4.5 minutes (~7,500 addresse
    cargo run --release -- serve --pack data/pack
    ```
 
+## Rebuilding packs safely
+
+Rebuilding the same `--pack` path writes a separate version under `generations/` and updates `CURRENT` only after the new version finishes and passes validation.
+A failed build leaves the previous version available.
+Existing servers keep using the version they opened; restart the server to use the replacement.
+Older packs without a `CURRENT` file remain readable and can be rebuilt at the same path.
+Old and failed versions are retained, so repeated builds use additional disk space.
+To copy a new pack, copy its `CURRENT` file and the generation it names, or copy that generation directory alone as a standalone pack.
+
 ## Hosted demo
 
 The public live demo and its Cloudflare Worker + Tunnel + VM deployment live in a

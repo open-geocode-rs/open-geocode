@@ -187,7 +187,7 @@ impl PackContextWriter {
 
 impl PackContextReader {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let root = pack_path.as_ref().join(CONTEXT_RELATIVE_DIR);
+        let root = crate::pack::resolve_pack_path(pack_path)?.join(CONTEXT_RELATIVE_DIR);
         let manifest_path = root.join(CONTEXT_MANIFEST_FILE);
         let manifest_file = File::open(&manifest_path)
             .with_context(|| format!("failed to open {}", manifest_path.display()))?;
