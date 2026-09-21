@@ -192,8 +192,7 @@ impl Serialize for AddressRecord {
 
 impl InterpolationRecord {
     pub fn id(&self) -> String {
-        let (low, high) = self.anchor_node_ids().unwrap_or((0, 0));
-        labels::interpolation_record_id(self.source.object_id, low, high)
+        labels::interpolation_id_from_anchors(self.source.object_id, &self.anchor_ids)
     }
 
     pub fn name(&self) -> String {
@@ -202,22 +201,6 @@ impl InterpolationRecord {
 
     pub fn label(&self) -> String {
         labels::interpolation_label(&self.name(), &self.interpolation, &self.address)
-    }
-
-    fn anchor_node_ids(&self) -> Option<(i64, i64)> {
-        let low = self
-            .anchor_ids
-            .first()?
-            .strip_prefix("osm:node:")?
-            .parse::<i64>()
-            .ok()?;
-        let high = self
-            .anchor_ids
-            .get(1)?
-            .strip_prefix("osm:node:")?
-            .parse::<i64>()
-            .ok()?;
-        Some((low, high))
     }
 }
 
@@ -289,10 +272,11 @@ impl Serialize for PostcodeRecord {
 
 impl PlaceRecord {
     pub fn id(&self) -> String {
-        if let Some(code) = self.place_type.strip_prefix("derived_country:") {
-            return labels::derived_country_id(code);
-        }
-        labels::osm_record_id(self.source.object_type, self.source.object_id)
+        labels::place_record_id(
+            self.source.object_type,
+            self.source.object_id,
+            &self.place_type,
+        )
     }
 
     pub fn label(&self) -> String {

@@ -79,6 +79,29 @@ pub fn interpolation_record_id(way_id: i64, low_node_id: i64, high_node_id: i64)
     format!("osm:way:{way_id}:interp:{low_node_id}-{high_node_id}")
 }
 
+pub(crate) fn interpolation_id_from_anchors(way_id: i64, anchors: &[String]) -> String {
+    let node_id = |index: usize| {
+        anchors
+            .get(index)?
+            .strip_prefix("osm:node:")?
+            .parse::<i64>()
+            .ok()
+    };
+    let (low, high) = node_id(0).zip(node_id(1)).unwrap_or((0, 0));
+    interpolation_record_id(way_id, low, high)
+}
+
+pub(crate) fn place_record_id(
+    object_type: OsmObjectType,
+    object_id: i64,
+    place_type: &str,
+) -> String {
+    match place_type.strip_prefix("derived_country:") {
+        Some(code) => derived_country_id(code),
+        None => osm_record_id(object_type, object_id),
+    }
+}
+
 pub fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
     match object_type {
         OsmObjectType::Node => "node",
