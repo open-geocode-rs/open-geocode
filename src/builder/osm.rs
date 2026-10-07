@@ -10,7 +10,7 @@
 //!                                           node references, boundary relations
 //! pass 2  read way blocks                 -> boundary relation member ways
 //! pass 3  read node blocks, merge-join    -> coordinates per way position
-//! emit    ways + coordinates (parallel)   -> address, street, interpolation records
+//! emit    ways + coordinates (parallel)   -> address, POI, street, interpolation records
 //! write   context records, then the rest, each in Hilbert order
 //! ```
 
@@ -23,6 +23,7 @@ mod interpolation;
 mod nodes;
 mod pbf;
 mod place;
+mod poi;
 mod postcode;
 mod scan;
 mod spill;
@@ -160,6 +161,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
                 let resolution = &mut build.report.geometry_resolution;
                 match feature.kind {
                     WayKind::Address => resolution.address_way_stubs += 1,
+                    WayKind::Poi => resolution.poi_way_stubs += 1,
                     WayKind::Street => resolution.street_way_stubs += 1,
                     WayKind::Interpolation => resolution.interpolation_way_stubs += 1,
                     WayKind::Boundary => {
@@ -311,6 +313,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         }
         ordered.write(&item)?;
     }
+    writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
     let context_count = ordered.written();
     write_ordered(
@@ -380,7 +383,7 @@ struct Build {
     report: BuilderReport,
     audit: Audit,
     postcodes: PostcodeAccumulator,
-    /// Addresses, interpolations and streets.
+    /// Addresses, POIs, interpolations and streets.
     records: ExternalSorter<PendingRecord>,
     /// Places and postcodes: everything a context tuple can point at.
     context_records: ExternalSorter<PendingRecord>,
@@ -529,9 +532,10 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use crate::{
-        pack::PackReader,
+        pack::{PackReader, RecordPointPrecision},
+        record::Record,
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
-        search::{PackTextSearcher, TextSearchOptions},
+        search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
     };
 
     use super::{
@@ -857,11 +861,188 @@ mod tests {
         assert_eq!(build_metrics.scratch, report.scratch);
     }
 
+    /// The town plus named POIs: one with an address, one without, a station
+    /// building, a namesake outside the town, and objects that are not POIs.
+    fn town_with_pois() -> Vec<Vec<TestElement>> {
+        let mut blocks = town();
+        blocks.insert(
+            2,
+            vec![
+                node(
+                    2001,
+                    43.65,
+                    -79.38,
+                    &[
+                        ("name", "Tim Hortons"),
+                        ("amenity", "cafe"),
+                        ("addr:housenumber", "123"),
+                        ("addr:street", "King Street West"),
+                        ("addr:postcode", "M5V 1A1"),
+                    ],
+                ),
+                node(
+                    2002,
+                    43.66,
+                    -79.36,
+                    &[("name", "Riverdale Farm"), ("tourism", "attraction")],
+                ),
+                node(
+                    2003,
+                    43.661,
+                    -79.361,
+                    &[("name", "Memorial Bench"), ("amenity", "bench")],
+                ),
+                node(
+                    2004,
+                    43.662,
+                    -79.362,
+                    &[
+                        ("amenity", "cafe"),
+                        ("addr:housenumber", "7"),
+                        ("addr:street", "Mill Street"),
+                    ],
+                ),
+                node(2005, 43.6450, -79.3810, &[]),
+                node(2006, 43.6450, -79.3800, &[]),
+                node(2007, 43.6456, -79.3800, &[]),
+                node(2008, 43.6456, -79.3810, &[]),
+                node(
+                    2009,
+                    43.2,
+                    -79.8,
+                    &[("name", "Tim Hortons"), ("amenity", "fast_food")],
+                ),
+            ],
+        );
+        blocks[3].push(way(
+            700,
+            &[2005, 2006, 2007, 2008, 2005],
+            &[
+                ("name", "Union Station"),
+                ("railway", "station"),
+                ("building", "train_station"),
+            ],
+        ));
+        blocks
+    }
+
+    #[test]
+    fn builds_named_pois_findable_by_name_locality_and_address() {
+        let dir = temp_dir("pois");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town_with_pois());
+        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let counts = &reader.manifest().layer_counts;
+        assert_eq!(counts.get("poi"), Some(&4), "{counts:?}");
+        assert_eq!(
+            counts.get("address"),
+            Some(&6),
+            "the unnamed cafe stays an address; the named one does not"
+        );
+        assert_eq!(report.accepted.pois_with_address, 1);
+        assert_eq!(report.accepted.poi_nodes, 3);
+        assert_eq!(report.accepted.poi_way_centroids, 1);
+        assert_eq!(report.accepted.poi_categories.get("amenity"), Some(&2));
+        assert_eq!(report.geometry_resolution.poi_way_stubs, 1);
+
+        // One record for the cafe, carrying its address.
+        let ids = (0..reader.manifest().record_count)
+            .map(|id| reader.record_summary(id).expect("summary").id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.iter().filter(|id| *id == "osm:node:2001").count(), 1);
+        assert!(!ids.iter().any(|id| id == "osm:node:2003"), "bench");
+        let cafe = reader
+            .find_by_source_id("osm:node:2001")
+            .expect("lookup")
+            .expect("cafe");
+        let Record::Poi(poi) = reader.records().record(cafe).expect("record") else {
+            panic!("the cafe is a POI");
+        };
+        assert_eq!(poi.category, "amenity:cafe");
+        assert_eq!(
+            poi.address.expect("address").street.as_deref(),
+            Some("King Street West")
+        );
+
+        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.into(),
+                    limit: 5,
+                    layer: layer.map(str::to_string),
+                })
+                .expect("search")
+        };
+        let ids = |hits: &[TextSearchHit]| {
+            hits.iter()
+                .map(|hit| hit.record.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // By name and the locality it lies in, though its tags name none.
+        let hits = search("Tim Hortons, Toronto", None);
+        assert_eq!(ids(&hits), vec!["osm:node:2001"]);
+        assert_eq!(hits[0].record.layer, "poi");
+        assert_eq!(hits[0].record.category.as_deref(), Some("amenity:cafe"));
+        assert_eq!(
+            hits[0].record.label,
+            "Tim Hortons, 123 King Street West, Toronto, M5V 1A1"
+        );
+        assert_eq!(search("Tim Hortons", Some("poi")).len(), 2);
+        assert_eq!(
+            search("Riverdale Farm Toronto", Some("poi"))[0]
+                .record
+                .label,
+            "Riverdale Farm, Toronto"
+        );
+        // By its address, also under the address layer filter.
+        assert_eq!(
+            ids(&search("123 King Street West", Some("address"))),
+            vec!["osm:node:2001"]
+        );
+        assert!(search("Riverdale Farm", Some("address")).is_empty());
+        let station = search("Union Station Toronto", Some("poi"));
+        assert_eq!(ids(&station), vec!["osm:way:700"]);
+        assert_eq!(
+            station[0].record.point.expect("point").precision,
+            RecordPointPrecision::Centroid
+        );
+        assert!(search("Memorial Bench", None).is_empty());
+
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "riverdale fa".into(),
+                limit: 5,
+                layer: None,
+            })
+            .expect("autocomplete");
+        assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);
+
+        // Reverse answers with the cafe's address, as it did when the cafe was
+        // an address record.
+        let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
+        let result = reverse
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.38,
+                lat: 43.65,
+            })
+            .expect("reverse")
+            .result
+            .expect("result");
+        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
+        assert_eq!(result.label, "123 King Street West, M5V 1A1");
+        assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
     #[test]
     fn spilling_to_disk_builds_the_same_pack() {
         let dir = temp_dir("spill");
         let input = dir.join("town.osm.pbf");
-        write_pbf(&input, &town());
+        write_pbf(&input, &town_with_pois());
         let in_memory = build(&dir.join("memory"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
         // A 4-byte budget leaves every sorter one item of memory, so everything
         // goes through run files and multi-round merges.

@@ -167,6 +167,23 @@ impl BoundarySet {
         records
     }
 
+    /// Names of the records admin context tuples can point at, by record id.
+    pub(crate) fn context_names(
+        &self,
+        boundary_record_ids: &[RecordId],
+        country_record_ids: &HashMap<String, RecordId>,
+    ) -> HashMap<RecordId, String> {
+        let boundaries = self
+            .candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.name.clone()));
+        let countries = self.derived_countries.iter().filter_map(|(code, record)| {
+            Some((*country_record_ids.get(code)?, record.name.clone()))
+        });
+        boundaries.chain(countries).collect()
+    }
+
     /// Index the boundaries under their final record ids.
     pub(crate) fn into_index(
         self,
@@ -219,6 +236,17 @@ pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<R
             place: record.address.place.as_deref(),
             ..SourceContext::default()
         },
+        Record::Poi(record) => record
+            .address
+            .as_ref()
+            .map(|address| SourceContext {
+                country: address.country.as_deref(),
+                region: address.region.as_deref(),
+                locality: address.locality.as_deref(),
+                place: address.place.as_deref(),
+                ..SourceContext::default()
+            })
+            .unwrap_or_default(),
         Record::Place(_, record) => SourceContext {
             place: Some(&record.name),
             ..SourceContext::default()

@@ -31,13 +31,13 @@ use crate::{
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
-        PlaceRecord, PostcodeRecord, Record, StreetRecord,
+        Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord,
     },
     util::text::collapse_whitespace,
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 5;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 6;
 
 /// Tantivy needs at least 15 MB per indexing thread (it uses fewer threads
 /// when given less) and gains little beyond 1.6 GB.
@@ -80,7 +80,9 @@ pub struct TextIndexCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextIndexDocument {
     pub record_id: RecordId,
-    pub layer: String,
+    /// Layers a `layer` filter finds the record under: its own, and `address`
+    /// for a POI that carries one.
+    pub layers: Vec<String>,
     pub content_text: String,
     pub label: Option<String>,
     pub name: Option<String>,
@@ -248,15 +250,27 @@ impl TextIndexFields {
     }
 
     /// Tantivy document for a record. Pure, so callers can build documents in
-    /// parallel before handing them to the writer.
-    pub fn document(self, record_id: RecordId, record: &Record) -> TantivyDocument {
-        self.to_tantivy_document(&TextIndexDocument::from_record(record_id, record))
+    /// parallel before handing them to the writer. `context_names` are the
+    /// admin areas the record lies in.
+    pub fn document(
+        self,
+        record_id: RecordId,
+        record: &Record,
+        context_names: &[&str],
+    ) -> TantivyDocument {
+        self.to_tantivy_document(&TextIndexDocument::from_record(
+            record_id,
+            record,
+            context_names,
+        ))
     }
 
     fn to_tantivy_document(self, projected: &TextIndexDocument) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
-        document.add_text(self.layer, &projected.layer);
+        for layer in &projected.layers {
+            document.add_text(self.layer, layer);
+        }
         if !projected.content_text.is_empty() {
             document.add_text(self.content_text, &projected.content_text);
         }
@@ -283,9 +297,13 @@ impl TextIndexFields {
 }
 
 impl TextIndexDocument {
-    pub fn from_record(record_id: RecordId, record: &Record) -> Self {
+    /// Only POIs are indexed under `context_names`: a POI name alone rarely
+    /// identifies one place ("Tim Hortons"), so it is looked up with the
+    /// locality it is in.
+    pub fn from_record(record_id: RecordId, record: &Record, context_names: &[&str]) -> Self {
         match record {
             Record::Address(record) => Self::project_address(record_id, record),
+            Record::Poi(record) => Self::project_poi(record_id, record, context_names),
             Record::Interpolation(record) => Self::project_interpolation(record_id, record),
             Record::Street(record) => Self::project_street(record_id, record),
             Record::Postcode(record) => Self::project_postcode(record_id, record),
@@ -300,6 +318,33 @@ impl TextIndexDocument {
         builder.name_for_search(&address.name());
         builder.address(&address.address);
         builder.build()
+    }
+
+    fn project_poi(
+        record_id: RecordId,
+        poi: &PoiRecord,
+        context_names: &[&str],
+    ) -> TextIndexProjection {
+        let mut builder = ProjectionBuilder::new(record_id, Layer::Poi.as_str());
+        builder.label_for_search(&poi.label());
+        builder.name(&poi.name);
+        builder.add_content_text(&poi.category);
+        if let Some(address) = &poi.address {
+            builder.also_layer(Layer::Address.as_str());
+            builder.address(address);
+        }
+        for name in context_names {
+            builder.add_content_text(name);
+        }
+        // A POI repeats words across its name, address and areas ("Walmer Road
+        // Parkette, 227 Walmer Road"). Without field norms every repeat would
+        // add to its score, so each word counts once: a POI must not outrank
+        // the address or place a query names on repetition alone.
+        let mut projection = builder.build();
+        let document = &mut projection.document;
+        document.label = document.label.as_deref().and_then(unique_words);
+        document.content_text = unique_words(&document.content_text).unwrap_or_default();
+        projection
     }
 
     fn project_interpolation(
@@ -489,7 +534,7 @@ impl ProjectionBuilder {
         Self {
             projected: TextIndexDocument {
                 record_id,
-                layer: layer.to_string(),
+                layers: vec![layer.to_string()],
                 content_text: String::new(),
                 label: None,
                 name: None,
@@ -500,6 +545,10 @@ impl ProjectionBuilder {
             content_parts: Vec::new(),
             autocomplete_subject_parts: Vec::new(),
         }
+    }
+
+    fn also_layer(&mut self, layer: &str) {
+        self.projected.layers.push(layer.to_string());
     }
 
     fn label(&mut self, value: &str) {
@@ -654,6 +703,19 @@ pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
     }
 }
 
+/// Normalized words of `value`, each once, in order of first use.
+fn unique_words(value: &str) -> Option<String> {
+    let normalized = normalize_index_text(value)?;
+    let mut seen = BTreeSet::new();
+    Some(
+        normalized
+            .split_whitespace()
+            .filter(|word| seen.insert(*word))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 fn unique_parts(parts: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     parts
@@ -691,10 +753,14 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Node, 123),
         };
 
-        let projected = TextIndexDocument::from_record(42, &record.into());
+        let projected = TextIndexDocument::from_record(42, &record.into(), &["Westminster"]);
 
         assert_eq!(projected.record_id, 42);
-        assert_eq!(projected.layer, "address");
+        assert_eq!(projected.layers, vec!["address"]);
+        assert!(
+            !projected.content_text.contains("westminster"),
+            "only POIs are indexed under their context"
+        );
         assert_eq!(projected.address_number.as_deref(), Some("221B"));
         assert!(projected.content_text.contains("221b baker street"));
         assert_eq!(projected.autocomplete_subject_text, "baker street nw1");
@@ -724,7 +790,7 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Way, 9),
         };
 
-        let projected = TextIndexDocument::from_record(7, &record.into());
+        let projected = TextIndexDocument::from_record(7, &record.into(), &[]);
 
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
@@ -751,13 +817,102 @@ mod tests {
             },
         };
 
-        let postcode = TextIndexDocument::from_record(1, &postcode.into());
-        let place = TextIndexDocument::from_record(2, &Record::Place(PlaceLayer::Locality, place));
+        let postcode = TextIndexDocument::from_record(1, &postcode.into(), &[]);
+        let place =
+            TextIndexDocument::from_record(2, &Record::Place(PlaceLayer::Locality, place), &[]);
 
         assert_eq!(postcode.postcode.as_deref(), Some("M5V"));
-        assert_eq!(place.layer, "locality");
+        assert_eq!(place.layers, vec!["locality"]);
         assert!(place.content_text.contains("toronto"));
         assert_eq!(postcode.autocomplete_subject_text, "m5v");
         assert_eq!(place.autocomplete_subject_text, "toronto");
+    }
+
+    #[test]
+    fn projects_poi_name_category_address_and_context() {
+        let poi = PoiRecord {
+            name: "Tim Hortons".to_string(),
+            category: "amenity:cafe".to_string(),
+            address: Some(AddressComponents {
+                number: "123".to_string(),
+                street: Some("King Street West".to_string()),
+                place: None,
+                unit: None,
+                locality: None,
+                region: None,
+                postcode: Some("M5V 1A1".to_string()),
+                country: None,
+            }),
+            geometry: point_geometry(-79.38, 43.65),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(OsmObjectType::Node, 5),
+        };
+
+        let projected =
+            TextIndexDocument::from_record(3, &poi.clone().into(), &["Toronto", "Ontario"]);
+
+        assert_eq!(projected.layers, vec!["poi", "address"]);
+        assert_eq!(projected.name.as_deref(), Some("Tim Hortons"));
+        assert_eq!(
+            projected.label.as_deref(),
+            Some("tim hortons 123 king street west m5v 1a1")
+        );
+        assert_eq!(projected.address_number.as_deref(), Some("123"));
+        for text in [
+            "tim hortons",
+            "amenity cafe",
+            "king street west",
+            "toronto",
+            "ontario",
+        ] {
+            assert!(projected.content_text.contains(text), "{text}");
+        }
+        assert!(
+            projected
+                .autocomplete_subject_text
+                .starts_with("tim hortons")
+        );
+        assert!(!projected.autocomplete_subject_text.contains("toronto"));
+
+        let plain = PoiRecord {
+            name: "Walmer Road Parkette".to_string(),
+            address: Some(AddressComponents {
+                number: "227".to_string(),
+                street: Some("Walmer Road".to_string()),
+                place: None,
+                unit: None,
+                locality: Some("Toronto".to_string()),
+                region: None,
+                postcode: None,
+                country: None,
+            }),
+            ..poi
+        };
+        let projected = TextIndexDocument::from_record(4, &plain.clone().into(), &["Toronto"]);
+        assert_eq!(
+            projected.label.as_deref(),
+            Some("walmer road parkette 227 toronto"),
+            "each word is indexed once"
+        );
+        for word in ["walmer", "road", "toronto"] {
+            assert_eq!(
+                projected
+                    .content_text
+                    .split(' ')
+                    .filter(|w| *w == word)
+                    .count(),
+                1,
+                "{word}"
+            );
+        }
+
+        let unaddressed = PoiRecord {
+            name: "Riverdale Farm".to_string(),
+            address: None,
+            ..plain
+        };
+        let projected = TextIndexDocument::from_record(5, &unaddressed.into(), &[]);
+        assert_eq!(projected.layers, vec!["poi"]);
+        assert_eq!(projected.address_number, None);
     }
 }

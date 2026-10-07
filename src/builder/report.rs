@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer},
+    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 13;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -72,6 +72,10 @@ impl BuilderReport {
         self.accepted.street_segments += accepted.street_segments;
         self.accepted.postcode_records += accepted.postcode_records;
         self.accepted.place_nodes += accepted.place_nodes;
+        self.accepted.poi_nodes += accepted.poi_nodes;
+        self.accepted.poi_way_centroids += accepted.poi_way_centroids;
+        self.accepted.pois_with_address += accepted.pois_with_address;
+        merge_counts(&mut self.accepted.poi_categories, accepted.poi_categories);
 
         self.rejected.total += rejected.total;
         merge_counts(&mut self.rejected.by_reason, rejected.by_reason);
@@ -133,6 +137,7 @@ impl BuilderReport {
         self.geometry_resolution.interpolation_way_stubs += geometry.interpolation_way_stubs;
         self.geometry_resolution.street_way_stubs += geometry.street_way_stubs;
         self.geometry_resolution.boundary_way_stubs += geometry.boundary_way_stubs;
+        self.geometry_resolution.poi_way_stubs += geometry.poi_way_stubs;
         self.geometry_resolution.required_node_refs += geometry.required_node_refs;
         self.geometry_resolution.resolved_node_refs += geometry.resolved_node_refs;
 
@@ -212,6 +217,12 @@ pub struct AcceptedCounts {
     pub street_segments: u64,
     pub postcode_records: u64,
     pub place_nodes: u64,
+    pub poi_nodes: u64,
+    pub poi_way_centroids: u64,
+    /// POIs that carry an address instead of being an address record.
+    pub pois_with_address: u64,
+    /// POIs by the key of their category, for example `amenity`.
+    pub poi_categories: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -356,6 +367,7 @@ pub struct GeometryResolutionCounts {
     pub interpolation_way_stubs: u64,
     pub street_way_stubs: u64,
     pub boundary_way_stubs: u64,
+    pub poi_way_stubs: u64,
     pub required_node_refs: u64,
     pub resolved_node_refs: u64,
 }
@@ -528,6 +540,23 @@ impl BuilderReport {
     pub(crate) fn accept_place(&mut self, layer: PlaceLayer) {
         self.accept_layer(layer.as_str());
         self.accepted.place_nodes += 1;
+    }
+
+    pub(crate) fn accept_poi(&mut self, poi: &PoiRecord) {
+        self.accept_layer("poi");
+        match poi.location_precision {
+            LocationPrecision::Point => self.accepted.poi_nodes += 1,
+            LocationPrecision::Centroid => self.accepted.poi_way_centroids += 1,
+        }
+        if poi.address.is_some() {
+            self.accepted.pois_with_address += 1;
+        }
+        let key = poi.category.split(':').next().unwrap_or_default();
+        *self
+            .accepted
+            .poi_categories
+            .entry(key.to_string())
+            .or_default() += 1;
     }
 
     fn accept_layer(&mut self, layer: &str) {

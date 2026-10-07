@@ -1,7 +1,7 @@
 //! Pass 1: classify every OSM object in one parallel scan.
 //!
-//! Address and place nodes become records immediately, because a node carries
-//! its own coordinates. Ways that need geometry become [`WayFeature`]s plus
+//! Address, POI and place nodes become records immediately, because a node
+//! carries its own coordinates. Ways that need geometry become [`WayFeature`]s plus
 //! their node references; boundary relations are kept as stubs. Each block is
 //! classified independently, so blocks are processed in parallel and merged in
 //! file order.
@@ -27,6 +27,7 @@ use super::{
     emitted::Emitted,
     interpolation::has_interpolation_tag,
     place::{emit_place_node, has_place_tag},
+    poi::{PoiCandidate, emit_poi, is_poi, poi_tags},
     spill::{WayFeature, WayKind},
     street::{has_highway_tag, missing_street_name_issue, street_name, street_tags},
 };
@@ -122,9 +123,44 @@ fn scan_node(
         emit_place_node(object_id, lat, lon, &all_tags, out);
     }
 
-    let tags = collect_addr_tags_from_map(&all_tags);
+    let address = node_address_tags(object_id, &all_tags, out);
+    if is_poi(&all_tags) {
+        emit_poi(
+            PoiCandidate {
+                object_type: OsmObjectType::Node,
+                object_id,
+                lat,
+                lon,
+                location_precision: LocationPrecision::Point,
+                tags: poi_tags(&all_tags, address.as_ref()),
+            },
+            out,
+        );
+    } else if let Some(tags) = address {
+        emit_address(
+            AddressCandidate {
+                object_type: OsmObjectType::Node,
+                object_id,
+                lat,
+                lon,
+                location_precision: LocationPrecision::Point,
+                tags,
+            },
+            out,
+        );
+    }
+}
+
+/// The node's `addr:*` tags when they state a valid address. Invalid ones are
+/// rejected whether or not the node is also a POI.
+fn node_address_tags(
+    object_id: i64,
+    all_tags: &BTreeMap<String, String>,
+    out: &mut Emitted,
+) -> Option<BTreeMap<String, String>> {
+    let tags = collect_addr_tags_from_map(all_tags);
     if tags.is_empty() {
-        return;
+        return None;
     }
 
     if has_interpolation_tag(&tags) {
@@ -132,11 +168,11 @@ fn scan_node(
             CandidateIssue::InterpolationUnsupportedObject,
             OsmObjectType::Node,
             object_id,
-            &all_tags,
+            all_tags,
             Some(&tags),
             Some("interpolation"),
         );
-        return;
+        return None;
     }
 
     if let Err(issue) = validate_address_tags(&tags) {
@@ -144,24 +180,13 @@ fn scan_node(
             issue,
             OsmObjectType::Node,
             object_id,
-            &all_tags,
+            all_tags,
             Some(&tags),
             Some("address"),
         );
-        return;
+        return None;
     }
-
-    emit_address(
-        AddressCandidate {
-            object_type: OsmObjectType::Node,
-            object_id,
-            lat,
-            lon,
-            location_precision: LocationPrecision::Point,
-            tags,
-        },
-        out,
-    );
+    Some(tags)
 }
 
 /// `refs` decodes the node list on first use; most tagged ways are not kept.
@@ -219,10 +244,6 @@ fn scan_way<'a>(
     }
 
     let tags = collect_addr_tags_from_map(&all_tags);
-    if tags.is_empty() {
-        return;
-    }
-
     if has_interpolation_tag(&tags) {
         if refs().is_empty() {
             output.emitted.reject(
@@ -239,7 +260,9 @@ fn scan_way<'a>(
         return;
     }
 
-    if let Err(issue) = validate_address_tags(&tags) {
+    let address = if tags.is_empty() {
+        None
+    } else if let Err(issue) = validate_address_tags(&tags) {
         output.emitted.reject(
             issue,
             OsmObjectType::Way,
@@ -248,9 +271,18 @@ fn scan_way<'a>(
             Some(&tags),
             Some("address"),
         );
-        return;
-    }
+        None
+    } else {
+        Some(tags)
+    };
 
+    let (kind, tags, layer_hint) = if is_poi(&all_tags) {
+        (WayKind::Poi, poi_tags(&all_tags, address.as_ref()), "poi")
+    } else if let Some(tags) = address {
+        (WayKind::Address, tags, "address")
+    } else {
+        return;
+    };
     if refs().is_empty() {
         output.emitted.reject(
             CandidateIssue::WayWithoutResolvedNodes,
@@ -258,12 +290,11 @@ fn scan_way<'a>(
             object_id,
             &all_tags,
             None,
-            Some("address"),
+            Some(layer_hint),
         );
         return;
     }
-
-    output.ways.push(feature(WayKind::Address, tags));
+    output.ways.push(feature(kind, tags));
 }
 
 fn scan_relation(

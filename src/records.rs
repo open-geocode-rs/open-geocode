@@ -18,7 +18,8 @@
 //!       dlon, dlat    zigzag varints from the block base
 //!       context       varint, 0 = none, else (tuple_id + 1) << 1 | ambiguous
 //!       source        zigzag OSM object id, or the address count for postcodes
-//!       fields        per layer, strings as varint ids local to the record's segment
+//!       fields        per layer, strings as varint ids local to the record's segment;
+//!                     a POI's address follows a presence byte
 //!       geometry      line strings only: varint count, then zigzag deltas
 //! ```
 //!
@@ -50,8 +51,8 @@ use crate::{
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, OsmObjectType, PlaceRecord, PostcodeRecord, Record, SourceProvenance,
-        StreetRecord, point_geometry,
+        LocationPrecision, OsmObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Record,
+        SourceProvenance, StreetRecord, point_geometry,
     },
     util::codec::{get_i64, get_u8, get_u32, get_u64, put_i64, put_u64, read_u32_le, read_u64_le},
 };
@@ -59,7 +60,7 @@ use crate::{
 pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 4;
+pub const RECORDS_VERSION: u32 = 5;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -97,6 +98,9 @@ pub struct RecordSummary {
     pub id: String,
     pub layer: String,
     pub label: String,
+    /// A POI's category, for example `amenity:cafe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<RecordPoint>,
     pub source: RecordSource,
@@ -178,7 +182,7 @@ impl RecordHeader {
     fn point(&self) -> RecordPoint {
         let precision = if self.line {
             RecordPointPrecision::RepresentativePoint
-        } else if self.layer == Layer::Address && !self.centroid {
+        } else if matches!(self.layer, Layer::Address | Layer::Poi) && !self.centroid {
             RecordPointPrecision::Point
         } else {
             RecordPointPrecision::Centroid
@@ -394,9 +398,15 @@ impl RecordsWriter {
             Record::Interpolation(record) => osm_source(&record.source),
             Record::Street(record) => osm_source(&record.source),
             Record::Place(_, record) => osm_source(&record.source),
+            Record::Poi(record) => osm_source(&record.source),
             Record::Postcode(record) => (SourceKind::Derived, record.source.record_count),
         };
-        let centroid = matches!(record, Record::Address(address) if address.location_precision == LocationPrecision::Centroid);
+        let precision = match record {
+            Record::Address(address) => Some(address.location_precision),
+            Record::Poi(poi) => Some(poi.location_precision),
+            _ => None,
+        };
+        let centroid = precision == Some(LocationPrecision::Centroid);
         let mut tag = layer_code(record.layer()) | (source_kind as u8) << TAG_SOURCE_SHIFT;
         if centroid {
             tag |= TAG_CENTROID;
@@ -416,21 +426,17 @@ impl RecordsWriter {
         put_u64(out, source_value);
 
         match record {
-            Record::Address(record) => {
-                let address = &record.address;
-                put_u64(out, u64::from(self.strings.id(&address.number)?));
-                self.put_optional_strings(
-                    out,
-                    &[
-                        address.street.as_deref(),
-                        address.place.as_deref(),
-                        address.unit.as_deref(),
-                        address.locality.as_deref(),
-                        address.region.as_deref(),
-                        address.postcode.as_deref(),
-                        address.country.as_deref(),
-                    ],
-                )?;
+            Record::Address(record) => self.put_address(out, &record.address)?,
+            Record::Poi(record) => {
+                put_u64(out, u64::from(self.strings.id(&record.name)?));
+                put_u64(out, u64::from(self.strings.id(&record.category)?));
+                match &record.address {
+                    Some(address) => {
+                        out.push(1);
+                        self.put_address(out, address)?;
+                    }
+                    None => out.push(0),
+                }
             }
             Record::Interpolation(record) => {
                 let address = &record.address;
@@ -478,6 +484,22 @@ impl RecordsWriter {
             }
         }
         Ok(())
+    }
+
+    fn put_address(&mut self, out: &mut Vec<u8>, address: &AddressComponents) -> Result<()> {
+        put_u64(out, u64::from(self.strings.id(&address.number)?));
+        self.put_optional_strings(
+            out,
+            &[
+                address.street.as_deref(),
+                address.place.as_deref(),
+                address.unit.as_deref(),
+                address.locality.as_deref(),
+                address.region.as_deref(),
+                address.postcode.as_deref(),
+                address.country.as_deref(),
+            ],
+        )
     }
 
     fn put_optional_strings(&mut self, out: &mut Vec<u8>, values: &[Option<&str>]) -> Result<()> {
@@ -624,17 +646,29 @@ impl RecordsReader {
     pub fn record(&self, id: RecordId) -> Result<Record> {
         let (header, mut fields) = self.body(id)?;
         let geometry = |fields: &mut &[u8]| self.geometry(&header, fields);
+        let location_precision = if header.centroid {
+            LocationPrecision::Centroid
+        } else {
+            LocationPrecision::Point
+        };
         Ok(match header.layer {
             Layer::Address => {
                 let address = self.address_components(header.strings, &mut fields)?;
                 Record::Address(AddressRecord {
                     address,
                     geometry: geometry(&mut fields)?,
-                    location_precision: if header.centroid {
-                        LocationPrecision::Centroid
-                    } else {
-                        LocationPrecision::Point
-                    },
+                    location_precision,
+                    source: header.provenance()?,
+                })
+            }
+            Layer::Poi => {
+                let (name, category, address) = self.poi_fields(header.strings, &mut fields)?;
+                Record::Poi(PoiRecord {
+                    name: name.to_string(),
+                    category: category.to_string(),
+                    address,
+                    geometry: geometry(&mut fields)?,
+                    location_precision,
                     source: header.provenance()?,
                 })
             }
@@ -680,6 +714,7 @@ impl RecordsReader {
     pub fn summary(&self, id: RecordId) -> Result<RecordSummary> {
         let (header, mut fields) = self.body(id)?;
         let source = header.source()?;
+        let mut category = None;
         let (record_id, label) = match header.layer {
             Layer::Address => {
                 let address = self.address_components(header.strings, &mut fields)?;
@@ -687,6 +722,15 @@ impl RecordsReader {
                 (
                     crate::labels::osm_record_id(object_type, object_id),
                     crate::labels::address_label(&address),
+                )
+            }
+            Layer::Poi => {
+                let (name, poi_category, address) = self.poi_fields(header.strings, &mut fields)?;
+                let (object_type, object_id) = header.osm_source()?;
+                category = Some(poi_category.to_string());
+                (
+                    crate::labels::osm_record_id(object_type, object_id),
+                    crate::labels::poi_label(name, address.as_ref(), None),
                 )
             }
             Layer::Interpolation => {
@@ -730,12 +774,13 @@ impl RecordsReader {
             id: record_id,
             layer: header.layer.as_str().to_string(),
             label,
+            category,
             point: Some(header.point()),
             source,
         })
     }
 
-    /// The postcode an address, interpolation or postcode record states,
+    /// The postcode an address, POI, interpolation or postcode record states,
     /// without decoding its geometry.
     pub fn postcode(&self, id: RecordId) -> Result<Option<String>> {
         let (header, mut fields) = self.body(id)?;
@@ -744,6 +789,10 @@ impl RecordsReader {
                 self.address_components(header.strings, &mut fields)?
                     .postcode
             }
+            Layer::Poi => self
+                .poi_fields(header.strings, &mut fields)?
+                .2
+                .and_then(|address| address.postcode),
             Layer::Interpolation => {
                 self.interpolation_fields(header.strings, &mut fields)?
                     .0
@@ -751,6 +800,21 @@ impl RecordsReader {
             }
             Layer::Postcode => Some(self.string_field(header.strings, &mut fields)?.to_string()),
             _ => None,
+        })
+    }
+
+    /// Whether a record is an explicit address: an address record or a POI
+    /// that carries one. Reads no strings.
+    pub fn is_explicit_address(&self, id: RecordId) -> Result<bool> {
+        let (header, mut fields) = self.body(id)?;
+        Ok(match header.layer {
+            Layer::Address => true,
+            Layer::Poi => {
+                get_u32(&mut fields)?;
+                get_u32(&mut fields)?;
+                get_u8(&mut fields)? != 0
+            }
+            _ => false,
         })
     }
 
@@ -954,6 +1018,20 @@ impl RecordsReader {
         })
     }
 
+    fn poi_fields(
+        &self,
+        strings: StringSegment,
+        fields: &mut &[u8],
+    ) -> Result<(&str, &str, Option<AddressComponents>)> {
+        let name = self.string_field(strings, fields)?;
+        let category = self.string_field(strings, fields)?;
+        let address = match get_u8(fields)? {
+            0 => None,
+            _ => Some(self.address_components(strings, fields)?),
+        };
+        Ok((name, category, address))
+    }
+
     fn interpolation_fields(
         &self,
         strings: StringSegment,
@@ -989,6 +1067,9 @@ impl RecordsReader {
         match header.layer {
             Layer::Address => {
                 self.address_components(header.strings, fields)?;
+            }
+            Layer::Poi => {
+                self.poi_fields(header.strings, fields)?;
             }
             Layer::Interpolation => {
                 self.interpolation_fields(header.strings, fields)?;
@@ -1150,6 +1231,31 @@ mod tests {
                 representative_point: [-79.0, 43.0],
                 source: SourceProvenance::osm(OsmObjectType::Way, 5),
             }),
+            Record::Poi(PoiRecord {
+                name: "Tim Hortons".into(),
+                category: "amenity:cafe".into(),
+                address: Some(AddressComponents {
+                    number: "123".into(),
+                    street: Some("King Street West".into()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: Some("M5V 1A1".into()),
+                    country: None,
+                }),
+                geometry: point_geometry(-79.0, 43.0),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(OsmObjectType::Way, 6),
+            }),
+            Record::Poi(PoiRecord {
+                name: "Riverdale Farm".into(),
+                category: "tourism:attraction".into(),
+                address: None,
+                geometry: point_geometry(-79.0, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(OsmObjectType::Node, 7),
+            }),
         ];
         for layer in [
             PlaceLayer::Country,
@@ -1224,6 +1330,32 @@ mod tests {
             reader.record_json(3).expect("interpolation")["anchor_ids"],
             json!(["osm:node:10", "osm:node:20"])
         );
+        let poi = reader.summary(4).expect("POI summary");
+        assert_eq!(poi.layer, "poi");
+        assert_eq!(poi.category.as_deref(), Some("amenity:cafe"));
+        assert_eq!(poi.label, "Tim Hortons, 123 King Street West, M5V 1A1");
+        assert_eq!(
+            poi.point.expect("point").precision,
+            RecordPointPrecision::Centroid
+        );
+        assert_eq!(
+            reader
+                .summary(5)
+                .expect("POI summary")
+                .point
+                .expect("point")
+                .precision,
+            RecordPointPrecision::Point
+        );
+        assert_eq!(
+            reader.postcode(4).expect("postcode").as_deref(),
+            Some("M5V 1A1")
+        );
+        assert_eq!(reader.postcode(5).expect("postcode"), None);
+        let explicit = (0..records.len() as u64)
+            .map(|id| reader.is_explicit_address(id).expect("explicit"))
+            .collect::<Vec<_>>();
+        assert_eq!(&explicit[..6], &[true, false, false, false, true, false]);
         assert_eq!(reader.line(0).expect("address line"), None);
         assert_eq!(
             reader.line(1).expect("street line"),
