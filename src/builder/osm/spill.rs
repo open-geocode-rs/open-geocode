@@ -16,7 +16,6 @@ use crate::{
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, OsmObjectType,
         PlaceRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
-    records::{dequantize, quantize},
     util::codec::{
         get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64, put_i64,
         put_opt_str, put_str, put_tags, put_u64,
@@ -24,6 +23,8 @@ use crate::{
 };
 
 use super::boundary::ContextOrigin;
+
+const COORDINATE_SCALE: f64 = 10_000_000.0;
 
 /// "Way `owner` needs node `node_id` at position `pos`." Sorted by node id so
 /// it can be joined against the node section of the PBF, which is sorted too.
@@ -456,18 +457,32 @@ fn decode_point(input: &mut &[u8]) -> Result<[f64; 2]> {
 }
 
 /// Line vertices are stored as 1e-7 degree deltas, the precision the record
-/// store keeps anyway.
+/// store keeps, without its range limit: a spilled line decodes to the values
+/// the store would quantize anyway, so an out-of-range vertex fails the build
+/// the same way whether or not it was spilled. Non-finite vertices keep their
+/// raw bits for the same reason.
 fn encode_geometry(out: &mut Vec<u8>, geometry: &Geometry) {
     match &geometry.value {
         GeometryValue::LineString { coordinates } => {
+            let finite = coordinates
+                .iter()
+                .all(|position| position[0].is_finite() && position[1].is_finite());
+            if !finite {
+                out.push(2);
+                put_u64(out, coordinates.len() as u64);
+                for position in coordinates {
+                    encode_point(out, [position[0], position[1]]);
+                }
+                return;
+            }
             out.push(1);
             put_u64(out, coordinates.len() as u64);
             let mut previous = (0i64, 0i64);
             for position in coordinates {
-                let lon = i64::from(quantize(position[0]).unwrap_or_default());
-                let lat = i64::from(quantize(position[1]).unwrap_or_default());
-                put_i64(out, lon - previous.0);
-                put_i64(out, lat - previous.1);
+                let lon = scale(position[0]);
+                let lat = scale(position[1]);
+                put_i64(out, lon.wrapping_sub(previous.0));
+                put_i64(out, lat.wrapping_sub(previous.1));
                 previous = (lon, lat);
             }
         }
@@ -479,7 +494,12 @@ fn encode_geometry(out: &mut Vec<u8>, geometry: &Geometry) {
     }
 }
 
+fn scale(value: f64) -> i64 {
+    (value * COORDINATE_SCALE).round() as i64
+}
+
 fn decode_geometry(input: &mut &[u8]) -> Result<Geometry> {
+    let line = |coordinates| Ok(Geometry::new(GeometryValue::LineString { coordinates }));
     match get_u8(input)? {
         0 => {
             let [lon, lat] = decode_point(input)?;
@@ -490,17 +510,25 @@ fn decode_geometry(input: &mut &[u8]) -> Result<Geometry> {
             let mut coordinates = Vec::with_capacity(count.min(input.len()));
             let mut previous = (0i64, 0i64);
             for _ in 0..count {
-                previous.0 += get_i64(input)?;
-                previous.1 += get_i64(input)?;
+                previous.0 = previous.0.wrapping_add(get_i64(input)?);
+                previous.1 = previous.1.wrapping_add(get_i64(input)?);
                 coordinates.push(
                     vec![
-                        dequantize(i32::try_from(previous.0)?),
-                        dequantize(i32::try_from(previous.1)?),
+                        previous.0 as f64 / COORDINATE_SCALE,
+                        previous.1 as f64 / COORDINATE_SCALE,
                     ]
                     .into(),
                 );
             }
-            Ok(Geometry::new(GeometryValue::LineString { coordinates }))
+            line(coordinates)
+        }
+        2 => {
+            let count = usize::try_from(get_u64(input)?)?;
+            let mut coordinates = Vec::with_capacity(count.min(input.len()));
+            for _ in 0..count {
+                coordinates.push(decode_point(input)?.to_vec().into());
+            }
+            line(coordinates)
         }
         other => bail!("unknown spilled geometry {other}"),
     }
@@ -541,6 +569,48 @@ mod tests {
             node_count: 4,
             tags: BTreeMap::from([("addr:interpolation".into(), "odd".into())]),
         });
+    }
+
+    #[test]
+    fn out_of_range_line_coordinates_are_not_spilled_as_zero() {
+        let record = Record::Street(StreetRecord {
+            name: "Edge Road".into(),
+            geometry: Geometry::new(GeometryValue::LineString {
+                coordinates: vec![vec![-79.0, 43.0].into(), vec![300.0, 43.1].into()],
+            }),
+            representative_point: [-79.0, 43.05],
+            source: SourceProvenance::osm(OsmObjectType::Way, 13),
+        });
+        let mut out = Vec::new();
+        PendingRecord {
+            key: 0,
+            seq: 0,
+            origin: None,
+            record: record.clone(),
+        }
+        .encode(&mut out);
+        let decoded = PendingRecord::decode(&mut out.as_slice()).expect("decode");
+        assert_eq!(
+            decoded.record, record,
+            "spilling must not change coordinates"
+        );
+
+        let mut infinite = record;
+        if let Record::Street(street) = &mut infinite {
+            street.geometry = Geometry::new(GeometryValue::LineString {
+                coordinates: vec![vec![-79.0, 43.0].into(), vec![f64::INFINITY, 43.1].into()],
+            });
+        }
+        let mut out = Vec::new();
+        PendingRecord {
+            key: 0,
+            seq: 0,
+            origin: None,
+            record: infinite.clone(),
+        }
+        .encode(&mut out);
+        let decoded = PendingRecord::decode(&mut out.as_slice()).expect("decode");
+        assert_eq!(decoded.record, infinite);
     }
 
     #[test]

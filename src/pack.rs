@@ -30,6 +30,7 @@ use crate::{
     container::{Container, ContainerWriter},
     context::{ContextReader, ContextTupleWriter},
     extsort::Scratch,
+    memory::MemoryBudget,
     record::{AddressRecord, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
     spatial_index::{RecordCells, SpatialIndexWriter},
@@ -85,9 +86,11 @@ pub struct PackWriterOptions {
     /// Directory for temporary build files. Defaults to a directory inside the
     /// new generation.
     pub scratch_dir: Option<PathBuf>,
-    /// Memory for the spatial index sorter before it spills to disk.
+    /// Pool every buffer of the build reserves from.
+    pub memory: Arc<MemoryBudget>,
+    /// Share of the pool the spatial index sorter may hold before it spills.
     pub sort_budget_bytes: usize,
-    /// Memory for Tantivy's indexing buffers.
+    /// Memory for Tantivy's indexing buffers, taken from the pool.
     pub text_index_memory_bytes: usize,
 }
 
@@ -95,6 +98,7 @@ impl Default for PackWriterOptions {
     fn default() -> Self {
         Self {
             scratch_dir: None,
+            memory: MemoryBudget::unlimited(),
             sort_budget_bytes: DEFAULT_SORT_BUDGET_BYTES,
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
         }
@@ -164,8 +168,12 @@ impl PackWriter {
         Ok(Self {
             records: RecordsWriter::create(&scratch)?,
             contexts: ContextTupleWriter::default(),
-            text: TextIndexWriter::create(&scratch, options.text_index_memory_bytes)?,
-            spatial: SpatialIndexWriter::new(&scratch, options.sort_budget_bytes),
+            text: TextIndexWriter::create(
+                &scratch,
+                &options.memory,
+                options.text_index_memory_bytes,
+            )?,
+            spatial: SpatialIndexWriter::new(&scratch, &options.memory, options.sort_budget_bytes),
             scratch,
             destination,
             generation,
@@ -320,8 +328,12 @@ impl SealedPack {
 
     /// Validate the Pack with the serving readers, then point `CURRENT` at it.
     pub fn publish(mut self) -> Result<PackManifest> {
-        publication::publish(&self.destination, &self.generation.path, &self.manifest)?;
-        self.generation.keep = true;
+        publication::publish(
+            &self.destination,
+            &self.generation.path,
+            &self.manifest,
+            &mut self.generation.keep,
+        )?;
         Ok(self.manifest)
     }
 }
@@ -388,6 +400,13 @@ impl PackReader {
 
     pub fn container(&self) -> &Container {
         &self.container
+    }
+
+    /// Check every section of the Pack file against its checksum.
+    pub fn verify(&self) -> Result<()> {
+        self.container
+            .verify()
+            .with_context(|| format!("{} failed verification", self.path.display()))
     }
 
     pub fn records(&self) -> &RecordsReader {
@@ -675,6 +694,47 @@ mod tests {
         assert_eq!(fs::read(root.join("CURRENT")).expect("pointer"), published);
         assert!(!generation.exists());
         assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+    }
+
+    #[test]
+    fn publishing_refuses_a_pack_corrupted_inside_a_section() {
+        let root = temp_root("checksum");
+        write_pack(&root, &[address_record(1, "10", "King Street")]);
+        let published = fs::read(root.join("CURRENT")).expect("pointer");
+
+        let mut replacement = PackWriter::create(&root).expect("replacement");
+        replacement
+            .write(&address_record(2, "20", "Queen Street"), None)
+            .expect("address");
+        let (sealed, _) = replacement.seal().expect("seal");
+        let pack = sealed.generation().join(PACK_FILE);
+        let offset = Container::open(&pack).expect("open").sections()["records/strings"].offset;
+        let mut bytes = fs::read(&pack).expect("read");
+        let last = bytes.len() - 1;
+        bytes[(offset as usize + 20).min(last)] ^= 0x55;
+        fs::write(&pack, &bytes).expect("corrupt");
+
+        let error = sealed.publish().unwrap_err();
+        assert!(format!("{error:#}").contains("checksum"), "{error:#}");
+        assert_eq!(fs::read(root.join("CURRENT")).expect("pointer"), published);
+    }
+
+    #[test]
+    fn a_failure_after_the_pointer_switch_keeps_the_published_generation() {
+        let root = temp_root("switch-failure");
+        write_pack(&root, &[address_record(1, "10", "King Street")]);
+        let mut replacement = PackWriter::create(&root).expect("replacement");
+        replacement
+            .write(&address_record(2, "20", "Queen Street"), None)
+            .expect("address");
+        let (sealed, _) = replacement.seal().expect("seal");
+
+        publication::FAIL_AFTER_SWITCH.set(true);
+        let result = sealed.publish();
+        publication::FAIL_AFTER_SWITCH.set(false);
+        assert!(result.is_err());
+        // CURRENT already names the new generation, so it must still exist.
+        assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
     }
 
     #[test]

@@ -16,12 +16,14 @@ use tantivy::{
 
 use crate::{
     pack::{PackReader, RecordId, RecordPointPrecision, RecordSummary},
-    record::OsmObjectType,
+    record::{Layer, OsmObjectType, Record},
+    spatial_index::SpatialIndexReader,
     text_index::{TextIndexFields, normalize_index_text, open_text_index},
 };
 
 pub struct PackTextSearcher {
     pack: Arc<PackReader>,
+    spatial: SpatialIndexReader,
     index: Index,
     reader: IndexReader,
     fields: TextIndexFields,
@@ -68,6 +70,12 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
+/// Postcode areas consulted for a hit that states no postcode: the nearest
+/// postcode records within this radius, compared on leading characters (a
+/// Canadian FSA, a US sectional centre, the start of a UK outward code).
+const POSTCODE_AREA_RADIUS_M: f64 = 10_000.0;
+const POSTCODE_AREA_CANDIDATES: usize = 16;
+const POSTCODE_AREA_CHARS: usize = 3;
 /// Hits examined per requested hit, so ties at the cutoff can be ordered.
 const RANK_WINDOW_FACTOR: usize = 3;
 const MAX_RANK_WINDOW: usize = 256;
@@ -83,7 +91,9 @@ impl PackTextSearcher {
         let schema = index.schema();
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
+        let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
         Ok(Self {
+            spatial,
             pack,
             index,
             reader,
@@ -102,7 +112,8 @@ impl PackTextSearcher {
             bail!("search query cannot be empty");
         }
 
-        let (_, hits) = self.search_variants(query_text, options.layer.as_deref(), limit)?;
+        let (_, hits) =
+            self.search_variants(query_text, options.layer.as_deref(), limit, |_| Ok(true))?;
         Ok(hits)
     }
 
@@ -122,14 +133,12 @@ impl PackTextSearcher {
 
         for candidate in address_geocode_candidates(address, options.postcode.as_deref()) {
             let (query, hits) =
-                self.search_variants(&candidate, options.layer.as_deref(), limit)?;
-            for hit in hits {
-                if hit.record.point.is_none() {
-                    continue;
-                }
-                if self.hit_matches_address_context(&hit, &options)? {
-                    return Ok(Some(AddressGeocodeHit { query, hit }));
-                }
+                self.search_variants(&candidate, options.layer.as_deref(), limit, |hit| {
+                    Ok(hit.record.point.is_some()
+                        && self.hit_matches_address_context(hit, &options)?)
+                })?;
+            if let Some(hit) = hits.into_iter().next() {
+                return Ok(Some(AddressGeocodeHit { query, hit }));
             }
         }
 
@@ -188,14 +197,20 @@ impl PackTextSearcher {
         ])))
     }
 
+    /// Try the query as written, then normalized and expanded rewrites, and
+    /// return the first variant with hits that `accept` keeps. A variant whose
+    /// hits are all rejected falls through to the next one. Fails only when no
+    /// variant could be parsed at all.
     fn search_variants(
         &self,
         query_text: &str,
         layer: Option<&str>,
         limit: usize,
+        mut accept: impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut last_query = query_text.trim().to_string();
         let mut parse_error = None;
+        let mut parsed_any = false;
         for variant in search_query_variants(query_text) {
             last_query = variant.clone();
             let query = match self.build_query(&variant, layer) {
@@ -205,21 +220,25 @@ impl PackTextSearcher {
                     continue;
                 }
             };
-            let hits = self
+            parsed_any = true;
+            let mut hits = Vec::new();
+            for hit in self
                 .ranked_hits(&query, &variant, limit)
-                .with_context(|| format!("failed to search text index for {variant:?}"))?;
+                .with_context(|| format!("failed to search text index for {variant:?}"))?
+            {
+                if accept(&hit)? {
+                    hits.push(hit);
+                }
+            }
             if !hits.is_empty() {
                 return Ok((variant, hits));
             }
         }
 
-        if let Some(error) = parse_error {
-            if search_query_variants(query_text).is_empty() {
-                return Err(error);
-            }
+        match parse_error {
+            Some(error) if !parsed_any => Err(error),
+            _ => Ok((last_query, Vec::new())),
         }
-
-        Ok((last_query, Vec::new()))
     }
 
     fn hit_matches_address_context(
@@ -232,6 +251,12 @@ impl PackTextSearcher {
         let desired_postcode = normalized_postcode_for_match(options.postcode.as_deref());
         if desired_region.is_none() && desired_locality.is_none() && desired_postcode.is_none() {
             return Ok(true);
+        }
+
+        if let Some(desired) = &desired_postcode
+            && !self.hit_in_postcode(hit, desired)?
+        {
+            return Ok(false);
         }
 
         let Some(context) = self.pack.boundary_context(hit.record_id)? else {
@@ -283,6 +308,54 @@ impl PackTextSearcher {
         }
 
         Ok(true)
+    }
+
+    /// Whether a hit can be in the requested (normalized) postcode.
+    ///
+    /// A hit that states a postcode must agree with it; either may be a prefix
+    /// of the other, so "M5V" matches "M5V 1A1". A hit without one is judged by
+    /// the postcode areas around it: if there are some nearby and none shares
+    /// the requested postcode's leading characters, the hit is somewhere else.
+    /// With no postcode data nearby there is nothing to contradict the row.
+    fn hit_in_postcode(&self, hit: &TextSearchHit, desired: &str) -> Result<bool> {
+        let compatible =
+            |postcode: &str| postcode.starts_with(desired) || desired.starts_with(postcode);
+        if let Some(postcode) = self.hit_postcode(hit.record_id)? {
+            return Ok(normalized_postcode_for_match(Some(&postcode))
+                .is_none_or(|postcode| compatible(&postcode)));
+        }
+        let Some(point) = hit.record.point else {
+            return Ok(true);
+        };
+        let area: String = desired.chars().take(POSTCODE_AREA_CHARS).collect();
+        let nearby = self.spatial.context_layer_candidates(
+            point.lon,
+            point.lat,
+            Layer::Postcode,
+            POSTCODE_AREA_RADIUS_M,
+            POSTCODE_AREA_CANDIDATES,
+        )?;
+        if nearby.is_empty() {
+            return Ok(true);
+        }
+        for candidate in nearby {
+            if let Some(record) = self.pack.context_record(candidate.record_id)?
+                && let Some(postcode) = normalized_postcode_for_match(record.postcode.as_deref())
+                && (postcode.starts_with(&area) || area.starts_with(&postcode))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn hit_postcode(&self, record_id: RecordId) -> Result<Option<String>> {
+        Ok(match self.pack.records().record(record_id)? {
+            Record::Address(record) => record.address.postcode,
+            Record::Interpolation(record) => record.address.postcode,
+            Record::Postcode(record) => Some(record.postcode),
+            Record::Street(_) | Record::Place(..) => None,
+        })
     }
 
     fn search_fields(&self) -> Vec<tantivy::schema::Field> {
@@ -721,6 +794,183 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["osm:node:5", "osm:node:7", "osm:way:9"]);
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    fn geocode(
+        searcher: &PackTextSearcher,
+        address: &str,
+        locality: Option<&str>,
+        postcode: Option<&str>,
+    ) -> Option<String> {
+        searcher
+            .geocode_address(AddressGeocodeOptions {
+                address: address.to_string(),
+                locality: locality.map(str::to_string),
+                region: None,
+                postcode: postcode.map(str::to_string),
+                limit: 10,
+                layer: None,
+            })
+            .expect("geocode")
+            .map(|hit| hit.hit.record.id)
+    }
+
+    #[test]
+    fn geocode_rejects_hits_in_a_different_postcode() {
+        let temp_dir = temp_pack_path("geocode-postcode");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "10", "King Street", None, Some("M5V 1A1"))
+                    .into(),
+                None,
+            )
+            .expect("write");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "10 King Street", None, Some("K7L 1A1")),
+            None
+        );
+        assert_eq!(
+            geocode(&searcher, "10 King Street", None, Some("m5v1a1")).as_deref(),
+            Some("osm:node:1")
+        );
+        // A forward sortation area matches the full postcode it starts.
+        assert_eq!(
+            geocode(&searcher, "10 King Street", None, Some("M5V")).as_deref(),
+            Some("osm:node:1")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_infers_the_postcode_area_of_hits_without_one() {
+        let temp_dir = temp_pack_path("geocode-inferred-postcode");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        // An address without addr:postcode, inside postcode area K0J.
+        let mut cobden = address_record("osm:node:1", "", "44", "Gould Street", None, None);
+        cobden.geometry = point_geometry(-76.88, 45.63);
+        writer.write(&cobden.into(), None).expect("cobden");
+        writer
+            .write(
+                &PostcodeRecord {
+                    postcode: "K0J 1K0".to_string(),
+                    geometry: point_geometry(-76.881, 45.631),
+                    source: DerivedSourceProvenance::osm_address_records(5),
+                }
+                .into(),
+                None,
+            )
+            .expect("postcode");
+        // An address far from every postcode record: its area is unknown.
+        let mut remote = address_record("osm:node:2", "", "7", "Far Road", None, None);
+        remote.geometry = point_geometry(-90.0, 50.0);
+        writer.write(&remote.into(), None).expect("remote");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "44 Gould Street", None, Some("M5V 1A1")),
+            None
+        );
+        assert_eq!(
+            geocode(&searcher, "44 Gould Street", None, Some("K0J 1K0")).as_deref(),
+            Some("osm:node:1")
+        );
+        assert_eq!(
+            geocode(&searcher, "7 Far Road", None, Some("M5V 1A1")).as_deref(),
+            Some("osm:node:2")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_tries_expanded_variants_when_earlier_hits_fail_the_context() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("geocode-variants");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut locality = |name: &str, object_id: i64| {
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            name: name.to_string(),
+                            place_type: "city".to_string(),
+                            geometry: point_geometry(-79.0, 43.0),
+                            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("locality")
+        };
+        let hamilton = locality("Hamilton", 100);
+        let toronto = locality("Toronto", 101);
+        let in_locality = |record_id| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple {
+                    locality_record_id: Some(record_id),
+                    ..AdminContextTuple::default()
+                },
+                flags: 0,
+            })
+        };
+        writer
+            .write(
+                &address_record("osm:node:1", "", "10", "King St W", None, None).into(),
+                in_locality(hamilton),
+            )
+            .expect("hamilton address");
+        writer
+            .write(
+                &address_record("osm:node:2", "", "10", "King Street West", None, None).into(),
+                in_locality(toronto),
+            )
+            .expect("toronto address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "10 King St W", Some("Toronto"), None).as_deref(),
+            Some("osm:node:2")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn search_reports_queries_that_cannot_be_parsed() {
+        let temp_dir = temp_pack_path("search-parse-error");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "10", "King Street", None, None).into(),
+                None,
+            )
+            .expect("write");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        let error = searcher
+            .search(TextSearchOptions {
+                query: "(".to_string(),
+                limit: 5,
+                layer: None,
+            })
+            .expect_err("unparseable query");
+        assert!(format!("{error:#}").contains("failed to parse search query"));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

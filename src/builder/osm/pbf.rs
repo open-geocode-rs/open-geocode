@@ -31,7 +31,7 @@ pub(crate) fn for_each_block<T, M, S>(
 ) -> Result<()>
 where
     T: Send,
-    M: Fn(u64, &PrimitiveBlock) -> Result<T> + Sync,
+    M: Fn(u64, PrimitiveBlock) -> Result<T> + Sync,
     S: FnMut(T) -> Result<()>,
 {
     let batch_size = rayon::current_num_threads() * BLOBS_PER_THREAD;
@@ -99,7 +99,7 @@ where
                 .map(|blob| {
                     let offset = blob.offset().map_or(0, |offset| offset.0);
                     match blob.decode()? {
-                        BlobDecode::OsmData(block) => map(offset, &block).map(Some),
+                        BlobDecode::OsmData(block) => map(offset, block).map(Some),
                         BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => Ok(None),
                     }
                 })

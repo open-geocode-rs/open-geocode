@@ -51,15 +51,18 @@ A region fits in the budget and never touches disk; a country or the planet spil
 cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-budget-mb 16384 --scratch-dir /mnt/fast-ssd/og-scratch
 ```
 
-- `--memory-budget-mb` (default 1024) bounds the sort buffers and the text indexing buffers.
-  Spilling is cheap on an SSD: Ontario builds in 42 seconds at 1.2 GB peak memory with the default, and in 43 seconds at 0.7 GB with a 256 MB budget.
+- `--memory-budget-mb` (default 1024, minimum 64) is one shared pool for the build's large buffers: sort buffers (counted by capacity), merge read buffers, and the text indexing buffers.
+  A buffer that would overflow the pool spills to disk instead, and the build report records the tracked peak (`scratch.peak_tracked_bytes`).
   Larger budgets mainly help very large inputs by reducing the number of runs to merge.
+- The budget is not the whole process size.
+  On top of it come the PBF blocks being decoded (a few hundred MB on a many-core machine), the admin boundary polygons, the postcode centroids, one segment of the string table (at most about a million strings), and the operating system's cache of mapped files.
 - `--scratch-dir` puts temporary files on a different disk; it defaults to the Pack directory.
   Each sorted run is deleted as soon as it has been merged, and the whole scratch directory is removed when the build ends.
   Ontario writes about 1 GB of scratch in total for a 0.94 GB input.
 - The input must be sorted by type and id, which Geofabrik and planet.openstreetmap.org files are.
   Run `osmium sort` on anything else; the builder stops with an error on unsorted nodes.
-- Admin boundary polygons, the string table, and postcode centroids stay in memory; they grow with the number of distinct boundaries, strings, and postcodes, not with the number of addresses.
+- Admin boundary polygons and postcode centroids stay in memory; they grow with the number of boundaries and postcodes, not with the number of addresses.
+- `verify-pack --pack <file>` checks a copied or downloaded Pack against its per-section checksums; every build runs the same check before it publishes.
 
 The build report (`audit/build-report.json`) records the time of each phase, how much each sorter spilled, and the size of every Pack section.
 

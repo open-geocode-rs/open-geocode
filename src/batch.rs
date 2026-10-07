@@ -114,6 +114,7 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
     if options.address_field_groups.is_empty() == options.join.is_none() {
         bail!("provide either --address-fields or --join-coordinates-from, but not both");
     }
+    ensure_distinct_paths(&options.input, &options.output, &options.audit)?;
 
     let mut reader = ReaderBuilder::new()
         .flexible(true)
@@ -151,10 +152,10 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
                 .pack
                 .as_ref()
                 .context("--pack is required when geocoding address fields")?;
-            Resolver::Pack(
+            Resolver::Pack(Box::new(
                 PackTextSearcher::open(pack)
                     .with_context(|| format!("failed to open Pack {}", pack.display()))?,
-            )
+            ))
         }
     };
 
@@ -199,17 +200,13 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
             report.rows += 1;
         }
     }
-    output
-        .flush()
-        .with_context(|| format!("failed to flush {}", options.output.display()))?;
-    audit
-        .flush()
-        .with_context(|| format!("failed to flush {}", options.audit.display()))?;
+    output.finish()?;
+    audit.finish()?;
     Ok(report)
 }
 
 enum Resolver {
-    Pack(PackTextSearcher),
+    Pack(Box<PackTextSearcher>),
     Join {
         lookup: HashMap<String, JoinedCoordinate>,
         key_index: usize,
@@ -378,20 +375,101 @@ fn read_csv(path: &Path) -> Result<CsvTable> {
     Ok(CsvTable { headers, rows })
 }
 
-fn create_csv(path: &Path, headers: &[String]) -> Result<csv::Writer<File>> {
+fn create_csv(path: &Path, headers: &[String]) -> Result<PendingCsv> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("{} is not a file path", path.display()))?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let file = File::create(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
     let mut writer = WriterBuilder::new().from_writer(file);
     writer
         .write_record(headers)
         .with_context(|| format!("failed to write headers to {}", path.display()))?;
-    Ok(writer)
+    Ok(PendingCsv {
+        writer,
+        temporary,
+        path: path.to_path_buf(),
+        finished: false,
+    })
+}
+
+/// A CSV written beside its destination and moved into place only once it is
+/// complete, so a failed run never leaves a truncated file behind.
+struct PendingCsv {
+    writer: csv::Writer<File>,
+    temporary: PathBuf,
+    path: PathBuf,
+    finished: bool,
+}
+
+impl PendingCsv {
+    fn write_record<I, T>(&mut self, record: I) -> Result<()>
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<[u8]>,
+    {
+        self.writer
+            .write_record(record)
+            .with_context(|| format!("failed to write a row to {}", self.path.display()))
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", self.path.display()))?;
+        std::fs::rename(&self.temporary, &self.path)
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingCsv {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+/// Refuse output paths that name the input or each other, however they are
+/// spelled.
+fn ensure_distinct_paths(input: &Path, output: &Path, audit: &Path) -> Result<()> {
+    let resolve = |path: &Path| -> Result<PathBuf> {
+        if path.exists() {
+            return path
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", path.display()));
+        }
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let parent = parent.canonicalize().unwrap_or(parent);
+        Ok(parent.join(path.file_name().unwrap_or_default()))
+    };
+    let (input, output_path, audit_path) = (resolve(input)?, resolve(output)?, resolve(audit)?);
+    for (first, second, first_name, second_name) in [
+        (&output_path, &input, "--output", "--input"),
+        (&audit_path, &input, "--audit", "--input"),
+        (&output_path, &audit_path, "--output", "--audit"),
+    ] {
+        if first == second {
+            bail!(
+                "{first_name} and {second_name} name the same file ({}); choose a different path",
+                first.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn read_join_lookup(join: &CoordinateJoinOptions) -> Result<HashMap<String, JoinedCoordinate>> {
@@ -795,6 +873,57 @@ mod tests {
         let audit = read_csv(&root.join("audit.csv")).expect("audit");
         assert_eq!(audit.rows[1][2], "unresolved");
         assert_eq!(audit.rows[2][6], "osm:node:1");
+    }
+
+    #[test]
+    fn refuses_to_overwrite_the_input() {
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-batch-same-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("dir");
+        let input = root.join("in.csv");
+        let contents = "id,street
+a,10 King Street
+";
+        std::fs::write(&input, contents).expect("input");
+        let coordinates = root.join("coordinates.csv");
+        std::fs::write(
+            &coordinates,
+            "id,lat,lon
+a,43.6,-79.4
+",
+        )
+        .expect("coordinates");
+        let options = |output: PathBuf, audit: PathBuf| BatchGeocodeOptions {
+            pack: None,
+            input: input.clone(),
+            output,
+            audit,
+            address_field_groups: Vec::new(),
+            locality_field: None,
+            region_field: None,
+            postcode_field: None,
+            layer: None,
+            limit: 5,
+            lat_column: "lat".into(),
+            lon_column: "lon".into(),
+            join: Some(CoordinateJoinOptions {
+                path: coordinates.clone(),
+                key_column: "id".into(),
+                lat_column: "lat".into(),
+                lon_column: "lon".into(),
+            }),
+        };
+        // The same file spelled differently must be caught too.
+        let same = root.join(".").join("in.csv");
+        for (output, audit) in [
+            (same.clone(), root.join("audit.csv")),
+            (root.join("out.csv"), same),
+            (root.join("out.csv"), root.join("out.csv")),
+        ] {
+            let error = run_batch_geocode(options(output, audit)).expect_err("same file");
+            assert!(format!("{error:#}").contains("same file"), "{error:#}");
+            assert_eq!(std::fs::read_to_string(&input).expect("input"), contents);
+        }
     }
 
     #[test]

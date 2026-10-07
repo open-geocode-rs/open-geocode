@@ -341,7 +341,7 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
 pub(crate) fn build_boundaries(
     ways: &[BoundaryWay],
     relations: &[BoundaryRelationStub],
-    member_lines: &HashMap<i64, Option<Vec<Vertex>>>,
+    member_lines: &HashMap<i64, Option<&[Vertex]>>,
 ) -> BoundarySet {
     let mut candidates = Vec::new();
     for way in ways {
@@ -433,14 +433,18 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
 
 fn boundary_from_relation(
     stub: &BoundaryRelationStub,
-    member_lines: &HashMap<i64, Option<Vec<Vertex>>>,
+    member_lines: &HashMap<i64, Option<&[Vertex]>>,
 ) -> Option<BuiltBoundary> {
     let (layer, admin_level, name) = admin_boundary_parts(&stub.tags)?;
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
-        let line = member_lines.get(&member.way_id)?.as_ref()?.clone();
+        let line = member_lines
+            .get(&member.way_id)
+            .copied()
+            .flatten()?
+            .to_vec();
         match member.role {
             BoundaryMemberRole::Outer => outer_segments.push(line),
             BoundaryMemberRole::Inner => inner_segments.push(line),
@@ -802,6 +806,10 @@ mod tests {
             },
         ];
 
+        let member_lines = member_lines
+            .iter()
+            .map(|(way_id, line): (&i64, &Option<Vec<Vertex>>)| (*way_id, line.as_deref()))
+            .collect();
         let set = build_boundaries(&[], &relations, &member_lines);
         assert_eq!(
             set.len(),

@@ -34,10 +34,14 @@ enum Commands {
         #[arg(long)]
         pack: PathBuf,
 
-        /// Memory for build sort buffers, in MiB. Larger inputs spill to
-        /// scratch files on disk instead of using more memory.
-        #[arg(long, default_value_t = DEFAULT_MEMORY_BUDGET_BYTES >> 20)]
-        memory_budget_mb: usize,
+        /// Memory for build sort buffers, in MiB (64 to 1048576). Larger inputs
+        /// spill to scratch files on disk instead of using more memory.
+        #[arg(
+            long,
+            default_value_t = (DEFAULT_MEMORY_BUDGET_BYTES >> 20) as u64,
+            value_parser = clap::value_parser!(u64).range(MIN_MEMORY_BUDGET_MB..=MAX_MEMORY_BUDGET_MB),
+        )]
+        memory_budget_mb: u64,
 
         /// Directory for scratch files. Defaults to inside the Pack directory.
         #[arg(long)]
@@ -74,6 +78,15 @@ enum Commands {
         /// Include Boundary-Derived Context for --row or --id.
         #[arg(long)]
         context: bool,
+    },
+
+    /// Check a Pack file against its section checksums, for example after
+    /// copying or downloading it.
+    #[command(name = "verify-pack")]
+    VerifyPack {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
     },
 
     /// Search a Pack text index and hydrate matching records.
@@ -228,6 +241,11 @@ struct BatchGeocodeArgs {
     join_lon_column: String,
 }
 
+/// Below this, sorters spill so often that the build drowns in tiny run files.
+const MIN_MEMORY_BUDGET_MB: u64 = 64;
+/// 1 TiB; keeps the conversion to bytes far from overflow.
+const MAX_MEMORY_BUDGET_MB: u64 = 1 << 20;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -242,7 +260,8 @@ async fn main() -> Result<()> {
             let report = build_osm_pack(BuildOsmOptions {
                 input,
                 pack,
-                memory_budget_bytes: memory_budget_mb << 20,
+                memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
+                    .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
             })?;
             write_json(serde_json::json!({
@@ -262,6 +281,16 @@ async fn main() -> Result<()> {
             rejections,
             context,
         } => inspect_pack(pack, row, id, layer, limit, rejections, context),
+        Commands::VerifyPack { pack } => {
+            let reader = PackReader::open(pack)?;
+            reader.verify()?;
+            write_json(serde_json::json!({
+                "path": reader.path().display().to_string(),
+                "sections": reader.container().sections().len(),
+                "bytes": reader.container().file_size(),
+                "verified": true,
+            }))
+        }
         Commands::SearchPack {
             pack,
             query,
@@ -498,4 +527,39 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         "output": output.display().to_string(),
         "audit": audit.display().to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn build_budget(value: &str) -> Result<usize, clap::Error> {
+        let cli = Cli::try_parse_from([
+            "open-geocode",
+            "build",
+            "--input",
+            "in.osm.pbf",
+            "--pack",
+            "pack",
+            "--memory-budget-mb",
+            value,
+        ])?;
+        match cli.command {
+            Commands::Build {
+                memory_budget_mb, ..
+            } => Ok(memory_budget_mb as usize),
+            _ => unreachable!("parsed a build command"),
+        }
+    }
+
+    #[test]
+    fn memory_budget_must_be_usable() {
+        assert!(build_budget("0").is_err());
+        assert!(build_budget("63").is_err());
+        assert!(build_budget("99999999999999999").is_err());
+        assert_eq!(build_budget("64").expect("minimum"), 64);
+        assert_eq!(build_budget("16384").expect("planet"), 16_384);
+    }
 }

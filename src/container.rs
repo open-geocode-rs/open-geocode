@@ -3,13 +3,14 @@
 //! A Pack is one file: a short header, named sections, and a table of contents
 //! at the end. Each section carries its own format version so one part of the
 //! Pack can evolve without touching the others. One file is one thing to
-//! upload, copy, checksum or swap, and readers memory-map it once and hand out
-//! borrowed slices per section.
+//! upload, copy or swap, and readers memory-map it once and hand out borrowed
+//! slices per section. Every section carries an XXH3 checksum, so a copy
+//! damaged in transit is caught by [`Container::verify`] before it is served.
 //!
 //! ```text
 //! header   magic "OGPACK01" | container version u32 | reserved u32
 //! sections each starts on a 64-byte boundary
-//! toc      varint count, then per section: name, version, offset, length
+//! toc      varint count, then per section: name, version, offset, length, xxh3
 //! trailer  toc offset u64 | toc length u64 | magic "OGPACKTC"
 //! ```
 
@@ -26,11 +27,14 @@ use anyhow::{Context, Result, bail};
 use memmap2::{Mmap, MmapOptions};
 pub use tantivy::directory::OwnedBytes as Bytes;
 
+use rayon::prelude::*;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
+
 use crate::util::codec::{get_string, get_u32, get_u64, put_str, put_u64, read_u64_le};
 
 const MAGIC: &[u8; 8] = b"OGPACK01";
 const TRAILER_MAGIC: &[u8; 8] = b"OGPACKTC";
-const CONTAINER_VERSION: u32 = 1;
+const CONTAINER_VERSION: u32 = 2;
 const HEADER_BYTES: u64 = 16;
 const TRAILER_BYTES: usize = 24;
 const SECTION_ALIGN: u64 = 64;
@@ -41,6 +45,8 @@ pub struct SectionInfo {
     pub version: u32,
     pub offset: u64,
     pub len: u64,
+    /// XXH3-64 of the section bytes.
+    pub checksum: u64,
 }
 
 pub struct ContainerWriter {
@@ -48,7 +54,14 @@ pub struct ContainerWriter {
     file: BufWriter<File>,
     offset: u64,
     sections: BTreeMap<String, SectionInfo>,
-    open: Option<(String, u32, u64)>,
+    open: Option<OpenSection>,
+}
+
+struct OpenSection {
+    name: String,
+    version: u32,
+    start: u64,
+    hasher: Xxh3,
 }
 
 impl ContainerWriter {
@@ -80,18 +93,24 @@ impl ContainerWriter {
         let padding = (SECTION_ALIGN - self.offset % SECTION_ALIGN) % SECTION_ALIGN;
         self.file.write_all(&vec![0u8; padding as usize])?;
         self.offset += padding;
-        self.open = Some((name.to_string(), version, self.offset));
+        self.open = Some(OpenSection {
+            name: name.to_string(),
+            version,
+            start: self.offset,
+            hasher: Xxh3::new(),
+        });
         Ok(())
     }
 
     pub fn end(&mut self) -> Result<()> {
-        let (name, version, start) = self.open.take().context("no open Pack section")?;
+        let section = self.open.take().context("no open Pack section")?;
         self.sections.insert(
-            name,
+            section.name,
             SectionInfo {
-                version,
-                offset: start,
-                len: self.offset - start,
+                version: section.version,
+                offset: section.start,
+                len: self.offset - section.start,
+                checksum: section.hasher.digest(),
             },
         );
         Ok(())
@@ -124,6 +143,7 @@ impl ContainerWriter {
             put_u64(&mut toc, u64::from(info.version));
             put_u64(&mut toc, info.offset);
             put_u64(&mut toc, info.len);
+            put_u64(&mut toc, info.checksum);
         }
         let toc_offset = self.offset;
         self.file.write_all(&toc)?;
@@ -140,7 +160,11 @@ impl ContainerWriter {
 
 impl Write for ContainerWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(section) = &mut self.open else {
+            return Err(io::Error::other("Pack bytes written outside a section"));
+        };
         let written = self.file.write(bytes)?;
+        section.hasher.update(&bytes[..written]);
         self.offset += written as u64;
         Ok(written)
     }
@@ -190,6 +214,18 @@ impl Container {
 
     pub fn sections(&self) -> &BTreeMap<String, SectionInfo> {
         &self.sections
+    }
+
+    /// Check every section against its checksum. Reads the whole file, so it
+    /// runs when a Pack is published or copied, not on every open.
+    pub fn verify(&self) -> Result<()> {
+        self.sections.par_iter().try_for_each(|(name, info)| {
+            let bytes = self.bytes_of(info);
+            if xxh3_64(&bytes) != info.checksum {
+                bail!("Pack section {name} is corrupt: its checksum does not match");
+            }
+            Ok(())
+        })
     }
 
     /// Bytes of a section whose version must match `version`. The handle keeps
@@ -250,6 +286,7 @@ fn parse_toc(bytes: &[u8]) -> Result<BTreeMap<String, SectionInfo>> {
             version: get_u32(&mut input)?,
             offset: get_u64(&mut input)?,
             len: get_u64(&mut input)?,
+            checksum: get_u64(&mut input)?,
         };
         let end = info
             .offset
@@ -333,6 +370,28 @@ mod tests {
         let error = container.section("alpha", 2).unwrap_err().to_string();
         assert!(error.contains("rebuild the Pack"), "{error}");
         assert!(container.section("missing", 1).is_err());
+    }
+
+    #[test]
+    fn verify_catches_a_flipped_byte_inside_a_section() {
+        let path = temp_file("checksum");
+        let mut writer = ContainerWriter::create(&path).expect("writer");
+        writer.add("alpha", 1, &[7u8; 4096]).expect("alpha");
+        writer.add("beta", 1, b"untouched").expect("beta");
+        writer.finish().expect("finish");
+        Container::open(&path)
+            .expect("open")
+            .verify()
+            .expect("intact");
+
+        let offset = Container::open(&path).expect("open").sections()["alpha"].offset as usize;
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[offset + 2000] ^= 1;
+        std::fs::write(&path, &bytes).expect("corrupt");
+        // Structure is intact, so the file still opens; the checksum catches it.
+        let container = Container::open(&path).expect("open");
+        let error = container.verify().unwrap_err().to_string();
+        assert!(error.contains("alpha"), "{error}");
     }
 
     #[test]

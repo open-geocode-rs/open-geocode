@@ -30,6 +30,7 @@ use serde::Serialize;
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     extsort::{ExternalSorter, Scratch, SortStats, Spill},
+    memory::MemoryBudget,
     pack::RecordId,
     record::{Layer, Record},
     records::{RecordsReader, dequantize},
@@ -177,10 +178,10 @@ pub struct SpatialIndexWriter {
 }
 
 impl SpatialIndexWriter {
-    pub fn new(scratch: &Arc<Scratch>, budget_bytes: usize) -> Self {
+    pub fn new(scratch: &Arc<Scratch>, budget: &Arc<MemoryBudget>, share_bytes: usize) -> Self {
         Self {
-            fine: ExternalSorter::new(scratch, "spatial-fine", budget_bytes),
-            context: ExternalSorter::new(scratch, "spatial-context", budget_bytes / 8),
+            fine: ExternalSorter::new(scratch, "spatial-fine", budget, share_bytes),
+            context: ExternalSorter::new(scratch, "spatial-context", budget, share_bytes / 8),
             points: 0,
             segments: 0,
         }
@@ -468,6 +469,27 @@ impl SpatialIndexReader {
             radius_m,
             limit,
             Layer::is_context,
+        )?;
+        Ok(closest_candidates(candidates, limit))
+    }
+
+    /// Like [`Self::context_candidates`], restricted to one context layer.
+    pub fn context_layer_candidates(
+        &self,
+        lon: f64,
+        lat: f64,
+        layer: Layer,
+        radius_m: f64,
+        limit: usize,
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.collect_points(
+            &self.context,
+            H3_CONTEXT_RESOLUTION,
+            lon,
+            lat,
+            radius_m,
+            limit,
+            |candidate| candidate == layer,
         )?;
         Ok(closest_candidates(candidates, limit))
     }
@@ -824,7 +846,7 @@ mod tests {
             std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let mut writer = RecordsWriter::create(&scratch).expect("records");
-        let mut spatial = SpatialIndexWriter::new(&scratch, 64);
+        let mut spatial = SpatialIndexWriter::new(&scratch, &MemoryBudget::unlimited(), 64);
         for record in records {
             let id = writer.write(record, None).expect("write");
             spatial

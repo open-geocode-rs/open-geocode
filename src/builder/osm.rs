@@ -50,6 +50,7 @@ use crate::{
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
     },
     extsort::{ExternalSorter, SortStats, Spool},
+    memory::MemoryBudget,
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
     },
@@ -101,10 +102,12 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     // resolved coordinates, the two record sorters, the spatial pairs); the text
     // index buffers take the same share as one sorter while records are written.
     let sorter_budget = (options.memory_budget_bytes / 4).max(1);
+    let memory = MemoryBudget::new(options.memory_budget_bytes);
     let mut writer = PackWriter::create_with(
         &options.pack,
         PackWriterOptions {
             scratch_dir: options.scratch_dir.clone(),
+            memory: Arc::clone(&memory),
             sort_budget_bytes: sorter_budget,
             text_index_memory_bytes: sorter_budget,
         },
@@ -120,24 +123,32 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         },
         audit: Audit::create(writer.generation())?,
         postcodes: PostcodeAccumulator::default(),
-        records: ExternalSorter::new(&scratch, "records", sorter_budget),
-        context_records: ExternalSorter::new(&scratch, "context-records", sorter_budget / 4),
+        records: ExternalSorter::new(&scratch, "records", &memory, sorter_budget),
+        context_records: ExternalSorter::new(
+            &scratch,
+            "context-records",
+            &memory,
+            sorter_budget / 4,
+        ),
         seq: 0,
     };
     build.report.scratch.memory_budget_bytes = options.memory_budget_bytes as u64;
 
     // Pass 1: classify everything.
     let phase = Instant::now();
-    let mut requests = ExternalSorter::new(&scratch, "node-requests", sorter_budget);
+    let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, sorter_budget);
     let mut features = Spool::<WayFeature>::create(&scratch, "way-features")?;
     let mut relations = Vec::new();
+    // Boundary ways kept by pass 1. When one is also a relation member, its
+    // vertices are reused instead of being requested a second time.
+    let mut boundary_feature_ids = HashSet::new();
     let mut node_blobs = Vec::new();
     let mut way_blobs = Vec::new();
     for_each_block(
         &options.input,
         "1/7 scan OSM objects",
         None,
-        |offset, block| Ok((offset, scan_block(block))),
+        |offset, block| Ok((offset, scan_block(&block))),
         |(offset, output)| {
             if output.has_nodes {
                 node_blobs.push(offset);
@@ -151,7 +162,10 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
                     WayKind::Address => resolution.address_way_stubs += 1,
                     WayKind::Street => resolution.street_way_stubs += 1,
                     WayKind::Interpolation => resolution.interpolation_way_stubs += 1,
-                    WayKind::Boundary => resolution.boundary_way_stubs += 1,
+                    WayKind::Boundary => {
+                        resolution.boundary_way_stubs += 1;
+                        boundary_feature_ids.insert(feature.way_id);
+                    }
                 }
                 request_nodes(
                     &mut requests,
@@ -171,14 +185,17 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     // tags of their own, so pass 1 could not know to keep them.
     let phase = Instant::now();
     let member_base = features.written();
-    let member_ids = boundary::required_boundary_way_ids(&relations);
+    let member_ids = boundary::required_boundary_way_ids(&relations)
+        .into_iter()
+        .filter(|way_id| !boundary_feature_ids.contains(way_id))
+        .collect::<HashSet<_>>();
     let mut members: HashMap<i64, (u64, usize)> = HashMap::new();
     if !member_ids.is_empty() {
         for_each_block(
             &options.input,
             "2/7 read boundary member ways",
             Some(&way_blobs),
-            |_, block| Ok(member_ways(block, &member_ids)),
+            |_, block| Ok(member_ways(&block, &member_ids)),
             |found| {
                 for (way_id, refs) in found {
                     if members.contains_key(&way_id) {
@@ -199,7 +216,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let request_stats = requests.stats();
     build.report.geometry_resolution.required_node_refs = request_stats.items;
     let mut resolved =
-        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", sorter_budget);
+        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, sorter_budget);
     let join = join_nodes(
         &options.input,
         &node_blobs,
@@ -228,7 +245,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
 
     // Admin boundaries, their place records and postcode centroids.
     let phase = Instant::now();
-    let member_lines: HashMap<i64, Option<Vec<Vertex>>> = members
+    let member_vertices: HashMap<i64, Option<Vec<Vertex>>> = members
         .into_iter()
         .map(|(way_id, (owner, count))| {
             let line = member_vertices
@@ -237,8 +254,26 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
             (way_id, line)
         })
         .collect();
+    // Boundary features that were incomplete have no entry in `boundary_ways`
+    // and resolve to `None`, like an incomplete member.
+    let mut member_lines: HashMap<i64, Option<&[Vertex]>> = boundary_feature_ids
+        .iter()
+        .map(|way_id| (*way_id, None))
+        .collect();
+    for way in &boundary_ways {
+        member_lines.insert(way.object_id, Some(way.vertices.as_slice()));
+    }
+    for (way_id, line) in &member_vertices {
+        member_lines.insert(*way_id, line.as_deref());
+    }
     let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines);
-    drop((boundary_ways, member_lines, relations));
+    drop(member_lines);
+    drop((
+        boundary_ways,
+        member_vertices,
+        relations,
+        boundary_feature_ids,
+    ));
     for (origin, record) in boundaries.place_records(&mut build.report) {
         build.push(record, Some(origin))?;
     }
@@ -300,6 +335,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
 
     let phase = Instant::now();
     report.scratch.spilled_bytes = scratch.spilled_bytes();
+    report.scratch.peak_tracked_bytes = memory.peak() as u64;
     drop(scratch);
     let progress = stage_progress("7/7 finish Pack indexes");
     let (sealed, stats) = writer.seal()?;
@@ -611,6 +647,16 @@ mod tests {
                     &[20, 9999],
                     &[("highway", "residential"), ("name", "Ghost Road")],
                 ),
+                // A named boundary way that is also a relation member.
+                way(
+                    605,
+                    &[30, 31, 32, 33, 30],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "10"),
+                        ("name", "Bay Ward"),
+                    ],
+                ),
             ],
             vec![
                 relation(
@@ -620,6 +666,15 @@ mod tests {
                         ("boundary", "administrative"),
                         ("admin_level", "8"),
                         ("name", "Toronto"),
+                    ],
+                ),
+                relation(
+                    902,
+                    &[(605, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "10"),
+                        ("name", "Bay Ward Relation"),
                     ],
                 ),
                 relation(
@@ -664,17 +719,26 @@ mod tests {
         assert_eq!(count("street"), 1);
         assert_eq!(count("interpolation"), 1);
         assert_eq!(count("postcode"), 1);
-        assert_eq!(count("neighbourhood"), 1);
+        assert_eq!(
+            count("neighbourhood"),
+            3,
+            "Annex, the Bay Ward way and its relation"
+        );
         assert_eq!(count("locality"), 1);
         assert_eq!(count("region"), 1);
         assert_eq!(count("country"), 1, "derived from ISO3166-2");
-        assert_eq!(report.output.record_count, 12);
+        assert_eq!(report.output.record_count, 14);
+        // Each way's nodes are requested once, even when a boundary way is also
+        // a relation member: 3 + 3 + 5 + 2 + 5 + 2 + 2 + 5.
+        assert_eq!(report.geometry_resolution.required_node_refs, 27);
         assert_eq!(report.accepted.postcode_records, 1);
         assert_eq!(report.geometry_resolution.street_way_stubs, 2);
         assert_eq!(
             report.scratch.sorters["records"].runs, 0,
             "a small input never spills"
         );
+        assert!(report.scratch.peak_tracked_bytes > 0);
+        assert!(report.scratch.peak_tracked_bytes <= report.scratch.memory_budget_bytes);
 
         // Context records come first, and each group is in Hilbert order.
         let headers = (0..reader.manifest().record_count)

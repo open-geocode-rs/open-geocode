@@ -11,15 +11,22 @@
 //! ```text
 //! records/index    record_count u64, then (block_count + 1) u64 block offsets
 //! records/blocks   blocks: base_lon i32 | base_lat i32 | n x u32 body end | bodies
-//! records/strings  string_count u64, then (string_count + 1) u64 offsets, then UTF-8
+//! records/strings  segment_records u64 | segment_count u64 | segment_count x u64 first string
+//!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
 //!
 //! body  tag u8        layer (4 bits) | centroid (1) | line geometry (1) | source kind (2)
 //!       dlon, dlat    zigzag varints from the block base
 //!       context       varint, 0 = none, else (tuple_id + 1) << 1 | ambiguous
 //!       source        zigzag OSM object id, or the address count for postcodes
-//!       fields        per layer, strings as varint string ids
+//!       fields        per layer, strings as varint ids local to the record's segment
 //!       geometry      line strings only: varint count, then zigzag deltas
 //! ```
+//!
+//! Strings are interned per segment of [`SEGMENT_RECORDS`] records: the build
+//! keeps one segment's dictionary in memory, not every distinct string of the
+//! input. Records are in Hilbert order, so a segment covers one area and most
+//! of its strings are its own; only widely shared ones (countries, regions)
+//! repeat across segments.
 
 use std::{
     collections::HashMap,
@@ -50,9 +57,11 @@ use crate::{
 pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 2;
+pub const RECORDS_VERSION: u32 = 3;
 
 pub const BLOCK_RECORDS: u64 = 64;
+/// Records per string segment.
+pub const SEGMENT_RECORDS: u64 = 1 << 20;
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 const BLOCK_HEADER_BYTES: usize = 8;
 
@@ -124,11 +133,19 @@ pub struct ContextRecord {
     pub point: Option<RecordPoint>,
 }
 
+/// Global string ids `first..end` belong to one segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StringSegment {
+    first: u64,
+    end: u64,
+}
+
 /// The fixed part of a record: enough for spatial filtering without touching
 /// strings or geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
     pub layer: Layer,
+    strings: StringSegment,
     pub lon_e7: i32,
     pub lat_e7: i32,
     pub context: Option<ContextRef>,
@@ -206,7 +223,9 @@ pub struct RecordsWriter {
     blocks: BufWriter<File>,
     blocks_path: PathBuf,
     blocks_len: u64,
-    block_offsets: Vec<u64>,
+    /// Start of every block, streamed to scratch.
+    block_offsets: BufWriter<File>,
+    block_offsets_path: PathBuf,
     /// Bodies of the open block and where each one ends.
     block: Vec<u8>,
     block_ends: Vec<u32>,
@@ -216,31 +235,47 @@ pub struct RecordsWriter {
     body: Vec<u8>,
 }
 
+/// Strings of the current segment. Bytes and end offsets stream to scratch
+/// files; only the current segment's dictionary is held in memory.
 struct StringTable {
     ids: HashMap<Box<str>, u32>,
+    segment_records: u64,
+    segment_firsts: Vec<u64>,
+    count: u64,
+    bytes_len: u64,
     bytes: BufWriter<File>,
     bytes_path: PathBuf,
-    offsets: Vec<u64>,
+    ends: BufWriter<File>,
+    ends_path: PathBuf,
 }
 
 impl StringTable {
+    /// Segment-local id of `value`.
     fn id(&mut self, value: &str) -> Result<u32> {
         if let Some(&id) = self.ids.get(value) {
             return Ok(id);
         }
-        let id = u32::try_from(self.offsets.len() - 1).context("string table is full")?;
+        let id = u32::try_from(self.ids.len()).context("string segment is full")?;
         self.bytes.write_all(value.as_bytes())?;
-        self.offsets
-            .push(self.offsets.last().copied().unwrap_or_default() + value.len() as u64);
+        self.bytes_len += value.len() as u64;
+        self.ends.write_all(&self.bytes_len.to_le_bytes())?;
+        self.count += 1;
         self.ids.insert(value.into(), id);
         Ok(id)
+    }
+
+    fn start_segment(&mut self) {
+        self.ids.clear();
+        self.segment_firsts.push(self.count);
     }
 }
 
 impl RecordsWriter {
     pub fn create(scratch: &Arc<Scratch>) -> Result<Self> {
         let blocks_path = scratch.path().join("records-blocks.bin");
+        let block_offsets_path = scratch.path().join("records-block-offsets.bin");
         let bytes_path = scratch.path().join("records-strings.bin");
+        let ends_path = scratch.path().join("records-string-ends.bin");
         let create = |path: &PathBuf| -> Result<BufWriter<File>> {
             Ok(BufWriter::with_capacity(
                 1 << 20,
@@ -252,16 +287,22 @@ impl RecordsWriter {
             blocks: create(&blocks_path)?,
             blocks_path,
             blocks_len: 0,
-            block_offsets: Vec::new(),
+            block_offsets: create(&block_offsets_path)?,
+            block_offsets_path,
             block: Vec::new(),
             block_ends: Vec::new(),
             block_base: (0, 0),
             record_count: 0,
             strings: StringTable {
                 ids: HashMap::new(),
+                segment_records: SEGMENT_RECORDS,
+                segment_firsts: Vec::new(),
+                count: 0,
+                bytes_len: 0,
                 bytes: create(&bytes_path)?,
                 bytes_path,
-                offsets: vec![0],
+                ends: create(&ends_path)?,
+                ends_path,
             },
             body: Vec::new(),
         })
@@ -272,7 +313,18 @@ impl RecordsWriter {
     }
 
     pub fn string_count(&self) -> u64 {
-        self.strings.offsets.len() as u64 - 1
+        self.strings.count
+    }
+
+    #[cfg(test)]
+    fn with_segment_records(mut self, segment_records: u64) -> Self {
+        self.strings.segment_records = segment_records;
+        self
+    }
+
+    /// Strings in the current segment's in-memory dictionary.
+    pub fn resident_strings(&self) -> usize {
+        self.strings.ids.len()
     }
 
     pub fn write(&mut self, record: &Record, context: Option<ContextRef>) -> Result<RecordId> {
@@ -280,6 +332,9 @@ impl RecordsWriter {
             .display_point()
             .with_context(|| format!("record {} has no finite display point", record.id()))?;
         let point = (quantize(lon)?, quantize(lat)?);
+        if self.record_count % self.strings.segment_records == 0 {
+            self.strings.start_segment();
+        }
         if self.record_count % BLOCK_RECORDS == 0 {
             self.flush_block()?;
             self.block_base = point;
@@ -415,7 +470,8 @@ impl RecordsWriter {
         if self.block_ends.is_empty() {
             return Ok(());
         }
-        self.block_offsets.push(self.blocks_len);
+        self.block_offsets
+            .write_all(&self.blocks_len.to_le_bytes())?;
         self.blocks.write_all(&self.block_base.0.to_le_bytes())?;
         self.blocks.write_all(&self.block_base.1.to_le_bytes())?;
         for end in &self.block_ends {
@@ -433,25 +489,28 @@ impl RecordsWriter {
     pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<()> {
         self.flush_block()?;
         self.blocks.flush()?;
+        self.block_offsets.flush()?;
         self.strings.bytes.flush()?;
+        self.strings.ends.flush()?;
 
         pack.begin(SECTION_INDEX, RECORDS_VERSION)?;
         pack.write_all(&self.record_count.to_le_bytes())?;
-        for offset in self.block_offsets.iter().chain([&self.blocks_len]) {
-            pack.write_all(&offset.to_le_bytes())?;
-        }
+        std::io::copy(&mut File::open(&self.block_offsets_path)?, pack)?;
+        pack.write_all(&self.blocks_len.to_le_bytes())?;
         pack.end()?;
 
         pack.add_file(SECTION_BLOCKS, RECORDS_VERSION, &self.blocks_path)?;
 
+        let strings = &self.strings;
         pack.begin(SECTION_STRINGS, RECORDS_VERSION)?;
-        let string_count = self.strings.offsets.len() as u64 - 1;
-        pack.write_all(&string_count.to_le_bytes())?;
-        for offset in &self.strings.offsets {
-            pack.write_all(&offset.to_le_bytes())?;
+        pack.write_all(&strings.segment_records.to_le_bytes())?;
+        pack.write_all(&(strings.segment_firsts.len() as u64).to_le_bytes())?;
+        for first in &strings.segment_firsts {
+            pack.write_all(&first.to_le_bytes())?;
         }
-        let mut bytes = File::open(&self.strings.bytes_path)?;
-        std::io::copy(&mut bytes, pack)?;
+        pack.write_all(&strings.count.to_le_bytes())?;
+        std::io::copy(&mut File::open(&strings.ends_path)?, pack)?;
+        std::io::copy(&mut File::open(&strings.bytes_path)?, pack)?;
         pack.end()
     }
 }
@@ -461,8 +520,13 @@ pub struct RecordsReader {
     record_count: u64,
     index: Bytes,
     blocks: Bytes,
-    string_count: u64,
     strings: Bytes,
+    segment_records: u64,
+    segment_count: u64,
+    string_count: u64,
+    /// Byte offsets within `strings` of the end-offset table and the text.
+    ends_start: usize,
+    text_start: usize,
 }
 
 impl RecordsReader {
@@ -479,19 +543,34 @@ impl RecordsReader {
         if read_u64_le(&index, index.len() - 8) != Some(blocks.len() as u64) {
             bail!("records index does not match the blocks section");
         }
-        let string_count = read_u64_le(&strings, 0).context("string table is truncated")?;
-        let text_start = 8 + (string_count + 1) * 8;
-        let text_len = read_u64_le(&strings, (text_start - 8) as usize)
-            .context("string table is truncated")?;
-        if strings.len() as u64 != text_start + text_len {
+        let truncated = || anyhow::anyhow!("string table is truncated");
+        let segment_records = read_u64_le(&strings, 0).ok_or_else(truncated)?;
+        let segment_count = read_u64_le(&strings, 8).ok_or_else(truncated)?;
+        if segment_records == 0 || segment_count != record_count.div_ceil(segment_records) {
+            bail!("string table segments do not match the record count");
+        }
+        let count_at = usize::try_from(16 + segment_count * 8)?;
+        let string_count = read_u64_le(&strings, count_at).ok_or_else(truncated)?;
+        let ends_start = count_at + 8;
+        let text_start = ends_start + usize::try_from(string_count * 8)?;
+        let text_len = if string_count == 0 {
+            0
+        } else {
+            read_u64_le(&strings, text_start - 8).ok_or_else(truncated)?
+        };
+        if strings.len() as u64 != text_start as u64 + text_len {
             bail!("string table does not match its offsets");
         }
         Ok(Self {
             record_count,
             index,
             blocks,
-            string_count,
             strings,
+            segment_records,
+            segment_count,
+            string_count,
+            ends_start,
+            text_start,
         })
     }
 
@@ -508,7 +587,7 @@ impl RecordsReader {
         let geometry = |fields: &mut &[u8]| self.geometry(&header, fields);
         Ok(match header.layer {
             Layer::Address => {
-                let address = self.address_components(&mut fields)?;
+                let address = self.address_components(header.strings, &mut fields)?;
                 Record::Address(AddressRecord {
                     address,
                     geometry: geometry(&mut fields)?,
@@ -522,7 +601,7 @@ impl RecordsReader {
             }
             Layer::Interpolation => {
                 let (address, interpolation, anchor_node_ids) =
-                    self.interpolation_fields(&mut fields)?;
+                    self.interpolation_fields(header.strings, &mut fields)?;
                 Record::Interpolation(InterpolationRecord {
                     address,
                     interpolation,
@@ -533,13 +612,13 @@ impl RecordsReader {
                 })
             }
             Layer::Street => Record::Street(StreetRecord {
-                name: self.string_field(&mut fields)?.to_string(),
+                name: self.string_field(header.strings, &mut fields)?.to_string(),
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance()?,
             }),
             Layer::Postcode => Record::Postcode(PostcodeRecord {
-                postcode: self.string_field(&mut fields)?.to_string(),
+                postcode: self.string_field(header.strings, &mut fields)?.to_string(),
                 geometry: geometry(&mut fields)?,
                 source: DerivedSourceProvenance::osm_address_records(header.source_value),
             }),
@@ -548,8 +627,8 @@ impl RecordsReader {
                 Record::Place(
                     place_layer,
                     PlaceRecord {
-                        name: self.string_field(&mut fields)?.to_string(),
-                        place_type: self.string_field(&mut fields)?.to_string(),
+                        name: self.string_field(header.strings, &mut fields)?.to_string(),
+                        place_type: self.string_field(header.strings, &mut fields)?.to_string(),
                         geometry: geometry(&mut fields)?,
                         source: header.provenance()?,
                     },
@@ -564,7 +643,7 @@ impl RecordsReader {
         let source = header.source()?;
         let (record_id, label) = match header.layer {
             Layer::Address => {
-                let address = self.address_components(&mut fields)?;
+                let address = self.address_components(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.osm_source()?;
                 (
                     crate::labels::osm_record_id(object_type, object_id),
@@ -572,7 +651,8 @@ impl RecordsReader {
                 )
             }
             Layer::Interpolation => {
-                let (address, range, anchors) = self.interpolation_fields(&mut fields)?;
+                let (address, range, anchors) =
+                    self.interpolation_fields(header.strings, &mut fields)?;
                 let (_, way_id) = header.osm_source()?;
                 (
                     crate::labels::interpolation_record_id(way_id, anchors[0], anchors[1]),
@@ -587,19 +667,19 @@ impl RecordsReader {
                 let (object_type, object_id) = header.osm_source()?;
                 (
                     crate::labels::osm_record_id(object_type, object_id),
-                    self.string_field(&mut fields)?.to_string(),
+                    self.string_field(header.strings, &mut fields)?.to_string(),
                 )
             }
             Layer::Postcode => {
-                let postcode = self.string_field(&mut fields)?;
+                let postcode = self.string_field(header.strings, &mut fields)?;
                 (
                     crate::labels::derived_postcode_id(postcode),
                     postcode.to_string(),
                 )
             }
             _ => {
-                let name = self.string_field(&mut fields)?;
-                let place_type = self.string_field(&mut fields)?;
+                let name = self.string_field(header.strings, &mut fields)?;
+                let place_type = self.string_field(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.osm_source()?;
                 (
                     crate::labels::place_record_id(object_type, object_id, place_type),
@@ -653,17 +733,33 @@ impl RecordsReader {
         Ok(value)
     }
 
-    pub fn string(&self, id: u32) -> Result<&str> {
-        let id = u64::from(id);
-        if id >= self.string_count {
-            bail!("string id {id} is out of range");
+    fn segment(&self, record_id: RecordId) -> StringSegment {
+        let segment = record_id / self.segment_records;
+        let first_at = |segment: u64| {
+            read_u64_le(&self.strings, (16 + segment * 8) as usize).expect("validated segments")
+        };
+        StringSegment {
+            first: first_at(segment),
+            end: if segment + 1 < self.segment_count {
+                first_at(segment + 1)
+            } else {
+                self.string_count
+            },
         }
-        let text_start = 8 + (self.string_count + 1) * 8;
-        let start = read_u64_le(&self.strings, (8 + id * 8) as usize).expect("validated offsets");
-        let end = read_u64_le(&self.strings, (16 + id * 8) as usize).expect("validated offsets");
+    }
+
+    fn string(&self, segment: StringSegment, local: u32) -> Result<&str> {
+        let id = segment.first + u64::from(local);
+        if id >= segment.end {
+            bail!("string id {local} is out of range for its segment");
+        }
+        let end_of = |id: u64| {
+            read_u64_le(&self.strings, self.ends_start + id as usize * 8).expect("validated ends")
+        };
+        let start = if id == 0 { 0 } else { end_of(id - 1) };
         let bytes = self
             .strings
-            .get((text_start + start) as usize..(text_start + end) as usize)
+            .get(self.text_start + start as usize..self.text_start + end_of(id) as usize)
             .context("string offsets are out of range")?;
         std::str::from_utf8(bytes).context("string table entry is not valid UTF-8")
     }
@@ -737,6 +833,7 @@ impl RecordsReader {
         Ok((
             RecordHeader {
                 layer,
+                strings: self.segment(id),
                 lon_e7,
                 lat_e7,
                 context,
@@ -749,25 +846,33 @@ impl RecordsReader {
         ))
     }
 
-    fn string_field(&self, fields: &mut &[u8]) -> Result<&str> {
-        self.string(get_u32(fields)?)
+    fn string_field(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<&str> {
+        self.string(strings, get_u32(fields)?)
     }
 
-    fn optional_strings<const N: usize>(&self, fields: &mut &[u8]) -> Result<[Option<String>; N]> {
+    fn optional_strings<const N: usize>(
+        &self,
+        strings: StringSegment,
+        fields: &mut &[u8],
+    ) -> Result<[Option<String>; N]> {
         let present = get_u8(fields)?;
         let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
         for (bit, value) in values.iter_mut().enumerate() {
             if present & (1 << bit) != 0 {
-                *value = Some(self.string_field(fields)?.to_string());
+                *value = Some(self.string_field(strings, fields)?.to_string());
             }
         }
         Ok(values)
     }
 
-    fn address_components(&self, fields: &mut &[u8]) -> Result<AddressComponents> {
-        let number = self.string_field(fields)?.to_string();
+    fn address_components(
+        &self,
+        strings: StringSegment,
+        fields: &mut &[u8],
+    ) -> Result<AddressComponents> {
+        let number = self.string_field(strings, fields)?.to_string();
         let [street, place, unit, locality, region, postcode, country] =
-            self.optional_strings(fields)?;
+            self.optional_strings(strings, fields)?;
         Ok(AddressComponents {
             number,
             street,
@@ -782,10 +887,12 @@ impl RecordsReader {
 
     fn interpolation_fields(
         &self,
+        strings: StringSegment,
         fields: &mut &[u8],
     ) -> Result<(InterpolationAddressComponents, InterpolationRange, [i64; 2])> {
-        let [street, place, locality, region, postcode, country] = self.optional_strings(fields)?;
-        let kind = self.string_field(fields)?.to_string();
+        let [street, place, locality, region, postcode, country] =
+            self.optional_strings(strings, fields)?;
+        let kind = self.string_field(strings, fields)?.to_string();
         let start = get_u32(fields)?;
         let end = start.wrapping_add(get_u32(fields)?);
         let step = get_u32(fields)?;
@@ -812,10 +919,10 @@ impl RecordsReader {
     fn skip_fields(&self, header: &RecordHeader, fields: &mut &[u8]) -> Result<()> {
         match header.layer {
             Layer::Address => {
-                self.address_components(fields)?;
+                self.address_components(header.strings, fields)?;
             }
             Layer::Interpolation => {
-                self.interpolation_fields(fields)?;
+                self.interpolation_fields(header.strings, fields)?;
             }
             Layer::Street | Layer::Postcode => {
                 get_u32(fields)?;
@@ -1059,6 +1166,42 @@ mod tests {
     }
 
     #[test]
+    fn string_dictionary_is_bounded_by_the_segment() {
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-segments-{}", uuid::Uuid::new_v4()));
+        let scratch = Scratch::create(root.join("scratch")).expect("scratch");
+        let mut writer = RecordsWriter::create(&scratch)
+            .expect("writer")
+            .with_segment_records(100);
+        let base = sample_records().remove(0);
+        let mut records = Vec::new();
+        let mut most_resident = 0;
+        for index in 0..1_050 {
+            let mut record = base.clone();
+            if let Record::Address(address) = &mut record {
+                // Every record has its own street; locality is shared by all.
+                address.address.street = Some(format!("Street {index}"));
+                address.address.number = (index % 7).to_string();
+            }
+            writer.write(&record, None).expect("write");
+            most_resident = most_resident.max(writer.resident_strings());
+            records.push(record);
+        }
+        assert!(
+            most_resident <= 100 + 12,
+            "dictionary held {most_resident} strings"
+        );
+        let path = root.join("pack.ogp");
+        let mut pack = ContainerWriter::create(&path).expect("pack");
+        writer.finish(&mut pack).expect("finish");
+        pack.finish().expect("pack finish");
+        let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
+        for (id, record) in records.iter().enumerate() {
+            assert_eq!(&reader.record(id as u64).expect("record"), record);
+        }
+    }
+
+    #[test]
     fn spans_blocks_and_keeps_contexts() {
         let base = sample_records().remove(0);
         let mut records = Vec::new();
@@ -1103,7 +1246,9 @@ mod tests {
         damaged[geometry_offset] = 1;
         let mut cursor = damaged.as_slice();
         assert_eq!(
-            reader.string_field(&mut cursor).expect("name"),
+            reader
+                .string_field(header.strings, &mut cursor)
+                .expect("name"),
             "King Street"
         );
         assert!(reader.geometry(&header, &mut cursor).is_err());

@@ -50,14 +50,19 @@ pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
     Ok(generation)
 }
 
+/// Validate a generation and point `CURRENT` at it. `keep` is set the moment
+/// `CURRENT` may name the generation, so a later failure never deletes the
+/// Pack that servers are told to open.
 pub(super) fn publish(
     destination: &Path,
     generation: &Path,
     manifest: &PackManifest,
+    keep: &mut bool,
 ) -> Result<()> {
     // Exercise the same readers used for serving before making the build visible.
     let pack = generation.join(PACK_FILE);
     let reader = PackReader::open(&pack)?;
+    reader.verify()?;
     if reader.manifest() != manifest {
         bail!("Pack manifest does not match the build");
     }
@@ -85,10 +90,25 @@ pub(super) fn publish(
     )?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&pending, destination.join(CURRENT))
-        .context("failed to publish pack CURRENT pointer")?;
+    *keep = true;
+    if let Err(error) = fs::rename(&pending, destination.join(CURRENT)) {
+        // CURRENT still names the previous generation.
+        *keep = false;
+        let _ = fs::remove_file(&pending);
+        return Err(error).context("failed to publish pack CURRENT pointer");
+    }
+    #[cfg(test)]
+    if FAIL_AFTER_SWITCH.get() {
+        bail!("injected failure after the CURRENT switch");
+    }
     sync_directory(destination)?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Simulates a failure after `CURRENT` already names the new generation.
+    pub(super) static FAIL_AFTER_SWITCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn sync_tree(path: &Path) -> Result<()> {

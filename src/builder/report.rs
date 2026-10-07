@@ -165,6 +165,8 @@ fn merge_samples<T>(
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ScratchReport {
     pub memory_budget_bytes: u64,
+    /// Most memory held at once by sort, merge and text indexing buffers.
+    pub peak_tracked_bytes: u64,
     pub spilled_bytes: u64,
     pub sorters: BTreeMap<String, SorterReport>,
 }

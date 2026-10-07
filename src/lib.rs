@@ -6,6 +6,7 @@ pub mod context;
 pub mod extsort;
 mod http;
 pub mod labels;
+pub mod memory;
 pub mod pack;
 pub mod record;
 pub mod records;

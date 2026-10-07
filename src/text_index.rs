@@ -27,6 +27,7 @@ use tantivy::{
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     extsort::Scratch,
+    memory::{MemoryBudget, Reservation},
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
@@ -47,6 +48,8 @@ const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 
 pub struct TextIndexWriter {
     writer: IndexWriter,
+    /// Tantivy's indexing buffers, held against the build budget.
+    _memory: Reservation,
     index: Index,
     path: PathBuf,
     fields: TextIndexFields,
@@ -101,7 +104,12 @@ impl fmt::Debug for TextIndexWriter {
 }
 
 impl TextIndexWriter {
-    pub fn create(scratch: &Arc<Scratch>, memory_bytes: usize) -> Result<Self> {
+    pub fn create(
+        scratch: &Arc<Scratch>,
+        budget: &Arc<MemoryBudget>,
+        memory_bytes: usize,
+    ) -> Result<Self> {
+        let memory_bytes = memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES);
         let (schema, fields) = build_schema();
         let path = scratch.path().join("text");
         fs::create_dir_all(&path)
@@ -109,13 +117,14 @@ impl TextIndexWriter {
         let index = Index::create_in_dir(&path, schema)
             .with_context(|| format!("failed to create Tantivy index {}", path.display()))?;
         let writer = index
-            .writer(memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES))
+            .writer(memory_bytes)
             .context("failed to create Tantivy index writer")?;
         // Disable background auto-merges during the build so the only merge is
         // the single deterministic one forced in `finish()`.
         writer.set_merge_policy(Box::new(NoMergePolicy));
         Ok(Self {
             writer,
+            _memory: Reservation::forced(budget, memory_bytes),
             index,
             path,
             fields,

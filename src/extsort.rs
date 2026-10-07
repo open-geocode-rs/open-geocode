@@ -1,10 +1,11 @@
 //! Disk-backed sorting and spooling for builds larger than memory.
 //!
-//! [`ExternalSorter`] buffers items until a byte budget is reached, sorts the
-//! buffer, and writes it to a run file in the build scratch directory. Reading
-//! merges every run with a k-way heap. When everything fits in the budget no run
-//! is written and the sort is an ordinary in-memory sort, so a city extract and
-//! a planet build share one code path.
+//! [`ExternalSorter`] buffers items until its share of the build
+//! [`MemoryBudget`] is used (or the shared pool runs out), sorts the buffer,
+//! and writes it to a run file in the build scratch directory. Reading merges
+//! every run with a k-way heap. When everything fits no run is written and the
+//! sort is an ordinary in-memory sort, so a city extract and a planet build
+//! share one code path.
 //!
 //! [`Spool`] is the unsorted sibling: an append-only scratch file replayed in
 //! write order.
@@ -25,12 +26,20 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
-use crate::util::codec::{get_u64, put_u64};
+use crate::{
+    memory::{MemoryBudget, Reservation},
+    util::codec::{get_u64, put_u64},
+};
 
 const IO_BUFFER_BYTES: usize = 1 << 20;
 /// Runs merged at once. Beyond this, runs are merged in rounds so the number of
 /// open files and read buffers stays bounded.
 const MAX_MERGE_FAN_IN: usize = 64;
+/// When the shared pool is full, a sorter spills only once its buffer holds at
+/// least this fraction of its share; smaller runs would cost more than they free.
+const MIN_RUN_FRACTION: usize = 16;
+/// Smallest buffer growth step, in items.
+const MIN_CAPACITY: usize = 1_024;
 
 /// A value that can be written to and read back from scratch files.
 pub trait Spill: Sized {
@@ -93,35 +102,74 @@ pub struct SortStats {
 
 pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
+    budget: Arc<MemoryBudget>,
     label: &'static str,
-    budget_bytes: usize,
+    /// Bytes this sorter may buffer before it spills.
+    share_bytes: usize,
+    /// Buffer capacity plus the heap bytes of buffered items.
+    reservation: Reservation,
     buffer: Vec<T>,
-    buffered_bytes: usize,
     runs: Vec<PathBuf>,
     stats: SortStats,
 }
 
 impl<T: Spill + Ord + Send> ExternalSorter<T> {
-    pub fn new(scratch: &Arc<Scratch>, label: &'static str, budget_bytes: usize) -> Self {
+    pub fn new(
+        scratch: &Arc<Scratch>,
+        label: &'static str,
+        budget: &Arc<MemoryBudget>,
+        share_bytes: usize,
+    ) -> Self {
         Self {
             scratch: Arc::clone(scratch),
+            budget: Arc::clone(budget),
             label,
-            budget_bytes: budget_bytes.max(1),
+            share_bytes: share_bytes.max(1),
+            reservation: Reservation::empty(budget),
             buffer: Vec::new(),
-            buffered_bytes: 0,
             runs: Vec::new(),
             stats: SortStats::default(),
         }
     }
 
     pub fn push(&mut self, item: T) -> Result<()> {
-        self.buffered_bytes += item.resident_bytes();
+        let heap = item
+            .resident_bytes()
+            .saturating_sub(std::mem::size_of::<T>());
+        let (mut growth, mut needed) = self.needed(heap);
+        let over_share = self.reservation.bytes() + needed > self.share_bytes;
+        if over_share || !self.reservation.try_grow(needed) {
+            // Spill when the share is used up, or when the pool is full and
+            // the buffer is big enough to be worth a run.
+            if over_share || self.reservation.bytes() >= self.share_bytes / MIN_RUN_FRACTION {
+                self.spill()?;
+                (growth, needed) = self.needed(heap);
+            }
+            if !self.reservation.try_grow(needed) {
+                self.reservation.force_grow(needed);
+            }
+        }
+        self.buffer.reserve_exact(growth);
         self.buffer.push(item);
         self.stats.items += 1;
-        if self.buffered_bytes >= self.budget_bytes {
-            self.spill()?;
-        }
         Ok(())
+    }
+
+    /// Items the buffer must grow by to take one more item, and the bytes that
+    /// costs including the item's own heap data.
+    fn needed(&self, heap: usize) -> (usize, usize) {
+        let growth = if self.buffer.len() == self.buffer.capacity() {
+            // Double, but never past what the share can hold.
+            let share_items = (self.share_bytes / std::mem::size_of::<T>().max(1)).max(1);
+            self.buffer
+                .capacity()
+                .max(MIN_CAPACITY)
+                .min(share_items.saturating_sub(self.buffer.capacity()))
+                .max(1)
+        } else {
+            0
+        };
+        (growth, heap + growth * std::mem::size_of::<T>())
     }
 
     pub fn stats(&self) -> SortStats {
@@ -130,23 +178,30 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
 
     /// Sorted items, ascending, with ties in insertion order.
     pub fn finish(mut self) -> Result<Sorted<T>> {
-        // Stable sort plus run-order tie-breaking keeps equal items in push order.
-        self.buffer.par_sort();
         if self.runs.is_empty() {
-            return Ok(Sorted::Memory(std::mem::take(&mut self.buffer).into_iter()));
+            // Stable sort plus run-order tie-breaking keeps equal items in push order.
+            self.buffer.par_sort();
+            let reservation =
+                std::mem::replace(&mut self.reservation, Reservation::empty(&self.budget));
+            return Ok(Sorted::Memory(
+                std::mem::take(&mut self.buffer).into_iter(),
+                reservation,
+            ));
         }
-        while self.runs.len() + 1 > MAX_MERGE_FAN_IN {
+        // Once anything spilled, the tail is spilled too, so a finished sorter
+        // holds only merge read buffers while later phases fill their own.
+        self.spill()?;
+        while self.runs.len() > MAX_MERGE_FAN_IN {
             let batch = self.runs.drain(..MAX_MERGE_FAN_IN).collect::<Vec<_>>();
             let merged = self.scratch.new_file(self.label);
             let mut writer = SpoolWriter::<T>::create(&self.scratch, &merged)?;
-            for item in Merge::<T>::open(&batch, Vec::new())? {
+            for item in Merge::<T>::open(&batch, &self.budget)? {
                 writer.write(&item?)?;
             }
             writer.finish()?;
             self.runs.insert(0, merged);
         }
-        let memory = std::mem::take(&mut self.buffer);
-        Ok(Sorted::Merge(Merge::open(&self.runs, memory)?))
+        Ok(Sorted::Merge(Merge::open(&self.runs, &self.budget)?))
     }
 
     fn spill(&mut self) -> Result<()> {
@@ -160,15 +215,18 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             writer.write(&item)?;
         }
         writer.finish()?;
-        self.buffered_bytes = 0;
+        // Return the memory to the pool, not just the items.
+        self.buffer = Vec::new();
+        self.reservation.release_all();
         self.runs.push(path);
         self.stats.runs += 1;
         Ok(())
     }
 }
 
+/// Sorted output. The in-memory form keeps its memory reserved until dropped.
 pub enum Sorted<T> {
-    Memory(std::vec::IntoIter<T>),
+    Memory(std::vec::IntoIter<T>, Reservation),
     Merge(Merge<T>),
 }
 
@@ -177,31 +235,19 @@ impl<T: Spill + Ord> Iterator for Sorted<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Memory(items) => items.next().map(Ok),
+            Self::Memory(items, _) => items.next().map(Ok),
             Self::Merge(merge) => merge.next(),
         }
     }
 }
 
-/// K-way merge over sorted run files plus an optional sorted in-memory tail.
+/// K-way merge over sorted run files.
 pub struct Merge<T> {
-    sources: Vec<Source<T>>,
+    sources: Vec<SpoolReader<T>>,
     heap: BinaryHeap<Reverse<HeapEntry<T>>>,
     failed: bool,
-}
-
-enum Source<T> {
-    File(SpoolReader<T>),
-    Memory(std::vec::IntoIter<T>),
-}
-
-impl<T: Spill> Source<T> {
-    fn next(&mut self) -> Option<Result<T>> {
-        match self {
-            Self::File(reader) => reader.next(),
-            Self::Memory(items) => items.next().map(Ok),
-        }
-    }
+    /// Read buffers of the open runs.
+    _buffers: Reservation,
 }
 
 struct HeapEntry<T> {
@@ -234,16 +280,16 @@ impl<T: Ord> Ord for HeapEntry<T> {
 impl<T: Spill + Ord> Merge<T> {
     /// Each run is read exactly once, so its file is deleted as soon as the
     /// merge is dropped; at planet scale this frees scratch disk between phases.
-    fn open(runs: &[PathBuf], memory: Vec<T>) -> Result<Self> {
+    fn open(runs: &[PathBuf], budget: &Arc<MemoryBudget>) -> Result<Self> {
+        let buffers = Reservation::forced(budget, runs.len() * IO_BUFFER_BYTES);
         let mut sources = runs
             .iter()
             .map(|path| {
                 let mut reader = SpoolReader::open(path)?;
                 reader.remove_on_drop = true;
-                Ok(Source::File(reader))
+                Ok(reader)
             })
             .collect::<Result<Vec<_>>>()?;
-        sources.push(Source::Memory(memory.into_iter()));
         let mut heap = BinaryHeap::with_capacity(sources.len());
         for (source, input) in sources.iter_mut().enumerate() {
             if let Some(item) = input.next() {
@@ -257,6 +303,7 @@ impl<T: Spill + Ord> Merge<T> {
             sources,
             heap,
             failed: false,
+            _buffers: buffers,
         })
     }
 }
@@ -484,7 +531,8 @@ mod tests {
     #[test]
     fn in_memory_sort_writes_no_runs() {
         let scratch = scratch("memory");
-        let mut sorter = ExternalSorter::new(&scratch, "pairs", usize::MAX);
+        let mut sorter =
+            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), usize::MAX);
         let input = pseudo_random(10_000);
         for item in &input {
             sorter.push(*item).expect("push");
@@ -506,7 +554,8 @@ mod tests {
         let scratch = scratch("spill");
         // Each item counts 16 bytes, so this spills every 50 items: 400 runs,
         // more than one merge round.
-        let mut sorter = ExternalSorter::new(&scratch, "pairs", 50 * 16);
+        let mut sorter =
+            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), 50 * 16);
         let input = pseudo_random(20_000);
         for item in &input {
             sorter.push(*item).expect("push");
@@ -524,9 +573,58 @@ mod tests {
     }
 
     #[test]
+    fn sorters_sharing_a_budget_stay_within_it() {
+        let scratch = scratch("shared");
+        let item = std::mem::size_of::<(u64, u64)>();
+        // Each sorter's share alone would fit; together they do not.
+        let budget = MemoryBudget::new(64 * 1024 * item);
+        let mut first = ExternalSorter::new(&scratch, "first", &budget, 48 * 1024 * item);
+        let mut second = ExternalSorter::new(&scratch, "second", &budget, 48 * 1024 * item);
+        let input = pseudo_random(400_000);
+        for pair in input.chunks(2) {
+            first.push(pair[0]).expect("push");
+            second.push(pair[1]).expect("push");
+        }
+        assert!(
+            budget.peak() <= budget.limit(),
+            "peak {} over {}",
+            budget.peak(),
+            budget.limit()
+        );
+        assert!(first.stats().runs > 0 && second.stats().runs > 0);
+        let first = first.finish().expect("finish");
+        // A spilled sorter writes its tail out: only read buffers stay reserved.
+        assert_eq!(
+            budget.used(),
+            first_runs_buffers(&first) + second.reservation.bytes()
+        );
+        let mut merged = first.collect::<Result<Vec<_>>>().expect("first");
+        merged.extend(
+            second
+                .finish()
+                .expect("finish")
+                .collect::<Result<Vec<_>>>()
+                .expect("second"),
+        );
+        merged.sort();
+        let mut expected = input;
+        expected.sort();
+        assert_eq!(merged, expected);
+        assert_eq!(budget.used(), 0);
+    }
+
+    fn first_runs_buffers<T>(sorted: &Sorted<T>) -> usize {
+        match sorted {
+            Sorted::Memory(..) => 0,
+            Sorted::Merge(merge) => merge.sources.len() * IO_BUFFER_BYTES,
+        }
+    }
+
+    #[test]
     fn run_files_are_removed_once_merged() {
         let scratch = scratch("cleanup");
-        let mut sorter = ExternalSorter::new(&scratch, "pairs", 10 * 16);
+        let mut sorter =
+            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), 10 * 16);
         for item in pseudo_random(1_000) {
             sorter.push(item).expect("push");
         }
@@ -568,7 +666,12 @@ mod tests {
         }
 
         let scratch = scratch("stable");
-        let mut sorter = ExternalSorter::new(&scratch, "keyed", 7 * std::mem::size_of::<Keyed>());
+        let mut sorter = ExternalSorter::new(
+            &scratch,
+            "keyed",
+            &MemoryBudget::unlimited(),
+            7 * std::mem::size_of::<Keyed>(),
+        );
         for payload in 0..1_000 {
             sorter
                 .push(Keyed {
