@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use open_geocode::{
     batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
-    bench::{PackBenchmarkOptions, benchmark_pack},
+    bench::{PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack, sample_poi_fixture},
     builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
@@ -147,6 +147,27 @@ enum Commands {
         /// Optional output path for the JSON benchmark report.
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+
+    /// Sample a seeded answer key of named POIs for bench-pack: each case
+    /// queries "<name>, <locality>" and expects that POI.
+    #[command(name = "sample-poi-fixture")]
+    SamplePoiFixture {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Number of POIs to draw.
+        #[arg(long, default_value_t = 500)]
+        count: usize,
+
+        /// Seed of the draw; the same Pack and seed give the same fixture.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+
+        /// Output path for the fixture JSON.
+        #[arg(long)]
+        output: PathBuf,
     },
 
     /// Geocode CSV rows into lat/lon columns using a Pack text index.
@@ -305,6 +326,20 @@ async fn main() -> Result<()> {
             warmup,
             output,
         } => bench_pack(pack, queries, iterations, warmup, output),
+        Commands::SamplePoiFixture {
+            pack,
+            count,
+            seed,
+            output,
+        } => {
+            let fixture = sample_poi_fixture(PoiFixtureOptions { pack, count, seed })?;
+            let cases = fixture.search.len();
+            write_json_to_path(&fixture, output.clone())?;
+            write_json(serde_json::json!({
+                "cases": cases,
+                "output": output.display().to_string(),
+            }))
+        }
         Commands::BatchGeocode(args) => batch_geocode(*args),
         Commands::Serve {
             pack,
@@ -427,7 +462,7 @@ fn write_json(value: Value) -> Result<()> {
     Ok(())
 }
 
-fn write_json_to_path(value: &Value, output: PathBuf) -> Result<()> {
+fn write_json_to_path(value: &impl serde::Serialize, output: PathBuf) -> Result<()> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
     {

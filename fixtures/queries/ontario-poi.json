@@ -1,0 +1,4504 @@
+{
+  "search": [
+    {
+      "name": "historic:monument",
+      "q": "Heritage Tree with plaque, Chatham-Kent",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7094973152
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Douglas Kemp Parkette, Clarington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 895639041
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Ryerson Public School, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 747465356
+      }
+    },
+    {
+      "name": "amenity:library",
+      "q": "Port Colborne Public Library, Port Colborne",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 172845774
+      }
+    },
+    {
+      "name": "amenity:post_depot",
+      "q": "Amazon Fulfillment Centre YYZ3, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 397313749
+      }
+    },
+    {
+      "name": "shop:flooring",
+      "q": "Fan 2 Flooring, Saugeen Shores",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12346181899
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Village Green Park, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 68586365
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Dr. Vrbensky Dentistry, Oakville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8999780469
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Body Blitz, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4253533421
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Teriyaki Experience, Aurora",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3429565209
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Magen David Sephardic Congregation, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2356284499
+      }
+    },
+    {
+      "name": "amenity:dojo",
+      "q": "Gentle Arts Dojo, Waterloo",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12881056594
+      }
+    },
+    {
+      "name": "shop:sports",
+      "q": "Pro Hockey Life, Windsor",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13711523302
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Nina Pizza, West Lincoln Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7557812395
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "PharmaChoice, Richmond Hill",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6589646909
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "Queen's Quay Family Medicine, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2681580825
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "The Caulin Block, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 452480950
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "El Taco De Oro, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2913128601
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "SSI, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 233910082
+      }
+    },
+    {
+      "name": "shop:gift",
+      "q": "Dollar Store and More, Prince Edward County",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 427997903
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Pizza Square, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6575089192
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Luna Restaurant, Brockville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 368849073
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "GP Convenience, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12884576002
+      }
+    },
+    {
+      "name": "shop:jewelry",
+      "q": "Juliet Rose Jewellers, Lincoln",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12092163555
+      }
+    },
+    {
+      "name": "building:commercial",
+      "q": "Ottawa Business Centre, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 483775296
+      }
+    },
+    {
+      "name": "shop:beauty",
+      "q": "Water Foot Spa, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 604084503
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Eleganza Hair Salon & Spa, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5813870316
+      }
+    },
+    {
+      "name": "leisure:playground",
+      "q": "Splash Pad - Clarity Park, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 982367269
+      }
+    },
+    {
+      "name": "shop:car_parts",
+      "q": "Johnston Research & Performance, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 32999932
+      }
+    },
+    {
+      "name": "amenity:doctors",
+      "q": "Cosmetic Surgery Institute, Richmond Hill",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12863019972
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "Bradley, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2295925659
+      }
+    },
+    {
+      "name": "healthcare:alternative",
+      "q": "Back in Motion Chiropractic Clinic, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5891429653
+      }
+    },
+    {
+      "name": "building:commercial",
+      "q": "Young Artists of Kingston Y.A.K. Summer Camps, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 189088298
+      }
+    },
+    {
+      "name": "tourism:guest_house",
+      "q": "Sheboane, St. Clair",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6018006492
+      }
+    },
+    {
+      "name": "office:accountant",
+      "q": "Michael Northcote, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6117193708
+      }
+    },
+    {
+      "name": "amenity:bank",
+      "q": "First Nations Bank of Canada, Lambton County",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6133400664
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Dairy Queen, Milton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2195678704
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Langstaff Secondary School, Richmond Hill",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 37272547
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Thomas, Large & Singer Inc., Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4324732167
+      }
+    },
+    {
+      "name": "amenity:fuel",
+      "q": "Esso, Hornepayne Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 517344254
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Stella Luna, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6493324139
+      }
+    },
+    {
+      "name": "amenity:veterinary",
+      "q": "Stonegates Veterinary Hospital, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1994055059
+      }
+    },
+    {
+      "name": "office:employment_agency",
+      "q": "United Staffing Service, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9903887602
+      }
+    },
+    {
+      "name": "shop:mobile_phone",
+      "q": "Hashtag Wireless, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6341020706
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "St. Columbia Presbysterian Church, Belleville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 288845149
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "BP-67-39, Adjala–Tosorontio",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1511641648
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Kiwanis Park, Renfrew",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 231657765
+      }
+    },
+    {
+      "name": "leisure:sports_centre",
+      "q": "Leaside Outdoor Pool, East York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1005042664
+      }
+    },
+    {
+      "name": "shop:swimming_pool",
+      "q": "Mermaid, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5171977033
+      }
+    },
+    {
+      "name": "shop:art",
+      "q": "York Mills Gallery, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4327528394
+      }
+    },
+    {
+      "name": "leisure:ice_rink",
+      "q": "Uxbridge Curling Club, Uxbridge",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 129999468
+      }
+    },
+    {
+      "name": "shop:interior_decoration",
+      "q": "Adorn II, The Blue Mountains",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2421959635
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Harbour Channel Co-Op, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 34891174
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Centennial Park, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 177926475
+      }
+    },
+    {
+      "name": "shop:ticket",
+      "q": "ROM Tickets, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9180132920
+      }
+    },
+    {
+      "name": "shop:gift",
+      "q": "Olive Branch, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6653799413
+      }
+    },
+    {
+      "name": "shop:supermarket",
+      "q": "FreshCo, Hawkesbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7081680189
+      }
+    },
+    {
+      "name": "tourism:picnic_site",
+      "q": "Gibbons Park Picnic Site 4, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9017662985
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Villa Nova, Wasaga Beach",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3424745495
+      }
+    },
+    {
+      "name": "shop:variety_store",
+      "q": "Dollar Tree, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 383629968
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Rickard Neighbourhood Park, Clarington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 480939883
+      }
+    },
+    {
+      "name": "office:government",
+      "q": "Toronto Community Housing Corporation Tenant Service Hub, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12437529180
+      }
+    },
+    {
+      "name": "amenity:car_wash",
+      "q": "Kawartha Auto Cleaning, Peterborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9228550820
+      }
+    },
+    {
+      "name": "shop:e-cigarette",
+      "q": "Canada Vape Club, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6571761652
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Dr. Beata Dabrowski & Associates, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2418394873
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Xe Lua, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6586981339
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Jesse Ketchum Child Care Centre, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 124945989
+      }
+    },
+    {
+      "name": "shop:greengrocer",
+      "q": "Dostana Grocers, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6329863974
+      }
+    },
+    {
+      "name": "shop:wine",
+      "q": "Fine Artisanal Wines and Food, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8803987966
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Rosemary Brown Public School, Ajax",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 708085746
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Unconventional Moose, Tweed",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3250742733
+      }
+    },
+    {
+      "name": "office:tax_advisor",
+      "q": "H&R Block, Prince Edward County",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3859406783
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "The Annex by Cheepskates, North Bay",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10270111502
+      }
+    },
+    {
+      "name": "tourism:hotel",
+      "q": "The Noble Suites Hotel, Brockville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 650396978
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Richmond Plaza Motel, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 153245849
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "The Great Canadian Pizza Co., Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1853670908
+      }
+    },
+    {
+      "name": "shop:florist",
+      "q": "Express Flower, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6548307613
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Raja Chettinad, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1327019333
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Dr. Liana Cardieri Family & Cosmetic Dentistry, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 159103033
+      }
+    },
+    {
+      "name": "aeroway:aerodrome",
+      "q": "Edenvale Aerodrome, Clearview",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 688055130
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "Woodbine Convenience Store, East York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 264823055
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Chung Mei Hair Design, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2611249745
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Communitech, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12236386966
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Hibachi Teppanyaki & Bar, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 85961384
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Casselman Dental Clinic, Casselman",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3938123459
+      }
+    },
+    {
+      "name": "building:commercial",
+      "q": "Firechek, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 211274550
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Yummy Momo, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 112757858
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Jason Jackson, Pickering",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6597524903
+      }
+    },
+    {
+      "name": "amenity:bicycle_rental",
+      "q": "MAC Rack Alumni Field, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13819507421
+      }
+    },
+    {
+      "name": "amenity:library",
+      "q": "Ottawa Public Library - Osgoode Branch, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 91523396
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Sicily Pizza, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5181200159
+      }
+    },
+    {
+      "name": "leisure:sports_centre",
+      "q": "Cavan Monaghan Community Centre, Cavan-Monaghan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 78214107
+      }
+    },
+    {
+      "name": "tourism:caravan_site",
+      "q": "Swan Lake Camp, Unorganized West Timiskaming",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 296954351
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Bell Canada Unionville UNVLON55CG0, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 661045059
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "St. Mary's Separate School, North Perth",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 490720339
+      }
+    },
+    {
+      "name": "shop:jewelry",
+      "q": "Oren Jewellery Couture, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1312695051
+      }
+    },
+    {
+      "name": "amenity:kindergarten",
+      "q": "Garderie l'Arche des amis, Russell",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6404906142
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "Shoppers Drug Mart, Smiths Falls",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 519816587
+      }
+    },
+    {
+      "name": "tourism:hotel",
+      "q": "Ramada Plaza, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 281361693
+      }
+    },
+    {
+      "name": "amenity:social_facility",
+      "q": "Amica at Newmarket, Newmarket",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 170684217
+      }
+    },
+    {
+      "name": "building:church",
+      "q": "St. Peter's Lutheran Church., Bluewater",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1420308159
+      }
+    },
+    {
+      "name": "building:school",
+      "q": "Centre for Hospitality and Culinary Arts, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 151179640
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "Jian Hing Supermarket, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5793619265
+      }
+    },
+    {
+      "name": "office:government",
+      "q": "Ottawa Cargo Services, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7211911074
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Ocean Grill Restaurant, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6549657693
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Cleo, Milton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1738484554
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Mama Bears Diner, Quinte West",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 530112481
+      }
+    },
+    {
+      "name": "office:it",
+      "q": "Binatech System Solutions, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7843952891
+      }
+    },
+    {
+      "name": "amenity:driving_school",
+      "q": "Young Drivers of Canada, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11711783049
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Inspire Barbershop, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11310852489
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Asi Auto Service, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 58560482
+      }
+    },
+    {
+      "name": "shop:jewelry",
+      "q": "Zorite, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11404628469
+      }
+    },
+    {
+      "name": "amenity:post_office",
+      "q": "Old Oakville Canada Post, Oakville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11423199151
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Win Win Chinese Restaurant, Whitby",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7076393170
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "The Barber's Chair, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6556571733
+      }
+    },
+    {
+      "name": "amenity:social_facility",
+      "q": "Chartwell Heritage Glen Retirement Residence, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 140294856
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "A Moment For You, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2353500246
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Woollen Factory, South Dundas",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 234438262
+      }
+    },
+    {
+      "name": "amenity:bar",
+      "q": "Phoenix Eatery & Bar, Brockville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6407739517
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Vandyk, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1518717387
+      }
+    },
+    {
+      "name": "amenity:prep_school",
+      "q": "MegaMind, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3475211321
+      }
+    },
+    {
+      "name": "shop:variety_store",
+      "q": "R.K. Bargains, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6594563435
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "570 Laurier, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 167826092
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Hair Envy Family Hair Studio, Oakville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12792156636
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Guest Inn, Quinte West",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 755503625
+      }
+    },
+    {
+      "name": "amenity:pub",
+      "q": "Perfect SZN Eatery & Pub, Bradford West Gwillimbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2430485179
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Studio-7, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6561482373
+      }
+    },
+    {
+      "name": "building:house",
+      "q": "4th 33, Town of Essex",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 716742234
+      }
+    },
+    {
+      "name": "amenity:fuel",
+      "q": "Esso, Pembroke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 549953287
+      }
+    },
+    {
+      "name": "healthcare:alternative",
+      "q": "Nature's Pharm, Waterloo",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4826287771
+      }
+    },
+    {
+      "name": "amenity:bar",
+      "q": "White House Hotel, Peterborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7855776614
+      }
+    },
+    {
+      "name": "tourism:hotel",
+      "q": "Travelodge, Richmond Hill",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 314665130
+      }
+    },
+    {
+      "name": "tourism:guest_house",
+      "q": "The Stream Bed and Breakfast, Mono",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 468225132
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "O'Connor Public School, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 36355572
+      }
+    },
+    {
+      "name": "shop:car",
+      "q": "Subaru of Brampton, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 243011508
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "I.D.A., Wasaga Beach",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3392521889
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Scholar's Green, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 137230374
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Wimbleton Road South Parkette, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9078062124
+      }
+    },
+    {
+      "name": "shop:bakery",
+      "q": "Le Roi Pastry & Bakery, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5833729295
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Toronto Formosan Presbyterian Church, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 445839834
+      }
+    },
+    {
+      "name": "amenity:social_facility",
+      "q": "Morriston Park Nursing Home, Puslinch",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 783379469
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Sunset Grill, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3648148101
+      }
+    },
+    {
+      "name": "amenity:social_centre",
+      "q": "Royal Canadian Legion Hall, Oshawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 317851413
+      }
+    },
+    {
+      "name": "shop:dry_cleaning",
+      "q": "Keep-u-neet Cleaners, Stratford",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7826260904
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Deckdout Apparel, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5995855538
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "A&J Windows & Doors, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8946565515
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "The Olde Red Hen Restaurant, Collingwood",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2471078785
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Northern Reflections, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6634316892
+      }
+    },
+    {
+      "name": "shop:florist",
+      "q": "Hummingbird Flowers, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2416234649
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Daniel Program Centre, Ramara Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 727356282
+      }
+    },
+    {
+      "name": "leisure:miniature_golf",
+      "q": "The Station Mini Golf, Saugeen Shores",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 557073693
+      }
+    },
+    {
+      "name": "shop:shoes",
+      "q": "Foot Locker, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6584703363
+      }
+    },
+    {
+      "name": "shop:carpet",
+      "q": "Direct Carpet Runners, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13719642493
+      }
+    },
+    {
+      "name": "amenity:bar",
+      "q": "Bar Down, Belleville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6612239326
+      }
+    },
+    {
+      "name": "healthcare:hospice",
+      "q": "Hospice Waterloo Region, Waterloo",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1292770835
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Richies Ice Cream and BBQ, Norwich",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6638277583
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Speedy Auto Service, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7745558730
+      }
+    },
+    {
+      "name": "shop:car",
+      "q": "Bolton Nissan, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 673885248
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "London Fire Station #2, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 139313780
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "California Sandwiches, Burlington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3801573984
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "The New Port Credit Corporate Centre, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 76910463
+      }
+    },
+    {
+      "name": "office:government",
+      "q": "Service Canada, Tillsonburg",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5436197199
+      }
+    },
+    {
+      "name": "leisure:sports_centre",
+      "q": "Goodwood Kartways, Uxbridge",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1299829807
+      }
+    },
+    {
+      "name": "shop:furniture",
+      "q": "I Branched Out (Workshop), Parry Sound",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1330784877
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Keswick Public School, Georgina",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 281465621
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Kanata Diving Supply, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6135802151
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "LASIK MD, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3243260322
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Smiles on Yonge Orthodontics, Richmond Hill",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12941605149
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Woodbine Park, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 29438910
+      }
+    },
+    {
+      "name": "shop:second_hand",
+      "q": "Thrifters' Nest, Chatham-Kent",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13283912675
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "New China Chinese Food, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 618833488
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Afton Park, Sarnia",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 212078763
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Jeon Ju Hyang Restaurant, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4622240923
+      }
+    },
+    {
+      "name": "shop:shoes",
+      "q": "Torbo Shoes, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6334219393
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Gather, Perth",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2762708978
+      }
+    },
+    {
+      "name": "shop:storage_rental",
+      "q": "Dundas Mini Storage, North Dundas",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 887352832
+      }
+    },
+    {
+      "name": "building:industrial",
+      "q": "Bunning Splicing & Rigging Limited, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 657935244
+      }
+    },
+    {
+      "name": "tourism:camp_site",
+      "q": "Achray Campground, Unorganized South Nipissing",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1291171573
+      }
+    },
+    {
+      "name": "leisure:sports_centre",
+      "q": "Mattamy National Cycling Centre, Milton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 275515277
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Living Hope Christian Reformed Church, Peterborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 425974979
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Solar Dental, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7068617408
+      }
+    },
+    {
+      "name": "shop:greengrocer",
+      "q": "Dyments Market, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3480403696
+      }
+    },
+    {
+      "name": "shop:hardware",
+      "q": "Bancroft Wind & Solar, Bancroft",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2653072022
+      }
+    },
+    {
+      "name": "office:printing",
+      "q": "Captain Printworks, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8283560837
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "J's, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5794863512
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Aurora High School, Aurora",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 183187339
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "Thorold Family Health Center, Thorold",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 659229183
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Lady Glaze Doughnuts, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1327026090
+      }
+    },
+    {
+      "name": "amenity:parking",
+      "q": "Tenant parking, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 75336771
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Curries N' More, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6548078850
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "D&Y Sushi, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6491425291
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Jam Filled Entertainment, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6146699600
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Dr. Walter Gunraj & Associates Dental Practice, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9233976102
+      }
+    },
+    {
+      "name": "shop:bed",
+      "q": "Sleep Country, Ajax",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 59048098
+      }
+    },
+    {
+      "name": "leisure:ice_rink",
+      "q": "Woodroffe Park Ice Rink, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5316697173
+      }
+    },
+    {
+      "name": "amenity:conference_centre",
+      "q": "Presentation Centre, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13811743801
+      }
+    },
+    {
+      "name": "shop:sports",
+      "q": "College Sports, Belleville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5359473921
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Christ EV Lutheran Latvian Church, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 311152681
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Culinaria Restaurant, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 34204304
+      }
+    },
+    {
+      "name": "shop:beauty",
+      "q": "Body Perks, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7435791311
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Little Anthony's, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 778772927
+      }
+    },
+    {
+      "name": "healthcare:physiotherapist",
+      "q": "Ropha's Body Balance Centre, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3936016415
+      }
+    },
+    {
+      "name": "historic:monument",
+      "q": "Thistle Ha' Farm, Pickering",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4813646331
+      }
+    },
+    {
+      "name": "craft:caterer",
+      "q": "The Little Gourmant, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4394722381
+      }
+    },
+    {
+      "name": "amenity:community_centre",
+      "q": "Sandford Recreation Centre, Uxbridge",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 437044542
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Salem Public School, Centre Wellington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 206002851
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Mister Transmission, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 469659763
+      }
+    },
+    {
+      "name": "shop:safety_equipment",
+      "q": "SOS Emergency Response Technologies, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11519230211
+      }
+    },
+    {
+      "name": "shop:stationery",
+      "q": "Staples, North Grenville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 242966118
+      }
+    },
+    {
+      "name": "leisure:swimming_pool",
+      "q": "Nipigon Swimming Pool, Nipigon Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 239832517
+      }
+    },
+    {
+      "name": "building:house",
+      "q": "2nd Lot 4, Town of Essex",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 941978196
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Pheasant Run Park, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 436181973
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "The Chase Convenience, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7713827251
+      }
+    },
+    {
+      "name": "amenity:cafe",
+      "q": "Primose Bagel Co., York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8941617794
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "A.G. Bridge Park, Niagara Falls",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 178401289
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Trinity Church, Clarington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 208867107
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Girard Park, Lakeshore",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 672125443
+      }
+    },
+    {
+      "name": "amenity:bank",
+      "q": "Auto Workers Community Credit Union, Clarington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7072919949
+      }
+    },
+    {
+      "name": "shop:beauty",
+      "q": "Bermuda Tan, St. Catharines",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6501242699
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "Mix40, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5379553312
+      }
+    },
+    {
+      "name": "leisure:ice_rink",
+      "q": "Osgoode Community Centre Ice Rink, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 91523259
+      }
+    },
+    {
+      "name": "shop:car",
+      "q": "Lockwood Chrysler Dodge Jeep Ram, Oakville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 32782885
+      }
+    },
+    {
+      "name": "amenity:dojo",
+      "q": "STQI Toronto, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3796212748
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Sakura Ichiban Sushi Express, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6366251213
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Wingstop, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4506131111
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "First Hair Salon, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 671933048
+      }
+    },
+    {
+      "name": "shop:chocolate",
+      "q": "Chocolate Sensations, Brant County",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3179292675
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Lucky Dragon Restaurant, Welland",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7613863403
+      }
+    },
+    {
+      "name": "shop:travel_agency",
+      "q": "All World Travel, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3416430826
+      }
+    },
+    {
+      "name": "leisure:sports_centre",
+      "q": "Midland Curling Club, Midland",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 118459181
+      }
+    },
+    {
+      "name": "shop:chocolate",
+      "q": "Laura Secord, North Bay",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6699538288
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Mandarino Ristorante, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6565973714
+      }
+    },
+    {
+      "name": "amenity:dojo",
+      "q": "Danforth Karate Academy, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5435799121
+      }
+    },
+    {
+      "name": "shop:supermarket",
+      "q": "Foodland, South Huron",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7802216292
+      }
+    },
+    {
+      "name": "shop:florist",
+      "q": "Westdale Florist, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4451903374
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Grace Baptist Church, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 474651218
+      }
+    },
+    {
+      "name": "office:diplomatic",
+      "q": "Bangladesh High Commission, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8613597898
+      }
+    },
+    {
+      "name": "amenity:dojo",
+      "q": "Aikido Tendokai, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7879317046
+      }
+    },
+    {
+      "name": "leisure:bowling_alley",
+      "q": "Mount Forest Bowling Centre, Wellington North",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 60829600
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Pro Locker, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5762521386
+      }
+    },
+    {
+      "name": "shop:beauty",
+      "q": "Global Beauty Supply, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 111664086
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Burnham Glen, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 38136707
+      }
+    },
+    {
+      "name": "shop:shoes",
+      "q": "Sloan's Shoes, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4751644757
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Max Auto Sales & Service, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10095841275
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Gateway Church, Haldimand County",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 379236990
+      }
+    },
+    {
+      "name": "building:construction",
+      "q": "Dominion Foundry, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 298450368
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Epiphany of our Lord Catholic Academy, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 122301356
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Shawarma Istanbul, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6357163304
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Holy Trinity Anglican Church, Chatham-Kent",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 750610731
+      }
+    },
+    {
+      "name": "shop:second_hand",
+      "q": "A Buy & Sell Shop, Kawartha Lakes",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 385895080
+      }
+    },
+    {
+      "name": "amenity:veterinary",
+      "q": "Nepean Animal Hospital, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 545573658
+      }
+    },
+    {
+      "name": "leisure:pitch",
+      "q": "Leaside Lawn Bowling Club, East York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 105741442
+      }
+    },
+    {
+      "name": "tourism:camp_site",
+      "q": "Trout Water Family Camping, Brock",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 55973950
+      }
+    },
+    {
+      "name": "amenity:bicycle_rental",
+      "q": "Don Mills Rd / Barber Greene Rd, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13109534566
+      }
+    },
+    {
+      "name": "amenity:social_facility",
+      "q": "King City Lodge Nursing Home, King",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 783507632
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "New Orlean's Pizza, Huron East",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4769585540
+      }
+    },
+    {
+      "name": "leisure:pitch",
+      "q": "Playing Field 1, Waterloo",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 167411353
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Ottawa Sivan Temple, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 469771237
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "Loblaw Pharmacy, Quinte West",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7347710098
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Island Foods West Indian Cuisine, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3772730733
+      }
+    },
+    {
+      "name": "amenity:fuel",
+      "q": "Econo, Port Hope",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 528982525
+      }
+    },
+    {
+      "name": "shop:medical_supply",
+      "q": "Health First Homecare Medical Supplies, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6566641246
+      }
+    },
+    {
+      "name": "amenity:bicycle_rental",
+      "q": "85 Lee Ave, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11284978456
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Loring-Wyle Parkette, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 42704429
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Scotty's, Barrie",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7196383859
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Royal York Gardens, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 31451888
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Mrs. Fields, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6323375938
+      }
+    },
+    {
+      "name": "leisure:golf_course",
+      "q": "Niagara National Golf & Country, Fort Erie",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 56221073
+      }
+    },
+    {
+      "name": "shop:cosmetics",
+      "q": "Bath & Body Works, Burlington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6632463440
+      }
+    },
+    {
+      "name": "office:diplomatic",
+      "q": "Consulate General of Sri Lanka, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8613419932
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Limelight Dental, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4410798125
+      }
+    },
+    {
+      "name": "shop:beauty",
+      "q": "Glow Beauty Bar, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3418249787
+      }
+    },
+    {
+      "name": "shop:bed",
+      "q": "Mattress 365 & Furniture, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11226014555
+      }
+    },
+    {
+      "name": "leisure:horse_riding",
+      "q": "Tay Valley Stables, Tay Valley",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 743156877
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Apartment Building, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 149799990
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "St. Luke's Anglican Church, Mulmur",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2985080980
+      }
+    },
+    {
+      "name": "shop:art",
+      "q": "Art Gallery, Goderich",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6028628786
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "The Country Kitchen, Westport",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 570788631
+      }
+    },
+    {
+      "name": "amenity:parking",
+      "q": "Terminal 1 Parking Garage, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 5191239
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Pizzaville, Orillia",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4314426653
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "McFadden, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6565391642
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Holy Shakes, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10994058299
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Caradoc North School, Strathroy-Caradoc",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 724650680
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Schnack & Co. Hair Design, Orangeville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13378938911
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Asian Legends, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3013597184
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "George McLean Park, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 548248977
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Camelot Park, Russell",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 461239467
+      }
+    },
+    {
+      "name": "historic:building",
+      "q": "Blacksmith Shop, Town of Essex",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1299910363
+      }
+    },
+    {
+      "name": "shop:dry_cleaning",
+      "q": "Dex Dry Cleaners & Alterations, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6600865388
+      }
+    },
+    {
+      "name": "shop:flooring",
+      "q": "Floors by Comfi Interiors, Milton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2204624763
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Listowel Memorial Park, North Perth",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 833327773
+      }
+    },
+    {
+      "name": "amenity:fire_station",
+      "q": "Floradale Fire Station, Woolwich",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 638844954
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Family of Faith Christian Fellowship, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 190105389
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Pro Oil Change, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 437627525
+      }
+    },
+    {
+      "name": "tourism:museum",
+      "q": "Michael Lee-Chin Crystal, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 214312074
+      }
+    },
+    {
+      "name": "building:service",
+      "q": "Wastewater Pumping Station #11, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 208936870
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "House of Styles Hair Design, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2767105863
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Outtakes Backstage Bistro, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13107792906
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "Garrison Creek Toronto Western Health Care Team, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7578971620
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Le Cafe Siam, St. Thomas",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7795521097
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Tuv Sud, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6171378422
+      }
+    },
+    {
+      "name": "amenity:fuel",
+      "q": "Shell, Huron East",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 525883322
+      }
+    },
+    {
+      "name": "amenity:doctors",
+      "q": "Dr Anthony Lentini, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4066748991
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Ghost Taco, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13239917083
+      }
+    },
+    {
+      "name": "tourism:chalet",
+      "q": "Charlton Lake Camp, Unorganized North Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3769188390
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Ramen Isshin, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2930382420
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Interstone, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5762506264
+      }
+    },
+    {
+      "name": "shop:furniture",
+      "q": "Mobilia, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13374887884
+      }
+    },
+    {
+      "name": "shop:dry_cleaning",
+      "q": "LV Cleaners, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12720457663
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Scarborough Pumping Station, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 43604225
+      }
+    },
+    {
+      "name": "shop:beauty",
+      "q": "Smudge Beauty Bar, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4463691413
+      }
+    },
+    {
+      "name": "shop:paint",
+      "q": "Dulux Paints, Welland",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 190371520
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Amici Italian Eatery & Bar, Sarnia",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6689585941
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Carling Tot Lot, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 246627468
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Walmart Intimate, Oshawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 583059415
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "The Boulevard, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 61843013
+      }
+    },
+    {
+      "name": "shop:yes",
+      "q": "Gateway North Outfitters, Chapple Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5545183832
+      }
+    },
+    {
+      "name": "historic:wreck",
+      "q": "Niagara Scow, Niagara Falls",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 248431076
+      }
+    },
+    {
+      "name": "amenity:bar",
+      "q": "Blue Bird Bar, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1370481302
+      }
+    },
+    {
+      "name": "shop:books",
+      "q": "Dark Horse Comics, North Bay",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1089785673
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Lucas Cafe, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13050362394
+      }
+    },
+    {
+      "name": "shop:pet",
+      "q": "NAFB Aquarium Centre, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10084974442
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Aki Donburi, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6551628747
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "Youth Net, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5764321700
+      }
+    },
+    {
+      "name": "shop:books",
+      "q": "Alphabet Bookshop, Port Colborne",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9972415117
+      }
+    },
+    {
+      "name": "amenity:bus_station",
+      "q": "Mohawk College Terminal, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9403952205
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Johnson & Robertson Financial Services, Meaford",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3667447916
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Graphic Wear House, Collingwood",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2471078794
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "École secondaire du Sacré-Coeur, Greater Sudbury",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 758456583
+      }
+    },
+    {
+      "name": "shop:chocolate",
+      "q": "Delight Chocolate, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6491294173
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Linh Anh Vietnamese Cuisine – Unionville, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11310904722
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Toronto Chinese Baptist Church, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 691478335
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Earl Horst Systems Ltd., Woolwich",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 590214489
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Meinzinger Park, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 68282586
+      }
+    },
+    {
+      "name": "leisure:miniature_golf",
+      "q": "Ure's Mini Golf, Amherstburg",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1100680368
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Bell Canada St Catharines-Linwell STCTON11DS0, St. Catharines",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 59257012
+      }
+    },
+    {
+      "name": "leisure:golf_course",
+      "q": "Manitoulin Island Country Club, Gordon/Barrie Island",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 125115069
+      }
+    },
+    {
+      "name": "shop:pet",
+      "q": "Pawpals, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3494914032
+      }
+    },
+    {
+      "name": "shop:photo",
+      "q": "Regal Photo, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6586988235
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Supreme Chinese B-B-Q, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11899038985
+      }
+    },
+    {
+      "name": "shop:bakery",
+      "q": "Coven Vegan Market, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13261987601
+      }
+    },
+    {
+      "name": "shop:car",
+      "q": "Stauffer Ford, Tillsonburg",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 200478619
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Gold Scissors, Ajax",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6606207557
+      }
+    },
+    {
+      "name": "amenity:post_depot",
+      "q": "Canada Post - Windsor Distribution Centre, Windsor",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 206185342
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Horseshoes Paavilion, Tweed",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 626526073
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Luna Dentistry, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 992352389
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Hideaway hair lounge, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9251342988
+      }
+    },
+    {
+      "name": "shop:dry_cleaning",
+      "q": "Riverdale Cleaners - Professional Wet Cleaning and Valet, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5426989322
+      }
+    },
+    {
+      "name": "shop:deli",
+      "q": "Old Fashioned Deli, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9000088082
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Hair Masters, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6985701045
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Paste Dental, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13720154537
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Cindy's Restaurant, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6146660587
+      }
+    },
+    {
+      "name": "shop:interior_decoration",
+      "q": "Decor Amour, Welland",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6632513438
+      }
+    },
+    {
+      "name": "amenity:stripclub",
+      "q": "Kennedy's Adult Entertainment, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2072105959
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Former General Hospital, Sault Ste. Marie",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 264948188
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "Habesha Variety, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6359386928
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Pineland Baptist Church, Burlington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 43939252
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Atlanta Motel, Orangeville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2141393750
+      }
+    },
+    {
+      "name": "building:greenhouse",
+      "q": "Crop Science Greenhouse, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 161129135
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Guildwood Park, Clarington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 34362791
+      }
+    },
+    {
+      "name": "amenity:cafe",
+      "q": "The Coffee Exchange, Windsor",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3090114269
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "New Age Medical Spa and Laser Clinic Cambridge, Cambridge",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11187716554
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Kyushu Yakitori Izakaya, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13574805901
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Westfield Secondary School, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5444147981
+      }
+    },
+    {
+      "name": "amenity:cafe",
+      "q": "Coffee Culture, Stratford",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3522200980
+      }
+    },
+    {
+      "name": "leisure:swimming_pool",
+      "q": "Flagstaff Park Outdoor Pool, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 79879636
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "On Route Auto Sales & Services, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 248422525
+      }
+    },
+    {
+      "name": "building:commercial",
+      "q": "Village Health Centre, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 469753825
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Place Brian Bourns, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 167410322
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Stamford Presbysterian Church, Niagara Falls",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 796721194
+      }
+    },
+    {
+      "name": "building:terrace",
+      "q": "Shirley Pllace, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 661920222
+      }
+    },
+    {
+      "name": "shop:jewelry",
+      "q": "Oliver Jewellery, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6332297844
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "Jean Coutu, Cornwall",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 601870505
+      }
+    },
+    {
+      "name": "amenity:pharmacy",
+      "q": "Queen's Pharmacy, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 630053621
+      }
+    },
+    {
+      "name": "amenity:pub",
+      "q": "The Corktown Pub, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 279057458
+      }
+    },
+    {
+      "name": "office:insurance",
+      "q": "Allstate, East York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3465460992
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Harvest Call Victory Church, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13236737832
+      }
+    },
+    {
+      "name": "leisure:pitch",
+      "q": "Windsor Rogues Rugby Field, Windsor",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 657987610
+      }
+    },
+    {
+      "name": "building:university",
+      "q": "McLaughlin Hall, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 5145330
+      }
+    },
+    {
+      "name": "leisure:fitness_centre",
+      "q": "Planet Fitness, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3908512867
+      }
+    },
+    {
+      "name": "leisure:garden",
+      "q": "Arts-Environment Gardens, Waterloo",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6680555712
+      }
+    },
+    {
+      "name": "shop:interior_decoration",
+      "q": "Wholesale Granite, Whitby",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4327322590
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Quiznos, Orangeville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1346360426
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Sushi Bong, Markham",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7089549864
+      }
+    },
+    {
+      "name": "shop:greengrocer",
+      "q": "Baily's Farm & Market, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1996952871
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Long Gui BBQ, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3733356264
+      }
+    },
+    {
+      "name": "building:hotel",
+      "q": "Building 29, Huntsville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 602728236
+      }
+    },
+    {
+      "name": "office:financial_advisor",
+      "q": "Mortgage Architects, Lincoln",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12092154594
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Daquin, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6200051284
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "St. Teresa of Calcutta Catholic Elementary School, Cambridge",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 180347391
+      }
+    },
+    {
+      "name": "shop:laundry",
+      "q": "Santo Antonio Coin Laundry, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13343131535
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Rainbow Sushi, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7553017337
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Swift Delivery Systems, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6123853936
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Uptowne Dental, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1416807390
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Kelsey's, Kawartha Lakes",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 179548988
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Church of the Transfiguration, St. Catharines",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13194623434
+      }
+    },
+    {
+      "name": "amenity:doctors",
+      "q": "Credit Valley Medical Arts Building, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 33076181
+      }
+    },
+    {
+      "name": "shop:tattoo",
+      "q": "TBP Tattoo Studio, St. Catharines",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 693749743
+      }
+    },
+    {
+      "name": "amenity:ice_cream",
+      "q": "Tip Top Creamery, Whitby",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12550923101
+      }
+    },
+    {
+      "name": "building:commercial",
+      "q": "Reis Informatica, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1307327156
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Jackson Park, Chatham-Kent",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 210135738
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Hair Studio 138, Carleton Place",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6654004750
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "St. Urbain Bagel, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7557332746
+      }
+    },
+    {
+      "name": "amenity:parking",
+      "q": "Visitor Parking, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 856152778
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "Bell Court Playground, Stratford",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1088314306
+      }
+    },
+    {
+      "name": "amenity:car_wash",
+      "q": "Sunrise Car Wash, Hamilton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 260043324
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "City South Pizza, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10777146873
+      }
+    },
+    {
+      "name": "shop:laundry",
+      "q": "Huge Coin Laundry, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6371265840
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "WorleyParsons, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 34582246
+      }
+    },
+    {
+      "name": "healthcare:yes",
+      "q": "Guelph Medical Imaging, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10245088067
+      }
+    },
+    {
+      "name": "shop:money_lender",
+      "q": "Cash Payday, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4070760198
+      }
+    },
+    {
+      "name": "shop:car_parts",
+      "q": "Benson Auto Parts, North Dundas",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8241489444
+      }
+    },
+    {
+      "name": "amenity:social_facility",
+      "q": "Caressant Care Lindsay Nursing Home, Kawartha Lakes",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7315359574
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Skye Motel, Scugog",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3929619035
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Antique Cars, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 192960568
+      }
+    },
+    {
+      "name": "shop:appliance",
+      "q": "Good Choice Appliance Ltd., Huron East",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 658192113
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Harrington Gardens, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 32802968
+      }
+    },
+    {
+      "name": "building:commercial",
+      "q": "Cooper Bros, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 262108499
+      }
+    },
+    {
+      "name": "amenity:library",
+      "q": "London Public Library - Cherryhill, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1459648824
+      }
+    },
+    {
+      "name": "building:yes",
+      "q": "Salle Paroissiale, Tiny",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 516647736
+      }
+    },
+    {
+      "name": "shop:bakery",
+      "q": "Sunlight Bakery, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7559831080
+      }
+    },
+    {
+      "name": "building:residential",
+      "q": "Southgate Residence, Kingsville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 584779790
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Curtis Dining Hall, Essa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 483983829
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "Cottam Convenience, Kingsville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 979898750
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Marathon Thift Store, Marathon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8735005507
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Aerotek, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6300350767
+      }
+    },
+    {
+      "name": "shop:hairdresser",
+      "q": "Top Notch Barbershop, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 10856473707
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Mr. Greek, Scarborough",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 58865790
+      }
+    },
+    {
+      "name": "shop:florist",
+      "q": "Fresh Floral Creations, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13025831402
+      }
+    },
+    {
+      "name": "amenity:social_centre",
+      "q": "Royal Canadian Legion Port Carling Branch 529, Muskoka Lakes Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 140968443
+      }
+    },
+    {
+      "name": "aeroway:aerodrome",
+      "q": "Kirkfield Airport, Kawartha Lakes",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12897804065
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "ONYT, Nepean",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6144146708
+      }
+    },
+    {
+      "name": "amenity:bar",
+      "q": "Q Bar, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6152753711
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Dr. L. Pincombe, Carleton Place",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6654004752
+      }
+    },
+    {
+      "name": "amenity:fast_food",
+      "q": "Firehouse Subs, Clarington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7073008148
+      }
+    },
+    {
+      "name": "leisure:sauna",
+      "q": "Steamul Sauna, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3750539669
+      }
+    },
+    {
+      "name": "shop:antiques",
+      "q": "McRatterson's Collectables & Antiques, Zorra",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6389481991
+      }
+    },
+    {
+      "name": "amenity:clinic",
+      "q": "North Simcoe Physiotherapy, Oshawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5796287419
+      }
+    },
+    {
+      "name": "leisure:fitness_centre",
+      "q": "Boxing Loft, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12409808848
+      }
+    },
+    {
+      "name": "amenity:car_wash",
+      "q": "Auto Reflections Car Care, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 305065525
+      }
+    },
+    {
+      "name": "tourism:guest_house",
+      "q": "Cedar Drive Bed and Breakfast, North Stormont",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 661495298
+      }
+    },
+    {
+      "name": "office:association",
+      "q": "Sri Sai, Brampton",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6341973944
+      }
+    },
+    {
+      "name": "office:financial_advisor",
+      "q": "Edward Jones, Midland",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 9061486843
+      }
+    },
+    {
+      "name": "amenity:fire_station",
+      "q": "Wiarton Fire Department, South Bruce Peninsula",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 176361874
+      }
+    },
+    {
+      "name": "tourism:museum",
+      "q": "Canadian Museum of Science and Technology, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 68658577
+      }
+    },
+    {
+      "name": "shop:convenience",
+      "q": "Lambton Convenience, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 383629887
+      }
+    },
+    {
+      "name": "shop:furniture",
+      "q": "Interior Today, Hastings Highlands",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1427710176
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Garage, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 1136693059
+      }
+    },
+    {
+      "name": "amenity:bar",
+      "q": "The Fox and the Firkin, Richmond Hill",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 192803962
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Carinderia, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3977372465
+      }
+    },
+    {
+      "name": "leisure:nature_reserve",
+      "q": "Steamboat Island, Neebing",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 72307968
+      }
+    },
+    {
+      "name": "shop:pet",
+      "q": "Essex Feed Warehouse, Town of Essex",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 634352723
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Harmony St. Mark's United Church, St. Joseph Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7089312548
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "L'avenue on Parliament, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4015549353
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Chez Lam, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 622453054
+      }
+    },
+    {
+      "name": "tourism:motel",
+      "q": "Eldo Inn, Blind River",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 2868820198
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Bourk's Complete Car Care, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 68609624
+      }
+    },
+    {
+      "name": "amenity:parking",
+      "q": "Carpark 210, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 33805756
+      }
+    },
+    {
+      "name": "building:university",
+      "q": "Generator Building, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 136468371
+      }
+    },
+    {
+      "name": "leisure:ice_rink",
+      "q": "March Central Park Ice Rink, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 550532594
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Ontario Auto Glass, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5838632394
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Gear Drive Auto, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 11800594914
+      }
+    },
+    {
+      "name": "amenity:bicycle_rental",
+      "q": "Bloor St W / Shaw St - SMART, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6363176125
+      }
+    },
+    {
+      "name": "amenity:college",
+      "q": "Collège La Cité, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 226380804
+      }
+    },
+    {
+      "name": "building:university",
+      "q": "Brescia College, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 147379380
+      }
+    },
+    {
+      "name": "historic:memorial",
+      "q": "East Ferris Cenotaph, East Ferris Township",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3393981315
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Alia N TanJay, Welland",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6632513406
+      }
+    },
+    {
+      "name": "building:greenhouse",
+      "q": "N. Sawatzky Farms, Leamington",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 489166091
+      }
+    },
+    {
+      "name": "tourism:camp_site",
+      "q": "Lake Apsey Resort Campground & RV, Espanola",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 397691687
+      }
+    },
+    {
+      "name": "shop:tea",
+      "q": "Ten Ren's Tea, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6551108422
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Downsview Secondary School, North York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 35668101
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Formo Sourdough Pizza and Bread, Westport",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 288979017
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Portabella, Prince Edward County",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4890523021
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Nai Nai, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12253332456
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Nuvo at Essex I, Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 170053034
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Corporate Assets Inc., Etobicoke",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 8946578670
+      }
+    },
+    {
+      "name": "office:accountant",
+      "q": "J & D Tax Services, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 5833729290
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Glenview Senior Public School, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 34315338
+      }
+    },
+    {
+      "name": "shop:mobile_phone",
+      "q": "The Mobile Store, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 6340941059
+      }
+    },
+    {
+      "name": "leisure:nature_reserve",
+      "q": "Brucedale Conservation Area, Kincardine",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 1387395657
+      }
+    },
+    {
+      "name": "healthcare:optometrist",
+      "q": "Cobourg Vision Care Optometrists, Cobourg",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 598639274
+      }
+    },
+    {
+      "name": "shop:florist",
+      "q": "Flower Shop, Niagara-on-the-Lake",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 3404362073
+      }
+    },
+    {
+      "name": "leisure:common",
+      "q": "The Archers Of Caledon, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 43936226
+      }
+    },
+    {
+      "name": "historic:monument",
+      "q": "Memory Lane Park, The Blue Mountains",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 495326936
+      }
+    },
+    {
+      "name": "shop:bakery",
+      "q": "The French Baker, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4458638690
+      }
+    },
+    {
+      "name": "office:company",
+      "q": "Sanmina, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 397299565
+      }
+    },
+    {
+      "name": "leisure:park",
+      "q": "West Crossroads Park, Vaughan",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 161614387
+      }
+    },
+    {
+      "name": "amenity:restaurant",
+      "q": "Bangkok Thai Station, Belleville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 7528049591
+      }
+    },
+    {
+      "name": "amenity:dentist",
+      "q": "Danforth Dental Solutions, Toronto",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 12995038524
+      }
+    },
+    {
+      "name": "leisure:pitch",
+      "q": "#1 Softball, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 10613499
+      }
+    },
+    {
+      "name": "amenity:school",
+      "q": "Holy Family School, Caledon",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 282095149
+      }
+    },
+    {
+      "name": "amenity:place_of_worship",
+      "q": "Light Presbyterian Church, Mississauga",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 178592986
+      }
+    },
+    {
+      "name": "shop:supermarket",
+      "q": "Metro, Brockville",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 412977371
+      }
+    },
+    {
+      "name": "building:apartments",
+      "q": "Bagot Lofts, Kingston",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 657305401
+      }
+    },
+    {
+      "name": "building:retail",
+      "q": "Fore Golfers Only, Central Elgin",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 650031860
+      }
+    },
+    {
+      "name": "office:religion",
+      "q": "Diocese Of London, London",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 4969154820
+      }
+    },
+    {
+      "name": "shop:car_repair",
+      "q": "Viselco, York",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 383629955
+      }
+    },
+    {
+      "name": "amenity:cafe",
+      "q": "Chat Time, Guelph",
+      "limit": 5,
+      "expect": {
+        "osm_type": "node",
+        "osm_id": 13237975636
+      }
+    },
+    {
+      "name": "leisure:sports_centre",
+      "q": "Forest Heights Pool, Kitchener",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 67379262
+      }
+    },
+    {
+      "name": "shop:clothes",
+      "q": "Eclipse, Ottawa",
+      "limit": 5,
+      "expect": {
+        "osm_type": "way",
+        "osm_id": 528170395
+      }
+    }
+  ]
+}
