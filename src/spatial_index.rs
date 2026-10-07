@@ -473,6 +473,43 @@ impl SpatialIndexReader {
         Ok(closest_candidates(candidates, limit))
     }
 
+    /// Whether any context point of `layer` within `radius_m` satisfies
+    /// `matches`, scanning rings outward and stopping at the first match.
+    /// `None` when there is no point of that layer within the radius at all.
+    pub fn any_context_point(
+        &self,
+        lon: f64,
+        lat: f64,
+        layer: Layer,
+        radius_m: f64,
+        mut matches: impl FnMut(RecordId) -> Result<bool>,
+    ) -> Result<Option<bool>> {
+        let Ok(lat_lng) = LatLng::new(lat, lon) else {
+            return Ok(None);
+        };
+        let mut cells = lat_lng
+            .to_cell(H3_CONTEXT_RESOLUTION)
+            .grid_disk_distances::<Vec<(CellIndex, u32)>>(disk_k(H3_CONTEXT_RESOLUTION, radius_m));
+        cells.sort_unstable_by_key(|(cell, k)| (*k, u64::from(*cell)));
+        let mut seen = false;
+        for (cell, _) in cells {
+            let Some(refs) = self.context.refs(u64::from(cell))? else {
+                continue;
+            };
+            for record_id in refs.points {
+                let (point_layer, point_lon, point_lat) = self.records.point(record_id)?;
+                if point_layer != layer || haversine_m(lon, lat, point_lon, point_lat) > radius_m {
+                    continue;
+                }
+                seen = true;
+                if matches(record_id)? {
+                    return Ok(Some(true));
+                }
+            }
+        }
+        Ok(seen.then_some(false))
+    }
+
     /// Like [`Self::context_candidates`], restricted to one context layer.
     pub fn context_layer_candidates(
         &self,
@@ -845,7 +882,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer = RecordsWriter::create(&scratch).expect("records");
+        let mut writer =
+            RecordsWriter::create(&scratch, &MemoryBudget::unlimited()).expect("records");
         let mut spatial = SpatialIndexWriter::new(&scratch, &MemoryBudget::unlimited(), 64);
         for record in records {
             let id = writer.write(record, None).expect("write");

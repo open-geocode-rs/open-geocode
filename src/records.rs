@@ -44,6 +44,7 @@ use serde_json::{Value, json};
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     extsort::Scratch,
+    memory::{MemoryBudget, Reservation},
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
@@ -60,6 +61,9 @@ pub const SECTION_STRINGS: &str = "records/strings";
 pub const RECORDS_VERSION: u32 = 3;
 
 pub const BLOCK_RECORDS: u64 = 64;
+/// Approximate bytes a dictionary entry costs beyond its text: the boxed
+/// key, the id and the hash table slot.
+const DICTIONARY_ENTRY_OVERHEAD: usize = 48;
 /// Records per string segment.
 pub const SEGMENT_RECORDS: u64 = 1 << 20;
 const COORDINATE_SCALE: f64 = 10_000_000.0;
@@ -239,6 +243,9 @@ pub struct RecordsWriter {
 /// files; only the current segment's dictionary is held in memory.
 struct StringTable {
     ids: HashMap<Box<str>, u32>,
+    /// The dictionary's memory, held against the build budget. It cannot
+    /// spill, but it is bounded by one segment and released at the next.
+    memory: Reservation,
     segment_records: u64,
     segment_firsts: Vec<u64>,
     count: u64,
@@ -261,17 +268,22 @@ impl StringTable {
         self.ends.write_all(&self.bytes_len.to_le_bytes())?;
         self.count += 1;
         self.ids.insert(value.into(), id);
+        let bytes = value.len() + DICTIONARY_ENTRY_OVERHEAD;
+        if !self.memory.try_grow(bytes) {
+            self.memory.force_grow(bytes);
+        }
         Ok(id)
     }
 
     fn start_segment(&mut self) {
-        self.ids.clear();
+        self.ids = HashMap::new();
+        self.memory.release_all();
         self.segment_firsts.push(self.count);
     }
 }
 
 impl RecordsWriter {
-    pub fn create(scratch: &Arc<Scratch>) -> Result<Self> {
+    pub fn create(scratch: &Arc<Scratch>, budget: &Arc<MemoryBudget>) -> Result<Self> {
         let blocks_path = scratch.path().join("records-blocks.bin");
         let block_offsets_path = scratch.path().join("records-block-offsets.bin");
         let bytes_path = scratch.path().join("records-strings.bin");
@@ -295,6 +307,7 @@ impl RecordsWriter {
             record_count: 0,
             strings: StringTable {
                 ids: HashMap::new(),
+                memory: Reservation::empty(budget),
                 segment_records: SEGMENT_RECORDS,
                 segment_firsts: Vec::new(),
                 count: 0,
@@ -693,6 +706,25 @@ impl RecordsReader {
             label,
             point: Some(header.point()),
             source,
+        })
+    }
+
+    /// The postcode an address, interpolation or postcode record states,
+    /// without decoding its geometry.
+    pub fn postcode(&self, id: RecordId) -> Result<Option<String>> {
+        let (header, mut fields) = self.body(id)?;
+        Ok(match header.layer {
+            Layer::Address => {
+                self.address_components(header.strings, &mut fields)?
+                    .postcode
+            }
+            Layer::Interpolation => {
+                self.interpolation_fields(header.strings, &mut fields)?
+                    .0
+                    .postcode
+            }
+            Layer::Postcode => Some(self.string_field(header.strings, &mut fields)?.to_string()),
+            _ => None,
         })
     }
 
@@ -1116,7 +1148,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-records-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer = RecordsWriter::create(&scratch).expect("writer");
+        let mut writer =
+            RecordsWriter::create(&scratch, &MemoryBudget::unlimited()).expect("writer");
         for (index, record) in records.iter().enumerate() {
             let id = writer
                 .write(record, contexts.get(index).copied().flatten())
@@ -1170,7 +1203,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-segments-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer = RecordsWriter::create(&scratch)
+        let budget = MemoryBudget::unlimited();
+        let mut writer = RecordsWriter::create(&scratch, &budget)
             .expect("writer")
             .with_segment_records(100);
         let base = sample_records().remove(0);
@@ -1185,12 +1219,14 @@ mod tests {
             }
             writer.write(&record, None).expect("write");
             most_resident = most_resident.max(writer.resident_strings());
+            assert!(budget.used() >= writer.resident_strings() * DICTIONARY_ENTRY_OVERHEAD);
             records.push(record);
         }
         assert!(
             most_resident <= 100 + 12,
             "dictionary held {most_resident} strings"
         );
+        assert!(budget.peak() < 200 * (DICTIONARY_ENTRY_OVERHEAD + 16));
         let path = root.join("pack.ogp");
         let mut pack = ContainerWriter::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");

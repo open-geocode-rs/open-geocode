@@ -44,24 +44,27 @@ Building the Ontario pack (~940 MB PBF) takes under a minute on a 24-core machin
 
 ## Building large extracts and the planet
 
-The builder streams: OSM objects, node references, coordinates, and finished records flow through external sorts, so memory stays within `--memory-budget-mb` whatever the input size.
+The builder streams: OSM objects, node references, coordinates, and finished records flow through external sorts, so its large buffers stay within `--memory-budget-mb` whatever the input size.
 A region fits in the budget and never touches disk; a country or the planet spills sorted runs to scratch files and merges them, through the same code.
 
 ```
 cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-budget-mb 16384 --scratch-dir /mnt/fast-ssd/og-scratch
 ```
 
-- `--memory-budget-mb` (default 1024, minimum 64) is one shared pool for the build's large buffers: sort buffers (counted by capacity), merge read buffers, and the text indexing buffers.
-  A buffer that would overflow the pool spills to disk instead, and the build report records the tracked peak (`scratch.peak_tracked_bytes`).
-  Larger budgets mainly help very large inputs by reducing the number of runs to merge.
-- The budget is not the whole process size.
-  On top of it come the PBF blocks being decoded (a few hundred MB on a many-core machine), the admin boundary polygons, the postcode centroids, one segment of the string table (at most about a million strings), and the operating system's cache of mapped files.
+- `--memory-budget-mb` (default 1024, minimum 64) is one shared pool for the build's large buffers: sort buffers (counted by capacity), the string table of the current segment, merge read buffers, and the text indexing buffers.
+  Each sorter gets a quarter of the pool and the text index a quarter, reserved only while records are written.
+  A sort buffer that would overflow the pool spills to disk.
+  The build report records the tracked peak (`scratch.peak_tracked_bytes`).
+- A few reservations are needed to make progress and are taken even when the pool is full, so the tracked peak can pass the budget slightly:
+  merge read buffers (64 KiB to 1 MiB per run file being merged, sized from the sorter's share), the text index's minimum of 16 MiB, and the string table, which cannot spill but restarts every 1,048,576 records.
+  A segment holds at most eight new strings per record, in practice far fewer because names repeat.
+- The process also uses memory outside the pool: the PBF blocks being decoded (a few hundred MB on a many-core machine), the admin boundary polygons, the postcode centroids, and the operating system's cache of mapped files.
 - `--scratch-dir` puts temporary files on a different disk; it defaults to the Pack directory.
   Each sorted run is deleted as soon as it has been merged, and the whole scratch directory is removed when the build ends.
   Ontario writes about 1 GB of scratch in total for a 0.94 GB input.
 - The input must be sorted by type and id, which Geofabrik and planet.openstreetmap.org files are.
   Run `osmium sort` on anything else; the builder stops with an error on unsorted nodes.
-- Admin boundary polygons and postcode centroids stay in memory; they grow with the number of boundaries and postcodes, not with the number of addresses.
+- Admin boundary polygons and postcode centroids grow with the number of boundaries and postcodes, not with the number of addresses.
 - `verify-pack --pack <file>` checks a copied or downloaded Pack against its per-section checksums; every build runs the same check before it publishes.
 
 The build report (`audit/build-report.json`) records the time of each phase, how much each sorter spilled, and the size of every Pack section.

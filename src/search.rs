@@ -16,7 +16,7 @@ use tantivy::{
 
 use crate::{
     pack::{PackReader, RecordId, RecordPointPrecision, RecordSummary},
-    record::{Layer, OsmObjectType, Record},
+    record::{Layer, OsmObjectType},
     spatial_index::SpatialIndexReader,
     text_index::{TextIndexFields, normalize_index_text, open_text_index},
 };
@@ -70,11 +70,10 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
-/// Postcode areas consulted for a hit that states no postcode: the nearest
-/// postcode records within this radius, compared on leading characters (a
+/// For a hit that states no postcode: postcode records within this radius are
+/// compared with the requested postcode on their leading characters (a
 /// Canadian FSA, a US sectional centre, the start of a UK outward code).
 const POSTCODE_AREA_RADIUS_M: f64 = 10_000.0;
-const POSTCODE_AREA_CANDIDATES: usize = 16;
 const POSTCODE_AREA_CHARS: usize = 3;
 /// Hits examined per requested hit, so ties at the cutoff can be ordered.
 const RANK_WINDOW_FACTOR: usize = 3;
@@ -318,44 +317,35 @@ impl PackTextSearcher {
     /// the requested postcode's leading characters, the hit is somewhere else.
     /// With no postcode data nearby there is nothing to contradict the row.
     fn hit_in_postcode(&self, hit: &TextSearchHit, desired: &str) -> Result<bool> {
-        let compatible =
-            |postcode: &str| postcode.starts_with(desired) || desired.starts_with(postcode);
-        if let Some(postcode) = self.hit_postcode(hit.record_id)? {
-            return Ok(normalized_postcode_for_match(Some(&postcode))
-                .is_none_or(|postcode| compatible(&postcode)));
+        if let Some(postcode) = self.pack.records().postcode(hit.record_id)? {
+            return Ok(
+                normalized_postcode_for_match(Some(&postcode)).is_none_or(|postcode| {
+                    postcode.starts_with(desired) || desired.starts_with(postcode.as_str())
+                }),
+            );
         }
         let Some(point) = hit.record.point else {
             return Ok(true);
         };
         let area: String = desired.chars().take(POSTCODE_AREA_CHARS).collect();
-        let nearby = self.spatial.context_layer_candidates(
+        let in_area = self.spatial.any_context_point(
             point.lon,
             point.lat,
             Layer::Postcode,
             POSTCODE_AREA_RADIUS_M,
-            POSTCODE_AREA_CANDIDATES,
+            |record_id| {
+                Ok(self
+                    .pack
+                    .records()
+                    .postcode(record_id)?
+                    .and_then(|postcode| normalized_postcode_for_match(Some(&postcode)))
+                    .is_some_and(|postcode| {
+                        postcode.starts_with(&area) || area.starts_with(postcode.as_str())
+                    }))
+            },
         )?;
-        if nearby.is_empty() {
-            return Ok(true);
-        }
-        for candidate in nearby {
-            if let Some(record) = self.pack.context_record(candidate.record_id)?
-                && let Some(postcode) = normalized_postcode_for_match(record.postcode.as_deref())
-                && (postcode.starts_with(&area) || area.starts_with(&postcode))
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn hit_postcode(&self, record_id: RecordId) -> Result<Option<String>> {
-        Ok(match self.pack.records().record(record_id)? {
-            Record::Address(record) => record.address.postcode,
-            Record::Interpolation(record) => record.address.postcode,
-            Record::Postcode(record) => Some(record.postcode),
-            Record::Street(_) | Record::Place(..) => None,
-        })
+        // No postcode data nearby means nothing contradicts the row.
+        Ok(in_area.unwrap_or(true))
     }
 
     fn search_fields(&self) -> Vec<tantivy::schema::Field> {
@@ -885,6 +875,50 @@ mod tests {
         assert_eq!(
             geocode(&searcher, "7 Far Road", None, Some("M5V 1A1")).as_deref(),
             Some("osm:node:2")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_accepts_hits_near_a_busier_neighbouring_postcode_area() {
+        let temp_dir = temp_pack_path("geocode-postcode-border");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut border = address_record("osm:node:1", "", "5", "Line Road", None, None);
+        border.geometry = point_geometry(-79.0, 43.0);
+        writer.write(&border.into(), None).expect("address");
+        let mut postcode = |code: String, lon: f64| {
+            writer
+                .write(
+                    &PostcodeRecord {
+                        postcode: code,
+                        geometry: point_geometry(lon, 43.0),
+                        source: DerivedSourceProvenance::osm_address_records(1),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("postcode");
+        };
+        // Twenty centres of the neighbouring area right next to the address,
+        // and the address's own area 8 km away.
+        for index in 0..20 {
+            postcode(
+                format!("B2B {index}A{index}"),
+                -79.0 + 0.0001 * index as f64,
+            );
+        }
+        postcode("A1A 1A1".to_string(), -78.9);
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "5 Line Road", None, Some("A1A 2B2")).as_deref(),
+            Some("osm:node:1")
+        );
+        assert_eq!(
+            geocode(&searcher, "5 Line Road", None, Some("C3C 3C3")),
+            None
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }

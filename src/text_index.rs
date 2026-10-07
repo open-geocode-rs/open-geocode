@@ -39,17 +39,19 @@ use crate::{
 pub const TEXT_SECTION_PREFIX: &str = "text/";
 pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 5;
 
-/// Tantivy needs at least 15 MB per indexing thread and uses up to 8 threads;
-/// beyond 1.6 GB more buffer stops paying off.
-const MIN_INDEX_MEMORY_BYTES: usize = 128 << 20;
+/// Tantivy needs at least 15 MB per indexing thread (it uses fewer threads
+/// when given less) and gains little beyond 1.6 GB.
+const MIN_INDEX_MEMORY_BYTES: usize = 16 << 20;
 const MAX_INDEX_MEMORY_BYTES: usize = 1_600_000_000;
 const TEXT_INDEX_BATCH_SIZE: usize = 10_000;
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 
 pub struct TextIndexWriter {
-    writer: IndexWriter,
-    /// Tantivy's indexing buffers, held against the build budget.
-    _memory: Reservation,
+    /// Created with the first document, so its buffers are reserved only for
+    /// the phase that writes records.
+    writer: Option<(IndexWriter, Reservation)>,
+    budget: Arc<MemoryBudget>,
+    memory_bytes: usize,
     index: Index,
     path: PathBuf,
     fields: TextIndexFields,
@@ -109,22 +111,16 @@ impl TextIndexWriter {
         budget: &Arc<MemoryBudget>,
         memory_bytes: usize,
     ) -> Result<Self> {
-        let memory_bytes = memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES);
         let (schema, fields) = build_schema();
         let path = scratch.path().join("text");
         fs::create_dir_all(&path)
             .with_context(|| format!("failed to create {}", path.display()))?;
         let index = Index::create_in_dir(&path, schema)
             .with_context(|| format!("failed to create Tantivy index {}", path.display()))?;
-        let writer = index
-            .writer(memory_bytes)
-            .context("failed to create Tantivy index writer")?;
-        // Disable background auto-merges during the build so the only merge is
-        // the single deterministic one forced in `finish()`.
-        writer.set_merge_policy(Box::new(NoMergePolicy));
         Ok(Self {
-            writer,
-            _memory: Reservation::forced(budget, memory_bytes),
+            writer: None,
+            budget: Arc::clone(budget),
+            memory_bytes: memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES),
             index,
             path,
             fields,
@@ -135,6 +131,26 @@ impl TextIndexWriter {
 
     pub fn fields(&self) -> TextIndexFields {
         self.fields
+    }
+
+    fn writer(&mut self) -> Result<&mut IndexWriter> {
+        if self.writer.is_none() {
+            // Reserve before Tantivy allocates; the share was sized within the
+            // budget, so this only overshoots if a caller asked for more.
+            let mut memory = Reservation::empty(&self.budget);
+            if !memory.try_grow(self.memory_bytes) {
+                memory.force_grow(self.memory_bytes);
+            }
+            let writer = self
+                .index
+                .writer(self.memory_bytes)
+                .context("failed to create Tantivy index writer")?;
+            // Disable background auto-merges during the build so the only
+            // merge is the single deterministic one forced in `finish()`.
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            self.writer = Some((writer, memory));
+        }
+        Ok(&mut self.writer.as_mut().expect("writer created").0)
     }
 
     pub fn add(&mut self, document: TantivyDocument) -> Result<()> {
@@ -154,7 +170,7 @@ impl TextIndexWriter {
             &mut self.pending_documents,
             Vec::with_capacity(TEXT_INDEX_BATCH_SIZE),
         );
-        self.writer
+        self.writer()?
             .run(documents.into_iter().map(UserOperation::Add))
             .context("failed to batch index records")?;
         Ok(())
@@ -163,7 +179,9 @@ impl TextIndexWriter {
     /// Commit, merge to a single segment and copy the index into the Pack.
     pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<TextIndexCommit> {
         self.flush()?;
-        self.writer
+        self.writer()?;
+        let (mut writer, memory) = self.writer.take().expect("writer created");
+        writer
             .commit()
             .context("failed to commit Tantivy text index")?;
         let segment_ids = self
@@ -171,21 +189,22 @@ impl TextIndexWriter {
             .searchable_segment_ids()
             .context("failed to list text index segments")?;
         if segment_ids.len() > 1 {
-            self.writer
+            writer
                 .merge(&segment_ids)
                 .wait()
                 .context("failed to merge text index segments")?;
-            self.writer
+            writer
                 .commit()
                 .context("failed to commit merged text index")?;
         }
-        self.writer
+        writer
             .garbage_collect_files()
             .wait()
             .context("failed to garbage collect text index files")?;
-        self.writer
+        writer
             .wait_merging_threads()
             .context("failed to stop Tantivy indexing threads")?;
+        drop(memory);
 
         let mut files = fs::read_dir(&self.path)?
             .map(|entry| entry.map(|entry| entry.path()))

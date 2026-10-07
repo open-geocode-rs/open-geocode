@@ -166,7 +166,7 @@ impl PackWriter {
                 .unwrap_or_else(|| generation.path.join(SCRATCH_DIR)),
         )?;
         Ok(Self {
-            records: RecordsWriter::create(&scratch)?,
+            records: RecordsWriter::create(&scratch, &options.memory)?,
             contexts: ContextTupleWriter::default(),
             text: TextIndexWriter::create(
                 &scratch,
@@ -735,6 +735,39 @@ mod tests {
         assert!(result.is_err());
         // CURRENT already names the new generation, so it must still exist.
         assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
+    }
+
+    #[test]
+    fn text_index_memory_fits_the_budget_and_waits_for_records() {
+        let root = temp_root("text-memory");
+        let memory = MemoryBudget::new(64 << 20);
+        let mut writer = PackWriter::create_with(
+            &root,
+            PackWriterOptions {
+                scratch_dir: None,
+                memory: Arc::clone(&memory),
+                sort_budget_bytes: 16 << 20,
+                text_index_memory_bytes: 16 << 20,
+            },
+        )
+        .expect("writer");
+        assert_eq!(
+            memory.used(),
+            0,
+            "nothing is reserved before records arrive"
+        );
+        writer
+            .write(&address_record(1, "10", "King Street"), None)
+            .expect("address");
+        assert!(memory.used() > 0);
+        assert!(
+            memory.peak() <= memory.limit(),
+            "peak {} of {}",
+            memory.peak(),
+            memory.limit()
+        );
+        writer.finish().expect("finish");
+        assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
     }
 
     #[test]

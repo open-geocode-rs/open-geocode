@@ -40,6 +40,8 @@ const MAX_MERGE_FAN_IN: usize = 64;
 const MIN_RUN_FRACTION: usize = 16;
 /// Smallest buffer growth step, in items.
 const MIN_CAPACITY: usize = 1_024;
+/// Smallest read buffer per run during a merge.
+const MIN_MERGE_BUFFER_BYTES: usize = 64 << 10;
 
 /// A value that can be written to and read back from scratch files.
 pub trait Spill: Sized {
@@ -195,13 +197,17 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             let batch = self.runs.drain(..MAX_MERGE_FAN_IN).collect::<Vec<_>>();
             let merged = self.scratch.new_file(self.label);
             let mut writer = SpoolWriter::<T>::create(&self.scratch, &merged)?;
-            for item in Merge::<T>::open(&batch, &self.budget)? {
+            for item in Merge::<T>::open(&batch, &self.budget, self.share_bytes)? {
                 writer.write(&item?)?;
             }
             writer.finish()?;
             self.runs.insert(0, merged);
         }
-        Ok(Sorted::Merge(Merge::open(&self.runs, &self.budget)?))
+        Ok(Sorted::Merge(Merge::open(
+            &self.runs,
+            &self.budget,
+            self.share_bytes,
+        )?))
     }
 
     fn spill(&mut self) -> Result<()> {
@@ -280,12 +286,20 @@ impl<T: Ord> Ord for HeapEntry<T> {
 impl<T: Spill + Ord> Merge<T> {
     /// Each run is read exactly once, so its file is deleted as soon as the
     /// merge is dropped; at planet scale this frees scratch disk between phases.
-    fn open(runs: &[PathBuf], budget: &Arc<MemoryBudget>) -> Result<Self> {
-        let buffers = Reservation::forced(budget, runs.len() * IO_BUFFER_BYTES);
+    /// Read buffers are sized so all of them fit the sorter's share, between
+    /// [`MIN_MERGE_BUFFER_BYTES`] and [`IO_BUFFER_BYTES`] each. They are needed
+    /// to make progress, so they are reserved even when the pool is full.
+    fn open(runs: &[PathBuf], budget: &Arc<MemoryBudget>, share_bytes: usize) -> Result<Self> {
+        let buffer_bytes =
+            (share_bytes / runs.len().max(1)).clamp(MIN_MERGE_BUFFER_BYTES, IO_BUFFER_BYTES);
+        let mut buffers = Reservation::empty(budget);
+        if !buffers.try_grow(runs.len() * buffer_bytes) {
+            buffers.force_grow(runs.len() * buffer_bytes);
+        }
         let mut sources = runs
             .iter()
             .map(|path| {
-                let mut reader = SpoolReader::open(path)?;
+                let mut reader = SpoolReader::open(path, buffer_bytes)?;
                 reader.remove_on_drop = true;
                 Ok(reader)
             })
@@ -359,7 +373,7 @@ impl<T: Spill> Spool<T> {
     /// once the reader is dropped.
     pub fn into_reader(self) -> Result<SpoolReader<T>> {
         self.writer.finish()?;
-        let mut reader = SpoolReader::open(&self.path)?;
+        let mut reader = SpoolReader::open(&self.path, IO_BUFFER_BYTES)?;
         reader.remove_on_drop = true;
         Ok(reader)
     }
@@ -414,11 +428,11 @@ pub struct SpoolReader<T> {
 }
 
 impl<T: Spill> SpoolReader<T> {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, buffer_bytes: usize) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("failed to open scratch file {}", path.display()))?;
         Ok(Self {
-            file: BufReader::with_capacity(IO_BUFFER_BYTES, file),
+            file: BufReader::with_capacity(buffer_bytes, file),
             path: path.to_path_buf(),
             buffer: Vec::new(),
             remove_on_drop: false,
@@ -616,7 +630,7 @@ mod tests {
     fn first_runs_buffers<T>(sorted: &Sorted<T>) -> usize {
         match sorted {
             Sorted::Memory(..) => 0,
-            Sorted::Merge(merge) => merge.sources.len() * IO_BUFFER_BYTES,
+            Sorted::Merge(merge) => merge._buffers.bytes(),
         }
     }
 

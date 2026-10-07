@@ -3,15 +3,17 @@
 //! The node section of a PBF is sorted by id, and the references are sorted by
 //! node id by an external sort, so the join is a single forward merge: no node
 //! table is ever held in memory, and nodes nobody asked for are skipped as they
-//! stream past. Workers decode only coordinates; tags are read from the decoded
-//! block afterwards, and only for the few nodes an interpolation way asked
-//! about.
+//! stream past. Workers decode only coordinates and drop the block; the rare
+//! block holding a node whose tags an interpolation way asked about is read
+//! again from the file for just those tags.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use anyhow::{Result, bail};
-use osmpbf::{Element, PrimitiveBlock};
+use std::{fs::File, io::BufReader};
+
+use anyhow::{Context, Result, bail};
+use osmpbf::{BlobReader, ByteOffset, Element, PrimitiveBlock};
 
 use crate::extsort::{ExternalSorter, Sorted};
 
@@ -27,14 +29,13 @@ pub(crate) struct JoinStats {
     pub missing: u64,
 }
 
-/// Node coordinates of one PBF block in file order, plus the decoded block for
-/// reading tags on demand.
+/// Node coordinates of one PBF block in file order, and where the block is.
 struct NodeBlock {
+    offset: u64,
     nodes: Vec<(i64, i32, i32)>,
-    block: PrimitiveBlock,
 }
 
-fn decode_nodes(block: PrimitiveBlock) -> NodeBlock {
+fn decode_nodes(offset: u64, block: PrimitiveBlock) -> NodeBlock {
     let mut nodes = Vec::new();
     for element in block.elements() {
         match element {
@@ -47,7 +48,7 @@ fn decode_nodes(block: PrimitiveBlock) -> NodeBlock {
             Element::Way(_) | Element::Relation(_) => {}
         }
     }
-    NodeBlock { nodes, block }
+    NodeBlock { offset, nodes }
 }
 
 /// Address tags of the nodes at the given ascending positions within the
@@ -88,6 +89,8 @@ pub(crate) fn join_nodes(
     resolved: &mut ExternalSorter<ResolvedRef>,
 ) -> Result<JoinStats> {
     let mut join = Join {
+        blobs: BlobReader::seekable_from_path(input)
+            .with_context(|| format!("failed to open {}", input.display()))?,
         requests,
         current: None,
         last_node_id: None,
@@ -98,7 +101,7 @@ pub(crate) fn join_nodes(
         input,
         "3/7 join node coordinates",
         Some(node_blobs),
-        |_, block| Ok(decode_nodes(block)),
+        |offset, block| Ok(decode_nodes(offset, block)),
         |block| join.block(block, resolved),
     )?;
     while join.current.is_some() {
@@ -109,6 +112,8 @@ pub(crate) fn join_nodes(
 }
 
 struct Join {
+    /// Re-reads blocks whose node tags were asked for.
+    blobs: BlobReader<BufReader<File>>,
     requests: Sorted<NodeRequest>,
     current: Option<NodeRequest>,
     last_node_id: Option<i64>,
@@ -172,7 +177,11 @@ impl Join {
                 .map(|(position, _)| *position)
                 .collect::<Vec<_>>();
             positions.dedup();
-            let tags = addr_tags_at(&block.block, &positions);
+            let blob = self
+                .blobs
+                .blob_from_offset(ByteOffset(block.offset))
+                .context("failed to re-read a node block")?;
+            let tags = addr_tags_at(&blob.to_primitiveblock()?, &positions);
             for (position, mut reference) in needs_tags {
                 reference.tags = tags.get(&position).cloned();
                 resolved.push(reference)?;
