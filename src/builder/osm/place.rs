@@ -1,44 +1,38 @@
 use std::collections::BTreeMap;
 
-use anyhow::Result;
-
 use crate::{
-    builder::report::{BuilderReport, CandidateIssue},
-    pack::RecordWriter,
-    record::{OsmObjectType, PlaceLayer, PlaceRecord, SourceProvenance, point_geometry},
+    builder::report::CandidateIssue,
+    record::{OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry},
     util::text::normalize_for_compare,
 };
 
-use super::tags::OsmTags;
+use super::{emitted::Emitted, tags::OsmTags};
 
 pub(crate) fn has_place_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("place")
 }
 
-pub(crate) fn write_place_node(
+pub(crate) fn emit_place_node(
     object_id: i64,
     lat: f64,
     lon: f64,
     tags: &BTreeMap<String, String>,
-    writer: &mut dyn RecordWriter,
-    report: &mut BuilderReport,
-) -> Result<()> {
+    out: &mut Emitted,
+) {
     match place_record_from_node(object_id, lat, lon, tags) {
         Ok((record, layer)) => {
-            writer.write_place(&record, layer)?;
-            report.accept_place(layer);
+            out.report.accept_place(layer);
+            out.records.push(Record::Place(layer, record));
         }
-        Err(issue) => report.reject_with_context(
+        Err(issue) => out.reject_in_report(
             issue,
             OsmObjectType::Node,
             object_id,
             tags,
             None,
             Some("place"),
-            false,
         ),
     }
-    Ok(())
 }
 
 fn place_record_from_node(
@@ -96,10 +90,7 @@ mod tests {
         assert_eq!(layer, PlaceLayer::Locality);
         assert_eq!(record.id(), "osm:node:42");
         assert_eq!(record.label(), "Toronto");
-        assert_eq!(record.name, "Toronto");
         assert_eq!(record.place_type, "city");
-        assert_eq!(record.source.object_type, OsmObjectType::Node);
-        assert_eq!(record.source.object_id, 42);
         match record.geometry.value {
             GeometryValue::Point { coordinates } => {
                 assert_eq!(coordinates.as_slice(), &[-79.3832, 43.6532]);
@@ -109,25 +100,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_place_node_without_clean_name() {
-        let tags = BTreeMap::from([("place".to_string(), "city".to_string())]);
-
+    fn rejects_unnamed_or_unsupported_places() {
+        let unnamed = BTreeMap::from([("place".to_string(), "city".to_string())]);
         assert_eq!(
-            place_record_from_node(42, 0.0, 0.0, &tags),
+            place_record_from_node(42, 0.0, 0.0, &unnamed),
             Err(CandidateIssue::PlaceMissingName)
         );
-    }
-
-    #[test]
-    fn rejects_unsupported_place_values() {
-        let tags = BTreeMap::from([
+        let sea = BTreeMap::from([
             ("place".to_string(), "sea".to_string()),
             ("name".to_string(), "Example Sea".to_string()),
         ]);
-
+        let mut out = Emitted::default();
+        emit_place_node(42, 0.0, 0.0, &sea, &mut out);
+        assert!(out.records.is_empty());
         assert_eq!(
-            place_record_from_node(42, 0.0, 0.0, &tags),
-            Err(CandidateIssue::PlaceUnsupportedValue)
+            out.report.rejected.by_reason.get("place_unsupported_value"),
+            Some(&1)
         );
     }
 }

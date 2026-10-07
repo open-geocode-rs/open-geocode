@@ -1,64 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
-
-use anyhow::{Context, Result};
 use geo::{Area, BoundingRect, Centroid, LineString, Point, Polygon, Rect};
 use geojson::{Bbox, Geometry, GeometryValue};
-use osmpbf::Element;
-
-use super::{collector::AddressWayStub, pbf::element_reader_with_progress};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NonPointGeometry {
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
-}
-
-pub(crate) fn resolve_required_node_locations(
-    input: &Path,
-    required_node_ids: &HashSet<i64>,
-) -> Result<HashMap<i64, (f64, f64)>> {
-    let mut node_locations = HashMap::with_capacity(required_node_ids.len());
-    let (reader, progress) = element_reader_with_progress(input, "2/7 resolve node coordinates")?;
-
-    reader
-        .for_each(|element| match element {
-            Element::DenseNode(node) => {
-                if required_node_ids.contains(&node.id()) {
-                    node_locations.insert(node.id(), (node.lat(), node.lon()));
-                }
-            }
-            Element::Node(node) => {
-                if required_node_ids.contains(&node.id()) {
-                    node_locations.insert(node.id(), (node.lat(), node.lon()));
-                }
-            }
-            Element::Way(_) | Element::Relation(_) => {}
-        })
-        .with_context(|| format!("failed to resolve node locations from {}", input.display()))?;
-    progress.finish_with_message("2/7 resolve node coordinates complete");
-
-    Ok(node_locations)
-}
-
-pub(crate) fn resolve_way_points(
-    stub: &AddressWayStub,
-    node_locations: &HashMap<i64, (f64, f64)>,
-) -> Option<Vec<(f64, f64)>> {
-    resolve_node_ref_points(&stub.node_refs, node_locations)
-}
-
-pub(crate) fn resolve_node_ref_points(
-    node_refs: &[i64],
-    node_locations: &HashMap<i64, (f64, f64)>,
-) -> Option<Vec<(f64, f64)>> {
-    let mut points = Vec::with_capacity(node_refs.len());
-    for node_id in node_refs {
-        points.push(*node_locations.get(node_id)?);
-    }
-    Some(points)
 }
 
 pub(crate) fn centroid(points: &[(f64, f64)]) -> Option<(f64, f64)> {
@@ -137,8 +83,6 @@ fn lat_lon_from_position(position: [f64; 2]) -> (f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
 
     #[test]
@@ -197,22 +141,5 @@ mod tests {
             closed_way_polygon_geometry(&[(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (0.0, 0.0)])
                 .is_none()
         );
-    }
-
-    #[test]
-    fn resolves_only_complete_way_points() {
-        let stub = AddressWayStub {
-            object_id: 1,
-            node_refs: vec![10, 11],
-            tags: BTreeMap::new(),
-        };
-        let complete = HashMap::from([(10, (1.0, 2.0)), (11, (3.0, 4.0))]);
-        let incomplete = HashMap::from([(10, (1.0, 2.0))]);
-
-        assert_eq!(
-            resolve_way_points(&stub, &complete),
-            Some(vec![(1.0, 2.0), (3.0, 4.0)])
-        );
-        assert_eq!(resolve_way_points(&stub, &incomplete), None);
     }
 }

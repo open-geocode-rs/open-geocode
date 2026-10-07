@@ -1,35 +1,32 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
-    path::Path,
+    collections::{BTreeMap, HashMap, HashSet},
 };
 
-use anyhow::{Context, Result};
 use geo::{
     Area, BoundingRect, Centroid, Contains, Covers, LineString, MultiPolygon, Point, Polygon, Rect,
 };
-use osmpbf::Element;
 use rstar::{AABB, RTree, RTreeObject};
 
 use crate::{
     builder::report::BuilderReport,
-    context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN},
-    pack::{PackWriter, RecordId, RecordWriter},
-    record::{
-        AddressRecord, InterpolationRecord, OsmObjectType, PlaceLayer, PlaceRecord, PostcodeRecord,
-        SourceProvenance, StreetRecord, point_geometry,
-    },
-    util::{geo::point_lon_lat, text::normalize_for_compare},
+    context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext},
+    pack::RecordId,
+    record::{OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry},
+    util::text::normalize_for_compare,
 };
 
-use super::{pbf::element_reader_with_progress, tags::OsmTags};
+use super::tags::OsmTags;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BoundaryWayStub {
-    pub object_id: i64,
-    pub node_refs: Vec<i64>,
-    pub tags: BTreeMap<String, String>,
-}
+/// Tags a boundary keeps after the scan.
+const BOUNDARY_TAG_KEYS: [&str; 6] = [
+    "ISO3166-1:alpha2",
+    "ISO3166-2",
+    "admin_level",
+    "boundary",
+    "country_code",
+    "name",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundaryRelationStub {
@@ -50,6 +47,22 @@ pub(crate) enum BoundaryMemberRole {
     Inner,
 }
 
+/// A resolved vertex of a boundary member way. Rings are stitched on node ids.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Vertex {
+    pub node_id: i64,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// A boundary-tagged way whose vertices all resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundaryWay {
+    pub object_id: i64,
+    pub tags: BTreeMap<String, String>,
+    pub vertices: Vec<Vertex>,
+}
+
 #[derive(Debug)]
 pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
@@ -64,12 +77,6 @@ pub(crate) struct SourceContext<'a> {
     pub locality: Option<&'a str>,
     pub neighbourhood: Option<&'a str>,
     pub place: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoundaryContextAssignment {
-    pub admin_context: AdminContextTuple,
-    pub flags: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -106,118 +113,126 @@ struct BoundaryCandidate {
     boundary: BuiltBoundary,
 }
 
-#[derive(Clone)]
-struct InferredCountrySource {
-    code: String,
-    name: String,
-    representative_point: [f64; 2],
-    source_object_type: OsmObjectType,
-    source_object_id: i64,
+/// Where a context record came from, so its final record id can be wired into
+/// the boundary index after records are sorted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextOrigin {
+    Boundary(u32),
+    DerivedCountry(String),
 }
 
-pub(crate) struct BoundaryContextRecordWriter<'a> {
-    inner: &'a mut PackWriter,
-    boundary_index: &'a BoundaryIndex,
+/// Admin boundaries built from the input, before record ids are known.
+pub(crate) struct BoundarySet {
+    candidates: Vec<BoundaryCandidate>,
+    derived_countries: Vec<(String, PlaceRecord)>,
 }
 
-impl<'a> BoundaryContextRecordWriter<'a> {
-    pub(crate) fn new(inner: &'a mut PackWriter, boundary_index: &'a BoundaryIndex) -> Self {
-        Self {
-            inner,
-            boundary_index,
+impl BoundarySet {
+    pub(crate) fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// Place records for every boundary and derived country.
+    pub(crate) fn place_records(&self, report: &mut BuilderReport) -> Vec<(ContextOrigin, Record)> {
+        let mut records = Vec::new();
+        for (code, record) in &self.derived_countries {
+            report.accept_place(PlaceLayer::Country);
+            records.push((
+                ContextOrigin::DerivedCountry(code.clone()),
+                Record::Place(PlaceLayer::Country, record.clone()),
+            ));
         }
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            let boundary = &candidate.boundary;
+            report.accept_place(boundary.layer);
+            records.push((
+                ContextOrigin::Boundary(index as u32),
+                Record::Place(
+                    boundary.layer,
+                    PlaceRecord {
+                        name: boundary.name.clone(),
+                        place_type: format!("admin_level:{}", boundary.admin_level),
+                        geometry: point_geometry(
+                            boundary.representative_point[0],
+                            boundary.representative_point[1],
+                        ),
+                        source: SourceProvenance::osm(
+                            candidate.source_object_type,
+                            candidate.source_object_id,
+                        ),
+                    },
+                ),
+            ));
+        }
+        records
     }
 
-    fn write_context(
-        &mut self,
-        record_id: RecordId,
-        point: Option<[f64; 2]>,
-        source_context: SourceContext<'_>,
-    ) {
-        let Some([lon, lat]) = point else {
-            return;
-        };
-        let assignment = self
-            .boundary_index
-            .context_for_point(lon, lat, source_context);
-        self.inner.write_boundary_context(
-            record_id,
-            assignment.admin_context,
-            None,
-            assignment.flags,
-        );
+    /// Index the boundaries under their final record ids.
+    pub(crate) fn into_index(
+        self,
+        boundary_record_ids: &[RecordId],
+        country_record_ids: &HashMap<String, RecordId>,
+    ) -> BoundaryIndex {
+        let accepted = self
+            .candidates
+            .into_iter()
+            .zip(boundary_record_ids)
+            .map(|(candidate, record_id)| {
+                let boundary = candidate.boundary;
+                AcceptedBoundary {
+                    record_id: *record_id,
+                    layer: boundary.layer,
+                    area: boundary.geometry.unsigned_area(),
+                    inferred_country_record_id: boundary
+                        .inferred_country_code
+                        .as_deref()
+                        .and_then(|code| country_record_ids.get(code).copied()),
+                    name: boundary.name,
+                    admin_level: boundary.admin_level,
+                    source_object_type: candidate.source_object_type,
+                    source_object_id: candidate.source_object_id,
+                    geometry: boundary.geometry,
+                }
+            })
+            .collect();
+        BoundaryIndex::new(accepted)
     }
 }
 
-impl RecordWriter for BoundaryContextRecordWriter<'_> {
-    fn write_address(&mut self, record: &AddressRecord) -> Result<RecordId> {
-        let record_id = self.inner.write_address(record)?;
-        self.write_context(
-            record_id,
-            point_lon_lat(&record.geometry),
-            SourceContext {
-                country: record.address.country.as_deref(),
-                region: record.address.region.as_deref(),
-                locality: record.address.locality.as_deref(),
-                place: record.address.place.as_deref(),
-                ..SourceContext::default()
-            },
-        );
-        Ok(record_id)
-    }
+/// Admin context for a record, from the boundaries covering its display point.
+/// Values the source data states (an `addr:city`, a place's own name) win ties
+/// between overlapping boundaries.
+pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<RecordContext> {
+    let [lon, lat] = record.display_point()?;
+    let source = match record {
+        Record::Address(record) => SourceContext {
+            country: record.address.country.as_deref(),
+            region: record.address.region.as_deref(),
+            locality: record.address.locality.as_deref(),
+            place: record.address.place.as_deref(),
+            ..SourceContext::default()
+        },
+        Record::Interpolation(record) => SourceContext {
+            country: record.address.country.as_deref(),
+            region: record.address.region.as_deref(),
+            locality: record.address.locality.as_deref(),
+            place: record.address.place.as_deref(),
+            ..SourceContext::default()
+        },
+        Record::Place(_, record) => SourceContext {
+            place: Some(&record.name),
+            ..SourceContext::default()
+        },
+        Record::Street(_) | Record::Postcode(_) => SourceContext::default(),
+    };
+    Some(index.context_for_point(lon, lat, source))
+}
 
-    fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId> {
-        let record_id = self.inner.write_place(record, layer)?;
-        self.write_context(
-            record_id,
-            point_lon_lat(&record.geometry),
-            SourceContext {
-                place: Some(&record.name),
-                ..SourceContext::default()
-            },
-        );
-        Ok(record_id)
-    }
-
-    fn write_interpolation(&mut self, record: &InterpolationRecord) -> Result<RecordId> {
-        let record_id = self.inner.write_interpolation(record)?;
-        self.write_context(
-            record_id,
-            Some(record.representative_point),
-            SourceContext {
-                country: record.address.country.as_deref(),
-                region: record.address.region.as_deref(),
-                locality: record.address.locality.as_deref(),
-                place: record.address.place.as_deref(),
-                ..SourceContext::default()
-            },
-        );
-        Ok(record_id)
-    }
-
-    fn write_street(&mut self, record: &StreetRecord) -> Result<RecordId> {
-        let record_id = self.inner.write_street(record)?;
-        self.write_context(
-            record_id,
-            Some(record.representative_point),
-            SourceContext::default(),
-        );
-        Ok(record_id)
-    }
-
-    fn write_postcode(&mut self, record: &PostcodeRecord) -> Result<RecordId> {
-        let record_id = self.inner.write_postcode(record)?;
-        self.write_context(
-            record_id,
-            point_lon_lat(&record.geometry),
-            SourceContext::default(),
-        );
-        Ok(record_id)
-    }
-
-    fn write_rejection(&mut self, rejection: crate::record::RejectedRecord) -> Result<()> {
-        self.inner.write_rejection(rejection)
-    }
+pub(crate) fn boundary_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    BOUNDARY_TAG_KEYS
+        .into_iter()
+        .filter_map(|key| Some((key.to_string(), tags.get(key)?.clone())))
+        .collect()
 }
 
 impl RTreeObject for BoundaryBox {
@@ -252,12 +267,9 @@ impl BoundaryIndex {
         lon: f64,
         lat: f64,
         source_context: SourceContext<'_>,
-    ) -> BoundaryContextAssignment {
+    ) -> RecordContext {
         if self.boundaries.is_empty() || !lon.is_finite() || !lat.is_finite() {
-            return BoundaryContextAssignment {
-                admin_context: AdminContextTuple::default(),
-                flags: 0,
-            };
+            return RecordContext::default();
         }
 
         let point = Point::new(lon, lat);
@@ -297,7 +309,7 @@ impl BoundaryIndex {
             }
         }
 
-        BoundaryContextAssignment {
+        RecordContext {
             admin_context: tuple,
             flags,
         }
@@ -323,98 +335,50 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
         .collect()
 }
 
-pub(crate) fn resolve_boundary_member_way_refs(
-    input: &Path,
-    required_way_ids: &HashSet<i64>,
-) -> Result<HashMap<i64, Vec<i64>>> {
-    let mut way_refs = HashMap::new();
-    if required_way_ids.is_empty() {
-        return Ok(way_refs);
-    }
-
-    let (reader, progress) = element_reader_with_progress(input, "2/7 resolve boundary ways")?;
-    reader
-        .for_each(|element| {
-            if let Element::Way(way) = element
-                && required_way_ids.contains(&way.id())
-            {
-                way_refs.insert(way.id(), way.refs().collect::<Vec<_>>());
-            }
-        })
-        .with_context(|| format!("failed to resolve boundary ways from {}", input.display()))?;
-    progress.finish_with_message("2/7 resolve boundary ways complete");
-
-    Ok(way_refs)
-}
-
-pub(crate) fn write_boundary_records(
-    way_stubs: &[BoundaryWayStub],
-    relation_stubs: &[BoundaryRelationStub],
-    relation_member_ways: &HashMap<i64, Vec<i64>>,
-    node_locations: &HashMap<i64, (f64, f64)>,
-    writer: &mut dyn RecordWriter,
-    report: &mut BuilderReport,
-) -> Result<BoundaryIndex> {
+/// Build boundary polygons from resolved boundary ways and relations.
+/// `member_lines` holds the resolved vertices of every relation member way,
+/// `None` when a member could not be fully resolved.
+pub(crate) fn build_boundaries(
+    ways: &[BoundaryWay],
+    relations: &[BoundaryRelationStub],
+    member_lines: &HashMap<i64, Option<&[Vertex]>>,
+) -> BoundarySet {
     let mut candidates = Vec::new();
-
-    for stub in way_stubs {
-        let Some(boundary) = boundary_from_way(stub, node_locations) else {
-            continue;
-        };
-        candidates.push(BoundaryCandidate {
-            source_object_type: OsmObjectType::Way,
-            source_object_id: stub.object_id,
-            boundary,
-        });
+    for way in ways {
+        if let Some(boundary) = boundary_from_way(way) {
+            candidates.push(BoundaryCandidate {
+                source_object_type: OsmObjectType::Way,
+                source_object_id: way.object_id,
+                boundary,
+            });
+        }
     }
-
-    for stub in relation_stubs {
-        let Some(boundary) = boundary_from_relation(stub, relation_member_ways, node_locations)
-        else {
-            continue;
-        };
-        candidates.push(BoundaryCandidate {
-            source_object_type: OsmObjectType::Relation,
-            source_object_id: stub.object_id,
-            boundary,
-        });
+    for stub in relations {
+        if let Some(boundary) = boundary_from_relation(stub, member_lines) {
+            candidates.push(BoundaryCandidate {
+                source_object_type: OsmObjectType::Relation,
+                source_object_id: stub.object_id,
+                boundary,
+            });
+        }
     }
-
-    let derived_country_record_ids = write_derived_country_records(&candidates, writer, report)?;
-
-    let mut accepted = Vec::new();
-    for candidate in candidates {
-        let record_id = write_boundary_place_record(
-            candidate.source_object_type,
-            candidate.source_object_id,
-            &candidate.boundary,
-            writer,
-            report,
-        )?;
-        accepted.push(accepted_boundary(
-            record_id,
-            candidate.source_object_type,
-            candidate.source_object_id,
-            candidate.boundary,
-            &derived_country_record_ids,
-        ));
+    let derived_countries = derived_country_records(&candidates);
+    BoundarySet {
+        candidates,
+        derived_countries,
     }
-
-    Ok(BoundaryIndex::new(accepted))
 }
 
-fn write_derived_country_records(
-    candidates: &[BoundaryCandidate],
-    writer: &mut dyn RecordWriter,
-    report: &mut BuilderReport,
-) -> Result<HashMap<String, RecordId>> {
+/// Region boundaries whose ISO 3166-2 code names a country that has no
+/// country boundary in the input get a derived country record.
+fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, PlaceRecord)> {
     let actual_country_codes = candidates
         .iter()
         .filter(|candidate| candidate.boundary.layer == PlaceLayer::Country)
         .filter_map(|candidate| candidate.boundary.inferred_country_code.clone())
         .collect::<HashSet<_>>();
 
-    let mut sources = HashMap::new();
+    let mut sources = BTreeMap::new();
     for candidate in candidates {
         if candidate.boundary.layer != PlaceLayer::Region {
             continue;
@@ -422,97 +386,39 @@ fn write_derived_country_records(
         let Some(code) = &candidate.boundary.inferred_country_code else {
             continue;
         };
-        if actual_country_codes.contains(code) {
+        if actual_country_codes.contains(code) || sources.contains_key(code) {
             continue;
         }
-        match sources.entry(code.clone()) {
-            Entry::Occupied(_) => {}
-            Entry::Vacant(entry) => {
-                entry.insert(InferredCountrySource {
-                    code: code.clone(),
-                    name: country_name_from_code(code).to_string(),
-                    representative_point: candidate.boundary.representative_point,
-                    source_object_type: candidate.source_object_type,
-                    source_object_id: candidate.source_object_id,
-                });
-            }
-        }
+        sources.insert(
+            code.clone(),
+            PlaceRecord {
+                name: country_name_from_code(code).to_string(),
+                place_type: format!("derived_country:{code}"),
+                geometry: point_geometry(
+                    candidate.boundary.representative_point[0],
+                    candidate.boundary.representative_point[1],
+                ),
+                source: SourceProvenance::osm(
+                    candidate.source_object_type,
+                    candidate.source_object_id,
+                ),
+            },
+        );
     }
-
-    let mut record_ids = HashMap::new();
-    let mut sources = sources.into_values().collect::<Vec<_>>();
-    sources.sort_by(|left, right| left.code.cmp(&right.code));
-    for source in sources {
-        let record = PlaceRecord {
-            name: source.name.clone(),
-            place_type: format!("derived_country:{}", source.code),
-            geometry: point_geometry(
-                source.representative_point[0],
-                source.representative_point[1],
-            ),
-            source: SourceProvenance::osm(source.source_object_type, source.source_object_id),
-        };
-        let record_id = writer.write_place(&record, PlaceLayer::Country)?;
-        report.accept_place(PlaceLayer::Country);
-        record_ids.insert(source.code, record_id);
-    }
-
-    Ok(record_ids)
+    sources.into_iter().collect()
 }
 
-fn write_boundary_place_record(
-    object_type: OsmObjectType,
-    object_id: i64,
-    boundary: &BuiltBoundary,
-    writer: &mut dyn RecordWriter,
-    report: &mut BuilderReport,
-) -> Result<RecordId> {
-    let record = PlaceRecord {
-        name: boundary.name.clone(),
-        place_type: format!("admin_level:{}", boundary.admin_level),
-        geometry: point_geometry(
-            boundary.representative_point[0],
-            boundary.representative_point[1],
-        ),
-        source: SourceProvenance::osm(object_type, object_id),
-    };
-    let record_id = writer.write_place(&record, boundary.layer)?;
-    report.accept_place(boundary.layer);
-    Ok(record_id)
-}
-
-fn accepted_boundary(
-    record_id: RecordId,
-    source_object_type: OsmObjectType,
-    source_object_id: i64,
-    boundary: BuiltBoundary,
-    derived_country_record_ids: &HashMap<String, RecordId>,
-) -> AcceptedBoundary {
-    let area = boundary.geometry.unsigned_area();
-    let inferred_country_record_id = boundary
-        .inferred_country_code
-        .as_deref()
-        .and_then(|code| derived_country_record_ids.get(code).copied());
-    AcceptedBoundary {
-        record_id,
-        layer: boundary.layer,
-        name: boundary.name,
-        admin_level: boundary.admin_level,
-        inferred_country_record_id,
-        source_object_type,
-        source_object_id,
-        geometry: boundary.geometry,
-        area,
+fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
+    let (layer, admin_level, name) = admin_boundary_parts(&way.tags)?;
+    let inferred_country_code = country_code_from_tags(&way.tags, layer);
+    let closed = ends(&way.vertices).is_some_and(|(first, last)| first == last);
+    if way.vertices.len() < 4 || !closed {
+        return None;
     }
-}
-
-fn boundary_from_way(
-    stub: &BoundaryWayStub,
-    node_locations: &HashMap<i64, (f64, f64)>,
-) -> Option<BuiltBoundary> {
-    let (layer, admin_level, name) = admin_boundary_parts(&stub.tags)?;
-    let inferred_country_code = country_code_from_tags(&stub.tags, layer);
-    let polygon = polygon_from_node_refs(&stub.node_refs, node_locations, Vec::new())?;
+    let polygon = Polygon::new(ring_line_string(&way.vertices), Vec::new());
+    if polygon.unsigned_area() <= f64::EPSILON {
+        return None;
+    }
     let geometry = MultiPolygon::new(vec![polygon]);
     let representative_point = representative_point(&geometry)?;
     Some(BuiltBoundary {
@@ -527,18 +433,21 @@ fn boundary_from_way(
 
 fn boundary_from_relation(
     stub: &BoundaryRelationStub,
-    relation_member_ways: &HashMap<i64, Vec<i64>>,
-    node_locations: &HashMap<i64, (f64, f64)>,
+    member_lines: &HashMap<i64, Option<&[Vertex]>>,
 ) -> Option<BuiltBoundary> {
     let (layer, admin_level, name) = admin_boundary_parts(&stub.tags)?;
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
-        let refs = relation_member_ways.get(&member.way_id)?.clone();
+        let line = member_lines
+            .get(&member.way_id)
+            .copied()
+            .flatten()?
+            .to_vec();
         match member.role {
-            BoundaryMemberRole::Outer => outer_segments.push(refs),
-            BoundaryMemberRole::Inner => inner_segments.push(refs),
+            BoundaryMemberRole::Outer => outer_segments.push(line),
+            BoundaryMemberRole::Inner => inner_segments.push(line),
         }
     }
 
@@ -547,7 +456,7 @@ fn boundary_from_relation(
         return None;
     }
     let inner_rings = stitch_rings(inner_segments);
-    let geometry = multipolygon_from_rings(outer_rings, inner_rings, node_locations)?;
+    let geometry = multipolygon_from_rings(outer_rings, inner_rings)?;
     let representative_point = representative_point(&geometry)?;
     Some(BuiltBoundary {
         layer,
@@ -560,14 +469,12 @@ fn boundary_from_relation(
 }
 
 fn multipolygon_from_rings(
-    outer_rings: Vec<Vec<i64>>,
-    inner_rings: Vec<Vec<i64>>,
-    node_locations: &HashMap<i64, (f64, f64)>,
+    outer_rings: Vec<Vec<Vertex>>,
+    inner_rings: Vec<Vec<Vertex>>,
 ) -> Option<MultiPolygon<f64>> {
     let mut outers = Vec::new();
     for ring in outer_rings {
-        let exterior = line_string_from_node_refs(&ring, node_locations)?;
-        let polygon = Polygon::new(exterior, Vec::new());
+        let polygon = Polygon::new(ring_line_string(&ring), Vec::new());
         if polygon.unsigned_area() > f64::EPSILON {
             outers.push((polygon, Vec::new()));
         }
@@ -577,7 +484,7 @@ fn multipolygon_from_rings(
     }
 
     for ring in inner_rings {
-        let interior = line_string_from_node_refs(&ring, node_locations)?;
+        let interior = ring_line_string(&ring);
         let Some(first) = interior.points().next() else {
             continue;
         };
@@ -593,40 +500,21 @@ fn multipolygon_from_rings(
     Some(MultiPolygon::new(polygons))
 }
 
-fn polygon_from_node_refs(
-    node_refs: &[i64],
-    node_locations: &HashMap<i64, (f64, f64)>,
-    interiors: Vec<LineString<f64>>,
-) -> Option<Polygon<f64>> {
-    let exterior = line_string_from_node_refs(node_refs, node_locations)?;
-    let polygon = Polygon::new(exterior, interiors);
-    (polygon.unsigned_area() > f64::EPSILON).then_some(polygon)
+fn ring_line_string(ring: &[Vertex]) -> LineString<f64> {
+    LineString::from(
+        ring.iter()
+            .map(|vertex| (vertex.lon, vertex.lat))
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn line_string_from_node_refs(
-    node_refs: &[i64],
-    node_locations: &HashMap<i64, (f64, f64)>,
-) -> Option<LineString<f64>> {
-    if node_refs.len() < 4 || node_refs.first() != node_refs.last() {
-        return None;
-    }
-    let coordinates = node_refs
-        .iter()
-        .map(|node_id| {
-            let (lat, lon) = node_locations.get(node_id)?;
-            Some((*lon, *lat))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(LineString::from(coordinates))
-}
-
-fn stitch_rings(mut segments: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> Vec<Vec<Vertex>> {
     segments.retain(|segment| segment.len() >= 2);
     let mut rings = Vec::new();
 
     while let Some(mut ring) = segments.pop() {
         loop {
-            if ring.len() >= 4 && ring.first() == ring.last() {
+            if ring.len() >= 4 && ends(&ring).is_some_and(|(first, last)| first == last) {
                 rings.push(ring);
                 break;
             }
@@ -642,11 +530,14 @@ fn stitch_rings(mut segments: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
     rings
 }
 
-fn can_join(ring: &[i64], segment: &[i64]) -> bool {
-    let Some((&ring_first, &ring_last)) = ring.first().zip(ring.last()) else {
-        return false;
-    };
-    let Some((&segment_first, &segment_last)) = segment.first().zip(segment.last()) else {
+fn ends(line: &[Vertex]) -> Option<(i64, i64)> {
+    Some((line.first()?.node_id, line.last()?.node_id))
+}
+
+fn can_join(ring: &[Vertex], segment: &[Vertex]) -> bool {
+    let (Some((ring_first, ring_last)), Some((segment_first, segment_last))) =
+        (ends(ring), ends(segment))
+    else {
         return false;
     };
     ring_last == segment_first
@@ -655,11 +546,9 @@ fn can_join(ring: &[i64], segment: &[i64]) -> bool {
         || ring_first == segment_first
 }
 
-fn join_segment(ring: &mut Vec<i64>, mut segment: Vec<i64>) {
-    let ring_first = *ring.first().expect("ring has first");
-    let ring_last = *ring.last().expect("ring has last");
-    let segment_first = *segment.first().expect("segment has first");
-    let segment_last = *segment.last().expect("segment has last");
+fn join_segment(ring: &mut Vec<Vertex>, mut segment: Vec<Vertex>) {
+    let (ring_first, ring_last) = ends(ring).expect("ring has ends");
+    let (segment_first, segment_last) = ends(&segment).expect("segment has ends");
 
     if ring_last == segment_first {
         ring.extend(segment.into_iter().skip(1));
@@ -863,6 +752,83 @@ mod tests {
 
         assert_eq!(assignment.admin_context.country_record_id, Some(7));
         assert_eq!(assignment.admin_context.region_record_id, Some(20));
+    }
+
+    #[test]
+    fn builds_relation_polygons_from_stitched_member_ways_and_derives_countries() {
+        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+        let member_lines = HashMap::from([
+            (
+                1,
+                Some(vec![
+                    vertex(10, -80.0, 40.0),
+                    vertex(11, -70.0, 40.0),
+                    vertex(12, -70.0, 50.0),
+                ]),
+            ),
+            // Reversed relative to the ring direction.
+            (
+                2,
+                Some(vec![
+                    vertex(10, -80.0, 40.0),
+                    vertex(13, -80.0, 50.0),
+                    vertex(12, -70.0, 50.0),
+                ]),
+            ),
+            (3, None),
+        ]);
+        let tags = |name: &str, iso: &str| {
+            BTreeMap::from([
+                ("boundary".to_string(), "administrative".to_string()),
+                ("admin_level".to_string(), "4".to_string()),
+                ("name".to_string(), name.to_string()),
+                ("ISO3166-2".to_string(), iso.to_string()),
+            ])
+        };
+        let members = |ids: &[i64]| {
+            ids.iter()
+                .map(|way_id| BoundaryRelationMember {
+                    way_id: *way_id,
+                    role: BoundaryMemberRole::Outer,
+                })
+                .collect()
+        };
+        let relations = [
+            BoundaryRelationStub {
+                object_id: 100,
+                members: members(&[1, 2]),
+                tags: tags("Ontario", "CA-ON"),
+            },
+            BoundaryRelationStub {
+                object_id: 101,
+                members: members(&[1, 3]),
+                tags: tags("Broken", "CA-QC"),
+            },
+        ];
+
+        let member_lines = member_lines
+            .iter()
+            .map(|(way_id, line): (&i64, &Option<Vec<Vertex>>)| (*way_id, line.as_deref()))
+            .collect();
+        let set = build_boundaries(&[], &relations, &member_lines);
+        assert_eq!(
+            set.len(),
+            1,
+            "a relation with an unresolved member is skipped"
+        );
+        let mut report = BuilderReport::default();
+        let places = set.place_records(&mut report);
+        assert_eq!(places.len(), 2);
+        assert_eq!(places[0].0, ContextOrigin::DerivedCountry("CA".into()));
+        assert_eq!(places[0].1.label(), "Canada");
+        assert_eq!(places[1].0, ContextOrigin::Boundary(0));
+        assert_eq!(places[1].1.id(), "osm:relation:100");
+        assert_eq!(report.accepted.place_nodes, 2);
+
+        let index = set.into_index(&[5], &HashMap::from([("CA".to_string(), 4)]));
+        let context = index.context_for_point(-75.0, 45.0, SourceContext::default());
+        assert_eq!(context.admin_context.region_record_id, Some(5));
+        assert_eq!(context.admin_context.country_record_id, Some(4));
     }
 
     #[test]

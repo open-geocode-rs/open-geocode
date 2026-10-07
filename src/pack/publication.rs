@@ -7,29 +7,38 @@ use std::{
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
-use super::{PackManifest, PackReader};
+use super::{PACK_FILE, PackManifest, PackReader};
 
 const GENERATIONS: &str = "generations";
 const CURRENT: &str = "CURRENT";
 
-/// Resolve once per operation so records and indexes come from the same build.
-/// Packs built before generation publication remain readable at their original path.
+/// Resolve once per operation so every reader opens the same build. A file
+/// path is a Pack file; a directory is a Pack directory with a `CURRENT`
+/// pointer to its published generation.
 pub fn resolve_pack_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let path = path.as_ref();
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
     let current = match fs::read_to_string(path.join(CURRENT)) {
         Ok(current) => current,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(path.to_path_buf()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            bail!(
+                "no Pack at {}: expected a Pack file or a Pack directory",
+                path.display()
+            )
+        }
         Err(error) => return Err(error).context("failed to read pack CURRENT pointer"),
     };
     let id = Uuid::parse_str(current.trim()).context("invalid pack generation in CURRENT")?;
-    let generation = path.join(GENERATIONS).join(id.to_string());
-    if !generation.join("manifest.json").is_file() {
+    let pack = path.join(GENERATIONS).join(id.to_string()).join(PACK_FILE);
+    if !pack.is_file() {
         bail!(
             "pack generation {} is incomplete or missing",
-            generation.display()
+            pack.display()
         );
     }
-    Ok(generation)
+    Ok(pack)
 }
 
 pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
@@ -41,33 +50,34 @@ pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
     Ok(generation)
 }
 
+/// Validate a generation and point `CURRENT` at it. `keep` is set the moment
+/// `CURRENT` may name the generation, so a later failure never deletes the
+/// Pack that servers are told to open.
 pub(super) fn publish(
     destination: &Path,
     generation: &Path,
     manifest: &PackManifest,
+    keep: &mut bool,
 ) -> Result<()> {
     // Exercise the same readers used for serving before making the build visible.
-    let reader = PackReader::open(generation)?;
-    let text = crate::text_index::open_text_index(generation)?;
-    let index_reader = text.reader()?;
-    if index_reader.searcher().num_docs() != manifest.record_count {
-        bail!("text index document count does not match pack records");
+    let pack = generation.join(PACK_FILE);
+    let reader = PackReader::open(&pack)?;
+    reader.verify()?;
+    if reader.manifest() != manifest {
+        bail!("Pack manifest does not match the build");
     }
-    let spatial = crate::spatial_index::PackSpatialIndexReader::open(generation)?;
-    drop((reader, index_reader, text, spatial));
+    let text = crate::text_index::open_text_index(reader.container())?;
+    if text.reader()?.searcher().num_docs() != manifest.record_count {
+        bail!("text index document count does not match Pack records");
+    }
+    crate::spatial_index::SpatialIndexReader::open(reader.container(), reader.records().clone())?;
+    drop((reader, text));
 
-    for entry in manifest.files.values() {
-        let path = generation.join(&entry.path);
-        let file = File::open(&path)?;
-        if file.metadata()?.len() != entry.bytes {
-            bail!("pack file {} does not match manifest size", path.display());
-        }
-    }
     sync_tree(generation)?;
     sync_directory(&destination.join(GENERATIONS))?;
 
     // A unique temporary pointer allows simultaneous builders without sharing writes.
-    // Keep old and failed generations: existing mappings and lazy readers may use them.
+    // Keep old generations: running servers may still map them.
     let pending = destination.join(format!(".CURRENT-{}", Uuid::new_v4()));
     let mut file = File::create_new(&pending)?;
     writeln!(
@@ -80,10 +90,25 @@ pub(super) fn publish(
     )?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&pending, destination.join(CURRENT))
-        .context("failed to publish pack CURRENT pointer")?;
+    *keep = true;
+    if let Err(error) = fs::rename(&pending, destination.join(CURRENT)) {
+        // CURRENT still names the previous generation.
+        *keep = false;
+        let _ = fs::remove_file(&pending);
+        return Err(error).context("failed to publish pack CURRENT pointer");
+    }
+    #[cfg(test)]
+    if FAIL_AFTER_SWITCH.get() {
+        bail!("injected failure after the CURRENT switch");
+    }
     sync_directory(destination)?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Simulates a failure after `CURRENT` already names the new generation.
+    pub(super) static FAIL_AFTER_SWITCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn sync_tree(path: &Path) -> Result<()> {

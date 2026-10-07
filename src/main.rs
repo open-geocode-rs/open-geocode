@@ -1,12 +1,13 @@
 use std::{fs::File, net::SocketAddr, path::PathBuf};
 
-use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use open_geocode::{
+    batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
     bench::{PackBenchmarkOptions, benchmark_pack},
-    builder::{BuildOsmOptions, build_osm_pack},
+    builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
@@ -23,21 +24,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Build a binary Pack from a regional OSM .pbf extract.
+    /// Build a Pack from an OSM .pbf extract, from a city up to the planet.
     Build {
-        /// Input regional .osm.pbf extract.
+        /// Input .osm.pbf file, sorted by type and id (the standard layout).
         #[arg(long)]
         input: PathBuf,
 
-        /// Output binary Pack directory.
+        /// Output Pack directory. The new build is published atomically.
         #[arg(long)]
         pack: PathBuf,
+
+        /// Memory for build sort buffers, in MiB (64 to 1048576). Larger inputs
+        /// spill to scratch files on disk instead of using more memory.
+        #[arg(
+            long,
+            default_value_t = (DEFAULT_MEMORY_BUDGET_BYTES >> 20) as u64,
+            value_parser = clap::value_parser!(u64).range(MIN_MEMORY_BUDGET_MB..=MAX_MEMORY_BUDGET_MB),
+        )]
+        memory_budget_mb: u64,
+
+        /// Directory for scratch files. Defaults to inside the Pack directory.
+        #[arg(long)]
+        scratch_dir: Option<PathBuf>,
     },
 
-    /// Inspect binary Pack records as readable JSON.
+    /// Inspect Pack records as readable JSON.
     #[command(name = "inspect-pack")]
     InspectPack {
-        /// Binary Pack directory.
+        /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
@@ -61,15 +75,24 @@ enum Commands {
         #[arg(long)]
         rejections: bool,
 
-        /// Include materialized Boundary-Derived Context for --row or --id.
+        /// Include Boundary-Derived Context for --row or --id.
         #[arg(long)]
         context: bool,
+    },
+
+    /// Check a Pack file against its section checksums, for example after
+    /// copying or downloading it.
+    #[command(name = "verify-pack")]
+    VerifyPack {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
     },
 
     /// Search a Pack text index and hydrate matching records.
     #[command(name = "search-pack")]
     SearchPack {
-        /// Binary Pack directory.
+        /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
@@ -89,7 +112,7 @@ enum Commands {
     /// Reverse geocode one coordinate from a Pack spatial index.
     #[command(name = "reverse-pack")]
     ReversePack {
-        /// Binary Pack directory.
+        /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
@@ -105,7 +128,7 @@ enum Commands {
     /// Benchmark Pack size, open time, and query latency.
     #[command(name = "bench-pack")]
     BenchPack {
-        /// Binary Pack directory.
+        /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
@@ -126,9 +149,13 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Geocode CSV rows into lat/lon columns using a Pack text index.
+    #[command(name = "batch-geocode")]
+    BatchGeocode(Box<BatchGeocodeArgs>),
+
     /// Serve the Runtime HTTP API and static demo files.
     Serve {
-        /// Binary Pack directory.
+        /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
@@ -147,12 +174,104 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Args)]
+struct BatchGeocodeArgs {
+    /// Pack directory or Pack file. Required with --address-fields.
+    #[arg(long)]
+    pack: Option<PathBuf>,
+
+    /// Input CSV path.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Clean output CSV path. Input columns are preserved and lat/lon are added or filled.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Audit CSV path.
+    #[arg(long)]
+    audit: PathBuf,
+
+    /// Comma-separated address columns to try as one query candidate. Repeat for fallbacks.
+    #[arg(long = "address-fields")]
+    address_fields: Vec<String>,
+
+    /// Optional locality/city column used for engine context validation.
+    #[arg(long)]
+    locality_field: Option<String>,
+
+    /// Optional region/province/state column used for engine context validation.
+    #[arg(long)]
+    region_field: Option<String>,
+
+    /// Optional postal-code column used for engine context validation.
+    #[arg(long)]
+    postcode_field: Option<String>,
+
+    /// Optional layer filter passed to the engine searcher.
+    #[arg(long)]
+    layer: Option<String>,
+
+    /// Number of engine candidates to inspect per query. Use 0 for the engine default.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+
+    /// Latitude output column name.
+    #[arg(long, default_value = "lat")]
+    lat_column: String,
+
+    /// Longitude output column name.
+    #[arg(long, default_value = "lon")]
+    lon_column: String,
+
+    /// Copy coordinates from another CSV instead of geocoding address fields.
+    #[arg(long)]
+    join_coordinates_from: Option<PathBuf>,
+
+    /// Key column used with --join-coordinates-from.
+    #[arg(long)]
+    join_key: Option<String>,
+
+    /// Latitude column in the joined CSV.
+    #[arg(long, default_value = "lat")]
+    join_lat_column: String,
+
+    /// Longitude column in the joined CSV.
+    #[arg(long, default_value = "lon")]
+    join_lon_column: String,
+}
+
+/// Below this, sorters spill so often that the build drowns in tiny run files.
+const MIN_MEMORY_BUDGET_MB: u64 = 64;
+/// 1 TiB; keeps the conversion to bytes far from overflow.
+const MAX_MEMORY_BUDGET_MB: u64 = 1 << 20;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { input, pack } => build_osm_pack(BuildOsmOptions { input, pack }),
+        Commands::Build {
+            input,
+            pack,
+            memory_budget_mb,
+            scratch_dir,
+        } => {
+            let report = build_osm_pack(BuildOsmOptions {
+                input,
+                pack,
+                memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
+                    .context("--memory-budget-mb is larger than this machine can address")?,
+                scratch_dir,
+            })?;
+            write_json(serde_json::json!({
+                "records": report.output.record_count,
+                "rejections": report.output.rejection_count,
+                "pack_bytes": report.output.pack_bytes,
+                "scratch_spilled_bytes": report.scratch.spilled_bytes,
+                "seconds": report.phases.total_ms as f64 / 1000.0,
+            }))
+        }
         Commands::InspectPack {
             pack,
             row,
@@ -162,6 +281,16 @@ async fn main() -> Result<()> {
             rejections,
             context,
         } => inspect_pack(pack, row, id, layer, limit, rejections, context),
+        Commands::VerifyPack { pack } => {
+            let reader = PackReader::open(pack)?;
+            reader.verify()?;
+            write_json(serde_json::json!({
+                "path": reader.path().display().to_string(),
+                "sections": reader.container().sections().len(),
+                "bytes": reader.container().file_size(),
+                "verified": true,
+            }))
+        }
         Commands::SearchPack {
             pack,
             query,
@@ -176,6 +305,7 @@ async fn main() -> Result<()> {
             warmup,
             output,
         } => bench_pack(pack, queries, iterations, warmup, output),
+        Commands::BatchGeocode(args) => batch_geocode(*args),
         Commands::Serve {
             pack,
             demo,
@@ -212,7 +342,11 @@ fn inspect_pack(
     } else if let Some(layer) = layer {
         serde_json::to_value(reader.records_json_by_layer(&layer, limit)?)?
     } else {
-        serde_json::to_value(reader.manifest())?
+        serde_json::json!({
+            "path": reader.path().display().to_string(),
+            "manifest": reader.manifest(),
+            "sections": reader.section_sizes(),
+        })
     };
 
     write_json(output)
@@ -223,13 +357,10 @@ fn inspect_record_by_source_id_json(
     source_id: &str,
     include_context: bool,
 ) -> Result<Value> {
-    for record_id in 0..reader.manifest().record_count {
-        let summary = reader.record_summary(record_id)?;
-        if summary.id == source_id {
-            return inspect_record_json(reader, record_id, include_context);
-        }
+    match reader.find_by_source_id(source_id)? {
+        Some(record_id) => inspect_record_json(reader, record_id, include_context),
+        None => bail!("record not found: {source_id}"),
     }
-    bail!("record not found: {source_id}")
 }
 
 fn inspect_record_json(
@@ -255,13 +386,10 @@ fn boundary_context_json(reader: &PackReader, record_id: RecordId) -> Result<Val
         return Ok(serde_json::json!(null));
     };
     let mut object = serde_json::Map::new();
-    object.insert(
-        "assignment_method".to_string(),
-        serde_json::json!(context.assignment_method),
-    );
     object.insert("flags".to_string(), serde_json::json!(context.flags));
 
-    if let Some(tuple) = context.admin_context {
+    {
+        let tuple = context.admin_context;
         for (key, value) in [
             ("country", tuple.country_record_id),
             ("region", tuple.region_record_id),
@@ -285,22 +413,6 @@ fn boundary_context_json(reader: &PackReader, record_id: RecordId) -> Result<Val
                 );
             }
         }
-    }
-
-    if let Some(postcode_record_id) = context.postcode_record_id
-        && let Some(record) = reader.context_record(postcode_record_id)?
-    {
-        object.insert(
-            "postcode".to_string(),
-            serde_json::json!({
-                "record_id": postcode_record_id,
-                "id": record.id,
-                "label": record.label,
-                "name": record.name,
-                "layer": record.layer,
-                "postcode": record.postcode,
-            }),
-        );
     }
 
     Ok(Value::Object(object))
@@ -360,5 +472,94 @@ fn bench_pack(
         write_json_to_path(&value, output)
     } else {
         write_json(value)
+    }
+}
+
+fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
+    let BatchGeocodeArgs {
+        pack,
+        input,
+        output,
+        audit,
+        address_fields,
+        locality_field,
+        region_field,
+        postcode_field,
+        layer,
+        limit,
+        lat_column,
+        lon_column,
+        join_coordinates_from,
+        join_key,
+        join_lat_column,
+        join_lon_column,
+    } = args;
+    let address_field_groups = parse_field_groups(&address_fields)?;
+    let join = if let Some(path) = join_coordinates_from {
+        let key_column = join_key.context("--join-key is required with --join-coordinates-from")?;
+        Some(CoordinateJoinOptions {
+            path,
+            key_column,
+            lat_column: join_lat_column,
+            lon_column: join_lon_column,
+        })
+    } else {
+        None
+    };
+    let report = run_batch_geocode(BatchGeocodeOptions {
+        pack,
+        input,
+        output: output.clone(),
+        audit: audit.clone(),
+        address_field_groups,
+        locality_field,
+        region_field,
+        postcode_field,
+        layer,
+        limit,
+        lat_column,
+        lon_column,
+        join,
+    })?;
+    write_json(serde_json::json!({
+        "rows": report.rows,
+        "resolved": report.resolved,
+        "output": output.display().to_string(),
+        "audit": audit.display().to_string(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn build_budget(value: &str) -> Result<usize, clap::Error> {
+        let cli = Cli::try_parse_from([
+            "open-geocode",
+            "build",
+            "--input",
+            "in.osm.pbf",
+            "--pack",
+            "pack",
+            "--memory-budget-mb",
+            value,
+        ])?;
+        match cli.command {
+            Commands::Build {
+                memory_budget_mb, ..
+            } => Ok(memory_budget_mb as usize),
+            _ => unreachable!("parsed a build command"),
+        }
+    }
+
+    #[test]
+    fn memory_budget_must_be_usable() {
+        assert!(build_budget("0").is_err());
+        assert!(build_budget("63").is_err());
+        assert!(build_budget("99999999999999999").is_err());
+        assert_eq!(build_budget("64").expect("minimum"), 64);
+        assert_eq!(build_budget("16384").expect("planet"), 16_384);
     }
 }
