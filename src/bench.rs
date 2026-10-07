@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -327,11 +328,12 @@ pub fn benchmark_pack(options: PackBenchmarkOptions) -> Result<PackBenchmarkRepo
     let warmup = options.warmup;
     let fixture = read_fixture(options.queries.as_deref())?;
 
-    let (reader, pack_reader_ms) = measure_value(|| PackReader::open(&options.pack))?;
-    let pack = pack_metrics(&options.pack, reader.manifest())?;
-    let (searcher, text_searcher_ms) = measure_value(|| PackTextSearcher::open(&options.pack))?;
+    let (reader, pack_reader_ms) = measure_value(|| PackReader::open(&options.pack).map(Arc::new))?;
+    let pack = pack_metrics(reader.path(), reader.manifest())?;
+    let (searcher, text_searcher_ms) =
+        measure_value(|| PackTextSearcher::from_pack(Arc::clone(&reader)))?;
     let (reverse_geocoder, reverse_geocoder_ms) =
-        measure_value(|| PackReverseGeocoder::open(&options.pack))?;
+        measure_value(|| PackReverseGeocoder::from_pack(Arc::clone(&reader)))?;
 
     let queries = QueryBenchmarkReport {
         search: benchmark_search_cases(&searcher, &fixture.search, iterations, warmup)?,

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -17,7 +17,7 @@ const CANDIDATE_LIMIT: usize = 16;
 
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
-    pack: PackReader,
+    pack: Arc<PackReader>,
     spatial: PackSpatialIndexReader,
 }
 
@@ -112,11 +112,13 @@ pub struct ReverseEvidence {
 
 impl PackReverseGeocoder {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack_path = pack_path.as_ref();
-        Ok(Self {
-            pack: PackReader::open(pack_path)?,
-            spatial: PackSpatialIndexReader::open(pack_path)?,
-        })
+        Self::from_pack(Arc::new(PackReader::open(pack_path)?))
+    }
+
+    /// Open the spatial index using an existing shared pack reader.
+    pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
+        let spatial = PackSpatialIndexReader::open(pack.path())?;
+        Ok(Self { pack, spatial })
     }
 
     pub fn reverse(&self, options: ReverseGeocodeOptions) -> Result<ReverseGeocodeResponse> {

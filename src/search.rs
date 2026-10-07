@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub struct PackTextSearcher {
-    pack: PackReader,
+    pack: Arc<PackReader>,
     index: Index,
     reader: IndexReader,
     fields: TextIndexFields,
@@ -67,7 +67,11 @@ const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 
 impl PackTextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack = PackReader::open(&pack_path)?;
+        Self::from_pack(Arc::new(PackReader::open(pack_path)?))
+    }
+
+    /// Open the text index using an existing shared pack reader.
+    pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
         let text_index_manifest = pack
             .manifest()
             .text_index
@@ -80,7 +84,7 @@ impl PackTextSearcher {
                 TEXT_INDEX_SCHEMA_VERSION
             );
         }
-        let index = open_text_index(&pack_path)?;
+        let index = open_text_index(pack.path())?;
         let schema = index.schema();
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
@@ -626,6 +630,55 @@ mod tests {
         let variants = search_query_variants("St Clair Ave W");
         assert!(variants.contains(&"st clair avenue west".to_string()));
         assert!(!variants.contains(&"street clair avenue west".to_string()));
+    }
+
+    #[test]
+    fn street_search_and_autocomplete_do_not_decode_road_geometry() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-summary-{}", uuid::Uuid::new_v4()));
+        let mut writer = PackWriter::create(&root).expect("writer");
+        let mut street = street_record("osm:way:9", "King Street");
+        street.geometry = geojson::Geometry::new(geojson::GeometryValue::LineString {
+            coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.001, 43.001].into()],
+        });
+        writer.write_street(&street).expect("street");
+        writer
+            .finish(&mut BuilderReport::default())
+            .expect("finish");
+        let generation = crate::pack::resolve_pack_path(&root).expect("generation");
+        // Damage only the road shape before opening any readers. A summary has no
+        // reason to read it, while a full-record request must still report the error.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(generation.join("records/geometries"))
+            .expect("geometry file");
+        file.seek(SeekFrom::Start(
+            crate::records_store::ARENA_HEADER_BYTES as u64,
+        ))
+        .expect("seek");
+        file.write_all(&0u32.to_le_bytes())
+            .expect("invalid point count");
+        drop(file);
+        let searcher = PackTextSearcher::open(&root).expect("searcher");
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "King".into(),
+                limit: 5,
+                layer: None,
+            })
+            .expect("summary search");
+        assert_eq!(hits[0].record.label, "King Street");
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "Kin".into(),
+                limit: 5,
+                layer: None,
+            })
+            .expect("summary autocomplete");
+        assert_eq!(suggestions[0].record, hits[0].record);
+        assert!(searcher.pack.record_json(0).is_err());
     }
 
     #[test]

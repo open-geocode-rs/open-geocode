@@ -36,6 +36,9 @@ pub use crate::records_archive::{
 
 pub type RecordId = u64;
 
+mod publication;
+pub use publication::resolve_pack_path;
+
 pub trait RecordWriter {
     fn write_address(&mut self, record: &AddressRecord) -> Result<RecordId>;
     fn write_place(&mut self, record: &PlaceRecord, layer: PlaceLayer) -> Result<RecordId>;
@@ -47,6 +50,7 @@ pub trait RecordWriter {
 
 pub struct PackWriter {
     path: PathBuf,
+    destination: PathBuf,
     records: RecordsArchiveWriter,
     rejections: File,
     rejection_offsets: File,
@@ -165,16 +169,8 @@ const OFFSET_ENTRY_BYTES: u64 = 24;
 
 impl PackWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        if path.exists() {
-            if path.is_dir() {
-                fs::remove_dir_all(&path)
-                    .with_context(|| format!("failed to clear pack {}", path.display()))?;
-            } else {
-                fs::remove_file(&path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
-            }
-        }
+        let destination = path.as_ref().to_path_buf();
+        let path = publication::create_generation(&destination)?;
 
         fs::create_dir_all(path.join("records"))
             .with_context(|| format!("failed to create {}", path.join("records").display()))?;
@@ -195,6 +191,7 @@ impl PackWriter {
 
         Ok(Self {
             path,
+            destination,
             records,
             rejections,
             rejection_offsets,
@@ -308,6 +305,7 @@ impl PackWriter {
         serde_json::to_writer_pretty(manifest_file, &manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
 
+        publication::publish(&self.destination, &self.path, &manifest)?;
         Ok(manifest)
     }
 
@@ -523,7 +521,7 @@ impl PackWriter {
 
 impl PackReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = resolve_pack_path(path)?;
         let manifest_path = path.join("manifest.json");
         let manifest_file = File::open(&manifest_path)
             .with_context(|| format!("failed to open {}", manifest_path.display()))?;
@@ -562,6 +560,11 @@ impl PackReader {
 
     pub const fn manifest(&self) -> &PackManifest {
         &self.manifest
+    }
+
+    /// The immutable generation opened by this reader.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn record_summary(&self, record_id: RecordId) -> Result<RecordSummary> {
@@ -933,6 +936,140 @@ mod tests {
     use crate::text_index::{TextIndexFields, open_text_index};
 
     use super::*;
+
+    #[test]
+    fn failed_osm_rebuild_preserves_published_pack() {
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-rebuild-{}", uuid::Uuid::new_v4()));
+        let mut writer = PackWriter::create(&root).expect("writer");
+        writer
+            .write_address(&address_record("osm:node:1", "10 King Street"))
+            .expect("address");
+        writer
+            .finish(&mut BuilderReport::default())
+            .expect("finish");
+        assert_eq!(
+            text_hit_record_id(&root, "king").expect("original search"),
+            0
+        );
+
+        let result = crate::builder::build_osm_pack(crate::builder::BuildOsmOptions {
+            input: root.join("missing.osm.pbf"),
+            pack: root.clone(),
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            text_hit_record_id(&root, "king").expect("search after failed rebuild"),
+            0
+        );
+        assert_eq!(
+            PackReader::open(&root)
+                .expect("original pack")
+                .manifest()
+                .record_count,
+            1
+        );
+    }
+
+    #[test]
+    fn publishes_replacement_without_changing_existing_readers() {
+        for legacy in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("open-geocode-publish-{}", uuid::Uuid::new_v4()));
+            let mut writer = PackWriter::create(&root).expect("writer");
+            writer
+                .write_address(&address_record("osm:node:1", "10 King Street"))
+                .expect("address");
+            let manifest = writer
+                .finish(&mut BuilderReport::default())
+                .expect("finish");
+            let root = if legacy {
+                // Reproduce the pre-generation directory layout without altering the source.
+                let source = resolve_pack_path(&root).expect("generation");
+                let legacy_root = root.join("legacy");
+                for file in manifest
+                    .files
+                    .values()
+                    .map(|file| file.path.as_str())
+                    .chain(["manifest.json"])
+                {
+                    let destination = legacy_root.join(file);
+                    fs::create_dir_all(destination.parent().expect("parent")).expect("directory");
+                    fs::copy(source.join(file), destination).expect("legacy file");
+                }
+                legacy_root
+            } else {
+                root
+            };
+            let original = PackReader::open(&root).expect("original reader");
+            let searcher = crate::search::PackTextSearcher::open(&root).expect("original searcher");
+            let mut replacement = PackWriter::create(&root).expect("replacement");
+            replacement
+                .write_address(&address_record("osm:node:2", "20 Queen Street"))
+                .expect("address");
+            assert_eq!(
+                text_hit_record_id(&root, "king").expect("search while building"),
+                0
+            );
+            replacement
+                .finish(&mut BuilderReport::default())
+                .expect("publish");
+            assert_eq!(text_hit_record_id(&root, "queen").expect("new search"), 0);
+            assert_eq!(
+                PackReader::open(&root)
+                    .expect("new reader")
+                    .record_summary(0)
+                    .expect("new record")
+                    .id,
+                "osm:node:2"
+            );
+            assert_eq!(
+                original.record_summary(0).expect("original record").id,
+                "osm:node:1"
+            );
+            let hits = searcher
+                .search(crate::search::TextSearchOptions {
+                    query: "king".into(),
+                    limit: 5,
+                    layer: None,
+                })
+                .expect("existing searcher after publish");
+            assert_eq!(hits[0].record.id, "osm:node:1");
+            assert!(original.path().join("manifest.json").is_file());
+        }
+    }
+
+    #[test]
+    fn validation_failure_does_not_publish_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-validation-{}", uuid::Uuid::new_v4()));
+        let mut original = PackWriter::create(&root).expect("original");
+        original
+            .write_address(&address_record("osm:node:1", "10 King Street"))
+            .expect("address");
+        original
+            .finish(&mut BuilderReport::default())
+            .expect("finish");
+        let published = fs::read(root.join("CURRENT")).expect("pointer");
+        let mut replacement = PackWriter::create(&root).expect("replacement");
+        replacement
+            .write_address(&address_record("osm:node:2", "20 Queen Street"))
+            .expect("address");
+        // Finish the buffers before injecting corruption into this unpublished fixture.
+        replacement.records.finish().expect("flush records");
+        File::options()
+            .write(true)
+            .open(replacement.path.join("records/directory"))
+            .expect("directory file")
+            .write_all(b"INVALID!")
+            .expect("corrupt header");
+        assert!(replacement.finish(&mut BuilderReport::default()).is_err());
+        assert_eq!(fs::read(root.join("CURRENT")).expect("pointer"), published);
+        assert_eq!(
+            text_hit_record_id(&root, "king").expect("original search"),
+            0
+        );
+    }
 
     #[test]
     fn writes_and_reads_binary_records_by_row_layer_and_source_id() {

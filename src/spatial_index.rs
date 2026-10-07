@@ -415,9 +415,9 @@ impl PackSpatialIndexWriter {
 
 impl PackSpatialIndexReader {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack_path = pack_path.as_ref();
+        let pack_path = crate::pack::resolve_pack_path(pack_path)?;
         Ok(Self {
-            index: SpatialIndexV2Reader::open(pack_path)?,
+            index: SpatialIndexV2Reader::open(&pack_path)?,
         })
     }
 
@@ -516,32 +516,10 @@ impl SpatialIndexV2Reader {
         radius_m: f64,
         limit: usize,
     ) -> Vec<PointCandidate> {
-        let mut candidates = Vec::new();
-        for h3_cell in h3_query_cell_ids(lon, lat, H3_FINE_RESOLUTION, radius_m) {
-            let Some(cell) = self.find_cell(&self.cells, h3_cell) else {
-                continue;
-            };
-            for point_id in self.point_ref_ids(cell.point_start, cell.point_count) {
-                let Some(entry) = self.read_point(point_id) else {
-                    continue;
-                };
-                if entry.layer != layer {
-                    continue;
-                }
-                let distance_m = haversine_m(lon, lat, entry.lon, entry.lat);
-                if distance_m <= radius_m {
-                    candidates.push(PointCandidate {
-                        record_id: entry.record_id,
-                        layer: entry.layer,
-                        lon: entry.lon,
-                        lat: entry.lat,
-                        distance_m,
-                    });
-                }
-            }
-        }
-        candidates.sort_by(compare_distance);
-        truncate(candidates, limit)
+        closest_candidates(
+            self.collect_points(lon, lat, radius_m, false, |candidate| candidate == layer),
+            limit,
+        )
     }
 
     fn context_candidates(
@@ -551,16 +529,39 @@ impl SpatialIndexV2Reader {
         radius_m: f64,
         limit: usize,
     ) -> Vec<PointCandidate> {
+        closest_candidates(
+            self.collect_points(lon, lat, radius_m, true, is_context_layer),
+            limit,
+        )
+    }
+
+    fn collect_points(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        context: bool,
+        accepts: impl Fn(SpatialLayer) -> bool,
+    ) -> Vec<PointCandidate> {
+        let (cells, refs, resolution) = if context {
+            (
+                &self.context_cells,
+                &self.context_cell_points,
+                H3_CONTEXT_RESOLUTION,
+            )
+        } else {
+            (&self.cells, &self.cell_points, H3_FINE_RESOLUTION)
+        };
         let mut candidates = Vec::new();
-        for h3_cell in h3_query_cell_ids(lon, lat, H3_CONTEXT_RESOLUTION, radius_m) {
-            let Some(cell) = self.find_cell(&self.context_cells, h3_cell) else {
+        for h3_cell in h3_query_cell_ids(lon, lat, resolution, radius_m) {
+            let Some(cell) = self.find_cell(cells, h3_cell) else {
                 continue;
             };
-            for point_id in self.context_point_ref_ids(cell.point_start, cell.point_count) {
+            for point_id in read_ref_range(refs, cell.point_start, cell.point_count) {
                 let Some(entry) = self.read_point(point_id) else {
                     continue;
                 };
-                if !is_context_layer(entry.layer) {
+                if !accepts(entry.layer) {
                     continue;
                 }
                 let distance_m = haversine_m(lon, lat, entry.lon, entry.lat);
@@ -575,8 +576,7 @@ impl SpatialIndexV2Reader {
                 }
             }
         }
-        candidates.sort_by(compare_distance);
-        truncate(candidates, limit)
+        candidates
     }
 
     fn segment_candidates(
@@ -624,8 +624,7 @@ impl SpatialIndexV2Reader {
                 }
             }
         }
-        candidates.sort_by(compare_distance);
-        truncate(candidates, limit)
+        closest_candidates(candidates, limit)
     }
 
     fn find_cell(&self, cells: &CountedMmap, h3_cell: u64) -> Option<CellDirectoryEntry> {
@@ -651,16 +650,8 @@ impl SpatialIndexV2Reader {
         read_segment_entry(&self.segments, u64::from(segment_id))
     }
 
-    fn point_ref_ids(&self, start: u64, count: u64) -> impl Iterator<Item = u32> + '_ {
-        read_ref_range(&self.cell_points, start, count)
-    }
-
     fn segment_ref_ids(&self, start: u64, count: u64) -> impl Iterator<Item = u32> + '_ {
         read_ref_range(&self.cell_segments, start, count)
-    }
-
-    fn context_point_ref_ids(&self, start: u64, count: u64) -> impl Iterator<Item = u32> + '_ {
-        read_ref_range(&self.context_cell_points, start, count)
     }
 }
 
@@ -1200,10 +1191,29 @@ impl CandidateDistance for SegmentCandidate {
     }
 }
 
-fn truncate<T>(mut candidates: Vec<T>, limit: usize) -> Vec<T> {
+fn closest_candidates<T: CandidateDistance>(mut candidates: Vec<T>, limit: usize) -> Vec<T> {
     if limit > 0 && candidates.len() > limit {
-        candidates.truncate(limit);
+        // Select indices so equal-distance candidates retain their original order,
+        // including ties at the cutoff. Only the retained candidates are sorted.
+        let mut indices: Vec<usize> = (0..candidates.len()).collect();
+        indices.select_nth_unstable_by(limit - 1, |&left, &right| {
+            compare_distance(&candidates[left], &candidates[right]).then_with(|| left.cmp(&right))
+        });
+        let cutoff_index = indices[limit - 1];
+        let cutoff_distance = candidates[cutoff_index].distance_m();
+        let mut index = 0;
+        candidates.retain(|candidate| {
+            let keep = candidate
+                .distance_m()
+                .partial_cmp(&cutoff_distance)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| index.cmp(&cutoff_index))
+                != Ordering::Greater;
+            index += 1;
+            keep
+        });
     }
+    candidates.sort_by(compare_distance);
     candidates
 }
 
@@ -1217,6 +1227,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn closest_candidates_matches_stable_full_sort() {
+        for count in [0, 1, 8, 1_000] {
+            let candidates: Vec<_> = (0..count)
+                .map(|id| PointCandidate {
+                    record_id: id,
+                    layer: SpatialLayer::Address,
+                    lon: 0.0,
+                    lat: 0.0,
+                    // Repeated, unsorted distances exercise ties at the cutoff.
+                    distance_m: ((id * 37) % 23) as f64,
+                })
+                .collect();
+            for limit in [0, 1, 3, 5, 8, 999, 1_000, 1_001] {
+                let mut expected = candidates.clone();
+                expected.sort_by(compare_distance);
+                if limit > 0 {
+                    expected.truncate(limit);
+                }
+                let actual = closest_candidates(candidates.clone(), limit);
+                assert_eq!(
+                    actual.iter().map(|hit| hit.record_id).collect::<Vec<_>>(),
+                    expected.iter().map(|hit| hit.record_id).collect::<Vec<_>>(),
+                    "count={count}, limit={limit}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn indexes_and_queries_address_points() {
@@ -1238,6 +1277,11 @@ mod tests {
         };
 
         writer.add_address(7, &record).expect("add record");
+        for id in 8..1_008 {
+            let mut nearby = record.clone();
+            nearby.geometry = point_geometry(-79.0, 43.0 + ((id * 37) % 100) as f64 * 0.000001);
+            writer.add_address(id, &nearby).expect("add nearby record");
+        }
         let temp_dir =
             std::env::temp_dir().join(format!("open-geocode-spatial-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1255,6 +1299,17 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 7);
+
+        let all = reader.point_candidates(-79.0, 43.0, SpatialLayer::Address, 100.0, 0);
+        let limited = reader.point_candidates(-79.0, 43.0, SpatialLayer::Address, 100.0, 5);
+        assert_eq!(all.len(), 1_001);
+        assert_eq!(
+            limited.iter().map(|hit| hit.record_id).collect::<Vec<_>>(),
+            all.iter()
+                .take(5)
+                .map(|hit| hit.record_id)
+                .collect::<Vec<_>>(),
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }

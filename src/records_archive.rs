@@ -431,44 +431,6 @@ impl RecordsArchiveWriter {
     }
 }
 
-/// A decoded record together with the layer name resolved from its entry kind.
-enum Decoded {
-    Address(AddressRecord),
-    Street(StreetRecord),
-    Place(PlaceRecord),
-    Postcode(PostcodeRecord),
-    Interpolation(InterpolationRecord),
-}
-
-impl Decoded {
-    fn id(&self) -> String {
-        match self {
-            Decoded::Address(record) => record.id(),
-            Decoded::Street(record) => record.id(),
-            Decoded::Place(record) => record.id(),
-            Decoded::Postcode(record) => record.id(),
-            Decoded::Interpolation(record) => record.id(),
-        }
-    }
-
-    fn label(&self) -> String {
-        match self {
-            Decoded::Address(record) => record.label(),
-            Decoded::Street(record) => record.label(),
-            Decoded::Place(record) => record.label(),
-            Decoded::Postcode(record) => record.label(),
-            Decoded::Interpolation(record) => record.label(),
-        }
-    }
-}
-
-struct FullRecord {
-    decoded: Decoded,
-    layer: &'static str,
-    point: RecordPoint,
-    source: RecordSource,
-}
-
 impl RecordsArchiveReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
@@ -481,24 +443,119 @@ impl RecordsArchiveReader {
     }
 
     pub fn summary(&self, record_id: RecordId) -> Result<RecordSummary> {
-        let full = self.decode_full(record_id)?;
-        Ok(RecordSummary {
-            id: full.decoded.id(),
-            layer: full.layer.to_string(),
-            label: full.decoded.label(),
-            point: Some(full.point),
-            source: full.source,
-        })
+        let (kind, bytes) = self.store.entry(record_id)?;
+        match kind {
+            EntryKind::Address => {
+                let entry: &AddressEntry = cast_entry(bytes)?;
+                osm_summary(
+                    "address",
+                    crate::labels::address_label(&self.decode_address_components(entry)?),
+                    osm_source(entry.source_object, entry.source_object_id)?,
+                    record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                )
+            }
+            EntryKind::Street => {
+                let entry: &StreetEntry = cast_entry(bytes)?;
+                osm_summary(
+                    "street",
+                    self.required_text(entry.name_start, entry.name_len, "name")?,
+                    osm_source(entry.source_object, entry.source_object_id)?,
+                    record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                )
+            }
+            EntryKind::Place => {
+                let entry: &PlaceEntry = cast_entry(bytes)?;
+                let place_type =
+                    self.required_text(entry.place_type_start, entry.place_type_len, "place_type")?;
+                let mut summary = osm_summary(
+                    decode_place_layer_code(entry.place_layer)?.as_str(),
+                    self.required_text(entry.name_start, entry.name_len, "name")?,
+                    osm_source(entry.source_object, entry.source_object_id)?,
+                    record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                )?;
+                summary.id = crate::labels::place_record_id(
+                    decode_source_object(SourceObject::from_u8(entry.source_object)?)?,
+                    entry.source_object_id,
+                    &place_type,
+                );
+                Ok(summary)
+            }
+            EntryKind::Postcode => {
+                let entry: &PostcodeEntry = cast_entry(bytes)?;
+                let postcode =
+                    self.required_text(entry.postcode_start, entry.postcode_len, "postcode")?;
+                Ok(RecordSummary {
+                    id: crate::labels::derived_postcode_id(&postcode),
+                    layer: "postcode".into(),
+                    label: postcode,
+                    point: Some(record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?),
+                    source: self.derived_source_record(entry)?,
+                })
+            }
+            EntryKind::Interpolation => {
+                let entry: &InterpolationEntry = cast_entry(bytes)?;
+                let address = self.decode_interpolation_components(entry)?;
+                let range = self.decode_interpolation_range(entry)?;
+                let mut summary = osm_summary(
+                    "interpolation",
+                    crate::labels::interpolation_label(
+                        &crate::labels::interpolation_name(&address),
+                        &range,
+                        &address,
+                    ),
+                    osm_source(entry.source_object, entry.source_object_id)?,
+                    record_point(
+                        entry.geometry_type,
+                        entry.location_precision,
+                        entry.display_lon,
+                        entry.display_lat,
+                    )?,
+                )?;
+                summary.id = crate::labels::interpolation_id_from_anchors(
+                    entry.source_object_id,
+                    &self.decode_anchor_ids(entry)?,
+                );
+                Ok(summary)
+            }
+        }
     }
 
     pub fn record_json(&self, record_id: RecordId) -> Result<Value> {
-        let full = self.decode_full(record_id)?;
-        match &full.decoded {
-            Decoded::Address(record) => record_json(full.layer, record),
-            Decoded::Street(record) => record_json(full.layer, record),
-            Decoded::Place(record) => record_json(full.layer, record),
-            Decoded::Postcode(record) => record_json(full.layer, record),
-            Decoded::Interpolation(record) => record_json(full.layer, record),
+        let (kind, bytes) = self.store.entry(record_id)?;
+        match kind {
+            EntryKind::Address => record_json("address", &self.decode_address(cast_entry(bytes)?)?),
+            EntryKind::Street => record_json("street", &self.decode_street(cast_entry(bytes)?)?),
+            EntryKind::Place => {
+                let (layer, record) = self.decode_place(cast_entry(bytes)?)?;
+                record_json(layer.as_str(), &record)
+            }
+            EntryKind::Postcode => {
+                record_json("postcode", &self.decode_postcode(cast_entry(bytes)?)?)
+            }
+            EntryKind::Interpolation => record_json(
+                "interpolation",
+                &self.decode_interpolation(cast_entry(bytes)?)?,
+            ),
         }
     }
 
@@ -549,117 +606,37 @@ impl RecordsArchiveReader {
     }
 
     pub fn context(&self, record_id: RecordId) -> Result<Option<ContextRecord>> {
-        let full = self.decode_full(record_id)?;
-        match &full.decoded {
-            Decoded::Postcode(postcode) => Ok(Some(ContextRecord {
-                id: postcode.id(),
-                layer: "postcode".to_string(),
-                label: postcode.label(),
-                name: postcode.name(),
-                postcode: Some(postcode.postcode.clone()),
-                point: Some(full.point),
-            })),
-            Decoded::Place(place) => Ok(Some(ContextRecord {
-                id: place.id(),
-                layer: full.layer.to_string(),
-                label: place.label(),
-                name: place.name.clone(),
-                postcode: None,
-                point: Some(full.point),
-            })),
-            _ => Ok(None),
+        let (kind, _) = self.store.entry(record_id)?;
+        if !matches!(kind, EntryKind::Place | EntryKind::Postcode) {
+            return Ok(None);
         }
+        let summary = self.summary(record_id)?;
+        Ok(Some(ContextRecord {
+            id: summary.id,
+            layer: summary.layer,
+            name: summary.label.clone(),
+            postcode: (kind == EntryKind::Postcode).then(|| summary.label.clone()),
+            label: summary.label,
+            point: summary.point,
+        }))
     }
 
-    fn decode_full(&self, record_id: RecordId) -> Result<FullRecord> {
-        let (kind, bytes) = self.store.entry(record_id)?;
-        Ok(match kind {
-            EntryKind::Address => {
-                let entry: &AddressEntry = cast_entry(bytes)?;
-                FullRecord {
-                    decoded: Decoded::Address(self.decode_address(entry)?),
-                    layer: "address",
-                    point: record_point(
-                        entry.geometry_type,
-                        entry.location_precision,
-                        entry.display_lon,
-                        entry.display_lat,
-                    )?,
-                    source: osm_source(entry.source_object, entry.source_object_id)?,
-                }
-            }
-            EntryKind::Street => {
-                let entry: &StreetEntry = cast_entry(bytes)?;
-                FullRecord {
-                    decoded: Decoded::Street(self.decode_street(entry)?),
-                    layer: "street",
-                    point: record_point(
-                        entry.geometry_type,
-                        entry.location_precision,
-                        entry.display_lon,
-                        entry.display_lat,
-                    )?,
-                    source: osm_source(entry.source_object, entry.source_object_id)?,
-                }
-            }
-            EntryKind::Place => {
-                let entry: &PlaceEntry = cast_entry(bytes)?;
-                let (place_layer, record) = self.decode_place(entry)?;
-                FullRecord {
-                    layer: place_layer.as_str(),
-                    point: record_point(
-                        entry.geometry_type,
-                        entry.location_precision,
-                        entry.display_lon,
-                        entry.display_lat,
-                    )?,
-                    source: osm_source(entry.source_object, entry.source_object_id)?,
-                    decoded: Decoded::Place(record),
-                }
-            }
-            EntryKind::Postcode => {
-                let entry: &PostcodeEntry = cast_entry(bytes)?;
-                FullRecord {
-                    decoded: Decoded::Postcode(self.decode_postcode(entry)?),
-                    layer: "postcode",
-                    point: record_point(
-                        entry.geometry_type,
-                        entry.location_precision,
-                        entry.display_lon,
-                        entry.display_lat,
-                    )?,
-                    source: self.derived_source_record(entry)?,
-                }
-            }
-            EntryKind::Interpolation => {
-                let entry: &InterpolationEntry = cast_entry(bytes)?;
-                FullRecord {
-                    decoded: Decoded::Interpolation(self.decode_interpolation(entry)?),
-                    layer: "interpolation",
-                    point: record_point(
-                        entry.geometry_type,
-                        entry.location_precision,
-                        entry.display_lon,
-                        entry.display_lat,
-                    )?,
-                    source: osm_source(entry.source_object, entry.source_object_id)?,
-                }
-            }
+    fn decode_address_components(&self, entry: &AddressEntry) -> Result<AddressComponents> {
+        Ok(AddressComponents {
+            number: self.required_text(entry.number_start, entry.number_len, "number")?,
+            street: self.optional_text(entry.street_start, entry.street_len)?,
+            place: self.optional_text(entry.place_start, entry.place_len)?,
+            unit: self.optional_text(entry.unit_start, entry.unit_len)?,
+            locality: self.optional_text(entry.locality_start, entry.locality_len)?,
+            region: self.optional_text(entry.region_start, entry.region_len)?,
+            postcode: self.optional_text(entry.postcode_start, entry.postcode_len)?,
+            country: self.optional_text(entry.country_start, entry.country_len)?,
         })
     }
 
     fn decode_address(&self, entry: &AddressEntry) -> Result<AddressRecord> {
         Ok(AddressRecord {
-            address: AddressComponents {
-                number: self.required_text(entry.number_start, entry.number_len, "number")?,
-                street: self.optional_text(entry.street_start, entry.street_len)?,
-                place: self.optional_text(entry.place_start, entry.place_len)?,
-                unit: self.optional_text(entry.unit_start, entry.unit_len)?,
-                locality: self.optional_text(entry.locality_start, entry.locality_len)?,
-                region: self.optional_text(entry.region_start, entry.region_len)?,
-                postcode: self.optional_text(entry.postcode_start, entry.postcode_len)?,
-                country: self.optional_text(entry.country_start, entry.country_len)?,
-            },
+            address: self.decode_address_components(entry)?,
             geometry: self.decode_geometry(
                 entry.geometry_type,
                 entry.geometry_start,
@@ -736,31 +713,45 @@ impl RecordsArchiveReader {
         })
     }
 
-    fn decode_interpolation(&self, entry: &InterpolationEntry) -> Result<InterpolationRecord> {
-        let anchor_ids = self
+    fn decode_interpolation_components(
+        &self,
+        entry: &InterpolationEntry,
+    ) -> Result<InterpolationAddressComponents> {
+        Ok(InterpolationAddressComponents {
+            street: self.optional_text(entry.street_start, entry.street_len)?,
+            place: self.optional_text(entry.place_start, entry.place_len)?,
+            locality: self.optional_text(entry.locality_start, entry.locality_len)?,
+            region: self.optional_text(entry.region_start, entry.region_len)?,
+            postcode: self.optional_text(entry.postcode_start, entry.postcode_len)?,
+            country: self.optional_text(entry.country_start, entry.country_len)?,
+        })
+    }
+
+    fn decode_interpolation_range(&self, entry: &InterpolationEntry) -> Result<InterpolationRange> {
+        Ok(InterpolationRange {
+            kind: self.required_text(
+                entry.interpolation_type_start,
+                entry.interpolation_type_len,
+                "interpolation_type",
+            )?,
+            start: entry.interpolation_start,
+            end: entry.interpolation_end,
+            step: entry.interpolation_step,
+        })
+    }
+
+    fn decode_anchor_ids(&self, entry: &InterpolationEntry) -> Result<Vec<String>> {
+        Ok(self
             .optional_text(entry.anchor_ids_start, entry.anchor_ids_len)?
             .map(|value| value.split('\n').map(str::to_string).collect())
-            .unwrap_or_default();
+            .unwrap_or_default())
+    }
+
+    fn decode_interpolation(&self, entry: &InterpolationEntry) -> Result<InterpolationRecord> {
         Ok(InterpolationRecord {
-            address: InterpolationAddressComponents {
-                street: self.optional_text(entry.street_start, entry.street_len)?,
-                place: self.optional_text(entry.place_start, entry.place_len)?,
-                locality: self.optional_text(entry.locality_start, entry.locality_len)?,
-                region: self.optional_text(entry.region_start, entry.region_len)?,
-                postcode: self.optional_text(entry.postcode_start, entry.postcode_len)?,
-                country: self.optional_text(entry.country_start, entry.country_len)?,
-            },
-            interpolation: InterpolationRange {
-                kind: self.required_text(
-                    entry.interpolation_type_start,
-                    entry.interpolation_type_len,
-                    "interpolation_type",
-                )?,
-                start: entry.interpolation_start,
-                end: entry.interpolation_end,
-                step: entry.interpolation_step,
-            },
-            anchor_ids,
+            address: self.decode_interpolation_components(entry)?,
+            interpolation: self.decode_interpolation_range(entry)?,
+            anchor_ids: self.decode_anchor_ids(entry)?,
             representative_point: [
                 dequantize_coordinate(entry.display_lon),
                 dequantize_coordinate(entry.display_lat),
@@ -918,6 +909,24 @@ fn point_precision(geometry_type: u8, location_precision: u8) -> Result<RecordPo
     }
 }
 
+fn osm_summary(
+    layer: &str,
+    label: String,
+    source: RecordSource,
+    point: RecordPoint,
+) -> Result<RecordSummary> {
+    Ok(RecordSummary {
+        id: crate::labels::osm_record_id(
+            source.object_type.context("missing OSM object type")?,
+            source.object_id.context("missing OSM object id")?,
+        ),
+        layer: layer.to_string(),
+        label,
+        point: Some(point),
+        source,
+    })
+}
+
 fn osm_source(source_object: u8, object_id: i64) -> Result<RecordSource> {
     Ok(RecordSource {
         dataset: "osm".to_string(),
@@ -1033,6 +1042,133 @@ mod tests {
     use geojson::GeometryValue;
 
     use super::*;
+
+    #[test]
+    fn summaries_match_full_records_for_every_entry_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "open-geocode-summary-parity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut writer = RecordsArchiveWriter::create(&root).expect("writer");
+        let line = Geometry::new(GeometryValue::LineString {
+            coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.001, 43.001].into()],
+        });
+        writer
+            .write_address(&AddressRecord {
+                address: AddressComponents {
+                    number: "10".into(),
+                    street: None,
+                    place: Some("Market Square".into()),
+                    unit: Some("2".into()),
+                    locality: Some("Toronto".into()),
+                    region: Some("ON".into()),
+                    postcode: Some("M5V 1A1".into()),
+                    country: Some("CA".into()),
+                },
+                geometry: point_geometry(-79.0, 43.0),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(OsmObjectType::Node, 1),
+            })
+            .expect("address");
+        writer
+            .write_street(&StreetRecord {
+                name: "King Street".into(),
+                geometry: line.clone(),
+                representative_point: [-79.0, 43.0],
+                source: SourceProvenance::osm(OsmObjectType::Way, 2),
+            })
+            .expect("street");
+        writer
+            .write_postcode(&PostcodeRecord {
+                postcode: "M5V 1A1".into(),
+                geometry: point_geometry(-79.0, 43.0),
+                source: DerivedSourceProvenance::osm_address_records(12),
+            })
+            .expect("postcode");
+        for layer in [
+            PlaceLayer::Country,
+            PlaceLayer::Region,
+            PlaceLayer::District,
+            PlaceLayer::Place,
+            PlaceLayer::Locality,
+            PlaceLayer::Neighbourhood,
+        ] {
+            writer
+                .write_place(
+                    &PlaceRecord {
+                        name: "Example place".into(),
+                        place_type: "city".into(),
+                        geometry: point_geometry(-79.0, 43.0),
+                        source: SourceProvenance::osm(OsmObjectType::Relation, 3),
+                    },
+                    layer,
+                )
+                .expect("place");
+        }
+        writer
+            .write_place(
+                &PlaceRecord {
+                    name: "Canada".into(),
+                    place_type: "derived_country:CA".into(),
+                    geometry: point_geometry(-79.0, 43.0),
+                    source: SourceProvenance::osm(OsmObjectType::Relation, 4),
+                },
+                PlaceLayer::Country,
+            )
+            .expect("derived country");
+        for anchor_ids in [
+            vec!["osm:node:10".into(), "osm:node:20".into()],
+            vec![],
+            vec!["invalid".into(), "osm:node:20".into()],
+        ] {
+            writer
+                .write_interpolation(&InterpolationRecord {
+                    address: InterpolationAddressComponents {
+                        street: Some("King Street".into()),
+                        place: None,
+                        locality: Some("Toronto".into()),
+                        region: Some("ON".into()),
+                        postcode: Some("M5V".into()),
+                        country: Some("CA".into()),
+                    },
+                    interpolation: InterpolationRange {
+                        kind: "even".into(),
+                        start: 10,
+                        end: 20,
+                        step: 2,
+                    },
+                    anchor_ids,
+                    geometry: line.clone(),
+                    representative_point: [-79.0, 43.0],
+                    source: SourceProvenance::osm(OsmObjectType::Way, 5),
+                })
+                .expect("interpolation");
+        }
+        writer.finish().expect("finish");
+        drop(writer);
+        let reader = RecordsArchiveReader::open(&root).expect("reader");
+        for id in 0..reader.len() {
+            let summary = reader.summary(id).expect("summary");
+            let full = reader.record_json(id).expect("full record");
+            assert_eq!(summary.id, full["id"]);
+            assert_eq!(summary.label, full["label"]);
+            assert_eq!(summary.layer, full["layer"]);
+            assert_eq!(
+                serde_json::to_value(&summary.source).expect("source"),
+                full["source"]
+            );
+            let point = summary.point.expect("point");
+            assert_eq!((point.lon, point.lat), (-79.0, 43.0));
+            assert_eq!(
+                point.precision,
+                if summary.layer == "street" || summary.layer == "interpolation" {
+                    RecordPointPrecision::RepresentativePoint
+                } else {
+                    RecordPointPrecision::Centroid
+                }
+            );
+        }
+    }
 
     #[test]
     fn round_trips_address_record() {
