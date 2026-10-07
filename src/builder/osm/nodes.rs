@@ -3,17 +3,14 @@
 //! The node section of a PBF is sorted by id, and the references are sorted by
 //! node id by an external sort, so the join is a single forward merge: no node
 //! table is ever held in memory, and nodes nobody asked for are skipped as they
-//! stream past. Workers decode only coordinates and drop the block; the rare
-//! block holding a node whose tags an interpolation way asked about is read
-//! again from the file for just those tags.
+//! stream past. Workers decode coordinates, plus address tags for the few
+//! nodes that have any, so interpolation anchors need no second read.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use std::{fs::File, io::BufReader};
-
-use anyhow::{Context, Result, bail};
-use osmpbf::{BlobReader, ByteOffset, Element, PrimitiveBlock};
+use anyhow::{Result, bail};
+use osmpbf::{Element, PrimitiveBlock};
 
 use crate::extsort::{ExternalSorter, Sorted};
 
@@ -29,57 +26,43 @@ pub(crate) struct JoinStats {
     pub missing: u64,
 }
 
-/// Node coordinates of one PBF block in file order, and where the block is.
+/// Nodes of one PBF block, in file order.
+#[derive(Debug, Default)]
 struct NodeBlock {
-    offset: u64,
     nodes: Vec<(i64, i32, i32)>,
+    /// Address tags by position in `nodes`, ascending; only nodes that have
+    /// an `addr:` key, about one in a hundred.
+    addr_tags: Vec<(usize, BTreeMap<String, String>)>,
 }
 
-fn decode_nodes(offset: u64, block: PrimitiveBlock) -> NodeBlock {
-    let mut nodes = Vec::new();
+fn decode_nodes(block: &PrimitiveBlock) -> NodeBlock {
+    let mut output = NodeBlock::default();
     for element in block.elements() {
-        match element {
-            Element::DenseNode(node) => {
-                nodes.push((node.id(), node.decimicro_lat(), node.decimicro_lon()));
-            }
-            Element::Node(node) => {
-                nodes.push((node.id(), node.decimicro_lat(), node.decimicro_lon()));
-            }
-            Element::Way(_) | Element::Relation(_) => {}
-        }
-    }
-    NodeBlock { offset, nodes }
-}
-
-/// Address tags of the nodes at the given ascending positions within the
-/// block's nodes.
-fn addr_tags_at(
-    block: &PrimitiveBlock,
-    positions: &[usize],
-) -> HashMap<usize, BTreeMap<String, String>> {
-    let mut wanted = positions.iter().copied().peekable();
-    let mut tags = HashMap::new();
-    let mut position = 0;
-    for element in block.elements() {
-        let wanted_here = wanted.peek() == Some(&position);
-        let node_tags = match element {
-            Element::DenseNode(node) => wanted_here.then(|| collect_clean_tags(node.tags())),
-            Element::Node(node) => wanted_here.then(|| collect_clean_tags(node.tags())),
+        let (id, lat, lon, addr_tags) = match element {
+            Element::DenseNode(node) => (
+                node.id(),
+                node.decimicro_lat(),
+                node.decimicro_lon(),
+                node.tags()
+                    .any(|(key, _)| key.starts_with("addr:"))
+                    .then(|| collect_addr_tags_from_map(&collect_clean_tags(node.tags()))),
+            ),
+            Element::Node(node) => (
+                node.id(),
+                node.decimicro_lat(),
+                node.decimicro_lon(),
+                node.tags()
+                    .any(|(key, _)| key.starts_with("addr:"))
+                    .then(|| collect_addr_tags_from_map(&collect_clean_tags(node.tags()))),
+            ),
             Element::Way(_) | Element::Relation(_) => continue,
         };
-        if let Some(node_tags) = node_tags {
-            wanted.next();
-            let addr_tags = collect_addr_tags_from_map(&node_tags);
-            if !addr_tags.is_empty() {
-                tags.insert(position, addr_tags);
-            }
-            if wanted.peek().is_none() {
-                break;
-            }
+        if let Some(tags) = addr_tags.filter(|tags| !tags.is_empty()) {
+            output.addr_tags.push((output.nodes.len(), tags));
         }
-        position += 1;
+        output.nodes.push((id, lat, lon));
     }
-    tags
+    output
 }
 
 pub(crate) fn join_nodes(
@@ -89,8 +72,6 @@ pub(crate) fn join_nodes(
     resolved: &mut ExternalSorter<ResolvedRef>,
 ) -> Result<JoinStats> {
     let mut join = Join {
-        blobs: BlobReader::seekable_from_path(input)
-            .with_context(|| format!("failed to open {}", input.display()))?,
         requests,
         current: None,
         last_node_id: None,
@@ -101,7 +82,7 @@ pub(crate) fn join_nodes(
         input,
         "3/7 join node coordinates",
         Some(node_blobs),
-        |offset, block| Ok(decode_nodes(offset, block)),
+        |_, block| Ok(decode_nodes(&block)),
         |block| join.block(block, resolved),
     )?;
     while join.current.is_some() {
@@ -112,8 +93,6 @@ pub(crate) fn join_nodes(
 }
 
 struct Join {
-    /// Re-reads blocks whose node tags were asked for.
-    blobs: BlobReader<BufReader<File>>,
     requests: Sorted<NodeRequest>,
     current: Option<NodeRequest>,
     last_node_id: Option<i64>,
@@ -131,9 +110,8 @@ impl Join {
         block: NodeBlock,
         resolved: &mut ExternalSorter<ResolvedRef>,
     ) -> Result<()> {
-        // Matches whose node tags were asked for, by position in the block.
-        let mut needs_tags: Vec<(usize, ResolvedRef)> = Vec::new();
-        for (position, (node_id, lat_e7, lon_e7)) in block.nodes.iter().copied().enumerate() {
+        let mut tags = block.addr_tags.into_iter().peekable();
+        for (position, (node_id, lat_e7, lon_e7)) in block.nodes.into_iter().enumerate() {
             if let Some(last) = self.last_node_id
                 && node_id <= last
             {
@@ -150,41 +128,31 @@ impl Join {
                 self.stats.missing += 1;
                 self.advance()?;
             }
+            while tags
+                .next_if(|(tag_position, _)| *tag_position < position)
+                .is_some()
+            {}
             while let Some(request) = self.current
                 && request.node_id == node_id
             {
-                let reference = ResolvedRef {
+                let node_tags = match tags.peek() {
+                    Some((tag_position, tags))
+                        if request.want_tags && *tag_position == position =>
+                    {
+                        Some(tags.clone())
+                    }
+                    _ => None,
+                };
+                resolved.push(ResolvedRef {
                     owner: request.owner,
                     pos: request.pos,
                     node_id,
                     lat_e7,
                     lon_e7,
-                    tags: None,
-                };
-                if request.want_tags {
-                    needs_tags.push((position, reference));
-                } else {
-                    resolved.push(reference)?;
-                }
+                    tags: node_tags,
+                })?;
                 self.stats.resolved += 1;
                 self.advance()?;
-            }
-        }
-
-        if !needs_tags.is_empty() {
-            let mut positions = needs_tags
-                .iter()
-                .map(|(position, _)| *position)
-                .collect::<Vec<_>>();
-            positions.dedup();
-            let blob = self
-                .blobs
-                .blob_from_offset(ByteOffset(block.offset))
-                .context("failed to re-read a node block")?;
-            let tags = addr_tags_at(&blob.to_primitiveblock()?, &positions);
-            for (position, mut reference) in needs_tags {
-                reference.tags = tags.get(&position).cloned();
-                resolved.push(reference)?;
             }
         }
         Ok(())

@@ -510,27 +510,6 @@ impl SpatialIndexReader {
         Ok(seen.then_some(false))
     }
 
-    /// Like [`Self::context_candidates`], restricted to one context layer.
-    pub fn context_layer_candidates(
-        &self,
-        lon: f64,
-        lat: f64,
-        layer: Layer,
-        radius_m: f64,
-        limit: usize,
-    ) -> Result<Vec<PointCandidate>> {
-        let candidates = self.collect_points(
-            &self.context,
-            H3_CONTEXT_RESOLUTION,
-            lon,
-            lat,
-            radius_m,
-            limit,
-            |candidate| candidate == layer,
-        )?;
-        Ok(closest_candidates(candidates, limit))
-    }
-
     pub fn segment_candidates(
         &self,
         lon: f64,

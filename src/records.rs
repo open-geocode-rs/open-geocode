@@ -11,7 +11,7 @@
 //! ```text
 //! records/index    record_count u64, then (block_count + 1) u64 block offsets
 //! records/blocks   blocks: base_lon i32 | base_lat i32 | n x u32 body end | bodies
-//! records/strings  segment_records u64 | segment_count u64 | segment_count x u64 first string
+//! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
 //!
 //! body  tag u8        layer (4 bits) | centroid (1) | line geometry (1) | source kind (2)
@@ -22,11 +22,12 @@
 //!       geometry      line strings only: varint count, then zigzag deltas
 //! ```
 //!
-//! Strings are interned per segment of [`SEGMENT_RECORDS`] records: the build
-//! keeps one segment's dictionary in memory, not every distinct string of the
-//! input. Records are in Hilbert order, so a segment covers one area and most
-//! of its strings are its own; only widely shared ones (countries, regions)
-//! repeat across segments.
+//! Strings are interned per segment: the build keeps one segment's dictionary
+//! in memory, not every distinct string of the input. A segment ends after
+//! [`SEGMENT_RECORDS`] records or once its dictionary uses its share of the
+//! build budget, whichever comes first. Records are in Hilbert order, so a
+//! segment covers one area and most of its strings are its own; only widely
+//! shared ones (countries, regions) repeat across segments.
 
 use std::{
     collections::HashMap,
@@ -58,7 +59,7 @@ use crate::{
 pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 3;
+pub const RECORDS_VERSION: u32 = 4;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -66,6 +67,8 @@ pub const BLOCK_RECORDS: u64 = 64;
 const DICTIONARY_ENTRY_OVERHEAD: usize = 48;
 /// Records per string segment.
 pub const SEGMENT_RECORDS: u64 = 1 << 20;
+/// Share of the build budget the string dictionary may use.
+const DICTIONARY_BUDGET_FRACTION: usize = 8;
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 const BLOCK_HEADER_BYTES: usize = 8;
 
@@ -246,8 +249,11 @@ struct StringTable {
     /// The dictionary's memory, held against the build budget. It cannot
     /// spill, but it is bounded by one segment and released at the next.
     memory: Reservation,
+    /// Dictionary bytes after which the next record starts a new segment.
+    memory_share: usize,
     segment_records: u64,
-    segment_firsts: Vec<u64>,
+    /// First record and first string of every segment.
+    segments: Vec<(u64, u64)>,
     count: u64,
     bytes_len: u64,
     bytes: BufWriter<File>,
@@ -275,10 +281,17 @@ impl StringTable {
         Ok(id)
     }
 
-    fn start_segment(&mut self) {
+    fn start_segment(&mut self, first_record: u64) {
         self.ids = HashMap::new();
         self.memory.release_all();
-        self.segment_firsts.push(self.count);
+        self.segments.push((first_record, self.count));
+    }
+
+    fn segment_full(&self, record_id: u64) -> bool {
+        let Some((first_record, _)) = self.segments.last() else {
+            return true;
+        };
+        record_id - first_record >= self.segment_records || self.memory.bytes() >= self.memory_share
     }
 }
 
@@ -308,8 +321,9 @@ impl RecordsWriter {
             strings: StringTable {
                 ids: HashMap::new(),
                 memory: Reservation::empty(budget),
+                memory_share: budget.limit() / DICTIONARY_BUDGET_FRACTION,
                 segment_records: SEGMENT_RECORDS,
-                segment_firsts: Vec::new(),
+                segments: Vec::new(),
                 count: 0,
                 bytes_len: 0,
                 bytes: create(&bytes_path)?,
@@ -331,6 +345,7 @@ impl RecordsWriter {
 
     #[cfg(test)]
     fn with_segment_records(mut self, segment_records: u64) -> Self {
+        // Applies from the next segment; the writer has not started one yet.
         self.strings.segment_records = segment_records;
         self
     }
@@ -345,8 +360,8 @@ impl RecordsWriter {
             .display_point()
             .with_context(|| format!("record {} has no finite display point", record.id()))?;
         let point = (quantize(lon)?, quantize(lat)?);
-        if self.record_count % self.strings.segment_records == 0 {
-            self.strings.start_segment();
+        if self.strings.segment_full(self.record_count) {
+            self.strings.start_segment(self.record_count);
         }
         if self.record_count % BLOCK_RECORDS == 0 {
             self.flush_block()?;
@@ -516,10 +531,10 @@ impl RecordsWriter {
 
         let strings = &self.strings;
         pack.begin(SECTION_STRINGS, RECORDS_VERSION)?;
-        pack.write_all(&strings.segment_records.to_le_bytes())?;
-        pack.write_all(&(strings.segment_firsts.len() as u64).to_le_bytes())?;
-        for first in &strings.segment_firsts {
-            pack.write_all(&first.to_le_bytes())?;
+        pack.write_all(&(strings.segments.len() as u64).to_le_bytes())?;
+        for (first_record, first_string) in &strings.segments {
+            pack.write_all(&first_record.to_le_bytes())?;
+            pack.write_all(&first_string.to_le_bytes())?;
         }
         pack.write_all(&strings.count.to_le_bytes())?;
         std::io::copy(&mut File::open(&strings.ends_path)?, pack)?;
@@ -534,7 +549,6 @@ pub struct RecordsReader {
     index: Bytes,
     blocks: Bytes,
     strings: Bytes,
-    segment_records: u64,
     segment_count: u64,
     string_count: u64,
     /// Byte offsets within `strings` of the end-offset table and the text.
@@ -557,12 +571,25 @@ impl RecordsReader {
             bail!("records index does not match the blocks section");
         }
         let truncated = || anyhow::anyhow!("string table is truncated");
-        let segment_records = read_u64_le(&strings, 0).ok_or_else(truncated)?;
-        let segment_count = read_u64_le(&strings, 8).ok_or_else(truncated)?;
-        if segment_records == 0 || segment_count != record_count.div_ceil(segment_records) {
-            bail!("string table segments do not match the record count");
+        let segment_count = read_u64_le(&strings, 0).ok_or_else(truncated)?;
+        let count_at = usize::try_from(8 + segment_count * 16)?;
+        let mut previous: Option<(u64, u64)> = None;
+        for segment in 0..segment_count {
+            let at = (8 + segment * 16) as usize;
+            let first_record = read_u64_le(&strings, at).ok_or_else(truncated)?;
+            let first_string = read_u64_le(&strings, at + 8).ok_or_else(truncated)?;
+            let ordered = match previous {
+                None => first_record == 0,
+                Some((record, string)) => first_record > record && first_string >= string,
+            };
+            if !ordered || first_record >= record_count {
+                bail!("string table segments do not match the records");
+            }
+            previous = Some((first_record, first_string));
         }
-        let count_at = usize::try_from(16 + segment_count * 8)?;
+        if (segment_count == 0) != (record_count == 0) {
+            bail!("string table segments do not match the records");
+        }
         let string_count = read_u64_le(&strings, count_at).ok_or_else(truncated)?;
         let ends_start = count_at + 8;
         let text_start = ends_start + usize::try_from(string_count * 8)?;
@@ -579,7 +606,6 @@ impl RecordsReader {
             index,
             blocks,
             strings,
-            segment_records,
             segment_count,
             string_count,
             ends_start,
@@ -766,14 +792,25 @@ impl RecordsReader {
     }
 
     fn segment(&self, record_id: RecordId) -> StringSegment {
-        let segment = record_id / self.segment_records;
-        let first_at = |segment: u64| {
-            read_u64_le(&self.strings, (16 + segment * 8) as usize).expect("validated segments")
+        let field = |segment: u64, offset: u64| {
+            read_u64_le(&self.strings, (8 + segment * 16 + offset) as usize)
+                .expect("validated segments")
         };
+        // Last segment whose first record is at or before this one.
+        let (mut low, mut high) = (0, self.segment_count);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if field(mid, 0) <= record_id {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let segment = low.saturating_sub(1);
         StringSegment {
-            first: first_at(segment),
+            first: field(segment, 8),
             end: if segment + 1 < self.segment_count {
-                first_at(segment + 1)
+                field(segment + 1, 8)
             } else {
                 self.string_count
             },
@@ -1234,6 +1271,48 @@ mod tests {
         let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
         for (id, record) in records.iter().enumerate() {
             assert_eq!(&reader.record(id as u64).expect("record"), record);
+        }
+    }
+
+    #[test]
+    fn string_dictionary_stays_within_its_share_of_a_small_budget() {
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-dictionary-{}", uuid::Uuid::new_v4()));
+        let scratch = Scratch::create(root.join("scratch")).expect("scratch");
+        let budget = MemoryBudget::new(64 << 20);
+        let mut writer = RecordsWriter::create(&scratch, &budget).expect("writer");
+        let base = sample_records().remove(0);
+        // Every record brings a new street name: the worst case.
+        for index in 0..200_000 {
+            let mut record = base.clone();
+            if let Record::Address(address) = &mut record {
+                address.address.street = Some(format!("Unique Street Number {index}"));
+            }
+            writer.write(&record, None).expect("write");
+        }
+        // One entry can land after the share is reached; the next record
+        // starts a new segment.
+        let share = budget.limit() / DICTIONARY_BUDGET_FRACTION;
+        let slack = 8 * (64 + DICTIONARY_ENTRY_OVERHEAD);
+        assert!(
+            budget.peak() <= share + slack,
+            "dictionary peaked at {} of {share}",
+            budget.peak()
+        );
+        assert!(writer.strings.segments.len() > 1);
+        let path = root.join("pack.ogp");
+        let mut pack = ContainerWriter::create(&path).expect("pack");
+        writer.finish(&mut pack).expect("finish");
+        pack.finish().expect("pack finish");
+        let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
+        for id in [0, 99_999, 199_999] {
+            let Record::Address(address) = reader.record(id).expect("record") else {
+                panic!("address");
+            };
+            assert_eq!(
+                address.address.street.as_deref(),
+                Some(format!("Unique Street Number {id}").as_str())
+            );
         }
     }
 
