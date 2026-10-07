@@ -3,7 +3,18 @@ use std::collections::BTreeMap;
 use geojson::{Geometry, GeometryValue};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
-use crate::labels;
+use crate::{labels, util::geo::point_lon_lat};
+
+/// One normalized geocoding record, as the builder emits it and the Pack
+/// stores it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Record {
+    Address(AddressRecord),
+    Interpolation(InterpolationRecord),
+    Street(StreetRecord),
+    Postcode(PostcodeRecord),
+    Place(PlaceLayer, PlaceRecord),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressRecord {
@@ -17,7 +28,8 @@ pub struct AddressRecord {
 pub struct InterpolationRecord {
     pub address: InterpolationAddressComponents,
     pub interpolation: InterpolationRange,
-    pub anchor_ids: Vec<String>,
+    /// OSM node ids of the low and high numbered anchors.
+    pub anchor_node_ids: [i64; 2],
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
@@ -46,7 +58,85 @@ pub struct PlaceRecord {
     pub source: SourceProvenance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Every record layer. Place layers are the context layers used to describe
+/// where an address is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    Address,
+    Country,
+    District,
+    Interpolation,
+    Locality,
+    Neighbourhood,
+    Place,
+    Postcode,
+    Region,
+    Street,
+}
+
+impl Layer {
+    pub const ALL: [Layer; 10] = [
+        Layer::Address,
+        Layer::Country,
+        Layer::District,
+        Layer::Interpolation,
+        Layer::Locality,
+        Layer::Neighbourhood,
+        Layer::Place,
+        Layer::Postcode,
+        Layer::Region,
+        Layer::Street,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Layer::Address => "address",
+            Layer::Country => "country",
+            Layer::District => "district",
+            Layer::Interpolation => "interpolation",
+            Layer::Locality => "locality",
+            Layer::Neighbourhood => "neighbourhood",
+            Layer::Place => "place",
+            Layer::Postcode => "postcode",
+            Layer::Region => "region",
+            Layer::Street => "street",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|layer| layer.as_str() == value)
+    }
+
+    /// Layers that describe the surroundings of a point (admin areas, named
+    /// places and postcodes) rather than a specific address or road.
+    pub const fn is_context(self) -> bool {
+        matches!(
+            self,
+            Layer::Country
+                | Layer::District
+                | Layer::Locality
+                | Layer::Neighbourhood
+                | Layer::Place
+                | Layer::Postcode
+                | Layer::Region
+        )
+    }
+
+    pub const fn place_layer(self) -> Option<PlaceLayer> {
+        match self {
+            Layer::Country => Some(PlaceLayer::Country),
+            Layer::Region => Some(PlaceLayer::Region),
+            Layer::District => Some(PlaceLayer::District),
+            Layer::Place => Some(PlaceLayer::Place),
+            Layer::Locality => Some(PlaceLayer::Locality),
+            Layer::Neighbourhood => Some(PlaceLayer::Neighbourhood),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PlaceLayer {
     Country,
     Region,
@@ -58,14 +148,26 @@ pub enum PlaceLayer {
 
 impl PlaceLayer {
     pub const fn as_str(self) -> &'static str {
-        match self {
-            PlaceLayer::Country => "country",
-            PlaceLayer::Region => "region",
-            PlaceLayer::District => "district",
-            PlaceLayer::Place => "place",
-            PlaceLayer::Locality => "locality",
-            PlaceLayer::Neighbourhood => "neighbourhood",
+        Layer::from_place(self).as_str()
+    }
+}
+
+impl Layer {
+    pub const fn from_place(layer: PlaceLayer) -> Self {
+        match layer {
+            PlaceLayer::Country => Layer::Country,
+            PlaceLayer::Region => Layer::Region,
+            PlaceLayer::District => Layer::District,
+            PlaceLayer::Place => Layer::Place,
+            PlaceLayer::Locality => Layer::Locality,
+            PlaceLayer::Neighbourhood => Layer::Neighbourhood,
         }
+    }
+}
+
+impl From<PlaceLayer> for Layer {
+    fn from(layer: PlaceLayer) -> Self {
+        Layer::from_place(layer)
     }
 }
 
@@ -150,12 +252,102 @@ pub struct RejectedRecord {
     pub source: SourceProvenance,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OsmObjectType {
     Node,
     Way,
     Relation,
+}
+
+impl Record {
+    pub const fn layer(&self) -> Layer {
+        match self {
+            Record::Address(_) => Layer::Address,
+            Record::Interpolation(_) => Layer::Interpolation,
+            Record::Street(_) => Layer::Street,
+            Record::Postcode(_) => Layer::Postcode,
+            Record::Place(layer, _) => Layer::from_place(*layer),
+        }
+    }
+
+    pub fn id(&self) -> String {
+        match self {
+            Record::Address(record) => record.id(),
+            Record::Interpolation(record) => record.id(),
+            Record::Street(record) => record.id(),
+            Record::Postcode(record) => record.id(),
+            Record::Place(_, record) => record.id(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Record::Address(record) => record.label(),
+            Record::Interpolation(record) => record.label(),
+            Record::Street(record) => record.label(),
+            Record::Postcode(record) => record.label(),
+            Record::Place(_, record) => record.label(),
+        }
+    }
+
+    pub fn geometry(&self) -> &Geometry {
+        match self {
+            Record::Address(record) => &record.geometry,
+            Record::Interpolation(record) => &record.geometry,
+            Record::Street(record) => &record.geometry,
+            Record::Postcode(record) => &record.geometry,
+            Record::Place(_, record) => &record.geometry,
+        }
+    }
+
+    /// The point used to place the record on a map: the point itself for point
+    /// records, the representative point for lines.
+    pub fn display_point(&self) -> Option<[f64; 2]> {
+        match self {
+            Record::Address(record) => point_lon_lat(&record.geometry),
+            Record::Interpolation(record) => Some(record.representative_point),
+            Record::Street(record) => Some(record.representative_point),
+            Record::Postcode(record) => point_lon_lat(&record.geometry),
+            Record::Place(_, record) => point_lon_lat(&record.geometry),
+        }
+    }
+}
+
+impl From<AddressRecord> for Record {
+    fn from(record: AddressRecord) -> Self {
+        Record::Address(record)
+    }
+}
+
+impl From<InterpolationRecord> for Record {
+    fn from(record: InterpolationRecord) -> Self {
+        Record::Interpolation(record)
+    }
+}
+
+impl From<StreetRecord> for Record {
+    fn from(record: StreetRecord) -> Self {
+        Record::Street(record)
+    }
+}
+
+impl From<PostcodeRecord> for Record {
+    fn from(record: PostcodeRecord) -> Self {
+        Record::Postcode(record)
+    }
+}
+
+impl Serialize for Record {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Record::Address(record) => record.serialize(serializer),
+            Record::Interpolation(record) => record.serialize(serializer),
+            Record::Street(record) => record.serialize(serializer),
+            Record::Postcode(record) => record.serialize(serializer),
+            Record::Place(_, record) => record.serialize(serializer),
+        }
+    }
 }
 
 impl AddressRecord {
@@ -192,7 +384,11 @@ impl Serialize for AddressRecord {
 
 impl InterpolationRecord {
     pub fn id(&self) -> String {
-        labels::interpolation_id_from_anchors(self.source.object_id, &self.anchor_ids)
+        labels::interpolation_record_id(
+            self.source.object_id,
+            self.anchor_node_ids[0],
+            self.anchor_node_ids[1],
+        )
     }
 
     pub fn name(&self) -> String {
@@ -206,13 +402,16 @@ impl InterpolationRecord {
 
 impl Serialize for InterpolationRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let anchor_ids = self
+            .anchor_node_ids
+            .map(|node_id| labels::osm_record_id(OsmObjectType::Node, node_id));
         let mut state = serializer.serialize_struct("InterpolationRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
         state.serialize_field("address", &self.address)?;
         state.serialize_field("interpolation", &self.interpolation)?;
-        state.serialize_field("anchor_ids", &self.anchor_ids)?;
+        state.serialize_field("anchor_ids", &anchor_ids)?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
         state.serialize_field("source", &self.source)?;
@@ -321,11 +520,13 @@ impl SourceProvenance {
     }
 }
 
+pub const DERIVED_FROM_ADDRESS_RECORDS: &str = "accepted_address_records";
+
 impl DerivedSourceProvenance {
     pub fn osm_address_records(record_count: u64) -> Self {
         Self {
             dataset: "osm".to_string(),
-            derived_from: "accepted_address_records".to_string(),
+            derived_from: DERIVED_FROM_ADDRESS_RECORDS.to_string(),
             record_count,
         }
     }

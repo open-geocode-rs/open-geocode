@@ -5,8 +5,8 @@ use serde::Serialize;
 
 use crate::{
     pack::{ContextRecord, PackReader, RecordId},
-    record::{AddressComponents, InterpolationAddressComponents, InterpolationRange},
-    spatial_index::{PackSpatialIndexReader, SpatialLayer},
+    record::{AddressComponents, InterpolationAddressComponents, InterpolationRange, Layer},
+    spatial_index::SpatialIndexReader,
 };
 
 const ADDRESS_RADIUS_M: f64 = 30.0;
@@ -18,7 +18,7 @@ const CANDIDATE_LIMIT: usize = 16;
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
     pack: Arc<PackReader>,
-    spatial: PackSpatialIndexReader,
+    spatial: SpatialIndexReader,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +117,7 @@ impl PackReverseGeocoder {
 
     /// Open the spatial index using an existing shared pack reader.
     pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
-        let spatial = PackSpatialIndexReader::open(pack.path())?;
+        let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
         Ok(Self { pack, spatial })
     }
 
@@ -154,10 +154,10 @@ impl PackReverseGeocoder {
             .point_candidates(
                 options.lon,
                 options.lat,
-                SpatialLayer::Address,
+                Layer::Address,
                 ADDRESS_RADIUS_M,
                 1,
-            )
+            )?
             .into_iter()
             .next()
         else {
@@ -201,10 +201,10 @@ impl PackReverseGeocoder {
         for candidate in self.spatial.segment_candidates(
             options.lon,
             options.lat,
-            SpatialLayer::Interpolation,
+            Layer::Interpolation,
             INTERPOLATION_RADIUS_M,
             CANDIDATE_LIMIT,
-        ) {
+        )? {
             let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
                 continue;
             };
@@ -247,13 +247,7 @@ impl PackReverseGeocoder {
     ) -> Result<Option<ReverseGeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .segment_candidates(
-                options.lon,
-                options.lat,
-                SpatialLayer::Street,
-                STREET_RADIUS_M,
-                1,
-            )
+            .segment_candidates(options.lon, options.lat, Layer::Street, STREET_RADIUS_M, 1)?
             .into_iter()
             .next()
         else {
@@ -333,7 +327,7 @@ impl PackReverseGeocoder {
             options.lat,
             CONTEXT_RADIUS_M,
             CANDIDATE_LIMIT,
-        ) {
+        )? {
             if !seen.insert(candidate.record_id) {
                 continue;
             }
@@ -356,12 +350,7 @@ impl PackReverseGeocoder {
             return Ok(());
         };
         let mut seen = context_record_ids.iter().copied().collect::<BTreeSet<_>>();
-        let admin_ids = boundary_context
-            .admin_context
-            .into_iter()
-            .flat_map(|tuple| tuple.parent_record_ids());
-        let postcode_ids = boundary_context.postcode_record_id.into_iter();
-        for context_record_id in admin_ids.chain(postcode_ids) {
+        for context_record_id in boundary_context.admin_context.parent_record_ids() {
             if !seen.insert(context_record_id) {
                 continue;
             }
@@ -507,11 +496,10 @@ mod tests {
     use geojson::{Geometry, GeometryValue};
 
     use crate::{
-        builder::report::BuilderReport,
         context::AdminContextTuple,
-        pack::{PackWriter, RecordWriter},
+        pack::{PackWriter, RecordContext},
         record::{
-            AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord,
+            AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord, Record,
             SourceProvenance, StreetRecord, point_geometry,
         },
     };
@@ -522,10 +510,11 @@ mod tests {
     fn reverse_prefers_explicit_address() {
         let temp_dir = temp_pack_dir("explicit");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
-        writer.write_street(&street_record()).expect("street");
-        writer.write_address(&address_record()).expect("address");
-        let mut report = BuilderReport::default();
-        writer.finish(&mut report).expect("finish");
+        writer.write(&street_record().into(), None).expect("street");
+        writer
+            .write(&address_record().into(), None)
+            .expect("address");
+        writer.finish().expect("finish");
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
@@ -548,10 +537,9 @@ mod tests {
         let temp_dir = temp_pack_dir("interpolation");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
-            .write_interpolation(&interpolation_record())
+            .write(&interpolation_record().into(), None)
             .expect("interpolation");
-        let mut report = BuilderReport::default();
-        writer.finish(&mut report).expect("finish");
+        writer.finish().expect("finish");
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
@@ -573,9 +561,8 @@ mod tests {
     fn reverse_falls_back_to_street() {
         let temp_dir = temp_pack_dir("street");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
-        writer.write_street(&street_record()).expect("street");
-        let mut report = BuilderReport::default();
-        writer.finish(&mut report).expect("finish");
+        writer.write(&street_record().into(), None).expect("street");
+        writer.finish().expect("finish");
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
@@ -598,22 +585,23 @@ mod tests {
         let temp_dir = temp_pack_dir("boundary-context");
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         let locality_id = writer
-            .write_place(&place_record(), PlaceLayer::Locality)
+            .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
             .expect("place");
         let mut address = address_record();
         address.address.locality = Some("North York".to_string());
-        let address_id = writer.write_address(&address).expect("address");
-        writer.write_boundary_context(
-            address_id,
-            AdminContextTuple {
-                locality_record_id: Some(locality_id),
-                ..AdminContextTuple::default()
-            },
-            None,
-            0,
-        );
-        let mut report = BuilderReport::default();
-        writer.finish(&mut report).expect("finish");
+        writer
+            .write(
+                &address.into(),
+                Some(RecordContext {
+                    admin_context: AdminContextTuple {
+                        locality_record_id: Some(locality_id),
+                        ..AdminContextTuple::default()
+                    },
+                    flags: 0,
+                }),
+            )
+            .expect("address");
+        writer.finish().expect("finish");
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
@@ -684,7 +672,7 @@ mod tests {
                 end: 98,
                 step: 2,
             },
-            anchor_ids: vec!["osm:node:2".to_string(), "osm:node:98".to_string()],
+            anchor_node_ids: [2, 98],
             geometry: line_geometry(),
             representative_point: [-79.0, 43.0005],
             source: SourceProvenance::osm(OsmObjectType::Way, 20),

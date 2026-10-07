@@ -1,37 +1,54 @@
+//! Tantivy text index.
+//!
+//! The index is built in the scratch directory, merged to one segment, and its
+//! files are copied into the Pack as `text/<file>` sections. At runtime a
+//! read-only [`Directory`] serves those sections straight from the Pack
+//! mapping, so the text index needs no files of its own.
+
 use std::{
-    collections::BTreeSet,
-    fmt, mem,
+    collections::{BTreeSet, HashMap},
+    fmt, fs, io, mem,
     path::{Path, PathBuf},
-    time::Instant,
+    sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
+    directory::{
+        Directory, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr,
+        error::{DeleteError, OpenReadError, OpenWriteError},
+    },
     indexer::UserOperation,
     merge_policy::NoMergePolicy,
     schema::{FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions},
 };
 
 use crate::{
+    container::{Bytes, Container, ContainerWriter},
+    extsort::Scratch,
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
-        PlaceLayer, PlaceRecord, PostcodeRecord, StreetRecord,
+        PlaceRecord, PostcodeRecord, Record, StreetRecord,
     },
     util::text::collapse_whitespace,
 };
 
-pub const TEXT_INDEX_RELATIVE_PATH: &str = "text/tantivy";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 4;
+pub const TEXT_SECTION_PREFIX: &str = "text/";
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 5;
 
-const INDEX_MEMORY_BUDGET_BYTES: usize = 1_600_000_000;
+/// Tantivy needs at least 15 MB per indexing thread and uses up to 8 threads;
+/// beyond 1.6 GB more buffer stops paying off.
+const MIN_INDEX_MEMORY_BYTES: usize = 128 << 20;
+const MAX_INDEX_MEMORY_BYTES: usize = 1_600_000_000;
 const TEXT_INDEX_BATCH_SIZE: usize = 10_000;
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 
-pub struct TantivyTextIndexWriter {
+pub struct TextIndexWriter {
     writer: IndexWriter,
     index: Index,
+    path: PathBuf,
     fields: TextIndexFields,
     pending_documents: Vec<TantivyDocument>,
     document_count: u64,
@@ -49,17 +66,10 @@ pub struct TextIndexFields {
     pub autocomplete_subject_text: Field,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TextIndexWriteMetrics {
-    pub text_projection_ns: u128,
-    pub tantivy_document_build_ns: u128,
-    pub tantivy_add_document_ns: u128,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextIndexCommit {
-    pub schema_version: u32,
     pub document_count: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,10 +89,10 @@ struct TextIndexProjection {
     document: TextIndexDocument,
 }
 
-impl fmt::Debug for TantivyTextIndexWriter {
+impl fmt::Debug for TextIndexWriter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TantivyTextIndexWriter")
+            .debug_struct("TextIndexWriter")
             .field("fields", &self.fields)
             .field("pending_document_count", &self.pending_documents.len())
             .field("document_count", &self.document_count)
@@ -90,148 +100,63 @@ impl fmt::Debug for TantivyTextIndexWriter {
     }
 }
 
-impl TantivyTextIndexWriter {
-    pub fn create(pack_path: impl AsRef<Path>) -> Result<Self> {
+impl TextIndexWriter {
+    pub fn create(scratch: &Arc<Scratch>, memory_bytes: usize) -> Result<Self> {
         let (schema, fields) = build_schema();
-        let index_path = text_index_path(pack_path);
-        std::fs::create_dir_all(&index_path)
-            .with_context(|| format!("failed to create {}", index_path.display()))?;
-        let index = Index::create_in_dir(&index_path, schema)
-            .with_context(|| format!("failed to create Tantivy index {}", index_path.display()))?;
+        let path = scratch.path().join("text");
+        fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        let index = Index::create_in_dir(&path, schema)
+            .with_context(|| format!("failed to create Tantivy index {}", path.display()))?;
         let writer = index
-            .writer(INDEX_MEMORY_BUDGET_BYTES)
+            .writer(memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES))
             .context("failed to create Tantivy index writer")?;
         // Disable background auto-merges during the build so the only merge is
-        // the single deterministic one we force in `commit()`. This avoids
-        // races with in-flight merges and yields a minimal, reproducible index.
+        // the single deterministic one forced in `finish()`.
         writer.set_merge_policy(Box::new(NoMergePolicy));
         Ok(Self {
             writer,
             index,
+            path,
             fields,
             pending_documents: Vec::with_capacity(TEXT_INDEX_BATCH_SIZE),
             document_count: 0,
         })
     }
 
-    pub fn add_address(
-        &mut self,
-        record_id: RecordId,
-        record: &AddressRecord,
-    ) -> Result<TextIndexWriteMetrics> {
-        let started = Instant::now();
-        let projected = TextIndexDocument::project_address(record_id, record);
-        self.add_projection(projected, elapsed_ns(started))
+    pub fn fields(&self) -> TextIndexFields {
+        self.fields
     }
 
-    pub fn add_place(
-        &mut self,
-        record_id: RecordId,
-        record: &PlaceRecord,
-        layer: PlaceLayer,
-    ) -> Result<TextIndexWriteMetrics> {
-        let started = Instant::now();
-        let projected = TextIndexDocument::project_place(record_id, layer.as_str(), record);
-        self.add_projection(projected, elapsed_ns(started))
-    }
-
-    pub fn add_interpolation(
-        &mut self,
-        record_id: RecordId,
-        record: &InterpolationRecord,
-    ) -> Result<TextIndexWriteMetrics> {
-        let started = Instant::now();
-        let projected = TextIndexDocument::project_interpolation(record_id, record);
-        self.add_projection(projected, elapsed_ns(started))
-    }
-
-    pub fn add_street(
-        &mut self,
-        record_id: RecordId,
-        record: &StreetRecord,
-    ) -> Result<TextIndexWriteMetrics> {
-        let started = Instant::now();
-        let projected = TextIndexDocument::project_street(record_id, record);
-        self.add_projection(projected, elapsed_ns(started))
-    }
-
-    pub fn add_postcode(
-        &mut self,
-        record_id: RecordId,
-        record: &PostcodeRecord,
-    ) -> Result<TextIndexWriteMetrics> {
-        let started = Instant::now();
-        let projected = TextIndexDocument::project_postcode(record_id, record);
-        self.add_projection(projected, elapsed_ns(started))
-    }
-
-    fn add_projection(
-        &mut self,
-        projected: TextIndexProjection,
-        projection_ns: u128,
-    ) -> Result<TextIndexWriteMetrics> {
-        let mut metrics = TextIndexWriteMetrics::default();
-
-        metrics.text_projection_ns += projection_ns;
-
-        let started = Instant::now();
-        let document = self.fields.to_tantivy_document(&projected.document);
-        metrics.tantivy_document_build_ns += elapsed_ns(started);
-
+    pub fn add(&mut self, document: TantivyDocument) -> Result<()> {
         self.pending_documents.push(document);
         self.document_count += 1;
-
         if self.pending_documents.len() >= TEXT_INDEX_BATCH_SIZE {
-            metrics.add_assign(self.flush()?);
+            self.flush()?;
         }
-
-        Ok(metrics)
+        Ok(())
     }
 
-    pub fn flush(&mut self) -> Result<TextIndexWriteMetrics> {
-        let mut metrics = TextIndexWriteMetrics::default();
+    fn flush(&mut self) -> Result<()> {
         if self.pending_documents.is_empty() {
-            return Ok(metrics);
+            return Ok(());
         }
-
         let documents = mem::replace(
             &mut self.pending_documents,
             Vec::with_capacity(TEXT_INDEX_BATCH_SIZE),
         );
-        let operations = documents
-            .into_iter()
-            .map(UserOperation::Add)
-            .collect::<Vec<_>>();
-
-        let started = Instant::now();
         self.writer
-            .run(operations)
+            .run(documents.into_iter().map(UserOperation::Add))
             .context("failed to batch index records")?;
-        metrics.tantivy_add_document_ns += elapsed_ns(started);
-        Ok(metrics)
+        Ok(())
     }
 
-    pub fn commit(&mut self) -> Result<TextIndexCommit> {
-        debug_assert!(
-            self.pending_documents.is_empty(),
-            "text index must be flushed before commit"
-        );
+    /// Commit, merge to a single segment and copy the index into the Pack.
+    pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<TextIndexCommit> {
+        self.flush()?;
         self.writer
             .commit()
             .context("failed to commit Tantivy text index")?;
-        self.merge_to_single_segment()?;
-        Ok(TextIndexCommit {
-            schema_version: TEXT_INDEX_SCHEMA_VERSION,
-            document_count: self.document_count,
-        })
-    }
-
-    /// Collapse the committed segments into one and drop the stale segment
-    /// files. With auto-merge disabled, the build leaves several segments, each
-    /// carrying its own term dictionary and store; merging unifies them so the
-    /// on-disk index is minimal and deterministic instead of varying with how
-    /// far the background merger happened to get.
-    fn merge_to_single_segment(&mut self) -> Result<()> {
         let segment_ids = self
             .index
             .searchable_segment_ids()
@@ -249,19 +174,34 @@ impl TantivyTextIndexWriter {
             .garbage_collect_files()
             .wait()
             .context("failed to garbage collect text index files")?;
-        Ok(())
-    }
-}
+        self.writer
+            .wait_merging_threads()
+            .context("failed to stop Tantivy indexing threads")?;
 
-impl TextIndexWriteMetrics {
-    pub const fn total_ns(self) -> u128 {
-        self.text_projection_ns + self.tantivy_document_build_ns + self.tantivy_add_document_ns
-    }
-
-    pub fn add_assign(&mut self, other: Self) {
-        self.text_projection_ns += other.text_projection_ns;
-        self.tantivy_document_build_ns += other.tantivy_document_build_ns;
-        self.tantivy_add_document_ns += other.tantivy_add_document_ns;
+        let mut files = fs::read_dir(&self.path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        files.sort();
+        let mut bytes = 0;
+        for file in files {
+            let name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("text index file name is not UTF-8")?;
+            if name.ends_with(".lock") {
+                continue;
+            }
+            bytes += fs::metadata(&file)?.len();
+            pack.add_file(
+                &format!("{TEXT_SECTION_PREFIX}{name}"),
+                TEXT_INDEX_SCHEMA_VERSION,
+                &file,
+            )?;
+        }
+        Ok(TextIndexCommit {
+            document_count: self.document_count,
+            bytes,
+        })
     }
 }
 
@@ -277,6 +217,12 @@ impl TextIndexFields {
             postcode_exact: schema.get_field("postcode_exact")?,
             autocomplete_subject_text: schema.get_field(AUTOCOMPLETE_SUBJECT_FIELD)?,
         })
+    }
+
+    /// Tantivy document for a record. Pure, so callers can build documents in
+    /// parallel before handing them to the writer.
+    pub fn document(self, record_id: RecordId, record: &Record) -> TantivyDocument {
+        self.to_tantivy_document(&TextIndexDocument::from_record(record_id, record))
     }
 
     fn to_tantivy_document(self, projected: &TextIndexDocument) -> TantivyDocument {
@@ -309,8 +255,15 @@ impl TextIndexFields {
 }
 
 impl TextIndexDocument {
-    pub fn from_address(record_id: RecordId, record: &AddressRecord) -> Self {
-        Self::project_address(record_id, record).document
+    pub fn from_record(record_id: RecordId, record: &Record) -> Self {
+        match record {
+            Record::Address(record) => Self::project_address(record_id, record),
+            Record::Interpolation(record) => Self::project_interpolation(record_id, record),
+            Record::Street(record) => Self::project_street(record_id, record),
+            Record::Postcode(record) => Self::project_postcode(record_id, record),
+            Record::Place(layer, record) => Self::project_place(record_id, layer.as_str(), record),
+        }
+        .document
     }
 
     fn project_address(record_id: RecordId, address: &AddressRecord) -> TextIndexProjection {
@@ -355,14 +308,90 @@ impl TextIndexDocument {
     }
 }
 
-pub fn text_index_path(pack_path: impl AsRef<Path>) -> PathBuf {
-    pack_path.as_ref().join(TEXT_INDEX_RELATIVE_PATH)
+pub fn open_text_index(container: &Container) -> Result<Index> {
+    Index::open(PackDirectory::new(container)?).context("failed to open the Pack text index")
 }
 
-pub fn open_text_index(pack_path: impl AsRef<Path>) -> Result<Index> {
-    let path = text_index_path(crate::pack::resolve_pack_path(pack_path)?);
-    Index::open_in_dir(&path)
-        .with_context(|| format!("failed to open Tantivy index {}", path.display()))
+/// Read-only Tantivy directory over the `text/` sections of a Pack. Writes the
+/// reader needs (lock files) go to a private in-memory directory.
+#[derive(Clone)]
+struct PackDirectory {
+    files: Arc<HashMap<PathBuf, Bytes>>,
+    scratch: RamDirectory,
+}
+
+impl fmt::Debug for PackDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackDirectory")
+            .field("files", &self.files.len())
+            .finish()
+    }
+}
+
+impl PackDirectory {
+    fn new(container: &Container) -> Result<Self> {
+        let mut files = HashMap::new();
+        for (name, info) in container.sections() {
+            let Some(file) = name.strip_prefix(TEXT_SECTION_PREFIX) else {
+                continue;
+            };
+            if info.version != TEXT_INDEX_SCHEMA_VERSION {
+                bail!(
+                    "text index version {} is unsupported; rebuild the Pack for version {TEXT_INDEX_SCHEMA_VERSION}",
+                    info.version
+                );
+            }
+            files.insert(PathBuf::from(file), container.raw_section(name)?);
+        }
+        if files.is_empty() {
+            bail!("Pack has no text index");
+        }
+        Ok(Self {
+            files: Arc::new(files),
+            scratch: RamDirectory::create(),
+        })
+    }
+}
+
+impl Directory for PackDirectory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        match self.files.get(path) {
+            Some(bytes) => Ok(Arc::new(bytes.clone())),
+            None => self.scratch.get_file_handle(path),
+        }
+    }
+
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.scratch.delete(path)
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        Ok(self.files.contains_key(path) || self.scratch.exists(path)?)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        self.scratch.open_write(path)
+    }
+
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        match self.files.get(path) {
+            Some(bytes) => Ok(bytes.as_slice().to_vec()),
+            None => self.scratch.atomic_read(path),
+        }
+    }
+
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.scratch.atomic_write(path, data)
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn watch(&self, _watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        Ok(WatchHandle::empty())
+    }
 }
 
 fn build_schema() -> (Schema, TextIndexFields) {
@@ -605,10 +634,6 @@ fn unique_parts(parts: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn elapsed_ns(started: Instant) -> u128 {
-    started.elapsed().as_nanos()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -638,7 +663,7 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Node, 123),
         };
 
-        let projected = TextIndexDocument::project_address(42, &record).document;
+        let projected = TextIndexDocument::from_record(42, &record.into());
 
         assert_eq!(projected.record_id, 42);
         assert_eq!(projected.layer, "address");
@@ -665,13 +690,13 @@ mod tests {
                 end: 99,
                 step: 2,
             },
-            anchor_ids: vec!["osm:node:1".to_string(), "osm:node:2".to_string()],
+            anchor_node_ids: [1, 2],
             geometry: point_geometry(-0.1586, 51.5237),
             representative_point: [-0.1586, 51.5237],
             source: SourceProvenance::osm(OsmObjectType::Way, 9),
         };
 
-        let projected = TextIndexDocument::project_interpolation(7, &record).document;
+        let projected = TextIndexDocument::from_record(7, &record.into());
 
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
@@ -698,9 +723,8 @@ mod tests {
             },
         };
 
-        let postcode = TextIndexDocument::project_postcode(1, &postcode).document;
-        let place =
-            TextIndexDocument::project_place(2, PlaceLayer::Locality.as_str(), &place).document;
+        let postcode = TextIndexDocument::from_record(1, &postcode.into());
+        let place = TextIndexDocument::from_record(2, &Record::Place(PlaceLayer::Locality, place));
 
         assert_eq!(postcode.postcode.as_deref(), Some("M5V"));
         assert_eq!(place.layer, "locality");

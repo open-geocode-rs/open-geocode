@@ -1,13 +1,14 @@
 pub mod batch;
 pub mod bench;
 pub mod builder;
+pub mod container;
 pub mod context;
+pub mod extsort;
 mod http;
 pub mod labels;
 pub mod pack;
 pub mod record;
-mod records_archive;
-mod records_store;
+pub mod records;
 pub mod reverse;
 pub mod runtime;
 pub mod search;

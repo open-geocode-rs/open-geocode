@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use csv::{ReaderBuilder, WriterBuilder};
+use rayon::prelude::*;
 
 use crate::{
     pack::{RecordPointPrecision, RecordSource},
@@ -102,82 +103,183 @@ const AUDIT_HEADERS: [&str; 16] = [
     "geocode_reason",
 ];
 
+/// Rows read, geocoded and written per chunk. Chunks keep memory flat for
+/// inputs of any size.
+const BATCH_CHUNK_ROWS: usize = 50_000;
+
+/// Geocode a CSV in streaming chunks. Within a chunk, rows are looked up in
+/// parallel and grouped by postcode and place, so neighbouring lookups touch
+/// the same index and record pages; output rows keep the input order.
 pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeReport> {
     if options.address_field_groups.is_empty() == options.join.is_none() {
         bail!("provide either --address-fields or --join-coordinates-from, but not both");
     }
 
-    let input = read_csv(&options.input)?;
-    let original_headers = input.headers.clone();
-    let original_lookup = header_lookup(&original_headers);
-    let mut output_headers = input.headers.clone();
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&options.input)
+        .with_context(|| format!("failed to open {}", options.input.display()))?;
+    let original_headers = reader
+        .headers()
+        .with_context(|| {
+            format!(
+                "failed to read CSV headers from {}",
+                options.input.display()
+            )
+        })?
+        .iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let lookup = header_lookup(&original_headers);
+    let mut output_headers = original_headers.clone();
     let coordinate_columns = ensure_coordinate_columns(
         &mut output_headers,
         &options.lat_column,
         &options.lon_column,
     )?;
+    let mut audit_headers = original_headers.clone();
+    audit_headers.extend(AUDIT_HEADERS.iter().map(|header| (*header).to_string()));
 
-    let mut output_rows = Vec::with_capacity(input.rows.len());
-    let mut audit_rows = Vec::with_capacity(input.rows.len());
-    let mut resolved = 0;
+    let resolver = match options.join.as_ref() {
+        Some(join) => Resolver::Join {
+            lookup: read_join_lookup(join)?,
+            key_index: find_header(&lookup, &join.key_column)
+                .with_context(|| format!("missing join key column {:?}", join.key_column))?,
+        },
+        None => {
+            let pack = options
+                .pack
+                .as_ref()
+                .context("--pack is required when geocoding address fields")?;
+            Resolver::Pack(
+                PackTextSearcher::open(pack)
+                    .with_context(|| format!("failed to open Pack {}", pack.display()))?,
+            )
+        }
+    };
 
-    if let Some(join) = options.join.as_ref() {
-        let join_lookup = read_join_lookup(join)?;
-        let key_index = find_header(&original_lookup, &join.key_column)
-            .with_context(|| format!("missing join key column {:?}", join.key_column))?;
-        for row in &input.rows {
+    let mut output = create_csv(&options.output, &output_headers)?;
+    let mut audit = create_csv(&options.audit, &audit_headers)?;
+    let mut report = BatchGeocodeReport {
+        rows: 0,
+        resolved: 0,
+    };
+    let mut records = reader.records();
+    loop {
+        let chunk = records
+            .by_ref()
+            .take(BATCH_CHUNK_ROWS)
+            .map(|record| {
+                Ok(record
+                    .with_context(|| {
+                        format!("failed to read CSV record from {}", options.input.display())
+                    })?
+                    .iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let audits = resolver.resolve(&options, &lookup, &chunk)?;
+        for (row, row_audit) in chunk.iter().zip(audits) {
             let mut output_row = padded_row(row, output_headers.len());
-            let key = row.get(key_index).map(String::as_str).unwrap_or_default();
-            let audit = if let Some(joined) = join_lookup
-                .get(key)
-                .filter(|joined| !joined.lat.trim().is_empty() && !joined.lon.trim().is_empty())
-            {
+            if !row_audit.lat.trim().is_empty() && !row_audit.lon.trim().is_empty() {
                 set_coordinate_values(
                     &mut output_row,
                     coordinate_columns,
-                    &joined.lat,
-                    &joined.lon,
+                    &row_audit.lat,
+                    &row_audit.lon,
                 );
-                resolved += 1;
-                audit_from_joined(joined)
-            } else {
-                AuditFields {
-                    status: "unresolved".to_string(),
-                    reason: "join key not found or joined coordinates are blank".to_string(),
-                    ..AuditFields::default()
-                }
-            };
-            output_rows.push(output_row);
-            audit_rows.push(audit_record(&original_headers, row, &audit));
-        }
-    } else {
-        let pack = options
-            .pack
-            .as_ref()
-            .context("--pack is required when geocoding address fields")?;
-        let searcher = PackTextSearcher::open(pack)
-            .with_context(|| format!("failed to open Pack {}", pack.display()))?;
-        for row in &input.rows {
-            let mut output_row = padded_row(row, output_headers.len());
-            let audit = geocode_row(&searcher, &options, &original_lookup, row)?;
-            if !audit.lat.is_empty() && !audit.lon.is_empty() {
-                set_coordinate_values(&mut output_row, coordinate_columns, &audit.lat, &audit.lon);
-                resolved += 1;
+                report.resolved += 1;
             }
-            output_rows.push(output_row);
-            audit_rows.push(audit_record(&original_headers, row, &audit));
+            output.write_record(&output_row)?;
+            audit.write_record(audit_record(&original_headers, row, &row_audit))?;
+            report.rows += 1;
         }
     }
+    output
+        .flush()
+        .with_context(|| format!("failed to flush {}", options.output.display()))?;
+    audit
+        .flush()
+        .with_context(|| format!("failed to flush {}", options.audit.display()))?;
+    Ok(report)
+}
 
-    write_csv(&options.output, &output_headers, &output_rows)?;
-    let mut audit_headers = original_headers;
-    audit_headers.extend(AUDIT_HEADERS.iter().map(|header| (*header).to_string()));
-    write_csv(&options.audit, &audit_headers, &audit_rows)?;
+enum Resolver {
+    Pack(PackTextSearcher),
+    Join {
+        lookup: HashMap<String, JoinedCoordinate>,
+        key_index: usize,
+    },
+}
 
-    Ok(BatchGeocodeReport {
-        rows: input.rows.len(),
-        resolved,
-    })
+impl Resolver {
+    fn resolve(
+        &self,
+        options: &BatchGeocodeOptions,
+        headers: &HashMap<String, usize>,
+        rows: &[Vec<String>],
+    ) -> Result<Vec<AuditFields>> {
+        match self {
+            Resolver::Join { lookup, key_index } => Ok(rows
+                .iter()
+                .map(|row| {
+                    let key = row.get(*key_index).map(String::as_str).unwrap_or_default();
+                    match lookup.get(key).filter(|joined| {
+                        !joined.lat.trim().is_empty() && !joined.lon.trim().is_empty()
+                    }) {
+                        Some(joined) => audit_from_joined(joined),
+                        None => AuditFields {
+                            status: "unresolved".to_string(),
+                            reason: "join key not found or joined coordinates are blank"
+                                .to_string(),
+                            ..AuditFields::default()
+                        },
+                    }
+                })
+                .collect()),
+            Resolver::Pack(searcher) => {
+                let mut order = (0..rows.len()).collect::<Vec<_>>();
+                order.sort_by_cached_key(|&index| locality_key(&rows[index], options, headers));
+                let mut results = order
+                    .into_par_iter()
+                    .map(|index| {
+                        geocode_row(searcher, options, headers, &rows[index])
+                            .map(|audit| (index, audit))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                results.sort_unstable_by_key(|(index, _)| *index);
+                Ok(results.into_iter().map(|(_, audit)| audit).collect())
+            }
+        }
+    }
+}
+
+/// Group key: rows in the same postcode and place are geocoded together.
+fn locality_key(
+    row: &[String],
+    options: &BatchGeocodeOptions,
+    headers: &HashMap<String, usize>,
+) -> [String; 4] {
+    let field = |name: Option<&str>| {
+        field_value(row, headers, name)
+            .map(|value| value.to_lowercase())
+            .unwrap_or_default()
+    };
+    [
+        field(options.postcode_field.as_deref()).replace(' ', ""),
+        field(options.region_field.as_deref()),
+        field(options.locality_field.as_deref()),
+        options
+            .address_field_groups
+            .first()
+            .and_then(|group| compose_query(row, headers, group))
+            .unwrap_or_default()
+            .to_lowercase(),
+    ]
 }
 
 pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<String>>> {
@@ -276,7 +378,7 @@ fn read_csv(path: &Path) -> Result<CsvTable> {
     Ok(CsvTable { headers, rows })
 }
 
-fn write_csv(path: &Path, headers: &[String], rows: &[Vec<String>]) -> Result<()> {
+fn create_csv(path: &Path, headers: &[String]) -> Result<csv::Writer<File>> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -289,15 +391,7 @@ fn write_csv(path: &Path, headers: &[String], rows: &[Vec<String>]) -> Result<()
     writer
         .write_record(headers)
         .with_context(|| format!("failed to write headers to {}", path.display()))?;
-    for row in rows {
-        writer
-            .write_record(row)
-            .with_context(|| format!("failed to write row to {}", path.display()))?;
-    }
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    Ok(())
+    Ok(writer)
 }
 
 fn read_join_lookup(join: &CoordinateJoinOptions) -> Result<HashMap<String, JoinedCoordinate>> {
@@ -384,7 +478,7 @@ fn padded_row(row: &[String], len: usize) -> Vec<String> {
     padded
 }
 
-fn set_coordinate_values(row: &mut Vec<String>, columns: CoordinateColumns, lat: &str, lon: &str) {
+fn set_coordinate_values(row: &mut [String], columns: CoordinateColumns, lat: &str, lon: &str) {
     row[columns.lat_index] = lat.to_string();
     row[columns.lon_index] = lon.to_string();
 }
@@ -615,6 +709,92 @@ mod tests {
             &["street".to_string(), "postalcode".to_string()],
         );
         assert_eq!(query.as_deref(), Some("1333 Sheppard Ave E, M3C 1J4"));
+    }
+
+    #[test]
+    fn geocodes_streamed_rows_in_input_order() {
+        use crate::{
+            pack::PackWriter,
+            record::{
+                AddressComponents, AddressRecord, LocationPrecision, SourceProvenance,
+                point_geometry,
+            },
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-batch-{}", uuid::Uuid::new_v4()));
+        let mut writer = PackWriter::create(root.join("pack")).expect("writer");
+        for (object_id, number, street, lon) in [
+            (1, "10", "King Street", -79.40),
+            (2, "20", "Queen Street", -79.41),
+        ] {
+            writer
+                .write(
+                    &AddressRecord {
+                        address: AddressComponents {
+                            number: number.into(),
+                            street: Some(street.into()),
+                            place: None,
+                            unit: None,
+                            locality: None,
+                            region: None,
+                            postcode: None,
+                            country: None,
+                        },
+                        geometry: point_geometry(lon, 43.6),
+                        location_precision: LocationPrecision::Point,
+                        source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let input = root.join("in.csv");
+        std::fs::write(
+            &input,
+            "id,street\na,20 Queen St\nb,nowhere at all\nc,10 King Street\n",
+        )
+        .expect("input");
+        let report = run_batch_geocode(BatchGeocodeOptions {
+            pack: Some(root.join("pack")),
+            input,
+            output: root.join("out.csv"),
+            audit: root.join("audit.csv"),
+            address_field_groups: vec![vec!["street".into()]],
+            locality_field: None,
+            region_field: None,
+            postcode_field: None,
+            layer: None,
+            limit: 5,
+            lat_column: "lat".into(),
+            lon_column: "lon".into(),
+            join: None,
+        })
+        .expect("batch");
+        assert_eq!(
+            report,
+            BatchGeocodeReport {
+                rows: 3,
+                resolved: 2
+            }
+        );
+        let output = read_csv(&root.join("out.csv")).expect("output");
+        assert_eq!(output.headers, vec!["id", "street", "lat", "lon"]);
+        assert_eq!(
+            output.rows[0],
+            vec!["a", "20 Queen St", "43.6000000", "-79.4100000"]
+        );
+        assert_eq!(output.rows[1], vec!["b", "nowhere at all", "", ""]);
+        assert_eq!(
+            output.rows[2],
+            vec!["c", "10 King Street", "43.6000000", "-79.4000000"]
+        );
+        let audit = read_csv(&root.join("audit.csv")).expect("audit");
+        assert_eq!(audit.rows[1][2], "unresolved");
+        assert_eq!(audit.rows[2][6], "osm:node:1");
     }
 
     #[test]

@@ -1,28 +1,24 @@
-use std::collections::{BTreeMap, HashMap};
-
-use anyhow::Result;
+use std::collections::BTreeMap;
 
 use crate::{
-    builder::report::{BuilderReport, CandidateIssue},
-    pack::RecordWriter,
+    builder::report::CandidateIssue,
     record::{
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, OsmObjectType,
-        SourceProvenance,
+        Record, SourceProvenance,
     },
     util::text::normalize_for_compare,
 };
 
-use super::{
-    address::{collect_addr_tags_from_map, write_rejected_record},
-    geometry::{line_string_geometry, resolve_node_ref_points},
-    tags::OsmTags,
-};
+use super::{emitted::Emitted, geometry::line_string_geometry, tags::OsmTags};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InterpolationWayStub {
-    pub object_id: i64,
-    pub node_refs: Vec<i64>,
-    pub tags: BTreeMap<String, String>,
+/// A vertex of an interpolation way with the address tags of its node, which
+/// make it a numbered anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InterpolationNode {
+    pub node_id: i64,
+    pub lat: f64,
+    pub lon: f64,
+    pub addr_tags: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,81 +46,69 @@ pub(crate) fn has_interpolation_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("addr:interpolation")
 }
 
-pub(crate) fn write_interpolation_records(
-    stub: &InterpolationWayStub,
-    node_locations: &HashMap<i64, (f64, f64)>,
-    address_node_tags: &HashMap<i64, BTreeMap<String, String>>,
-    writer: &mut dyn RecordWriter,
-    report: &mut BuilderReport,
-) -> Result<()> {
-    let Ok(rule) = interpolation_rule(&stub.tags) else {
+/// Emit one interpolation record per pair of consecutive numeric anchors.
+/// `nodes` is `None` when any vertex could not be resolved.
+pub(crate) fn emit_interpolation(
+    way_id: i64,
+    tags: &BTreeMap<String, String>,
+    nodes: Option<&[InterpolationNode]>,
+    out: &mut Emitted,
+) {
+    let Ok(rule) = interpolation_rule(tags) else {
         reject_interpolation(
             CandidateIssue::InterpolationUnsupportedValue,
-            stub,
-            writer,
-            report,
-        )?;
-        return Ok(());
+            way_id,
+            tags,
+            out,
+        );
+        return;
     };
 
-    if stub.node_refs.is_empty() {
-        reject_interpolation(
-            CandidateIssue::InterpolationWayWithoutNodes,
-            stub,
-            writer,
-            report,
-        )?;
-        return Ok(());
-    }
-
-    let Some(points) = resolve_node_ref_points(&stub.node_refs, node_locations) else {
+    let Some(nodes) = nodes else {
         reject_interpolation(
             CandidateIssue::InterpolationUnresolvedGeometry,
-            stub,
-            writer,
-            report,
-        )?;
-        return Ok(());
+            way_id,
+            tags,
+            out,
+        );
+        return;
     };
+    let points = nodes
+        .iter()
+        .map(|node| (node.lat, node.lon))
+        .collect::<Vec<_>>();
 
-    let anchors = match numeric_anchors(stub, address_node_tags) {
+    let anchors = match numeric_anchors(nodes) {
         Ok(anchors) => anchors,
         Err(issue) => {
-            reject_interpolation(issue, stub, writer, report)?;
-            return Ok(());
+            reject_interpolation(issue, way_id, tags, out);
+            return;
         }
     };
-    let issue = if anchors.is_empty() {
-        Some(CandidateIssue::InterpolationMissingAnchors)
-    } else if anchors.len() == 1 {
-        Some(CandidateIssue::InterpolationInsufficientNumericAnchors)
-    } else {
-        None
+    let issue = match anchors.len() {
+        0 => Some(CandidateIssue::InterpolationMissingAnchors),
+        1 => Some(CandidateIssue::InterpolationInsufficientNumericAnchors),
+        _ => None,
     };
     if let Some(issue) = issue {
-        reject_interpolation(issue, stub, writer, report)?;
-        return Ok(());
+        reject_interpolation(issue, way_id, tags, out);
+        return;
     }
 
     for pair in anchors.windows(2) {
-        let start_anchor = &pair[0];
-        let end_anchor = &pair[1];
-        match interpolation_record_from_segment(stub, &rule, start_anchor, end_anchor, &points) {
+        match interpolation_record_from_segment(way_id, tags, &rule, &pair[0], &pair[1], &points) {
             Ok(record) => {
-                writer.write_interpolation(&record)?;
-                report.accept_interpolation();
+                out.report.accept_interpolation();
+                out.records.push(Record::Interpolation(record));
             }
-            Err(issue) => {
-                reject_interpolation(issue, stub, writer, report)?;
-            }
+            Err(issue) => reject_interpolation(issue, way_id, tags, out),
         }
     }
-
-    Ok(())
 }
 
 fn interpolation_record_from_segment(
-    stub: &InterpolationWayStub,
+    way_id: i64,
+    way_tags: &BTreeMap<String, String>,
     rule: &InterpolationRule,
     first_anchor: &Anchor,
     second_anchor: &Anchor,
@@ -141,7 +125,7 @@ fn interpolation_record_from_segment(
 
     validate_range(low_anchor.number, high_anchor.number, rule)?;
 
-    let address = segment_address(&stub.tags, &low_anchor.tags, &high_anchor.tags)?;
+    let address = segment_address(way_tags, &low_anchor.tags, &high_anchor.tags)?;
     if address.street.is_none() && address.place.is_none() {
         return Err(CandidateIssue::InterpolationMissingStreetOrPlace);
     }
@@ -156,11 +140,6 @@ fn interpolation_record_from_segment(
     let built = line_string_geometry(&segment_points)
         .ok_or(CandidateIssue::InterpolationUnresolvedGeometry)?;
 
-    let anchor_ids = vec![
-        format!("osm:node:{}", low_anchor.node_id),
-        format!("osm:node:{}", high_anchor.node_id),
-    ];
-
     Ok(InterpolationRecord {
         address,
         interpolation: InterpolationRange {
@@ -169,21 +148,20 @@ fn interpolation_record_from_segment(
             end: high_anchor.number,
             step: rule.step,
         },
-        anchor_ids,
+        anchor_node_ids: [low_anchor.node_id, high_anchor.node_id],
         geometry: built.geometry,
         representative_point: built.representative_point,
-        source: SourceProvenance::osm(OsmObjectType::Way, stub.object_id),
+        source: SourceProvenance::osm(OsmObjectType::Way, way_id),
     })
 }
 
 fn numeric_anchors(
-    stub: &InterpolationWayStub,
-    address_node_tags: &HashMap<i64, BTreeMap<String, String>>,
+    nodes: &[InterpolationNode],
 ) -> std::result::Result<Vec<Anchor>, CandidateIssue> {
     let mut anchors = Vec::new();
     let mut found_housenumber = false;
-    for (index, node_id) in stub.node_refs.iter().enumerate() {
-        let Some(tags) = address_node_tags.get(node_id) else {
+    for (index, node) in nodes.iter().enumerate() {
+        let Some(tags) = &node.addr_tags else {
             continue;
         };
         let Some(house_number) = tags.cleaned("addr:housenumber") else {
@@ -195,7 +173,7 @@ fn numeric_anchors(
         };
         anchors.push(Anchor {
             index,
-            node_id: *node_id,
+            node_id: node.node_id,
             number,
             tags: tags.clone(),
         });
@@ -361,28 +339,18 @@ fn segment_points_between(
 
 fn reject_interpolation(
     issue: CandidateIssue,
-    stub: &InterpolationWayStub,
-    writer: &mut dyn RecordWriter,
-    report: &mut BuilderReport,
-) -> Result<()> {
-    let addr_tags = collect_addr_tags_from_map(&stub.tags);
-    report.reject_with_context(
+    way_id: i64,
+    tags: &BTreeMap<String, String>,
+    out: &mut Emitted,
+) {
+    out.reject(
         issue,
         OsmObjectType::Way,
-        stub.object_id,
-        &stub.tags,
-        Some(&addr_tags),
+        way_id,
+        tags,
+        Some(tags),
         Some("interpolation"),
-        true,
     );
-    write_rejected_record(
-        issue,
-        OsmObjectType::Way,
-        stub.object_id,
-        &stub.tags,
-        Some("interpolation"),
-        writer,
-    )
 }
 
 fn parse_house_number(value: &str) -> Option<u32> {
@@ -396,115 +364,108 @@ fn parse_house_number(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pack::test_support::MemoryRecordWriter;
-
     use super::*;
+
+    fn way_tags(kind: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("addr:interpolation".to_string(), kind.to_string()),
+            ("addr:street".to_string(), "King Street".to_string()),
+        ])
+    }
+
+    fn node(node_id: i64, lat: f64, number: Option<&str>) -> InterpolationNode {
+        InterpolationNode {
+            node_id,
+            lat,
+            lon: -79.0 - (lat - 43.0),
+            addr_tags: number.map(|number| {
+                BTreeMap::from([
+                    ("addr:housenumber".to_string(), number.to_string()),
+                    ("addr:street".to_string(), "King Street".to_string()),
+                ])
+            }),
+        }
+    }
 
     #[test]
     fn emits_one_segment_per_numeric_anchor_pair() {
-        let stub = InterpolationWayStub {
-            object_id: 42,
-            node_refs: vec![1, 2, 3],
-            tags: BTreeMap::from([
-                ("addr:interpolation".to_string(), "odd".to_string()),
-                ("addr:street".to_string(), "King Street".to_string()),
-            ]),
+        let nodes = [
+            node(1, 43.0, Some("101")),
+            node(2, 43.1, Some("103")),
+            node(3, 43.2, Some("105")),
+        ];
+        let mut out = Emitted::default();
+        emit_interpolation(42, &way_tags("odd"), Some(&nodes), &mut out);
+
+        assert_eq!(out.records.len(), 2);
+        let Record::Interpolation(first) = &out.records[0] else {
+            panic!("expected interpolation");
         };
-        let node_locations =
-            HashMap::from([(1, (43.0, -79.0)), (2, (43.1, -79.1)), (3, (43.2, -79.2))]);
-        let address_node_tags = HashMap::from([
-            (
-                1,
-                BTreeMap::from([
-                    ("addr:housenumber".to_string(), "101".to_string()),
-                    ("addr:street".to_string(), "King Street".to_string()),
-                ]),
-            ),
-            (
-                2,
-                BTreeMap::from([
-                    ("addr:housenumber".to_string(), "103".to_string()),
-                    ("addr:street".to_string(), "King Street".to_string()),
-                ]),
-            ),
-            (
-                3,
-                BTreeMap::from([
-                    ("addr:housenumber".to_string(), "105".to_string()),
-                    ("addr:street".to_string(), "King Street".to_string()),
-                ]),
-            ),
-        ]);
-        let mut writer = MemoryRecordWriter::default();
-        let mut report = BuilderReport::default();
-
-        write_interpolation_records(
-            &stub,
-            &node_locations,
-            &address_node_tags,
-            &mut writer,
-            &mut report,
-        )
-        .expect("write interpolation");
-
-        assert_eq!(writer.records.len(), 2);
-        assert_eq!(writer.records[0].layer(), "interpolation");
-        let first = writer.records[0]
-            .interpolation()
-            .expect("expected interpolation");
-        let second = writer.records[1]
-            .interpolation()
-            .expect("expected interpolation");
+        let Record::Interpolation(second) = &out.records[1] else {
+            panic!("expected interpolation");
+        };
         assert_eq!(first.interpolation.start, 101);
         assert_eq!(second.interpolation.start, 103);
-        assert!(writer.rejections.is_empty());
-        assert_eq!(report.accepted.interpolation_ranges, 2);
+        assert_eq!(first.anchor_node_ids, [1, 2]);
+        assert!(out.rejections.is_empty());
+        assert_eq!(out.report.accepted.interpolation_ranges, 2);
     }
 
     #[test]
     fn reverses_descending_segment_geometry() {
-        let stub = InterpolationWayStub {
-            object_id: 42,
-            node_refs: vec![1, 2],
-            tags: BTreeMap::from([
-                ("addr:interpolation".to_string(), "even".to_string()),
-                ("addr:street".to_string(), "King Street".to_string()),
-            ]),
-        };
-        let rule = interpolation_rule(&stub.tags).expect("rule");
-        let first_anchor = Anchor {
-            index: 0,
-            node_id: 1,
-            number: 200,
-            tags: BTreeMap::from([("addr:street".to_string(), "King Street".to_string())]),
-        };
-        let second_anchor = Anchor {
-            index: 1,
-            node_id: 2,
-            number: 100,
+        let tags = way_tags("even");
+        let rule = interpolation_rule(&tags).expect("rule");
+        let anchor = |index, node_id, number| Anchor {
+            index,
+            node_id,
+            number,
             tags: BTreeMap::from([("addr:street".to_string(), "King Street".to_string())]),
         };
 
         let record = interpolation_record_from_segment(
-            &stub,
+            42,
+            &tags,
             &rule,
-            &first_anchor,
-            &second_anchor,
+            &anchor(0, 1, 200),
+            &anchor(1, 2, 100),
             &[(43.0, -79.0), (44.0, -80.0)],
         )
         .expect("record");
 
         assert_eq!(record.interpolation.start, 100);
         assert_eq!(record.interpolation.end, 200);
-        assert_eq!(
-            record.anchor_ids,
-            vec!["osm:node:2".to_string(), "osm:node:1".to_string()]
-        );
+        assert_eq!(record.anchor_node_ids, [2, 1]);
         assert!(
             record
                 .geometry
                 .to_string()
                 .contains("\"coordinates\":[[-80.0,44.0],[-79.0,43.0]]")
+        );
+    }
+
+    #[test]
+    fn rejects_unresolved_geometry_and_missing_anchors() {
+        let mut out = Emitted::default();
+        emit_interpolation(42, &way_tags("odd"), None, &mut out);
+        emit_interpolation(
+            43,
+            &way_tags("odd"),
+            Some(&[node(1, 43.0, None), node(2, 43.1, None)]),
+            &mut out,
+        );
+        emit_interpolation(44, &way_tags("sometimes"), None, &mut out);
+        let reasons = out
+            .rejections
+            .iter()
+            .map(|rejection| rejection.reason.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                "interpolation_unresolved_geometry",
+                "interpolation_missing_anchors",
+                "interpolation_unsupported_value",
+            ]
         );
     }
 

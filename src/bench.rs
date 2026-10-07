@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -8,10 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::{
-    pack::{PackManifest, PackReader},
+    builder::report::{BuilderReport, PhaseTimings, ScratchReport, Throughput},
+    pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackManifest, PackReader},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     search::{PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
 };
@@ -43,196 +42,43 @@ pub struct PackBenchmarkSettings {
 
 #[derive(Debug, Serialize)]
 pub struct PackMetricReport {
-    pub manifest: PackManifestSummary,
+    pub manifest: PackManifest,
     pub bytes: PackByteMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildMetricReport>,
 }
 
+/// Build timings and throughput from the build report next to the Pack.
 #[derive(Debug, Serialize)]
 pub struct BuildMetricReport {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accepted_records: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rejected_records: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_seconds: Option<f64>,
+    pub input_bytes: u64,
+    pub accepted_records: u64,
+    pub rejected_records: u64,
+    pub total_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_mib_per_sec: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accepted_records_per_sec: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rejected_records_per_sec: Option<f64>,
-    pub phases: BuildPhaseMetrics,
-    pub record_store: RecordStoreBuildMetrics,
-    pub text_index: TextIndexBuildMetrics,
-    pub spatial_index: SpatialIndexBuildMetrics,
-    pub osm_scan: OsmScanMetrics,
-    pub geometry_resolution: GeometryResolutionMetrics,
+    pub phases: PhaseTimings,
+    pub throughput: Throughput,
+    pub scratch: ScratchReport,
 }
 
-#[derive(Debug, Default, Serialize)]
-pub struct BuildPhaseMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pack_create_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub osm_feature_scan_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_coordinate_resolution_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub record_emission_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pack_finalize_ms: Option<u128>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct RecordStoreBuildMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub record_encode_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub record_table_write_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rejection_encode_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rejection_table_write_ms: Option<u128>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct TextIndexBuildMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub document_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub write_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub projection_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tantivy_document_build_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tantivy_add_document_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_ms: Option<u128>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct SpatialIndexBuildMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub point_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub segment_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub add_record_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finalize_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub point_pair_generation_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub segment_pair_generation_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pair_sort_dedupe_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cell_directory_build_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_write_ms: Option<u128>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct OsmScanMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dense_nodes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nodes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ways: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relations: Option<u64>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct GeometryResolutionMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub address_way_stubs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interpolation_way_stubs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub street_way_stubs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required_node_refs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved_node_refs: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PackManifestSummary {
-    pub schema_version: u32,
-    pub crate_version: String,
-    pub built_at_unix: u64,
-    pub record_count: u64,
-    pub rejection_count: u64,
-    pub layer_counts: BTreeMap<String, u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_index_schema_version: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_index_document_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spatial_index_schema_version: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spatial_index_point_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spatial_index_segment_count: Option<u64>,
-}
-
+/// Pack bytes by section group.
 #[derive(Debug, Default, Serialize)]
 pub struct PackByteMetrics {
     pub total: u64,
-    pub manifest: u64,
     pub records: u64,
-    pub offsets: u64,
-    pub record_store: u64,
-    pub audit: u64,
+    pub context: u64,
     pub text_index: u64,
     pub spatial_index: u64,
     pub other: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_per_record: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub record_store_bytes_per_record: Option<f64>,
+    pub records_bytes_per_record: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_index_bytes_per_record: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spatial_index_bytes_per_record: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PackFileMetric {
-    pub path: String,
-    pub bytes: u64,
-    pub category: PackFileCategory,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PackFileCategory {
-    Manifest,
-    Records,
-    Offsets,
-    Audit,
-    TextIndex,
-    SpatialIndex,
-    Other,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,7 +175,7 @@ pub fn benchmark_pack(options: PackBenchmarkOptions) -> Result<PackBenchmarkRepo
     let fixture = read_fixture(options.queries.as_deref())?;
 
     let (reader, pack_reader_ms) = measure_value(|| PackReader::open(&options.pack).map(Arc::new))?;
-    let pack = pack_metrics(reader.path(), reader.manifest())?;
+    let pack = pack_metrics(&reader)?;
     let (searcher, text_searcher_ms) =
         measure_value(|| PackTextSearcher::from_pack(Arc::clone(&reader)))?;
     let (reverse_geocoder, reverse_geocoder_ms) =
@@ -375,107 +221,44 @@ fn read_fixture(path: Option<&Path>) -> Result<BenchmarkFixture> {
     serde_json::from_reader(file).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn pack_metrics(pack_path: &Path, manifest: &PackManifest) -> Result<PackMetricReport> {
-    let files = collect_file_metrics(pack_path)?;
-    let bytes = byte_metrics(&files, manifest.record_count);
-    let build_report = read_build_report(pack_path)?;
-    let build = build_report.as_ref().map(build_metrics);
+fn pack_metrics(reader: &PackReader) -> Result<PackMetricReport> {
+    let manifest = reader.manifest();
+    let mut bytes = PackByteMetrics {
+        total: reader.container().file_size(),
+        ..PackByteMetrics::default()
+    };
+    for (name, len) in reader.section_sizes() {
+        let group = match name.split('/').next().unwrap_or_default() {
+            "records" => &mut bytes.records,
+            "context" => &mut bytes.context,
+            "text" => &mut bytes.text_index,
+            "spatial" => &mut bytes.spatial_index,
+            _ => &mut bytes.other,
+        };
+        *group += len;
+    }
+    if manifest.record_count > 0 {
+        let count = manifest.record_count as f64;
+        bytes.bytes_per_record = Some(bytes.total as f64 / count);
+        bytes.records_bytes_per_record = Some(bytes.records as f64 / count);
+        bytes.text_index_bytes_per_record = Some(bytes.text_index as f64 / count);
+        bytes.spatial_index_bytes_per_record = Some(bytes.spatial_index as f64 / count);
+    }
     Ok(PackMetricReport {
-        manifest: PackManifestSummary::from_manifest(manifest),
+        manifest: manifest.clone(),
         bytes,
-        build,
+        build: read_build_report(reader.path())?.map(build_metrics),
     })
 }
 
-fn collect_file_metrics(pack_path: &Path) -> Result<Vec<PackFileMetric>> {
-    let mut files = Vec::new();
-    collect_file_metrics_under(pack_path, pack_path, &mut files)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
-}
-
-fn collect_file_metrics_under(
-    pack_path: &Path,
-    current: &Path,
-    files: &mut Vec<PackFileMetric>,
-) -> Result<()> {
-    for entry in
-        fs::read_dir(current).with_context(|| format!("failed to read {}", current.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_file_metrics_under(pack_path, &path, files)?;
-        } else if metadata.is_file() {
-            let relative = pack_relative_path(pack_path, &path)?;
-            files.push(PackFileMetric {
-                category: categorize_pack_file(&relative),
-                path: relative,
-                bytes: metadata.len(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn pack_relative_path(pack_path: &Path, path: &Path) -> Result<String> {
-    let relative = path
-        .strip_prefix(pack_path)
-        .with_context(|| format!("{} is not inside {}", path.display(), pack_path.display()))?;
-    Ok(relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/"))
-}
-
-fn categorize_pack_file(path: &str) -> PackFileCategory {
-    if path == "manifest.json" {
-        PackFileCategory::Manifest
-    } else if path.starts_with("records/") {
-        PackFileCategory::Records
-    } else if path.starts_with("audit/") {
-        PackFileCategory::Audit
-    } else if path.starts_with("text/") {
-        PackFileCategory::TextIndex
-    } else if path.starts_with("spatial/") {
-        PackFileCategory::SpatialIndex
-    } else {
-        PackFileCategory::Other
-    }
-}
-
-fn byte_metrics(files: &[PackFileMetric], record_count: u64) -> PackByteMetrics {
-    let mut metrics = PackByteMetrics::default();
-    for file in files {
-        metrics.total += file.bytes;
-        match file.category {
-            PackFileCategory::Manifest => metrics.manifest += file.bytes,
-            PackFileCategory::Records => metrics.records += file.bytes,
-            PackFileCategory::Offsets => metrics.offsets += file.bytes,
-            PackFileCategory::Audit => metrics.audit += file.bytes,
-            PackFileCategory::TextIndex => metrics.text_index += file.bytes,
-            PackFileCategory::SpatialIndex => metrics.spatial_index += file.bytes,
-            PackFileCategory::Other => metrics.other += file.bytes,
-        }
-    }
-    metrics.record_store = metrics.records + metrics.offsets;
-    if record_count > 0 {
-        let record_count = record_count as f64;
-        metrics.bytes_per_record = Some(metrics.total as f64 / record_count);
-        metrics.record_store_bytes_per_record = Some(metrics.record_store as f64 / record_count);
-        metrics.text_index_bytes_per_record = Some(metrics.text_index as f64 / record_count);
-        metrics.spatial_index_bytes_per_record = Some(metrics.spatial_index as f64 / record_count);
-    }
-    metrics
-}
-
-fn read_build_report(pack_path: &Path) -> Result<Option<Value>> {
-    let path = pack_path.join("audit").join("build-report.json");
-    if !path.exists() {
+fn read_build_report(pack_file: &Path) -> Result<Option<BuilderReport>> {
+    let Some(path) = pack_file
+        .parent()
+        .map(|dir| dir.join(AUDIT_DIR).join(BUILD_REPORT_FILE))
+        .filter(|path| path.is_file())
+    else {
         return Ok(None);
-    }
+    };
     let file =
         fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
     serde_json::from_reader(file)
@@ -483,135 +266,19 @@ fn read_build_report(pack_path: &Path) -> Result<Option<Value>> {
         .with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn build_metrics(report: &Value) -> BuildMetricReport {
-    let schema_version = value_at_u64(report, &["schema_version"]);
-    let input_bytes = value_at_u64(report, &["input_bytes"]);
-    let accepted_records = value_at_u64(report, &["accepted", "total"]);
-    let rejected_records = value_at_u64(report, &["rejected", "total"]);
-    let total_ms = value_at_u128(report, &["phases", "total_ms"]);
-    let total_seconds = total_ms.map(|ms| ms as f64 / 1_000.0);
-
+fn build_metrics(report: BuilderReport) -> BuildMetricReport {
+    let total_seconds = report.phases.total_ms as f64 / 1_000.0;
     BuildMetricReport {
-        schema_version,
-        input_bytes,
-        accepted_records,
-        rejected_records,
-        total_ms,
+        input_bytes: report.input_bytes,
+        accepted_records: report.accepted.total,
+        rejected_records: report.rejected.total,
         total_seconds,
-        input_mib_per_sec: rate_mib_per_sec(input_bytes, total_ms),
-        accepted_records_per_sec: rate_per_sec(accepted_records, total_ms),
-        rejected_records_per_sec: rate_per_sec(rejected_records, total_ms),
-        phases: BuildPhaseMetrics {
-            pack_create_ms: value_at_u128(report, &["phases", "pack_create_ms"]),
-            osm_feature_scan_ms: value_at_u128(report, &["phases", "discovery_ms"]),
-            node_coordinate_resolution_ms: value_at_u128(
-                report,
-                &["phases", "coordinate_resolution_ms"],
-            ),
-            record_emission_ms: value_at_u128(report, &["phases", "record_emission_ms"]),
-            pack_finalize_ms: value_at_u128(report, &["phases", "pack_finish_ms"]),
-        },
-        record_store: RecordStoreBuildMetrics {
-            record_encode_ms: value_at_u128(report, &["pack_write", "record_encode_ms"]),
-            record_table_write_ms: value_at_u128(report, &["pack_write", "record_table_write_ms"]),
-            rejection_encode_ms: value_at_u128(report, &["pack_write", "rejection_encode_ms"]),
-            rejection_table_write_ms: value_at_u128(
-                report,
-                &["pack_write", "rejection_table_write_ms"],
-            ),
-        },
-        text_index: TextIndexBuildMetrics {
-            schema_version: value_at_u64(report, &["text_index_schema_version"]),
-            document_count: value_at_u64(report, &["text_index_document_count"]),
-            bytes: value_at_u64(report, &["text_index_bytes"]),
-            write_ms: value_at_u128(report, &["pack_write", "text_index_write_ms"]),
-            projection_ms: value_at_u128(report, &["pack_write", "text_projection_ms"]),
-            tantivy_document_build_ms: value_at_u128(
-                report,
-                &["pack_write", "tantivy_document_build_ms"],
-            ),
-            tantivy_add_document_ms: value_at_u128(
-                report,
-                &["pack_write", "tantivy_add_document_ms"],
-            ),
-            commit_ms: value_at_u128(report, &["pack_write", "text_index_commit_ms"]),
-        },
-        spatial_index: SpatialIndexBuildMetrics {
-            schema_version: value_at_u64(report, &["spatial_index_schema_version"]),
-            point_count: value_at_u64(report, &["spatial_index_point_count"]),
-            segment_count: value_at_u64(report, &["spatial_index_segment_count"]),
-            bytes: value_at_u64(report, &["spatial_index_bytes"]),
-            add_record_ms: value_at_u128(report, &["pack_write", "spatial_index_write_ms"]),
-            finalize_ms: value_at_u128(report, &["pack_write", "spatial_index_finish_ms"]),
-            point_pair_generation_ms: value_at_u128(
-                report,
-                &["pack_write", "spatial_point_pair_generation_ms"],
-            ),
-            segment_pair_generation_ms: value_at_u128(
-                report,
-                &["pack_write", "spatial_segment_pair_generation_ms"],
-            ),
-            pair_sort_dedupe_ms: value_at_u128(
-                report,
-                &["pack_write", "spatial_pair_sort_dedupe_ms"],
-            ),
-            cell_directory_build_ms: value_at_u128(
-                report,
-                &["pack_write", "spatial_cell_directory_build_ms"],
-            ),
-            file_write_ms: value_at_u128(report, &["pack_write", "spatial_file_write_ms"]),
-        },
-        osm_scan: OsmScanMetrics {
-            dense_nodes: value_at_u64(report, &["scanned", "dense_nodes"]),
-            nodes: value_at_u64(report, &["scanned", "nodes"]),
-            ways: value_at_u64(report, &["scanned", "ways"]),
-            relations: value_at_u64(report, &["scanned", "relations"]),
-        },
-        geometry_resolution: GeometryResolutionMetrics {
-            address_way_stubs: value_at_u64(report, &["geometry_resolution", "address_way_stubs"]),
-            interpolation_way_stubs: value_at_u64(
-                report,
-                &["geometry_resolution", "interpolation_way_stubs"],
-            ),
-            street_way_stubs: value_at_u64(report, &["geometry_resolution", "street_way_stubs"]),
-            required_node_refs: value_at_u64(
-                report,
-                &["geometry_resolution", "required_node_refs"],
-            ),
-            resolved_node_refs: value_at_u64(
-                report,
-                &["geometry_resolution", "resolved_node_refs"],
-            ),
-        },
+        input_mib_per_sec: (total_seconds > 0.0)
+            .then(|| report.input_bytes as f64 / 1_048_576.0 / total_seconds),
+        phases: report.phases,
+        throughput: report.throughput,
+        scratch: report.scratch,
     }
-}
-
-fn value_at_u64(value: &Value, path: &[&str]) -> Option<u64> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    current.as_u64()
-}
-
-fn value_at_u128(value: &Value, path: &[&str]) -> Option<u128> {
-    value_at_u64(value, path).map(u128::from)
-}
-
-fn rate_per_sec(count: Option<u64>, total_ms: Option<u128>) -> Option<f64> {
-    let total_ms = total_ms?;
-    if total_ms == 0 {
-        return None;
-    }
-    Some(count? as f64 / (total_ms as f64 / 1_000.0))
-}
-
-fn rate_mib_per_sec(bytes: Option<u64>, total_ms: Option<u128>) -> Option<f64> {
-    let total_ms = total_ms?;
-    if total_ms == 0 {
-        return None;
-    }
-    Some(bytes? as f64 / 1_048_576.0 / (total_ms as f64 / 1_000.0))
 }
 
 fn benchmark_search_cases(
@@ -771,39 +438,6 @@ fn measure_iterations(
     Ok(durations)
 }
 
-impl PackManifestSummary {
-    fn from_manifest(manifest: &PackManifest) -> Self {
-        Self {
-            schema_version: manifest.schema_version,
-            crate_version: manifest.crate_version.clone(),
-            built_at_unix: manifest.built_at_unix,
-            record_count: manifest.record_count,
-            rejection_count: manifest.rejection_count,
-            layer_counts: manifest.layer_counts.clone(),
-            text_index_schema_version: manifest
-                .text_index
-                .as_ref()
-                .map(|index| index.schema_version),
-            text_index_document_count: manifest
-                .text_index
-                .as_ref()
-                .map(|index| index.document_count),
-            spatial_index_schema_version: manifest
-                .spatial_index
-                .as_ref()
-                .map(|index| index.schema_version),
-            spatial_index_point_count: manifest
-                .spatial_index
-                .as_ref()
-                .map(|index| index.point_count),
-            spatial_index_segment_count: manifest
-                .spatial_index
-                .as_ref()
-                .map(|index| index.segment_count),
-        }
-    }
-}
-
 impl LatencyStats {
     fn from_nanos(durations: &[u128]) -> Self {
         debug_assert!(!durations.is_empty());
@@ -837,8 +471,7 @@ fn nanos_to_ms(nanos: u128) -> f64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        builder::report::BuilderReport,
-        pack::{PackWriter, RecordWriter},
+        pack::PackWriter,
         record::{
             AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
             point_geometry,
@@ -863,10 +496,13 @@ mod tests {
 
         assert_eq!(report.pack.manifest.record_count, 1);
         assert!(report.pack.bytes.total > 0);
-        assert!(report.pack.bytes.record_store > 0);
-        let build = report.pack.build.as_ref().expect("build metrics");
-        assert!(build.phases.pack_finalize_ms.is_some());
-        assert!(build.text_index.commit_ms.is_some());
+        assert!(report.pack.bytes.records > 0);
+        assert!(report.pack.bytes.text_index > 0);
+        assert!(report.pack.bytes.spatial_index > 0);
+        assert!(
+            report.pack.build.is_none(),
+            "a Pack written directly has no build report"
+        );
         assert!(report.open.pack_reader_ms >= 0.0);
         assert_eq!(report.queries.search.case_count, 0);
 
@@ -912,25 +548,27 @@ mod tests {
     fn write_test_pack(path: &Path) {
         let mut writer = PackWriter::create(path).expect("writer");
         writer
-            .write_address(&AddressRecord {
-                address: AddressComponents {
-                    number: "10".to_string(),
-                    street: Some("King Street".to_string()),
-                    place: None,
-                    unit: None,
-                    locality: Some("Toronto".to_string()),
-                    region: Some("Ontario".to_string()),
-                    postcode: Some("M5V 1A1".to_string()),
-                    country: Some("CA".to_string()),
-                },
-                geometry: point_geometry(-79.4, 43.6),
-                location_precision: LocationPrecision::Point,
-                source: SourceProvenance::osm(OsmObjectType::Node, 1),
-            })
+            .write(
+                &AddressRecord {
+                    address: AddressComponents {
+                        number: "10".to_string(),
+                        street: Some("King Street".to_string()),
+                        place: None,
+                        unit: None,
+                        locality: Some("Toronto".to_string()),
+                        region: Some("Ontario".to_string()),
+                        postcode: Some("M5V 1A1".to_string()),
+                        country: Some("CA".to_string()),
+                    },
+                    geometry: point_geometry(-79.4, 43.6),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::osm(OsmObjectType::Node, 1),
+                }
+                .into(),
+                None,
+            )
             .expect("write address");
-        writer
-            .finish(&mut BuilderReport::default())
-            .expect("finish");
+        writer.finish().expect("finish");
     }
 
     fn temp_pack_path(name: &str) -> PathBuf {

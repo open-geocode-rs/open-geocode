@@ -456,8 +456,7 @@ mod router_tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::builder::report::BuilderReport;
-    use crate::pack::{PackWriter, RecordWriter};
+    use crate::pack::PackWriter;
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
         point_geometry,
@@ -471,30 +470,32 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(dir);
         let mut writer = PackWriter::create(dir).expect("writer");
         writer
-            .write_address(&AddressRecord {
-                address: AddressComponents {
-                    number: "10".to_string(),
-                    street: Some("King Street".to_string()),
-                    place: None,
-                    unit: None,
-                    locality: Some("Toronto".to_string()),
-                    region: None,
-                    postcode: Some("M5V 1A1".to_string()),
-                    country: None,
-                },
-                geometry: point_geometry(-79.0, 43.0),
-                location_precision: LocationPrecision::Point,
-                source: SourceProvenance {
-                    dataset: "osm".to_string(),
-                    object_type: OsmObjectType::Node,
-                    object_id: 1,
-                    tags: Some(BTreeMap::new()),
-                },
-            })
+            .write(
+                &AddressRecord {
+                    address: AddressComponents {
+                        number: "10".to_string(),
+                        street: Some("King Street".to_string()),
+                        place: None,
+                        unit: None,
+                        locality: Some("Toronto".to_string()),
+                        region: None,
+                        postcode: Some("M5V 1A1".to_string()),
+                        country: None,
+                    },
+                    geometry: point_geometry(-79.0, 43.0),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance {
+                        dataset: "osm".to_string(),
+                        object_type: OsmObjectType::Node,
+                        object_id: 1,
+                        tags: Some(BTreeMap::new()),
+                    },
+                }
+                .into(),
+                None,
+            )
             .expect("write address");
-        writer
-            .finish(&mut BuilderReport::default())
-            .expect("finish");
+        writer.finish().expect("finish");
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {

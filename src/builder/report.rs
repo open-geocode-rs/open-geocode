@@ -7,6 +7,8 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 13;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
     pub schema_version: u32,
@@ -24,35 +26,163 @@ pub struct BuilderReport {
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
     pub throughput: Throughput,
-    pub pack_write: PackWriteTimings,
-    pub node_cache_entries: usize,
-    pub record_table_bytes: u64,
-    pub offset_table_bytes: u64,
-    pub rejection_table_bytes: u64,
-    pub rejection_offset_table_bytes: u64,
-    pub text_index_path: String,
-    pub text_index_schema_version: u32,
-    pub text_index_document_count: u64,
-    pub text_index_bytes: u64,
-    pub spatial_index_path: String,
-    pub spatial_index_schema_version: u32,
-    pub spatial_index_point_count: u64,
-    pub spatial_index_segment_count: u64,
-    pub spatial_index_bytes: u64,
+    pub scratch: ScratchReport,
+    pub output: PackOutputReport,
 }
 
 impl BuilderReport {
     /// Derive build throughput from the final wall-clock and record counts.
-    /// Call once `phases.total_ms` is final (i.e. after pack finalize).
+    /// Call once `phases.total_ms` is final.
     pub(crate) fn finalize_throughput(&mut self) {
         let secs = self.phases.total_ms as f64 / 1000.0;
         if secs <= 0.0 {
             return;
         }
-        self.throughput.records_per_sec = self.text_index_document_count as f64 / secs;
+        self.throughput.records_per_sec = self.output.record_count as f64 / secs;
         self.throughput.addresses_per_sec =
             *self.accepted.by_layer.get("address").unwrap_or(&0) as f64 / secs;
     }
+
+    /// Fold a report produced by a parallel worker into this one. Workers cover
+    /// consecutive input ranges and are merged in input order, so capped sample
+    /// lists keep the same entries a sequential build would.
+    pub(crate) fn merge(&mut self, other: BuilderReport) {
+        let BuilderReport {
+            scanned,
+            accepted,
+            rejected,
+            disposition,
+            validation,
+            quality,
+            triage,
+            geometry_resolution,
+            completeness,
+            ..
+        } = other;
+        self.scanned.nodes += scanned.nodes;
+        self.scanned.dense_nodes += scanned.dense_nodes;
+        self.scanned.ways += scanned.ways;
+        self.scanned.relations += scanned.relations;
+
+        self.accepted.total += accepted.total;
+        merge_counts(&mut self.accepted.by_layer, accepted.by_layer);
+        self.accepted.node_addresses += accepted.node_addresses;
+        self.accepted.way_centroid_addresses += accepted.way_centroid_addresses;
+        self.accepted.interpolation_ranges += accepted.interpolation_ranges;
+        self.accepted.street_segments += accepted.street_segments;
+        self.accepted.postcode_records += accepted.postcode_records;
+        self.accepted.place_nodes += accepted.place_nodes;
+
+        self.rejected.total += rejected.total;
+        merge_counts(&mut self.rejected.by_reason, rejected.by_reason);
+
+        self.disposition.invalid += disposition.invalid;
+        self.disposition.out_of_scope += disposition.out_of_scope;
+        self.disposition.unsupported += disposition.unsupported;
+        self.disposition.unresolved_geometry += disposition.unresolved_geometry;
+        merge_counts(&mut self.disposition.by_reason, disposition.by_reason);
+
+        self.validation
+            .missing_housenumber
+            .merge(validation.missing_housenumber);
+        self.validation
+            .missing_street_or_place
+            .merge(validation.missing_street_or_place);
+        self.validation
+            .unsupported_relation
+            .merge(validation.unsupported_relation);
+        self.validation
+            .unresolved_geometry
+            .merge(validation.unresolved_geometry);
+        self.validation
+            .interpolation
+            .merge(validation.interpolation);
+
+        self.quality.addresses.merge(quality.addresses);
+        merge_samples(
+            &mut self.quality.samples,
+            quality.samples,
+            MAX_ACCEPTED_QUALITY_SAMPLES_PER_BUCKET,
+        );
+
+        merge_counts(&mut self.triage.by_bucket, triage.by_bucket);
+        for (reason, buckets) in triage.by_reason_and_bucket {
+            merge_counts(
+                self.triage.by_reason_and_bucket.entry(reason).or_default(),
+                buckets,
+            );
+        }
+        let gaps = triage.street_name_gaps;
+        merge_counts(
+            &mut self.triage.street_name_gaps.by_highway,
+            gaps.by_highway,
+        );
+        merge_counts(
+            &mut self.triage.street_name_gaps.by_service,
+            gaps.by_service,
+        );
+        merge_counts(&mut self.triage.street_name_gaps.by_bucket, gaps.by_bucket);
+        merge_samples(
+            &mut self.triage.samples,
+            triage.samples,
+            MAX_REJECTION_SAMPLES_PER_REASON_BUCKET,
+        );
+
+        let geometry = geometry_resolution;
+        self.geometry_resolution.address_way_stubs += geometry.address_way_stubs;
+        self.geometry_resolution.interpolation_way_stubs += geometry.interpolation_way_stubs;
+        self.geometry_resolution.street_way_stubs += geometry.street_way_stubs;
+        self.geometry_resolution.boundary_way_stubs += geometry.boundary_way_stubs;
+        self.geometry_resolution.required_node_refs += geometry.required_node_refs;
+        self.geometry_resolution.resolved_node_refs += geometry.resolved_node_refs;
+
+        self.completeness.city += completeness.city;
+        self.completeness.postcode += completeness.postcode;
+        self.completeness.state += completeness.state;
+        self.completeness.country += completeness.country;
+    }
+}
+
+fn merge_counts(target: &mut BTreeMap<String, u64>, source: BTreeMap<String, u64>) {
+    for (key, count) in source {
+        *target.entry(key).or_default() += count;
+    }
+}
+
+fn merge_samples<T>(
+    target: &mut BTreeMap<String, Vec<T>>,
+    source: BTreeMap<String, Vec<T>>,
+    cap: usize,
+) {
+    for (bucket, samples) in source {
+        let existing = target.entry(bucket).or_default();
+        let room = cap.saturating_sub(existing.len());
+        existing.extend(samples.into_iter().take(room));
+    }
+}
+
+/// Disk used for build scratch files and how often each sorter spilled.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ScratchReport {
+    pub memory_budget_bytes: u64,
+    pub spilled_bytes: u64,
+    pub sorters: BTreeMap<String, SorterReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SorterReport {
+    pub items: u64,
+    pub runs: u64,
+}
+
+/// What the build wrote.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PackOutputReport {
+    pub pack_bytes: u64,
+    pub record_count: u64,
+    pub text_index_bytes: u64,
+    pub rejection_count: u64,
+    pub sections: BTreeMap<String, u64>,
 }
 
 /// Build throughput derived from `phases.total_ms` (records/addresses per second).
@@ -143,9 +273,9 @@ pub struct AcceptedRecordSample {
     pub source_id: String,
     pub object_type: OsmObjectType,
     pub object_id: i64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_fields: Vec<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
 }
 
@@ -172,7 +302,7 @@ pub struct RejectionSample {
     pub object_type: OsmObjectType,
     pub object_id: i64,
     pub source_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer_hint: Option<String>,
     pub writes_rejection_record: bool,
     pub tags: BTreeMap<String, String>,
@@ -186,13 +316,46 @@ pub struct IssueAuditCounts {
     pub by_addr_key: BTreeMap<String, u64>,
 }
 
+impl IssueAuditCounts {
+    fn merge(&mut self, other: IssueAuditCounts) {
+        merge_counts(&mut self.by_shape, other.by_shape);
+        merge_counts(&mut self.by_feature_context, other.by_feature_context);
+        merge_counts(&mut self.by_object_type, other.by_object_type);
+        merge_counts(&mut self.by_addr_key, other.by_addr_key);
+    }
+}
+
+impl AcceptedAddressQuality {
+    fn merge(&mut self, other: AcceptedAddressQuality) {
+        self.total += other.total;
+        self.has_street += other.has_street;
+        self.has_place += other.has_place;
+        self.has_unit += other.has_unit;
+        self.has_locality += other.has_locality;
+        self.missing_locality += other.missing_locality;
+        self.has_region += other.has_region;
+        self.missing_region += other.missing_region;
+        self.has_postcode += other.has_postcode;
+        self.missing_postcode += other.missing_postcode;
+        self.has_country += other.has_country;
+        self.missing_country += other.missing_country;
+        self.has_full_admin_context += other.has_full_admin_context;
+        self.missing_any_admin_context += other.missing_any_admin_context;
+        self.enrichable_by_point += other.enrichable_by_point;
+        self.not_enrichable_by_point += other.not_enrichable_by_point;
+        merge_counts(&mut self.by_location_precision, other.by_location_precision);
+        merge_counts(&mut self.by_context_shape, other.by_context_shape);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct GeometryResolutionCounts {
-    pub address_way_stubs: usize,
-    pub interpolation_way_stubs: usize,
-    pub street_way_stubs: usize,
-    pub required_node_refs: usize,
-    pub resolved_node_refs: usize,
+    pub address_way_stubs: u64,
+    pub interpolation_way_stubs: u64,
+    pub street_way_stubs: u64,
+    pub boundary_way_stubs: u64,
+    pub required_node_refs: u64,
+    pub resolved_node_refs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -203,40 +366,26 @@ pub struct CompletenessCounts {
     pub country: u64,
 }
 
+/// Wall-clock time per build phase, in order.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PhaseTimings {
-    pub pack_create_ms: u128,
-    pub discovery_ms: u128,
-    pub coordinate_resolution_ms: u128,
-    pub record_emission_ms: u128,
-    pub pack_finish_ms: u128,
+    /// Pass 1: classify every OSM object.
+    pub scan_ms: u128,
+    /// Pass 2: read the ways that make up boundary relations.
+    pub boundary_member_scan_ms: u128,
+    /// Pass 3: join node coordinates onto way references.
+    pub node_join_ms: u128,
+    /// Assemble way geometry into records.
+    pub feature_emission_ms: u128,
+    /// Build admin boundary polygons.
+    pub boundary_build_ms: u128,
+    /// Write places, postcodes and boundaries.
+    pub context_record_write_ms: u128,
+    /// Write addresses, interpolations and streets in Hilbert order.
+    pub record_write_ms: u128,
+    /// Finish the text and spatial indexes and write the Pack file.
+    pub pack_seal_ms: u128,
     pub total_ms: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct PackWriteTimings {
-    pub record_encode_ms: u128,
-    pub record_table_write_ms: u128,
-    pub text_index_write_ms: u128,
-    pub text_projection_ms: u128,
-    pub tantivy_document_build_ms: u128,
-    pub tantivy_add_document_ms: u128,
-    pub spatial_index_write_ms: u128,
-    pub spatial_point_pair_generation_ms: u128,
-    pub spatial_segment_pair_generation_ms: u128,
-    pub spatial_pair_sort_dedupe_ms: u128,
-    pub spatial_cell_directory_build_ms: u128,
-    pub spatial_file_write_ms: u128,
-    pub rejection_encode_ms: u128,
-    pub rejection_table_write_ms: u128,
-    pub final_offset_header_ms: u128,
-    pub table_flush_ms: u128,
-    pub text_index_commit_ms: u128,
-    pub text_index_size_ms: u128,
-    pub spatial_index_finish_ms: u128,
-    pub spatial_index_size_ms: u128,
-    pub table_size_ms: u128,
-    pub runtime_finalize_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1028,6 +1177,40 @@ const POI_CONTEXT_KEYS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use crate::record::{AddressComponents, SourceProvenance, point_geometry};
+
+    #[test]
+    fn merging_worker_reports_matches_one_sequential_report() {
+        let tags = BTreeMap::from([("highway".to_string(), "residential".to_string())]);
+        let mut sequential = BuilderReport::default();
+        let mut first = BuilderReport::default();
+        let mut second = BuilderReport::default();
+        for object_id in 0..8 {
+            let worker = if object_id < 3 {
+                &mut first
+            } else {
+                &mut second
+            };
+            for report in [&mut sequential, worker] {
+                report.reject_with_context(
+                    CandidateIssue::StreetMissingName,
+                    OsmObjectType::Way,
+                    object_id,
+                    &tags,
+                    None,
+                    Some("street"),
+                    false,
+                );
+                report.accept_address_with_tags(
+                    &address_record("", object_id, Some("King Street"), None, None, None, None),
+                    None,
+                );
+            }
+        }
+        let mut merged = BuilderReport::default();
+        merged.merge(first);
+        merged.merge(second);
+        assert_eq!(merged, sequential);
+    }
 
     use super::*;
 

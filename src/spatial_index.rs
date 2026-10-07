@@ -1,139 +1,60 @@
-use std::{
-    cmp::Ordering,
-    collections::BTreeSet,
-    fmt,
-    fs::{self, File},
-    io::{BufWriter, Write},
-    mem,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+//! H3 spatial index over the record store.
+//!
+//! The index maps H3 cells to record references. It stores no coordinates of
+//! its own: point references are record ids and segment references are
+//! `(record id, segment index)`, both resolved against the record store, which
+//! already holds every point and line. Because records are in Hilbert order,
+//! the ids inside one cell are close together and their deltas are tiny.
+//!
+//! Two indexes share one layout: a fine one (H3 resolution 11) over addresses,
+//! places, postcodes and road segments, and a coarse one (resolution 6) over
+//! context points for wide-radius admin lookups.
+//!
+//! ```text
+//! spatial/<name>/index  cell_count u64, block_count u64,
+//!                       then per block of 16 cells: first_cell u64, data_offset u64,
+//!                       then the data length u64
+//! spatial/<name>/data   per cell: varint cell delta (0 for a block's first cell),
+//!                       varint refs length, refs:
+//!                       varint point count, delta-coded record ids,
+//!                       varint segment count, delta-coded segment refs
+//! ```
+
+use std::{cmp::Ordering, collections::HashMap, io::Write, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use bytemuck::{Pod, Zeroable};
-use geojson::{Geometry, GeometryValue};
+use geojson::GeometryValue;
 use h3o::{CellIndex, LatLng, Resolution};
-use memmap2::{Mmap, MmapOptions};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
+    container::{Bytes, Container, ContainerWriter},
+    extsort::{ExternalSorter, Scratch, SortStats, Spill},
     pack::RecordId,
-    record::{
-        AddressRecord, InterpolationRecord, PlaceLayer, PlaceRecord, PostcodeRecord, StreetRecord,
-    },
-    util::geo::point_lon_lat,
+    record::{Layer, Record},
+    records::{RecordsReader, dequantize},
+    util::codec::{get_u64, put_u64, read_u64_le},
 };
 
-#[cfg(not(target_endian = "little"))]
-compile_error!("open-geocode spatial pack files currently require little-endian targets");
+pub const SPATIAL_VERSION: u32 = 2;
+const FINE: &str = "spatial/fine";
+const CONTEXT: &str = "spatial/context";
 
-pub const SPATIAL_INDEX_V2_RELATIVE_DIR: &str = "spatial/v2";
-pub const SPATIAL_INDEX_SCHEMA_VERSION: u32 = 2;
-
-const SPATIAL_INDEX_V2_MANIFEST: &str = "manifest.json";
-
-const V2_CELLS_FILE: &str = "cells.bin";
-const V2_POINTS_FILE: &str = "points.bin";
-const V2_SEGMENTS_FILE: &str = "segments.bin";
-const V2_CELL_POINTS_FILE: &str = "cell_points.bin";
-const V2_CELL_SEGMENTS_FILE: &str = "cell_segments.bin";
-const V2_CONTEXT_CELLS_FILE: &str = "context_cells.bin";
-const V2_CONTEXT_CELL_POINTS_FILE: &str = "context_cell_points.bin";
-
-const V2_CELLS_MAGIC: &[u8; 8] = b"OGC2CELL";
-const V2_POINTS_MAGIC: &[u8; 8] = b"OGC2PNTS";
-const V2_SEGMENTS_MAGIC: &[u8; 8] = b"OGC2SEGS";
-const V2_POINT_REFS_MAGIC: &[u8; 8] = b"OGC2PREF";
-const V2_SEGMENT_REFS_MAGIC: &[u8; 8] = b"OGC2SREF";
-
-const COUNTED_HEADER_BYTES: usize = 16;
-const CELL_ENTRY_BYTES: usize = 40;
-const POINT_ENTRY_BYTES: usize = 17;
-const SEGMENT_ENTRY_BYTES: usize = 33;
-const REF_ENTRY_BYTES: usize = 4;
-const SPATIAL_FILE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-const SPATIAL_ENCODE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-
-const COORDINATE_SCALE: f64 = 10_000_000.0;
-const FRACTION_SCALE: f64 = u32::MAX as f64;
 const H3_FINE_RESOLUTION: Resolution = Resolution::Eleven;
 const H3_CONTEXT_RESOLUTION: Resolution = Resolution::Six;
 const H3_SEGMENT_SAMPLE_DIVISOR: f64 = 2.0;
 const H3_RADIUS_EXTRA_RING: u32 = 1;
 const H3_MAX_QUERY_K: u32 = 128;
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
-const SPATIAL_PAIR_CHUNK_SIZE: usize = 8_192;
-
-#[derive(Debug, Default)]
-pub struct PackSpatialIndexWriter {
-    points: Vec<SpatialPointEntry>,
-    segments: Vec<SpatialSegmentEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpatialIndexCommit {
-    pub schema_version: u32,
-    pub relative_path: String,
-    pub point_count: u64,
-    pub segment_count: u64,
-    pub build_timings: SpatialIndexBuildTimings,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SpatialIndexBuildTimings {
-    pub point_pair_generation_ms: u128,
-    pub segment_pair_generation_ms: u128,
-    pub pair_sort_dedupe_ms: u128,
-    pub cell_directory_build_ms: u128,
-    pub file_write_ms: u128,
-}
-
-pub struct PackSpatialIndexReader {
-    index: SpatialIndexV2Reader,
-}
-
-impl fmt::Debug for PackSpatialIndexReader {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PackSpatialIndexReader")
-            .field("index", &self.index)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SpatialLayer {
-    Address,
-    Country,
-    District,
-    Interpolation,
-    Locality,
-    Neighbourhood,
-    Place,
-    Postcode,
-    Region,
-    Street,
-}
-
-impl From<PlaceLayer> for SpatialLayer {
-    fn from(layer: PlaceLayer) -> Self {
-        match layer {
-            PlaceLayer::Country => Self::Country,
-            PlaceLayer::Region => Self::Region,
-            PlaceLayer::District => Self::District,
-            PlaceLayer::Place => Self::Place,
-            PlaceLayer::Locality => Self::Locality,
-            PlaceLayer::Neighbourhood => Self::Neighbourhood,
-        }
-    }
-}
+const CELLS_PER_BLOCK: u64 = 16;
+const SEGMENT_INDEX_BITS: u32 = 16;
+const KIND_POINT: u8 = 0;
+const KIND_SEGMENT: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PointCandidate {
     pub record_id: RecordId,
-    pub layer: SpatialLayer,
+    pub layer: Layer,
     pub lon: f64,
     pub lat: f64,
     pub distance_m: f64,
@@ -142,282 +63,373 @@ pub struct PointCandidate {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SegmentCandidate {
     pub record_id: RecordId,
-    pub layer: SpatialLayer,
+    pub layer: Layer,
     pub closest_lon: f64,
     pub closest_lat: f64,
     pub distance_m: f64,
     pub fraction: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SpatialPointEntry {
-    record_id: RecordId,
-    layer: SpatialLayer,
-    lon: f64,
-    lat: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SpatialSegmentEntry {
-    record_id: RecordId,
-    layer: SpatialLayer,
-    start_lon: f64,
-    start_lat: f64,
-    end_lon: f64,
-    end_lat: f64,
-    start_fraction: f64,
-    end_fraction: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SpatialIndexV2Manifest {
-    schema_version: u32,
-    h3_fine_resolution: u8,
-    h3_context_resolution: u8,
-    coordinate_scale: f64,
-    point_count: u64,
-    segment_count: u64,
-    cell_count: u64,
-    context_cell_count: u64,
-    cell_point_ref_count: u64,
-    cell_segment_ref_count: u64,
-    context_cell_point_ref_count: u64,
-}
-
-struct SpatialIndexV2Reader {
-    manifest: SpatialIndexV2Manifest,
-    cells: CountedMmap,
-    points: CountedMmap,
-    segments: CountedMmap,
-    cell_points: CountedMmap,
-    cell_segments: CountedMmap,
-    context_cells: CountedMmap,
-    context_cell_points: CountedMmap,
-}
-
-impl fmt::Debug for SpatialIndexV2Reader {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SpatialIndexV2Reader")
-            .field("manifest", &self.manifest)
-            .field("cells", &self.cells)
-            .field("points", &self.points)
-            .field("segments", &self.segments)
-            .field("cell_points", &self.cell_points)
-            .field("cell_segments", &self.cell_segments)
-            .field("context_cells", &self.context_cells)
-            .field("context_cell_points", &self.context_cell_points)
-            .finish()
-    }
-}
-
-struct CountedMmap {
-    bytes: Mmap,
-    count: u64,
-    entry_bytes: usize,
-}
-
-impl fmt::Debug for CountedMmap {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CountedMmap")
-            .field("count", &self.count)
-            .field("entry_bytes", &self.entry_bytes)
-            .field("bytes", &self.bytes.len())
-            .finish()
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
-struct CellDirectoryEntry {
-    h3_cell: u64,
-    point_start: u64,
-    point_count: u64,
-    segment_start: u64,
-    segment_count: u64,
-}
-
-const _: () = assert!(mem::size_of::<CellDirectoryEntry>() == CELL_ENTRY_BYTES);
-const _: () = assert!(mem::size_of::<u32>() == REF_ENTRY_BYTES);
-
+/// One (cell, reference) pair produced while records are written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct CellRefPair {
-    h3_cell: u64,
-    id: u32,
+pub struct CellRef {
+    cell: u64,
+    kind: u8,
+    reference: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BuiltSegment {
-    start: [f64; 2],
-    end: [f64; 2],
-    start_fraction: f64,
-    end_fraction: f64,
+impl Spill for CellRef {
+    fn encode(&self, out: &mut Vec<u8>) {
+        (self.cell, self.kind, self.reference).encode(out);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let (cell, kind, reference) = <(u64, u8, u64)>::decode(input)?;
+        Ok(Self {
+            cell,
+            kind,
+            reference,
+        })
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SegmentProjection {
-    lon: f64,
-    lat: f64,
-    distance_m: f64,
-    t: f64,
+/// Index pairs for one record, computed off the write path in parallel.
+#[derive(Debug, Default)]
+pub struct RecordCells {
+    fine: Vec<CellRef>,
+    context: Vec<CellRef>,
+    points: u64,
+    segments: u64,
 }
 
-impl PackSpatialIndexWriter {
-    pub fn add_address(&mut self, record_id: RecordId, record: &AddressRecord) -> Result<()> {
-        if let Some([lon, lat]) = point_lon_lat(&record.geometry) {
-            self.points.push(SpatialPointEntry {
-                record_id,
-                layer: SpatialLayer::Address,
-                lon,
-                lat,
-            });
+impl RecordCells {
+    pub fn for_record(record_id: RecordId, record: &Record) -> Result<Self> {
+        let mut cells = Self::default();
+        match record {
+            Record::Street(_) | Record::Interpolation(_) => {
+                let GeometryValue::LineString { coordinates } = &record.geometry().value else {
+                    return Ok(cells);
+                };
+                let positions = coordinates
+                    .iter()
+                    .filter_map(|position| match position.as_slice() {
+                        [lon, lat, ..] if lon.is_finite() && lat.is_finite() => Some([*lon, *lat]),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                for (index, pair) in positions.windows(2).enumerate() {
+                    if haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]) <= f64::EPSILON {
+                        continue;
+                    }
+                    let index = u64::try_from(index)?;
+                    if index >= 1 << SEGMENT_INDEX_BITS {
+                        bail!("line record {} has too many segments to index", record.id());
+                    }
+                    let reference = record_id << SEGMENT_INDEX_BITS | index;
+                    for cell in segment_cells(pair[0], pair[1], H3_FINE_RESOLUTION)? {
+                        cells.fine.push(CellRef {
+                            cell,
+                            kind: KIND_SEGMENT,
+                            reference,
+                        });
+                    }
+                    cells.segments += 1;
+                }
+            }
+            _ => {
+                let Some([lon, lat]) = record.display_point() else {
+                    return Ok(cells);
+                };
+                cells.fine.push(CellRef {
+                    cell: cell_id(lon, lat, H3_FINE_RESOLUTION)?,
+                    kind: KIND_POINT,
+                    reference: record_id,
+                });
+                if record.layer().is_context() {
+                    cells.context.push(CellRef {
+                        cell: cell_id(lon, lat, H3_CONTEXT_RESOLUTION)?,
+                        kind: KIND_POINT,
+                        reference: record_id,
+                    });
+                }
+                cells.points += 1;
+            }
         }
+        Ok(cells)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpatialCommit {
+    pub point_count: u64,
+    pub segment_count: u64,
+    pub cell_count: u64,
+    pub context_cell_count: u64,
+    pub fine_pairs: SortStats,
+    pub context_pairs: SortStats,
+}
+
+pub struct SpatialIndexWriter {
+    fine: ExternalSorter<CellRef>,
+    context: ExternalSorter<CellRef>,
+    points: u64,
+    segments: u64,
+}
+
+impl SpatialIndexWriter {
+    pub fn new(scratch: &Arc<Scratch>, budget_bytes: usize) -> Self {
+        Self {
+            fine: ExternalSorter::new(scratch, "spatial-fine", budget_bytes),
+            context: ExternalSorter::new(scratch, "spatial-context", budget_bytes / 8),
+            points: 0,
+            segments: 0,
+        }
+    }
+
+    pub fn add(&mut self, cells: RecordCells) -> Result<()> {
+        for pair in cells.fine {
+            self.fine.push(pair)?;
+        }
+        for pair in cells.context {
+            self.context.push(pair)?;
+        }
+        self.points += cells.points;
+        self.segments += cells.segments;
         Ok(())
     }
 
-    pub fn add_interpolation(&mut self, record_id: RecordId, record: &InterpolationRecord) {
-        self.add_line_segments(record_id, SpatialLayer::Interpolation, &record.geometry);
+    pub fn finish(self, pack: &mut ContainerWriter) -> Result<SpatialCommit> {
+        let fine_pairs = self.fine.stats();
+        let context_pairs = self.context.stats();
+        let cell_count = write_cell_index(pack, FINE, self.fine)?;
+        let context_cell_count = write_cell_index(pack, CONTEXT, self.context)?;
+        Ok(SpatialCommit {
+            point_count: self.points,
+            segment_count: self.segments,
+            cell_count,
+            context_cell_count,
+            fine_pairs,
+            context_pairs,
+        })
     }
+}
 
-    pub fn add_street(&mut self, record_id: RecordId, record: &StreetRecord) {
-        self.add_line_segments(record_id, SpatialLayer::Street, &record.geometry);
-    }
+fn write_cell_index(
+    pack: &mut ContainerWriter,
+    name: &str,
+    pairs: ExternalSorter<CellRef>,
+) -> Result<u64> {
+    let mut blocks: Vec<(u64, u64)> = Vec::new();
+    let mut cell_count = 0u64;
+    let mut data_len = 0u64;
+    let mut previous_cell = 0u64;
+    let mut current: Option<u64> = None;
+    let mut points = Vec::new();
+    let mut segments = Vec::new();
+    let mut entry = Vec::new();
+    let mut refs = Vec::new();
 
-    pub fn add_postcode(&mut self, record_id: RecordId, record: &PostcodeRecord) -> Result<()> {
-        if let Some([lon, lat]) = point_lon_lat(&record.geometry) {
-            self.points.push(SpatialPointEntry {
-                record_id,
-                layer: SpatialLayer::Postcode,
-                lon,
-                lat,
-            });
+    pack.begin(&format!("{name}/data"), SPATIAL_VERSION)?;
+    let mut flush = |pack: &mut ContainerWriter,
+                     cell: u64,
+                     points: &mut Vec<u64>,
+                     segments: &mut Vec<u64>|
+     -> Result<()> {
+        if cell_count % CELLS_PER_BLOCK == 0 {
+            blocks.push((cell, data_len));
+            previous_cell = cell;
         }
+        refs.clear();
+        put_delta_list(&mut refs, points);
+        put_delta_list(&mut refs, segments);
+        entry.clear();
+        put_u64(&mut entry, cell - previous_cell);
+        put_u64(&mut entry, refs.len() as u64);
+        pack.write_all(&entry)?;
+        pack.write_all(&refs)?;
+        data_len += (entry.len() + refs.len()) as u64;
+        previous_cell = cell;
+        cell_count += 1;
+        points.clear();
+        segments.clear();
         Ok(())
+    };
+    let mut last: Option<CellRef> = None;
+    for pair in pairs.finish()? {
+        let pair = pair?;
+        if last == Some(pair) {
+            continue;
+        }
+        last = Some(pair);
+        if current.is_some_and(|cell| cell != pair.cell) {
+            flush(
+                pack,
+                current.expect("current cell"),
+                &mut points,
+                &mut segments,
+            )?;
+        }
+        current = Some(pair.cell);
+        match pair.kind {
+            KIND_POINT => points.push(pair.reference),
+            _ => segments.push(pair.reference),
+        }
     }
-
-    pub fn add_place(&mut self, record_id: RecordId, layer: SpatialLayer, record: &PlaceRecord) {
-        self.add_place_point(record_id, layer, record);
+    if let Some(cell) = current {
+        flush(pack, cell, &mut points, &mut segments)?;
     }
+    pack.end()?;
 
-    pub fn finish(self, pack_path: &Path) -> Result<SpatialIndexCommit> {
-        self.finish_v2(pack_path)
+    let mut index = Vec::with_capacity(24 + blocks.len() * 16);
+    index.extend_from_slice(&cell_count.to_le_bytes());
+    index.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+    for (first_cell, offset) in &blocks {
+        index.extend_from_slice(&first_cell.to_le_bytes());
+        index.extend_from_slice(&offset.to_le_bytes());
     }
+    index.extend_from_slice(&data_len.to_le_bytes());
+    pack.add(&format!("{name}/index"), SPATIAL_VERSION, &index)?;
+    Ok(cell_count)
+}
 
-    fn finish_v2(self, pack_path: &Path) -> Result<SpatialIndexCommit> {
-        let point_count = self.points.len() as u64;
-        let segment_count = self.segments.len() as u64;
-        let root = pack_path.join(SPATIAL_INDEX_V2_RELATIVE_DIR);
-        fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create {}", root.display()))?;
-        let mut build_timings = SpatialIndexBuildTimings::default();
+fn put_delta_list(out: &mut Vec<u8>, values: &[u64]) {
+    put_u64(out, values.len() as u64);
+    let mut previous = 0;
+    for value in values {
+        put_u64(out, value - previous);
+        previous = *value;
+    }
+}
 
-        let started = Instant::now();
-        let (mut point_pairs, mut context_point_pairs) = build_point_pairs(&self.points)?;
-        build_timings.point_pair_generation_ms = elapsed_ms(started);
+fn get_delta_list(input: &mut &[u8]) -> Result<Vec<u64>> {
+    let count = usize::try_from(get_u64(input)?)?;
+    if count > input.len() {
+        bail!("spatial reference list is truncated");
+    }
+    let mut values = Vec::with_capacity(count);
+    let mut previous = 0u64;
+    for _ in 0..count {
+        previous = previous
+            .checked_add(get_u64(input)?)
+            .context("spatial reference overflows")?;
+        values.push(previous);
+    }
+    Ok(values)
+}
 
-        let started = Instant::now();
-        let mut segment_pairs = build_segment_pairs(&self.segments)?;
-        build_timings.segment_pair_generation_ms = elapsed_ms(started);
+#[derive(Clone)]
+struct CellTable {
+    index: Bytes,
+    data: Bytes,
+    block_count: u64,
+}
 
-        let started = Instant::now();
-        sort_dedupe_cell_pairs(&mut point_pairs);
-        sort_dedupe_cell_pairs(&mut segment_pairs);
-        sort_dedupe_cell_pairs(&mut context_point_pairs);
-        build_timings.pair_sort_dedupe_ms = elapsed_ms(started);
+struct CellRefs {
+    points: Vec<u64>,
+    segments: Vec<u64>,
+}
 
-        let started = Instant::now();
-        let (cells, point_refs, segment_refs) = build_cell_directory(&point_pairs, &segment_pairs);
-        let (context_cells, context_point_refs, context_segment_refs) =
-            build_cell_directory(&context_point_pairs, &[]);
-        debug_assert!(context_segment_refs.is_empty());
-        build_timings.cell_directory_build_ms = elapsed_ms(started);
-
-        let started = Instant::now();
-        write_points_file(&root.join(V2_POINTS_FILE), &self.points)?;
-        write_segments_file(&root.join(V2_SEGMENTS_FILE), &self.segments)?;
-        write_cells_file(&root.join(V2_CELLS_FILE), &cells)?;
-        write_refs_file(
-            &root.join(V2_CELL_POINTS_FILE),
-            V2_POINT_REFS_MAGIC,
-            &point_refs,
-        )?;
-        write_refs_file(
-            &root.join(V2_CELL_SEGMENTS_FILE),
-            V2_SEGMENT_REFS_MAGIC,
-            &segment_refs,
-        )?;
-        write_cells_file(&root.join(V2_CONTEXT_CELLS_FILE), &context_cells)?;
-        write_refs_file(
-            &root.join(V2_CONTEXT_CELL_POINTS_FILE),
-            V2_POINT_REFS_MAGIC,
-            &context_point_refs,
-        )?;
-
-        let manifest = SpatialIndexV2Manifest {
-            schema_version: SPATIAL_INDEX_SCHEMA_VERSION,
-            h3_fine_resolution: u8::from(H3_FINE_RESOLUTION),
-            h3_context_resolution: u8::from(H3_CONTEXT_RESOLUTION),
-            coordinate_scale: COORDINATE_SCALE,
-            point_count,
-            segment_count,
-            cell_count: cells.len() as u64,
-            context_cell_count: context_cells.len() as u64,
-            cell_point_ref_count: point_refs.len() as u64,
-            cell_segment_ref_count: segment_refs.len() as u64,
-            context_cell_point_ref_count: context_point_refs.len() as u64,
-        };
-        let manifest_path = root.join(SPATIAL_INDEX_V2_MANIFEST);
-        let manifest_file = File::create(&manifest_path)
-            .with_context(|| format!("failed to create {}", manifest_path.display()))?;
-        serde_json::to_writer_pretty(manifest_file, &manifest)
-            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
-        build_timings.file_write_ms = elapsed_ms(started);
-
-        Ok(SpatialIndexCommit {
-            schema_version: SPATIAL_INDEX_SCHEMA_VERSION,
-            relative_path: SPATIAL_INDEX_V2_RELATIVE_DIR.to_string(),
-            point_count,
-            segment_count,
-            build_timings,
+impl CellTable {
+    fn open(container: &Container, name: &str) -> Result<Self> {
+        let index = container.section(&format!("{name}/index"), SPATIAL_VERSION)?;
+        let data = container.section(&format!("{name}/data"), SPATIAL_VERSION)?;
+        let cell_count = read_u64_le(&index, 0).context("spatial index is truncated")?;
+        let block_count = read_u64_le(&index, 8).context("spatial index is truncated")?;
+        if block_count != cell_count.div_ceil(CELLS_PER_BLOCK)
+            || index.len() as u64 != 24 + block_count * 16
+            || read_u64_le(&index, index.len() - 8) != Some(data.len() as u64)
+        {
+            bail!("spatial index {name} is inconsistent with its data");
+        }
+        Ok(Self {
+            index,
+            data,
+            block_count,
         })
     }
 
-    fn add_place_point(&mut self, record_id: RecordId, layer: SpatialLayer, record: &PlaceRecord) {
-        if let Some([lon, lat]) = point_lon_lat(&record.geometry) {
-            self.points.push(SpatialPointEntry {
-                record_id,
-                layer,
-                lon,
-                lat,
-            });
-        }
+    fn block(&self, block: u64) -> (u64, u64) {
+        let offset = 16 + block as usize * 16;
+        (
+            read_u64_le(&self.index, offset).expect("validated index"),
+            read_u64_le(&self.index, offset + 8).expect("validated index"),
+        )
     }
 
-    fn add_line_segments(&mut self, record_id: RecordId, layer: SpatialLayer, geometry: &Geometry) {
-        self.segments
-            .extend(
-                line_segments(geometry)
-                    .into_iter()
-                    .map(|segment| SpatialSegmentEntry {
-                        record_id,
-                        layer,
-                        start_lon: segment.start[0],
-                        start_lat: segment.start[1],
-                        end_lon: segment.end[0],
-                        end_lat: segment.end[1],
-                        start_fraction: segment.start_fraction,
-                        end_fraction: segment.end_fraction,
-                    }),
-            );
+    fn refs(&self, cell: u64) -> Result<Option<CellRefs>> {
+        // Last block whose first cell is <= cell.
+        let (mut low, mut high) = (0, self.block_count);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.block(mid).0 <= cell {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let Some(block) = low.checked_sub(1) else {
+            return Ok(None);
+        };
+        let (first_cell, start) = self.block(block);
+        let end = if block + 1 < self.block_count {
+            self.block(block + 1).1
+        } else {
+            self.data.len() as u64
+        };
+        let mut input = self
+            .data
+            .get(start as usize..end as usize)
+            .context("spatial block is out of range")?;
+        let mut current = first_cell;
+        while !input.is_empty() {
+            current += get_u64(&mut input)?;
+            let len = usize::try_from(get_u64(&mut input)?)?;
+            let mut refs = input.get(..len).context("spatial cell is truncated")?;
+            input = &input[len..];
+            match current.cmp(&cell) {
+                Ordering::Less => continue,
+                Ordering::Greater => return Ok(None),
+                Ordering::Equal => {
+                    return Ok(Some(CellRefs {
+                        points: get_delta_list(&mut refs)?,
+                        segments: get_delta_list(&mut refs)?,
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
-impl PackSpatialIndexReader {
-    pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        let pack_path = crate::pack::resolve_pack_path(pack_path)?;
+#[derive(Clone)]
+pub struct SpatialIndexReader {
+    fine: CellTable,
+    context: CellTable,
+    records: RecordsReader,
+}
+
+impl std::fmt::Debug for SpatialIndexReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpatialIndexReader")
+            .field("fine_blocks", &self.fine.block_count)
+            .field("context_blocks", &self.context.block_count)
+            .finish()
+    }
+}
+
+struct LineCache {
+    points: Vec<[f64; 2]>,
+    /// Cumulative length at each vertex, in metres.
+    lengths: Vec<f64>,
+}
+
+impl SpatialIndexReader {
+    pub fn open(container: &Container, records: RecordsReader) -> Result<Self> {
         Ok(Self {
-            index: SpatialIndexV2Reader::open(&pack_path)?,
+            fine: CellTable::open(container, FINE)?,
+            context: CellTable::open(container, CONTEXT)?,
+            records,
         })
     }
 
@@ -425,12 +437,20 @@ impl PackSpatialIndexReader {
         &self,
         lon: f64,
         lat: f64,
-        layer: SpatialLayer,
+        layer: Layer,
         radius_m: f64,
         limit: usize,
-    ) -> Vec<PointCandidate> {
-        self.index
-            .point_candidates(lon, lat, layer, radius_m, limit)
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.collect_points(
+            &self.fine,
+            H3_FINE_RESOLUTION,
+            lon,
+            lat,
+            radius_m,
+            limit,
+            |candidate| candidate == layer,
+        )?;
+        Ok(closest_candidates(candidates, limit))
     }
 
     pub fn context_candidates(
@@ -439,698 +459,221 @@ impl PackSpatialIndexReader {
         lat: f64,
         radius_m: f64,
         limit: usize,
-    ) -> Vec<PointCandidate> {
-        self.index.context_candidates(lon, lat, radius_m, limit)
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.collect_points(
+            &self.context,
+            H3_CONTEXT_RESOLUTION,
+            lon,
+            lat,
+            radius_m,
+            limit,
+            Layer::is_context,
+        )?;
+        Ok(closest_candidates(candidates, limit))
     }
 
     pub fn segment_candidates(
         &self,
         lon: f64,
         lat: f64,
-        layer: SpatialLayer,
+        layer: Layer,
         radius_m: f64,
         limit: usize,
-    ) -> Vec<SegmentCandidate> {
-        self.index
-            .segment_candidates(lon, lat, layer, radius_m, limit)
-    }
-}
-
-impl SpatialIndexV2Reader {
-    fn open(pack_path: &Path) -> Result<Self> {
-        let root = pack_path.join(SPATIAL_INDEX_V2_RELATIVE_DIR);
-        let manifest_path = root.join(SPATIAL_INDEX_V2_MANIFEST);
-        let manifest_file = File::open(&manifest_path)
-            .with_context(|| format!("failed to open {}", manifest_path.display()))?;
-        let manifest: SpatialIndexV2Manifest = serde_json::from_reader(manifest_file)
-            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-        if manifest.schema_version != SPATIAL_INDEX_SCHEMA_VERSION {
-            bail!(
-                "unsupported spatial index schema version {}; expected {}",
-                manifest.schema_version,
-                SPATIAL_INDEX_SCHEMA_VERSION
-            );
-        }
-
-        Ok(Self {
-            manifest,
-            cells: open_counted_mmap(root.join(V2_CELLS_FILE), V2_CELLS_MAGIC, CELL_ENTRY_BYTES)?,
-            points: open_counted_mmap(
-                root.join(V2_POINTS_FILE),
-                V2_POINTS_MAGIC,
-                POINT_ENTRY_BYTES,
-            )?,
-            segments: open_counted_mmap(
-                root.join(V2_SEGMENTS_FILE),
-                V2_SEGMENTS_MAGIC,
-                SEGMENT_ENTRY_BYTES,
-            )?,
-            cell_points: open_counted_mmap(
-                root.join(V2_CELL_POINTS_FILE),
-                V2_POINT_REFS_MAGIC,
-                REF_ENTRY_BYTES,
-            )?,
-            cell_segments: open_counted_mmap(
-                root.join(V2_CELL_SEGMENTS_FILE),
-                V2_SEGMENT_REFS_MAGIC,
-                REF_ENTRY_BYTES,
-            )?,
-            context_cells: open_counted_mmap(
-                root.join(V2_CONTEXT_CELLS_FILE),
-                V2_CELLS_MAGIC,
-                CELL_ENTRY_BYTES,
-            )?,
-            context_cell_points: open_counted_mmap(
-                root.join(V2_CONTEXT_CELL_POINTS_FILE),
-                V2_POINT_REFS_MAGIC,
-                REF_ENTRY_BYTES,
-            )?,
-        })
-    }
-
-    fn point_candidates(
-        &self,
-        lon: f64,
-        lat: f64,
-        layer: SpatialLayer,
-        radius_m: f64,
-        limit: usize,
-    ) -> Vec<PointCandidate> {
-        closest_candidates(
-            self.collect_points(lon, lat, radius_m, false, |candidate| candidate == layer),
-            limit,
-        )
-    }
-
-    fn context_candidates(
-        &self,
-        lon: f64,
-        lat: f64,
-        radius_m: f64,
-        limit: usize,
-    ) -> Vec<PointCandidate> {
-        closest_candidates(
-            self.collect_points(lon, lat, radius_m, true, is_context_layer),
-            limit,
-        )
-    }
-
-    fn collect_points(
-        &self,
-        lon: f64,
-        lat: f64,
-        radius_m: f64,
-        context: bool,
-        accepts: impl Fn(SpatialLayer) -> bool,
-    ) -> Vec<PointCandidate> {
-        let (cells, refs, resolution) = if context {
-            (
-                &self.context_cells,
-                &self.context_cell_points,
-                H3_CONTEXT_RESOLUTION,
-            )
-        } else {
-            (&self.cells, &self.cell_points, H3_FINE_RESOLUTION)
-        };
+    ) -> Result<Vec<SegmentCandidate>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut lines: HashMap<RecordId, Option<LineCache>> = HashMap::new();
         let mut candidates = Vec::new();
-        for h3_cell in h3_query_cell_ids(lon, lat, resolution, radius_m) {
-            let Some(cell) = self.find_cell(cells, h3_cell) else {
+        for cell in query_cells(lon, lat, H3_FINE_RESOLUTION, radius_m) {
+            let Some(refs) = self.fine.refs(cell)? else {
                 continue;
             };
-            for point_id in read_ref_range(refs, cell.point_start, cell.point_count) {
-                let Some(entry) = self.read_point(point_id) else {
+            for reference in refs.segments {
+                if !seen.insert(reference) {
+                    continue;
+                }
+                let record_id = reference >> SEGMENT_INDEX_BITS;
+                let segment = (reference & ((1 << SEGMENT_INDEX_BITS) - 1)) as usize;
+                let line = match lines.entry(record_id) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(if self.records.header(record_id)?.layer == layer {
+                            self.records.line(record_id)?.map(line_cache)
+                        } else {
+                            None
+                        })
+                    }
+                };
+                let Some(line) = line.as_ref() else {
                     continue;
                 };
-                if !accepts(entry.layer) {
-                    continue;
-                }
-                let distance_m = haversine_m(lon, lat, entry.lon, entry.lat);
-                if distance_m <= radius_m {
-                    candidates.push(PointCandidate {
-                        record_id: entry.record_id,
-                        layer: entry.layer,
-                        lon: entry.lon,
-                        lat: entry.lat,
-                        distance_m,
-                    });
-                }
-            }
-        }
-        candidates
-    }
-
-    fn segment_candidates(
-        &self,
-        lon: f64,
-        lat: f64,
-        layer: SpatialLayer,
-        radius_m: f64,
-        limit: usize,
-    ) -> Vec<SegmentCandidate> {
-        let mut seen_segment_ids = BTreeSet::new();
-        let mut candidates = Vec::new();
-        for h3_cell in h3_query_cell_ids(lon, lat, H3_FINE_RESOLUTION, radius_m) {
-            let Some(cell) = self.find_cell(&self.cells, h3_cell) else {
-                continue;
-            };
-            for segment_id in self.segment_ref_ids(cell.segment_start, cell.segment_count) {
-                if !seen_segment_ids.insert(segment_id) {
-                    continue;
-                }
-                let Some(entry) = self.read_segment(segment_id) else {
-                    continue;
+                let (Some(start), Some(end)) =
+                    (line.points.get(segment), line.points.get(segment + 1))
+                else {
+                    bail!("segment reference {reference} is out of range");
                 };
-                if entry.layer != layer {
-                    continue;
-                }
-                let projection = project_to_segment_m(
-                    lon,
-                    lat,
-                    entry.start_lon,
-                    entry.start_lat,
-                    entry.end_lon,
-                    entry.end_lat,
-                );
+                let projection = project_to_segment_m(lon, lat, *start, *end);
                 if projection.distance_m <= radius_m {
+                    let total = *line.lengths.last().expect("line has vertices");
+                    let start_fraction = line.lengths[segment] / total;
+                    let end_fraction = line.lengths[segment + 1] / total;
                     candidates.push(SegmentCandidate {
-                        record_id: entry.record_id,
-                        layer: entry.layer,
+                        record_id,
+                        layer,
                         closest_lon: projection.lon,
                         closest_lat: projection.lat,
                         distance_m: projection.distance_m,
-                        fraction: entry.start_fraction
-                            + projection.t * (entry.end_fraction - entry.start_fraction),
+                        fraction: start_fraction + projection.t * (end_fraction - start_fraction),
                     });
                 }
             }
         }
-        closest_candidates(candidates, limit)
+        Ok(closest_candidates(candidates, limit))
     }
 
-    fn find_cell(&self, cells: &CountedMmap, h3_cell: u64) -> Option<CellDirectoryEntry> {
-        let mut low = 0;
-        let mut high = cells.count;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let entry = read_cell_entry(cells, mid)?;
-            match entry.h3_cell.cmp(&h3_cell) {
-                Ordering::Less => low = mid + 1,
-                Ordering::Greater => high = mid,
-                Ordering::Equal => return Some(entry),
-            }
-        }
-        None
-    }
-
-    fn read_point(&self, point_id: u32) -> Option<SpatialPointEntry> {
-        read_point_entry(&self.points, u64::from(point_id))
-    }
-
-    fn read_segment(&self, segment_id: u32) -> Option<SpatialSegmentEntry> {
-        read_segment_entry(&self.segments, u64::from(segment_id))
-    }
-
-    fn segment_ref_ids(&self, start: u64, count: u64) -> impl Iterator<Item = u32> + '_ {
-        read_ref_range(&self.cell_segments, start, count)
-    }
-}
-
-fn build_point_pairs(points: &[SpatialPointEntry]) -> Result<(Vec<CellRefPair>, Vec<CellRefPair>)> {
-    let mut point_pairs = Vec::with_capacity(points.len());
-    let mut context_point_pairs = Vec::new();
-
-    for (index, point) in points.iter().enumerate() {
-        let point_id = u32::try_from(index).context("too many spatial points for v2 index")?;
-        point_pairs.push(CellRefPair {
-            h3_cell: h3_cell_id(point.lon, point.lat, H3_FINE_RESOLUTION)?,
-            id: point_id,
-        });
-        if is_context_layer(point.layer) {
-            context_point_pairs.push(CellRefPair {
-                h3_cell: h3_cell_id(point.lon, point.lat, H3_CONTEXT_RESOLUTION)?,
-                id: point_id,
-            });
-        }
-    }
-
-    Ok((point_pairs, context_point_pairs))
-}
-
-fn build_segment_pairs(segments: &[SpatialSegmentEntry]) -> Result<Vec<CellRefPair>> {
-    let chunks: Result<Vec<Vec<CellRefPair>>> = segments
-        .par_chunks(SPATIAL_PAIR_CHUNK_SIZE)
-        .enumerate()
-        .map(|(chunk_index, chunk)| {
-            let mut pairs = Vec::with_capacity(chunk.len() * 3);
-            let base_index = chunk_index * SPATIAL_PAIR_CHUNK_SIZE;
-            for (offset, segment) in chunk.iter().enumerate() {
-                let segment_id = u32::try_from(base_index + offset)
-                    .context("too many spatial segments for v2 index")?;
-                for h3_cell in h3_segment_cell_ids(segment, H3_FINE_RESOLUTION)? {
-                    pairs.push(CellRefPair {
-                        h3_cell,
-                        id: segment_id,
-                    });
-                }
-            }
-            Ok(pairs)
-        })
-        .collect();
-
-    let chunks = chunks?;
-    let total_pairs = chunks.iter().map(Vec::len).sum();
-    let mut pairs = Vec::with_capacity(total_pairs);
-    for mut chunk in chunks {
-        pairs.append(&mut chunk);
-    }
-    Ok(pairs)
-}
-
-fn sort_dedupe_cell_pairs(pairs: &mut Vec<CellRefPair>) {
-    pairs.par_sort_unstable();
-    pairs.dedup();
-}
-
-fn build_cell_directory(
-    point_pairs: &[CellRefPair],
-    segment_pairs: &[CellRefPair],
-) -> (Vec<CellDirectoryEntry>, Vec<u32>, Vec<u32>) {
-    let mut entries = Vec::new();
-    let mut point_refs = Vec::new();
-    let mut segment_refs = Vec::new();
-    let mut point_index = 0;
-    let mut segment_index = 0;
-
-    while point_index < point_pairs.len() || segment_index < segment_pairs.len() {
-        let h3_cell = match (
-            point_pairs.get(point_index).map(|pair| pair.h3_cell),
-            segment_pairs.get(segment_index).map(|pair| pair.h3_cell),
-        ) {
-            (Some(point_cell), Some(segment_cell)) => point_cell.min(segment_cell),
-            (Some(point_cell), None) => point_cell,
-            (None, Some(segment_cell)) => segment_cell,
-            (None, None) => break,
+    /// Points within `radius_m`, scanning H3 rings outward from the query
+    /// cell. With a `limit`, the scan stops as soon as the `limit` closest hits
+    /// are certain: once the disk scanned so far covers a radius beyond the
+    /// `limit`-th distance, no unscanned point can be closer. Dense areas (a
+    /// city centre full of postcodes) then cost a few rings instead of the
+    /// whole radius.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_points(
+        &self,
+        index: &CellTable,
+        resolution: Resolution,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+        accepts: impl Fn(Layer) -> bool,
+    ) -> Result<Vec<PointCandidate>> {
+        let Ok(lat_lng) = LatLng::new(lat, lon) else {
+            return Ok(Vec::new());
         };
+        let max_k = disk_k(resolution, radius_m);
+        let mut cells = lat_lng
+            .to_cell(resolution)
+            .grid_disk_distances::<Vec<(CellIndex, u32)>>(max_k);
+        cells.sort_unstable_by_key(|(cell, k)| (*k, u64::from(*cell)));
 
-        let point_start = point_refs.len() as u64;
-        while point_pairs
-            .get(point_index)
-            .is_some_and(|pair| pair.h3_cell == h3_cell)
-        {
-            point_refs.push(point_pairs[point_index].id);
-            point_index += 1;
+        let mut candidates = Vec::new();
+        let mut next = 0;
+        for k in 0..=max_k {
+            while let Some(&(cell, ring)) = cells.get(next)
+                && ring == k
+            {
+                next += 1;
+                let Some(refs) = index.refs(u64::from(cell))? else {
+                    continue;
+                };
+                for record_id in refs.points {
+                    let (layer, point_lon, point_lat) = self.records.point(record_id)?;
+                    if !accepts(layer) {
+                        continue;
+                    }
+                    let distance_m = haversine_m(lon, lat, point_lon, point_lat);
+                    if distance_m <= radius_m {
+                        candidates.push(PointCandidate {
+                            record_id,
+                            layer,
+                            lon: point_lon,
+                            lat: point_lat,
+                            distance_m,
+                        });
+                    }
+                }
+            }
+            if limit > 0 && candidates.len() >= limit && k < max_k {
+                // `disk_k` scans `ceil(r / edge) + H3_RADIUS_EXTRA_RING` rings to
+                // cover radius r, so the rings scanned so far cover this radius.
+                let covered_m =
+                    f64::from(k.saturating_sub(H3_RADIUS_EXTRA_RING)) * resolution.edge_length_m();
+                let mut distances = candidates
+                    .iter()
+                    .map(|candidate| candidate.distance_m)
+                    .collect::<Vec<_>>();
+                let (_, kth, _) = distances.select_nth_unstable_by(limit - 1, f64::total_cmp);
+                if *kth < covered_m {
+                    break;
+                }
+            }
         }
-        let point_count = point_refs.len() as u64 - point_start;
-
-        let segment_start = segment_refs.len() as u64;
-        while segment_pairs
-            .get(segment_index)
-            .is_some_and(|pair| pair.h3_cell == h3_cell)
-        {
-            segment_refs.push(segment_pairs[segment_index].id);
-            segment_index += 1;
-        }
-        let segment_count = segment_refs.len() as u64 - segment_start;
-
-        entries.push(CellDirectoryEntry {
-            h3_cell,
-            point_start,
-            point_count,
-            segment_start,
-            segment_count,
-        });
+        Ok(candidates)
     }
-    (entries, point_refs, segment_refs)
 }
 
-fn h3_cell_id(lon: f64, lat: f64, resolution: Resolution) -> Result<u64> {
+fn line_cache(points: Vec<[i32; 2]>) -> LineCache {
+    let points = points
+        .into_iter()
+        .map(|[lon, lat]| [dequantize(lon), dequantize(lat)])
+        .collect::<Vec<_>>();
+    let mut lengths = Vec::with_capacity(points.len());
+    let mut total = 0.0;
+    lengths.push(0.0);
+    for pair in points.windows(2) {
+        total += haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]);
+        lengths.push(total);
+    }
+    LineCache { points, lengths }
+}
+
+fn cell_id(lon: f64, lat: f64, resolution: Resolution) -> Result<u64> {
     let lat_lng = LatLng::new(lat, lon).context("invalid coordinate for h3 cell")?;
     Ok(u64::from(lat_lng.to_cell(resolution)))
 }
 
-fn h3_query_cell_ids(lon: f64, lat: f64, resolution: Resolution, radius_m: f64) -> Vec<u64> {
+/// Rings around the query cell that cover `radius_m`.
+fn disk_k(resolution: Resolution, radius_m: f64) -> u32 {
+    if radius_m <= 0.0 {
+        H3_RADIUS_EXTRA_RING
+    } else {
+        ((radius_m / resolution.edge_length_m()).ceil() as u32)
+            .saturating_add(H3_RADIUS_EXTRA_RING)
+            .min(H3_MAX_QUERY_K)
+    }
+}
+
+fn query_cells(lon: f64, lat: f64, resolution: Resolution, radius_m: f64) -> Vec<u64> {
     let Ok(lat_lng) = LatLng::new(lat, lon) else {
         return Vec::new();
     };
-    let cell = lat_lng.to_cell(resolution);
-    let k = h3_radius_k(resolution, radius_m);
-    cell.grid_disk::<Vec<CellIndex>>(k)
+    let mut cells = lat_lng
+        .to_cell(resolution)
+        .grid_disk::<Vec<CellIndex>>(disk_k(resolution, radius_m))
         .into_iter()
         .map(u64::from)
-        .collect()
+        .collect::<Vec<_>>();
+    // Ascending cell ids read the index front to back.
+    cells.sort_unstable();
+    cells
 }
 
-fn h3_segment_cell_ids(segment: &SpatialSegmentEntry, resolution: Resolution) -> Result<Vec<u64>> {
-    let length = haversine_m(
-        segment.start_lon,
-        segment.start_lat,
-        segment.end_lon,
-        segment.end_lat,
-    );
+fn segment_cells(start: [f64; 2], end: [f64; 2], resolution: Resolution) -> Result<Vec<u64>> {
+    let length = haversine_m(start[0], start[1], end[0], end[1]);
     let step = (resolution.edge_length_m() / H3_SEGMENT_SAMPLE_DIVISOR).max(1.0);
     let sample_count = ((length / step).ceil() as usize).max(1);
     let mut cells = Vec::with_capacity(sample_count + 1);
     for sample in 0..=sample_count {
         let t = sample as f64 / sample_count as f64;
-        let lon = segment.start_lon + t * (segment.end_lon - segment.start_lon);
-        let lat = segment.start_lat + t * (segment.end_lat - segment.start_lat);
-        cells.push(h3_cell_id(lon, lat, resolution)?);
+        let lon = start[0] + t * (end[0] - start[0]);
+        let lat = start[1] + t * (end[1] - start[1]);
+        cells.push(cell_id(lon, lat, resolution)?);
     }
     cells.sort_unstable();
     cells.dedup();
     Ok(cells)
 }
 
-fn h3_radius_k(resolution: Resolution, radius_m: f64) -> u32 {
-    if radius_m <= 0.0 {
-        return H3_RADIUS_EXTRA_RING;
-    }
-    ((radius_m / resolution.edge_length_m()).ceil() as u32)
-        .saturating_add(H3_RADIUS_EXTRA_RING)
-        .min(H3_MAX_QUERY_K)
-}
-
-fn elapsed_ms(started: Instant) -> u128 {
-    started.elapsed().as_millis()
-}
-
-fn write_cells_file(path: &Path, entries: &[CellDirectoryEntry]) -> Result<()> {
-    write_counted_file(path, V2_CELLS_MAGIC, entries.len() as u64, |file| {
-        file.write_all(bytemuck::cast_slice(entries))?;
-        Ok(())
-    })
-}
-
-fn write_points_file(path: &Path, points: &[SpatialPointEntry]) -> Result<()> {
-    write_counted_file(path, V2_POINTS_MAGIC, points.len() as u64, |file| {
-        let mut buffer = Vec::with_capacity(SPATIAL_ENCODE_BUFFER_BYTES);
-        for point in points {
-            flush_if_full(&mut buffer, POINT_ENTRY_BYTES, file)?;
-            buffer.extend_from_slice(&point.record_id.to_le_bytes());
-            buffer.push(spatial_layer_code(point.layer));
-            buffer.extend_from_slice(&quantize_coordinate(point.lon).to_le_bytes());
-            buffer.extend_from_slice(&quantize_coordinate(point.lat).to_le_bytes());
-        }
-        if !buffer.is_empty() {
-            file.write_all(&buffer)?;
-        }
-        Ok(())
-    })
-}
-
-fn write_segments_file(path: &Path, segments: &[SpatialSegmentEntry]) -> Result<()> {
-    write_counted_file(path, V2_SEGMENTS_MAGIC, segments.len() as u64, |file| {
-        let mut buffer = Vec::with_capacity(SPATIAL_ENCODE_BUFFER_BYTES);
-        for segment in segments {
-            flush_if_full(&mut buffer, SEGMENT_ENTRY_BYTES, file)?;
-            buffer.extend_from_slice(&segment.record_id.to_le_bytes());
-            buffer.push(spatial_layer_code(segment.layer));
-            buffer.extend_from_slice(&quantize_coordinate(segment.start_lon).to_le_bytes());
-            buffer.extend_from_slice(&quantize_coordinate(segment.start_lat).to_le_bytes());
-            buffer.extend_from_slice(&quantize_coordinate(segment.end_lon).to_le_bytes());
-            buffer.extend_from_slice(&quantize_coordinate(segment.end_lat).to_le_bytes());
-            buffer.extend_from_slice(&quantize_fraction(segment.start_fraction).to_le_bytes());
-            buffer.extend_from_slice(&quantize_fraction(segment.end_fraction).to_le_bytes());
-        }
-        if !buffer.is_empty() {
-            file.write_all(&buffer)?;
-        }
-        Ok(())
-    })
-}
-
-fn write_refs_file(path: &Path, magic: &[u8; 8], refs: &[u32]) -> Result<()> {
-    write_counted_file(path, magic, refs.len() as u64, |file| {
-        file.write_all(bytemuck::cast_slice(refs))?;
-        Ok(())
-    })
-}
-
-fn flush_if_full(
-    buffer: &mut Vec<u8>,
-    next_entry_bytes: usize,
-    file: &mut BufWriter<File>,
-) -> Result<()> {
-    if buffer.len() + next_entry_bytes > SPATIAL_ENCODE_BUFFER_BYTES {
-        file.write_all(buffer)?;
-        buffer.clear();
-    }
-    Ok(())
-}
-
-fn write_counted_file(
-    path: &Path,
-    magic: &[u8; 8],
-    count: u64,
-    write_entries: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let mut file = BufWriter::with_capacity(SPATIAL_FILE_BUFFER_BYTES, file);
-    file.write_all(magic)?;
-    file.write_all(&count.to_le_bytes())?;
-    write_entries(&mut file)?;
-    file.flush()?;
-    Ok(())
-}
-
-fn open_counted_mmap(
-    path: PathBuf,
-    expected_magic: &[u8; 8],
-    entry_bytes: usize,
-) -> Result<CountedMmap> {
-    let file = File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
-    // SAFETY: the map is read-only, the file handle is not used for writes here,
-    // and Pack files are immutable once built.
-    let bytes = unsafe { MmapOptions::new().map(&file) }
-        .with_context(|| format!("failed to mmap {}", path.display()))?;
-    if bytes.len() < COUNTED_HEADER_BYTES {
-        bail!("{} is too short for a counted spatial file", path.display());
-    }
-    let Some(magic) = bytes.get(0..8) else {
-        bail!("{} is missing magic", path.display());
-    };
-    if magic != expected_magic {
-        bail!("{} has an invalid magic header", path.display());
-    }
-    let count = read_u64(&bytes, 8).expect("validated counted header");
-    let entries_bytes = usize::try_from(count)
-        .ok()
-        .and_then(|count| count.checked_mul(entry_bytes))
-        .context("spatial file entry count overflows usize")?;
-    let expected_len = COUNTED_HEADER_BYTES
-        .checked_add(entries_bytes)
-        .context("spatial file length overflows usize")?;
-    if bytes.len() != expected_len {
-        bail!(
-            "{} has {} bytes but expected {}",
-            path.display(),
-            bytes.len(),
-            expected_len
-        );
-    }
-    Ok(CountedMmap {
-        bytes,
-        count,
-        entry_bytes,
-    })
-}
-
-fn read_cell_entry(cells: &CountedMmap, index: u64) -> Option<CellDirectoryEntry> {
-    let offset = entry_offset(cells, index)?;
-    Some(CellDirectoryEntry {
-        h3_cell: read_u64(&cells.bytes, offset)?,
-        point_start: read_u64(&cells.bytes, offset + 8)?,
-        point_count: read_u64(&cells.bytes, offset + 16)?,
-        segment_start: read_u64(&cells.bytes, offset + 24)?,
-        segment_count: read_u64(&cells.bytes, offset + 32)?,
-    })
-}
-
-fn read_point_entry(points: &CountedMmap, index: u64) -> Option<SpatialPointEntry> {
-    let offset = entry_offset(points, index)?;
-    let layer = spatial_layer_from_code(*points.bytes.get(offset + 8)?)?;
-    Some(SpatialPointEntry {
-        record_id: read_u64(&points.bytes, offset)?,
-        layer,
-        lon: dequantize_coordinate(read_i32(&points.bytes, offset + 9)?),
-        lat: dequantize_coordinate(read_i32(&points.bytes, offset + 13)?),
-    })
-}
-
-fn read_segment_entry(segments: &CountedMmap, index: u64) -> Option<SpatialSegmentEntry> {
-    let offset = entry_offset(segments, index)?;
-    let layer = spatial_layer_from_code(*segments.bytes.get(offset + 8)?)?;
-    Some(SpatialSegmentEntry {
-        record_id: read_u64(&segments.bytes, offset)?,
-        layer,
-        start_lon: dequantize_coordinate(read_i32(&segments.bytes, offset + 9)?),
-        start_lat: dequantize_coordinate(read_i32(&segments.bytes, offset + 13)?),
-        end_lon: dequantize_coordinate(read_i32(&segments.bytes, offset + 17)?),
-        end_lat: dequantize_coordinate(read_i32(&segments.bytes, offset + 21)?),
-        start_fraction: dequantize_fraction(read_u32(&segments.bytes, offset + 25)?),
-        end_fraction: dequantize_fraction(read_u32(&segments.bytes, offset + 29)?),
-    })
-}
-
-fn read_ref_range(refs: &CountedMmap, start: u64, count: u64) -> impl Iterator<Item = u32> + '_ {
-    (start..start.saturating_add(count)).filter_map(move |index| {
-        let offset = entry_offset(refs, index)?;
-        read_u32(&refs.bytes, offset)
-    })
-}
-
-fn entry_offset(file: &CountedMmap, index: u64) -> Option<usize> {
-    if index >= file.count {
-        return None;
-    }
-    let index = usize::try_from(index).ok()?;
-    let offset = COUNTED_HEADER_BYTES.checked_add(index.checked_mul(file.entry_bytes)?)?;
-    (offset + file.entry_bytes <= file.bytes.len()).then_some(offset)
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let array: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
-    Some(u64::from_le_bytes(array))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let array: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
-    Some(u32::from_le_bytes(array))
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
-    let array: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
-    Some(i32::from_le_bytes(array))
-}
-
-fn quantize_coordinate(value: f64) -> i32 {
-    (value * COORDINATE_SCALE)
-        .round()
-        .clamp(i32::MIN as f64, i32::MAX as f64) as i32
-}
-
-fn dequantize_coordinate(value: i32) -> f64 {
-    value as f64 / COORDINATE_SCALE
-}
-
-fn quantize_fraction(value: f64) -> u32 {
-    (value.clamp(0.0, 1.0) * FRACTION_SCALE).round() as u32
-}
-
-fn dequantize_fraction(value: u32) -> f64 {
-    value as f64 / FRACTION_SCALE
-}
-
-fn spatial_layer_code(layer: SpatialLayer) -> u8 {
-    match layer {
-        SpatialLayer::Address => 1,
-        SpatialLayer::Country => 2,
-        SpatialLayer::District => 3,
-        SpatialLayer::Interpolation => 4,
-        SpatialLayer::Locality => 5,
-        SpatialLayer::Neighbourhood => 6,
-        SpatialLayer::Place => 7,
-        SpatialLayer::Postcode => 8,
-        SpatialLayer::Region => 9,
-        SpatialLayer::Street => 10,
-    }
-}
-
-fn spatial_layer_from_code(value: u8) -> Option<SpatialLayer> {
-    match value {
-        1 => Some(SpatialLayer::Address),
-        2 => Some(SpatialLayer::Country),
-        3 => Some(SpatialLayer::District),
-        4 => Some(SpatialLayer::Interpolation),
-        5 => Some(SpatialLayer::Locality),
-        6 => Some(SpatialLayer::Neighbourhood),
-        7 => Some(SpatialLayer::Place),
-        8 => Some(SpatialLayer::Postcode),
-        9 => Some(SpatialLayer::Region),
-        10 => Some(SpatialLayer::Street),
-        _ => None,
-    }
-}
-
-fn line_segments(geometry: &Geometry) -> Vec<BuiltSegment> {
-    let GeometryValue::LineString { coordinates } = &geometry.value else {
-        return Vec::new();
-    };
-    let positions = coordinates
-        .iter()
-        .filter_map(|position| {
-            let [lon, lat, ..] = position.as_slice() else {
-                return None;
-            };
-            if lon.is_finite() && lat.is_finite() {
-                Some([*lon, *lat])
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    if positions.len() < 2 {
-        return Vec::new();
-    }
-
-    let mut lengths = Vec::with_capacity(positions.len() - 1);
-    let mut total = 0.0;
-    for pair in positions.windows(2) {
-        let length = haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]);
-        lengths.push(length);
-        total += length;
-    }
-    if total <= f64::EPSILON {
-        return Vec::new();
-    }
-
-    let mut traversed = 0.0;
-    let mut segments = Vec::with_capacity(lengths.len());
-    for (index, pair) in positions.windows(2).enumerate() {
-        let length = lengths[index];
-        if length <= f64::EPSILON {
-            continue;
-        }
-        let start_fraction = traversed / total;
-        traversed += length;
-        segments.push(BuiltSegment {
-            start: pair[0],
-            end: pair[1],
-            start_fraction,
-            end_fraction: traversed / total,
-        });
-    }
-    segments
-}
-
-fn is_context_layer(layer: SpatialLayer) -> bool {
-    matches!(
-        layer,
-        SpatialLayer::Country
-            | SpatialLayer::District
-            | SpatialLayer::Locality
-            | SpatialLayer::Neighbourhood
-            | SpatialLayer::Place
-            | SpatialLayer::Postcode
-            | SpatialLayer::Region
-    )
-}
-
-fn project_to_segment_m(
+struct SegmentProjection {
     lon: f64,
     lat: f64,
-    start_lon: f64,
-    start_lat: f64,
-    end_lon: f64,
-    end_lat: f64,
-) -> SegmentProjection {
-    let (sx, sy) = local_xy_m(start_lon, start_lat, lon, lat);
-    let (ex, ey) = local_xy_m(end_lon, end_lat, lon, lat);
+    distance_m: f64,
+    t: f64,
+}
+
+fn project_to_segment_m(lon: f64, lat: f64, start: [f64; 2], end: [f64; 2]) -> SegmentProjection {
+    let (sx, sy) = local_xy_m(start[0], start[1], lon, lat);
+    let (ex, ey) = local_xy_m(end[0], end[1], lon, lat);
     let vx = ex - sx;
     let vy = ey - sy;
     let length_2 = vx * vx + vy * vy;
@@ -1142,8 +685,8 @@ fn project_to_segment_m(
     let x = sx + t * vx;
     let y = sy + t * vy;
     SegmentProjection {
-        lon: start_lon + t * (end_lon - start_lon),
-        lat: start_lat + t * (end_lat - start_lat),
+        lon: start[0] + t * (end[0] - start[0]),
+        lat: start[1] + t * (end[1] - start[1]),
         distance_m: (x * x + y * y).sqrt(),
         t,
     }
@@ -1155,7 +698,7 @@ fn local_xy_m(lon: f64, lat: f64, origin_lon: f64, origin_lat: f64) -> (f64, f64
     (x, y)
 }
 
-fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
+pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
     let d_lat = (b_lat - a_lat).to_radians();
     let d_lon = (b_lon - a_lon).to_radians();
     let a_lat = a_lat.to_radians();
@@ -1164,15 +707,6 @@ fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
     let sin_d_lon = (d_lon / 2.0).sin();
     let h = sin_d_lat * sin_d_lat + a_lat.cos() * b_lat.cos() * sin_d_lon * sin_d_lon;
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
-}
-
-fn compare_distance<T>(left: &T, right: &T) -> Ordering
-where
-    T: CandidateDistance,
-{
-    left.distance_m()
-        .partial_cmp(&right.distance_m())
-        .unwrap_or(Ordering::Equal)
 }
 
 trait CandidateDistance {
@@ -1189,6 +723,12 @@ impl CandidateDistance for SegmentCandidate {
     fn distance_m(&self) -> f64 {
         self.distance_m
     }
+}
+
+fn compare_distance<T: CandidateDistance>(left: &T, right: &T) -> Ordering {
+    left.distance_m()
+        .partial_cmp(&right.distance_m())
+        .unwrap_or(Ordering::Equal)
 }
 
 fn closest_candidates<T: CandidateDistance>(mut candidates: Vec<T>, limit: usize) -> Vec<T> {
@@ -1219,14 +759,16 @@ fn closest_candidates<T: CandidateDistance>(mut candidates: Vec<T>, limit: usize
 
 #[cfg(test)]
 mod tests {
-    use geojson::GeometryValue;
-
-    use crate::record::{
-        AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
-        OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
-    };
+    use geojson::Geometry;
 
     use super::*;
+    use crate::{
+        record::{
+            AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
+            OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
+        },
+        records::RecordsWriter,
+    };
 
     #[test]
     fn closest_candidates_matches_stable_full_sort() {
@@ -1234,7 +776,7 @@ mod tests {
             let candidates: Vec<_> = (0..count)
                 .map(|id| PointCandidate {
                     record_id: id,
-                    layer: SpatialLayer::Address,
+                    layer: Layer::Address,
                     lon: 0.0,
                     lat: 0.0,
                     // Repeated, unsorted distances exercise ties at the cutoff.
@@ -1257,10 +799,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn indexes_and_queries_address_points() {
-        let mut writer = PackSpatialIndexWriter::default();
-        let record = AddressRecord {
+    fn address(lon: f64, lat: f64, object_id: i64) -> Record {
+        Record::Address(AddressRecord {
             address: AddressComponents {
                 number: "10".to_string(),
                 street: Some("King Street".to_string()),
@@ -1271,37 +811,65 @@ mod tests {
                 postcode: None,
                 country: None,
             },
-            geometry: point_geometry(-79.0, 43.0),
+            geometry: point_geometry(lon, lat),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, 1),
-        };
+            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+        })
+    }
 
-        writer.add_address(7, &record).expect("add record");
-        for id in 8..1_008 {
-            let mut nearby = record.clone();
-            nearby.geometry = point_geometry(-79.0, 43.0 + ((id * 37) % 100) as f64 * 0.000001);
-            writer.add_address(id, &nearby).expect("add nearby record");
+    /// Build a Pack holding only records and the spatial index, with a sorter
+    /// budget small enough to force spilling.
+    fn build(records: &[Record]) -> (SpatialIndexReader, SpatialCommit) {
+        let root =
+            std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
+        let scratch = Scratch::create(root.join("scratch")).expect("scratch");
+        let mut writer = RecordsWriter::create(&scratch).expect("records");
+        let mut spatial = SpatialIndexWriter::new(&scratch, 64);
+        for record in records {
+            let id = writer.write(record, None).expect("write");
+            spatial
+                .add(RecordCells::for_record(id, record).expect("cells"))
+                .expect("add");
         }
-        let temp_dir =
-            std::env::temp_dir().join(format!("open-geocode-spatial-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let commit = writer.finish(&temp_dir).expect("finish");
+        let path = root.join("pack.ogp");
+        let mut pack = ContainerWriter::create(&path).expect("pack");
+        writer.finish(&mut pack).expect("records finish");
+        let commit = spatial.finish(&mut pack).expect("spatial finish");
+        pack.finish().expect("pack finish");
+        let container = Container::open(&path).expect("open");
+        let records = RecordsReader::open(&container).expect("records reader");
+        (
+            SpatialIndexReader::open(&container, records).expect("spatial reader"),
+            commit,
+        )
+    }
 
-        assert_eq!(commit.schema_version, SPATIAL_INDEX_SCHEMA_VERSION);
-        assert_eq!(commit.relative_path, SPATIAL_INDEX_V2_RELATIVE_DIR);
-        assert!(temp_dir.join(SPATIAL_INDEX_V2_RELATIVE_DIR).exists());
-        let manifest = read_test_manifest(&temp_dir);
-        assert_eq!(manifest.h3_fine_resolution, 11);
-        assert_eq!(manifest.h3_context_resolution, 6);
+    #[test]
+    fn indexes_and_queries_address_points() {
+        let mut records = vec![address(-79.0, 43.0, 7)];
+        for id in 8..1_008 {
+            records.push(address(
+                -79.0,
+                43.0 + ((id * 37) % 100) as f64 * 0.000001,
+                id,
+            ));
+        }
+        let (reader, commit) = build(&records);
+        assert!(commit.fine_pairs.runs > 0, "the tiny budget must spill");
+        assert_eq!(commit.point_count, 1_001);
 
-        let reader = PackSpatialIndexReader::open(&temp_dir).expect("reader");
-        let hits = reader.point_candidates(-79.0, 43.0, SpatialLayer::Address, 5.0, 1);
-
+        let hits = reader
+            .point_candidates(-79.0, 43.0, Layer::Address, 5.0, 1)
+            .expect("hits");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 7);
+        assert_eq!(hits[0].record_id, 0);
 
-        let all = reader.point_candidates(-79.0, 43.0, SpatialLayer::Address, 100.0, 0);
-        let limited = reader.point_candidates(-79.0, 43.0, SpatialLayer::Address, 100.0, 5);
+        let all = reader
+            .point_candidates(-79.0, 43.0, Layer::Address, 100.0, 0)
+            .expect("all");
+        let limited = reader
+            .point_candidates(-79.0, 43.0, Layer::Address, 100.0, 5)
+            .expect("limited");
         assert_eq!(all.len(), 1_001);
         assert_eq!(
             limited.iter().map(|hit| hit.record_id).collect::<Vec<_>>(),
@@ -1310,72 +878,104 @@ mod tests {
                 .map(|hit| hit.record_id)
                 .collect::<Vec<_>>(),
         );
-
-        let _ = fs::remove_dir_all(temp_dir);
+        assert!(
+            reader
+                .point_candidates(-79.0, 43.0, Layer::Postcode, 100.0, 0)
+                .expect("other layer")
+                .is_empty()
+        );
     }
 
     #[test]
-    fn indexes_context_points_with_coarse_h3_cells() {
-        let mut writer = PackSpatialIndexWriter::default();
-        let record = PostcodeRecord {
+    fn early_stopping_ring_scan_matches_the_full_scan() {
+        // Postcodes scattered over ~60 km, denser near the centre.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as f64 / 1_000_000.0 - 0.5
+        };
+        let records = (0..2_000)
+            .map(|index| {
+                let spread = if index % 3 == 0 { 0.6 } else { 0.05 };
+                Record::Postcode(PostcodeRecord {
+                    postcode: format!("P{index}"),
+                    geometry: point_geometry(-79.4 + next() * spread, 43.7 + next() * spread),
+                    source: DerivedSourceProvenance::osm_address_records(1),
+                })
+            })
+            .collect::<Vec<_>>();
+        let (reader, _) = build(&records);
+        for (lon, lat) in [(-79.4, 43.7), (-79.6, 43.9), (-79.1, 43.5), (-78.0, 43.0)] {
+            for limit in [1, 16, 100] {
+                let early = reader
+                    .context_candidates(lon, lat, 50_000.0, limit)
+                    .expect("early");
+                let mut full = reader
+                    .context_candidates(lon, lat, 50_000.0, 0)
+                    .expect("full");
+                full.truncate(limit);
+                let distances = |hits: &[PointCandidate]| {
+                    hits.iter().map(|hit| hit.distance_m).collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    distances(&early),
+                    distances(&full),
+                    "{lon},{lat} limit {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexes_context_points_with_coarse_cells() {
+        let (reader, _) = build(&[Record::Postcode(PostcodeRecord {
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(1),
-        };
-
-        writer.add_postcode(11, &record).expect("add record");
-        let temp_dir = std::env::temp_dir().join(format!(
-            "open-geocode-spatial-context-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&temp_dir);
-        writer.finish(&temp_dir).expect("finish");
-
-        let reader = PackSpatialIndexReader::open(&temp_dir).expect("reader");
-        let hits = reader.context_candidates(-79.39, 43.6, 5_000.0, 5);
-
+        })]);
+        let hits = reader
+            .context_candidates(-79.39, 43.6, 5_000.0, 5)
+            .expect("hits");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 11);
-
-        let _ = fs::remove_dir_all(temp_dir);
+        assert_eq!(hits[0].record_id, 0);
+        assert_eq!(hits[0].layer, Layer::Postcode);
     }
 
     #[test]
     fn indexes_line_segments_with_fraction() {
-        let mut writer = PackSpatialIndexWriter::default();
-        let record = StreetRecord {
-            name: "King Street".to_string(),
-            geometry: Geometry::new(GeometryValue::LineString {
-                coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
-            }),
-            representative_point: [-79.0, 43.0005],
-            source: SourceProvenance::osm(OsmObjectType::Way, 1),
+        let street = |object_id: i64, lon: f64| {
+            Record::Street(StreetRecord {
+                name: "King Street".to_string(),
+                geometry: Geometry::new(GeometryValue::LineString {
+                    coordinates: vec![
+                        vec![lon, 43.0].into(),
+                        vec![lon, 43.0005].into(),
+                        vec![lon, 43.001].into(),
+                    ],
+                }),
+                representative_point: [lon, 43.0005],
+                source: SourceProvenance::osm(OsmObjectType::Way, object_id),
+            })
         };
-
-        writer.add_street(9, &record);
-        let temp_dir = std::env::temp_dir().join(format!(
-            "open-geocode-spatial-line-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&temp_dir);
-        writer.finish(&temp_dir).expect("finish");
-
-        let reader = PackSpatialIndexReader::open(&temp_dir).expect("reader");
-        let hits = reader.segment_candidates(-79.00001, 43.0005, SpatialLayer::Street, 5.0, 1);
-
+        let (reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);
+        assert_eq!(commit.segment_count, 4);
+        let hits = reader
+            .segment_candidates(-79.00001, 43.00075, Layer::Street, 5.0, 1)
+            .expect("hits");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 9);
-        assert!((hits[0].fraction - 0.5).abs() < 0.01);
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    fn read_test_manifest(path: &Path) -> SpatialIndexV2Manifest {
-        let file = File::open(
-            path.join(SPATIAL_INDEX_V2_RELATIVE_DIR)
-                .join(SPATIAL_INDEX_V2_MANIFEST),
-        )
-        .expect("manifest");
-        serde_json::from_reader(file).expect("parse manifest")
+        assert_eq!(hits[0].record_id, 0);
+        assert!(
+            (hits[0].fraction - 0.75).abs() < 0.01,
+            "{}",
+            hits[0].fraction
+        );
+        assert!(
+            reader
+                .segment_candidates(-79.00001, 43.00075, Layer::Interpolation, 5.0, 1)
+                .expect("other layer")
+                .is_empty()
+        );
     }
 }
