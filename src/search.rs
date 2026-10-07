@@ -984,6 +984,100 @@ mod tests {
     }
 
     #[test]
+    fn pois_named_after_a_place_or_street_do_not_outrank_it() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, PoiRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("search-poi-repeats");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let township = writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Locality,
+                    PlaceRecord {
+                        name: "Muskoka Lakes Township".to_string(),
+                        place_type: "admin_level:8".to_string(),
+                        geometry: point_geometry(-79.5, 45.1),
+                        source: SourceProvenance::osm(OsmObjectType::Relation, 1),
+                    },
+                ),
+                None,
+            )
+            .expect("township");
+        writer.set_context_names(
+            [(township, "Muskoka Lakes Township".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let in_township = Some(RecordContext {
+            admin_context: AdminContextTuple {
+                locality_record_id: Some(township),
+                ..AdminContextTuple::default()
+            },
+            flags: 0,
+        });
+        let poi = |object_id, name: &str, address| PoiRecord {
+            name: name.to_string(),
+            category: "amenity:fire_station".to_string(),
+            address,
+            geometry: point_geometry(-79.5, 45.1),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+        };
+        writer
+            .write(
+                &poi(2, "Muskoka Lakes Township Fire Station", None).into(),
+                in_township,
+            )
+            .expect("fire station");
+        writer
+            .write(
+                &address_record("osm:node:3", "", "4", "Walmer Road", Some("Toronto"), None).into(),
+                None,
+            )
+            .expect("address");
+        let parkette_address = address_record(
+            "osm:node:4",
+            "",
+            "227",
+            "Walmer Road",
+            Some("Toronto"),
+            None,
+        )
+        .address;
+        writer
+            .write(
+                &poi(4, "Walmer Road Parkette", Some(parkette_address)).into(),
+                None,
+            )
+            .expect("parkette");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let top = |query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                })
+                .expect("search")[0]
+                .record
+                .id
+                .clone()
+        };
+
+        assert_eq!(top("Muskoka Lakes Township"), "osm:relation:1");
+        assert_eq!(top("Walmer Road"), "osm:node:3");
+        assert_eq!(top("Walmer Road Parkette"), "osm:node:4");
+        assert_eq!(top("Fire Station, Muskoka Lakes Township"), "osm:node:2");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn search_reports_queries_that_cannot_be_parsed() {
         let temp_dir = temp_pack_path("search-parse-error");
         let _ = std::fs::remove_dir_all(&temp_dir);

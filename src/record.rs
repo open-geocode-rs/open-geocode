@@ -14,6 +14,7 @@ pub enum Record {
     Street(StreetRecord),
     Postcode(PostcodeRecord),
     Place(PlaceLayer, PlaceRecord),
+    Poi(PoiRecord),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +51,19 @@ pub struct PostcodeRecord {
     pub source: DerivedSourceProvenance,
 }
 
+/// A named point of interest. One that also states a valid address carries it,
+/// so the same OSM object is found by its name and by its address.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoiRecord {
+    pub name: String,
+    /// The tag that made it a POI, as `key:value`, for example `amenity:cafe`.
+    pub category: String,
+    pub address: Option<AddressComponents>,
+    pub geometry: Geometry,
+    pub location_precision: LocationPrecision,
+    pub source: SourceProvenance,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaceRecord {
     pub name: String,
@@ -70,13 +84,14 @@ pub enum Layer {
     Locality,
     Neighbourhood,
     Place,
+    Poi,
     Postcode,
     Region,
     Street,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 10] = [
+    pub const ALL: [Layer; 11] = [
         Layer::Address,
         Layer::Country,
         Layer::District,
@@ -84,6 +99,7 @@ impl Layer {
         Layer::Locality,
         Layer::Neighbourhood,
         Layer::Place,
+        Layer::Poi,
         Layer::Postcode,
         Layer::Region,
         Layer::Street,
@@ -98,6 +114,7 @@ impl Layer {
             Layer::Locality => "locality",
             Layer::Neighbourhood => "neighbourhood",
             Layer::Place => "place",
+            Layer::Poi => "poi",
             Layer::Postcode => "postcode",
             Layer::Region => "region",
             Layer::Street => "street",
@@ -268,6 +285,7 @@ impl Record {
             Record::Street(_) => Layer::Street,
             Record::Postcode(_) => Layer::Postcode,
             Record::Place(layer, _) => Layer::from_place(*layer),
+            Record::Poi(_) => Layer::Poi,
         }
     }
 
@@ -278,6 +296,7 @@ impl Record {
             Record::Street(record) => record.id(),
             Record::Postcode(record) => record.id(),
             Record::Place(_, record) => record.id(),
+            Record::Poi(record) => record.id(),
         }
     }
 
@@ -288,6 +307,7 @@ impl Record {
             Record::Street(record) => record.label(),
             Record::Postcode(record) => record.label(),
             Record::Place(_, record) => record.label(),
+            Record::Poi(record) => record.label(),
         }
     }
 
@@ -298,6 +318,7 @@ impl Record {
             Record::Street(record) => &record.geometry,
             Record::Postcode(record) => &record.geometry,
             Record::Place(_, record) => &record.geometry,
+            Record::Poi(record) => &record.geometry,
         }
     }
 
@@ -310,6 +331,7 @@ impl Record {
             Record::Street(record) => Some(record.representative_point),
             Record::Postcode(record) => point_lon_lat(&record.geometry),
             Record::Place(_, record) => point_lon_lat(&record.geometry),
+            Record::Poi(record) => point_lon_lat(&record.geometry),
         }
     }
 }
@@ -338,6 +360,12 @@ impl From<PostcodeRecord> for Record {
     }
 }
 
+impl From<PoiRecord> for Record {
+    fn from(record: PoiRecord) -> Self {
+        Record::Poi(record)
+    }
+}
+
 impl Serialize for Record {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -346,6 +374,7 @@ impl Serialize for Record {
             Record::Street(record) => record.serialize(serializer),
             Record::Postcode(record) => record.serialize(serializer),
             Record::Place(_, record) => record.serialize(serializer),
+            Record::Poi(record) => record.serialize(serializer),
         }
     }
 }
@@ -491,6 +520,35 @@ impl Serialize for PlaceRecord {
         state.serialize_field("name", &self.name)?;
         state.serialize_field("place_type", &self.place_type)?;
         state.serialize_field("geometry", &self.geometry)?;
+        state.serialize_field("source", &self.source)?;
+        state.end()
+    }
+}
+
+impl PoiRecord {
+    pub fn id(&self) -> String {
+        labels::osm_record_id(self.source.object_type, self.source.object_id)
+    }
+
+    pub fn label(&self) -> String {
+        labels::poi_label(&self.name, self.address.as_ref(), None)
+    }
+}
+
+impl Serialize for PoiRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("PoiRecord", 8)?;
+        state.serialize_field("id", &self.id())?;
+        state.serialize_field("label", &self.label())?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("category", &self.category)?;
+        if let Some(address) = &self.address {
+            state.serialize_field("address", address)?;
+        } else {
+            state.skip_field("address")?;
+        }
+        state.serialize_field("geometry", &self.geometry)?;
+        state.serialize_field("location_precision", &self.location_precision)?;
         state.serialize_field("source", &self.source)?;
         state.end()
     }

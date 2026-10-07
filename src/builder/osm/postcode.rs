@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
+use geojson::Geometry;
+
 use crate::{
-    record::{AddressRecord, DerivedSourceProvenance, PostcodeRecord, point_geometry},
+    record::{AddressComponents, DerivedSourceProvenance, PostcodeRecord, point_geometry},
     util::geo::point_lon_lat,
 };
 
@@ -19,11 +21,12 @@ struct PostcodeGroup {
 }
 
 impl PostcodeAccumulator {
-    pub(crate) fn accept_address(&mut self, address: &AddressRecord) {
-        let Some(postcode) = address.address.postcode.as_deref().and_then(clean_postcode) else {
+    /// Count an accepted address: an address record or a POI that states one.
+    pub(crate) fn accept(&mut self, address: &AddressComponents, geometry: &Geometry) {
+        let Some(postcode) = address.postcode.as_deref().and_then(clean_postcode) else {
             return;
         };
-        let Some([lon, lat]) = point_lon_lat(&address.geometry) else {
+        let Some([lon, lat]) = point_lon_lat(geometry) else {
             return;
         };
         let group = self.groups.entry(postcode).or_default();
@@ -87,16 +90,14 @@ fn clean_postcode(value: &str) -> Option<String> {
 mod tests {
     use geojson::GeometryValue;
 
-    use crate::record::{AddressComponents, LocationPrecision, OsmObjectType, SourceProvenance};
-
     use super::*;
 
     #[test]
     fn derives_postcode_record_from_accepted_addresses_across_workers() {
         let mut first = PostcodeAccumulator::default();
         let mut second = PostcodeAccumulator::default();
-        first.accept_address(&address_record("m5v 2t6", -79.4, 43.6));
-        second.accept_address(&address_record("M5V   2T6", -79.2, 43.8));
+        first.accept(&address("m5v 2t6"), &point_geometry(-79.4, 43.6));
+        second.accept(&address("M5V   2T6"), &point_geometry(-79.2, 43.8));
         first.merge(second);
 
         assert_eq!(first.len(), 1);
@@ -119,21 +120,16 @@ mod tests {
         assert_eq!(clean_postcode("---"), None);
     }
 
-    fn address_record(postcode: &str, lon: f64, lat: f64) -> AddressRecord {
-        AddressRecord {
-            address: AddressComponents {
-                number: "1".to_string(),
-                street: Some("King Street".to_string()),
-                place: None,
-                unit: None,
-                locality: None,
-                region: None,
-                postcode: Some(postcode.to_string()),
-                country: None,
-            },
-            geometry: point_geometry(lon, lat),
-            location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, 1),
+    fn address(postcode: &str) -> AddressComponents {
+        AddressComponents {
+            number: "1".to_string(),
+            street: Some("King Street".to_string()),
+            place: None,
+            unit: None,
+            locality: None,
+            region: None,
+            postcode: Some(postcode.to_string()),
+            country: None,
         }
     }
 }

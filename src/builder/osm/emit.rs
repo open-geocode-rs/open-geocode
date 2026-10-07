@@ -21,6 +21,7 @@ use super::{
     emitted::Emitted,
     geometry::centroid,
     interpolation::{InterpolationNode, emit_interpolation},
+    poi::{PoiCandidate, emit_poi},
     spill::{ResolvedRef, WayFeature, WayKind},
     street::emit_street,
 };
@@ -111,6 +112,30 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
                     &feature.tags,
                     Some(&feature.tags),
                     Some("address"),
+                ),
+            }
+        }
+        WayKind::Poi => {
+            let center = if complete { centroid(&points()) } else { None };
+            match center {
+                Some((lat, lon)) => emit_poi(
+                    PoiCandidate {
+                        object_type: OsmObjectType::Way,
+                        object_id: feature.way_id,
+                        lat,
+                        lon,
+                        location_precision: LocationPrecision::Centroid,
+                        tags: feature.tags,
+                    },
+                    out,
+                ),
+                None => out.reject(
+                    CandidateIssue::WayWithoutResolvedNodes,
+                    OsmObjectType::Way,
+                    feature.way_id,
+                    &feature.tags,
+                    None,
+                    Some("poi"),
                 ),
             }
         }

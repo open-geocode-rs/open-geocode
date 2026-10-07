@@ -27,7 +27,7 @@ pub(crate) fn emit_address(candidate: AddressCandidate, out: &mut Emitted) {
         Ok(record) => {
             out.report
                 .accept_address_with_tags(&record, Some(&candidate.tags));
-            out.postcodes.accept_address(&record);
+            out.postcodes.accept(&record.address, &record.geometry);
             out.records.push(Record::Address(record));
         }
         Err(issue) => out.reject_in_report(
@@ -44,7 +44,19 @@ pub(crate) fn emit_address(candidate: AddressCandidate, out: &mut Emitted) {
 pub(crate) fn address_record_from_candidate(
     candidate: &AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
-    let tags = &candidate.tags;
+    Ok(AddressRecord {
+        address: address_components(&candidate.tags)?,
+        geometry: point_geometry(candidate.lon, candidate.lat),
+        location_precision: candidate.location_precision,
+        source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
+    })
+}
+
+/// The address `addr:*` tags state, if they name a house number and a street
+/// or place.
+pub(crate) fn address_components(
+    tags: &BTreeMap<String, String>,
+) -> std::result::Result<AddressComponents, CandidateIssue> {
     let house_number = tags
         .cleaned("addr:housenumber")
         .ok_or(CandidateIssue::MissingHouseNumber)?;
@@ -55,20 +67,15 @@ pub(crate) fn address_record_from_candidate(
         return Err(CandidateIssue::MissingStreetOrPlace);
     }
 
-    Ok(AddressRecord {
-        address: AddressComponents {
-            number: house_number,
-            street,
-            place,
-            unit: tags.cleaned("addr:unit"),
-            locality: tags.cleaned("addr:city"),
-            region: tags.cleaned("addr:state"),
-            postcode: tags.cleaned("addr:postcode"),
-            country: tags.cleaned("addr:country"),
-        },
-        geometry: point_geometry(candidate.lon, candidate.lat),
-        location_precision: candidate.location_precision,
-        source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
+    Ok(AddressComponents {
+        number: house_number,
+        street,
+        place,
+        unit: tags.cleaned("addr:unit"),
+        locality: tags.cleaned("addr:city"),
+        region: tags.cleaned("addr:state"),
+        postcode: tags.cleaned("addr:postcode"),
+        country: tags.cleaned("addr:country"),
     })
 }
 
