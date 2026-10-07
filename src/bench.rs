@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,9 +12,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     builder::report::{BuilderReport, PhaseTimings, ScratchReport, Throughput},
     pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackManifest, PackReader},
+    record::{Layer, OsmObjectType, Record},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
-    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
+    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+    text_index::normalize_index_text,
 };
+
+/// Hits a sampled POI case asks for: enough to score hit@5.
+const POI_CASE_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct PackBenchmarkOptions {
@@ -102,7 +108,26 @@ pub struct OperationBenchmarkReport<T> {
     pub warmup_runs: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency: Option<LatencyStats>,
+    /// Over the cases that name the object they expect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accuracy: Option<AccuracyReport>,
     pub cases: Vec<T>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AccuracyReport {
+    pub cases: usize,
+    pub hit_at_1: usize,
+    pub hit_at_5: usize,
+    pub hit_at_1_rate: f64,
+    pub hit_at_5_rate: f64,
+}
+
+/// The OSM object a query case should find.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpectedObject {
+    pub osm_type: OsmObjectType,
+    pub osm_id: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +139,11 @@ pub struct TextQueryCaseReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
     pub hit_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect: Option<ExpectedObject>,
+    /// 1-based rank of the expected object, absent when it was not returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_rank: Option<usize>,
     pub latency: LatencyStats,
 }
 
@@ -139,34 +169,36 @@ pub struct LatencyStats {
     pub total_ms: f64,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct BenchmarkFixture {
-    #[serde(default)]
-    search: Vec<TextQueryFixture>,
-    #[serde(default)]
-    autocomplete: Vec<TextQueryFixture>,
-    #[serde(default)]
-    reverse: Vec<ReverseQueryFixture>,
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BenchmarkFixture {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search: Vec<TextQueryFixture>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub autocomplete: Vec<TextQueryFixture>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reverse: Vec<ReverseQueryFixture>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct TextQueryFixture {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(alias = "q")]
-    query: String,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    layer: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextQueryFixture {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "q", alias = "query")]
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<ExpectedObject>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ReverseQueryFixture {
-    #[serde(default)]
-    name: Option<String>,
-    lon: f64,
-    lat: f64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReverseQueryFixture {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub lon: f64,
+    pub lat: f64,
 }
 
 pub fn benchmark_pack(options: PackBenchmarkOptions) -> Result<PackBenchmarkReport> {
@@ -287,38 +319,13 @@ fn benchmark_search_cases(
     iterations: usize,
     warmup: usize,
 ) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
-    let mut reports = Vec::new();
-    let mut all_durations = Vec::new();
-    for case in cases {
-        let limit = case.limit.unwrap_or(10);
-        let mut hit_count = 0;
-        let durations = measure_iterations(iterations, warmup, || {
-            let hits = searcher.search(TextSearchOptions {
-                query: case.query.clone(),
-                limit,
-                layer: case.layer.clone(),
-            })?;
-            hit_count = hits.len();
-            Ok(())
-        })?;
-        all_durations.extend(durations.iter().copied());
-        reports.push(TextQueryCaseReport {
-            name: case.name.clone(),
+    benchmark_text_cases(cases, iterations, warmup, |case, limit| {
+        searcher.search(TextSearchOptions {
             query: case.query.clone(),
             limit,
             layer: case.layer.clone(),
-            hit_count,
-            latency: LatencyStats::from_nanos(&durations),
-        });
-    }
-
-    Ok(operation_report(
-        cases.len(),
-        iterations,
-        warmup,
-        reports,
-        &all_durations,
-    ))
+        })
+    })
 }
 
 fn benchmark_autocomplete_cases(
@@ -327,18 +334,28 @@ fn benchmark_autocomplete_cases(
     iterations: usize,
     warmup: usize,
 ) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
+    benchmark_text_cases(cases, iterations, warmup, |case, limit| {
+        searcher.autocomplete(TextAutocompleteOptions {
+            query: case.query.clone(),
+            limit,
+            layer: case.layer.clone(),
+        })
+    })
+}
+
+fn benchmark_text_cases(
+    cases: &[TextQueryFixture],
+    iterations: usize,
+    warmup: usize,
+    run: impl Fn(&TextQueryFixture, usize) -> Result<Vec<TextSearchHit>>,
+) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
     let mut reports = Vec::new();
     let mut all_durations = Vec::new();
     for case in cases {
         let limit = case.limit.unwrap_or(10);
-        let mut hit_count = 0;
+        let mut hits = Vec::new();
         let durations = measure_iterations(iterations, warmup, || {
-            let hits = searcher.autocomplete(TextAutocompleteOptions {
-                query: case.query.clone(),
-                limit,
-                layer: case.layer.clone(),
-            })?;
-            hit_count = hits.len();
+            hits = run(case, limit)?;
             Ok(())
         })?;
         all_durations.extend(durations.iter().copied());
@@ -347,18 +364,29 @@ fn benchmark_autocomplete_cases(
             query: case.query.clone(),
             limit,
             layer: case.layer.clone(),
-            hit_count,
+            hit_count: hits.len(),
+            expect: case.expect,
+            expected_rank: case.expect.and_then(|expect| {
+                hits.iter()
+                    .position(|hit| {
+                        hit.record.source.object_type == Some(expect.osm_type)
+                            && hit.record.source.object_id == Some(expect.osm_id)
+                    })
+                    .map(|index| index + 1)
+            }),
             latency: LatencyStats::from_nanos(&durations),
         });
     }
 
-    Ok(operation_report(
-        cases.len(),
-        iterations,
-        warmup,
-        reports,
-        &all_durations,
-    ))
+    let mut report = operation_report(cases.len(), iterations, warmup, reports, &all_durations);
+    report.accuracy = AccuracyReport::from_ranks(
+        report
+            .cases
+            .iter()
+            .filter(|case| case.expect.is_some())
+            .map(|case| case.expected_rank),
+    );
+    Ok(report)
 }
 
 fn benchmark_reverse_cases(
@@ -410,7 +438,116 @@ fn operation_report<T>(
         measured_runs: case_count * iterations,
         warmup_runs: case_count * warmup,
         latency: (!durations.is_empty()).then(|| LatencyStats::from_nanos(durations)),
+        accuracy: None,
         cases,
+    }
+}
+
+impl AccuracyReport {
+    /// `None` when no case expects an object.
+    fn from_ranks(ranks: impl Iterator<Item = Option<usize>>) -> Option<Self> {
+        let (mut cases, mut hit_at_1, mut hit_at_5) = (0, 0, 0);
+        for rank in ranks {
+            cases += 1;
+            hit_at_1 += usize::from(rank == Some(1));
+            hit_at_5 += usize::from(rank.is_some_and(|rank| rank <= 5));
+        }
+        (cases > 0).then(|| Self {
+            cases,
+            hit_at_1,
+            hit_at_5,
+            hit_at_1_rate: hit_at_1 as f64 / cases as f64,
+            hit_at_5_rate: hit_at_5 as f64 / cases as f64,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoiFixtureOptions {
+    pub pack: PathBuf,
+    pub count: usize,
+    pub seed: u64,
+}
+
+/// An answer key of named POIs: `count` cases drawn with `seed` from the POIs
+/// whose name is unique within their locality, each queried as
+/// "<name>, <locality>" and expected to find that POI. The locality is the
+/// one [`PackReader::locality`] names; POIs without one are not drawn.
+pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture> {
+    let reader = PackReader::open(&options.pack)?;
+    let mut candidates = Vec::new();
+    // POIs per (area, name), over both the locality and the district a POI
+    // lies in: "<name>, Toronto" must be unique among every POI in Toronto,
+    // including those in a locality inside it.
+    let mut name_counts: HashMap<(String, String), usize> = HashMap::new();
+    for record_id in 0..reader.manifest().record_count {
+        if reader.records().header(record_id)?.layer != Layer::Poi {
+            continue;
+        }
+        let Record::Poi(poi) = reader.records().record(record_id)? else {
+            continue;
+        };
+        let Some(context) = reader.boundary_context(record_id)? else {
+            continue;
+        };
+        let name = normalize_index_text(&poi.name).unwrap_or_default();
+        let tuple = context.admin_context;
+        let mut areas = Vec::new();
+        for area_id in [tuple.locality_record_id, tuple.district_record_id]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(area) = reader.context_record(area_id)? {
+                areas.push(normalize_index_text(&area.name).unwrap_or_default());
+            }
+        }
+        areas.dedup();
+        for area in areas {
+            *name_counts.entry((area, name.clone())).or_default() += 1;
+        }
+        if let Some(locality) = reader.locality(record_id)? {
+            let key = (normalize_index_text(&locality).unwrap_or_default(), name);
+            candidates.push((key, poi, locality));
+        }
+    }
+    candidates.retain(|(key, _, _)| name_counts[key] == 1);
+
+    // A seeded Fisher-Yates prefix: reproducible for one Pack and seed.
+    let mut random = SplitMix64(options.seed);
+    let count = options.count.min(candidates.len());
+    for index in 0..count {
+        let pick = index + (random.next() % (candidates.len() - index) as u64) as usize;
+        candidates.swap(index, pick);
+    }
+    let search = candidates
+        .into_iter()
+        .take(count)
+        .map(|(_, poi, locality)| TextQueryFixture {
+            name: Some(poi.category.clone()),
+            query: format!("{}, {locality}", poi.name),
+            limit: Some(POI_CASE_LIMIT),
+            layer: None,
+            expect: Some(ExpectedObject {
+                osm_type: poi.source.object_type,
+                osm_id: poi.source.object_id,
+            }),
+        })
+        .collect();
+    Ok(BenchmarkFixture {
+        search,
+        ..BenchmarkFixture::default()
+    })
+}
+
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.0;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
     }
 }
 
@@ -471,14 +608,159 @@ fn nanos_to_ms(nanos: u128) -> f64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        pack::PackWriter,
+        context::AdminContextTuple,
+        pack::{PackWriter, RecordContext},
         record::{
-            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
-            point_geometry,
+            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer,
+            PlaceRecord, PoiRecord, SourceProvenance, point_geometry,
         },
     };
 
     use super::*;
+
+    #[test]
+    fn samples_unique_pois_and_scores_hits_at_one_and_five() {
+        let temp_dir = temp_pack_path("bench-poi-fixture");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut area = |layer, name: &str, object_id| {
+            writer
+                .write(
+                    &Record::Place(
+                        layer,
+                        PlaceRecord {
+                            name: name.to_string(),
+                            place_type: "admin_level:8".to_string(),
+                            geometry: point_geometry(-79.4, 43.6),
+                            source: SourceProvenance::osm(OsmObjectType::Relation, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("area")
+        };
+        // Toronto is a district with no locality over its core.
+        let toronto = area(PlaceLayer::District, "Toronto", 1);
+        let north_york = area(PlaceLayer::Locality, "North York", 2);
+        let hamilton = area(PlaceLayer::Locality, "Hamilton", 3);
+        writer.set_context_names(
+            [
+                (toronto, "Toronto".to_string()),
+                (north_york, "North York".to_string()),
+                (hamilton, "Hamilton".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let in_area = |locality, district| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple {
+                    locality_record_id: locality,
+                    district_record_id: district,
+                    ..AdminContextTuple::default()
+                },
+                flags: 0,
+            })
+        };
+        let downtown = in_area(None, Some(toronto));
+        for (object_id, name, context) in [
+            // Two in Toronto share a name: neither can be expected.
+            (10, "Tim Hortons", downtown),
+            (11, "TIM  HORTONS", downtown),
+            (12, "Tim Hortons", in_area(Some(hamilton), None)),
+            (13, "Riverdale Farm", downtown),
+            // No locality to query it with.
+            (14, "Lonely Cabin", None),
+            // Unique in North York, but "Ali Baba, Toronto" would find both.
+            (15, "Ali Baba", in_area(Some(north_york), Some(toronto))),
+            (16, "Ali Baba", downtown),
+        ] {
+            let poi = PoiRecord {
+                name: name.to_string(),
+                category: "amenity:cafe".to_string(),
+                address: None,
+                geometry: point_geometry(-79.4, 43.6),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+            };
+            writer.write(&poi.into(), context).expect("POI");
+        }
+        writer.finish().expect("finish");
+        let reader = PackReader::open(&temp_dir).expect("reader");
+        let riverdale = reader
+            .find_by_source_id("osm:node:13")
+            .expect("lookup")
+            .expect("Riverdale Farm");
+        assert_eq!(
+            reader.record_summary(riverdale).expect("summary").label,
+            "Riverdale Farm, Toronto",
+            "labelled with its district where no locality covers it"
+        );
+
+        let sample = |seed| {
+            sample_poi_fixture(PoiFixtureOptions {
+                pack: temp_dir.clone(),
+                count: 10,
+                seed,
+            })
+            .expect("sample")
+        };
+        let fixture = sample(7);
+        let mut queries = fixture
+            .search
+            .iter()
+            .map(|case| (case.query.as_str(), case.expect.expect("expect").osm_id))
+            .collect::<Vec<_>>();
+        queries.sort();
+        assert_eq!(
+            queries,
+            vec![
+                ("Ali Baba, North York", 15),
+                ("Riverdale Farm, Toronto", 13),
+                ("Tim Hortons, Hamilton", 12)
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&sample(7).search).expect("json"),
+            serde_json::to_value(&fixture.search).expect("json"),
+            "the same seed draws the same cases"
+        );
+
+        // One case expects an object the query cannot find.
+        let mut fixture = fixture;
+        fixture.search.push(TextQueryFixture {
+            name: None,
+            query: "Riverdale Farm, Toronto".to_string(),
+            limit: Some(5),
+            layer: None,
+            expect: Some(ExpectedObject {
+                osm_type: OsmObjectType::Way,
+                osm_id: 13,
+            }),
+        });
+        let fixture_path = temp_dir.join("poi.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&fixture).expect("fixture json"),
+        )
+        .expect("write fixture");
+        let report = benchmark_pack(PackBenchmarkOptions {
+            pack: temp_dir.clone(),
+            queries: Some(fixture_path),
+            iterations: 1,
+            warmup: 0,
+        })
+        .expect("benchmark");
+        let accuracy = report.queries.search.accuracy.expect("accuracy");
+        assert_eq!(
+            (accuracy.cases, accuracy.hit_at_1, accuracy.hit_at_5),
+            (4, 3, 3)
+        );
+        assert_eq!(report.queries.search.cases[3].expected_rank, None);
+        assert!(report.queries.autocomplete.accuracy.is_none());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn reports_pack_metrics_without_query_fixture() {
