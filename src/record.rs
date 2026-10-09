@@ -232,6 +232,39 @@ pub struct InterpolationRange {
     pub step: u32,
 }
 
+/// A range runs from `start` at the first vertex of its line to `end` at the
+/// last, so a house number and its fraction of the line's length estimate
+/// each other.
+impl InterpolationRange {
+    /// The number in the range nearest to `fraction` of the way along it.
+    pub fn number_at(&self, fraction: f64) -> u32 {
+        let fraction = fraction.clamp(0.0, 1.0);
+        let span = self.end.saturating_sub(self.start);
+        if span == 0 || self.step == 0 {
+            return self.start;
+        }
+        let steps = (fraction * span as f64 / self.step as f64).round() as u32;
+        (self.start + steps * self.step).min(self.end)
+    }
+
+    /// How far along the range `number` lies, `None` when the range does not
+    /// contain it: outside `start..=end`, or between its steps (an even
+    /// number on an odd range).
+    pub fn fraction_of(&self, number: u32) -> Option<f64> {
+        if !(self.start..=self.end).contains(&number)
+            || (self.step > 0 && (number - self.start) % self.step != 0)
+        {
+            return None;
+        }
+        let span = self.end - self.start;
+        Some(if span == 0 {
+            0.0
+        } else {
+            f64::from(number - self.start) / f64::from(span)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocationPrecision {

@@ -118,6 +118,7 @@ pub struct SearchApiPoint {
 pub enum SearchApiPointPrecision {
     Point,
     Centroid,
+    Estimated,
     RepresentativePoint,
 }
 
@@ -344,6 +345,7 @@ impl From<RecordPoint> for SearchApiPoint {
             precision: match point.precision {
                 RecordPointPrecision::Point => SearchApiPointPrecision::Point,
                 RecordPointPrecision::Centroid => SearchApiPointPrecision::Centroid,
+                RecordPointPrecision::Estimated => SearchApiPointPrecision::Estimated,
                 RecordPointPrecision::RepresentativePoint => {
                     SearchApiPointPrecision::RepresentativePoint
                 }

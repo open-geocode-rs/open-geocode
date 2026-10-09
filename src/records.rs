@@ -118,6 +118,8 @@ pub struct RecordPoint {
 pub enum RecordPointPrecision {
     Point,
     Centroid,
+    /// A house number placed along an interpolation range.
+    Estimated,
     RepresentativePoint,
 }
 
