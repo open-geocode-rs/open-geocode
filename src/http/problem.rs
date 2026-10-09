@@ -151,6 +151,10 @@ impl Problem {
     pub(crate) fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
     }
+
+    pub(crate) fn is_internal(&self) -> bool {
+        self.0.status == StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+    }
 }
 
 impl IntoResponse for Problem {
