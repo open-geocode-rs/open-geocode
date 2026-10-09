@@ -130,9 +130,23 @@ impl PackTextSearcher {
             return Ok(None);
         }
 
+        // Only the first accepted hit is returned, so `limit` just sizes the
+        // window the context check looks through. Cutting to it first would drop
+        // a correct hit ranked behind the same street in another town. The
+        // window stops at MAX_RANK_WINDOW, so a correct hit behind that many
+        // better-ranked rejects is still missed. Because the widened window can
+        // accept a lower-ranked hit, an earlier query variant now wins over a
+        // later rewrite more often than when only `limit` hits were checked.
+        let (region, locality, postcode) = desired_address_context(&options);
+        let window = if region.is_some() || locality.is_some() || postcode.is_some() {
+            limit.max(MAX_RANK_WINDOW)
+        } else {
+            limit
+        };
+
         for candidate in address_geocode_candidates(address, options.postcode.as_deref()) {
             let (query, hits) =
-                self.search_variants(&candidate, options.layer.as_deref(), limit, |hit| {
+                self.search_variants(&candidate, options.layer.as_deref(), window, |hit| {
                     Ok(hit.record.point.is_some()
                         && self.hit_matches_address_context(hit, &options)?)
                 })?;
@@ -245,9 +259,7 @@ impl PackTextSearcher {
         hit: &TextSearchHit,
         options: &AddressGeocodeOptions,
     ) -> Result<bool> {
-        let desired_region = normalized_for_match(options.region.as_deref());
-        let desired_locality = normalized_for_match(options.locality.as_deref());
-        let desired_postcode = normalized_postcode_for_match(options.postcode.as_deref());
+        let (desired_region, desired_locality, desired_postcode) = desired_address_context(options);
         if desired_region.is_none() && desired_locality.is_none() && desired_postcode.is_none() {
             return Ok(true);
         }
@@ -676,6 +688,18 @@ fn normalized_for_match(value: Option<&str>) -> Option<String> {
     normalize_index_text(value?.trim())
 }
 
+/// The region, locality and postcode a hit must match. Blank values count as
+/// absent, so a hit is only checked against context that can reject it.
+fn desired_address_context(
+    options: &AddressGeocodeOptions,
+) -> (Option<String>, Option<String>, Option<String>) {
+    (
+        normalized_for_match(options.region.as_deref()),
+        normalized_for_match(options.locality.as_deref()),
+        normalized_postcode_for_match(options.postcode.as_deref()),
+    )
+}
+
 fn normalized_postcode_for_match(value: Option<&str>) -> Option<String> {
     normalized_for_match(value).map(|value| value.split_whitespace().collect())
 }
@@ -835,6 +859,71 @@ mod tests {
             Some("osm:node:1")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_filters_hits_ranked_beyond_the_requested_limit() {
+        let temp_dir = temp_pack_path("geocode-filter-before-limit");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        // Twelve identical streets without a postcode tie with, and sort ahead
+        // of, the one inside the requested postcode area. Only the postcode
+        // record beside each of them tells them apart.
+        let mut write_street = |id: &str, lon: f64, postcode: &str| {
+            let mut record = address_record(id, "", "10", "King Street", None, None);
+            record.geometry = point_geometry(lon, 43.0);
+            writer.write(&record.into(), None).expect("address");
+            writer
+                .write(
+                    &PostcodeRecord {
+                        postcode: postcode.to_string(),
+                        geometry: point_geometry(lon + 0.001, 43.0),
+                        source: DerivedSourceProvenance::osm_address_records(5),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("postcode");
+        };
+        for id in 1..=12 {
+            write_street(&format!("osm:node:{id}"), -90.0 - id as f64, "M5V 1A1");
+        }
+        write_street("osm:node:99", -76.0, "K7L 1A1");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for limit in [1, 10] {
+            let hit = searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "10 King Street".to_string(),
+                    locality: None,
+                    region: None,
+                    postcode: Some("K7L 1A1".to_string()),
+                    limit,
+                    layer: None,
+                })
+                .expect("geocode")
+                .map(|hit| hit.hit.record.id);
+            assert_eq!(hit.as_deref(), Some("osm:node:99"), "limit {limit}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_treats_blank_context_as_absent() {
+        let options = |postcode: &str| AddressGeocodeOptions {
+            address: "10 King Street".to_string(),
+            locality: Some("  ".to_string()),
+            region: Some(String::new()),
+            postcode: Some(postcode.to_string()),
+            limit: 1,
+            layer: None,
+        };
+        assert_eq!(desired_address_context(&options(" ")), (None, None, None));
+        assert_eq!(
+            desired_address_context(&options("k7l 1a1")).2.as_deref(),
+            Some("k7l1a1")
+        );
     }
 
     #[test]
