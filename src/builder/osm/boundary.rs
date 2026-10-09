@@ -614,7 +614,9 @@ fn admin_level_layer(admin_level: u8) -> Option<PlaceLayer> {
         4 => Some(PlaceLayer::Region),
         6 => Some(PlaceLayer::District),
         8 => Some(PlaceLayer::Locality),
-        10 => Some(PlaceLayer::Neighbourhood),
+        // 9 holds Australia's suburbs and localities (15k boundaries) and city
+        // districts elsewhere: below a city either way.
+        9 | 10 => Some(PlaceLayer::Neighbourhood),
         _ => None,
     }
 }
