@@ -258,6 +258,19 @@ impl PackTextSearcher {
             return Ok(false);
         }
 
+        // The address's own town settles the locality where no boundary carries it:
+        // suburbs are not admin_level 8 everywhere, and some countries map none.
+        let desired_locality = match desired_locality {
+            Some(locality) => {
+                let own = self
+                    .pack
+                    .address(hit.record_id)?
+                    .and_then(|record| normalized_for_match(record.address.locality.as_deref()));
+                (own.as_deref() != Some(locality.as_str())).then_some(locality)
+            }
+            None => None,
+        };
+
         let Some(context) = self.pack.boundary_context(hit.record_id)? else {
             return Ok(desired_region.is_none() && desired_locality.is_none());
         };
@@ -804,6 +817,33 @@ mod tests {
             })
             .expect("geocode")
             .map(|hit| hit.hit.record.id)
+    }
+
+    #[test]
+    fn geocode_matches_the_locality_an_address_names_without_boundaries() {
+        let temp_dir = temp_pack_path("geocode-own-locality");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, locality) in [("osm:node:1", "Kew"), ("osm:node:2", "Mirboo North")] {
+            writer
+                .write(
+                    &address_record(id, "", "13", "Peacock Street", Some(locality), None).into(),
+                    None,
+                )
+                .expect("write");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "13 Peacock Street", Some("MIRBOO NORTH"), None).as_deref(),
+            Some("osm:node:2")
+        );
+        assert_eq!(
+            geocode(&searcher, "13 Peacock Street", Some("Toorak"), None),
+            None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]

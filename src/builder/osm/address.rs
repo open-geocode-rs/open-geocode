@@ -61,7 +61,7 @@ pub(crate) fn address_record_from_candidate(
             street,
             place,
             unit: tags.cleaned("addr:unit"),
-            locality: tags.cleaned("addr:city"),
+            locality: address_locality(tags),
             region: tags.cleaned("addr:state"),
             postcode: tags.cleaned("addr:postcode"),
             country: tags.cleaned("addr:country"),
@@ -70,6 +70,20 @@ pub(crate) fn address_record_from_candidate(
         location_precision: candidate.location_precision,
         source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
     })
+}
+
+/// The town an address names. Mappers in Australia and New Zealand, among others,
+/// put it in `addr:suburb` and leave `addr:city` empty.
+fn address_locality(tags: &BTreeMap<String, String>) -> Option<String> {
+    [
+        "addr:city",
+        "addr:suburb",
+        "addr:town",
+        "addr:village",
+        "addr:hamlet",
+    ]
+    .into_iter()
+    .find_map(|key| tags.cleaned(key))
 }
 
 pub(crate) fn collect_clean_tags<'a>(
