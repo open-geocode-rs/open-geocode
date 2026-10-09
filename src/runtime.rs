@@ -217,6 +217,26 @@ fn with_id(problem: Problem, request_id: &Option<String>) -> Problem {
     }
 }
 
+/// A bare 500 for the client, with the cause logged here under the request id: the body must not
+/// carry it (ADR 0017 Decision 31), so the log is the only place it survives.
+fn internal(cause: impl std::fmt::Display, request_id: &Option<String>) -> Problem {
+    eprintln!(
+        "internal error (request {}): {cause:#}",
+        request_id.as_deref().unwrap_or("-")
+    );
+    with_id(Problem::internal(), request_id)
+}
+
+/// A search error as a Problem, logging the cause when it is ours rather than the query's.
+fn search_error(error: anyhow::Error, request_id: &Option<String>) -> Problem {
+    let cause = format!("{error:#}");
+    let problem = classify_search_error(error);
+    if problem.is_internal() {
+        return internal(cause, request_id);
+    }
+    with_id(problem, request_id)
+}
+
 async fn search(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
@@ -242,8 +262,8 @@ async fn search(
     let searcher = Arc::clone(&state.searcher);
     let hits = task::spawn_blocking(move || searcher.search(options))
         .await
-        .map_err(|_| with_id(Problem::internal(), &request_id))?
-        .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+        .map_err(|error| internal(error, &request_id))?
+        .map_err(|error| search_error(error, &request_id))?;
 
     Ok(Json(SearchResponse {
         query,
@@ -279,8 +299,8 @@ async fn autocomplete(
     let searcher = Arc::clone(&state.searcher);
     let hits = task::spawn_blocking(move || searcher.autocomplete(options))
         .await
-        .map_err(|_| with_id(Problem::internal(), &request_id))?
-        .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+        .map_err(|error| internal(error, &request_id))?
+        .map_err(|error| search_error(error, &request_id))?;
 
     Ok(Json(AutocompleteResponse {
         query,
@@ -312,8 +332,8 @@ async fn reverse(
         })
     })
     .await
-    .map_err(|_| with_id(Problem::internal(), &request_id))?
-    .map_err(|_| with_id(Problem::internal(), &request_id))?;
+    .map_err(|error| internal(error, &request_id))?
+    .map_err(|error| internal(error, &request_id))?;
 
     Ok(Json(response))
 }
