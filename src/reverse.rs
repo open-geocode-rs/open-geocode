@@ -83,6 +83,8 @@ pub struct ReverseContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub street: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postcode: Option<String>,
@@ -210,7 +212,7 @@ impl PackReverseGeocoder {
             };
             let number = estimated_number(&interpolation.interpolation, candidate.fraction);
             self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
-            apply_interpolation_context(context, &interpolation.address);
+            apply_interpolation_context(context, &interpolation.address,number);
             self.enrich_context(options, context, context_record_ids)?;
             let primary = estimated_primary_label(number, &interpolation.address)
                 .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
@@ -371,11 +373,13 @@ fn apply_address_context(context: &mut ReverseContext, address: &AddressComponen
     set_option_if_missing(&mut context.locality, address.locality.clone());
     set_option_if_missing(&mut context.region, address.region.clone());
     set_option_if_missing(&mut context.country, address.country.clone());
+    set_option_if_missing(&mut context.number, Some(address.number.clone()));
 }
 
 fn apply_interpolation_context(
     context: &mut ReverseContext,
     address: &InterpolationAddressComponents,
+    number: u32
 ) {
     set_option_if_missing(&mut context.street, address.street.clone());
     set_option_if_missing(&mut context.place, address.place.clone());
@@ -383,6 +387,7 @@ fn apply_interpolation_context(
     set_option_if_missing(&mut context.locality, address.locality.clone());
     set_option_if_missing(&mut context.region, address.region.clone());
     set_option_if_missing(&mut context.country, address.country.clone());
+    set_option_if_missing(&mut context.number, Some(number.to_string()));
 }
 
 fn apply_context_record(context: &mut ReverseContext, record: &ContextRecord) -> bool {
