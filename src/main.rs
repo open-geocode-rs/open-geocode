@@ -7,7 +7,7 @@ use serde_json::Value;
 use open_geocode::{
     batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
     bench::{PackBenchmarkOptions, benchmark_pack},
-    builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
+    builder::{AddressFile, BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
@@ -46,6 +46,13 @@ enum Commands {
         /// Directory for scratch files. Defaults to inside the Pack directory.
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
+
+        /// OpenAddresses-format CSV of extra addresses (LON, LAT, NUMBER,
+        /// STREET required; UNIT, CITY, REGION, POSTCODE optional), as
+        /// `dataset=path` or `path` (the file stem names the dataset). Records
+        /// get the id `dataset:row`. Repeat for several files.
+        #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
+        addresses: Vec<AddressFile>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -256,6 +263,7 @@ async fn main() -> Result<()> {
             pack,
             memory_budget_mb,
             scratch_dir,
+            addresses,
         } => {
             let report = build_osm_pack(BuildOsmOptions {
                 input,
@@ -263,6 +271,7 @@ async fn main() -> Result<()> {
                 memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
+                addresses,
             })?;
             write_json(serde_json::json!({
                 "records": report.output.record_count,

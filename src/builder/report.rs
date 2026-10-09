@@ -7,7 +7,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 13;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -63,10 +63,12 @@ impl BuilderReport {
         self.scanned.dense_nodes += scanned.dense_nodes;
         self.scanned.ways += scanned.ways;
         self.scanned.relations += scanned.relations;
+        self.scanned.address_rows += scanned.address_rows;
 
         self.accepted.total += accepted.total;
         merge_counts(&mut self.accepted.by_layer, accepted.by_layer);
         self.accepted.node_addresses += accepted.node_addresses;
+        self.accepted.imported_addresses += accepted.imported_addresses;
         self.accepted.way_centroid_addresses += accepted.way_centroid_addresses;
         self.accepted.interpolation_ranges += accepted.interpolation_ranges;
         self.accepted.street_segments += accepted.street_segments;
@@ -200,6 +202,8 @@ pub struct ScannedCounts {
     pub dense_nodes: u64,
     pub ways: u64,
     pub relations: u64,
+    /// Rows read from imported address files.
+    pub address_rows: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -207,6 +211,8 @@ pub struct AcceptedCounts {
     pub total: u64,
     pub by_layer: BTreeMap<String, u64>,
     pub node_addresses: u64,
+    /// Rows of imported address files; `node_addresses` counts OSM nodes only.
+    pub imported_addresses: u64,
     pub way_centroid_addresses: u64,
     pub interpolation_ranges: u64,
     pub street_segments: u64,
@@ -379,6 +385,8 @@ pub struct PhaseTimings {
     pub node_join_ms: u128,
     /// Assemble way geometry into records.
     pub feature_emission_ms: u128,
+    /// Read imported address files into records.
+    pub address_import_ms: u128,
     /// Build admin boundary polygons.
     pub boundary_build_ms: u128,
     /// Write places, postcodes and boundaries.
@@ -394,6 +402,12 @@ pub struct PhaseTimings {
 pub(crate) enum CandidateIssue {
     MissingHouseNumber,
     MissingStreetOrPlace,
+    /// An imported address row whose longitude or latitude is missing, not a
+    /// number, or outside the valid range.
+    InvalidCoordinates,
+    /// An imported address row with a line break inside a field, usually from a stray quote, which
+    /// swallows the rows after it.
+    MalformedRow,
     UnsupportedRelation,
     WayWithoutResolvedNodes,
     InterpolationUnsupportedValue,
@@ -419,6 +433,8 @@ impl CandidateIssue {
         match self {
             Self::MissingHouseNumber => "missing_housenumber",
             Self::MissingStreetOrPlace => "missing_street_or_place",
+            Self::InvalidCoordinates => "invalid_coordinates",
+            Self::MalformedRow => "malformed_row",
             Self::UnsupportedRelation => "unsupported_relation",
             Self::WayWithoutResolvedNodes => "way_without_resolved_nodes",
             Self::InterpolationUnsupportedValue => "interpolation_unsupported_value",
@@ -444,7 +460,10 @@ impl CandidateIssue {
 
     const fn disposition(self) -> CandidateDisposition {
         match self {
-            Self::MissingHouseNumber | Self::MissingStreetOrPlace => CandidateDisposition::Invalid,
+            Self::MissingHouseNumber
+            | Self::MissingStreetOrPlace
+            | Self::InvalidCoordinates
+            | Self::MalformedRow => CandidateDisposition::Invalid,
             Self::UnsupportedRelation
             | Self::InterpolationUnsupportedValue
             | Self::InterpolationUnsupportedObject => CandidateDisposition::Unsupported,
@@ -491,6 +510,9 @@ impl BuilderReport {
     ) {
         self.accept_layer("address");
         match address.location_precision() {
+            _ if address.source.object_type == OsmObjectType::Row => {
+                self.accepted.imported_addresses += 1;
+            }
             LocationPrecision::Point => self.accepted.node_addresses += 1,
             LocationPrecision::Centroid => self.accepted.way_centroid_addresses += 1,
         };
@@ -656,7 +678,7 @@ impl BuilderReport {
             layer: "address".to_string(),
             id: address.id(),
             label: address.label(),
-            source_id: source_id(address.source.object_type, address.source.object_id),
+            source_id: address.id(),
             object_type: address.source.object_type,
             object_id: address.source.object_id,
             missing_fields,
@@ -726,9 +748,10 @@ impl BuilderReport {
             CandidateIssue::MissingHouseNumber => &mut self.validation.missing_housenumber,
             CandidateIssue::MissingStreetOrPlace => &mut self.validation.missing_street_or_place,
             CandidateIssue::UnsupportedRelation => &mut self.validation.unsupported_relation,
-            CandidateIssue::WayWithoutResolvedNodes | CandidateIssue::StreetUnresolvedGeometry => {
-                &mut self.validation.unresolved_geometry
-            }
+            CandidateIssue::WayWithoutResolvedNodes
+            | CandidateIssue::StreetUnresolvedGeometry
+            | CandidateIssue::InvalidCoordinates
+            | CandidateIssue::MalformedRow => &mut self.validation.unresolved_geometry,
             CandidateIssue::InterpolationUnsupportedValue
             | CandidateIssue::InterpolationUnsupportedObject
             | CandidateIssue::InterpolationWayWithoutNodes
@@ -902,6 +925,14 @@ fn rejection_triage(issue: CandidateIssue, tags: &BTreeMap<String, String>) -> R
             bucket: "likely_usable_missing_source_data",
             note: "object has a house number but no street/place; could be recoverable only with street inference or better source data",
         },
+        CandidateIssue::InvalidCoordinates => RejectionTriage {
+            bucket: "invalid_source_data",
+            note: "address row has no usable longitude and latitude; it cannot be placed on the map",
+        },
+        CandidateIssue::MalformedRow => RejectionTriage {
+            bucket: "invalid_source_data",
+            note: "address record has a line break inside a field, usually from a stray quote; it and the rows it swallowed are lost",
+        },
         CandidateIssue::UnsupportedRelation | CandidateIssue::InterpolationUnsupportedObject => {
             RejectionTriage {
                 bucket: "needs_parser_support",
@@ -1074,6 +1105,8 @@ fn address_shape(issue: CandidateIssue, addr_tags: &BTreeMap<String, String>) ->
             }
         }
         CandidateIssue::WayWithoutResolvedNodes => "way_without_resolved_nodes",
+        CandidateIssue::InvalidCoordinates => "invalid_coordinates",
+        CandidateIssue::MalformedRow => "malformed_row",
         CandidateIssue::StreetUnresolvedGeometry => "street_unresolved_geometry",
         CandidateIssue::StreetMissingName => "street_missing_name",
         CandidateIssue::StreetRefOnlyName => "street_ref_only_name",
@@ -1154,6 +1187,7 @@ fn object_type_name(object_type: OsmObjectType) -> &'static str {
         OsmObjectType::Node => "node",
         OsmObjectType::Way => "way",
         OsmObjectType::Relation => "relation",
+        OsmObjectType::Row => "row",
     }
 }
 

@@ -258,6 +258,9 @@ pub enum OsmObjectType {
     Node,
     Way,
     Relation,
+    /// A row of an imported address file. The row's dataset is the source's
+    /// `dataset` and `object_id` is its row number.
+    Row,
 }
 
 impl Record {
@@ -356,7 +359,7 @@ impl AddressRecord {
     }
 
     pub fn id(&self) -> String {
-        labels::osm_record_id(self.source.object_type, self.source.object_id)
+        labels::source_record_id(&self.source)
     }
 
     pub fn name(&self) -> String {
@@ -502,6 +505,16 @@ impl SourceProvenance {
             dataset: "osm".to_string(),
             object_type,
             object_id,
+            tags: None,
+        }
+    }
+
+    /// Row `row` of the address file imported as `dataset`.
+    pub fn row(dataset: &str, row: i64) -> Self {
+        Self {
+            dataset: dataset.to_string(),
+            object_type: OsmObjectType::Row,
+            object_id: row,
             tags: None,
         }
     }

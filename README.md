@@ -69,6 +69,21 @@ cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-
 
 The build report (`audit/build-report.json`) records the time of each phase, how much each sorter spilled, and the size of every Pack section.
 
+## Adding address points from CSV
+
+`--addresses [dataset=]path.csv` (repeatable) adds OpenAddresses-format rows, such as G-NAF or LINZ extracts, to the build.
+The header is `LON,LAT,NUMBER,STREET,UNIT,CITY,DISTRICT,REGION,POSTCODE`, matched case-insensitively in any order; `LON`, `LAT`, `NUMBER` and `STREET` are required, and `DISTRICT`, `HASH` and `ID` are ignored.
+
+```
+cargo run --release -- build --input new-zealand.osm.pbf --addresses linz=oa_nz.csv --pack data/nz
+```
+
+- Rows are streamed in batches and go through the same sorters, boundary context, postcode centroids, text index and reverse geocoding as OSM addresses, so the memory budget holds whatever the file size.
+- A record's id is `dataset:row` (`linz:42`): the dataset name, or the file stem without one, and the row's 1-based position among the data rows. Its source reports object type `row`.
+- Rows without a number or street, or with coordinates that are missing, not numeric or out of range, are skipped and counted in the build report (`scanned.address_rows`, `rejected.by_reason`). A record with a line break inside a field, as a stray quote makes it, is rejected as `malformed_row`, and the rows it swallows are lost with it; files should be well-formed CSV.
+- Rows are not deduplicated against OSM addresses or each other.
+- Packs without imported rows are unchanged and older Packs still open. A Pack with imported rows stores its record sections as version 5, so an older binary refuses it when it opens it.
+
 ## Rebuilding packs safely
 
 Rebuilding the same `--pack` path writes a separate version under `generations/` and updates `CURRENT` only after the new version finishes and passes validation.

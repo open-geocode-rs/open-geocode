@@ -701,7 +701,7 @@ fn source_type_rank(object_type: OsmObjectType) -> u8 {
     match object_type {
         OsmObjectType::Relation => 0,
         OsmObjectType::Way => 1,
-        OsmObjectType::Node => 2,
+        OsmObjectType::Node | OsmObjectType::Row => 2,
     }
 }
 

@@ -714,6 +714,7 @@ fn object_type_name(object_type: OsmObjectType) -> String {
         OsmObjectType::Node => "node",
         OsmObjectType::Way => "way",
         OsmObjectType::Relation => "relation",
+        OsmObjectType::Row => "row",
     }
     .to_string()
 }
