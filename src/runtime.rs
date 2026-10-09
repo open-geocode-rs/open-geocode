@@ -28,7 +28,10 @@ use crate::{
     pack::{PackReader, RecordPoint, RecordPointPrecision, RecordSource},
     record::OsmObjectType,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseGeocodeResponse},
-    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+    search::{
+        AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchHit,
+        TextSearchOptions,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -74,6 +77,17 @@ struct SearchParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct GeocodeParams {
+    address: Option<String>,
+    locality: Option<String>,
+    region: Option<String>,
+    postcode: Option<String>,
+    #[serde(default)]
+    limit: usize,
+    layer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ReverseParams {
     lon: f64,
     lat: f64,
@@ -83,6 +97,14 @@ struct ReverseParams {
 pub struct SearchResponse {
     pub query: String,
     pub results: Vec<SearchApiResult>,
+}
+
+/// The one best match for a structured address, or `null` when nothing in the
+/// Pack fits its locality, region and postcode. `query` is the rewrite that matched.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct GeocodeResponse {
+    pub query: String,
+    pub result: Option<SearchApiResult>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -164,6 +186,7 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     let mut app: Router<AppState> = Router::new()
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
+        .route("/geocode", get_only(geocode))
         .route("/reverse", get_only(reverse))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz));
@@ -248,6 +271,67 @@ async fn search(
     Ok(Json(SearchResponse {
         query,
         results: hits.into_iter().map(SearchApiResult::from_hit).collect(),
+    }))
+}
+
+/// `/geocode`: the structured-address lookup `batch-geocode` runs per row. The
+/// street address is searched on its own and hits are kept only when they fit the
+/// given locality, region and postcode, so a town in the query cannot outrank the
+/// street.
+async fn geocode(
+    State(state): State<AppState>,
+    request_id: Option<Extension<RequestId>>,
+    params: Result<Query<GeocodeParams>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<GeocodeResponse>, Problem> {
+    let request_id = request_id.map(|Extension(RequestId(id))| id);
+    let Query(params) = params.map_err(|_| {
+        with_id(
+            Problem::malformed_parameter("could not parse query parameters"),
+            &request_id,
+        )
+    })?;
+
+    let address = bounds::validate_query_length(params.address.as_deref().unwrap_or_default())
+        .map_err(|problem| with_id(problem, &request_id))?;
+    if address.is_empty() {
+        return Err(with_id(
+            Problem::invalid_query("address must not be empty"),
+            &request_id,
+        ));
+    }
+    let context = |value: Option<String>| -> Result<Option<String>, Problem> {
+        let value = bounds::validate_query_length(value.as_deref().unwrap_or_default())
+            .map_err(|problem| with_id(problem, &request_id))?;
+        Ok(Some(value).filter(|value| !value.is_empty()))
+    };
+    let locality = context(params.locality)?;
+    let region = context(params.region)?;
+    let postcode = context(params.postcode)?;
+    bounds::validate_search_limit(params.limit).map_err(|problem| with_id(problem, &request_id))?;
+
+    let options = AddressGeocodeOptions {
+        address: address.clone(),
+        locality,
+        region,
+        postcode,
+        limit: params.limit,
+        layer: params.layer,
+    };
+    let searcher = Arc::clone(&state.searcher);
+    let hit = task::spawn_blocking(move || searcher.geocode_address(options))
+        .await
+        .map_err(|_| with_id(Problem::internal(), &request_id))?
+        .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+
+    Ok(Json(match hit {
+        Some(hit) => GeocodeResponse {
+            query: hit.query,
+            result: Some(SearchApiResult::from_hit(hit.hit)),
+        },
+        None => GeocodeResponse {
+            query: address,
+            result: None,
+        },
     }))
 }
 
@@ -618,6 +702,44 @@ mod router_tests {
         let reply = send(router, request("GET", "/search?q=King%20Street&limit=5")).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.content_type(), "application/json");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_keeps_hits_in_the_given_postcode() {
+        let pack = temp_path("geocode");
+        write_pack(&pack);
+        let demo = temp_path("geocode-demo");
+        let no_basemap = temp_path("geocode-no-basemap");
+        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        assert_eq!(body["result"]["layer"], "address");
+        assert_eq!(body["result"]["point"]["lon"], -79.0);
+
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=V6B%201A1",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(reply.json()["result"].is_null());
+
+        let reply = send(router, request("GET", "/geocode?locality=Toronto")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(&pack);
     }
