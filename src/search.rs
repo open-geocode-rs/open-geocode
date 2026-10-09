@@ -58,12 +58,31 @@ pub struct AddressGeocodeOptions {
     pub postcode: Option<String>,
     pub limit: usize,
     pub layer: Option<String>,
+    /// When no house matches, answer with the street of that name in the
+    /// requested locality or postcode. Off by default: the result is a point
+    /// on the street, not the house.
+    pub street_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AddressGeocodeHit {
     pub query: String,
+    /// The layer of the hit. `address` and `interpolation` hits are at the
+    /// house, a `street` hit is only a point on the street.
+    pub match_level: Layer,
     pub hit: TextSearchHit,
+}
+
+impl AddressGeocodeHit {
+    fn new(query: String, hit: TextSearchHit) -> Result<Self> {
+        let match_level = Layer::parse(&hit.record.layer)
+            .with_context(|| format!("unknown record layer {:?}", hit.record.layer))?;
+        Ok(Self {
+            query,
+            match_level,
+            hit,
+        })
+    }
 }
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -78,6 +97,10 @@ const POSTCODE_AREA_CHARS: usize = 3;
 /// Hits examined per requested hit, so ties at the cutoff can be ordered.
 const RANK_WINDOW_FACTOR: usize = 3;
 const MAX_RANK_WINDOW: usize = 256;
+/// Streets examined by the fallback. OSM stores one street record per way and
+/// street records carry no locality text, so the area can only be checked after
+/// the search. A name with more namesakes than this is not resolved.
+const STREET_FALLBACK_LIMIT: usize = 1_000;
 
 impl PackTextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
@@ -134,14 +157,56 @@ impl PackTextSearcher {
             let (query, hits) =
                 self.search_variants(&candidate, options.layer.as_deref(), limit, |hit| {
                     Ok(hit.record.point.is_some()
-                        && self.hit_matches_address_context(hit, &options)?)
+                        && self.hit_matches_address_context(hit, &options, false)?)
                 })?;
             if let Some(hit) = hits.into_iter().next() {
-                return Ok(Some(AddressGeocodeHit { query, hit }));
+                return AddressGeocodeHit::new(query, hit).map(Some);
             }
         }
 
-        Ok(None)
+        self.geocode_street(address, &options)
+    }
+
+    /// The house is not in the data, but its street may be: a point on the
+    /// street in the requested area beats no answer. Only a locality or a
+    /// postcode can pick the right street among namesakes, so a region alone,
+    /// or a caller-chosen layer, gets no fallback. Without a locality the
+    /// postcode must be confirmed by postcode data near the street.
+    fn geocode_street(
+        &self,
+        address: &str,
+        options: &AddressGeocodeOptions,
+    ) -> Result<Option<AddressGeocodeHit>> {
+        let has_locality = normalized_for_match(options.locality.as_deref()).is_some();
+        let has_postcode = normalized_postcode_for_match(options.postcode.as_deref()).is_some();
+        if !options.street_fallback || options.layer.is_some() || !(has_locality || has_postcode) {
+            return Ok(None);
+        }
+        let Some(street) = street_fallback_query(address) else {
+            return Ok(None);
+        };
+
+        // Hits are ranked best first, so the first one in the area is the answer.
+        let mut found = false;
+        let (query, hits) = self.search_variants(
+            &street,
+            Some(Layer::Street.as_str()),
+            STREET_FALLBACK_LIMIT,
+            |hit| {
+                if found
+                    || hit.record.point.is_none()
+                    || !is_street_name(&hit.record.label, &street)
+                {
+                    return Ok(false);
+                }
+                found = self.hit_matches_address_context(hit, options, !has_locality)?;
+                Ok(found)
+            },
+        )?;
+        hits.into_iter()
+            .next()
+            .map(|hit| AddressGeocodeHit::new(query, hit))
+            .transpose()
     }
 
     pub fn autocomplete(&self, options: TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
@@ -244,6 +309,7 @@ impl PackTextSearcher {
         &self,
         hit: &TextSearchHit,
         options: &AddressGeocodeOptions,
+        strict_postcode: bool,
     ) -> Result<bool> {
         let desired_region = normalized_for_match(options.region.as_deref());
         let desired_locality = normalized_for_match(options.locality.as_deref());
@@ -253,7 +319,7 @@ impl PackTextSearcher {
         }
 
         if let Some(desired) = &desired_postcode
-            && !self.hit_in_postcode(hit, desired)?
+            && !self.hit_in_postcode(hit, desired, strict_postcode)?
         {
             return Ok(false);
         }
@@ -315,8 +381,9 @@ impl PackTextSearcher {
     /// of the other, so "M5V" matches "M5V 1A1". A hit without one is judged by
     /// the postcode areas around it: if there are some nearby and none shares
     /// the requested postcode's leading characters, the hit is somewhere else.
-    /// With no postcode data nearby there is nothing to contradict the row.
-    fn hit_in_postcode(&self, hit: &TextSearchHit, desired: &str) -> Result<bool> {
+    /// With no postcode data nearby there is nothing to contradict the row, so
+    /// it passes, unless `strict` asks for the postcode to be confirmed.
+    fn hit_in_postcode(&self, hit: &TextSearchHit, desired: &str, strict: bool) -> Result<bool> {
         if let Some(postcode) = self.pack.records().postcode(hit.record_id)? {
             return Ok(
                 normalized_postcode_for_match(Some(&postcode)).is_none_or(|postcode| {
@@ -325,7 +392,7 @@ impl PackTextSearcher {
             );
         }
         let Some(point) = hit.record.point else {
-            return Ok(true);
+            return Ok(!strict);
         };
         let area: String = desired.chars().take(POSTCODE_AREA_CHARS).collect();
         let in_area = self.spatial.any_context_point(
@@ -345,7 +412,7 @@ impl PackTextSearcher {
             },
         )?;
         // No postcode data nearby means nothing contradicts the row.
-        Ok(in_area.unwrap_or(true))
+        Ok(in_area.unwrap_or(!strict))
     }
 
     fn search_fields(&self) -> Vec<tantivy::schema::Field> {
@@ -538,6 +605,32 @@ fn address_geocode_candidates(address: &str, postcode: Option<&str>) -> Vec<Stri
     unique_strings(candidates)
 }
 
+/// The street name of an address: unit terms and the house number are
+/// dropped, with whatever precedes them ("Level 3, 100 George St"), but an
+/// ordinal street name such as "8th Street" is kept. A numeric street name
+/// ("12 10 Mile Road") loses its number and so matches nothing.
+fn street_fallback_query(address: &str) -> Option<String> {
+    let expanded = expand_address_abbreviations(&normalize_index_text(address)?);
+    let stripped = strip_unit_terms(&expanded)?;
+    let tokens = stripped.split_whitespace().collect::<Vec<_>>();
+    let first_number = tokens
+        .iter()
+        .position(|token| is_house_number_token(token))?;
+    let street = tokens[first_number..]
+        .iter()
+        .skip_while(|token| is_house_number_token(token))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!street.is_empty()).then_some(street)
+}
+
+/// Whether a street label is exactly the street asked for: "Main Street East"
+/// is another road than "Main Street".
+fn is_street_name(label: &str, street: &str) -> bool {
+    normalize_index_text(label).is_some_and(|label| expand_address_abbreviations(&label) == street)
+}
+
 fn meaningful_address_query(address: &str) -> Option<String> {
     let normalized = normalize_index_text(address)?;
     let expanded = expand_address_abbreviations(&normalized);
@@ -714,6 +807,14 @@ fn is_address_number_token(token: &str) -> bool {
         .is_some_and(|character| character.is_ascii_digit())
 }
 
+/// A house number or unit number, not an ordinal such as "8th".
+fn is_house_number_token(token: &str) -> bool {
+    is_address_number_token(token)
+        && !["st", "nd", "rd", "th"]
+            .iter()
+            .any(|suffix| token.ends_with(suffix))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -801,9 +902,62 @@ mod tests {
                 postcode: postcode.map(str::to_string),
                 limit: 10,
                 layer: None,
+                street_fallback: false,
             })
             .expect("geocode")
             .map(|hit| hit.hit.record.id)
+    }
+
+    /// The id and match level of the answer with the street fallback on.
+    fn geocode_with_street_fallback(
+        searcher: &PackTextSearcher,
+        address: &str,
+        locality: Option<&str>,
+        region: Option<&str>,
+        postcode: Option<&str>,
+    ) -> Option<(String, Layer)> {
+        searcher
+            .geocode_address(AddressGeocodeOptions {
+                address: address.to_string(),
+                locality: locality.map(str::to_string),
+                region: region.map(str::to_string),
+                postcode: postcode.map(str::to_string),
+                limit: 10,
+                layer: None,
+                street_fallback: true,
+            })
+            .expect("geocode")
+            .map(|hit| (hit.hit.record.id, hit.match_level))
+    }
+
+    /// Writes a locality place and returns its record id.
+    fn write_locality(writer: &mut PackWriter, name: &str, object_id: i64) -> RecordId {
+        use crate::record::{PlaceLayer, PlaceRecord, Record};
+
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Locality,
+                    PlaceRecord {
+                        name: name.to_string(),
+                        place_type: "city".to_string(),
+                        geometry: point_geometry(-79.0, 43.0),
+                        source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                    },
+                ),
+                None,
+            )
+            .expect("locality")
+    }
+
+    fn in_locality(record_id: RecordId) -> Option<crate::pack::RecordContext> {
+        Some(crate::pack::RecordContext {
+            admin_context: crate::context::AdminContextTuple {
+                locality_record_id: Some(record_id),
+                ..crate::context::AdminContextTuple::default()
+            },
+            flags: 0,
+        })
     }
 
     #[test]
@@ -980,6 +1134,150 @@ mod tests {
             geocode(&searcher, "10 King St W", Some("Toronto"), None).as_deref(),
             Some("osm:node:2")
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn street_fallback_query_drops_house_numbers_but_keeps_ordinal_names() {
+        let query = |address| street_fallback_query(address);
+        assert_eq!(query("15 Eruera St").as_deref(), Some("eruera street"));
+        assert_eq!(
+            query("Unit 3, 15-17 Eruera Street").as_deref(),
+            Some("eruera street")
+        );
+        assert_eq!(query("12 8th Street").as_deref(), Some("8th street"));
+        assert_eq!(
+            query("Level 3, 100 George St").as_deref(),
+            Some("george street")
+        );
+        assert_eq!(
+            query("Shop 2, 15 Eruera Rd").as_deref(),
+            Some("eruera road")
+        );
+        assert_eq!(query("Lot 5 Eruera Road").as_deref(), Some("eruera road"));
+        assert_eq!(query("15"), None);
+        assert_eq!(query("Eruera Street"), None);
+    }
+
+    #[test]
+    fn geocode_falls_back_to_the_street_in_the_requested_locality() {
+        let temp_dir = temp_pack_path("geocode-street-fallback");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let rotorua = write_locality(&mut writer, "Rotorua", 100);
+        let taupo = write_locality(&mut writer, "Taupo", 101);
+        // The namesake in Taupo is listed first, so it is the better tie-break.
+        for (id, name, locality) in [
+            ("osm:way:1", "Eruera Street", taupo),
+            ("osm:way:2", "Eruera Street", rotorua),
+            ("osm:way:3", "Eruera Street East", rotorua),
+            ("osm:way:4", "Main Street East", rotorua),
+        ] {
+            writer
+                .write(&street_record(id, name).into(), in_locality(locality))
+                .expect("street");
+        }
+        writer
+            .write(
+                &address_record("osm:node:5", "", "14", "Eruera Street", None, None).into(),
+                in_locality(rotorua),
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let level = |address: &str, locality: Option<&str>| {
+            geocode_with_street_fallback(&searcher, address, locality, None, None)
+        };
+
+        assert_eq!(
+            level("15 Eruera Street", Some("Rotorua")),
+            Some(("osm:way:2".to_string(), Layer::Street))
+        );
+        assert_eq!(
+            level("14 Eruera Street", Some("Rotorua")),
+            Some(("osm:node:5".to_string(), Layer::Address))
+        );
+        // No street of that name in the locality.
+        assert_eq!(level("15 Eruera Street", Some("Hamilton")), None);
+        // Nothing says which of the namesake streets is meant.
+        assert_eq!(level("15 Eruera Street", None), None);
+        // "Main Street East" is another road than "Main Street".
+        assert_eq!(level("15 Main Street", Some("Rotorua")), None);
+        // The fallback is opt-in.
+        assert_eq!(
+            geocode(&searcher, "15 Eruera Street", Some("Rotorua"), None),
+            None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_street_fallback_finds_the_street_among_many_namesakes() {
+        let temp_dir = temp_pack_path("geocode-street-namesakes");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let elsewhere = write_locality(&mut writer, "Elsewhere", 100);
+        let rotorua = write_locality(&mut writer, "Rotorua", 101);
+        // The namesakes outside Rotorua all rank ahead of the one inside it.
+        let way_ids = (1..STREET_FALLBACK_LIMIT as i64).map(|id| (id, elsewhere));
+        for (id, locality) in way_ids.chain([(STREET_FALLBACK_LIMIT as i64, rotorua)]) {
+            writer
+                .write(
+                    &street_record(&format!("osm:way:{id}"), "Main Street").into(),
+                    in_locality(locality),
+                )
+                .expect("street");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode_with_street_fallback(&searcher, "15 Main Street", Some("Rotorua"), None, None),
+            Some((format!("osm:way:{STREET_FALLBACK_LIMIT}"), Layer::Street))
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_street_fallback_needs_a_locality_or_a_confirmed_postcode() {
+        let temp_dir = temp_pack_path("geocode-street-postcode");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut street = street_record("osm:way:1", "Gould Street");
+        street.geometry = point_geometry(-76.88, 45.63);
+        street.representative_point = [-76.88, 45.63];
+        writer.write(&street.into(), None).expect("street");
+        // Far from any postcode record.
+        let mut remote = street_record("osm:way:2", "Remote Road");
+        remote.geometry = point_geometry(-60.0, 50.0);
+        remote.representative_point = [-60.0, 50.0];
+        writer.write(&remote.into(), None).expect("remote street");
+        writer
+            .write(
+                &PostcodeRecord {
+                    postcode: "K0J 1K0".to_string(),
+                    geometry: point_geometry(-76.881, 45.631),
+                    source: DerivedSourceProvenance::osm_address_records(5),
+                }
+                .into(),
+                None,
+            )
+            .expect("postcode");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let street_in = |address: &str, region: Option<&str>, postcode: Option<&str>| {
+            geocode_with_street_fallback(&searcher, address, None, region, postcode)
+        };
+
+        assert_eq!(street_in("44 Gould Street", None, Some("M5V 1A1")), None);
+        assert_eq!(
+            street_in("44 Gould Street", None, Some("K0J 1K0")),
+            Some(("osm:way:1".to_string(), Layer::Street))
+        );
+        // A region alone does not say which namesake is meant.
+        assert_eq!(street_in("44 Gould Street", Some("Ontario"), None), None);
+        // No postcode data near the street: the postcode is not confirmed.
+        assert_eq!(street_in("44 Remote Road", None, Some("K0J 1K0")), None);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
