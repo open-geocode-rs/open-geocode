@@ -4,8 +4,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::{
+    labels,
     pack::{ContextRecord, PackReader, RecordId},
-    record::{AddressComponents, InterpolationAddressComponents, InterpolationRange, Layer},
+    record::{AddressComponents, InterpolationAddressComponents, Layer, PoiRecord, Record},
     spatial_index::SpatialIndexReader,
 };
 
@@ -151,32 +152,33 @@ impl PackReverseGeocoder {
     ) -> Result<Option<ReverseGeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .point_candidates(
-                options.lon,
-                options.lat,
-                Layer::Address,
-                ADDRESS_RADIUS_M,
-                1,
-            )?
+            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
             .into_iter()
             .next()
         else {
             return Ok(None);
         };
-        let Some(address) = self.pack.address(candidate.record_id)? else {
-            return Ok(None);
+        // A POI that carries an address answers as that address.
+        let record = self.pack.records().record(candidate.record_id)?;
+        let address = match &record {
+            Record::Address(record) => &record.address,
+            Record::Poi(PoiRecord {
+                address: Some(address),
+                ..
+            }) => address,
+            _ => return Ok(None),
         };
 
         self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
-        apply_address_context(context, &address.address);
+        apply_address_context(context, address);
         self.enrich_context(options, context, context_record_ids)?;
 
         Ok(Some(ReverseGeocodeResult {
             match_kind: ReverseMatchKind::ExplicitAddress,
-            label: address.label(),
+            label: labels::address_label(address),
             primary_record_id: Some(candidate.record_id),
-            id: Some(address.id()),
-            layer: Some("address".to_string()),
+            id: Some(record.id()),
+            layer: Some(record.layer().as_str().to_string()),
             distance_m: Some(candidate.distance_m),
             point: Some(ReversePoint {
                 lon: candidate.lon,
@@ -208,11 +210,11 @@ impl PackReverseGeocoder {
             let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
                 continue;
             };
-            let number = estimated_number(&interpolation.interpolation, candidate.fraction);
+            let number = interpolation.interpolation.number_at(candidate.fraction);
             self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
             apply_interpolation_context(context, &interpolation.address);
             self.enrich_context(options, context, context_record_ids)?;
-            let primary = estimated_primary_label(number, &interpolation.address)
+            let primary = labels::estimated_address_name(number, &interpolation.address)
                 .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
 
             return Ok(Some(ReverseGeocodeResult {
@@ -398,28 +400,6 @@ fn apply_context_record(context: &mut ReverseContext, record: &ContextRecord) ->
     }
 }
 
-fn estimated_number(range: &InterpolationRange, fraction: f64) -> u32 {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let span = range.end.saturating_sub(range.start);
-    if span == 0 || range.step == 0 {
-        return range.start;
-    }
-    let raw = range.start as f64 + fraction * span as f64;
-    let step_index = ((raw - range.start as f64) / range.step as f64).round() as u32;
-    (range.start + step_index * range.step).min(range.end)
-}
-
-fn estimated_primary_label(
-    number: u32,
-    address: &InterpolationAddressComponents,
-) -> Option<String> {
-    address
-        .street
-        .as_deref()
-        .or(address.place.as_deref())
-        .map(|street_or_place| format!("{number} {street_or_place}"))
-}
-
 fn compose_label(primary: &str, context: &ReverseContext) -> String {
     let mut parts = vec![primary.to_string()];
     for part in [
@@ -499,8 +479,8 @@ mod tests {
         context::AdminContextTuple,
         pack::{PackWriter, RecordContext},
         record::{
-            AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord, Record,
-            SourceProvenance, StreetRecord, point_geometry,
+            AddressRecord, InterpolationRange, LocationPrecision, OsmObjectType, PlaceLayer,
+            PlaceRecord, Record, SourceProvenance, StreetRecord, point_geometry,
         },
     };
 
@@ -627,6 +607,61 @@ mod tests {
             "open-geocode-reverse-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn reverse_answers_with_the_address_of_a_poi_but_not_its_name() {
+        let temp_dir = temp_pack_dir("poi");
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer.write(&street_record().into(), None).expect("street");
+        // An unaddressed POI on top of the query point is not an address.
+        writer
+            .write(
+                &PoiRecord {
+                    name: "Corner Bench Park".to_string(),
+                    category: "leisure:park".to_string(),
+                    address: None,
+                    geometry: point_geometry(-79.0, 43.0),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::osm(OsmObjectType::Node, 40),
+                }
+                .into(),
+                None,
+            )
+            .expect("park");
+        writer
+            .write(
+                &PoiRecord {
+                    name: "Queen Bakery".to_string(),
+                    category: "shop:bakery".to_string(),
+                    address: Some(address_record().address),
+                    geometry: point_geometry(-79.0, 43.00005),
+                    location_precision: LocationPrecision::Centroid,
+                    source: SourceProvenance::osm(OsmObjectType::Way, 41),
+                }
+                .into(),
+                None,
+            )
+            .expect("bakery");
+        writer.finish().expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let result = geocoder
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.0,
+                lat: 43.0,
+            })
+            .expect("reverse")
+            .result
+            .expect("result");
+
+        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.id.as_deref(), Some("osm:way:41"));
+        assert_eq!(result.layer.as_deref(), Some("poi"));
+        assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
+        assert_eq!(result.evidence.explicit_address_record_id, Some(2));
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     fn address_record() -> AddressRecord {

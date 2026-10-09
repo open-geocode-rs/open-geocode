@@ -7,7 +7,7 @@
 //! the ids inside one cell are close together and their deltas are tiny.
 //!
 //! Two indexes share one layout: a fine one (H3 resolution 11) over addresses,
-//! places, postcodes and road segments, and a coarse one (resolution 6) over
+//! POIs, places, postcodes and road segments, and a coarse one (resolution 6) over
 //! context points for wide-radius admin lookups.
 //!
 //! ```text
@@ -449,7 +449,32 @@ impl SpatialIndexReader {
             lat,
             radius_m,
             limit,
-            |candidate| candidate == layer,
+            |_, candidate| Ok(candidate == layer),
+        )?;
+        Ok(closest_candidates(candidates, limit))
+    }
+
+    /// Explicit address points: address records and POIs that carry an
+    /// address.
+    pub fn address_candidates(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.collect_points(
+            &self.fine,
+            H3_FINE_RESOLUTION,
+            lon,
+            lat,
+            radius_m,
+            limit,
+            |record_id, layer| match layer {
+                Layer::Address => Ok(true),
+                Layer::Poi => self.records.is_explicit_address(record_id),
+                _ => Ok(false),
+            },
         )?;
         Ok(closest_candidates(candidates, limit))
     }
@@ -468,7 +493,7 @@ impl SpatialIndexReader {
             lat,
             radius_m,
             limit,
-            Layer::is_context,
+            |_, layer| Ok(layer.is_context()),
         )?;
         Ok(closest_candidates(candidates, limit))
     }
@@ -568,6 +593,36 @@ impl SpatialIndexReader {
         Ok(closest_candidates(candidates, limit))
     }
 
+    /// The point `fraction` of the way along a line record by length, the
+    /// inverse of the `fraction` [`Self::segment_candidates`] reports. `None`
+    /// for point records.
+    pub fn point_along_line(&self, record_id: RecordId, fraction: f64) -> Result<Option<[f64; 2]>> {
+        let Some(line) = self.records.line(record_id)?.map(line_cache) else {
+            return Ok(None);
+        };
+        let total = *line.lengths.last().expect("line has vertices");
+        let target = fraction.clamp(0.0, 1.0) * total;
+        let segment = line
+            .lengths
+            .windows(2)
+            .position(|pair| target <= pair[1])
+            .unwrap_or(line.points.len().saturating_sub(2));
+        let (Some(start), Some(end)) = (line.points.get(segment), line.points.get(segment + 1))
+        else {
+            return Ok(line.points.first().copied());
+        };
+        let length = line.lengths[segment + 1] - line.lengths[segment];
+        let t = if length <= f64::EPSILON {
+            0.0
+        } else {
+            (target - line.lengths[segment]) / length
+        };
+        Ok(Some([
+            start[0] + t * (end[0] - start[0]),
+            start[1] + t * (end[1] - start[1]),
+        ]))
+    }
+
     /// Points within `radius_m`, scanning H3 rings outward from the query
     /// cell. With a `limit`, the scan stops as soon as the `limit` closest hits
     /// are certain: once the disk scanned so far covers a radius beyond the
@@ -583,7 +638,7 @@ impl SpatialIndexReader {
         lat: f64,
         radius_m: f64,
         limit: usize,
-        accepts: impl Fn(Layer) -> bool,
+        accepts: impl Fn(RecordId, Layer) -> Result<bool>,
     ) -> Result<Vec<PointCandidate>> {
         let Ok(lat_lng) = LatLng::new(lat, lon) else {
             return Ok(Vec::new());
@@ -606,11 +661,8 @@ impl SpatialIndexReader {
                 };
                 for record_id in refs.points {
                     let (layer, point_lon, point_lat) = self.records.point(record_id)?;
-                    if !accepts(layer) {
-                        continue;
-                    }
                     let distance_m = haversine_m(lon, lat, point_lon, point_lat);
-                    if distance_m <= radius_m {
+                    if distance_m <= radius_m && accepts(record_id, layer)? {
                         candidates.push(PointCandidate {
                             record_id,
                             layer,

@@ -2,8 +2,8 @@
 
 Fast, lightweight, self-hosted geocoding in pure Rust.
 
-`open-geocode` is a minimal Rust-native geocoding engine: address search,
-Tantivy-backed autocomplete, and reverse geocoding from coordinates to
+`open-geocode` is a minimal Rust-native geocoding engine: address and named
+place search, Tantivy-backed autocomplete, and reverse geocoding from coordinates to
 address-first location context. It turns OpenStreetMap PBF extracts into a
 single compact Pack file holding a memory-mapped record store, a Tantivy text
 index, and an H3-backed spatial index, with no database or search cluster to run.
@@ -30,7 +30,7 @@ be far cheaper to run.
 
 ## Quickstart
 
-Building the Ontario pack (~940 MB PBF) takes under a minute on a 24-core machine and produces a ~300 MB Pack.
+Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machine and produces a ~330 MB Pack.
 
 1. Download an OSM extract, for example Ontario from [Geofabrik](https://download.geofabrik.de/north-america/canada/ontario.html), and save it as `data/ontario.pbf`.
 2. Build the pack:
@@ -58,6 +58,37 @@ Published versions are retained, so repeated builds use additional disk space.
 A Pack is one file, `generations/<id>/pack.ogp`.
 Every command that takes `--pack` accepts either the Pack directory or that file, so you can copy, cache, or upload the file on its own.
 The build audit (`audit/rejections.jsonl` and `audit/build-report.json`) sits next to the file but is not part of the Pack you serve.
+
+## Named places of interest
+
+Named shops, restaurants, schools, offices, parks, stations and other points of interest form the `poi` layer, found by name: `Tim Hortons, Toronto`.
+A node or way is a POI when it has a name and one of `amenity`, `shop`, `tourism`, `leisure`, `office`, `craft`, `healthcare`, `historic`, `aeroway`, `railway=station`, `public_transport=station` or `building`; street furniture such as benches, waste baskets and parking spaces is left out.
+Each result carries its `category`, the tag that made it a POI (`amenity:cafe`).
+
+- A POI that also states a valid address is one record carrying that address, so it is found by its name and by its address, and `layer=address` still returns it.
+- POIs are indexed under the admin areas they lie in, and labelled with their locality when their tags name none: `Tim Hortons, 123 King Street West, Toronto`.
+- Reverse geocoding stays address-first: a POI with an address answers as that address (`layer: "poi"`), one without never answers.
+- Ways use their centroid. Relations, popularity ranking, distance bias and category synonyms are not supported yet.
+
+Ontario has 183,825 POIs, 85,308 of them with an address.
+On a seeded answer key of 500 Ontario POIs whose name is unique in their locality ([`fixtures/queries/ontario-poi.json`](fixtures/queries/ontario-poi.json)), each queried as `<name>, <locality>`:
+
+| | open-geocode | Nominatim |
+| --- | ---: | ---: |
+| hit@1 | 486 (97.2%) | 489 (97.8%) |
+| hit@5 | 499 (99.8%) | 491 (98.2%) |
+
+Two of the 500 objects are not in Nominatim's data at all (its data is newer than the extract) and count as misses for it.
+The key is drawn from open-geocode's own index and locality names, which favours it; treat this as a check that lookup works, not a ranking of the two engines.
+
+To reproduce, sample a key from a Pack and score it with `bench-pack`, which reports hit@1 and hit@5 for every case that names the object it expects:
+
+```
+cargo run --release -- sample-poi-fixture --pack data/pack --count 500 --seed 2026 --output fixtures/queries/ontario-poi.json
+cargo run --release -- bench-pack --pack data/pack --queries fixtures/queries/ontario-poi.json
+```
+
+`scripts/nominatim-poi-baseline.ps1` scores public Nominatim on the same key from its cached responses ([`fixtures/queries/ontario-poi-nominatim.json`](fixtures/queries/ontario-poi-nominatim.json)); it sends requests only for uncached cases, at one per second.
 
 ## Hosted demo
 
@@ -107,6 +138,7 @@ Single binary, no database or cluster: **~4.6× smaller on disk, lower memory us
 | Forward geocoding | Turn customer, store, vendor, or service addresses into coordinates |
 | Reverse geocoding | Convert fleet, delivery, device, or field-work GPS pings into readable locations using H3 candidate lookup and address-first gates |
 | Autocomplete | Power address forms, checkout flows, internal tools, and store locators with Tantivy-native prefix queries |
+| POI lookup | Find named businesses, schools, parks, and stations by name and town |
 | Batch geocoding | Enrich CSVs, database tables, and large address lists without per-row API pricing |
 | Search optimization | Handle messy addresses, abbreviations, partial queries, field-aware matches, interpolation ranges, and ranked candidates |
 | Private data | Geocode internal addresses, custom places, service zones, or proprietary datasets |

@@ -14,7 +14,8 @@ use crate::{
     record::{
         AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, OsmObjectType,
-        PlaceRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord, point_geometry,
+        PlaceRecord, PoiRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord,
+        point_geometry,
     },
     util::codec::{
         get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64, put_i64,
@@ -126,6 +127,7 @@ pub(crate) enum WayKind {
     Street,
     Interpolation,
     Boundary,
+    Poi,
 }
 
 /// A way kept by the scan, without its node list: the node references travel
@@ -145,6 +147,7 @@ impl Spill for WayFeature {
             WayKind::Street => 1,
             WayKind::Interpolation => 2,
             WayKind::Boundary => 3,
+            WayKind::Poi => 4,
         });
         put_i64(out, self.way_id);
         put_u64(out, u64::from(self.node_count));
@@ -158,6 +161,7 @@ impl Spill for WayFeature {
                 1 => WayKind::Street,
                 2 => WayKind::Interpolation,
                 3 => WayKind::Boundary,
+                4 => WayKind::Poi,
                 other => bail!("unknown way feature kind {other}"),
             },
             way_id: get_i64(input)?,
@@ -237,22 +241,11 @@ fn tags_bytes(tags: &BTreeMap<String, String>) -> usize {
 
 fn record_heap_bytes(record: &Record) -> usize {
     let strings = match record {
-        Record::Address(record) => {
-            let address = &record.address;
-            address.number.len()
-                + [
-                    &address.street,
-                    &address.place,
-                    &address.unit,
-                    &address.locality,
-                    &address.region,
-                    &address.postcode,
-                    &address.country,
-                ]
-                .into_iter()
-                .flatten()
-                .map(String::len)
-                .sum::<usize>()
+        Record::Address(record) => address_heap_bytes(&record.address),
+        Record::Poi(record) => {
+            record.name.len()
+                + record.category.len()
+                + record.address.as_ref().map_or(0, address_heap_bytes)
         }
         Record::Interpolation(_) => 96,
         Record::Street(record) => record.name.len(),
@@ -266,6 +259,23 @@ fn record_heap_bytes(record: &Record) -> usize {
     strings + positions + 128
 }
 
+fn address_heap_bytes(address: &AddressComponents) -> usize {
+    address.number.len()
+        + [
+            &address.street,
+            &address.place,
+            &address.unit,
+            &address.locality,
+            &address.region,
+            &address.postcode,
+            &address.country,
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .sum::<usize>()
+}
+
 fn encode_record(out: &mut Vec<u8>, record: &Record) {
     out.push(
         Layer::ALL
@@ -275,23 +285,22 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
     );
     match record {
         Record::Address(record) => {
-            let address = &record.address;
-            put_str(out, &address.number);
-            for value in [
-                &address.street,
-                &address.place,
-                &address.unit,
-                &address.locality,
-                &address.region,
-                &address.postcode,
-                &address.country,
-            ] {
-                put_opt_str(out, value.as_deref());
+            encode_address(out, &record.address);
+            encode_precision(out, record.location_precision);
+            encode_source(out, &record.source);
+            encode_geometry(out, &record.geometry);
+        }
+        Record::Poi(record) => {
+            put_str(out, &record.name);
+            put_str(out, &record.category);
+            match &record.address {
+                Some(address) => {
+                    out.push(1);
+                    encode_address(out, address);
+                }
+                None => out.push(0),
             }
-            out.push(match record.location_precision {
-                LocationPrecision::Point => 0,
-                LocationPrecision::Centroid => 1,
-            });
+            encode_precision(out, record.location_precision);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -342,33 +351,23 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
         .get(usize::from(get_u8(input)?))
         .context("unknown spilled record layer")?;
     Ok(match layer {
-        Layer::Address => {
-            let number = get_string(input)?;
-            let mut fields = [None, None, None, None, None, None, None];
-            for field in &mut fields {
-                *field = get_opt_string(input)?;
-            }
-            let [street, place, unit, locality, region, postcode, country] = fields;
-            let location_precision = match get_u8(input)? {
-                0 => LocationPrecision::Point,
-                _ => LocationPrecision::Centroid,
-            };
-            Record::Address(AddressRecord {
-                address: AddressComponents {
-                    number,
-                    street,
-                    place,
-                    unit,
-                    locality,
-                    region,
-                    postcode,
-                    country,
-                },
-                location_precision,
-                source: decode_source(input)?,
-                geometry: decode_geometry(input)?,
-            })
-        }
+        Layer::Address => Record::Address(AddressRecord {
+            address: decode_address(input)?,
+            location_precision: decode_precision(input)?,
+            source: decode_source(input)?,
+            geometry: decode_geometry(input)?,
+        }),
+        Layer::Poi => Record::Poi(PoiRecord {
+            name: get_string(input)?,
+            category: get_string(input)?,
+            address: match get_u8(input)? {
+                0 => None,
+                _ => Some(decode_address(input)?),
+            },
+            location_precision: decode_precision(input)?,
+            source: decode_source(input)?,
+            geometry: decode_geometry(input)?,
+        }),
         Layer::Interpolation => {
             let mut fields = [None, None, None, None, None, None];
             for field in &mut fields {
@@ -416,6 +415,54 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 geometry: decode_geometry(input)?,
             },
         ),
+    })
+}
+
+fn encode_address(out: &mut Vec<u8>, address: &AddressComponents) {
+    put_str(out, &address.number);
+    for value in [
+        &address.street,
+        &address.place,
+        &address.unit,
+        &address.locality,
+        &address.region,
+        &address.postcode,
+        &address.country,
+    ] {
+        put_opt_str(out, value.as_deref());
+    }
+}
+
+fn decode_address(input: &mut &[u8]) -> Result<AddressComponents> {
+    let number = get_string(input)?;
+    let mut fields = [None, None, None, None, None, None, None];
+    for field in &mut fields {
+        *field = get_opt_string(input)?;
+    }
+    let [street, place, unit, locality, region, postcode, country] = fields;
+    Ok(AddressComponents {
+        number,
+        street,
+        place,
+        unit,
+        locality,
+        region,
+        postcode,
+        country,
+    })
+}
+
+fn encode_precision(out: &mut Vec<u8>, precision: LocationPrecision) {
+    out.push(match precision {
+        LocationPrecision::Point => 0,
+        LocationPrecision::Centroid => 1,
+    });
+}
+
+fn decode_precision(input: &mut &[u8]) -> Result<LocationPrecision> {
+    Ok(match get_u8(input)? {
+        0 => LocationPrecision::Point,
+        _ => LocationPrecision::Centroid,
     })
 }
 
@@ -674,6 +721,31 @@ mod tests {
                     source: SourceProvenance::osm(OsmObjectType::Node, 15),
                 },
             ),
+            Record::Poi(PoiRecord {
+                name: "Tim Hortons".into(),
+                category: "amenity:cafe".into(),
+                address: Some(AddressComponents {
+                    number: "123".into(),
+                    street: Some("King Street West".into()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: Some("M5V 1A1".into()),
+                    country: None,
+                }),
+                geometry: point_geometry(-79.38, 43.65),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(OsmObjectType::Way, 16),
+            }),
+            Record::Poi(PoiRecord {
+                name: "Riverdale Farm".into(),
+                category: "tourism:attraction".into(),
+                address: None,
+                geometry: point_geometry(-79.36, 43.67),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(OsmObjectType::Node, 17),
+            }),
         ];
         for (seq, record) in records.into_iter().enumerate() {
             round_trip(&PendingRecord {

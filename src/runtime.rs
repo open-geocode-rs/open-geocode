@@ -97,6 +97,9 @@ pub struct SearchApiResult {
     pub id: String,
     pub layer: String,
     pub label: String,
+    /// A POI's category, for example `amenity:cafe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<SearchApiPoint>,
@@ -115,6 +118,7 @@ pub struct SearchApiPoint {
 pub enum SearchApiPointPrecision {
     Point,
     Centroid,
+    Estimated,
     RepresentativePoint,
 }
 
@@ -325,6 +329,7 @@ impl SearchApiResult {
             id: hit.record.id,
             layer: hit.record.layer,
             label: hit.record.label,
+            category: hit.record.category,
             score: hit.score,
             point: hit.record.point.map(SearchApiPoint::from),
             source: SearchApiSource::from(hit.record.source),
@@ -340,6 +345,7 @@ impl From<RecordPoint> for SearchApiPoint {
             precision: match point.precision {
                 RecordPointPrecision::Point => SearchApiPointPrecision::Point,
                 RecordPointPrecision::Centroid => SearchApiPointPrecision::Centroid,
+                RecordPointPrecision::Estimated => SearchApiPointPrecision::Estimated,
                 RecordPointPrecision::RepresentativePoint => {
                     SearchApiPointPrecision::RepresentativePoint
                 }
@@ -376,6 +382,7 @@ mod tests {
                 id: "osm:node:1".to_string(),
                 layer: "address".to_string(),
                 label: "10 King Street, Toronto".to_string(),
+                category: None,
                 point: Some(RecordPoint {
                     lon: -79.3832,
                     lat: 43.6532,
@@ -418,6 +425,7 @@ mod tests {
                 id: "osm:way:9".to_string(),
                 layer: "street".to_string(),
                 label: "King Street".to_string(),
+                category: None,
                 point: Some(RecordPoint {
                     lon: -79.41,
                     lat: 43.61,

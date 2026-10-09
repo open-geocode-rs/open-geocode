@@ -13,7 +13,7 @@
 //! ```
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -30,11 +30,12 @@ use crate::{
     container::{Container, ContainerWriter},
     context::{ContextReader, ContextTupleWriter},
     extsort::Scratch,
+    labels,
     memory::MemoryBudget,
-    record::{AddressRecord, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
+    record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
     spatial_index::{RecordCells, SpatialIndexWriter},
-    text_index::TextIndexWriter,
+    text_index::{PostcodeAreas, TextIndexWriter},
 };
 
 pub use crate::{
@@ -115,6 +116,8 @@ pub struct PackWriter {
     text: TextIndexWriter,
     spatial: SpatialIndexWriter,
     layer_counts: BTreeMap<Layer, u64>,
+    context_names: HashMap<RecordId, String>,
+    postcode_areas: PostcodeAreas,
 }
 
 /// A finished, unpublished Pack.
@@ -178,6 +181,8 @@ impl PackWriter {
             destination,
             generation,
             layer_counts: BTreeMap::new(),
+            context_names: HashMap::new(),
+            postcode_areas: PostcodeAreas::default(),
         })
     }
 
@@ -196,6 +201,18 @@ impl PackWriter {
         self.records.record_count()
     }
 
+    /// Names of the records admin contexts point at, so the records written
+    /// after this can be indexed under the areas they lie in.
+    pub fn set_context_names(&mut self, names: HashMap<RecordId, String>) {
+        self.context_names = names;
+    }
+
+    /// Postcode centroids, so the records written after this that state no
+    /// postcode are ranked by the nearest one.
+    pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {
+        self.postcode_areas = areas;
+    }
+
     pub fn write(&mut self, record: &Record, context: Option<RecordContext>) -> Result<RecordId> {
         let first = self.records.record_count();
         self.write_batch(std::slice::from_ref(&(record.clone(), context)))?;
@@ -207,13 +224,20 @@ impl PackWriter {
     pub fn write_batch(&mut self, batch: &[(Record, Option<RecordContext>)]) -> Result<()> {
         let first = self.records.record_count();
         let fields = self.text.fields();
+        let context_names = &self.context_names;
+        let postcode_areas = &self.postcode_areas;
         let prepared = batch
             .par_iter()
             .enumerate()
-            .map(|(offset, (record, _))| {
+            .map(|(offset, (record, context))| {
                 let record_id = first + offset as u64;
+                let names = context
+                    .iter()
+                    .flat_map(|context| context.admin_context.parent_record_ids())
+                    .filter_map(|id| context_names.get(&id).map(String::as_str))
+                    .collect::<Vec<_>>();
                 Ok((
-                    fields.document(record_id, record),
+                    fields.document(record_id, record, &names, postcode_areas),
                     RecordCells::for_record(record_id, record)?,
                 ))
             })
@@ -242,6 +266,7 @@ impl PackWriter {
             text,
             spatial,
             layer_counts,
+            ..
         } = self;
         let path = generation.path.join(PACK_FILE);
         let mut pack = ContainerWriter::create(&path)?;
@@ -422,8 +447,34 @@ impl PackReader {
             .collect()
     }
 
+    /// The summary search and autocomplete return. A POI whose address states
+    /// no locality is labelled with the locality it lies in.
     pub fn record_summary(&self, record_id: RecordId) -> Result<RecordSummary> {
-        self.records.summary(record_id)
+        let mut summary = self.records.summary(record_id)?;
+        if summary.layer == Layer::Poi.as_str()
+            && let Record::Poi(poi) = self.records.record(record_id)?
+            && poi
+                .address
+                .as_ref()
+                .is_none_or(|address| address.locality.is_none())
+            && let Some(locality) = self.locality(record_id)?
+        {
+            summary.label = labels::poi_label(&poi.name, poi.address.as_ref(), Some(&locality));
+        }
+        Ok(summary)
+    }
+
+    /// Name of the locality a record lies in, from its boundary context, or
+    /// of its district where no locality covers it: a single-tier city such as
+    /// Toronto is a district with no locality over its core.
+    pub fn locality(&self, record_id: RecordId) -> Result<Option<String>> {
+        let Some(area_id) = self.boundary_context(record_id)?.and_then(|context| {
+            let tuple = context.admin_context;
+            tuple.locality_record_id.or(tuple.district_record_id)
+        }) else {
+            return Ok(None);
+        };
+        Ok(self.context_record(area_id)?.map(|record| record.name))
     }
 
     pub fn record_json(&self, record_id: RecordId) -> Result<Value> {
@@ -453,13 +504,6 @@ impl PackReader {
             }
         }
         Ok(None)
-    }
-
-    pub fn address(&self, record_id: RecordId) -> Result<Option<AddressRecord>> {
-        Ok(match self.records.record(record_id)? {
-            Record::Address(record) => Some(record),
-            _ => None,
-        })
     }
 
     pub fn interpolation(&self, record_id: RecordId) -> Result<Option<InterpolationRecord>> {
@@ -520,7 +564,8 @@ mod tests {
 
     use crate::{
         record::{
-            AddressComponents, LocationPrecision, OsmObjectType, SourceProvenance, point_geometry,
+            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
+            point_geometry,
         },
         search::{PackTextSearcher, TextSearchOptions},
     };
