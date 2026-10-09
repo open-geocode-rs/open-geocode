@@ -722,6 +722,7 @@ fn precision_name(precision: RecordPointPrecision) -> &'static str {
     match precision {
         RecordPointPrecision::Point => "point",
         RecordPointPrecision::Centroid => "centroid",
+        RecordPointPrecision::Estimated => "estimated",
         RecordPointPrecision::RepresentativePoint => "representative_point",
     }
 }

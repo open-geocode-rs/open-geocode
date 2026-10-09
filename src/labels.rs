@@ -66,6 +66,40 @@ pub fn interpolation_name(components: &InterpolationAddressComponents) -> String
         .to_string()
 }
 
+/// "825 College Street": a house number estimated on an interpolation range.
+pub fn estimated_address_name(
+    number: u32,
+    components: &InterpolationAddressComponents,
+) -> Option<String> {
+    components
+        .street
+        .as_deref()
+        .or(components.place.as_deref())
+        .map(|street_or_place| format!("{number} {street_or_place}"))
+}
+
+/// The label of an estimated address, laid out like an address label.
+pub fn estimated_address_label(
+    number: u32,
+    components: &InterpolationAddressComponents,
+) -> Option<String> {
+    let primary = estimated_address_name(number, components)?;
+    Some(
+        [
+            Some(primary.as_str()),
+            components.locality.as_deref(),
+            components.region.as_deref(),
+            components.postcode.as_deref(),
+            components.country.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", "),
+    )
+}
+
 pub fn interpolation_label(
     name: &str,
     range: &InterpolationRange,
@@ -100,6 +134,12 @@ pub fn derived_postcode_id(postcode: &str) -> String {
 
 pub fn derived_country_id(code: &str) -> String {
     format!("derived:country:{code}")
+}
+
+/// A house number placed between two stated numbers, by the ids of their
+/// records.
+pub fn estimated_address_id(number: u32, low_id: &str, high_id: &str) -> String {
+    format!("derived:estimate:{number}:{low_id}:{high_id}")
 }
 
 pub fn interpolation_record_id(way_id: i64, low_node_id: i64, high_node_id: i64) -> String {

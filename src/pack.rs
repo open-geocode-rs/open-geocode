@@ -35,7 +35,7 @@ use crate::{
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
     spatial_index::{RecordCells, SpatialIndexWriter},
-    text_index::TextIndexWriter,
+    text_index::{PostcodeAreas, TextIndexWriter},
 };
 
 pub use crate::{
@@ -117,6 +117,7 @@ pub struct PackWriter {
     spatial: SpatialIndexWriter,
     layer_counts: BTreeMap<Layer, u64>,
     context_names: HashMap<RecordId, String>,
+    postcode_areas: PostcodeAreas,
 }
 
 /// A finished, unpublished Pack.
@@ -181,6 +182,7 @@ impl PackWriter {
             generation,
             layer_counts: BTreeMap::new(),
             context_names: HashMap::new(),
+            postcode_areas: PostcodeAreas::default(),
         })
     }
 
@@ -205,6 +207,12 @@ impl PackWriter {
         self.context_names = names;
     }
 
+    /// Postcode centroids, so the records written after this that state no
+    /// postcode are ranked by the nearest one.
+    pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {
+        self.postcode_areas = areas;
+    }
+
     pub fn write(&mut self, record: &Record, context: Option<RecordContext>) -> Result<RecordId> {
         let first = self.records.record_count();
         self.write_batch(std::slice::from_ref(&(record.clone(), context)))?;
@@ -217,6 +225,7 @@ impl PackWriter {
         let first = self.records.record_count();
         let fields = self.text.fields();
         let context_names = &self.context_names;
+        let postcode_areas = &self.postcode_areas;
         let prepared = batch
             .par_iter()
             .enumerate()
@@ -228,7 +237,7 @@ impl PackWriter {
                     .filter_map(|id| context_names.get(&id).map(String::as_str))
                     .collect::<Vec<_>>();
                 Ok((
-                    fields.document(record_id, record, &names),
+                    fields.document(record_id, record, &names, postcode_areas),
                     RecordCells::for_record(record_id, record)?,
                 ))
             })

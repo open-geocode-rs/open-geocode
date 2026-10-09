@@ -57,7 +57,8 @@ use crate::{
     },
     record::{Record, RejectedRecord},
     records::quantize,
-    util::hilbert::hilbert_key,
+    text_index::PostcodeAreas,
+    util::{geo::point_lon_lat, hilbert::hilbert_key},
 };
 use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_context};
 use emit::{FeatureOutput, emit_features};
@@ -279,8 +280,12 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     for (origin, record) in boundaries.place_records(&mut build.report) {
         build.push(record, Some(origin))?;
     }
+    let mut postcode_centroids = Vec::new();
     for record in std::mem::take(&mut build.postcodes).into_records() {
         build.report.accept_postcode();
+        if let Some(point) = point_lon_lat(&record.geometry) {
+            postcode_centroids.push((record.postcode.clone(), point));
+        }
         build.push(Record::Postcode(record), None)?;
     }
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
@@ -314,6 +319,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         ordered.write(&item)?;
     }
     writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
+    writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
     let context_count = ordered.written();
     write_ordered(
@@ -982,9 +988,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // By name and the locality it lies in, though its tags name none.
+        // By name and the locality it lies in, though its tags name none. The
+        // locality leaves out the others, unless it matches nothing at all.
         let hits = search("Tim Hortons, Toronto", None);
         assert_eq!(ids(&hits), vec!["osm:node:2001"]);
+        assert_eq!(search("Tim Hortons, Atlantis", None).len(), 2);
         assert_eq!(hits[0].record.layer, "poi");
         assert_eq!(hits[0].record.category.as_deref(), Some("amenity:cafe"));
         assert_eq!(

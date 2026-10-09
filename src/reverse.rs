@@ -6,10 +6,7 @@ use serde::Serialize;
 use crate::{
     labels,
     pack::{ContextRecord, PackReader, RecordId},
-    record::{
-        AddressComponents, InterpolationAddressComponents, InterpolationRange, Layer, PoiRecord,
-        Record,
-    },
+    record::{AddressComponents, InterpolationAddressComponents, Layer, PoiRecord, Record},
     spatial_index::SpatialIndexReader,
 };
 
@@ -213,11 +210,11 @@ impl PackReverseGeocoder {
             let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
                 continue;
             };
-            let number = estimated_number(&interpolation.interpolation, candidate.fraction);
+            let number = interpolation.interpolation.number_at(candidate.fraction);
             self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
             apply_interpolation_context(context, &interpolation.address);
             self.enrich_context(options, context, context_record_ids)?;
-            let primary = estimated_primary_label(number, &interpolation.address)
+            let primary = labels::estimated_address_name(number, &interpolation.address)
                 .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
 
             return Ok(Some(ReverseGeocodeResult {
@@ -403,28 +400,6 @@ fn apply_context_record(context: &mut ReverseContext, record: &ContextRecord) ->
     }
 }
 
-fn estimated_number(range: &InterpolationRange, fraction: f64) -> u32 {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let span = range.end.saturating_sub(range.start);
-    if span == 0 || range.step == 0 {
-        return range.start;
-    }
-    let raw = range.start as f64 + fraction * span as f64;
-    let step_index = ((raw - range.start as f64) / range.step as f64).round() as u32;
-    (range.start + step_index * range.step).min(range.end)
-}
-
-fn estimated_primary_label(
-    number: u32,
-    address: &InterpolationAddressComponents,
-) -> Option<String> {
-    address
-        .street
-        .as_deref()
-        .or(address.place.as_deref())
-        .map(|street_or_place| format!("{number} {street_or_place}"))
-}
-
 fn compose_label(primary: &str, context: &ReverseContext) -> String {
     let mut parts = vec![primary.to_string()];
     for part in [
@@ -504,8 +479,8 @@ mod tests {
         context::AdminContextTuple,
         pack::{PackWriter, RecordContext},
         record::{
-            AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord, Record,
-            SourceProvenance, StreetRecord, point_geometry,
+            AddressRecord, InterpolationRange, LocationPrecision, OsmObjectType, PlaceLayer,
+            PlaceRecord, Record, SourceProvenance, StreetRecord, point_geometry,
         },
     };
 
