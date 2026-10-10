@@ -145,6 +145,27 @@ impl Problem {
         problem
     }
 
+    // --- Router (`open-geocode route`) ----------------------------------------
+
+    /// A `country` the router has no Runtime for.
+    pub(crate) fn unknown_country(country: &str, known: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "unknown_country").with_detail(format!(
+            "no Runtime for country {country:?}; configured: {known}"
+        ))
+    }
+
+    /// A route the router cannot answer by fanning out (reverse): it needs `country`.
+    pub(crate) fn country_required(route: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "country_required")
+            .with_detail(format!("{route} needs a country parameter"))
+    }
+
+    /// A Runtime behind the router did not answer.
+    pub(crate) fn upstream_unavailable(country: &str) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "upstream_unavailable")
+            .with_detail(format!("the {country} Runtime did not answer"))
+    }
+
     // --- 500 ---------------------------------------------------------------
 
     /// A generic 500. Carries no detail so internal errors never leak.
