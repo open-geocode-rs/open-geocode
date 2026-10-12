@@ -166,8 +166,29 @@ impl PackTextSearcher {
             bail!("search query cannot be empty");
         }
 
+        // A hit that contradicts a postcode the query states is not an answer
+        // to it, so it does not end the pass loop. Without this a stated house
+        // number in the wrong postcode wins the strict pass and returns alone,
+        // and the later passes that would have found the right street never
+        // run: "8 High Street, Deloraine TAS 7304" answered with the 7018 High
+        // Street, 163 km away. Only a stated postcode can reject, so queries
+        // that name none are unaffected.
         let (_, hits) =
-            self.search_variants(query_text, options.layer.as_deref(), limit, |_, _| Ok(true))?;
+            self.search_variants(query_text, options.layer.as_deref(), limit, |plan, hit| {
+                // The forms are the whole context part and the part from its
+                // first word with a digit ("sandybaytas7005", "7005"), so a
+                // hit is contradicted only when no form agrees with it.
+                let postcode = plan.postcode();
+                if postcode.forms.is_empty() {
+                    return Ok(true);
+                }
+                for form in &postcode.forms {
+                    if self.hit_in_postcode(hit, form)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?;
         Ok(hits)
     }
 
@@ -2766,21 +2787,55 @@ mod tests {
         let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
 
         // The index knows no "A1A 9Z9", but the record near "A1A 1A1" shares
-        // its first three characters.
+        // its first three characters. The record that states "B2B 2B2"
+        // contradicts the query outright and is left out: it is not an answer
+        // to it, however little else matches.
         assert_eq!(
             top_ids(&searcher, "5 Main Street, A1A 9Z9"),
-            vec!["osm:node:2", "osm:node:3", "osm:node:1"]
+            vec!["osm:node:2", "osm:node:3"]
         );
         assert_eq!(
             top_ids(&searcher, "5 Main Street, Toronto ON B2B 2B2")[0],
             "osm:node:1",
             "the postcode starts at its first word with a digit"
         );
-        // A postcode nobody shares prefers no one: the closest labels first.
+        // A postcode nobody shares prefers no one: the closest labels first,
+        // and again without the record whose own postcode disagrees.
         assert_eq!(
             top_ids(&searcher, "5 Main Street, Z9Z 9Z9"),
-            vec!["osm:node:2", "osm:node:3", "osm:node:1"]
+            vec!["osm:node:2", "osm:node:3"]
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A stated house number in the wrong postcode used to win the strict
+    /// pass and return alone, so the later passes that would have found the
+    /// right street never ran.
+    #[test]
+    fn a_hit_contradicting_the_stated_postcode_does_not_end_the_search() {
+        let temp_dir = temp_pack_path("search-postcode-rejects-strict");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        // The number exists, but only in the wrong postcode.
+        let mut elsewhere =
+            address_record("osm:node:1", "", "8", "High Street", None, Some("7018"));
+        elsewhere.geometry = point_geometry(147.4, -42.9);
+        // The right locality has the street but not the number.
+        let mut street = street_record("osm:way:2", "High Street");
+        street.geometry = point_geometry(146.65, -41.52);
+        street.representative_point = [146.65, -41.52];
+        writer.write(&elsewhere.into(), None).expect("address");
+        writer.write(&street.into(), None).expect("street");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        let ids = top_ids(&searcher, "8 High Street, 7304");
+        assert!(
+            !ids.contains(&"osm:node:1".to_string()),
+            "the 7018 address answers no query for 7304: {ids:?}"
+        );
+        // A query that states no postcode still reaches it.
+        assert!(top_ids(&searcher, "8 High Street").contains(&"osm:node:1".to_string()));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
