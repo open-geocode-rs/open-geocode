@@ -774,6 +774,9 @@ impl PackTextSearcher {
             {
                 continue;
             }
+            if ranking.numbered && record.layer == Layer::Street.as_str() {
+                self.place_on_street_line(record_id, &mut record)?;
+            }
             hits.push((
                 key.clone(),
                 TieBreak::new(&record, &query_words),
@@ -797,6 +800,37 @@ impl PackTextSearcher {
     /// Place `number` on the interpolation range `record` summarizes: the
     /// point that far along its line, labelled as that address. `false` when
     /// the range does not contain the number.
+    /// Move a street standing in for a house number onto its own centre line.
+    ///
+    /// A street's representative point is the centroid of its geometry, which
+    /// is the right label anchor but need not sit on the street at all: the
+    /// centroid of an L-shaped or crescent road falls in the space the bend
+    /// encloses, and on a long road it can be a kilometre from the pavement.
+    /// A point halfway along the line is on the street by construction, so it
+    /// is never further from the house asked for than the centroid is, and
+    /// usually much closer.
+    ///
+    /// This asks nothing of the address data and so holds for every country:
+    /// it uses only the street's own geometry. Where a number can be placed
+    /// properly, by a range that holds it or between stated neighbours, that
+    /// runs first and this never applies.
+    fn place_on_street_line(&self, record_id: RecordId, record: &mut RecordSummary) -> Result<()> {
+        let Some(point) = record.point else {
+            return Ok(());
+        };
+        // Half way along the line, by distance rather than by vertex count, so
+        // a densely drawn bend does not pull the point into it.
+        let Some([lon, lat]) = self.spatial.point_along_line(record_id, 0.5)? else {
+            return Ok(());
+        };
+        record.point = Some(RecordPoint {
+            lon,
+            lat,
+            precision: point.precision,
+        });
+        Ok(())
+    }
+
     fn estimate_house(
         &self,
         record_id: RecordId,
