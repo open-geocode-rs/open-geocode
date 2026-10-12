@@ -1,0 +1,106 @@
+{
+ "meta": {
+  "state": "TAS",
+  "gnaf_release": "AUG 2026",
+  "datum": "GDA2020",
+  "seed": 2026,
+  "positional_types": [
+   "BC",
+   "BCM",
+   "PC",
+   "PCM"
+  ],
+  "buckets_m": {
+   "exact": 25,
+   "correct": 100,
+   "near": 500,
+   "off": 5000
+  },
+  "geohash_backstop": [
+   "gh6",
+   "gh4"
+  ],
+  "hit5_rule": "best distance among top 5",
+  "note": "buckets frozen before first scored run; offset vector is diagnostic only"
+ },
+ "ledger": [
+  [
+   "default geocodes (live)",
+   376517
+  ],
+  [
+   "  of which positional",
+   351754
+  ],
+  [
+   "ADDRESS_DETAIL rows",
+   376517
+  ],
+  [
+   "  primary",
+   276053
+  ],
+  [
+   "  unit",
+   66977
+  ],
+  [
+   "  retired",
+   0
+  ],
+  [
+   "  alias",
+   8723
+  ],
+  [
+   "  excluded_no_positional_geocode",
+   24763
+  ],
+  [
+   "  excluded_integrity",
+   1
+  ],
+  [
+   "  form full/alias",
+   8723
+  ],
+  [
+   "  form full/ambiguous",
+   23095
+  ],
+  [
+   "  form full/primary",
+   269320
+  ],
+  [
+   "  form full/unit",
+   50615
+  ],
+  [
+   "  form messy/alias",
+   8723
+  ],
+  [
+   "  form messy/ambiguous",
+   77040
+  ],
+  [
+   "  form messy/primary",
+   225933
+  ],
+  [
+   "  form messy/unit",
+   40057
+  ]
+ ],
+ "geocode_types": {
+  "PC": 343664,
+  "GG": 7093,
+  "BC": 7761,
+  "STL": 16287,
+  "LOC": 1216,
+  "PAPS": 167,
+  "PCM": 308,
+  "BCM": 21
+ }
+}
