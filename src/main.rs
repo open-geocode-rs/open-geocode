@@ -1,4 +1,8 @@
-use std::{fs::File, net::SocketAddr, path::PathBuf};
+use std::{
+    fs::File,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -6,8 +10,12 @@ use serde_json::Value;
 
 use open_geocode::{
     batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
-    bench::{PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack, sample_poi_fixture},
+    bench::{
+        BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
+        sample_poi_fixture,
+    },
     builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
+    geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
@@ -145,6 +153,28 @@ enum Commands {
         warmup: usize,
 
         /// Optional output path for the JSON benchmark report.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Score forward geocoding against authoritative coordinates, in frozen
+    /// distance buckets plus geohash agreement. Separate from bench-pack
+    /// because that matches object ids and this measures distance.
+    #[command(name = "bench-geocode")]
+    BenchGeocode {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// JSON fixture of cases carrying expect_lat/expect_lon.
+        #[arg(long)]
+        queries: PathBuf,
+
+        /// Candidates inspected per query. At least 5, for hit@5.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        /// Optional output path for the JSON report.
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -326,6 +356,25 @@ async fn main() -> Result<()> {
             warmup,
             output,
         } => bench_pack(pack, queries, iterations, warmup, output),
+        Commands::BenchGeocode {
+            pack,
+            queries,
+            limit,
+            output,
+        } => {
+            let report = benchmark_geocode(GeocodeBenchmarkOptions {
+                pack,
+                fixture: queries,
+                limit,
+                output: None,
+            })?;
+            let value = serde_json::to_value(report)?;
+            if let Some(output) = output {
+                write_json_to_path(&value, output)
+            } else {
+                write_json(value)
+            }
+        }
         Commands::SamplePoiFixture {
             pack,
             count,
@@ -334,7 +383,7 @@ async fn main() -> Result<()> {
         } => {
             let fixture = sample_poi_fixture(PoiFixtureOptions { pack, count, seed })?;
             let cases = fixture.search.len();
-            write_json_to_path(&fixture, output.clone())?;
+            write_fixture_to_path(&fixture, &output)?;
             write_json(serde_json::json!({
                 "cases": cases,
                 "output": output.display().to_string(),
@@ -462,12 +511,32 @@ fn write_json(value: Value) -> Result<()> {
     Ok(())
 }
 
-fn write_json_to_path(value: &impl serde::Serialize, output: PathBuf) -> Result<()> {
+/// A query fixture as one compact JSON object per case. Pretty-printing 500
+/// cases spans 4,500 lines; a line per case stays greppable and keeps a
+/// regenerated answer key to a readable diff.
+fn write_fixture_to_path(fixture: &BenchmarkFixture, output: &Path) -> Result<()> {
+    create_output_dir(output)?;
+    let body = fixture
+        .search
+        .iter()
+        .map(|case| Ok(format!("    {}", serde_json::to_string(case)?)))
+        .collect::<Result<Vec<_>>>()?
+        .join(",\n");
+    std::fs::write(output, format!("{{\n  \"search\": [\n{body}\n  ]\n}}\n"))?;
+    Ok(())
+}
+
+fn create_output_dir(output: &Path) -> Result<()> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+fn write_json_to_path(value: &impl serde::Serialize, output: PathBuf) -> Result<()> {
+    create_output_dir(&output)?;
     let file = File::create(&output)?;
     serde_json::to_writer_pretty(file, value)?;
     Ok(())

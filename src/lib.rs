@@ -4,6 +4,7 @@ pub mod builder;
 pub mod container;
 pub mod context;
 pub mod extsort;
+pub mod geocode_bench;
 mod http;
 pub mod labels;
 pub mod memory;
