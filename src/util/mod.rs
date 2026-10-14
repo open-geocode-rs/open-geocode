@@ -8,3 +8,4 @@ pub(crate) mod codec;
 pub(crate) mod geo;
 pub(crate) mod hilbert;
 pub(crate) mod text;
+pub(crate) mod transliterate;

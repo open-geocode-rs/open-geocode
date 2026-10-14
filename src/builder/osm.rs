@@ -953,7 +953,7 @@ mod tests {
             .expect("ward");
         assert_eq!(
             reader.records().names(ward).expect("names"),
-            vec!["千代田区", "Chiyoda", "ちよだく"]
+            vec!["千代田区", "Chiyoda", "ちよだく", "chiyodaku"]
         );
 
         let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
@@ -977,6 +977,11 @@ mod tests {
             first("ちよだく", "locality").as_deref(),
             Some("osm:way:500")
         );
+        assert_eq!(
+            first("chiyodaku", "locality").as_deref(),
+            Some("osm:way:500"),
+            "the Latin form of a kana name"
+        );
 
         let tagger = crate::parse::lattice::LatticeTagger::open(&dir.join("pack")).expect("tagger");
         let dictionaries = tagger.dictionaries();
@@ -985,6 +990,7 @@ mod tests {
             (Field::Locality, "千代田区"),
             (Field::Locality, "ちよだく"),
             (Field::Locality, "chiyoda"),
+            (Field::Locality, "chiyodaku"),
             (Field::Locality, "丸の内一丁目"),
             (Field::Region, "東京都"),
             (Field::Street, "uchibori dori"),
