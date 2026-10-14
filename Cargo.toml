@@ -39,6 +39,9 @@ stable_deref_trait = "1.2"
 tantivy = "0.25.0"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }
+# The Unicode Script property: which characters the parser reads as a
+# script written without spaces.
+unicode-script = "0.5.7"
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 

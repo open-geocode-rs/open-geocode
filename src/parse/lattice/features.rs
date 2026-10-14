@@ -432,13 +432,15 @@ fn has_street_type_suffix(word: &str, dictionaries: &Dictionaries) -> bool {
         .any(|start| dictionaries.contains(Field::StreetType, &word[boundaries[start]..]))
 }
 
+/// The script block of a letter, by its Unicode Script property.
 fn script(character: char) -> usize {
-    match u32::from(character) {
-        0..=0x24F | 0x1E00..=0x1EFF => 0,
-        0x370..=0x3FF | 0x1F00..=0x1FFF => 1,
-        0x400..=0x52F => 2,
-        0x590..=0x6FF | 0x750..=0x77F => 3,
-        0x3040..=0x30FF | 0x3400..=0x9FFF | 0xAC00..=0xD7AF => 4,
+    use unicode_script::{Script, UnicodeScript};
+    match character.script() {
+        Script::Latin => 0,
+        Script::Greek => 1,
+        Script::Cyrillic => 2,
+        Script::Hebrew | Script::Arabic | Script::Syriac => 3,
+        Script::Han | Script::Hiragana | Script::Katakana | Script::Hangul => 4,
         _ => 5,
     }
 }

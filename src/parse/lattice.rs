@@ -36,6 +36,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use levenshtein_automata::{DFA, LevenshteinAutomatonBuilder};
+use unicode_script::{Script, UnicodeScript};
 
 use self::{
     decode::Lattice,
@@ -200,24 +201,53 @@ impl Tokens {
     }
 }
 
+/// The scripts written without spaces between words: a space between two of
+/// their characters marks no word boundary.
+const UNSPACED_SCRIPTS: [Script; 7] = [
+    Script::Han,
+    Script::Hiragana,
+    Script::Katakana,
+    Script::Thai,
+    Script::Lao,
+    Script::Khmer,
+    Script::Myanmar,
+];
+
 /// Whether `character` belongs to a script written without spaces between
-/// words: Han, hiragana, katakana, Thai, Lao, Myanmar, Khmer. A space
-/// between two such characters marks no word boundary.
+/// words ([`UNSPACED_SCRIPTS`]), by its Unicode Script_Extensions property:
+/// the prolonged sound mark "ー" and the iteration mark "々" are, as kana and
+/// Han are, and a character of every script (a digit) is not.
 pub fn is_unspaced(character: char) -> bool {
-    matches!(
-        u32::from(character),
-        0x0E00..=0x0EFF
-            | 0x1000..=0x109F
-            | 0x1780..=0x17FF
-            | 0x3005..=0x3007
-            | 0x3040..=0x30FF
-            | 0x31F0..=0x31FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xF900..=0xFAFF
-            | 0xFF66..=0xFF9F
-            | 0x20000..=0x3FFFF
-    )
+    let scripts = character.script_extension();
+    !scripts.is_common()
+        && !scripts.is_inherited()
+        && UNSPACED_SCRIPTS
+            .iter()
+            .any(|script| scripts.contains_script(*script))
+}
+
+/// Whether every character of `word` is of no one script (Unicode Common or
+/// Inherited): digits, fullwidth or not. Such a word takes the script of the
+/// characters beside it, as UAX #24 resolves Common characters, so it joins
+/// a run of a script without spaces on either side ("４ 丁 目" is "４丁目").
+fn is_neutral(word: &str) -> bool {
+    !word.is_empty()
+        && word.chars().all(|character| {
+            let scripts = character.script_extension();
+            scripts.is_common() || scripts.is_inherited()
+        })
+}
+
+/// `word` with the fullwidth forms of ASCII characters ("１", "ａ") written as
+/// ASCII, as compatibility normalization (NFKC) folds them, so a number typed
+/// through an input method is the number a name is stored with.
+fn fold_width(word: &str) -> String {
+    word.chars()
+        .map(|character| match u32::from(character) {
+            code @ 0xFF01..=0xFF5E => char::from_u32(code - 0xFEE0).unwrap_or(character),
+            _ => character,
+        })
+        .collect()
 }
 
 /// `character<TAB>value` rows of the ideographs that are numerals, from the
@@ -267,11 +297,13 @@ pub fn dictionary_key(name: &str) -> Option<String> {
 /// The units a lattice is built on: the tokens of a [`Tokens`], except that
 /// a token holding characters of a script written without spaces is split
 /// into one unit per such character and one per run of other characters
-/// ("丸の内2" is "丸", "の", "内", "2"). Units written with no space between
-/// them, or with only a space between two characters of such a script, are
-/// *glued*: they join without a space in a dictionary key, so
-/// "東京都千代田区", "東京都 千代田区" and "東 京 都 千 代 田 区" are the
-/// same units with the same keys.
+/// ("丸の内2" is "丸", "の", "内", "2"), and fullwidth forms are folded to
+/// ASCII ([`fold_width`]). Units written with no space between them, or with
+/// only a space between a character of such a script and another or a digit
+/// (see [`is_neutral`]), are *glued*: they join without a space in a
+/// dictionary key, so "東京都千代田区", "東京都 千代田区" and
+/// "東 京 都 千 代 田 区" are the same units with the same keys, and so are
+/// "5番2号" and "5 番 2 号".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Units {
     /// The units as words, with the field breaks and joiners of the tokens
@@ -292,8 +324,9 @@ impl Units {
             glued: Vec::with_capacity(tokens.len()),
         };
         for (index, word) in tokens.words.iter().enumerate() {
+            let word = fold_width(word);
             if !word.chars().any(is_unspaced) {
-                units.push(tokens, index, word.clone(), true);
+                units.push(tokens, index, word, true);
                 continue;
             }
             let mut first = true;
@@ -318,18 +351,19 @@ impl Units {
     }
 
     /// Add a unit of token `index` of `tokens`, `first` when it starts it.
+    /// The first unit of a token is glued to the unit before it when only a
+    /// space stands between them and one side is a character of a script
+    /// without spaces and the other is too or is [`is_neutral`].
     fn push(&mut self, tokens: &Tokens, index: usize, text: String, first: bool) {
         let glued = if first {
-            let after_unspaced = self
-                .tokens
-                .words
-                .last()
-                .and_then(|last| last.chars().last())
-                .is_some_and(is_unspaced);
-            after_unspaced
-                && text.chars().next().is_some_and(is_unspaced)
-                && !tokens.breaks[index]
-                && tokens.joiners[index].is_none()
+            let spaced = !tokens.breaks[index] && tokens.joiners[index].is_none();
+            spaced
+                && self.tokens.words.last().is_some_and(|before| {
+                    let unspaced_before = before.chars().last().is_some_and(is_unspaced);
+                    let unspaced_after = text.chars().next().is_some_and(is_unspaced);
+                    (unspaced_before && (unspaced_after || is_neutral(&text)))
+                        || (unspaced_after && is_neutral(before))
+                })
         } else {
             true
         };

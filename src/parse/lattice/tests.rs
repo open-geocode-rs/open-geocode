@@ -365,16 +365,18 @@ fn unspaced_scripts_split_into_glued_characters() {
         ]
     );
     assert_eq!(unspaced.key(0, 7), "東京都千代田区");
-    // A space between two characters of such a script is no word break, so
-    // the spaced and the one-character-per-token forms are the same units.
+    // A space between two characters of such a script, or between one and
+    // a digit, is no word break, so the spaced and the
+    // one-character-per-token forms are the same units.
     for text in [
         "東京都 千代田区 丸の内 2-7-2",
         "東 京 都 千 代 田 区 丸 の 内 2-7-2",
     ] {
         let units = Units::of(&Tokens::new(text));
         assert_eq!(words(&units), words(&unspaced), "{text}");
+        assert_eq!(units.glued, unspaced.glued, "{text}");
         assert_eq!(units.key(0, 7), "東京都千代田区", "{text}");
-        assert_eq!(units.key(7, 11), "丸の内 2", "{text}");
+        assert_eq!(units.key(7, 11), "丸の内2", "{text}");
     }
     // A field break still separates them, and spaced scripts stay words.
     let broken = Units::of(&Tokens::new("東京都, 千代田区"));
@@ -383,6 +385,119 @@ fn unspaced_scripts_split_into_glued_characters() {
     assert_eq!(words(&latin), ["670", "king", "st", "w"]);
     assert_eq!(latin.glued, [false; 4]);
     assert_eq!(Units::of(&Tokens::new("서울 종로구")).len(), 2);
+    // A digit joins only a script without spaces, and two numbers stay two.
+    let mixed = Units::of(&Tokens::new("tower 3 丁目 1 71"));
+    assert_eq!(words(&mixed), ["tower", "3", "丁", "目", "1", "71"]);
+    assert_eq!(mixed.glued, [false, false, true, true, true, false]);
+}
+
+/// The units of `text` as they key and feature a lattice: their words, which
+/// are glued, and the field breaks and joiners before them.
+fn unit_shape(text: &str) -> (Vec<String>, Vec<bool>, Vec<bool>, Vec<Option<char>>) {
+    let units = Units::of(&Tokens::new(text));
+    (
+        units.tokens.words,
+        units.glued,
+        units.tokens.breaks,
+        units.tokens.joiners,
+    )
+}
+
+/// The label of every unit of `text` in each of its best labellings.
+fn unit_labels(tagger: &LatticeTagger, text: &str) -> Vec<Vec<Label>> {
+    let lattice = tagger.lattice(&Tokens::new(text), &Suppression::default());
+    decode::best(&lattice, tagger.weights(), N_BEST)
+        .iter()
+        .map(|path| path.labels(&lattice))
+        .collect()
+}
+
+#[test]
+fn spaced_and_unspaced_writing_are_the_same_units_and_labels() {
+    let tagger = LatticeTagger::new(
+        Dictionaries::from_entries([
+            (Field::Region, "愛知県", entry(200_000, "JP")),
+            (Field::Locality, "名古屋市", entry(90_000, "JP")),
+            (Field::Locality, "中区", entry(9_000, "JP")),
+            (Field::Locality, "4丁目", entry(30_000, "JP")),
+            (Field::Poi, "アニメイト", entry(40, "JP")),
+            (Field::Street, "ถนนสุขุมวิท", entry(500, "TH")),
+            (Field::Locality, "ວຽງຈັນ", entry(500, "LA")),
+            (Field::Locality, "ភ្នំពេញ", entry(500, "KH")),
+            (Field::Locality, "ရန်ကုန်", entry(500, "MM")),
+        ]),
+        Weights::built_in(),
+    );
+    // Han, hiragana, katakana (fullwidth and halfwidth), Thai, Lao, Khmer
+    // and Myanmar, each with digits before and after its characters.
+    for forms in [
+        &[
+            "愛知県名古屋市中区栄4丁目5番2号",
+            "愛知県 名古屋市 中区 栄 ４丁目 5番2号",
+            "愛 知 県 名 古 屋 市 中 区 栄 ４ 丁 目 5 番 2 号",
+            "愛知県 名古屋市 中区 栄 4 丁目 5 番 2 号",
+        ][..],
+        &["４丁目", "４ 丁目", "４ 丁 目", "4丁目"],
+        &["5番2号", "5 番 2 号"],
+        &["とうきょうとちよだく1", "と う きょう と ち よ だ く 1"],
+        &["アニメイト福岡天神3階", "ア ニ メ イ ト 福 岡 天 神 3 階"],
+        &["ｱﾆﾒｲﾄ2", "ｱ ﾆ ﾒ ｲ ﾄ 2"],
+        &["ถนนสุขุมวิท 15", "ถ น น ส ุ ข ุ ม ว ิ ท 15"],
+        &["ນະຄອນຫຼວງວຽງຈັນ 3", "ນ ະ ຄ ອ ນ ຫ ຼ ວ ງ ວ ຽ ງ ຈ ັ ນ 3"],
+        &["ភ្នំពេញ 12", "ភ ្ ន ំ ព េ ញ 12"],
+        &["ရန်ကုန် 7", "ရ န ် က ု န ် 7"],
+    ] {
+        let expected = unit_shape(forms[0]);
+        let pieces = |text: &str| {
+            tagger
+                .parse(text)
+                .into_iter()
+                .map(|parsed| parsed.pieces)
+                .collect::<Vec<_>>()
+        };
+        for form in &forms[1..] {
+            assert_eq!(unit_shape(form), expected, "{form} as {}", forms[0]);
+            assert_eq!(pieces(form), pieces(forms[0]), "{form}");
+            assert_eq!(
+                unit_labels(&tagger, form),
+                unit_labels(&tagger, forms[0]),
+                "{form}"
+            );
+        }
+    }
+    assert_eq!(dictionary_key("5 番 2 号"), dictionary_key("５番２号"));
+}
+
+#[test]
+fn unspaced_scripts_are_the_script_property_of_every_character_listed_before() {
+    // The ranges the parser listed by hand before it read the Unicode
+    // Script property: Thai, Myanmar, Khmer, the iteration marks, kana, Han
+    // and halfwidth katakana. Every letter of them is still unspaced.
+    let ranges = [
+        0x0E00..=0x0E7F,
+        0x1000..=0x109F,
+        0x1780..=0x17FF,
+        0x3005..=0x3007,
+        0x3041..=0x30FF,
+        0x31F0..=0x31FF,
+        0x3400..=0x4DBF,
+        0x4E00..=0x9FFF,
+        0xF900..=0xFAFF,
+        0xFF66..=0xFF9F,
+        0x20000..=0x2A6DF,
+    ];
+    for code in ranges.into_iter().flatten() {
+        let Some(character) = char::from_u32(code) else {
+            continue;
+        };
+        if character.is_alphanumeric() {
+            assert!(is_unspaced(character), "U+{code:04X} {character}");
+        }
+    }
+    assert!(is_unspaced('ຫ') && is_unspaced('ー'));
+    for character in ['4', '４', 'a', 'ä', 'я', '한', 'ا'] {
+        assert!(!is_unspaced(character), "{character}");
+    }
 }
 
 #[test]
