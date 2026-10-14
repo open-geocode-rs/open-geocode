@@ -6,6 +6,7 @@
 //! mapping, so the text index needs no files of its own.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap},
     fmt, fs, io, mem,
     path::{Path, PathBuf},
@@ -27,6 +28,7 @@ use tantivy::{
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     extsort::Scratch,
+    labels,
     memory::{MemoryBudget, Reservation},
     pack::RecordId,
     record::{
@@ -296,9 +298,13 @@ impl TextIndexDocument {
 
     fn project_address(record_id: RecordId, address: &AddressRecord) -> TextIndexProjection {
         let mut builder = ProjectionBuilder::new(record_id, "address");
-        builder.label_for_search(&address.label());
-        builder.name_for_search(&address.name());
-        builder.address(&address.address);
+        let (searchable, unit) = split_unit(&address.address);
+        builder.label_for_search(&labels::address_label(&searchable));
+        builder.name_for_search(&labels::address_name(&searchable));
+        builder.address(&searchable);
+        if let Some(unit) = unit {
+            builder.add_content_text(&unit_token(&unit));
+        }
         builder.build()
     }
 
@@ -654,6 +660,63 @@ pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
     }
 }
 
+/// The index token of a unit. It cannot collide with a house number, and
+/// queries that name the unit are rewritten to it (`unit_query` in search.rs).
+pub(crate) fn unit_token(unit: &str) -> String {
+    format!("u{unit}")
+}
+
+/// An address as it is indexed, and the unit taken out of it.
+///
+/// AU/NZ write a flat as "UNIT/NUMBER" ("10/1367"), and the tokenizer would
+/// otherwise index the 10 as if it were a house, so "10 Eruera Street" matched
+/// unit 10 of number 1367. The number keeps the house alone and the unit
+/// becomes its own token. A unit given as its own tag ("Flat 4") is handled
+/// the same way.
+///
+/// This assumes unit first, as `strip_unit_terms` does for queries. Europe's
+/// "BUILDING/FLAT" ("10/12" in Poland) is read the wrong way round, and the
+/// country is too rarely tagged to tell them apart. Only all-digit units
+/// before a number that starts with a digit are split, so "10/A", "12 1/2",
+/// "12-14/3" and "1/2/34" are indexed as written.
+fn split_unit(address: &AddressComponents) -> (Cow<'_, AddressComponents>, Option<String>) {
+    let all_digits =
+        |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let mut number = address.number.as_str();
+    let mut unit = None;
+    if let Some((flat, house)) = number.rsplit_once('/')
+        && all_digits(flat)
+        && house.starts_with(|character: char| character.is_ascii_digit())
+    {
+        number = house;
+        unit = Some(flat.to_string());
+    }
+    let tag = address
+        .unit
+        .as_deref()
+        .and_then(normalize_index_text)
+        .and_then(|tag| {
+            tag.split_whitespace()
+                .last()
+                .filter(|last| all_digits(last))
+                .map(str::to_string)
+        });
+    let tag_taken = tag.is_some();
+    if number.len() == address.number.len() && !tag_taken {
+        return (Cow::Borrowed(address), None);
+    }
+    let split = AddressComponents {
+        number: number.to_string(),
+        unit: if tag_taken {
+            None
+        } else {
+            address.unit.clone()
+        },
+        ..address.clone()
+    };
+    (Cow::Owned(split), unit.or(tag))
+}
+
 fn unique_parts(parts: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     parts
@@ -699,6 +762,49 @@ mod tests {
         assert!(projected.content_text.contains("221b baker street"));
         assert_eq!(projected.autocomplete_subject_text, "baker street nw1");
         assert!(!projected.autocomplete_subject_text.contains("london"));
+    }
+
+    #[test]
+    fn projects_a_flat_by_its_building_number() {
+        let mut components = AddressComponents {
+            number: "10/1367".to_string(),
+            street: Some("Eruera Street".to_string()),
+            place: None,
+            unit: Some("Flat 4".to_string()),
+            locality: Some("Rotorua".to_string()),
+            region: None,
+            postcode: None,
+            country: None,
+        };
+        let record = |components: &AddressComponents| AddressRecord {
+            address: components.clone(),
+            geometry: point_geometry(176.2, -38.1),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(OsmObjectType::Node, 1),
+        };
+
+        let projected = TextIndexDocument::from_record(1, &record(&components).into());
+        assert_eq!(projected.address_number.as_deref(), Some("1367"));
+        let tokens: Vec<_> = projected.content_text.split_whitespace().collect();
+        assert!(tokens.contains(&"1367") && tokens.contains(&"u10"));
+        assert!(!tokens.contains(&"10") && !tokens.contains(&"flat"));
+
+        // A unit given as a tag only is indexed the same way.
+        components.number = "1367".to_string();
+        let projected = TextIndexDocument::from_record(1, &record(&components).into());
+        assert!(
+            projected
+                .content_text
+                .split_whitespace()
+                .any(|token| token == "u4")
+        );
+
+        // These are not "UNIT/NUMBER" and keep their number.
+        for number in ["12 1/2", "10/A", "12-14/3", "1/2/34"] {
+            components.number = number.to_string();
+            let projected = TextIndexDocument::from_record(1, &record(&components).into());
+            assert_eq!(projected.address_number.as_deref(), Some(number));
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::{
     pack::{PackReader, RecordId, RecordPointPrecision, RecordSummary},
     record::{Layer, OsmObjectType},
     spatial_index::SpatialIndexReader,
-    text_index::{TextIndexFields, normalize_index_text, open_text_index},
+    text_index::{TextIndexFields, normalize_index_text, open_text_index, unit_token},
 };
 
 pub struct PackTextSearcher {
@@ -529,10 +529,18 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
 
 fn address_geocode_candidates(address: &str, postcode: Option<&str>) -> Vec<String> {
     let mut candidates = Vec::new();
-    if let Some(postcode) = postcode.and_then(normalize_index_text)
-        && let Some(address) = meaningful_address_query(address)
-    {
-        candidates.push(format!("{address} {postcode}"));
+    if let Some(postcode) = postcode.and_then(normalize_index_text) {
+        // The flat first, so a postcode does not settle for any flat of the
+        // building.
+        for query in [
+            unit_address_query(address),
+            meaningful_address_query(address),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            candidates.push(format!("{query} {postcode}"));
+        }
     }
     candidates.push(address.to_string());
     unique_strings(candidates)
@@ -544,6 +552,11 @@ fn meaningful_address_query(address: &str) -> Option<String> {
     strip_unit_terms(&expanded)
 }
 
+fn unit_address_query(address: &str) -> Option<String> {
+    let normalized = normalize_index_text(address)?;
+    unit_query(&expand_address_abbreviations(&normalized))
+}
+
 fn search_query_variants(query_text: &str) -> Vec<String> {
     let mut variants = Vec::new();
     if let Some(cleaned) = collapse_query(query_text) {
@@ -553,6 +566,7 @@ fn search_query_variants(query_text: &str) -> Vec<String> {
         variants.push(normalized.clone());
         let expanded = expand_address_abbreviations(&normalized);
         variants.push(expanded.clone());
+        variants.extend(unit_query(&expanded));
         if let Some(without_unit) = strip_unit_terms(&expanded) {
             variants.push(without_unit);
         }
@@ -622,13 +636,27 @@ fn previous_token_is_street_type(tokens: &[&str]) -> bool {
 }
 
 fn strip_unit_terms(value: &str) -> Option<String> {
+    split_unit_terms(value).1
+}
+
+/// The query with its unit rewritten to the token a flat is indexed under, so
+/// "3/12 Smith Street" and "unit 3 12 Smith Street" find flat 3 of number 12.
+fn unit_query(value: &str) -> Option<String> {
+    let (unit, rest) = split_unit_terms(value);
+    Some(format!("{} {}", unit_token(unit?), rest?))
+}
+
+/// The unit a query names and the query without it.
+fn split_unit_terms(value: &str) -> (Option<&str>, Option<String>) {
     let tokens = value.split_whitespace().collect::<Vec<_>>();
     let mut stripped = Vec::with_capacity(tokens.len());
+    let mut unit = None;
     let mut index = 0;
     while index < tokens.len() {
         if is_unit_designator(tokens[index]) {
             index += 1;
             if index < tokens.len() && is_unit_value_token(tokens[index]) {
+                unit.get_or_insert(tokens[index]);
                 index += 1;
             }
             continue;
@@ -638,11 +666,11 @@ fn strip_unit_terms(value: &str) -> Option<String> {
     }
 
     if stripped.len() > 2 && is_numeric_token(stripped[0]) && is_numeric_token(stripped[1]) {
-        stripped.remove(0);
+        unit.get_or_insert(stripped.remove(0));
     }
 
     let stripped = stripped.join(" ");
-    (!stripped.is_empty()).then_some(stripped)
+    (unit, (!stripped.is_empty()).then_some(stripped))
 }
 
 fn is_unit_designator(token: &str) -> bool {
@@ -980,6 +1008,111 @@ mod tests {
             geocode(&searcher, "10 King St W", Some("Toronto"), None).as_deref(),
             Some("osm:node:2")
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_does_not_read_a_unit_as_the_house_number() {
+        let temp_dir = temp_pack_path("geocode-unit");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let flat = address_record("osm:node:1", "", "10/1367", "Eruera Street", None, None);
+        let mut tagged = address_record("osm:node:2", "", "88", "Eruera Street", None, None);
+        tagged.address.unit = Some("7".to_string());
+        writer.write(&flat.into(), None).expect("flat");
+        writer.write(&tagged.into(), None).expect("tagged");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for address in [
+            "1367 Eruera Street",
+            "10/1367 Eruera Street",
+            "unit 10 1367 Eruera Street",
+        ] {
+            assert_eq!(
+                geocode(&searcher, address, None, None).as_deref(),
+                Some("osm:node:1"),
+                "{address}"
+            );
+        }
+        assert_eq!(
+            geocode(&searcher, "7/88 Eruera Street", None, None).as_deref(),
+            Some("osm:node:2")
+        );
+        // Neither 10 nor 7 is a house on this street.
+        assert_eq!(geocode(&searcher, "10 Eruera Street", None, None), None);
+        assert_eq!(geocode(&searcher, "7 Eruera Street", None, None), None);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_finds_the_flat_that_a_query_names() {
+        let temp_dir = temp_pack_path("geocode-flats");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, number) in [(1, "1/12"), (2, "2/12"), (3, "3/12")] {
+            let flat = address_record(
+                &format!("osm:node:{id}"),
+                "",
+                number,
+                "Smith Street",
+                None,
+                Some("3000"),
+            );
+            writer.write(&flat.into(), None).expect("flat");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for postcode in [None, Some("3000")] {
+            for address in ["3/12 Smith Street", "unit 3 12 Smith Street"] {
+                assert_eq!(
+                    geocode(&searcher, address, None, postcode).as_deref(),
+                    Some("osm:node:3"),
+                    "{address} {postcode:?}"
+                );
+            }
+        }
+        // The building is found by its number, and a flat that does not exist
+        // falls back to it; a unit alone is not a house.
+        assert!(geocode(&searcher, "12 Smith Street", None, None).is_some());
+        assert!(geocode(&searcher, "9/12 Smith Street", None, None).is_some());
+        assert_eq!(geocode(&searcher, "3 Smith Street", None, None), None);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_keeps_numbers_that_are_not_unit_slash_house() {
+        let temp_dir = temp_pack_path("geocode-slash-numbers");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, number, street) in [
+            (1, "10/A", "Via Roma"),
+            (2, "12 1/2", "High Street"),
+            (3, "12-14/3", "Range Street"),
+            (4, "1/2/34", "Multi Street"),
+        ] {
+            let record = address_record(&format!("osm:node:{id}"), "", number, street, None, None);
+            writer.write(&record.into(), None).expect("write");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for (address, id) in [
+            ("10 Via Roma", "osm:node:1"),
+            ("12 High Street", "osm:node:2"),
+            ("12 Range Street", "osm:node:3"),
+            ("2 Multi Street", "osm:node:4"),
+        ] {
+            assert_eq!(
+                geocode(&searcher, address, None, None).as_deref(),
+                Some(id),
+                "{address}"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
