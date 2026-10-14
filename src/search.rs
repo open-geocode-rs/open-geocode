@@ -23,6 +23,10 @@ use tantivy::{
 use crate::{
     labels,
     pack::{PackReader, RecordId, RecordPoint, RecordPointPrecision, RecordSource, RecordSummary},
+    parse::{
+        lattice::{LatticeTagger, Tokens},
+        types::{Label, Tagged},
+    },
     record::{
         AddressComponents, DERIVED_FROM_ADDRESS_RECORDS, Layer, OsmObjectType, PoiRecord, Record,
     },
@@ -30,8 +34,8 @@ use crate::{
     text_index::{
         HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
         TextIndexFields, base_house_number, compact_postcode, expand_address_abbreviations,
-        expand_final_direction, is_direction, is_numeric_token, is_street_type,
-        normalize_index_text, open_text_index, street_search_text,
+        expand_final_direction, is_numeric_token, normalize_index_text, open_text_index,
+        street_search_text,
     },
 };
 
@@ -40,6 +44,8 @@ pub struct PackTextSearcher {
     spatial: SpatialIndexReader,
     reader: IndexReader,
     fields: TextIndexFields,
+    /// Labels the words of a query from the Pack's own dictionaries.
+    tagger: Arc<LatticeTagger>,
     /// The fast fields ranking reads, per segment. The Pack's index never
     /// changes, so they are opened once rather than per query.
     columns: Arc<HashMap<SegmentId, SegmentColumns>>,
@@ -133,6 +139,10 @@ impl PackTextSearcher {
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
         let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
+        let tagger = Arc::new(LatticeTagger::from_container(
+            pack.container(),
+            pack.path(),
+        )?);
         let mut columns = HashMap::new();
         for segment in reader.searcher().segment_readers() {
             let fast_fields = segment.fast_fields();
@@ -151,6 +161,7 @@ impl PackTextSearcher {
             pack,
             reader,
             fields,
+            tagger,
             columns: Arc::new(columns),
         })
     }
@@ -173,8 +184,12 @@ impl PackTextSearcher {
         // run: "8 High Street, Deloraine TAS 7304" answered with the 7018 High
         // Street, 163 km away. Only a stated postcode can reject, so queries
         // that name none are unaffected.
-        let (_, hits) =
-            self.search_variants(query_text, options.layer.as_deref(), limit, |plan, hit| {
+        let (_, hits) = self.search_variants(
+            query_text,
+            &[],
+            options.layer.as_deref(),
+            limit,
+            |plan, hit| {
                 // The forms are the whole context part and the part from its
                 // first word with a digit ("sandybaytas7005", "7005"), so a
                 // hit is contradicted only when no form agrees with it.
@@ -188,7 +203,8 @@ impl PackTextSearcher {
                     }
                 }
                 Ok(false)
-            })?;
+            },
+        )?;
         Ok(hits)
     }
 
@@ -206,29 +222,31 @@ impl PackTextSearcher {
             return Ok(None);
         }
 
-        // The context fields join the query as context, so they rank the
-        // records in the stated area first; the checks below then reject the
-        // records they contradict.
-        let query = [
-            Some(address),
-            options.locality.as_deref(),
-            options.region.as_deref(),
-            options.postcode.as_deref(),
+        // Only the address is parsed: the context fields are already labelled,
+        // and join each plan as context, so they rank the records in the
+        // stated area first; the checks below then reject the records they
+        // contradict.
+        let context = [
+            ContextPart::of(Label::Locality, options.locality.as_deref()),
+            ContextPart::of(Label::Region, options.region.as_deref()),
+            ContextPart::of(Label::Postcode, options.postcode.as_deref()),
         ]
         .into_iter()
         .flatten()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ");
-        let (query, hits) =
-            self.search_variants(&query, options.layer.as_deref(), limit, |plan, hit| {
+        .collect::<Vec<_>>();
+        let (query, hits) = self.search_variants(
+            address,
+            &context,
+            options.layer.as_deref(),
+            limit,
+            |plan, hit| {
                 // A street stands in for a house number it does not have in
                 // search, but a geocoded row needs the address itself.
                 Ok(hit.record.point.is_some()
                     && !(plan.house_number.is_some() && hit.record.layer == Layer::Street.as_str())
                     && self.hit_matches_address_context(hit, &options)?)
-            })?;
+            },
+        )?;
         Ok(hits
             .into_iter()
             .next()
@@ -285,15 +303,16 @@ impl PackTextSearcher {
 
     /// Every identifying word is required: of a record's street when the
     /// query asks for a house number on it, else of what the record is. A
-    /// locality part is required of where it is unless `pass` is lenient; a
-    /// postcode part only adds to the score of the records it matches, since
-    /// a record's tags often state a different postcode than the one written.
+    /// locality part is required of where it is unless `pass` is lenient. A
+    /// region or country part only ranks, since few records state the "ON"
+    /// a query may write, and so does a postcode part, since a record's tags
+    /// often state a different postcode than the one written.
     fn subject_clauses(&self, plan: &QueryPlan, pass: Pass) -> Vec<(Occur, Box<dyn Query>)> {
         let mut clauses = Vec::new();
-        // Without commas a query does not say which of its words place it
-        // ("Riverdale Farm Toronto"), so any of them may name an area. Nor
-        // does one whose localities matched nothing ("Tim Hortons Toronto,
-        // ON").
+        // A query the parser found no places in may still name one
+        // ("Riverdale Farm Toronto" when the Pack does not know Toronto), so
+        // any of its words may name an area. So may one whose localities
+        // matched nothing.
         let anywhere = plan.context.is_empty() || pass == Pass::Lenient;
         for word in &plan.required {
             let what = if plan.house_number.is_some() {
@@ -309,10 +328,10 @@ impl PackTextSearcher {
             clauses.push((Occur::Must, query));
         }
         for part in &plan.context {
-            let clause = if pass.requires_locality() && !is_postcode_part(part) {
-                (Occur::Must, self.locality_part_query(part))
+            let clause = if pass.requires_locality() && part.label == Label::Locality {
+                (Occur::Must, self.locality_part_query(&part.words))
             } else {
-                (Occur::Should, self.context_part_query(part))
+                (Occur::Should, self.context_part_query(&part.words))
             };
             clauses.push(clause);
         }
@@ -465,75 +484,100 @@ impl PackTextSearcher {
         ))
     }
 
-    /// Search the query as the index spells it, then without unit text, then
-    /// both with the number a house number starts with ("407" of "407A"), and
-    /// return the first variant with hits that `accept` keeps. Each [`Pass`]
-    /// runs only when the ones before it found nothing: first the house number
-    /// in the localities the query names, then the number placed between its
-    /// stated neighbours there or a street standing in for it, then anything,
-    /// with the localities only ranking. Fails when the query has no words to
-    /// search.
+    /// Search a plan of each of the parser's best labellings of the query in
+    /// turn, best first, and return the first hits that `accept` keeps.
+    /// `context` joins every plan. A plan is searched as it is and with the
+    /// number its house number starts with ("407" of "407A"), and each
+    /// [`Pass`] runs only when the ones before it found nothing: first the
+    /// house number in the localities the plan names, then the number placed
+    /// between its stated neighbours there or a street standing in for it,
+    /// then anything, with the localities only ranking. The next labelling is
+    /// searched only when every pass of the one before found nothing, so a
+    /// reading that drops what the best one requires never outranks it.
+    /// Fails when the query has no words to search.
     fn search_variants(
         &self,
         query_text: &str,
+        context: &[ContextPart],
         layer: Option<&str>,
         limit: usize,
         mut accept: impl FnMut(&QueryPlan, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
-        let mut variants = search_query_variants(query_text)
-            .into_iter()
-            .filter_map(|variant| Some((QueryPlan::parse(&variant)?, variant)))
-            .collect::<Vec<_>>();
-        let Some((_, last_query)) = variants.last() else {
+        let mut plans = Vec::<QueryPlan>::new();
+        for parsed in self.tagger.parse(query_text) {
+            if let Some(plan) = QueryPlan::from_tagged(&parsed.pieces, context)
+                && !plans.contains(&plan)
+            {
+                plans.push(plan);
+            }
+        }
+        let Some(first_plan) = plans.first() else {
             bail!("failed to parse search query {query_text:?}: it has no words to search");
         };
-        let last_query = last_query.clone();
-        let base_variants = variants
-            .iter()
-            .filter_map(|(plan, variant)| Some((plan.with_base_house_number()?, variant.clone())))
-            .collect::<Vec<_>>();
-        variants.extend(base_variants);
+        let first_query = first_plan.text();
         let query_words: HashSet<String> = normalize_index_text(query_text)
-            .map(|text| text.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_default();
-        for pass in [Pass::Strict, Pass::Street, Pass::Lenient] {
-            for (plan, variant) in &variants {
-                if !pass.searches_anew(plan) {
-                    continue;
-                }
-                let ranking = Ranking {
-                    query_words: query_words.clone(),
-                    house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
-                    numbered: plan.house_number.is_some(),
-                    postcode: plan.postcode(),
-                };
-                let mut hits = Vec::new();
-                if pass == Pass::Street
-                    && layer
-                        .map(str::trim)
-                        .filter(|layer| !layer.is_empty())
-                        .is_none_or(|layer| layer == Layer::Address.as_str())
-                    && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking)?
-                    && accept(plan, &estimate)?
-                {
-                    hits.push(estimate);
-                }
-                let query = self.build_query(plan, pass, layer);
-                for hit in self
-                    .ranked_hits(&query, &ranking, limit)
-                    .with_context(|| format!("failed to search text index for {variant:?}"))?
-                {
-                    if accept(plan, &hit)? {
-                        hits.push(hit);
+            .iter()
+            .flat_map(|text| text.split_whitespace())
+            .map(str::to_string)
+            .chain(context.iter().flat_map(|part| part.words.iter().cloned()))
+            .collect();
+        for plan in plans {
+            let text = plan.text();
+            let base = plan.with_base_house_number();
+            let variants = std::iter::once(plan).chain(base).collect::<Vec<_>>();
+            for pass in [Pass::Strict, Pass::Street, Pass::Lenient] {
+                for plan in &variants {
+                    if !pass.searches_anew(plan) {
+                        continue;
                     }
-                }
-                if !hits.is_empty() {
-                    hits.truncate(limit);
-                    return Ok((variant.clone(), hits));
+                    let hits = self
+                        .search_plan(plan, pass, &query_words, layer, limit, &mut accept)
+                        .with_context(|| format!("failed to search text index for {text:?}"))?;
+                    if !hits.is_empty() {
+                        return Ok((text, hits));
+                    }
                 }
             }
         }
-        Ok((last_query, Vec::new()))
+        Ok((first_query, Vec::new()))
+    }
+
+    /// The hits of one pass over one plan that `accept` keeps, at most
+    /// `limit`.
+    fn search_plan(
+        &self,
+        plan: &QueryPlan,
+        pass: Pass,
+        query_words: &HashSet<String>,
+        layer: Option<&str>,
+        limit: usize,
+        accept: &mut impl FnMut(&QueryPlan, &TextSearchHit) -> Result<bool>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let ranking = Ranking {
+            query_words: query_words.clone(),
+            house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
+            numbered: plan.house_number.is_some(),
+            postcode: plan.postcode(),
+        };
+        let mut hits = Vec::new();
+        if pass == Pass::Street
+            && layer
+                .map(str::trim)
+                .filter(|layer| !layer.is_empty())
+                .is_none_or(|layer| layer == Layer::Address.as_str())
+            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking)?
+            && accept(plan, &estimate)?
+        {
+            hits.push(estimate);
+        }
+        let query = self.build_query(plan, pass, layer);
+        for hit in self.ranked_hits(&query, &ranking, limit)? {
+            if accept(plan, &hit)? {
+                hits.push(hit);
+            }
+        }
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     fn hit_matches_address_context(
@@ -1265,7 +1309,7 @@ impl Pass {
         match self {
             Self::Strict => true,
             Self::Street => plan.house_number.is_some(),
-            Self::Lenient => plan.context.iter().any(|part| !is_postcode_part(part)),
+            Self::Lenient => plan.context.iter().any(|part| !part.is_postcode()),
         }
     }
 }
@@ -1378,76 +1422,116 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
 }
 
-/// A query's words by role. The first comma-separated part with words other
-/// than unit text names what is sought, and its words are required. The
-/// parts after it ("Toronto", "M6G 1B8") place it, and unit text ("unit 602")
-/// and words after the street with digits ("fl36") only rank (see
-/// [`PackTextSearcher::build_query`]).
-#[derive(Debug, Default, PartialEq)]
+/// A query's words by role, from one labelling of its tokens by the address
+/// parser (see [`crate::parse::lattice`]). Street and other words name what
+/// is sought and are required; locality, region, postcode and country words
+/// place it; unit words only rank (see [`PackTextSearcher::build_query`]).
+#[derive(Debug, Clone, Default, PartialEq)]
 struct QueryPlan {
-    /// The leading required word when it reads as a house number ("670",
-    /// "221b", "993_5") and other required words follow.
+    /// The house number the parser read ("670", "221b", "993_5"), when other
+    /// required words name the street it is on.
     house_number: Option<HouseNumber>,
     required: Vec<String>,
     optional: Vec<String>,
-    /// The words of each part after the subject, in order.
-    context: Vec<Vec<String>>,
+    /// Each run of locality, region, postcode or country words, in order.
+    context: Vec<ContextPart>,
+}
+
+/// A run of query words that says where the sought record is.
+#[derive(Debug, Clone, PartialEq)]
+struct ContextPart {
+    /// Locality, region, postcode or country.
+    label: Label,
+    words: Vec<String>,
+}
+
+impl ContextPart {
+    /// The part of a structured field ("Toronto", "M5V 1M9"), `None` when
+    /// it has no words.
+    fn of(label: Label, value: Option<&str>) -> Option<Self> {
+        let words = Tokens::new(value?).words;
+        (!words.is_empty()).then_some(Self { label, words })
+    }
+
+    fn is_postcode(&self) -> bool {
+        self.label == Label::Postcode
+    }
 }
 
 impl QueryPlan {
-    /// Plan a normalized query whose parts are separated by commas.
-    fn parse(query: &str) -> Option<Self> {
-        let parts = query
-            .split(',')
-            .map(|part| part.split_whitespace().collect::<Vec<_>>())
-            .filter(|words| !words.is_empty())
-            .collect::<Vec<_>>();
-        let subject = parts
-            .iter()
-            .position(|words| !split_unit_words(words).0.is_empty())?;
+    /// Plan one labelling of a query's tokens, with `context` (the
+    /// structured fields of a geocoded row) after the parts the labelling
+    /// names. `None` when the query has no words.
+    fn from_tagged(tokens: &[Tagged], context: &[ContextPart]) -> Option<Self> {
         let mut plan = Self::default();
-        for (index, words) in parts.iter().enumerate() {
-            if index > subject && is_unit_part(words) {
-                plan.optional
-                    .extend(words.iter().map(|word| word.to_string()));
-                continue;
-            }
-            let (identifying, unit) = split_unit_words(words);
-            plan.optional.extend(unit);
-            if index == subject {
-                plan.required = identifying;
-            } else if index > subject && !identifying.is_empty() {
-                plan.context.push(identifying);
+        let mut runs = Vec::<(Label, Vec<String>)>::new();
+        for tagged in tokens {
+            match runs.last_mut() {
+                Some((label, words)) if *label == tagged.label => words.push(tagged.token.clone()),
+                _ => runs.push((tagged.label, vec![tagged.token.clone()])),
             }
         }
-        if plan.required.len() > 1
-            && let Some(number) = HouseNumber::parse(&plan.required[0])
-        {
-            plan.house_number = Some(number);
-            plan.required.remove(0);
-        }
-        // The street name ends at its type or direction ("Wellington Street
-        // West"), unless the type leads it ("Highway 7"); words with digits
-        // after that are a unit or floor ("FL36", "G120", a trailing "2").
-        if let Some(end) = plan
-            .required
-            .iter()
-            .enumerate()
-            .position(|(index, word)| index > 0 && (is_street_type(word) || is_direction(word)))
-        {
-            let after = plan.required.split_off(end + 1);
-            for word in after {
-                if word.chars().any(|character| character.is_ascii_digit()) {
-                    plan.optional.push(word);
-                } else {
-                    plan.required.push(word);
+        for (label, words) in runs {
+            match label {
+                Label::HouseNumber if plan.house_number.is_none() => {
+                    // A number written in parts ("993.5", "1384 1/2") is one
+                    // house number; else its first word is.
+                    if let Some(number) = HouseNumber::parse(&words.join("_")) {
+                        plan.house_number = Some(number);
+                    } else if let Some(number) = HouseNumber::parse(&words[0]) {
+                        plan.house_number = Some(number);
+                        plan.optional.extend(words.into_iter().skip(1));
+                    } else {
+                        plan.required.extend(words);
+                    }
+                }
+                Label::HouseNumber | Label::Unit => plan.optional.extend(words),
+                Label::Street | Label::Other => plan.required.extend(
+                    expand_address_abbreviations(&words.join(" "))
+                        .split_whitespace()
+                        .map(str::to_string),
+                ),
+                Label::Locality | Label::Region | Label::Postcode | Label::Country => {
+                    plan.context.push(ContextPart { label, words });
                 }
             }
+        }
+        plan.context.extend(context.iter().cloned());
+        // A query of places only ("Toronto", "Seaforth, Huron East") seeks
+        // the first; a house number alone is sought as a word.
+        if plan.required.is_empty() {
+            if !plan.context.is_empty() {
+                plan.required = plan.context.remove(0).words;
+            } else if let Some(number) = plan.house_number.take() {
+                plan.required = number.text.split_whitespace().map(str::to_string).collect();
+            } else {
+                plan.required = std::mem::take(&mut plan.optional);
+            }
+        }
+        if plan.required.is_empty() {
+            return None;
         }
         if plan.house_number.is_some() {
             expand_final_direction(&mut plan.required);
         }
         Some(plan)
+    }
+
+    /// The plan as text: the house number, the words it seeks, then each
+    /// context part after a comma.
+    fn text(&self) -> String {
+        let subject = self
+            .house_number
+            .iter()
+            .map(|number| number.text.as_str())
+            .chain(self.required.iter().map(String::as_str))
+            .chain(self.optional.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::iter::once(subject)
+            .chain(self.context.iter().map(|part| part.words.join(" ")))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The plan with the number its house number starts with in place of a
@@ -1463,23 +1547,22 @@ impl QueryPlan {
                 text: number.base.to_string(),
                 base: number.base,
             }),
-            required: self.required.clone(),
-            optional: self.optional.clone(),
-            context: self.context.clone(),
+            ..self.clone()
         })
     }
 
     /// The postcode the first postcode part names.
     fn postcode(&self) -> QueryPostcode {
-        let Some(part) = self.context.iter().find(|part| is_postcode_part(part)) else {
+        let Some(part) = self.context.iter().find(|part| part.is_postcode()) else {
             return QueryPostcode::default();
         };
-        let first_digit = part
+        let words = &part.words;
+        let first_digit = words
             .iter()
             .position(|word| word.chars().any(|character| character.is_ascii_digit()))
             .unwrap_or_default();
         QueryPostcode {
-            forms: unique_strings(vec![part.concat(), part[first_digit..].concat()]),
+            forms: unique_strings(vec![words.concat(), words[first_digit..].concat()]),
         }
     }
 }
@@ -1494,7 +1577,7 @@ struct HouseNumber {
 
 impl HouseNumber {
     /// Digits with at most one letter after them: "670", "221b", but not
-    /// "1st". A fraction joined by [`join_fractional_house_number`] reads as
+    /// "1st". The parts of a number written in parts, joined by "_", read as
     /// one ("993_5").
     fn parse(word: &str) -> Option<Self> {
         let digits = word.trim_end_matches(|character: char| character.is_alphabetic());
@@ -1515,174 +1598,6 @@ impl HouseNumber {
     fn plain(&self) -> Option<u32> {
         is_numeric_token(&self.text).then_some(self.base)
     }
-}
-
-/// A context part with a digit names a postcode ("M6G 1B8", "SW1A", "10115"),
-/// not a locality.
-fn is_postcode_part(part: &[String]) -> bool {
-    part.iter()
-        .any(|word| word.chars().any(|character| character.is_ascii_digit()))
-}
-
-/// A comma-separated part that is a unit designator and its value, though the
-/// value has no digit ("unit b", "suite b"). The short designators "ste",
-/// "fl" and "rm" also abbreviate place names (Sainte, Florida), so only they
-/// need a digit to be read as a unit.
-fn is_unit_part<T: AsRef<str>>(words: &[T]) -> bool {
-    let [designator, value] = words else {
-        return false;
-    };
-    let designator = designator.as_ref();
-    is_unit_designator(designator)
-        && (is_unit_value_token(value.as_ref()) || !matches!(designator, "ste" | "fl" | "rm"))
-}
-
-/// Words that identify a place, and unit text: a unit designator followed by
-/// a value with a digit ("unit 602", "suite 4b").
-fn split_unit_words(words: &[&str]) -> (Vec<String>, Vec<String>) {
-    let mut identifying = Vec::new();
-    let mut unit = Vec::new();
-    let mut index = 0;
-    while index < words.len() {
-        if is_unit_designator(words[index])
-            && words
-                .get(index + 1)
-                .is_some_and(|value| is_unit_value_token(value))
-        {
-            unit.extend([words[index].to_string(), words[index + 1].to_string()]);
-            index += 2;
-        } else {
-            identifying.push(words[index].to_string());
-            index += 1;
-        }
-    }
-    (identifying, unit)
-}
-
-/// The query as the index spells it (normalized, abbreviations expanded),
-/// then without unit text, each keeping its comma-separated parts.
-fn search_query_variants(query_text: &str) -> Vec<String> {
-    let Some(expanded) = map_query_parts(query_text, |part| {
-        let (number, rest) = join_fractional_house_number(part);
-        let rest = normalize_index_text(rest).map(|rest| expand_address_abbreviations(&rest));
-        match (number, rest) {
-            (Some(number), Some(rest)) => Some(format!("{number} {rest}")),
-            (number, rest) => number.or(rest),
-        }
-    }) else {
-        return Vec::new();
-    };
-    let without_unit = expanded
-        .split(',')
-        .enumerate()
-        .filter(|(index, part)| {
-            *index == 0 || !is_unit_part(&part.split_whitespace().collect::<Vec<_>>())
-        })
-        .filter_map(|(_, part)| strip_unit_terms(part))
-        .collect::<Vec<_>>();
-    unique_strings(
-        [
-            Some(expanded),
-            (!without_unit.is_empty()).then(|| without_unit.join(", ")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-    )
-}
-
-/// A part that starts with a house number with a fraction ("993.5 Bloor",
-/// "1384 1/2 Queen"), split into the number as one word, its parts joined by
-/// "_" ("993_5", which [`HouseNumber::parse`] reads), and the rest of the
-/// part. Normalizing would split the number into two.
-fn join_fractional_house_number(part: &str) -> (Option<String>, &str) {
-    let trimmed = part.trim_start();
-    let digits = |text: &str| {
-        text.find(|character: char| !character.is_ascii_digit())
-            .unwrap_or(text.len())
-    };
-    let whole = digits(trimmed);
-    let after = &trimmed[whole..];
-    let fraction = if let Some(decimals) = after.strip_prefix('.') {
-        let count = digits(decimals);
-        (count > 0).then(|| (decimals[..count].to_string(), &decimals[count..]))
-    } else {
-        let spaced = after.trim_start();
-        let numerator = digits(spaced);
-        spaced[numerator..]
-            .strip_prefix('/')
-            .and_then(|denominator| {
-                let count = digits(denominator);
-                (numerator > 0 && count > 0 && spaced.len() < after.len()).then(|| {
-                    (
-                        format!("{}_{}", &spaced[..numerator], &denominator[..count]),
-                        &denominator[count..],
-                    )
-                })
-            })
-    };
-    match fraction {
-        Some((fraction, rest))
-            if whole > 0 && rest.chars().next().is_none_or(char::is_whitespace) =>
-        {
-            (Some(format!("{}_{fraction}", &trimmed[..whole])), rest)
-        }
-        _ => (None, part),
-    }
-}
-
-/// Apply `map` to each comma-separated part of a query, dropping the parts it
-/// empties. `None` when no part is left.
-fn map_query_parts(query: &str, map: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let parts = query.split(',').filter_map(&map).collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn strip_unit_terms(value: &str) -> Option<String> {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
-    let mut stripped = Vec::with_capacity(tokens.len());
-    let mut index = 0;
-    while index < tokens.len() {
-        if is_unit_designator(tokens[index]) {
-            index += 1;
-            if index < tokens.len() && is_unit_value_token(tokens[index]) {
-                index += 1;
-            }
-            continue;
-        }
-        stripped.push(tokens[index]);
-        index += 1;
-    }
-
-    if stripped.len() > 2 && is_numeric_token(stripped[0]) && is_numeric_token(stripped[1]) {
-        stripped.remove(0);
-    }
-
-    let stripped = stripped.join(" ");
-    (!stripped.is_empty()).then_some(stripped)
-}
-
-fn is_unit_designator(token: &str) -> bool {
-    matches!(
-        token,
-        "apt"
-            | "apartment"
-            | "bldg"
-            | "building"
-            | "dept"
-            | "department"
-            | "fl"
-            | "floor"
-            | "rm"
-            | "room"
-            | "ste"
-            | "suite"
-            | "unit"
-    )
-}
-
-fn is_unit_value_token(token: &str) -> bool {
-    token.chars().any(|character| character.is_ascii_digit())
 }
 
 fn normalized_for_match(value: Option<&str>) -> Option<String> {
@@ -1737,27 +1652,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn search_query_variants_expand_common_address_abbreviations() {
-        let variants = search_query_variants("33 Princess St Suite 170");
-        assert!(variants.contains(&"33 princess street suite 170".to_string()));
-        assert!(variants.contains(&"33 princess street".to_string()));
-    }
-
-    #[test]
-    fn search_query_variants_strip_leading_unit_numbers() {
-        let variants = search_query_variants("306-1333 Sheppard Ave E");
-        assert!(variants.contains(&"306 1333 sheppard avenue east".to_string()));
-        assert!(variants.contains(&"1333 sheppard avenue east".to_string()));
-    }
-
-    #[test]
-    fn search_query_variants_do_not_treat_initial_saint_as_street() {
-        let variants = search_query_variants("St Clair Ave W");
-        assert!(variants.contains(&"st clair avenue west".to_string()));
-        assert!(!variants.contains(&"street clair avenue west".to_string()));
-    }
 
     #[test]
     fn equal_scores_prefer_the_closest_label_then_points_then_lower_ids() {
@@ -3069,60 +2963,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// Tokens labelled as the parser labels them, written `word/label`.
+    fn tagged(text: &str) -> Vec<Tagged> {
+        text.split_whitespace()
+            .map(|pair| {
+                let (token, label) = pair.split_once('/').expect("word/label");
+                Tagged {
+                    token: token.to_string(),
+                    label: Label::from_name(label).expect("label"),
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn plans_units_floors_directions_and_fractions() {
-        let plan = |query: &str| {
-            let variants = search_query_variants(query);
-            QueryPlan::parse(&variants[0]).expect("plan")
-        };
+    fn plans_numbers_units_streets_and_places_from_labelled_tokens() {
+        let plan = |text: &str| QueryPlan::from_tagged(&tagged(text), &[]).expect("plan");
         let words = |words: &[&str]| {
             words
                 .iter()
                 .map(|word| word.to_string())
                 .collect::<Vec<_>>()
         };
+        let part = |label: Label, words: &[&str]| ContextPart {
+            label,
+            words: words.iter().map(|word| word.to_string()).collect(),
+        };
 
-        let floor = plan("79 Wellington St W FL36, Toronto");
+        let floor =
+            plan("79/house_number wellington/street st/street w/street fl36/unit toronto/locality");
+        assert_eq!(floor.house_number.expect("number").text, "79");
         assert_eq!(floor.required, words(&["wellington", "street", "west"]));
         assert_eq!(floor.optional, words(&["fl36"]));
-        assert_eq!(plan("6628 Finch Ave W 1").optional, words(&["1"]));
-        // A street type that leads the name is followed by the name.
-        assert_eq!(plan("1000 Highway 7").required, words(&["highway", "7"]));
-        assert_eq!(
-            plan("Highway 7, Markham").required,
-            words(&["highway", "7"])
-        );
+        assert_eq!(floor.context, [part(Label::Locality, &["toronto"])]);
 
-        let query = "283 Morningside Ave, Unit-B, Toronto";
-        let unit = plan(query);
-        assert_eq!(unit.context, vec![words(&["toronto"])]);
-        assert_eq!(unit.optional, words(&["unit", "b"]));
+        // Unit text only ranks, before or after the address.
+        let unit = plan(
+            "unit/unit 602/unit 670/house_number king/street st/street w/street \
+             toronto/locality on/region m5v/postcode 1m9/postcode",
+        );
+        assert_eq!(unit.optional, words(&["unit", "602"]));
         assert_eq!(
-            search_query_variants(query),
-            vec![
-                "283 morningside avenue, unit b, toronto",
-                "283 morningside avenue, toronto"
+            unit.context,
+            [
+                part(Label::Locality, &["toronto"]),
+                part(Label::Region, &["on"]),
+                part(Label::Postcode, &["m5v", "1m9"]),
             ]
         );
-        // "Ste" also abbreviates Sainte.
+        assert_eq!(unit.postcode().forms, ["m5v1m9"]);
         assert_eq!(
-            plan("10 Rue Principale, Ste Foy").context,
-            vec![words(&["ste", "foy"])]
+            unit.text(),
+            "670 king street west unit 602, toronto, on, m5v 1m9"
+        );
+        assert_eq!(
+            plan("306/unit 1333/house_number sheppard/street ave/street e/street")
+                .house_number
+                .expect("number")
+                .text,
+            "1333"
         );
 
+        // A street type that leads the name keeps the number after it, and
+        // an initial "st" is Saint.
         assert_eq!(
-            plan("15 THE DONWAY E").required,
+            plan("1000/house_number highway/street 7/street").required,
+            words(&["highway", "7"])
+        );
+        assert_eq!(
+            plan("st/street clair/street ave/street w/street").required,
+            words(&["st", "clair", "avenue", "west"])
+        );
+        assert_eq!(
+            plan("15/house_number the/street donway/street e/street").required,
             words(&["the", "donway", "east"])
         );
+        // A street named first, its number after it.
+        let german = plan("maximilianstr/street 5/house_number münchen/locality");
+        assert_eq!(german.house_number.expect("number").text, "5");
+        assert_eq!(german.required, words(&["maximilianstr"]));
 
-        for (query, text, base) in [
-            ("993.5 Bloor St W", "993 5", 993),
-            ("1384 1/2 Queen St E", "1384 1 2", 1384),
-            ("407A Yonge St", "407a", 407),
+        for (text, number, base) in [
+            (
+                "993/house_number 5/house_number bloor/street st/street",
+                "993 5",
+                993,
+            ),
+            (
+                "1384/house_number 1/house_number 2/house_number queen/street",
+                "1384 1 2",
+                1384,
+            ),
+            ("407a/house_number yonge/street st/street", "407a", 407),
         ] {
-            let plan = plan(query);
-            let number = plan.house_number.as_ref().expect("number");
-            assert_eq!((number.text.as_str(), number.base), (text, base), "{query}");
+            let plan = plan(text);
+            let house = plan.house_number.as_ref().expect("number");
+            assert_eq!((house.text.as_str(), house.base), (number, base), "{text}");
             let fallback = plan.with_base_house_number().expect("fallback");
             assert_eq!(
                 fallback.house_number.expect("number").text,
@@ -3130,13 +3066,29 @@ mod tests {
             );
         }
         assert_eq!(
-            plan("306-1333 Sheppard Ave E")
-                .house_number
-                .expect("n")
-                .text,
-            "306"
+            plan("10/house_number king/street st/street").with_base_house_number(),
+            None
         );
-        assert_eq!(plan("10 King St").with_base_house_number(), None);
+        // A number in parts that is no number keeps its first word.
+        let lettered = plan("221/house_number b/house_number baker/street street/street");
+        assert_eq!(lettered.house_number.expect("number").text, "221");
+        assert_eq!(lettered.optional, words(&["b"]));
+
+        // A query of places seeks the first of them, and a structured
+        // field joins after the parsed parts.
+        let places = QueryPlan::from_tagged(
+            &tagged("seaforth/locality huron/locality east/locality"),
+            &[part(Label::Region, &["ontario"])],
+        )
+        .expect("plan");
+        assert_eq!(places.required, words(&["seaforth", "huron", "east"]));
+        assert_eq!(places.context, [part(Label::Region, &["ontario"])]);
+        let number = plan("670/house_number");
+        assert_eq!(
+            (number.house_number, number.required),
+            (None, words(&["670"]))
+        );
+        assert!(QueryPlan::from_tagged(&[], &[]).is_none());
     }
 
     #[test]

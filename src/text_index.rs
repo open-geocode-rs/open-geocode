@@ -891,14 +891,6 @@ fn direction_word(abbreviation: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether an expanded word is a direction.
-pub(crate) fn is_direction(word: &str) -> bool {
-    matches!(
-        word,
-        "east" | "north" | "south" | "west" | "northeast" | "northwest" | "southeast" | "southwest"
-    )
-}
-
 /// Whether an expanded word is a street type ("street", "avenue").
 pub(crate) fn is_street_type(word: &str) -> bool {
     matches!(
