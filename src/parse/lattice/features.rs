@@ -96,7 +96,10 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("phrase_before", &PHRASE_KINDS),
     ("phrase_after", &PHRASE_KINDS),
     ("chain", &["2", "3", "4+", "with_region"]),
-    ("grounding", &["no_area", "no_postcode"]),
+    (
+        "grounding",
+        &["no_locality", "no_region", "no_country", "no_postcode"],
+    ),
 ];
 
 /// The kinds of vocabulary phrase, in the order of
@@ -253,7 +256,7 @@ const fn offset(block: Block) -> u32 {
 }
 
 /// Feature ids of the named blocks.
-const NAMED: usize = offset(Block::Grounding) as usize + 2;
+const NAMED: usize = offset(Block::Grounding) as usize + 4;
 /// The lengths of the hashed affixes.
 const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
 /// Buckets of each affix block: one per side and length.
@@ -286,26 +289,33 @@ pub(super) fn chain_region() -> u32 {
     id(Block::Chain, 3)
 }
 
-/// Say whether the Pack explains `span` as what a closed-class label names.
-/// A locality, region or country is a place the Pack knows and a postcode
-/// is a pattern some country uses, so a span is one only when the Pack
-/// explains it: an area name of the span, exactly or within a few edits,
-/// or a chain of area names, and a postcode pattern match. `grounding`
-/// features mark the spans the Pack does not explain, and their weights,
-/// one per label, say how unlikely a closed-class label is there.
+/// Say what the Pack does not explain `span` as, of the closed-class
+/// labels. A locality, region or country is a place the Pack knows and a
+/// postcode is a pattern some country uses, so a span is one only when the
+/// Pack explains it: a name of that field, exactly or within a few edits (a
+/// locality also as a chain of area names), or a postcode pattern match.
+/// `grounding` features mark what the Pack does not explain, and their
+/// weights, one per label, say how unlikely each label is there.
 pub(super) fn ground(span: &mut Span) {
-    let areas = offset(Block::DictDistance)..offset(Block::DictDistance) + 9;
+    let distance = |field: Field| {
+        let index = field_index(field).expect("a name field") as u32;
+        let first = offset(Block::DictDistance) + 3 * index;
+        first..first + 3
+    };
     let chains = offset(Block::Chain)..offset(Block::Chain) + 3;
     let postcodes = offset(Block::PostcodeAny)..offset(Block::PostcodeAny) + 3;
     let has =
-        |range: &std::ops::Range<u32>| span.features.iter().any(|feature| range.contains(feature));
-    let area = has(&areas) || has(&chains);
-    let postcode = has(&postcodes);
-    if !area {
-        span.features.push(id(Block::Grounding, 0));
-    }
-    if !postcode {
-        span.features.push(id(Block::Grounding, 1));
+        |range: std::ops::Range<u32>| span.features.iter().any(|feature| range.contains(feature));
+    let explained = [
+        has(distance(Field::Locality)) || has(chains),
+        has(distance(Field::Region)),
+        has(distance(Field::Country)),
+        has(postcodes),
+    ];
+    for (index, explained) in explained.into_iter().enumerate() {
+        if !explained {
+            span.features.push(id(Block::Grounding, index));
+        }
     }
 }
 
@@ -725,6 +735,7 @@ mod tests {
         assert_eq!(unique.len(), COUNT);
         assert_eq!(name(0), "bias:bias");
         assert_eq!(name(NAMED as u32 - 1), "grounding:no_postcode");
+        assert_eq!(name(NAMED as u32 - 4), "grounding:no_locality");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
         assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
         assert_eq!(

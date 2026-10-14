@@ -119,14 +119,16 @@ fn spans_the_pack_does_not_explain_as_places_or_postcodes_say_so() {
             .expect("span")
             .features
     };
-    let (no_area, no_postcode) = (
-        by_name("grounding:no_area"),
-        by_name("grounding:no_postcode"),
-    );
-    assert!(features(1, 2).contains(&no_area) && features(1, 2).contains(&no_postcode));
-    assert!(!features(2, 3).contains(&no_area), "a known locality");
+    let [no_locality, no_region, no_country, no_postcode] =
+        ["no_locality", "no_region", "no_country", "no_postcode"]
+            .map(|name| by_name(&format!("grounding:{name}")));
+    for feature in [no_locality, no_region, no_country, no_postcode] {
+        assert!(features(1, 2).contains(&feature));
+    }
+    assert!(!features(2, 3).contains(&no_locality), "a known locality");
+    assert!(features(2, 3).contains(&no_region), "but no region");
     assert!(!features(3, 5).contains(&no_postcode), "a postcode pattern");
-    assert!(features(3, 5).contains(&no_area));
+    assert!(features(3, 5).contains(&no_locality));
 }
 
 #[test]

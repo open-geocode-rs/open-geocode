@@ -257,10 +257,9 @@ impl Weights {
         set("joined:hyphen_after", &[(Unit, 1.5), (HouseNumber, -0.5)]);
         set("joined:hyphen_before", &[(HouseNumber, 0.5)]);
         // A place or postcode the Pack does not explain is seldom one.
-        set(
-            "grounding:no_area",
-            &[(Locality, -0.5), (Region, -1.0), (Country, -1.0)],
-        );
+        set("grounding:no_locality", &[(Locality, -0.5)]);
+        set("grounding:no_region", &[(Region, -1.0)]);
+        set("grounding:no_country", &[(Country, -1.0)]);
         set("grounding:no_postcode", &[(Postcode, -1.0)]);
         for (tokens, value) in [("1", 3.0), ("2", 4.0), ("3", 4.0)] {
             set(&format!("postcode_any:{tokens}"), &[(Postcode, value)]);
