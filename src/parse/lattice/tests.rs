@@ -572,3 +572,31 @@ fn glued_area_names_are_a_chain() {
             .all(|span| !span.features.contains(&by_name("chain:2")))
     );
 }
+
+/// The median time to tag a 10-token Latin query on a real Pack:
+/// `OG_PARSE_PACK=data/packs/jp cargo test --release tag_latency -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs a Pack in OG_PARSE_PACK"]
+fn tag_latency_on_a_pack() {
+    let pack = std::env::var("OG_PARSE_PACK").expect("OG_PARSE_PACK");
+    let tagger = LatticeTagger::open(Path::new(&pack)).expect("pack");
+    println!("{:?}", tagger.dictionaries());
+    let query = "Unit 602, 670 King Street West, Toronto, ON M5V 1M9";
+    assert_eq!(Tokens::new(query).len(), 10);
+    for _ in 0..200 {
+        tagger.tag(query);
+    }
+    let mut times = (0..2_000)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            std::hint::black_box(tagger.tag(query));
+            started.elapsed().as_secs_f64() * 1e6
+        })
+        .collect::<Vec<_>>();
+    times.sort_by(f64::total_cmp);
+    println!(
+        "median {:.0} us, p90 {:.0} us",
+        times[times.len() / 2],
+        times[times.len() * 9 / 10]
+    );
+}
