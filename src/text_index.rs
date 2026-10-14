@@ -818,6 +818,34 @@ pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
     }
 }
 
+/// Street-type abbreviations and the words they stand for, in normalized
+/// text. A word's first abbreviation here is its usual one.
+pub(crate) const STREET_TYPE_ABBREVIATIONS: &[(&str, &str)] = &[
+    ("ave", "avenue"),
+    ("av", "avenue"),
+    ("blvd", "boulevard"),
+    ("cir", "circle"),
+    ("ct", "court"),
+    ("crt", "court"),
+    ("cres", "crescent"),
+    ("gdns", "gardens"),
+    ("grv", "grove"),
+    ("hts", "heights"),
+    ("dr", "drive"),
+    ("hwy", "highway"),
+    ("ln", "lane"),
+    ("pkwy", "parkway"),
+    ("pl", "place"),
+    ("rd", "road"),
+    ("sq", "square"),
+    ("st", "street"),
+    ("ter", "terrace"),
+    ("terr", "terrace"),
+    ("trl", "trail"),
+    ("tr", "trail"),
+    ("wy", "way"),
+];
+
 /// Expand the common abbreviations of street types and of directions that
 /// follow a street type, in normalized text: "king st w" becomes "king street
 /// west". Indexed text and queries are expanded alike, so either spelling
@@ -828,27 +856,18 @@ pub(crate) fn expand_address_abbreviations(value: &str) -> String {
     let mut expanded: Vec<&str> = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
         let replacement = match *token {
-            "ave" | "av" => Some("avenue"),
-            "blvd" => Some("boulevard"),
-            "cir" => Some("circle"),
-            "ct" | "crt" => Some("court"),
-            "cres" => Some("crescent"),
-            "gdns" => Some("gardens"),
-            "grv" => Some("grove"),
-            "hts" => Some("heights"),
-            "dr" => Some("drive"),
-            "hwy" => Some("highway"),
-            "ln" => Some("lane"),
-            "pkwy" => Some("parkway"),
-            "pl" => Some("place"),
-            "rd" => Some("road"),
-            "sq" => Some("square"),
-            "st" if index > 0 && !is_numeric_token(tokens[index - 1]) => Some("street"),
-            "ter" | "terr" => Some("terrace"),
-            "trl" | "tr" => Some("trail"),
-            "wy" => Some("way"),
-            _ if expanded.last().is_some_and(|word| is_street_type(word)) => direction_word(token),
-            _ => None,
+            "st" if index == 0 || is_numeric_token(tokens[index - 1]) => None,
+            _ => STREET_TYPE_ABBREVIATIONS
+                .iter()
+                .find(|(abbreviation, _)| abbreviation == token)
+                .map(|(_, word)| *word)
+                .or_else(|| {
+                    expanded
+                        .last()
+                        .is_some_and(|word| is_street_type(word))
+                        .then(|| direction_word(token))
+                        .flatten()
+                }),
         };
         expanded.push(replacement.unwrap_or(*token));
     }
@@ -877,7 +896,7 @@ pub(crate) fn expand_final_direction(words: &mut [String]) {
     }
 }
 
-fn direction_word(abbreviation: &str) -> Option<&'static str> {
+pub(crate) fn direction_word(abbreviation: &str) -> Option<&'static str> {
     Some(match abbreviation {
         "e" => "east",
         "n" => "north",
