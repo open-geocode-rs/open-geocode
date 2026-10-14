@@ -621,6 +621,10 @@ impl LatticeTagger {
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
         let runs = units.runs();
         let phrases = Phrases::new(self, &units, longest);
+        // Exact area names, `(start, end, is a region)`, and the glued
+        // spans without other evidence, which may be chains of them.
+        let mut areas = Vec::new();
+        let mut glued_spans = Vec::new();
         for start in 0..tokens.len() {
             for end in start + 1..=(start + longest).min(tokens.len()) {
                 if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
@@ -651,6 +655,9 @@ impl LatticeTagger {
                     }
                     if let Some(hit) = self.lookup(field, &mut key) {
                         evidence = true;
+                        if hit.distance == 0 && Field::AREAS.contains(&field) {
+                            areas.push((start, end, field == Field::Region));
+                        }
                         set.dictionary_hit(field, &hit, key.key.chars().count());
                         if end - start > 1 {
                             for (unit, cover) in covers[start..end].iter_mut().enumerate() {
@@ -683,7 +690,27 @@ impl LatticeTagger {
                 }
                 if evidence {
                     spans.push(set.into_span());
+                } else if glued {
+                    glued_spans.push(set);
                 }
+            }
+        }
+        // A glued span that is two or more area names written one after
+        // the other ("横浜市西区") is an edge with the chain it is.
+        let chains = Chains::new(&areas);
+        for span in spans.iter_mut() {
+            if let Some(chain) = chains.of(&units, span.start, span.end) {
+                span.features.push(features::chain_feature(chain));
+                if chain.region {
+                    span.features.push(features::chain_region());
+                }
+            }
+        }
+        for mut set in glued_spans {
+            let (start, end) = set.range();
+            if let Some(chain) = chains.of(&units, start, end) {
+                set.chain(chain.pieces, chain.region);
+                spans.push(set.into_span());
             }
         }
         for (unit, bits) in covers.into_iter().enumerate() {
@@ -697,6 +724,9 @@ impl LatticeTagger {
         for &(start, end) in runs.iter().filter(|(start, end)| end - start > longest) {
             let mut set = FeatureSet::new(tokens, &infos, start, end);
             set.affixes(&units.key(start, end));
+            if let Some(chain) = chains.of(&units, start, end) {
+                set.chain(chain.pieces, chain.region);
+            }
             spans.push(set.into_span());
         }
         let candidates = countries.top(MAX_CANDIDATE_COUNTRIES, &self.weights);
@@ -785,6 +815,62 @@ pub fn pack_file(pack: &Path) -> Result<PathBuf> {
         .filter(|name| *name == PACK_FILE)
         .context("not a Pack file")?;
     Ok(path)
+}
+
+/// A span that is area names written one after the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Chain {
+    /// How many names, two or more.
+    pub pieces: usize,
+    /// Whether one of them is a region name.
+    pub region: bool,
+}
+
+/// The exact area names of a query, to find the glued spans that are two or
+/// more of them with no break between them.
+struct Chains {
+    /// `(end, is a region)` of the area names starting at each unit.
+    from: HashMap<usize, Vec<(usize, bool)>>,
+}
+
+impl Chains {
+    fn new(areas: &[(usize, usize, bool)]) -> Self {
+        let mut from = HashMap::<usize, Vec<(usize, bool)>>::new();
+        for &(start, end, region) in areas {
+            from.entry(start).or_default().push((end, region));
+        }
+        Self { from }
+    }
+
+    /// The chain `start..end` is: the most names that cover it end to end,
+    /// when that is two or more and the span is glued.
+    fn of(&self, units: &Units, start: usize, end: usize) -> Option<Chain> {
+        if end - start < 2 || self.from.is_empty() || !units.unspaced(start, end) {
+            return None;
+        }
+        // best[offset]: the most names covering start..start + offset, and
+        // whether one is a region.
+        let mut best: Vec<Option<(usize, bool)>> = vec![None; end - start + 1];
+        best[0] = Some((0, false));
+        for at in start..end {
+            let Some((pieces, region)) = best[at - start] else {
+                continue;
+            };
+            for &(to, is_region) in self.from.get(&at).into_iter().flatten() {
+                if to > end {
+                    continue;
+                }
+                let next = (pieces + 1, region || is_region);
+                let cell = &mut best[to - start];
+                if cell.is_none_or(|cell| next > cell) {
+                    *cell = Some(next);
+                }
+            }
+        }
+        best[end - start]
+            .filter(|(pieces, _)| *pieces >= 2)
+            .map(|(pieces, region)| Chain { pieces, region })
+    }
 }
 
 /// The vocabulary phrases of a query's units (see [`Field::PHRASES`]): the

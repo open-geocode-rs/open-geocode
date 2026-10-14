@@ -540,3 +540,35 @@ fn vocabulary_phrases_are_spans_and_tell_their_neighbours() {
     assert!(has(&lattice, 0, 3, "phrase:po_box"));
     assert!(has(&lattice, 3, 4, "phrase_before:po_box"));
 }
+
+#[test]
+fn glued_area_names_are_a_chain() {
+    let dictionaries = Dictionaries::from_entries([
+        (Field::Region, "神奈川県", entry(100, "JP")),
+        (Field::Locality, "横浜市", entry(50, "JP")),
+        (Field::Locality, "西区", entry(10, "JP")),
+    ]);
+    let tagger = LatticeTagger::new(dictionaries, Weights::zero());
+    let lattice = tagger.lattice(&Tokens::new("神奈川県横浜市西区"), &Suppression::default());
+    let features = |start: usize, end: usize| {
+        lattice
+            .spans
+            .iter()
+            .find(|span| span.start == start && span.end == end)
+            .map(|span| span.features.clone())
+            .unwrap_or_default()
+    };
+    assert!(features(0, 9).contains(&by_name("chain:3")));
+    assert!(features(0, 9).contains(&by_name("chain:with_region")));
+    // Two locality names glued: an edge only because it is a chain.
+    assert!(features(4, 9).contains(&by_name("chain:2")));
+    assert!(!features(4, 9).contains(&by_name("chain:with_region")));
+    // Written apart, the names are no chain.
+    let lattice = tagger.lattice(&Tokens::new("横浜市, 西区"), &Suppression::default());
+    assert!(
+        lattice
+            .spans
+            .iter()
+            .all(|span| !span.features.contains(&by_name("chain:2")))
+    );
+}

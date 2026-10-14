@@ -95,6 +95,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("phrase", &PHRASE_KINDS),
     ("phrase_before", &PHRASE_KINDS),
     ("phrase_after", &PHRASE_KINDS),
+    ("chain", &["2", "3", "4+", "with_region"]),
 ];
 
 /// The kinds of vocabulary phrase, in the order of
@@ -236,6 +237,7 @@ enum Block {
     Phrase,
     PhraseBefore,
     PhraseAfter,
+    Chain,
 }
 
 const fn offset(block: Block) -> u32 {
@@ -249,7 +251,7 @@ const fn offset(block: Block) -> u32 {
 }
 
 /// Feature ids of the named blocks.
-const NAMED: usize = offset(Block::PhraseAfter) as usize + PHRASE_KINDS.len();
+const NAMED: usize = offset(Block::Chain) as usize + 4;
 /// The lengths of the hashed affixes.
 const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
 /// Buckets of each affix block: one per side and length.
@@ -270,6 +272,16 @@ pub(super) fn cover(field: Field, begins: bool) -> Option<u32> {
 /// The id of the first dict_cover feature.
 pub(super) const fn cover_base() -> u32 {
     offset(Block::DictCover)
+}
+
+/// The feature of a chain of `chain.pieces` area names.
+pub(super) fn chain_feature(chain: super::Chain) -> u32 {
+    id(Block::Chain, chain.pieces.clamp(2, 4) - 2)
+}
+
+/// The feature of a chain one of whose names is a region.
+pub(super) fn chain_region() -> u32 {
+    id(Block::Chain, 3)
 }
 
 fn field_index(field: Field) -> Option<usize> {
@@ -607,6 +619,21 @@ impl FeatureSet {
         }
     }
 
+    /// The span is `pieces` area names glued one after the other, one of
+    /// them a region when `region`.
+    pub fn chain(&mut self, pieces: usize, region: bool) {
+        self.features
+            .push(chain_feature(super::Chain { pieces, region }));
+        if region {
+            self.features.push(chain_region());
+        }
+    }
+
+    /// The units the span covers.
+    pub fn range(&self) -> (usize, usize) {
+        (self.start, self.end)
+    }
+
     /// The span is one number written in parts: "993.5", "1384 1/2".
     pub fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
@@ -670,7 +697,7 @@ mod tests {
         let unique = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), COUNT);
         assert_eq!(name(0), "bias:bias");
-        assert_eq!(name(NAMED as u32 - 1), "phrase_after:directional");
+        assert_eq!(name(NAMED as u32 - 1), "chain:with_region");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
         assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
         assert_eq!(

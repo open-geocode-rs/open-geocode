@@ -111,6 +111,8 @@ impl Field {
         Field::Country,
         Field::Poi,
     ];
+    /// The fields of names of the areas a record lies in.
+    pub const AREAS: [Field; 3] = [Field::Locality, Field::Region, Field::Country];
     /// The fields of vocabulary phrases a span of a query can be: words
     /// that say what the words beside them are.
     pub const PHRASES: [Field; 6] = [

@@ -619,7 +619,7 @@ const NUMERAL_SHARE: f64 = 0.1;
 const ISLAND_SHARE: f64 = 0.35;
 /// Share of rows of addresses that state several areas that write them as
 /// one locality field (see [`chained_areas`]).
-const CHAIN_SHARE: f64 = 0.3;
+const CHAIN_SHARE: f64 = 0.5;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
