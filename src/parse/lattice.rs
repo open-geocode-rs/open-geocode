@@ -285,6 +285,25 @@ pub fn is_numeral(character: char) -> bool {
     character.is_numeric() || numeral_value(character).is_some()
 }
 
+/// `key` with each run of numerals written as `#`, the form numbered areas
+/// of one kind share ("#丁目" of "5丁目" and "四丁目", "sector #"), or
+/// `None` when it has no numeral or nothing but numerals.
+pub fn mask_numerals(key: &str) -> Option<String> {
+    let mut masked = String::with_capacity(key.len());
+    let mut numbered = false;
+    for character in key.chars() {
+        if is_numeral(character) {
+            if !masked.ends_with('#') {
+                masked.push('#');
+            }
+            numbered = true;
+        } else {
+            masked.push(character);
+        }
+    }
+    (numbered && masked.chars().any(char::is_alphabetic)).then_some(masked)
+}
+
 /// The key a name is stored under in the parser's dictionaries: its
 /// normalized words as [`Units`], glued as a query's are, so a name written
 /// with spaces between characters of a script without spaces
@@ -651,9 +670,10 @@ impl LatticeTagger {
     }
 
     /// Whether `path` reads its query as one address can be written: each
-    /// of the country, the region and the postcode is one field at most, and
-    /// the places it names that the Pack knows lie one in another (a ward in
-    /// its city, the city in its region), so no admin level is named twice.
+    /// of the country, the region and the postcode is one field at most, a
+    /// house number has a number, and the places it names that the Pack
+    /// knows are each named once and lie one in another (a ward in its city,
+    /// the city in its region), so no admin level is named twice.
     /// The model scores parts of a labelling; this holds of the whole.
     fn is_one_address(&self, lattice: &Lattice, path: &decode::Path) -> bool {
         let labels = path.labels(lattice);
@@ -666,6 +686,19 @@ impl LatticeTagger {
             if fields > 1 {
                 return false;
             }
+        }
+        // A house number has a number in it: "堺" alone is none.
+        let numberless_house = path.segments.iter().any(|segment| {
+            let span = &lattice.spans[segment.span];
+            segment.label == Label::HouseNumber
+                && !lattice
+                    .units
+                    .key(span.start, span.end)
+                    .chars()
+                    .any(is_numeral)
+        });
+        if numberless_house {
+            return false;
         }
         let places = path
             .segments
@@ -681,6 +714,9 @@ impl LatticeTagger {
                 lattice.place(span.start, span.end)
             })
             .collect::<Vec<_>>();
+        // Each place is named once: a second field naming only the place of
+        // another ("那覇" after "那覇市") is part of something else, a venue
+        // named after its city.
         places.iter().enumerate().all(|(index, left)| {
             places[index + 1..]
                 .iter()
@@ -843,8 +879,9 @@ impl LatticeTagger {
     /// abbreviations expanded the way the text index expands them, else the
     /// nearest name the key's fuzzy automaton accepts.
     fn lookup(&self, field: Field, key: &mut SpanKey) -> Option<Match> {
-        let exact = [key.key.as_str(), key.expanded.as_str()]
+        let exact = [Some(&key.key), Some(&key.expanded), key.masked.as_ref()]
             .into_iter()
+            .flatten()
             .filter_map(|key| self.dictionaries.get(field, key))
             .max_by_key(|entry| entry.count);
         if let Some(entry) = exact {
@@ -1035,6 +1072,9 @@ impl Phrases {
 struct SpanKey {
     key: String,
     expanded: String,
+    /// The key with its numerals masked ([`mask_numerals`]), which names
+    /// the numbered areas of a kind the Pack holds many of.
+    masked: Option<String>,
     /// Whether the span may be a typo of a name: it is at least
     /// [`MIN_FUZZY_CHARS`] long, has no digit, not every word of it is a
     /// known word, and it is not of a script written without spaces. A house
@@ -1059,6 +1099,7 @@ impl SpanKey {
             && !span.iter().all(|info| info.known_word);
         Self {
             tokens: expanded.split(' ').count(),
+            masked: mask_numerals(&key),
             key,
             expanded,
             fuzzy,

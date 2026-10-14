@@ -39,7 +39,7 @@ use levenshtein_automata::{DFA, Distance, SINK_STATE};
 
 use unicode_script::{Script, UnicodeScript};
 
-use super::{CountryCode, dictionary_key, is_numeral, is_unspaced};
+use super::{CountryCode, dictionary_key, is_numeral, is_unspaced, mask_numerals};
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     context::AdminContextTuple,
@@ -93,6 +93,10 @@ const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/libpostal/qualifiers.txt")
 /// Admin type words libpostal's qualifiers lack ("freistaat",
 /// "comunidad de", "-도"), with how they attach to a name.
 const ADMIN_TYPES: &str = include_str!("data/admin_types.txt");
+/// How many area names a numbered form must be shared by to be a name of its
+/// own: a kind of area (`#丁目`), not one name with a numeral in it
+/// (`四日市市`).
+const MIN_NUMBERED_NAMES: usize = 5;
 
 /// The admin levels a name is used at, one bit each.
 mod level {
@@ -104,6 +108,16 @@ mod level {
     pub const PLACE: u8 = 1 << 5;
     /// The levels whose areas are also named without their type word.
     pub const ALIASED: u8 = REGION | DISTRICT | LOCALITY;
+
+    /// The levels whose areas are named in `field`.
+    pub fn of_field(field: super::Field) -> u8 {
+        match field {
+            super::Field::Country => COUNTRY,
+            super::Field::Region => REGION,
+            super::Field::Locality => DISTRICT | LOCALITY | NEIGHBOURHOOD | PLACE,
+            _ => 0,
+        }
+    }
 }
 
 /// One dictionary of the parser.
@@ -429,8 +443,8 @@ impl Dictionaries {
     }
 
     /// Whether places of the areas `left` and of the areas `right` can be
-    /// named in one address: an area of each is the same, or one record
-    /// lies in both, so one lies in the other.
+    /// named in one address: two different places, one of each, lie one in
+    /// the other. One place named twice is not.
     pub fn nest(&self, left: &[u32], right: &[u32]) -> bool {
         let pairs = self.nesting.len() / 8;
         let pair_at = |index: usize| {
@@ -443,7 +457,7 @@ impl Dictionaries {
         left.iter().any(|left| {
             right.iter().any(|right| {
                 if left == right {
-                    return true;
+                    return false;
                 }
                 let wanted = nesting_pair(*left, *right);
                 let (mut low, mut high) = (0, pairs);
@@ -555,9 +569,16 @@ pub struct RecordNames {
     names: Vec<(Field, String, u8)>,
     /// The country its own address states (`addr:country`).
     country: Option<CountryCode>,
+    /// Whether the record is a place: an admin area, or a place the Pack
+    /// holds only as a point.
+    place: bool,
 }
 
 impl RecordNames {
+    pub fn is_place(&self) -> bool {
+        self.place
+    }
+
     pub fn of(record: &Record) -> Self {
         let mut names = Self::default();
         match record {
@@ -588,6 +609,7 @@ impl RecordNames {
                 }
             }
             Record::Place(layer, place) => {
+                names.place = true;
                 let (field, level) = match layer {
                     PlaceLayer::Country => (Field::Country, level::COUNTRY),
                     PlaceLayer::Region => (Field::Region, level::REGION),
@@ -714,6 +736,12 @@ pub struct DictionaryBuilder {
     areas: HashMap<RecordId, Area>,
     /// Every admin context a record lies in, for which areas lie in which.
     contexts: HashSet<AdminContextTuple>,
+    /// Each place with the areas its own context places it in, as
+    /// [`nesting_pair`]s (see [`DictionaryBuilder::add_place`]).
+    area_pairs: Vec<u64>,
+    /// Each name of a place with the place's record id, so a name of a
+    /// place held only as a point names it too.
+    place_names: Vec<(String, u32, u8)>,
     /// The country code of each country record admin contexts point at.
     country_codes: HashMap<RecordId, CountryCode>,
 }
@@ -723,6 +751,29 @@ impl DictionaryBuilder {
     /// in the country its admin context places it in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
         self.country_codes = codes;
+    }
+
+    /// Note that the place `place` lies in the areas of its own context, and
+    /// which of its names name it. An area is in no context of its own
+    /// layer, and a place the Pack holds only as a point (the ward node
+    /// "東区" of Sapporo) in none at all, so without this its names would
+    /// name only the areas of other places they name.
+    pub fn add_place(&mut self, place: RecordId, context: &RecordContext, names: &RecordNames) {
+        let Ok(place) = u32::try_from(place) else {
+            return;
+        };
+        for parent in context.admin_context.parent_record_ids() {
+            if let Ok(parent) = u32::try_from(parent)
+                && parent != place
+            {
+                self.area_pairs.push(nesting_pair(place, parent));
+            }
+        }
+        for (field, name, level) in &names.names {
+            if Field::AREAS.contains(field) {
+                self.place_names.push((name.clone(), place, *level));
+            }
+        }
     }
 
     /// Count one written record: its own names, and its admin areas.
@@ -784,6 +835,8 @@ impl DictionaryBuilder {
             mut names,
             areas,
             contexts,
+            area_pairs,
+            place_names,
             country_codes,
         } = self;
         // The ids of the areas each area name names, and the levels of the
@@ -791,6 +844,8 @@ impl DictionaryBuilder {
         let mut places = BTreeMap::<String, Vec<u32>>::new();
         let mut levels = HashMap::<String, u8>::new();
         let mut aliases = HashMap::<String, Alias>::new();
+        // The numbered forms of area names, with the names that share each.
+        let mut numbered = HashMap::<(Field, String), (NameStats, HashSet<String>)>::new();
         for (
             area,
             Area {
@@ -818,24 +873,50 @@ impl DictionaryBuilder {
                         alias.areas.extend(id);
                     }
                 }
+                if let Some(masked) = mask_numerals(&key) {
+                    let (masked_stats, keys) = numbered.entry((*field, masked)).or_default();
+                    masked_stats.merge(stats);
+                    keys.insert(key.clone());
+                }
                 names.entry((*field, key.clone())).or_default().merge(stats);
                 *levels.entry(key.clone()).or_default() |= level;
                 places.entry(key).or_default().extend(id);
             }
         }
-        // An alias of areas of one level joins their names, unless it is
-        // already the name of an area of another level, or names areas of
-        // two ("京都" of "京都府" and "京都市" is neither). Names that only
-        // records state ("addr:city=東京") are no areas, and often the very
-        // area the alias names.
+        // The names of each place, to tell one place held as both a point and
+        // an area ("那覇市" the node and the boundary) from two places.
+        let mut names_of = HashMap::<u32, HashSet<String>>::new();
+        for (area, names) in area_names {
+            if let Ok(area) = u32::try_from(*area) {
+                names_of
+                    .entry(area)
+                    .or_default()
+                    .extend(names.iter().filter_map(|name| dictionary_key(name)));
+            }
+        }
+        // The levels of the places each name names, points among them.
+        let mut place_levels = levels.clone();
+        for (key, place, level) in place_names {
+            names_of.entry(place).or_default().insert(key.clone());
+            *place_levels.entry(key.clone()).or_default() |= level;
+            places.entry(key).or_default().push(place);
+        }
+        // An alias of areas of one field joins their names, unless it is
+        // already the name of an area of another field, or names areas of
+        // two ("京都" of "京都府" and "京都市" is neither). Levels of one
+        // field are one label, so "ōta" of the ward "ōta ku" and of the city
+        // "ōta shi" is a locality either way, and the places it names are
+        // told apart by the rest of the address. Names that only records
+        // state ("addr:city=東京") are no areas, and often the very area the
+        // alias names.
         for (key, alias) in aliases {
             let [field] = alias.fields[..] else {
                 continue;
             };
-            let other_level = levels
+            let other_field = levels
                 .get(&key)
-                .is_some_and(|levels| levels & !alias.stats.levels != 0);
-            if alias.stats.levels.count_ones() != 1 || other_level {
+                .is_some_and(|levels| levels & !level::of_field(field) != 0);
+            if other_field {
                 continue;
             }
             names
@@ -843,6 +924,20 @@ impl DictionaryBuilder {
                 .or_default()
                 .merge(&alias.stats);
             places.entry(key).or_default().extend(alias.areas);
+        }
+        // A numbered form that many areas share is a name of its own, so a
+        // block, sector or ward the Pack does not hold by its number is still
+        // a place of a kind it does ("5丁目" of "#丁目"). It names no area,
+        // so the address check never reads one place in it.
+        for ((field, masked), (stats, keys)) in numbered {
+            if keys.len() < MIN_NUMBERED_NAMES
+                || levels
+                    .get(&masked)
+                    .is_some_and(|levels| levels & !level::of_field(field) != 0)
+            {
+                continue;
+            }
+            names.entry((field, masked)).or_default().merge(&stats);
         }
         // A country is also written as its code ("ca"), as people write it.
         for (area, code) in &country_codes {
@@ -906,11 +1001,32 @@ impl DictionaryBuilder {
                 &build_fst(&fields[field.index()])?,
             )?;
         }
+        // Which places a name names is only known where the Pack holds every
+        // place of a level: countries, regions, districts and cities are all
+        // drawn, neighbourhoods and blocks only here and there ("中島町" of
+        // one city, "5丁目" of hundreds). A name that also names one of those
+        // is no place the address check can hold to the rest of an address.
+        places.retain(|key, _| {
+            place_levels
+                .get(key)
+                .is_none_or(|levels| levels & (level::NEIGHBOURHOOD | level::PLACE) == 0)
+        });
         let (map, ids) = area_sections(places);
         pack.add(AREAS_SECTION, DICTIONARY_VERSION, &map)?;
         pack.add(AREA_IDS_SECTION, DICTIONARY_VERSION, &ids)?;
-        // Every two areas one record lies in lie one in the other.
-        let mut pairs = Vec::new();
+        // Every two areas one record lies in lie one in the other, and so does
+        // every place with the areas its own context places it in, unless the
+        // two share a name and so are one place.
+        let shares_name = |left: u32, right: u32| {
+            names_of
+                .get(&left)
+                .zip(names_of.get(&right))
+                .is_some_and(|(left, right)| !left.is_disjoint(right))
+        };
+        let mut pairs = area_pairs
+            .into_iter()
+            .filter(|pair| !shares_name((pair >> 32) as u32, *pair as u32))
+            .collect::<Vec<_>>();
         for context in &contexts {
             let ids = context
                 .parent_record_ids()

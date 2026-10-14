@@ -819,3 +819,14 @@ fn tag_latency_on_a_pack() {
         times[times.len() * 9 / 10]
     );
 }
+
+#[test]
+fn numbered_names_share_one_form_of_any_numerals() {
+    assert_eq!(mask_numerals("5丁目").as_deref(), Some("#丁目"));
+    assert_eq!(mask_numerals("四丁目").as_deref(), Some("#丁目"));
+    assert_eq!(mask_numerals("１２丁目").as_deref(), Some("#丁目"));
+    assert_eq!(mask_numerals("北9条西3").as_deref(), Some("北#条西#"));
+    assert_eq!(mask_numerals("sector 12").as_deref(), Some("sector #"));
+    assert_eq!(mask_numerals("toronto"), None);
+    assert_eq!(mask_numerals("12"), None);
+}

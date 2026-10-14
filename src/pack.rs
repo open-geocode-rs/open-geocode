@@ -292,7 +292,15 @@ impl PackWriter {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        for ((record, context), (document, cells, names)) in batch.iter().zip(prepared) {
+        for (offset, ((record, context), (document, cells, names))) in
+            batch.iter().zip(prepared).enumerate()
+        {
+            let record_id = first + offset as u64;
+            if let Some(context) = context
+                && names.is_place()
+            {
+                self.dictionaries.add_place(record_id, context, &names);
+            }
             self.dictionaries.add(names, context.as_ref());
             let context = match context {
                 Some(context) => self.contexts.intern(*context)?,
