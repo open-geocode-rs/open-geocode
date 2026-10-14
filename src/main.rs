@@ -291,6 +291,12 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         show_misses: usize,
 
+        /// Also score every system apart on the rows whose locality, region
+        /// and street names the Pack's dictionaries all hold, and on the
+        /// others. Needs --pack.
+        #[arg(long)]
+        coverage: bool,
+
         /// Also write the full results as JSON to this path.
         #[arg(long)]
         json: Option<PathBuf>,
@@ -581,6 +587,7 @@ async fn main() -> Result<()> {
             taggers,
             baselines,
             show_misses,
+            coverage,
             json,
         } => {
             let report = run_parse_bench(&ParseBenchOptions {
@@ -591,6 +598,7 @@ async fn main() -> Result<()> {
                 taggers,
                 baselines: (!baselines.is_empty()).then_some(baselines),
                 show_misses,
+                coverage,
             })?;
             if let Some(json) = json {
                 write_json_to_path(&report, json)?;

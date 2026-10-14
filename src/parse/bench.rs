@@ -37,7 +37,11 @@ use self::{
     variant::Variant,
 };
 use crate::parse::{
-    lattice::LatticeTagger,
+    lattice::{
+        LatticeTagger,
+        dictionary::{Dictionaries, Field},
+        dictionary_key,
+    },
     legacy::LegacyTagger,
     types::{Label, Tagger},
 };
@@ -91,6 +95,9 @@ pub struct ParseBenchOptions {
     pub baselines: Option<Vec<String>>,
     /// Worst rows of the first tagger to list, per variant.
     pub show_misses: usize,
+    /// Also score every system apart on the rows whose names the Pack's
+    /// dictionaries all hold and on the others (see [`Coverage`]).
+    pub coverage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,6 +110,70 @@ pub struct ParseBenchReport {
     pub groups: Vec<GroupReport>,
     /// The first tagger's worst rows, up to `show_misses` per variant.
     pub misses: Vec<Miss>,
+    /// Per country and variant, the scores on covered and on uncovered rows,
+    /// with `--coverage`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<CoverageGroup>,
+}
+
+/// Whether a gold row's names are all in the Pack's dictionaries: every
+/// locality, region and street span of it, read as the parser reads it
+/// ([`dictionary_key`]), is a name of that field, exactly. A span is a run of
+/// tokens of one label within one part of the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    Covered,
+    Uncovered,
+}
+
+impl Coverage {
+    pub fn of(row: &TaggedRow, dictionaries: &Dictionaries) -> Self {
+        let mut start = 0;
+        for end in 1..=row.tokens.len() {
+            let closes = end == row.tokens.len()
+                || row.breaks.contains(&end)
+                || row.tokens[end].label != row.tokens[start].label;
+            if !closes {
+                continue;
+            }
+            let field = match row.tokens[start].label {
+                Label::Locality => Some(Field::Locality),
+                Label::Region => Some(Field::Region),
+                Label::Street => Some(Field::Street),
+                _ => None,
+            };
+            if let Some(field) = field {
+                let words = row.tokens[start..end]
+                    .iter()
+                    .map(|tagged| tagged.token.as_str())
+                    .collect::<Vec<_>>();
+                let known = dictionary_key(&words.join(" "))
+                    .is_some_and(|key| dictionaries.contains(field, &key));
+                if !known {
+                    return Coverage::Uncovered;
+                }
+            }
+            start = end;
+        }
+        Coverage::Covered
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Coverage::Covered => "covered",
+            Coverage::Uncovered => "uncovered",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CoverageGroup {
+    pub country: String,
+    pub variant: &'static str,
+    pub coverage: Coverage,
+    pub rows: usize,
+    pub systems: BTreeMap<String, Summary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +207,8 @@ struct VariantCounts {
     variant: Variant,
     rows: usize,
     by_system: BTreeMap<String, Counts>,
+    /// Rows and counts per system on covered and on uncovered rows.
+    by_coverage: BTreeMap<Coverage, (usize, BTreeMap<String, Counts>)>,
 }
 
 pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> {
@@ -152,6 +225,12 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
     for kind in &options.taggers {
         taggers.push((kind.system_name(), kind.open(options.pack.as_deref())?));
     }
+    let coverage_tagger = if options.coverage {
+        let pack = options.pack.as_deref().context("--coverage needs --pack")?;
+        Some(LatticeTagger::open(pack)?)
+    } else {
+        None
+    };
     let mut systems = taggers
         .iter()
         .map(|(name, _)| name.to_string())
@@ -162,15 +241,43 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
     let mut misses = Vec::new();
     for file in &files {
         let gold = read_rows(&file.path)?;
+        // Variants keep the gold rows' tokens and labels, so a gold row's
+        // coverage is its variants'.
+        let coverage = coverage_tagger.as_ref().map(|tagger| {
+            gold.iter()
+                .map(|row| Coverage::of(row, tagger.dictionaries()))
+                .collect::<Vec<_>>()
+        });
         for variant in Variant::ALL {
             let rows = gold
                 .iter()
                 .map(|row| variant.apply(row))
                 .collect::<Vec<_>>();
             let mut by_system = BTreeMap::new();
+            let mut by_coverage = BTreeMap::<Coverage, (usize, BTreeMap<String, Counts>)>::new();
+            if let Some(coverage) = &coverage {
+                for row in coverage {
+                    by_coverage.entry(*row).or_default().0 += 1;
+                }
+            }
+            let mut add_row =
+                |system: &str, line: usize, gold: &[Label], predicted: Option<&[Label]>| {
+                    by_system
+                        .entry(system.to_string())
+                        .or_insert_with(Counts::default)
+                        .add_row(gold, predicted);
+                    if let Some(coverage) = &coverage {
+                        by_coverage
+                            .entry(coverage[line])
+                            .or_default()
+                            .1
+                            .entry(system.to_string())
+                            .or_default()
+                            .add_row(gold, predicted);
+                    }
+                };
             let mut variant_misses = Vec::new();
             for (index, (name, tagger)) in taggers.iter().enumerate() {
-                let system: &mut Counts = by_system.entry(name.to_string()).or_default();
                 for (line, row) in rows.iter().enumerate() {
                     let tagged = tagger.tag(&row.query());
                     let aligned = tagged.len() == row.tokens.len()
@@ -180,7 +287,7 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                             .all(|(left, right)| left.token == right.token);
                     let predicted = aligned
                         .then(|| tagged.iter().map(|tagged| tagged.label).collect::<Vec<_>>());
-                    system.add_row(&row.labels(), predicted.as_deref());
+                    add_row(name, line, &row.labels(), predicted.as_deref());
                     if index == 0 && options.show_misses > 0 {
                         let miss = miss(file, variant, line + 1, row, predicted.as_deref());
                         if miss.wrong > 0 {
@@ -207,11 +314,10 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                     rows.len(),
                     file.path.display()
                 );
-                let system: &mut Counts = by_system.entry(baseline.clone()).or_default();
                 for (line, (row, predicted)) in rows.iter().zip(&predicted).enumerate() {
                     let Some(predicted) = predicted else {
                         // The baseline failed on the row: wrong on every token.
-                        system.add_row(&row.labels(), None);
+                        add_row(baseline, line, &row.labels(), None);
                         continue;
                     };
                     ensure!(
@@ -226,7 +332,7 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                         line + 1,
                         variant.name()
                     );
-                    system.add_row(&row.labels(), Some(&predicted.labels()));
+                    add_row(baseline, line, &row.labels(), Some(&predicted.labels()));
                 }
             }
             keep_worst(&mut variant_misses, options.show_misses);
@@ -236,6 +342,7 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                 variant,
                 rows: rows.len(),
                 by_system,
+                by_coverage,
             });
         }
     }
@@ -268,11 +375,28 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
         }
     }
 
+    let coverage = counts
+        .iter()
+        .flat_map(|counts| {
+            counts
+                .by_coverage
+                .iter()
+                .map(|(coverage, (rows, by_system))| CoverageGroup {
+                    country: counts.country.clone(),
+                    variant: counts.variant.name(),
+                    coverage: *coverage,
+                    rows: *rows,
+                    systems: summaries(by_system),
+                })
+        })
+        .collect();
+
     Ok(ParseBenchReport {
         systems,
         variants: Variant::ALL.iter().map(|variant| variant.name()).collect(),
         groups,
         misses,
+        coverage,
     })
 }
 
@@ -382,6 +506,41 @@ impl ParseBenchReport {
                     match group.systems.get(system) {
                         Some(summary) => {
                             let _ = write!(out, " {:.1} |", 100.0 * metric(summary));
+                        }
+                        None => out.push_str(" - |"),
+                    }
+                }
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+
+        if !self.coverage.is_empty() {
+            let _ = writeln!(
+                out,
+                "### Coverage split (full-parse / token accuracy, %)\n\n\
+                 A row is covered when the Pack's dictionaries hold every one of its \
+                 locality, region and street names exactly.\n"
+            );
+            self.header(&mut out, &["country", "variant", "coverage", "rows"]);
+            for group in &self.coverage {
+                let _ = write!(
+                    out,
+                    "| {} | {} | {} | {} |",
+                    group.country,
+                    group.variant,
+                    group.coverage.name(),
+                    group.rows
+                );
+                for system in &self.systems {
+                    match group.systems.get(system) {
+                        Some(summary) => {
+                            let _ = write!(
+                                out,
+                                " {:.1} / {:.1} |",
+                                100.0 * summary.full_parse_accuracy,
+                                100.0 * summary.token_accuracy
+                            );
                         }
                         None => out.push_str(" - |"),
                     }
@@ -624,6 +783,44 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn a_row_is_covered_when_the_dictionaries_hold_each_of_its_names() {
+        use crate::parse::lattice::dictionary::Entry;
+        let entry = Entry {
+            count: 1,
+            country: None,
+        };
+        let dictionaries = Dictionaries::from_entries([
+            (Field::Locality, "浜松市", entry),
+            (Field::Locality, "本州", entry),
+            (Field::Region, "静岡県", entry),
+            (Field::Region, "shizuoka", entry),
+        ]);
+        let coverage =
+            |line: &str| Coverage::of(&TaggedRow::parse_line(line).expect("row"), &dictionaries);
+        // Each part is its own span: "本州" and "浜松市" are two names.
+        assert_eq!(
+            coverage(concat!(
+                "ja	jp	日/country 本/country , 静/region 岡/region 県/region , ",
+                "本/locality 州/locality , 浜/locality 松/locality 市/locality , seven/other"
+            )),
+            Coverage::Covered
+        );
+        // A name in the wrong field is not covered.
+        assert_eq!(
+            coverage("ja	jp	浜/region 松/region 市/region"),
+            Coverage::Uncovered
+        );
+        assert_eq!(
+            coverage("ja_rm	jp	mori/locality , shizuoka/region"),
+            Coverage::Uncovered
+        );
+        assert_eq!(
+            coverage("ja_rm	jp	セブン/other , shizuoka/region , japan/country"),
+            Coverage::Covered
+        );
+    }
+
     fn options(gold: PathBuf, predictions: PathBuf, show_misses: usize) -> ParseBenchOptions {
         ParseBenchOptions {
             gold,
@@ -633,6 +830,7 @@ mod tests {
             taggers: vec![TaggerKind::Legacy],
             baselines: None,
             show_misses,
+            coverage: false,
         }
     }
 
