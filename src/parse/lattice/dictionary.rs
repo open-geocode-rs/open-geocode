@@ -9,8 +9,10 @@
 //! only copy of place data. Street-type words are the words that start or end
 //! many of those street names, plus a vendored list of common types and
 //! abbreviations; unit words are a vendored list plus the words that
-//! designate many of the Pack's `addr:unit` values. A `words` section holds
-//! every word of every name, so a lookup knows when a word is no typo.
+//! designate many of the Pack's `addr:unit` values. POI names are a field of
+//! their own, so a venue's name is known as one. A `words` section holds
+//! every word of every name but a POI's, so a lookup knows when a word is no
+//! typo.
 //!
 //! A Pack built before these sections existed still opens: its dictionaries
 //! are empty and the parser runs on token shapes alone.
@@ -59,27 +61,31 @@ pub enum Field {
     Region,
     Street,
     Country,
+    /// Names of the Pack's POIs: venues, shops, buildings.
+    Poi,
     StreetType,
     Unit,
     Word,
 }
 
 impl Field {
-    pub const ALL: [Field; 7] = [
+    pub const ALL: [Field; 8] = [
         Field::Locality,
         Field::Region,
         Field::Street,
         Field::Country,
+        Field::Poi,
         Field::StreetType,
         Field::Unit,
         Field::Word,
     ];
     /// The fields of names that a whole span of a query can be.
-    pub const NAMES: [Field; 4] = [
+    pub const NAMES: [Field; 5] = [
         Field::Locality,
         Field::Region,
         Field::Street,
         Field::Country,
+        Field::Poi,
     ];
 
     /// The Pack section that holds the field.
@@ -89,6 +95,7 @@ impl Field {
             Field::Region => "parse/region",
             Field::Street => "parse/street",
             Field::Country => "parse/country",
+            Field::Poi => "parse/poi",
             Field::StreetType => "parse/street_type",
             Field::Unit => "parse/unit",
             Field::Word => "parse/words",
@@ -334,8 +341,11 @@ impl RecordNames {
         let mut names = Self::default();
         match record {
             Record::Address(record) => names.address(&record.address),
-            Record::Poi(record) => {
-                if let Some(address) = &record.address {
+            Record::Poi(poi) => {
+                for name in record.names() {
+                    names.add(Field::Poi, Some(name));
+                }
+                if let Some(address) = &poi.address {
                     names.address(address);
                 }
             }
@@ -542,8 +552,13 @@ impl DictionaryBuilder {
             }
         }
         fields[Field::Unit.index()] = units;
+        // Every word of every name but a POI's: a venue's name is any word
+        // at all, and would make typos of street names known words.
         let mut words = BTreeMap::<String, Entry>::new();
-        for entries in &fields {
+        for (field, entries) in Field::ALL.into_iter().zip(&fields) {
+            if field == Field::Poi {
+                continue;
+            }
             for name in entries.keys() {
                 for word in name.split_whitespace() {
                     words
@@ -754,6 +769,26 @@ mod tests {
                 (Field::Locality, "横浜市".to_string()),
                 (Field::Locality, "よこはまし".to_string()),
                 (Field::Locality, "yokohama shi".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pois_are_named_by_every_name() {
+        let poi = Record::Poi(crate::record::PoiRecord {
+            name: "Cafe Uno".into(),
+            alt_names: vec!["カフェ ウノ".into()],
+            category: "amenity:cafe".into(),
+            address: None,
+            geometry: crate::record::point_geometry(0.0, 0.0),
+            location_precision: crate::record::LocationPrecision::Point,
+            source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+        });
+        assert_eq!(
+            RecordNames::of(&poi).names,
+            vec![
+                (Field::Poi, "cafe uno".to_string()),
+                (Field::Poi, "カフェウノ".to_string()),
             ]
         );
     }

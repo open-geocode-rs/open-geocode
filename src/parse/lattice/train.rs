@@ -605,6 +605,10 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
 /// (`name:ja-Hira`, `name:en`, ...) when it has any, so the model sees names
 /// in the other scripts and languages queries write them in.
 const ALT_NAME_SHARE: f64 = 0.3;
+/// Share of the rows of POIs with an address that write the address beside
+/// the POI's name, so the model sees a venue name next to the street and
+/// areas it is in, and the POI dictionary hit on the venue alone.
+const POI_ADDRESS_SHARE: f64 = 0.7;
 /// Share of rows of records on an island that name it.
 const ISLAND_SHARE: f64 = 0.35;
 /// Share of rows of addresses that state several areas that write them as
@@ -702,7 +706,7 @@ impl<'a> Renderer<'a> {
             Record::Poi(record) => {
                 fields.house = name;
                 if let Some(address) = &record.address
-                    && random.chance(0.5)
+                    && random.chance(POI_ADDRESS_SHARE)
                 {
                     stated = Some(address);
                     address_fields(address, &mut fields);
@@ -885,6 +889,7 @@ impl<'a> Renderer<'a> {
                 Label::Street => Field::Street,
                 Label::Locality => Field::Locality,
                 Label::Region => Field::Region,
+                Label::Other => Field::Poi,
                 _ => continue,
             };
             if random.chance(0.15) {

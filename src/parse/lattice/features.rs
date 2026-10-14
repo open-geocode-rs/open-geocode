@@ -94,7 +94,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("dict_cover", &DICT_COVER),
 ];
 
-const DICT_COVER: [&str; 8] = [
+const DICT_COVER: [&str; 10] = [
     "locality:begin",
     "locality:inside",
     "region:begin",
@@ -103,10 +103,12 @@ const DICT_COVER: [&str; 8] = [
     "street:inside",
     "country:begin",
     "country:inside",
+    "poi:begin",
+    "poi:inside",
 ];
 
-const DICT_FIELDS: [&str; 4] = ["locality", "region", "street", "country"];
-const FIELD_BY_DISTANCE: [&str; 12] = [
+const DICT_FIELDS: [&str; 5] = ["locality", "region", "street", "country", "poi"];
+const FIELD_BY_DISTANCE: [&str; 15] = [
     "locality:0",
     "locality:1",
     "locality:2",
@@ -119,8 +121,11 @@ const FIELD_BY_DISTANCE: [&str; 12] = [
     "country:0",
     "country:1",
     "country:2",
+    "poi:0",
+    "poi:1",
+    "poi:2",
 ];
-const FIELD_BY_TOKENS: [&str; 20] = [
+const FIELD_BY_TOKENS: [&str; 25] = [
     "locality:1",
     "locality:2",
     "locality:3",
@@ -141,8 +146,13 @@ const FIELD_BY_TOKENS: [&str; 20] = [
     "country:3",
     "country:4",
     "country:5",
+    "poi:1",
+    "poi:2",
+    "poi:3",
+    "poi:4",
+    "poi:5",
 ];
-const FIELD_BY_FREQUENCY: [&str; 24] = [
+const FIELD_BY_FREQUENCY: [&str; 30] = [
     "locality:1",
     "locality:2-9",
     "locality:10-99",
@@ -167,8 +177,14 @@ const FIELD_BY_FREQUENCY: [&str; 24] = [
     "country:100-999",
     "country:1000-9999",
     "country:10000+",
+    "poi:1",
+    "poi:2-9",
+    "poi:10-99",
+    "poi:100-999",
+    "poi:1000-9999",
+    "poi:10000+",
 ];
-const FIELD_BY_SHORT: [&str; 8] = [
+const FIELD_BY_SHORT: [&str; 10] = [
     "locality:1-2",
     "locality:3",
     "region:1-2",
@@ -177,6 +193,8 @@ const FIELD_BY_SHORT: [&str; 8] = [
     "street:3",
     "country:1-2",
     "country:3",
+    "poi:1-2",
+    "poi:3",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +261,7 @@ fn field_index(field: Field) -> Option<usize> {
         Field::Region => Some(1),
         Field::Street => Some(2),
         Field::Country => Some(3),
+        Field::Poi => Some(4),
         _ => None,
     }
 }
@@ -613,7 +632,7 @@ mod tests {
         let unique = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), COUNT);
         assert_eq!(name(0), "bias:bias");
-        assert_eq!(name(NAMED as u32 - 1), "dict_cover:country:inside");
+        assert_eq!(name(NAMED as u32 - 1), "dict_cover:poi:inside");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
         assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
         assert_eq!(

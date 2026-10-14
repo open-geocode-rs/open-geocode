@@ -73,6 +73,9 @@ const TWO_EDIT_CHARS: usize = 8;
 const MAX_TWO_EDIT_CHARS: usize = 16;
 /// Spans longer than this are only looked up exactly.
 const MAX_FUZZY_CHARS: usize = 32;
+/// A one-token span shorter than this is only looked up exactly in the POI
+/// names: they are many, and a short word is one edit from many venues.
+const MIN_FUZZY_POI_CHARS: usize = 6;
 /// Characters that end one field of a query and start the next.
 const FIELD_BREAKS: [char; 4] = [',', ';', '\n', '|'];
 /// Characters that join two words into one written unit: the parts of a
@@ -580,7 +583,7 @@ impl LatticeTagger {
         // The span of each unit alone, and the dict_cover features each
         // unit gets from the longer names it lies in, one bit per feature.
         let mut single = Vec::with_capacity(tokens.len());
-        let mut covers = vec![0u8; tokens.len()];
+        let mut covers = vec![0u16; tokens.len()];
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
         let runs = units.runs();
         for start in 0..tokens.len() {
@@ -641,7 +644,7 @@ impl LatticeTagger {
             }
         }
         for (unit, bits) in covers.into_iter().enumerate() {
-            for bit in (0..8).filter(|bit| bits & (1 << bit) != 0) {
+            for bit in (0..16).filter(|bit| bits & (1 << bit) != 0) {
                 spans[single[unit]]
                     .features
                     .push(features::cover_base() + bit);
@@ -670,6 +673,13 @@ impl LatticeTagger {
         }
         let first = key.expanded.chars().next().map_or(0, char::len_utf8);
         let prefix = key.expanded[..first].to_string();
+        if field == Field::Poi {
+            if key.tokens < 2 && key.chars < MIN_FUZZY_POI_CHARS {
+                return None;
+            }
+            let dfa = key.poi_dfa(self)?;
+            return self.dictionaries.fuzzy(field, dfa, &prefix);
+        }
         let dfa = key.dfa(self)?;
         self.dictionaries.fuzzy(field, dfa, &prefix)
     }
@@ -747,7 +757,12 @@ struct SpanKey {
     /// script without spaces every character is a word, so one edit names
     /// another place rather than a typo of this one.
     fuzzy: bool,
+    /// Tokens and characters of the expanded key.
+    tokens: usize,
+    chars: usize,
     dfa: Option<DFA>,
+    /// The automaton of the names within one edit, for the POI names.
+    poi_dfa: Option<DFA>,
 }
 
 impl SpanKey {
@@ -758,11 +773,27 @@ impl SpanKey {
             && !span.iter().any(|info| info.has_digit || info.unspaced)
             && !span.iter().all(|info| info.known_word);
         Self {
+            tokens: expanded.split(' ').count(),
             key,
             expanded,
             fuzzy,
+            chars,
             dfa: None,
+            poi_dfa: None,
         }
+    }
+
+    /// The automaton of the names within one edit of the expanded key, for
+    /// the POI names: they are many, and two edits of a span reach many
+    /// venues. `None` when the span is no typo.
+    fn poi_dfa(&mut self, tagger: &LatticeTagger) -> Option<&DFA> {
+        if !self.fuzzy {
+            return None;
+        }
+        if self.poi_dfa.is_none() {
+            self.poi_dfa = Some(tagger.one_edit.build_dfa(&self.expanded));
+        }
+        self.poi_dfa.as_ref()
     }
 
     /// The automaton of the names within one edit of the expanded key, or
