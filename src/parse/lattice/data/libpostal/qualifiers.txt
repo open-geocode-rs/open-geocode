@@ -1,0 +1,357 @@
+# libpostal resources/dictionaries/*/{qualifiers}.txt (MIT)
+# af
+noordekant
+oostekant
+westekant
+suidekant
+# be
+блок
+blok
+горад|г
+horad|h
+вёска
+vioska
+мікрараён
+mikrarajon
+область
+oblast
+посблок|пос
+пасёлак|пас
+pasiolak|pas
+posblok
+раион|р-н
+raion|r-n
+во́бласць|вобласць
+voblast
+востраў|во
+vostraŭ|vostrau|vo
+# bg
+блок|бл
+blok|bl
+село|с
+selo|s
+град|гр
+grad|gr
+квартал|кварт|кв|кв-л
+kvartal|kvart|kv|kv-l
+жилищен комплекс|ж.к.|жк|ж к
+zhilishten kompleks|z.k.|zk|z k
+# br
+amezeg
+# bs
+grad
+naselje
+# ca
+barri|b
+bloc|bl
+cantonada|cant
+districte|distr
+polígon|pol|poligon
+polígon industrial|pi|poligon industrial|pol ind
+punt quilomètric|punt quilometric|pk|p.k.|p k
+urbanització|urb|urbanitzacio
+# cy
+pentre
+ynys
+# de
+bezirk|bez
+gemeinde|gde
+hauptstadt|hptst
+# el
+δήμος|δημος|δ
+dímos|dimos|d
+νησί|νησι|ν
+nisí|nisi|n
+νομός|νομος|ν
+nomós|nomos|n
+# en
+block|blk|bl|blck
+quadrant|qd|quad
+section|sec|sect|sxn
+township|twp|tshp
+village|vil|vge|vill|villag|villg|vlg|vlge|vllg|vl
+# es
+aldea
+ampliación|amplicacion|ampl|amp
+auzoa
+barriada|barda
+barrio|bo|brio|brrio|bº|b°|b.º|b.°|b /|br
+barrios|bos|brios|brrios
+bloque|blque|bloq|blq|bl|bq|blo
+colonia|col
+comuna
+conjunto|cjto|conj|cto
+ciudad|cdad|cd
+cuadra|cuadr
+distrito|dtto
+distrito postal|dp|d p|dtto postal
+estado|edo
+extrarradio|extrr
+extramuros|extrm
+isla|isl|is
+islas|isls|iss
+kilómetro|km|kilometro|kilom
+manzana|mz
+núcleo|ncleo|nucleo
+partida|ptda
+poblado|pbdo|pob|pobl
+polígono|poligono|políg|polig|pol
+polígono residencial|poligono residencial|políg res|polig res|pol.res|pol res|pgres|pg res|pr|p.r.|p.r|p r
+polígono industrial|poligono industrial|políg ind|polig ind|pol.ind|pol ind|pgind|pg ind|pi|p.i.|p.i|p i
+provincia|pcia
+punto kilométrico|punto kilometrico|pk|p.k.|p k
+sección|seccion|secc|sccn|scn|sec
+sector|sect
+urbanización|urbanizacion|urb|ur
+vecindario|vecin
+zona|zna|zn
+# et
+kubermang|kub
+küla|kula
+maakond|mk
+oblast|obl
+rajoon|raj
+vald
+# eu
+auzoa
+blokea|bl
+# fi
+kerrostalo
+palveluta
+# fr
+agglomeratión|agglomeration|agl|agglom
+arrondissement|arrdt
+aire
+aires
+bloc
+bourg|brg
+canton|con
+cité|cite
+cités|cites
+domaine|dom
+domaines|doms
+faubourg|faub|faubg|faugrb|fg
+île|ile
+îles|iles
+lieu-dit|lieu dit|lieudit|ld|ldit|l dit|l-dit
+lotissement|lot
+lotissements|lots
+quartier|qua|qrt|qu
+zone|z
+# gd
+àrainn
+# hi
+nagar|नगर
+colony
+cantonment|cantt
+# hr
+naselje
+# id
+banjar|bjr
+blok|blk
+desa|ds|dsa
+dusun|dsn|dsun
+gampong|gmpg|gpg|gp
+gedung|gdg|gd
+kabupaten|kab|kbptn|kbp
+kampung|kmpg|kpg|kp|kampong
+kecamatan|kec|kcmntn|kcm
+kelurahan|kel|klrhn|klh
+kompleks|komp|kmplk
+kota|kta
+pulau|plau|pl
+# is
+borg
+borgir
+# it
+borgata|borg.a|borga
+borgate|borg.e|borge
+borghi|b.ghi|bghi
+borgo|b.go|bgo
+blocco|bl.o|blo
+blocchi|bl.i|bli
+colonia|col.a|cola
+fermata
+fortino|fort.no|fortno
+isola
+isole
+isoletta
+isolette
+isoletto
+isoletti
+palazzi|pal.zi|palzi
+# ja
+県
+ken
+都
+to
+道
+do
+府
+fu
+市
+shi
+区
+ku
+郡
+gun
+町
+chō|cho
+machi
+村
+mura
+son
+字
+aza
+丁目
+chōme|chome|choume
+駅
+eki
+大字
+ōaza|oaza
+小字
+koaza
+街区
+gaiku
+番
+ban
+番地
+banchi
+番地の
+banchi-no|banchi no
+# ko
+구
+gu
+동
+dong
+번지
+beonji
+# lt
+gyvenvietė|gyvenv|gyvenviete
+kaimas|k
+miestas|m
+miestelis|mstl
+rajonas|r
+# ms
+blok
+kampung|kampong|kg
+nusa
+penampang
+pulau
+seksyen
+# nl
+noordzijde|nz|n.z.|n.z|n z
+oostzijde|oz|o.z.|o.z|o z
+westzijde|wz|w.z.|w.z|w z
+zuidzijde|zz|z.z.|z.z|z z
+# pl
+blok|bl
+dzielnica|dziel
+gmina|gm
+kwartał|kwartal|kw
+okręg|ok
+osiedle|os
+wieś
+wyspa
+województwo|wojewodztwo|woj
+# pt
+bairro|b|bº|b°|bo|brº|br°|bro
+distrito|dtto|dist
+divisao|div
+quadra|q|qd
+secao|sec
+superquadra|super quadra|sq|s.q.|s.q|s q
+urbanização|urbanizacao|urb
+zona|zn
+# ro
+bloc|bl
+cartier|cartierul
+comuna|comunā
+kilometrul|kilometru|km
+sat|satul
+sector|sectorul|sect
+zona
+# ru
+агрогородок|аг
+agrogorodok|ag
+блок
+blok
+деревня|дер|д
+derevnya|der|d
+гмина|гм
+gmina|gm
+квартал|кварт|кв|кв-л
+kvartal|kvart|kv|kv-l
+микрорайон
+mikrorayon
+област|обл
+oblast|obl
+посблок|пос
+posblok
+остров|о
+ostrov|o
+город|г
+gorod|g
+городской посёлок|гп
+gorodskoy posolok|gp
+раион|р-н
+raion|r-n
+сельсовет
+сельский совет|с / с|сельсовет|сельскии совет
+sel'skiy sovet|s / s|sel'sovet|selskiy sovet|selsovet
+посёлок|поселок|пос
+posolok|pos
+посёлок городско́го ти́па|пгт|посёлок городского типа|поселок городского типа
+posolok gorodskógo típa|pgt|posolok gorodskogo tipa
+# si
+duwa
+gama
+nuwara
+pura
+# sk
+osada
+sídlisko|sídl|sidlisko
+stredisko|stred
+# tr
+il
+ilçe|ilce
+köyü|koyu
+mahalle|mah
+mahallesi|mah
+# uk
+блок|бл
+blok|bl
+квартал|кварт|кв|кв-л
+kvartal|kvart|kv|kv-l
+область|обл
+oblast|obl
+район|р-н
+raion|r-n
+місто|міс|м
+misto|mis|m
+# vi
+phường|ph|p
+quận|quan|q
+thành phố|thanh pho|tp|t p
+thị xã|thi xa|tx|t x
+thị trấn|thi tran|tt|t t
+# zh
+省
+shěng|sheng
+縣
+xiàn|xian
+市
+shì|shi
+區
+区
+qū|qu
+鎮
+zhèn|zhen
+鄉
+xiāng|xiang
+里
+lǐ|li
+村
+cūn|cun
+鄰
+lín|lin

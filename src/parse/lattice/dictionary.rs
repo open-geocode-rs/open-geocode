@@ -17,27 +17,49 @@
 //! every word of every name but a POI's, so a lookup knows when a word is no
 //! typo.
 //!
+//! An admin area is also named without the word of its type ("愛知" for
+//! "愛知県", "Bayern" for "Freistaat Bayern"), from libpostal's qualifiers
+//! and a vendored list of admin type words (see [`admin_aliases`]). Which
+//! areas each area name names and which areas lie in which are sections of
+//! their own (`parse/areas`, `parse/area_ids`, `parse/nesting`), so a parse
+//! naming places that cannot be in one address is known as one.
+//!
 //! A Pack built before these sections existed still opens: its dictionaries
 //! are empty and the parser runs on token shapes alone.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result};
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
 
-use super::{CountryCode, dictionary_key};
+use unicode_script::{Script, UnicodeScript};
+
+use super::{CountryCode, dictionary_key, is_numeral, is_unspaced};
 use crate::{
     container::{Bytes, Container, ContainerWriter},
+    context::AdminContextTuple,
     pack::{RecordContext, RecordId},
     record::{AddressComponents, PlaceLayer, Record},
 };
 
 /// Format version of every `parse/` dictionary section.
-pub const DICTIONARY_VERSION: u32 = 2;
+pub const DICTIONARY_VERSION: u32 = 3;
+/// The Pack section mapping each area name's key to where its areas are
+/// listed in [`AREA_IDS_SECTION`].
+pub const AREAS_SECTION: &str = "parse/areas";
+/// The record ids of the areas each area name names, little-endian `u32`.
+pub const AREA_IDS_SECTION: &str = "parse/area_ids";
+/// Every pair of areas one record lies in, sorted little-endian `u64`s of
+/// the smaller id above the larger.
+pub const NESTING_SECTION: &str = "parse/nesting";
+/// A name of more areas than this ("2丁目", "中央区") says too little of
+/// where it is: its areas are not listed.
+const MAX_AREAS_PER_NAME: usize = 64;
 /// Bits of an FST value that hold the count; the country code sits above.
 const COUNT_BITS: u32 = 40;
 const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
@@ -65,6 +87,24 @@ const LIBPOSTAL_LEVEL_TYPES: &str = include_str!("data/libpostal/level_types.txt
 const LIBPOSTAL_BUILDING_TYPES: &str = include_str!("data/libpostal/building_types.txt");
 const LIBPOSTAL_STREET_TYPES: &str = include_str!("data/libpostal/street_types.txt");
 const LIBPOSTAL_DIRECTIONALS: &str = include_str!("data/libpostal/directionals.txt");
+/// libpostal's qualifiers: words that say what kind of place a name is, its
+/// admin type words among them ("県", "bezirk", "township").
+const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/libpostal/qualifiers.txt");
+/// Admin type words libpostal's qualifiers lack ("freistaat",
+/// "comunidad de", "-도"), with how they attach to a name.
+const ADMIN_TYPES: &str = include_str!("data/admin_types.txt");
+
+/// The admin levels a name is used at, one bit each.
+mod level {
+    pub const COUNTRY: u8 = 1;
+    pub const REGION: u8 = 1 << 1;
+    pub const DISTRICT: u8 = 1 << 2;
+    pub const LOCALITY: u8 = 1 << 3;
+    pub const NEIGHBOURHOOD: u8 = 1 << 4;
+    pub const PLACE: u8 = 1 << 5;
+    /// The levels whose areas are also named without their type word.
+    pub const ALIASED: u8 = REGION | DISTRICT | LOCALITY;
+}
 
 /// One dictionary of the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -194,6 +234,10 @@ pub struct Match {
 /// The parser's dictionaries, memory-mapped from the Pack.
 pub struct Dictionaries {
     maps: Vec<Map<Bytes>>,
+    /// Area name keys to `offset << 8 | count` of their ids in `area_ids`.
+    areas: Map<Bytes>,
+    area_ids: Bytes,
+    nesting: Bytes,
     /// Records per country, from the country dictionary, to prefer the
     /// countries the Pack covers when only a postcode pattern names one.
     countries: HashMap<CountryCode, u64>,
@@ -205,6 +249,8 @@ impl fmt::Debug for Dictionaries {
         for field in Field::ALL {
             debug.field(field.section(), &self.len(field));
         }
+        debug.field(AREAS_SECTION, &self.areas.len());
+        debug.field(NESTING_SECTION, &(self.nesting.len() / 8));
         debug.finish()
     }
 }
@@ -222,7 +268,25 @@ impl Dictionaries {
                 Map::new(bytes).with_context(|| format!("invalid Pack section {}", field.section()))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self::from_maps(maps))
+        let section = |name: &str| -> Result<Option<Bytes>> {
+            if container.sections().contains_key(name) {
+                Ok(Some(container.section(name, DICTIONARY_VERSION)?))
+            } else {
+                Ok(None)
+            }
+        };
+        let mut dictionaries = Self::from_maps(maps);
+        if let (Some(areas), Some(area_ids), Some(nesting)) = (
+            section(AREAS_SECTION)?,
+            section(AREA_IDS_SECTION)?,
+            section(NESTING_SECTION)?,
+        ) {
+            dictionaries.areas =
+                Map::new(areas).with_context(|| format!("invalid Pack section {AREAS_SECTION}"))?;
+            dictionaries.area_ids = area_ids;
+            dictionaries.nesting = nesting;
+        }
+        Ok(dictionaries)
     }
 
     /// Empty dictionaries, for a Pack without them.
@@ -257,7 +321,33 @@ impl Dictionaries {
                 *countries.entry(country).or_default() += entry.count;
             }
         }
-        Self { maps, countries }
+        Self {
+            maps,
+            areas: empty_values(),
+            area_ids: Bytes::empty(),
+            nesting: Bytes::empty(),
+            countries,
+        }
+    }
+
+    /// The same dictionaries with the areas each name names and the pairs
+    /// of areas one record lies in, as the Pack writer stores them.
+    #[cfg(test)]
+    pub(crate) fn with_areas(mut self, areas: &[(&str, &[u32])], nesting: &[(u32, u32)]) -> Self {
+        let lists = areas
+            .iter()
+            .map(|(key, ids)| (key.to_string(), ids.to_vec()))
+            .collect();
+        let (map, ids) = area_sections(lists);
+        self.areas = Map::new(Bytes::new(map)).expect("valid FST");
+        self.area_ids = Bytes::new(ids);
+        self.nesting = Bytes::new(nesting_section(
+            nesting
+                .iter()
+                .map(|&(left, right)| nesting_pair(left, right))
+                .collect(),
+        ));
+        self
     }
 
     fn map(&self, field: Field) -> &Map<Bytes> {
@@ -320,6 +410,56 @@ impl Dictionaries {
         best
     }
 
+    /// The record ids of the areas named `key`; empty when it names none, or
+    /// more than [`MAX_AREAS_PER_NAME`].
+    pub fn areas(&self, key: &str) -> Vec<u32> {
+        let Some(value) = self.areas.get(key) else {
+            return Vec::new();
+        };
+        let (offset, count) = ((value >> 8) as usize, (value & 0xFF) as usize);
+        self.area_ids
+            .get(offset * 4..(offset + count) * 4)
+            .map(|bytes| {
+                bytes
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes")))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether places of the areas `left` and of the areas `right` can be
+    /// named in one address: an area of each is the same, or one record
+    /// lies in both, so one lies in the other.
+    pub fn nest(&self, left: &[u32], right: &[u32]) -> bool {
+        let pairs = self.nesting.len() / 8;
+        let pair_at = |index: usize| {
+            u64::from_le_bytes(
+                self.nesting[index * 8..index * 8 + 8]
+                    .try_into()
+                    .expect("eight bytes"),
+            )
+        };
+        left.iter().any(|left| {
+            right.iter().any(|right| {
+                if left == right {
+                    return true;
+                }
+                let wanted = nesting_pair(*left, *right);
+                let (mut low, mut high) = (0, pairs);
+                while low < high {
+                    let middle = (low + high) / 2;
+                    match pair_at(middle).cmp(&wanted) {
+                        std::cmp::Ordering::Less => low = middle + 1,
+                        std::cmp::Ordering::Greater => high = middle,
+                        std::cmp::Ordering::Equal => return true,
+                    }
+                }
+                false
+            })
+        })
+    }
+
     /// How strongly the Pack covers `country`, between 0 and 1.
     pub fn country_weight(&self, country: CountryCode) -> f32 {
         let total = self.countries.values().sum::<u64>();
@@ -367,11 +507,52 @@ fn build_fst(entries: &BTreeMap<String, Entry>) -> Result<Vec<u8>> {
     Ok(builder.into_inner()?)
 }
 
+fn empty_values() -> Map<Bytes> {
+    let bytes = MapBuilder::memory().into_inner().expect("empty FST");
+    Map::new(Bytes::new(bytes)).expect("valid empty FST")
+}
+
+/// The FST of area name keys and the id lists it points into, from the ids
+/// of the areas each key names. A key of more than [`MAX_AREAS_PER_NAME`]
+/// areas is left out.
+fn area_sections(lists: BTreeMap<String, Vec<u32>>) -> (Vec<u8>, Vec<u8>) {
+    let mut builder = MapBuilder::memory();
+    let mut ids = Vec::new();
+    for (key, mut areas) in lists {
+        areas.sort_unstable();
+        areas.dedup();
+        if areas.is_empty() || areas.len() > MAX_AREAS_PER_NAME {
+            continue;
+        }
+        let offset = (ids.len() / 4) as u64;
+        for area in &areas {
+            ids.extend_from_slice(&area.to_le_bytes());
+        }
+        builder
+            .insert(&key, (offset << 8) | areas.len() as u64)
+            .expect("keys in order");
+    }
+    (builder.into_inner().expect("in-memory FST"), ids)
+}
+
+/// Two areas as one sortable value, the smaller id above the larger.
+fn nesting_pair(left: u32, right: u32) -> u64 {
+    (u64::from(left.min(right)) << 32) | u64::from(left.max(right))
+}
+
+fn nesting_section(mut pairs: Vec<u64>) -> Vec<u8> {
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs.iter().flat_map(|pair| pair.to_le_bytes()).collect()
+}
+
 /// The names a record adds to the dictionaries, normalized. Computed beside
 /// its text document, in parallel; [`DictionaryBuilder::add`] then counts it.
 #[derive(Debug, Default)]
 pub struct RecordNames {
-    names: Vec<(Field, String)>,
+    /// Each name with its field and the admin level it names (see
+    /// [`level`]; none for a street or a POI).
+    names: Vec<(Field, String, u8)>,
     /// The country its own address states (`addr:country`).
     country: Option<CountryCode>,
 }
@@ -383,7 +564,7 @@ impl RecordNames {
             Record::Address(record) => names.address(&record.address),
             Record::Poi(poi) => {
                 for name in record.names() {
-                    names.add(Field::Poi, Some(name));
+                    names.add(Field::Poi, Some(name), 0);
                 }
                 if let Some(address) = &poi.address {
                     names.address(address);
@@ -391,25 +572,32 @@ impl RecordNames {
             }
             Record::Interpolation(record) => {
                 let address = &record.address;
-                names.add(Field::Street, address.street.as_deref());
-                names.add(Field::Locality, address.place.as_deref());
-                names.add(Field::Locality, address.locality.as_deref());
-                names.add(Field::Region, address.region.as_deref());
+                names.add(Field::Street, address.street.as_deref(), 0);
+                names.add(Field::Locality, address.place.as_deref(), level::LOCALITY);
+                names.add(
+                    Field::Locality,
+                    address.locality.as_deref(),
+                    level::LOCALITY,
+                );
+                names.add(Field::Region, address.region.as_deref(), level::REGION);
                 names.country_name(address.country.as_deref());
             }
             Record::Street(_) => {
                 for name in record.names() {
-                    names.add(Field::Street, Some(name));
+                    names.add(Field::Street, Some(name), 0);
                 }
             }
             Record::Place(layer, place) => {
-                let field = match layer {
-                    PlaceLayer::Country => Field::Country,
-                    PlaceLayer::Region => Field::Region,
-                    _ => Field::Locality,
+                let (field, level) = match layer {
+                    PlaceLayer::Country => (Field::Country, level::COUNTRY),
+                    PlaceLayer::Region => (Field::Region, level::REGION),
+                    PlaceLayer::District => (Field::Locality, level::DISTRICT),
+                    PlaceLayer::Locality => (Field::Locality, level::LOCALITY),
+                    PlaceLayer::Neighbourhood => (Field::Locality, level::NEIGHBOURHOOD),
+                    PlaceLayer::Place => (Field::Locality, level::PLACE),
                 };
                 for name in record.names() {
-                    names.add(field, Some(name));
+                    names.add(field, Some(name), level);
                 }
                 if let Some(code) = place.place_type.strip_prefix("derived_country:") {
                     names.country = CountryCode::parse(code);
@@ -423,40 +611,46 @@ impl RecordNames {
     fn address(&mut self, address: &AddressComponents) {
         if let Some(unit) = &address.unit {
             for word in unit_designators(unit) {
-                self.names.push((Field::Unit, word));
+                self.names.push((Field::Unit, word, 0));
             }
         }
-        self.add(Field::Street, address.street.as_deref());
-        self.add(Field::Locality, address.place.as_deref());
-        self.add(Field::Locality, address.locality.as_deref());
+        self.add(Field::Street, address.street.as_deref(), 0);
+        self.add(Field::Locality, address.place.as_deref(), level::LOCALITY);
+        self.add(
+            Field::Locality,
+            address.locality.as_deref(),
+            level::LOCALITY,
+        );
         for area in &address.areas {
-            self.add(Field::Locality, Some(area));
+            self.add(Field::Locality, Some(area), level::NEIGHBOURHOOD);
         }
-        self.add(Field::Region, address.region.as_deref());
+        self.add(Field::Region, address.region.as_deref(), level::REGION);
         self.country_name(address.country.as_deref());
     }
 
     /// `addr:country` is usually a code ("CA"), which is both the country of
     /// the record and a country word a query may use.
     fn country_name(&mut self, value: Option<&str>) {
-        self.add(Field::Country, value);
+        self.add(Field::Country, value, level::COUNTRY);
         if let Some(code) = value.and_then(CountryCode::parse) {
             self.country = Some(code);
         }
     }
 
-    fn add(&mut self, field: Field, value: Option<&str>) {
+    fn add(&mut self, field: Field, value: Option<&str>, level: u8) {
         if let Some(name) = value.and_then(dictionary_key) {
-            self.names.push((field, name));
+            self.names.push((field, name, level));
         }
     }
 }
 
-/// How often one name is used, and in which countries.
-#[derive(Debug, Default)]
+/// How often one name is used, in which countries, and at which admin
+/// levels.
+#[derive(Debug, Default, Clone)]
 struct NameStats {
     count: u64,
     countries: Vec<(CountryCode, u64)>,
+    levels: u8,
 }
 
 impl NameStats {
@@ -476,6 +670,7 @@ impl NameStats {
 
     fn merge(&mut self, other: &NameStats) {
         self.count += other.count;
+        self.levels |= other.levels;
         for &(country, count) in &other.countries {
             self.add_country(country, count);
         }
@@ -493,13 +688,32 @@ impl NameStats {
     }
 }
 
+/// An admin area records were counted in.
+#[derive(Debug)]
+struct Area {
+    field: Field,
+    /// Its admin level, one bit of [`level`].
+    level: u8,
+    stats: NameStats,
+}
+
+/// A name of admin areas without their type word, before it is known not
+/// to name an area of another level.
+#[derive(Debug, Default)]
+struct Alias {
+    fields: Vec<Field>,
+    stats: NameStats,
+    areas: Vec<u32>,
+}
+
 /// Collects the dictionaries while the Pack writer writes records.
 #[derive(Debug, Default)]
 pub struct DictionaryBuilder {
     names: HashMap<(Field, String), NameStats>,
-    /// Records lying in each admin area, by the area's record id and the
-    /// field its name belongs to.
-    areas: HashMap<RecordId, (Field, NameStats)>,
+    /// Records lying in each admin area, by the area's record id.
+    areas: HashMap<RecordId, Area>,
+    /// Every admin context a record lies in, for which areas lie in which.
+    contexts: HashSet<AdminContextTuple>,
     /// The country code of each country record admin contexts point at.
     country_codes: HashMap<RecordId, CountryCode>,
 }
@@ -518,25 +732,39 @@ impl DictionaryBuilder {
             .and_then(|tuple| tuple.country_record_id)
             .and_then(|id| self.country_codes.get(&id).copied())
             .or(names.country);
-        for (field, name) in names.names {
-            self.names.entry((field, name)).or_default().add(1, country);
+        for (field, name, level) in names.names {
+            let stats = self.names.entry((field, name)).or_default();
+            stats.add(1, country);
+            stats.levels |= level;
         }
         let Some(tuple) = tuple else {
             return;
         };
-        for (field, area) in [
-            (Field::Country, tuple.country_record_id),
-            (Field::Region, tuple.region_record_id),
-            (Field::Locality, tuple.district_record_id),
-            (Field::Locality, tuple.locality_record_id),
-            (Field::Locality, tuple.neighbourhood_record_id),
-            (Field::Locality, tuple.place_record_id),
+        self.contexts.insert(tuple);
+        for (field, level, area) in [
+            (Field::Country, level::COUNTRY, tuple.country_record_id),
+            (Field::Region, level::REGION, tuple.region_record_id),
+            (Field::Locality, level::DISTRICT, tuple.district_record_id),
+            (Field::Locality, level::LOCALITY, tuple.locality_record_id),
+            (
+                Field::Locality,
+                level::NEIGHBOURHOOD,
+                tuple.neighbourhood_record_id,
+            ),
+            (Field::Locality, level::PLACE, tuple.place_record_id),
         ] {
             if let Some(area) = area {
                 self.areas
                     .entry(area)
-                    .or_insert_with(|| (field, NameStats::default()))
-                    .1
+                    .or_insert_with(|| Area {
+                        field,
+                        level,
+                        stats: NameStats {
+                            levels: level,
+                            ..NameStats::default()
+                        },
+                    })
+                    .stats
                     .add(1, country);
             }
         }
@@ -544,7 +772,9 @@ impl DictionaryBuilder {
 
     /// Write every dictionary section. `area_names` names the admin areas
     /// records were counted in, each area's `name` first; every name of an
-    /// area is counted for the records lying in it.
+    /// area is counted for the records lying in it, and so is every name of
+    /// a region, district or locality without its type word
+    /// ([`admin_aliases`]) that names no area of another level.
     pub fn finish(
         self,
         pack: &mut ContainerWriter,
@@ -553,18 +783,66 @@ impl DictionaryBuilder {
         let Self {
             mut names,
             areas,
+            contexts,
             country_codes,
         } = self;
-        for (area, (field, stats)) in areas {
+        // The ids of the areas each area name names.
+        let mut places = BTreeMap::<String, Vec<u32>>::new();
+        let mut aliases = HashMap::<String, Alias>::new();
+        for (
+            area,
+            Area {
+                field,
+                level,
+                stats,
+            },
+        ) in &areas
+        {
+            let id = u32::try_from(*area).ok();
             let keys = area_names
-                .get(&area)
+                .get(area)
                 .into_iter()
                 .flatten()
                 .filter_map(|name| dictionary_key(name))
                 .collect::<HashSet<_>>();
             for key in keys {
-                names.entry((field, key)).or_default().merge(&stats);
+                if level & level::ALIASED != 0 {
+                    for alias in admin_aliases(&key) {
+                        let alias = aliases.entry(alias).or_default();
+                        if !alias.fields.contains(field) {
+                            alias.fields.push(*field);
+                        }
+                        alias.stats.merge(stats);
+                        alias.areas.extend(id);
+                    }
+                }
+                names.entry((*field, key.clone())).or_default().merge(stats);
+                places.entry(key).or_default().extend(id);
             }
+        }
+        // An alias of areas of one level joins their names, unless it is
+        // already a name of an area of another level ("京都" of "京都府"
+        // and "京都市" is neither).
+        for (key, alias) in aliases {
+            let [field] = alias.fields[..] else {
+                continue;
+            };
+            if alias.stats.levels.count_ones() != 1 {
+                continue;
+            }
+            let other_level = Field::AREAS.iter().any(|area| {
+                names
+                    .get(&(*area, key.clone()))
+                    .is_some_and(|stats| stats.levels & !alias.stats.levels != 0)
+            });
+            if other_level {
+                continue;
+            }
+            names
+                .entry((field, key.clone()))
+                .or_default()
+                .merge(&alias.stats);
+            places.entry(key).or_default().extend(alias.areas);
         }
         // A country is also written as its code ("ca"), as people write it.
         for (area, code) in &country_codes {
@@ -628,8 +906,119 @@ impl DictionaryBuilder {
                 &build_fst(&fields[field.index()])?,
             )?;
         }
+        let (map, ids) = area_sections(places);
+        pack.add(AREAS_SECTION, DICTIONARY_VERSION, &map)?;
+        pack.add(AREA_IDS_SECTION, DICTIONARY_VERSION, &ids)?;
+        // Every two areas one record lies in lie one in the other.
+        let mut pairs = Vec::new();
+        for context in &contexts {
+            let ids = context
+                .parent_record_ids()
+                .filter_map(|id| u32::try_from(id).ok())
+                .collect::<Vec<_>>();
+            for (index, left) in ids.iter().enumerate() {
+                for right in &ids[index + 1..] {
+                    pairs.push(nesting_pair(*left, *right));
+                }
+            }
+        }
+        pack.add(NESTING_SECTION, DICTIONARY_VERSION, &nesting_section(pairs))?;
         Ok(())
     }
+}
+
+/// How an admin type word is written beside the name of its area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Attach {
+    /// A word of its own before or after the name ("freistaat bayern",
+    /// "aichi prefecture").
+    Word,
+    /// Attached after the name ("愛知県", "경기도").
+    After,
+    /// Attached before the name ("จังหวัดเชียงใหม่").
+    Before,
+}
+
+/// The admin type words of [`LIBPOSTAL_QUALIFIERS`] and [`ADMIN_TYPES`] as
+/// dictionary keys with how they attach to a name. In [`ADMIN_TYPES`] a
+/// leading `-` attaches a word after the name and a trailing `-` before it.
+/// A libpostal qualifier of a script written without spaces, or of Hangul,
+/// whose words carry their type attached, attaches after the name; any
+/// other is a word of its own.
+fn admin_types() -> &'static [(String, Attach)] {
+    static TYPES: OnceLock<Vec<(String, Attach)>> = OnceLock::new();
+    TYPES.get_or_init(|| {
+        let phrases = |list: &'static str| {
+            list.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .flat_map(|line| line.split('|'))
+        };
+        let mut types = Vec::new();
+        for phrase in phrases(LIBPOSTAL_QUALIFIERS) {
+            let attached = phrase
+                .chars()
+                .next()
+                .is_some_and(|first| is_unspaced(first) || first.script() == Script::Hangul);
+            let attach = if attached {
+                Attach::After
+            } else {
+                Attach::Word
+            };
+            types.extend(dictionary_key(phrase).map(|key| (key, attach)));
+        }
+        for phrase in phrases(ADMIN_TYPES) {
+            let (phrase, attach) = if let Some(phrase) = phrase.strip_prefix('-') {
+                (phrase, Attach::After)
+            } else if let Some(phrase) = phrase.strip_suffix('-') {
+                (phrase, Attach::Before)
+            } else {
+                (phrase, Attach::Word)
+            };
+            types.extend(dictionary_key(phrase).map(|key| (key, attach)));
+        }
+        types.sort();
+        types.dedup();
+        types
+    })
+}
+
+/// The names an admin area's name `key` (a dictionary key) is also written
+/// as without the word of its type: "愛知" of "愛知県", "bayern" of
+/// "freistaat bayern", "madrid" of "comunidad de madrid", "경기" of "경기도".
+/// What is left must be two or more characters with no numeral, so "北区"
+/// and "3丁目" have none.
+pub(super) fn admin_aliases(key: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for (phrase, attach) in admin_types() {
+        let rests = match attach {
+            Attach::Word => [
+                key.strip_suffix(phrase.as_str())
+                    .and_then(|rest| rest.strip_suffix(' ')),
+                key.strip_prefix(phrase.as_str())
+                    .and_then(|rest| rest.strip_prefix(' ')),
+            ],
+            Attach::After => [
+                key.strip_suffix(phrase.as_str())
+                    .filter(|rest| !rest.ends_with(' ')),
+                None,
+            ],
+            Attach::Before => [
+                key.strip_prefix(phrase.as_str())
+                    .filter(|rest| !rest.starts_with(' ')),
+                None,
+            ],
+        };
+        for rest in rests.into_iter().flatten() {
+            let usable = rest.chars().count() >= 2
+                && !rest.chars().any(is_numeral)
+                && rest.chars().any(char::is_alphabetic);
+            if usable && !aliases.iter().any(|alias| alias == rest) {
+                aliases.push(rest.to_string());
+            }
+        }
+    }
+    aliases
 }
 
 /// The words that start or end many street names, with the vendored types.
@@ -715,6 +1104,15 @@ pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The names of `names` with their fields.
+    fn named(names: &RecordNames) -> Vec<(Field, String)> {
+        names
+            .names
+            .iter()
+            .map(|(field, name, _)| (*field, name.clone()))
+            .collect()
+    }
 
     fn entry(count: u64, country: Option<&str>) -> Entry {
         Entry {
@@ -817,7 +1215,7 @@ mod tests {
             },
         );
         assert_eq!(
-            RecordNames::of(&place).names,
+            named(&RecordNames::of(&place)),
             vec![
                 (Field::Locality, "横浜市".to_string()),
                 (Field::Locality, "よこはまし".to_string()),
@@ -838,7 +1236,7 @@ mod tests {
             source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
         });
         assert_eq!(
-            RecordNames::of(&poi).names,
+            named(&RecordNames::of(&poi)),
             vec![
                 (Field::Poi, "cafe uno".to_string()),
                 (Field::Poi, "カフェウノ".to_string()),
@@ -878,6 +1276,81 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn admin_areas_are_also_named_without_their_type_word() {
+        let aliases = |key: &str| admin_aliases(key);
+        assert_eq!(aliases("愛知県"), ["愛知"]);
+        assert_eq!(aliases("東京都"), ["東京"]);
+        assert_eq!(aliases("とうきょうと"), ["とうきょう"]);
+        assert_eq!(aliases("freistaat bayern"), ["bayern"]);
+        assert!(aliases("comunidad de madrid").contains(&"madrid".to_string()));
+        assert_eq!(aliases("aichi prefecture"), ["aichi"]);
+        assert_eq!(aliases("경기도"), ["경기"]);
+        assert_eq!(aliases("จังหวัดเชียงใหม่"), ["เชียงใหม่"]);
+        // Too little or a number is left: no alias.
+        assert!(aliases("北区").is_empty());
+        assert!(aliases("3丁目").is_empty());
+        // A type word inside a word is no type word.
+        assert!(aliases("statesville").is_empty());
+    }
+
+    #[test]
+    fn aliases_and_nesting_come_from_the_areas_records_lie_in() {
+        let mut builder = DictionaryBuilder::default();
+        let context = |region: RecordId, locality: RecordId| RecordContext {
+            admin_context: AdminContextTuple {
+                region_record_id: Some(region),
+                locality_record_id: Some(locality),
+                ..Default::default()
+            },
+            flags: 0,
+        };
+        for (region, locality) in [(1, 2), (3, 4), (3, 5)] {
+            builder.add(RecordNames::default(), Some(&context(region, locality)));
+        }
+        let names = HashMap::from([
+            (1, vec!["愛知県".to_string()]),
+            (2, vec!["名古屋市".to_string()]),
+            (3, vec!["京都府".to_string()]),
+            (4, vec!["京都市".to_string()]),
+            (5, vec!["宇治市".to_string()]),
+        ]);
+        let dir = std::env::temp_dir().join(format!("og-aliases-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("pack.ogp");
+        let mut pack = ContainerWriter::create(&path).expect("pack");
+        builder.finish(&mut pack, &names).expect("finish");
+        pack.finish().expect("seal");
+        let dictionaries =
+            Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
+        assert!(dictionaries.contains(Field::Region, "愛知"));
+        assert!(dictionaries.contains(Field::Locality, "名古屋"));
+        // "京都" names a region and a locality: neither.
+        assert!(!dictionaries.contains(Field::Region, "京都"));
+        assert!(!dictionaries.contains(Field::Locality, "京都"));
+        assert_eq!(dictionaries.areas("愛知"), [1]);
+        assert_eq!(dictionaries.areas("名古屋市"), [2]);
+        assert!(dictionaries.nest(&[1], &[2]));
+        assert!(dictionaries.nest(&[3], &[4]) && dictionaries.nest(&[5], &[3]));
+        assert!(!dictionaries.nest(&[1], &[4]), "Kyoto is not in Aichi");
+        assert!(!dictionaries.nest(&[4], &[5]), "two cities of one region");
+        assert!(dictionaries.areas("札幌").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_name_of_too_many_areas_lists_none() {
+        let many = (0..=MAX_AREAS_PER_NAME as u32).collect::<Vec<_>>();
+        let dictionaries = Dictionaries::empty().with_areas(
+            &[("中央区", &many[..]), ("東京都", &[7]), ("銀座", &[9, 8])],
+            &[(8, 7)],
+        );
+        assert!(dictionaries.areas("中央区").is_empty());
+        assert_eq!(dictionaries.areas("銀座"), [8, 9]);
+        assert!(dictionaries.nest(&[7], &[9, 8]));
+        assert!(!dictionaries.nest(&[7], &[9]));
     }
 
     #[test]
@@ -948,7 +1421,21 @@ mod tests {
             source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
         }));
         assert_eq!(
-            names.names,
+            names
+                .names
+                .iter()
+                .map(|(_, _, level)| *level)
+                .collect::<Vec<_>>(),
+            [
+                0,
+                level::LOCALITY,
+                level::NEIGHBOURHOOD,
+                level::REGION,
+                level::COUNTRY
+            ]
+        );
+        assert_eq!(
+            named(&names),
             vec![
                 (Field::Street, "king street west".to_string()),
                 (Field::Locality, "toronto".to_string()),

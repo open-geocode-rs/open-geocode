@@ -43,6 +43,7 @@ LISTS = {
     "building_types": ["building_types"],
     "street_types": ["street_types"],
     "directionals": ["directionals"],
+    "qualifiers": ["qualifiers"],
 }
 
 BRACKETED = re.compile(r"^\s*[\(（\[].*[\)）\]]\s*$")

@@ -35,8 +35,8 @@ use serde::Serialize;
 use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
     decode::{self, END, LABELS, Lattice, Path as LabelPath, START, STATES},
-    dictionary::{Dictionaries, Field},
-    is_unspaced,
+    dictionary::{Dictionaries, Field, admin_aliases},
+    dictionary_key, is_unspaced,
     weights::Weights,
 };
 use crate::{
@@ -621,6 +621,10 @@ const ISLAND_SHARE: f64 = 0.35;
 /// Share of rows of addresses that state several areas that write them as
 /// one locality field (see [`chained_areas`]).
 const CHAIN_SHARE: f64 = 0.5;
+/// Share of the rows naming a region, district or locality that name it
+/// without the word of its type, when the dictionaries hold it so ("愛知" of
+/// "愛知県", see [`admin_aliases`]).
+const ADMIN_ALIAS_SHARE: f64 = 0.3;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
@@ -1041,7 +1045,7 @@ impl<'a> Renderer<'a> {
         let mut locality = None;
         for area in [tuple.locality_record_id, tuple.district_record_id] {
             if locality.is_none() {
-                locality = self.name(area, random)?;
+                locality = self.admin_name(area, Field::Locality, random)?;
             }
         }
         let countries = self.names(tuple.country_record_id)?;
@@ -1055,7 +1059,7 @@ impl<'a> Renderer<'a> {
             locality,
             island: self.name(tuple.place_record_id, random)?,
             suburb: self.name(tuple.neighbourhood_record_id, random)?,
-            region: self.name(tuple.region_record_id, random)?,
+            region: self.admin_name(tuple.region_record_id, Field::Region, random)?,
             country,
             country_code,
         })
@@ -1065,6 +1069,33 @@ impl<'a> Renderer<'a> {
     fn name(&mut self, id: Option<RecordId>, random: &mut Random) -> Result<Option<String>> {
         let names = self.names(id)?;
         Ok(pick_name(&names, random).map(str::to_string))
+    }
+
+    /// One name of an admin area, as [`Self::name`] picks it, or in
+    /// [`ADMIN_ALIAS_SHARE`] of draws that name without its type word when
+    /// `field` holds it so.
+    fn admin_name(
+        &mut self,
+        id: Option<RecordId>,
+        field: Field,
+        random: &mut Random,
+    ) -> Result<Option<String>> {
+        let Some(name) = self.name(id, random)? else {
+            return Ok(None);
+        };
+        if random.chance(ADMIN_ALIAS_SHARE)
+            && let Some(key) = dictionary_key(&name)
+        {
+            let aliases = admin_aliases(&key)
+                .into_iter()
+                .filter(|alias| self.tagger.dictionaries().contains(field, alias))
+                .collect::<Vec<_>>();
+            if !aliases.is_empty() {
+                let pick = random.below(aliases.len() as u64) as usize;
+                return Ok(aliases.into_iter().nth(pick));
+            }
+        }
+        Ok(Some(name))
     }
 
     /// Every name of an area, its `name` first.
