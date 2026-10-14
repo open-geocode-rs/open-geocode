@@ -12,6 +12,7 @@ use crate::{
     builder::report::BuilderReport,
     context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext},
     pack::RecordId,
+    parse::lattice::CountryCode,
     record::{OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry},
     util::text::normalize_for_compare,
 };
@@ -182,6 +183,28 @@ impl BoundarySet {
             Some((*country_record_ids.get(code)?, record.name.clone()))
         });
         boundaries.chain(countries).collect()
+    }
+
+    /// The country code of each country record, by record id: the country
+    /// boundaries that state one, and the derived countries.
+    pub(crate) fn country_codes(
+        &self,
+        boundary_record_ids: &[RecordId],
+        country_record_ids: &HashMap<String, RecordId>,
+    ) -> HashMap<RecordId, CountryCode> {
+        let boundaries = self
+            .candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter(|(candidate, _)| candidate.boundary.layer == PlaceLayer::Country)
+            .filter_map(|(candidate, record_id)| {
+                let code = candidate.boundary.inferred_country_code.as_deref()?;
+                Some((*record_id, CountryCode::parse(code)?))
+            });
+        let derived = country_record_ids
+            .iter()
+            .filter_map(|(code, record_id)| Some((*record_id, CountryCode::parse(code)?)));
+        boundaries.chain(derived).collect()
     }
 
     /// Index the boundaries under their final record ids.

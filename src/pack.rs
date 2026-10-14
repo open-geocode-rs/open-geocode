@@ -1,7 +1,8 @@
 //! Pack writer and reader.
 //!
 //! A Pack is one container file (see [`crate::container`]) holding the record
-//! store, admin context table, text index and spatial index. Builds write a new
+//! store, admin context table, text index, spatial index and the address
+//! parser's dictionaries and weights (see [`crate::parse::lattice`]). Builds write a new
 //! generation next to the published one and switch the `CURRENT` pointer only
 //! after the new Pack passes validation, so running servers never see a
 //! partial Pack.
@@ -32,6 +33,11 @@ use crate::{
     extsort::Scratch,
     labels,
     memory::MemoryBudget,
+    parse::lattice::{
+        CountryCode,
+        dictionary::{DictionaryBuilder, RecordNames},
+        weights::{WEIGHTS_SECTION, WEIGHTS_VERSION, Weights},
+    },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
     spatial_index::{RecordCells, SpatialIndexWriter},
@@ -118,6 +124,8 @@ pub struct PackWriter {
     layer_counts: BTreeMap<Layer, u64>,
     context_names: HashMap<RecordId, String>,
     postcode_areas: PostcodeAreas,
+    dictionaries: DictionaryBuilder,
+    parse_weights: Option<Weights>,
 }
 
 /// A finished, unpublished Pack.
@@ -183,6 +191,8 @@ impl PackWriter {
             layer_counts: BTreeMap::new(),
             context_names: HashMap::new(),
             postcode_areas: PostcodeAreas::default(),
+            dictionaries: DictionaryBuilder::default(),
+            parse_weights: None,
         })
     }
 
@@ -205,6 +215,19 @@ impl PackWriter {
     /// after this can be indexed under the areas they lie in.
     pub fn set_context_names(&mut self, names: HashMap<RecordId, String>) {
         self.context_names = names;
+    }
+
+    /// Country codes of the country records admin contexts point at, so the
+    /// parser's dictionaries know which country each name is used in.
+    pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
+        self.dictionaries.set_country_codes(codes);
+    }
+
+    /// Trained parser weights to carry in the Pack (`parse/weights`).
+    /// Without them the parser reads a weights file beside the Pack file, or
+    /// its built-in weights.
+    pub fn set_parse_weights(&mut self, weights: Weights) {
+        self.parse_weights = Some(weights);
     }
 
     /// Postcode centroids, so the records written after this that state no
@@ -239,10 +262,12 @@ impl PackWriter {
                 Ok((
                     fields.document(record_id, record, &names, postcode_areas),
                     RecordCells::for_record(record_id, record)?,
+                    RecordNames::of(record),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        for ((record, context), (document, cells)) in batch.iter().zip(prepared) {
+        for ((record, context), (document, cells, names)) in batch.iter().zip(prepared) {
+            self.dictionaries.add(names, context.as_ref());
             let context = match context {
                 Some(context) => self.contexts.intern(*context)?,
                 None => None,
@@ -266,6 +291,9 @@ impl PackWriter {
             text,
             spatial,
             layer_counts,
+            context_names,
+            dictionaries,
+            parse_weights,
             ..
         } = self;
         let path = generation.path.join(PACK_FILE);
@@ -278,6 +306,11 @@ impl PackWriter {
         contexts.finish(&mut pack)?;
         let text_commit = text.finish(&mut pack)?;
         let spatial_commit = spatial.finish(&mut pack)?;
+        dictionaries.finish(&mut pack, &context_names)?;
+        drop(context_names);
+        if let Some(weights) = parse_weights {
+            pack.add(WEIGHTS_SECTION, WEIGHTS_VERSION, &weights.to_bytes())?;
+        }
 
         let manifest = PackManifest {
             schema_version: PACK_SCHEMA_VERSION,

@@ -9,6 +9,7 @@ mod http;
 pub mod labels;
 pub mod memory;
 pub mod pack;
+pub mod parse;
 pub mod record;
 pub mod records;
 pub mod reverse;

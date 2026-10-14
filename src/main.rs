@@ -17,6 +17,10 @@ use open_geocode::{
     builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     pack::{PackReader, RecordId},
+    parse::lattice::{
+        LatticeTagger,
+        train::{TrainOptions, train_weights},
+    },
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
     search::{PackTextSearcher, TextSearchOptions},
@@ -54,6 +58,12 @@ enum Commands {
         /// Directory for scratch files. Defaults to inside the Pack directory.
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
+
+        /// Trained address parser weights (from `parse-train`) to carry in
+        /// the Pack. Without them the parser uses a `parse.weights` file
+        /// beside the Pack file, or its built-in weights.
+        #[arg(long)]
+        parse_weights: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -115,6 +125,48 @@ enum Commands {
         /// Number of search hits to print. Use 0 for the default.
         #[arg(long, default_value_t = 10)]
         limit: usize,
+    },
+
+    /// Label the tokens of an address query with the Pack's parser, and print
+    /// its best labellings.
+    Parse {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Address query to label.
+        query: String,
+    },
+
+    /// Train the address parser's weights on addresses rendered from the
+    /// Pack's own records, and write them for `build --parse-weights`.
+    #[command(name = "parse-train")]
+    ParseTrain {
+        /// Pack directory or Pack file whose records and dictionaries to train
+        /// on.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Extra labelled addresses in libpostal's training format
+        /// (`country<TAB>address` with `token/label` pairs). Repeatable.
+        #[arg(long)]
+        extra: Vec<PathBuf>,
+
+        /// Output weights file.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Rendered training rows.
+        #[arg(long, default_value_t = 200_000)]
+        rows: usize,
+
+        /// Passes over the training rows.
+        #[arg(long, default_value_t = 5)]
+        epochs: usize,
+
+        /// Seed of the record draw and the noise.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
     },
 
     /// Reverse geocode one coordinate from a Pack spatial index.
@@ -307,6 +359,7 @@ async fn main() -> Result<()> {
             pack,
             memory_budget_mb,
             scratch_dir,
+            parse_weights,
         } => {
             let report = build_osm_pack(BuildOsmOptions {
                 input,
@@ -314,6 +367,7 @@ async fn main() -> Result<()> {
                 memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
+                parse_weights,
             })?;
             write_json(serde_json::json!({
                 "records": report.output.record_count,
@@ -349,6 +403,25 @@ async fn main() -> Result<()> {
             limit,
         } => search_pack(pack, query, layer, limit),
         Commands::ReversePack { pack, lon, lat } => reverse_pack(pack, lon, lat),
+        Commands::Parse { pack, query } => parse_query(pack, &query),
+        Commands::ParseTrain {
+            pack,
+            extra,
+            out,
+            rows,
+            epochs,
+            seed,
+        } => {
+            let report = train_weights(&TrainOptions {
+                pack,
+                extra,
+                out,
+                rows,
+                epochs,
+                seed,
+            })?;
+            write_json(serde_json::to_value(report)?)
+        }
         Commands::BenchPack {
             pack,
             queries,
@@ -539,6 +612,38 @@ fn write_json_to_path(value: &impl serde::Serialize, output: PathBuf) -> Result<
     create_output_dir(&output)?;
     let file = File::create(&output)?;
     serde_json::to_writer_pretty(file, value)?;
+    Ok(())
+}
+
+/// Each token with its label, then the n-best labellings with their scores.
+fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
+    let tagger = LatticeTagger::open(&pack)?;
+    let parses = tagger.parse(query);
+    let Some(best) = parses.first() else {
+        bail!("the query has no words to label");
+    };
+    let width = best
+        .tokens
+        .iter()
+        .map(|tagged| tagged.token.chars().count())
+        .max()
+        .unwrap_or_default();
+    for tagged in &best.tokens {
+        println!("{:width$}  {}", tagged.token, tagged.label.name());
+    }
+    println!();
+    for (rank, parse) in parses.iter().enumerate() {
+        let country = parse
+            .country
+            .map_or("--".to_string(), |code| code.to_string());
+        let labelled = parse
+            .pieces
+            .iter()
+            .map(|tagged| format!("{}/{}", tagged.token, tagged.label.name()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{}. {:8.3} {country}  {labelled}", rank + 1, parse.score);
+    }
     Ok(())
 }
 

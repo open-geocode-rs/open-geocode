@@ -55,6 +55,7 @@ use crate::{
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
     },
+    parse::lattice::weights::Weights,
     record::{Record, RejectedRecord},
     records::quantize,
     text_index::PostcodeAreas,
@@ -82,6 +83,8 @@ pub struct BuildOsmOptions {
     pub memory_budget_bytes: usize,
     /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
+    /// Trained address parser weights to carry in the Pack.
+    pub parse_weights: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -91,6 +94,7 @@ impl Default for BuildOsmOptions {
             pack: PathBuf::new(),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             scratch_dir: None,
+            parse_weights: None,
         }
     }
 }
@@ -114,6 +118,9 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
             text_index_memory_bytes: sorter_budget,
         },
     )?;
+    if let Some(path) = &options.parse_weights {
+        writer.set_parse_weights(Weights::read(path)?);
+    }
     let scratch = Arc::clone(writer.scratch());
     let mut build = Build {
         report: BuilderReport {
@@ -319,6 +326,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         ordered.write(&item)?;
     }
     writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
+    writer.set_country_codes(boundaries.country_codes(&boundary_ids, &country_ids));
     writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
     let context_count = ordered.written();
@@ -707,6 +715,7 @@ mod tests {
             pack: root.to_path_buf(),
             memory_budget_bytes,
             scratch_dir: None,
+            parse_weights: None,
         })
         .expect("build")
     }
