@@ -515,3 +515,28 @@ fn every_token_of_the_normalized_query_gets_one_label_in_order() {
         );
     }
 }
+
+#[test]
+fn vocabulary_phrases_are_spans_and_tell_their_neighbours() {
+    let dictionaries = Dictionaries::from_entries(
+        dictionary::vocabulary("post office box|po box|p o box\n私 書 箱|shishobako")
+            .iter()
+            .map(|(key, entry)| (Field::PoBox, key.as_str(), *entry)),
+    );
+    let tagger = LatticeTagger::new(dictionaries, Weights::zero());
+    let has = |lattice: &Lattice, start: usize, end: usize, feature: &str| {
+        lattice
+            .spans
+            .iter()
+            .find(|span| span.start == start && span.end == end)
+            .is_some_and(|span| span.features.contains(&by_name(feature)))
+    };
+    let lattice = tagger.lattice(&Tokens::new("p o box 29"), &Suppression::default());
+    assert!(has(&lattice, 0, 3, "phrase:po_box"));
+    assert!(has(&lattice, 3, 4, "phrase_before:po_box"));
+    assert!(!has(&lattice, 2, 3, "phrase:po_box"));
+    // A phrase of a script written without spaces is its glued units.
+    let lattice = tagger.lattice(&Tokens::new("私書箱 819"), &Suppression::default());
+    assert!(has(&lattice, 0, 3, "phrase:po_box"));
+    assert!(has(&lattice, 3, 4, "phrase_before:po_box"));
+}

@@ -609,6 +609,9 @@ const ALT_NAME_SHARE: f64 = 0.3;
 /// the POI's name, so the model sees a venue name next to the street and
 /// areas it is in, and the POI dictionary hit on the venue alone.
 const POI_ADDRESS_SHARE: f64 = 0.7;
+/// Share of written units whose unit, PO box or level word follows the
+/// number instead of leading it.
+const UNIT_WORD_AFTER_SHARE: f64 = 0.3;
 /// Share of rows of records on an island that name it.
 const ISLAND_SHARE: f64 = 0.35;
 /// Share of rows of addresses that state several areas that write them as
@@ -621,7 +624,9 @@ struct Renderer<'a> {
     tagger: &'a LatticeTagger,
     /// Every name of each area record, its `name` first.
     names: HashMap<RecordId, Vec<String>>,
-    unit_words: Vec<String>,
+    /// The words a unit is written with: the Pack's unit words, PO box
+    /// words and level words.
+    unit_words: [Vec<String>; 3],
     template_countries: Vec<String>,
 }
 
@@ -632,7 +637,8 @@ impl<'a> Renderer<'a> {
             tagger,
             names: HashMap::new(),
             // The vendored unit words and those the Pack's units use.
-            unit_words: tagger.dictionaries().keys(Field::Unit),
+            unit_words: [Field::Unit, Field::PoBox, Field::Level]
+                .map(|field| tagger.dictionaries().keys(field)),
             template_countries: templates().keys().cloned().collect(),
         }
     }
@@ -952,13 +958,34 @@ impl<'a> Renderer<'a> {
             );
             return;
         }
+        // A unit word, or a PO box or level phrase, before the number or,
+        // some of the time, after it ("301号室", "3階").
+        let kind = match random.below(10) {
+            0..=5 => 0,
+            6 | 7 => 1,
+            _ => 2,
+        };
+        let vocabulary = &self.unit_words[kind];
+        let phrase = (!vocabulary.is_empty())
+            .then(|| &vocabulary[random.below(vocabulary.len() as u64) as usize])
+            .and_then(|phrase| words(phrase));
+        let after = random.chance(UNIT_WORD_AFTER_SHARE);
         let mut words = Tokens::default();
-        if !self.unit_words.is_empty() {
-            let word = &self.unit_words[random.below(self.unit_words.len() as u64) as usize];
-            words.push(word.clone(), false, None);
+        let push_phrase = |words: &mut Tokens| {
+            if let Some(phrase) = &phrase {
+                for (word, joiner) in phrase.words.iter().zip(&phrase.joiners) {
+                    words.push(word.clone(), false, *joiner);
+                }
+            }
+        };
+        if !after {
+            push_phrase(&mut words);
         }
         for (word, joiner) in value.words.into_iter().zip(value.joiners) {
             words.push(word, false, joiner);
+        }
+        if after {
+            push_phrase(&mut words);
         }
         let street_end = groups
             .iter()

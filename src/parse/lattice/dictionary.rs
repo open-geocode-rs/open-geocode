@@ -9,7 +9,10 @@
 //! only copy of place data. Street-type words are the words that start or end
 //! many of those street names, plus a vendored list of common types and
 //! abbreviations; unit words are a vendored list plus the words that
-//! designate many of the Pack's `addr:unit` values. POI names are a field of
+//! designate many of the Pack's `addr:unit` values. libpostal's open word
+//! lists (unit, PO box, level, building and street types, directionals) in
+//! every language they hold join the street-type and unit dictionaries and
+//! fill dictionaries of their own. POI names are a field of
 //! their own, so a venue's name is known as one. A `words` section holds
 //! every word of every name but a POI's, so a lookup knows when a word is no
 //! typo.
@@ -53,6 +56,15 @@ const MIN_UNIT_WORD_VALUES: u64 = 20;
 const STREET_TYPE_WORDS: &str = include_str!("data/street_types.txt");
 /// Words that introduce a unit, floor or building part, one per line.
 const UNIT_WORDS: &str = include_str!("data/unit_words.txt");
+/// libpostal's open word lists (MIT, see `data/LICENSE-libpostal.txt`),
+/// every language of a list in one file, one phrase per line with its
+/// `|`-separated variants. Vendored by `scripts/parse_lattice_words.py`.
+const LIBPOSTAL_UNIT_TYPES: &str = include_str!("data/libpostal/unit_types.txt");
+const LIBPOSTAL_PO_BOXES: &str = include_str!("data/libpostal/po_boxes.txt");
+const LIBPOSTAL_LEVEL_TYPES: &str = include_str!("data/libpostal/level_types.txt");
+const LIBPOSTAL_BUILDING_TYPES: &str = include_str!("data/libpostal/building_types.txt");
+const LIBPOSTAL_STREET_TYPES: &str = include_str!("data/libpostal/street_types.txt");
+const LIBPOSTAL_DIRECTIONALS: &str = include_str!("data/libpostal/directionals.txt");
 
 /// One dictionary of the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -66,10 +78,18 @@ pub enum Field {
     StreetType,
     Unit,
     Word,
+    /// Words of a PO box ("po box", "私書箱"), from libpostal.
+    PoBox,
+    /// Words of a floor or level ("floor", "階"), from libpostal.
+    Level,
+    /// Words of a building ("tower", "ビル"), from libpostal.
+    Building,
+    /// Compass directions ("north", "nw"), from libpostal.
+    Directional,
 }
 
 impl Field {
-    pub const ALL: [Field; 8] = [
+    pub const ALL: [Field; 12] = [
         Field::Locality,
         Field::Region,
         Field::Street,
@@ -78,6 +98,10 @@ impl Field {
         Field::StreetType,
         Field::Unit,
         Field::Word,
+        Field::PoBox,
+        Field::Level,
+        Field::Building,
+        Field::Directional,
     ];
     /// The fields of names that a whole span of a query can be.
     pub const NAMES: [Field; 5] = [
@@ -86,6 +110,16 @@ impl Field {
         Field::Street,
         Field::Country,
         Field::Poi,
+    ];
+    /// The fields of vocabulary phrases a span of a query can be: words
+    /// that say what the words beside them are.
+    pub const PHRASES: [Field; 6] = [
+        Field::Unit,
+        Field::PoBox,
+        Field::Level,
+        Field::Building,
+        Field::StreetType,
+        Field::Directional,
     ];
 
     /// The Pack section that holds the field.
@@ -99,6 +133,10 @@ impl Field {
             Field::StreetType => "parse/street_type",
             Field::Unit => "parse/unit",
             Field::Word => "parse/words",
+            Field::PoBox => "parse/po_box",
+            Field::Level => "parse/level",
+            Field::Building => "parse/building",
+            Field::Directional => "parse/directional",
         }
     }
 
@@ -546,12 +584,21 @@ impl DictionaryBuilder {
         }
         fields[Field::StreetType.index()] = street_types(&fields[Field::Street.index()]);
         let mut units = vocabulary(UNIT_WORDS);
+        units.extend(vocabulary(LIBPOSTAL_UNIT_TYPES));
         for (word, entry) in &fields[Field::Unit.index()] {
             if entry.count >= MIN_UNIT_WORD_VALUES {
                 units.entry(word.clone()).or_insert(*entry).count = entry.count;
             }
         }
         fields[Field::Unit.index()] = units;
+        for (field, list) in [
+            (Field::PoBox, LIBPOSTAL_PO_BOXES),
+            (Field::Level, LIBPOSTAL_LEVEL_TYPES),
+            (Field::Building, LIBPOSTAL_BUILDING_TYPES),
+            (Field::Directional, LIBPOSTAL_DIRECTIONALS),
+        ] {
+            fields[field.index()] = vocabulary(list);
+        }
         // Every word of every name but a POI's: a venue's name is any word
         // at all, and would make typos of street names known words.
         let mut words = BTreeMap::<String, Entry>::new();
@@ -600,6 +647,7 @@ fn street_types(streets: &BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
     }
     let threshold = ((streets.len() as f64 * STREET_TYPE_SHARE) as u64).max(MIN_STREET_TYPE_NAMES);
     let mut types = vocabulary(STREET_TYPE_WORDS);
+    types.extend(vocabulary(LIBPOSTAL_STREET_TYPES));
     for (word, count) in ends {
         if count >= threshold && !word.chars().any(|character| character.is_numeric()) {
             types
@@ -641,11 +689,14 @@ fn unit_designators(value: &str) -> Vec<String> {
     words
 }
 
-/// A vendored word list as dictionary entries.
-fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
+/// A vendored word list as dictionary entries: one phrase per line, its
+/// variants separated by `|`, `#` lines comments. Every language of a list
+/// is read alike.
+pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
     list.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(|line| line.split('|'))
         .filter_map(dictionary_key)
         .map(|word| {
             (

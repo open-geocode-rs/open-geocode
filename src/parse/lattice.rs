@@ -586,6 +586,7 @@ impl LatticeTagger {
         let mut covers = vec![0u16; tokens.len()];
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
         let runs = units.runs();
+        let phrases = Phrases::new(self, &units, longest);
         for start in 0..tokens.len() {
             for end in start + 1..=(start + longest).min(tokens.len()) {
                 if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
@@ -593,6 +594,12 @@ impl LatticeTagger {
                 }
                 let mut set = FeatureSet::new(tokens, &infos, start, end);
                 let mut evidence = end - start == 1;
+                let kinds = phrases.kinds(start, end);
+                if kinds != 0 {
+                    evidence = true;
+                    set.phrase(kinds);
+                }
+                set.phrase_neighbours(phrases.ending[start], phrases.starting[end]);
                 let mut key = SpanKey::new(units.key(start, end), &infos[start..end]);
                 // A word's affixes: of a token, or of glued units as one.
                 let glued = end - start > 1 && units.unspaced(start, end);
@@ -742,6 +749,56 @@ pub fn pack_file(pack: &Path) -> Result<PathBuf> {
         .filter(|name| *name == PACK_FILE)
         .context("not a Pack file")?;
     Ok(path)
+}
+
+/// The vocabulary phrases of a query's units (see [`Field::PHRASES`]): the
+/// kinds of phrase each span is, one bit per field, and the kinds of the
+/// phrases that end before and start at each unit.
+struct Phrases {
+    /// `(start, end, kinds)` of every span that is a phrase.
+    spans: Vec<(usize, usize, u8)>,
+    /// `ending[unit]`: the kinds of the phrases that end right before `unit`.
+    ending: Vec<u8>,
+    /// `starting[unit]`: the kinds of the phrases that start at `unit`; one
+    /// past the last unit is empty.
+    starting: Vec<u8>,
+}
+
+impl Phrases {
+    fn new(tagger: &LatticeTagger, units: &Units, longest: usize) -> Self {
+        let len = units.len();
+        let mut phrases = Self {
+            spans: Vec::new(),
+            ending: vec![0; len + 1],
+            starting: vec![0; len + 1],
+        };
+        for start in 0..len {
+            for end in start + 1..=(start + longest).min(len) {
+                if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
+                    break;
+                }
+                let key = units.key(start, end);
+                let kinds = Field::PHRASES
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| tagger.dictionaries.contains(**field, &key))
+                    .fold(0u8, |kinds, (bit, _)| kinds | 1 << bit);
+                if kinds != 0 {
+                    phrases.spans.push((start, end, kinds));
+                    phrases.ending[end] |= kinds;
+                    phrases.starting[start] |= kinds;
+                }
+            }
+        }
+        phrases
+    }
+
+    fn kinds(&self, start: usize, end: usize) -> u8 {
+        self.spans
+            .iter()
+            .find(|span| span.0 == start && span.1 == end)
+            .map_or(0, |span| span.2)
+    }
 }
 
 /// A span as dictionary keys, with the fuzzy automaton of its expanded key

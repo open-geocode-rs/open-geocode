@@ -1,0 +1,313 @@
+# libpostal resources/dictionaries/*/{unit_types_numbered,unit_types_standalone}.txt (MIT)
+# be
+кватэра|кв
+kvatera|kv
+# bg
+апартамент|ап|апт
+apartament|ap|apt
+офис|оф
+ofis|of
+стая
+staya
+# bs
+apartman|ap|apt
+soba
+stan
+ured
+# ca
+apartament|apmt
+casa
+habitació|hab|habitacio
+lletra
+lot|lt
+oficina|of
+parcel·la|parc|parcella
+porta|pta
+sala
+unitat|un
+# cs
+apartmán|apartman|apt
+kancelář|kancelar
+pokoj|pok
+# da
+hus
+lejlighed|lejl
+# de
+appartement|apt|app
+büro|buro|buero
+haus
+top
+wohnung|whg|w|/ w|/ / w
+wohnungsnummer
+zimmer|zi
+# el
+διαμέρισμα|διαμερισμα
+diamérisma|diamerisma
+δωμάτιο|δωματιο
+domátio|domatio
+γραφείου|γραφειου
+grafeíou|grafeiou
+# en
+allotment
+antenna|ant
+apartment|apt|ap|aprt|aptmnt
+barbecue|bbq|barbeque
+berth|brth
+boatshed|btsd
+building|bdg|bldg|blg
+block|blk|bl|blck
+bungalow|bnglw|bongalow|bunglow|bungalo|bngw
+cage
+caravan|cvan
+carpark|carp
+carspace|cars
+club
+coolroom
+cottage|cott|cottg
+door
+duplex|dup|dupl
+extension|ext|extn
+factory|fcty|fty|fy
+farm|frm
+flat|flt
+garage|grge
+hall
+hangar|hngr
+house|hse|hous|hs|ho
+kiosk|ksk
+lease|lse
+lobby|lby|lbby
+location|loc|locn|loctn
+lot
+maisonette|msnt
+marine berth|mb|mbth
+office|ofc|off|o|offc
+parcel
+penthouse|pths|ph|pent house
+pier
+portion|por
+rear
+reserve|rsve|rsrv|rsv|resv
+room|rm
+section|sec
+shed|shd
+shop|shp
+showroom|shrm
+sign
+site
+slip
+space|spc
+stall|stl|stll|sl
+station
+stop
+store|stor
+strata unit|su|str
+studio|stu
+substation|subs
+suite|ste|se
+tenancy|tncy
+tower|twr
+townhouse|tnhs|twnhs|tnhse|twnhse
+trailer|trlr
+trailer park lot|trlr park lot|trlr pk lot
+unit|un|unt|u
+van
+vault|vlt
+villa|vlla|vl
+ward|wrd|wd
+warehouse|we|whs|wrhs
+workshop|wshp|wkshp|wksp
+front|frnt
+lower left|lower l|lwr l
+lower right|lower r|lwr r
+rear lower|rear lwr
+side|sd
+top floor left|tfl|t f l|t.f.l|t / f / l
+top floor right|tfr|t f r|t.f.r|t / f / r
+top left|tl|t l|t.l|t / l
+top right|tr|t r|t.r|t / r
+upper left|upper l|upr left|uppr left|upr l|uppr l
+upper right|upper r|upr right|uppr right|upr r|uppr r
+# es
+apartamento|apto|apt|apartamiento|ap
+ático|át|atico|at
+casa
+consultorio|cn
+departamento|dpto|dept|dep|dto|depto
+interior|int|in
+número interior|no int|# int|nº int|n° int|№ int|n.º int|n.° int|núm int|númr int|numr int|númro int|numro int|núm.ro int|nr int|num.ro int|nro int|n.ro int|no in|# in|nº in|n° in|№ in|n.º in|n.° in|núm in|númr in|numr in|númro in|numro in|núm.ro in|nr in|num.ro in|nro in|n.ro in
+letra
+lote|lt
+oficina|of|ofc
+parcela
+puerta|pta
+sala
+suite|ste
+unidad|unid|udad|un
+ático|át|atico|at|atco
+ático de lujo|át de lujo|atico de lujo|at de lujo|ático lujo|át lujo|atico lujo|at lujo|atco lujo
+cobertizo|cbtizfrente|fren
+sobreático|sobreatico
+trasera|trs|tras
+# et
+korter|k
+ruumi
+uks
+# eu
+apartamentu|ap|aptu|apt
+bulego
+# fi
+asunto|as
+huone
+# fr
+appartement|app|ap|appt|apt|appart
+bureau|bur
+boîte|bte
+chambre
+lotissement|lot
+parcelle
+porte|p|pte
+salle
+suite
+unité|u|unite
+# ga
+árasán|arasan
+# he
+דירה
+dira
+# hr
+apartman|ap|apt
+soba
+stan
+ured
+# hu
+iroda
+lakás|lakas
+szoba
+# id
+garasi|grsi
+gedung|gdg|gd
+gudang|gdng
+hangar|hngr
+kamar|kmr
+kantor
+kavling|kav|kv
+kebun|kebon|kbn
+kios
+pabrik|pabrk|pbrk
+parkiran|park
+rukun tetangga|rt
+rukun warga|rw
+stasiun
+toko|tko
+vila|vla|vl
+belakang bawah|belakang bwh|blkg bwh
+belakang|blkg
+depan|dpn
+kanan bawah|kanan bwh|knan bwh
+kiri bawah|kiri bwh|kri bwh
+lobi|lbi|lbbi
+sisi|ssi
+# is
+íbúð|ibuo
+# it
+appartamento|app
+casa|c|ca|ca'
+garage|g.ge|gge
+interno|int
+lotto
+officina|off.a|off
+porta
+sala
+unità|unita
+# lt
+biuro
+butas
+kambarys
+# lv
+birojs
+dzīvoklis|dz|dzivoklis
+istaba
+# nb
+leilighet|leil
+# nl
+appartement|app|apt|ap
+bus|b
+kamer
+# pl
+mieszkanie|m
+pokój|pok
+# pt
+apartamento|ap|apt|apto|apt.o
+casa
+conjunto|conj|cj
+letra
+lote|lt
+parcela
+porta|pta
+moradia
+sala
+unidade|un
+sobre loja|slj
+# ro
+apartamentul|apartament|ap|apt|apart
+birou
+cladire|cladirea|clădire|clădirea
+corp|corpul
+complex
+interior|int
+lotul
+sală|sala
+# ru
+квартира|кв
+kvartira|kv
+кабинет|каб|к-т|к
+kabinet|kab|k-t|k
+литера|лит
+litera|lit
+офис|оф
+ofis|of
+помещение|пом
+pomeshhenie|pom
+# sk
+apartmán|apartman|apt
+izba
+kancelária|kancelaria
+# sl
+soba
+stanovanje
+urad
+# sr
+апартман|ап|апт
+apartman|ap|apt
+канцеларија
+kancelarija
+соба
+soba
+стан
+stan
+# sv
+bostad|bst
+hus
+lägenhet|lgh|lagenhet|laegenhet|lg
+lägenhetsnummer|lgh nr|lghnr|lagenhetsnummer|laegenhetsnummer|lgnr|lg nr
+rum
+# tr
+apartman|apt|ap
+daire|d
+oda
+ofis
+# uk
+квартира|кв
+kvartyra|kv
+кабінет|каб|к-т|к
+kabinet|kab|k-t|k
+кімната|км
+kimnata|km
+літера|літ
+litera|lit
+офіс|оф
+ofis|of
+# zh
+室
+shì|shi

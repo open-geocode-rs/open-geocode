@@ -92,6 +92,20 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("postcode_any", &["1", "2", "3"]),
     ("postcode_country", &["1", "2", "3"]),
     ("dict_cover", &DICT_COVER),
+    ("phrase", &PHRASE_KINDS),
+    ("phrase_before", &PHRASE_KINDS),
+    ("phrase_after", &PHRASE_KINDS),
+];
+
+/// The kinds of vocabulary phrase, in the order of
+/// [`Field::PHRASES`](super::dictionary::Field::PHRASES).
+const PHRASE_KINDS: [&str; 6] = [
+    "unit",
+    "po_box",
+    "level",
+    "building",
+    "street_type",
+    "directional",
 ];
 
 const DICT_COVER: [&str; 10] = [
@@ -219,6 +233,9 @@ enum Block {
     PostcodeAny,
     PostcodeCountry,
     DictCover,
+    Phrase,
+    PhraseBefore,
+    PhraseAfter,
 }
 
 const fn offset(block: Block) -> u32 {
@@ -232,7 +249,7 @@ const fn offset(block: Block) -> u32 {
 }
 
 /// Feature ids of the named blocks.
-const NAMED: usize = offset(Block::DictCover) as usize + DICT_COVER.len();
+const NAMED: usize = offset(Block::PhraseAfter) as usize + PHRASE_KINDS.len();
 /// The lengths of the hashed affixes.
 const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
 /// Buckets of each affix block: one per side and length.
@@ -569,6 +586,26 @@ impl FeatureSet {
         }
     }
 
+    /// The span is a vocabulary phrase of the kinds of `kinds`, one bit per
+    /// field of [`Field::PHRASES`]: "po box", "私書箱", "floor".
+    pub fn phrase(&mut self, kinds: u8) {
+        self.phrase_bits(Block::Phrase, kinds);
+    }
+
+    /// A phrase of the kinds of `before` ends right before the span, and one
+    /// of the kinds of `after` starts right after it: the number of "po box
+    /// 29" follows a PO box phrase.
+    pub fn phrase_neighbours(&mut self, before: u8, after: u8) {
+        self.phrase_bits(Block::PhraseBefore, before);
+        self.phrase_bits(Block::PhraseAfter, after);
+    }
+
+    fn phrase_bits(&mut self, block: Block, kinds: u8) {
+        for kind in (0..PHRASE_KINDS.len()).filter(|kind| kinds & (1 << kind) != 0) {
+            self.push(block, kind);
+        }
+    }
+
     /// The span is one number written in parts: "993.5", "1384 1/2".
     pub fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
@@ -632,7 +669,7 @@ mod tests {
         let unique = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), COUNT);
         assert_eq!(name(0), "bias:bias");
-        assert_eq!(name(NAMED as u32 - 1), "dict_cover:poi:inside");
+        assert_eq!(name(NAMED as u32 - 1), "phrase_after:directional");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
         assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
         assert_eq!(
