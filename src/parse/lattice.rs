@@ -614,18 +614,19 @@ impl LatticeTagger {
             return Vec::new();
         }
         let lattice = self.lattice(tokens, &Suppression::default());
-        let paths = decode::best(&lattice, &self.weights, n.max(CONSTRAINED_PATHS));
-        let addresses = paths
-            .iter()
-            .filter(|path| self.is_one_address(&lattice, path))
-            .cloned()
-            .collect::<Vec<_>>();
-        // When no labelling can be one address, the best ones still read it.
-        let paths = if addresses.is_empty() {
-            paths
-        } else {
-            addresses
-        };
+        let mut paths = decode::best(&lattice, &self.weights, n);
+        // The best labellings are almost always addresses; only when one is
+        // not are more decoded to find those that are. When none is, the
+        // best ones still read it.
+        if !paths.iter().all(|path| self.is_one_address(&lattice, path)) {
+            let addresses = decode::best(&lattice, &self.weights, n.max(CONSTRAINED_PATHS))
+                .into_iter()
+                .filter(|path| self.is_one_address(&lattice, path))
+                .collect::<Vec<_>>();
+            if !addresses.is_empty() {
+                paths = addresses;
+            }
+        }
         paths
             .into_iter()
             .take(n)
