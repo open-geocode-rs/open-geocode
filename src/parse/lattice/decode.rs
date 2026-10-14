@@ -48,6 +48,9 @@ pub(super) struct Lattice {
     pub units: Units,
     pub spans: Vec<Span>,
     pub candidates: Vec<CountryCode>,
+    /// The spans that are names of areas the Pack knows, as `(start, end,
+    /// the record ids of the areas)`.
+    pub places: Vec<(usize, usize, Vec<u32>)>,
     /// Span indices by the token they end before.
     by_end: Vec<Vec<usize>>,
 }
@@ -64,8 +67,17 @@ impl Lattice {
             units,
             spans,
             candidates,
+            places: Vec::new(),
             by_end,
         }
+    }
+
+    /// The areas the span `start..end` names, when the Pack knows them.
+    pub fn place(&self, start: usize, end: usize) -> Option<&[u32]> {
+        self.places
+            .iter()
+            .find(|place| place.0 == start && place.1 == end)
+            .map(|place| place.2.as_slice())
     }
 }
 

@@ -60,6 +60,9 @@ pub const MAX_SPAN_TOKENS: usize = 5;
 pub const MAX_UNSPACED_SPAN: usize = 10;
 /// How many labellings [`LatticeTagger::parse`] returns at most.
 pub const N_BEST: usize = 3;
+/// How many labellings are decoded per country before those that cannot be
+/// one address are dropped (see [`LatticeTagger::is_one_address`]).
+const CONSTRAINED_PATHS: usize = 8;
 /// How many candidate countries are decoded besides the global fallback.
 const MAX_CANDIDATE_COUNTRIES: usize = 3;
 /// The file a Pack's trained weights are read from when the Pack does not
@@ -611,8 +614,21 @@ impl LatticeTagger {
             return Vec::new();
         }
         let lattice = self.lattice(tokens, &Suppression::default());
-        decode::best(&lattice, &self.weights, n)
+        let paths = decode::best(&lattice, &self.weights, n.max(CONSTRAINED_PATHS));
+        let addresses = paths
+            .iter()
+            .filter(|path| self.is_one_address(&lattice, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        // When no labelling can be one address, the best ones still read it.
+        let paths = if addresses.is_empty() {
+            paths
+        } else {
+            addresses
+        };
+        paths
             .into_iter()
+            .take(n)
             .map(|path| {
                 let labels = path.labels(&lattice);
                 ParsedQuery {
@@ -631,6 +647,44 @@ impl LatticeTagger {
                 }
             })
             .collect()
+    }
+
+    /// Whether `path` reads its query as one address can be written: each
+    /// of the country, the region and the postcode is one field at most, and
+    /// the places it names that the Pack knows lie one in another (a ward in
+    /// its city, the city in its region), so no admin level is named twice.
+    /// The model scores parts of a labelling; this holds of the whole.
+    fn is_one_address(&self, lattice: &Lattice, path: &decode::Path) -> bool {
+        let labels = path.labels(lattice);
+        for label in [Label::Country, Label::Region, Label::Postcode] {
+            let fields = labels
+                .iter()
+                .enumerate()
+                .filter(|(index, at)| **at == label && (*index == 0 || labels[index - 1] != label))
+                .count();
+            if fields > 1 {
+                return false;
+            }
+        }
+        let places = path
+            .segments
+            .iter()
+            .filter(|segment| {
+                matches!(
+                    segment.label,
+                    Label::Locality | Label::Region | Label::Country
+                )
+            })
+            .filter_map(|segment| {
+                let span = &lattice.spans[segment.span];
+                lattice.place(span.start, span.end)
+            })
+            .collect::<Vec<_>>();
+        places.iter().enumerate().all(|(index, left)| {
+            places[index + 1..]
+                .iter()
+                .all(|right| self.dictionaries.nest(left, right))
+        })
     }
 
     /// Every span of the units of `tokens` with its evidence, and the
@@ -658,6 +712,7 @@ impl LatticeTagger {
         // Exact area names, `(start, end, is a region)`, and the glued
         // spans without other evidence, which may be chains of them.
         let mut areas = Vec::new();
+        let mut places = Vec::new();
         let mut glued_spans = Vec::new();
         for start in 0..tokens.len() {
             for end in start + 1..=(start + longest).min(tokens.len()) {
@@ -683,6 +738,7 @@ impl LatticeTagger {
                 if glued && runs.contains(&(start, end)) {
                     evidence = true;
                 }
+                let mut area = false;
                 for field in Field::NAMES {
                     if suppression.hides(field, start, end) {
                         continue;
@@ -691,6 +747,7 @@ impl LatticeTagger {
                         evidence = true;
                         if hit.distance == 0 && Field::AREAS.contains(&field) {
                             areas.push((start, end, field == Field::Region));
+                            area = true;
                         }
                         set.dictionary_hit(field, &hit, key.key.chars().count());
                         if end - start > 1 {
@@ -703,6 +760,15 @@ impl LatticeTagger {
                         if let Some(country) = hit.entry.country {
                             countries.vote(country, field.country_vote(hit.distance, end - start));
                         }
+                    }
+                }
+                if area {
+                    let ids = [&key.key, &key.expanded]
+                        .into_iter()
+                        .map(|key| self.dictionaries.areas(key))
+                        .find(|ids| !ids.is_empty());
+                    if let Some(ids) = ids {
+                        places.push((start, end, ids));
                     }
                 }
                 if is_number_in_parts(tokens, &infos, start, end)
@@ -767,7 +833,9 @@ impl LatticeTagger {
             features::ground(span);
         }
         let candidates = countries.top(MAX_CANDIDATE_COUNTRIES, &self.weights);
-        Lattice::new(units, spans, candidates)
+        let mut lattice = Lattice::new(units, spans, candidates);
+        lattice.places = places;
+        lattice
     }
 
     /// The best hit of `key` in `field`: exact, as written or with its

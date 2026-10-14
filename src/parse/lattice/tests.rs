@@ -277,6 +277,69 @@ fn a_query_pointing_to_a_country_is_read_as_that_country_only() {
 }
 
 #[test]
+fn labellings_whose_places_cannot_be_one_address_are_dropped() {
+    use Label::*;
+    let tagger = LatticeTagger::new(
+        Dictionaries::from_entries([
+            (Field::Region, "愛知県", entry(200_000, "JP")),
+            (Field::Region, "京都府", entry(100_000, "JP")),
+            (Field::Locality, "名古屋市", entry(90_000, "JP")),
+            (Field::Locality, "京都市", entry(60_000, "JP")),
+        ])
+        .with_areas(
+            &[
+                ("愛知県", &[1]),
+                ("名古屋市", &[2]),
+                ("京都府", &[3]),
+                ("京都市", &[4]),
+            ],
+            &[(1, 2), (3, 4)],
+        ),
+        Weights::built_in(),
+    );
+    let read = |query: &str| {
+        tagger
+            .parse(query)
+            .into_iter()
+            .map(|parsed| {
+                parsed
+                    .pieces
+                    .into_iter()
+                    .map(|piece| (piece.token, piece.label))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let city_and_region =
+        |city: &str, region: &str| vec![(city.to_string(), Locality), (region.to_string(), Region)];
+    // A city in its region is read as one; a city of another region never.
+    assert_eq!(
+        read("名古屋市, 愛知県")[0],
+        city_and_region("名古屋市", "愛知県")
+    );
+    let parses = read("京都市, 愛知県");
+    assert!(!parses.is_empty());
+    assert!(
+        !parses.contains(&city_and_region("京都市", "愛知県")),
+        "{parses:?}"
+    );
+    // Two places of one level, or two region fields, are no address.
+    let lattice = tagger.lattice(
+        &Tokens::new("愛知県, 名古屋市, 京都府"),
+        &Suppression::default(),
+    );
+    let one_address = |gold: &[Label]| {
+        let gold = lattice.units.expand(gold);
+        let path = decode::decode(&lattice, tagger.weights(), Some(code("JP")), 1, Some(&gold));
+        tagger.is_one_address(&lattice, &path[0])
+    };
+    assert!(one_address(&[Region, Locality, Other]));
+    assert!(!one_address(&[Region, Locality, Region]));
+    assert!(!one_address(&[Region, Locality, Locality]));
+    assert!(!one_address(&[Region, Other, Region]));
+}
+
+#[test]
 fn built_in_weights_read_common_address_shapes() {
     use Label::*;
     let tagger = tagger();
