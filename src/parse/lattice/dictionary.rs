@@ -8,7 +8,8 @@
 //! and country names come from the Pack's own records, so the Pack stays the
 //! only copy of place data. Street-type words are the words that start or end
 //! many of those street names, plus a vendored list of common types and
-//! abbreviations; unit words are a vendored list. A `words` section holds
+//! abbreviations; unit words are a vendored list plus the words that
+//! designate many of the Pack's `addr:unit` values. A `words` section holds
 //! every word of every name, so a lookup knows when a word is no typo.
 //!
 //! A Pack built before these sections existed still opens: its dictionaries
@@ -41,6 +42,9 @@ const STREET_TYPE_SHARE: f64 = 0.002;
 /// ...and at least this many of them, so a small Pack does not promote a
 /// name that happens to repeat.
 const MIN_STREET_TYPE_NAMES: u64 = 20;
+/// A word that designates at least this many of the Pack's `addr:unit`
+/// values ("suite" of "suite 200") is a unit word.
+const MIN_UNIT_WORD_VALUES: u64 = 20;
 
 /// Street types and their common abbreviations in many languages, one per
 /// line; vocabulary, not place data.
@@ -226,6 +230,16 @@ impl Dictionaries {
         self.map(field).contains_key(key)
     }
 
+    /// Every name in `field`, in key order.
+    pub fn keys(&self, field: Field) -> Vec<String> {
+        let mut keys = Vec::with_capacity(self.len(field));
+        let mut stream = self.map(field).keys();
+        while let Some(key) = stream.next() {
+            keys.push(String::from_utf8_lossy(key).into_owned());
+        }
+        keys
+    }
+
     /// The best name `dfa` accepts that starts with `prefix`: fewest edits,
     /// then most used. The prefix keeps the walk to one branch of the FST:
     /// without it, two edits reach every two-character start of every name.
@@ -357,6 +371,11 @@ impl RecordNames {
     }
 
     fn address(&mut self, address: &AddressComponents) {
+        if let Some(unit) = &address.unit {
+            for word in unit_designators(unit) {
+                self.names.push((Field::Unit, word));
+            }
+        }
         self.add(Field::Street, address.street.as_deref());
         self.add(Field::Locality, address.place.as_deref());
         self.add(Field::Locality, address.locality.as_deref());
@@ -516,7 +535,13 @@ impl DictionaryBuilder {
             fields[field.index()].insert(name.clone(), stats.entry());
         }
         fields[Field::StreetType.index()] = street_types(&fields[Field::Street.index()]);
-        fields[Field::Unit.index()] = vocabulary(UNIT_WORDS);
+        let mut units = vocabulary(UNIT_WORDS);
+        for (word, entry) in &fields[Field::Unit.index()] {
+            if entry.count >= MIN_UNIT_WORD_VALUES {
+                units.entry(word.clone()).or_insert(*entry).count = entry.count;
+            }
+        }
+        fields[Field::Unit.index()] = units;
         let mut words = BTreeMap::<String, Entry>::new();
         for entries in &fields {
             for name in entries.keys() {
@@ -574,9 +599,31 @@ fn street_types(streets: &BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
     types
 }
 
-/// The vendored unit words, normalized, for rendering training rows.
-pub(super) fn unit_words() -> Vec<String> {
-    vocabulary(UNIT_WORDS).into_keys().collect()
+/// The words of an `addr:unit` value that say what kind of unit its number
+/// is: the words of letters of a value that also holds a number ("suite" and
+/// "floor" of "Suite 200, Floor 3"). A word of a script written without
+/// spaces is one character per unit of the parser, never a unit word.
+fn unit_designators(value: &str) -> Vec<String> {
+    let tokens = super::Tokens::new(value);
+    if !tokens
+        .words
+        .iter()
+        .any(|word| word.chars().any(char::is_numeric))
+    {
+        return Vec::new();
+    }
+    let mut words = tokens
+        .words
+        .into_iter()
+        .filter(|word| {
+            word.chars().count() >= 2
+                && word.chars().all(char::is_alphabetic)
+                && !word.chars().any(super::is_unspaced)
+        })
+        .collect::<Vec<_>>();
+    words.sort_unstable();
+    words.dedup();
+    words
 }
 
 /// A vendored word list as dictionary entries.
@@ -743,6 +790,55 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn words_many_units_are_written_with_are_unit_words() {
+        let address = |unit: &str| {
+            Record::Address(crate::record::AddressRecord {
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: "1".into(),
+                    street: Some("Main Street".into()),
+                    place: None,
+                    unit: Some(unit.into()),
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                geometry: crate::record::point_geometry(0.0, 0.0),
+                location_precision: crate::record::LocationPrecision::Point,
+                source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+            })
+        };
+        let mut builder = DictionaryBuilder::default();
+        for index in 0..MIN_UNIT_WORD_VALUES {
+            builder.add(RecordNames::of(&address(&format!("Bay {index}"))), None);
+        }
+        builder.add(RecordNames::of(&address("Booth 1")), None);
+        let dir = std::env::temp_dir().join(format!("og-units-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("pack.ogp");
+        let mut pack = ContainerWriter::create(&path).expect("pack");
+        builder.finish(&mut pack, &HashMap::new()).expect("finish");
+        pack.finish().expect("seal");
+        let dictionaries =
+            Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
+        assert!(dictionaries.contains(Field::Unit, "bay"));
+        assert!(!dictionaries.contains(Field::Unit, "booth"), "too few");
+        assert!(dictionaries.contains(Field::Unit, "suite"), "vendored");
+        assert!(dictionaries.keys(Field::Unit).contains(&"bay".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_designators_are_the_words_of_a_numbered_unit() {
+        assert_eq!(unit_designators("Suite 200, Floor 3"), ["floor", "suite"]);
+        assert_eq!(unit_designators("Apt. 4B"), ["apt"]);
+        assert!(unit_designators("Penthouse").is_empty(), "no number");
+        assert!(unit_designators("B 12").is_empty(), "one letter");
+        assert!(unit_designators("301号室").is_empty(), "unspaced script");
     }
 
     #[test]

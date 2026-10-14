@@ -34,7 +34,7 @@ use serde::Serialize;
 use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, Suppression, Tokens,
     decode::{self, END, LABELS, Lattice, Path as LabelPath, START, STATES},
-    dictionary::{Dictionaries, Field, unit_words},
+    dictionary::{Dictionaries, Field},
     is_unspaced,
     weights::Weights,
 };
@@ -611,7 +611,8 @@ impl<'a> Renderer<'a> {
             pack,
             tagger,
             names: HashMap::new(),
-            unit_words: unit_words(),
+            // The vendored unit words and those the Pack's units use.
+            unit_words: tagger.dictionaries().keys(Field::Unit),
             template_countries: templates().keys().cloned().collect(),
         }
     }
@@ -900,9 +901,11 @@ impl<'a> Renderer<'a> {
             );
             return;
         }
-        let mut words = Tokens::from_words(&[
-            &self.unit_words[random.below(self.unit_words.len() as u64) as usize]
-        ]);
+        let mut words = Tokens::default();
+        if !self.unit_words.is_empty() {
+            let word = &self.unit_words[random.below(self.unit_words.len() as u64) as usize];
+            words.push(word.clone(), false, None);
+        }
         for (word, joiner) in value.words.into_iter().zip(value.joiners) {
             words.push(word, false, joiner);
         }
