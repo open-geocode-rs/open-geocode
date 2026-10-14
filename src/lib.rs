@@ -11,6 +11,7 @@ pub mod pack;
 pub mod record;
 pub mod records;
 pub mod reverse;
+pub mod route;
 pub mod runtime;
 pub mod search;
 pub mod spatial_index;

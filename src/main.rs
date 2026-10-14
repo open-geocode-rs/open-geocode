@@ -10,6 +10,7 @@ use open_geocode::{
     builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    route::{RouteOptions, route},
     runtime::{ServeOptions, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
@@ -172,6 +173,19 @@ enum Commands {
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
     },
+    /// Serve one HTTP entry point in front of one Runtime per country Pack.
+    ///
+    /// Requests with `country=XX` go to that country's Runtime; /search and /autocomplete
+    /// without it go to every Runtime and are merged by score.
+    Route {
+        /// A Runtime as COUNTRY=URL, e.g. NZ=http://127.0.0.1:8081. Repeat per country.
+        #[arg(long = "worker", required = true)]
+        workers: Vec<String>,
+
+        /// Address and port to bind.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: SocketAddr,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -319,6 +333,16 @@ async fn main() -> Result<()> {
                 basemap,
             })
             .await
+        }
+        Commands::Route { workers, bind } => {
+            let workers = workers
+                .into_iter()
+                .map(|w| match w.split_once('=') {
+                    Some((country, url)) => Ok((country.to_string(), url.to_string())),
+                    None => bail!("--worker takes COUNTRY=URL, got {w:?}"),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            route(RouteOptions { workers, bind }).await
         }
     }
 }
