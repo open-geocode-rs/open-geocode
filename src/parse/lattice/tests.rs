@@ -117,6 +117,35 @@ fn hidden_dictionary_hits_leave_only_the_token_spans() {
 }
 
 #[test]
+fn a_run_of_glued_characters_is_an_edge_whatever_its_length() {
+    let tagger = tagger();
+    // Two runs, split by the field break; the second is longer than any
+    // span looked up.
+    let tokens = Tokens::new("み な と み ら い, 神奈川県横浜市西区みなとみらい");
+    let units = Units::of(&tokens);
+    assert_eq!(units.runs(), [(0, 6), (6, 21)]);
+    let lattice = tagger.lattice(&tokens, &Suppression::default());
+    let spans = lattice
+        .spans
+        .iter()
+        .map(|span| (span.start, span.end))
+        .collect::<Vec<_>>();
+    assert!(spans.contains(&(0, 6)), "{spans:?}");
+    assert!(spans.contains(&(6, 21)), "{spans:?}");
+    let run = lattice
+        .spans
+        .iter()
+        .find(|span| (span.start, span.end) == (6, 21))
+        .expect("run");
+    assert!(
+        run.features
+            .iter()
+            .any(|id| features::name(*id).starts_with("affix:suffix4:")),
+        "the run carries its affixes"
+    );
+}
+
+#[test]
 fn fuzzy_lookup_corrects_long_unknown_words_only() {
     let tagger = tagger();
     let lookup = |field: Field, word: &str| {

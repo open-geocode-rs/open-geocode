@@ -327,6 +327,21 @@ impl Units {
         key
     }
 
+    /// The maximal runs of two or more glued units, as `start..end`.
+    fn runs(&self) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for end in 1..=self.len() {
+            if end == self.len() || !self.glued[end] {
+                if end - start > 1 {
+                    runs.push((start, end));
+                }
+                start = end;
+            }
+        }
+        runs
+    }
+
     /// Whether every unit of `start..end` after the first is glued to the
     /// one before it.
     fn unspaced(&self, start: usize, end: usize) -> bool {
@@ -567,6 +582,7 @@ impl LatticeTagger {
         let mut single = Vec::with_capacity(tokens.len());
         let mut covers = vec![0u8; tokens.len()];
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
+        let runs = units.runs();
         for start in 0..tokens.len() {
             for end in start + 1..=(start + longest).min(tokens.len()) {
                 if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
@@ -575,6 +591,16 @@ impl LatticeTagger {
                 let mut set = FeatureSet::new(tokens, &infos, start, end);
                 let mut evidence = end - start == 1;
                 let mut key = SpanKey::new(units.key(start, end), &infos[start..end]);
+                // A word's affixes: of a token, or of glued units as one.
+                let glued = end - start > 1 && units.unspaced(start, end);
+                if (end - start == 1 && !infos[start].unspaced) || glued {
+                    set.affixes(&key.key);
+                }
+                // A whole run of glued units is an edge of its own, a name
+                // the dictionaries may not hold.
+                if glued && runs.contains(&(start, end)) {
+                    evidence = true;
+                }
                 for field in Field::NAMES {
                     if suppression.hides(field, start, end) {
                         continue;
@@ -620,6 +646,12 @@ impl LatticeTagger {
                     .features
                     .push(features::cover_base() + bit);
             }
+        }
+        // Runs longer than the longest span looked up.
+        for &(start, end) in runs.iter().filter(|(start, end)| end - start > longest) {
+            let mut set = FeatureSet::new(tokens, &infos, start, end);
+            set.affixes(&units.key(start, end));
+            spans.push(set.into_span());
         }
         let candidates = countries.top(MAX_CANDIDATE_COUNTRIES, &self.weights);
         Lattice::new(units, spans, candidates)

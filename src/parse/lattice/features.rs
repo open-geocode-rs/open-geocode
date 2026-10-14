@@ -5,6 +5,19 @@
 //! of any other: a word's identity is the Pack's business, its role the
 //! model's. Each feature is conjoined with the label of the edge it is on,
 //! so one feature id carries one weight per label.
+//!
+//! The one exception reads a little of a word's letters: the affix blocks
+//! hash the character n-grams (n = 2, 3, 4) a word starts and ends with,
+//! shorter than the word, into [`AFFIX_BUCKETS`] buckets per side and n, so
+//! endings such as "-strasse", "-ville" or "-shi" tell their role on names
+//! no dictionary holds. The word of a span is its one token, or the units of
+//! a script written without spaces glued into one key ("みなとみらい").
+//!
+//! ```text
+//! ids 0 .. NAMED                      the named blocks of BLOCKS, in order
+//! NAMED + (side * 3 + n - 2) * 1024   bucket 0 of the affix block of side
+//!   + bucket                          (0 prefix, 1 suffix) and n (2..=4)
+//! ```
 
 use super::{
     CountryCode, MAX_SPAN_TOKENS, Tokens,
@@ -200,8 +213,15 @@ const fn offset(block: Block) -> u32 {
     offset as u32
 }
 
+/// Feature ids of the named blocks.
+const NAMED: usize = offset(Block::DictCover) as usize + DICT_COVER.len();
+/// The lengths of the hashed affixes.
+const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
+/// Buckets of each affix block: one per side and length.
+pub(super) const AFFIX_BUCKETS: usize = 1_024;
+const AFFIX_BLOCKS: usize = 2 * AFFIX_SIZES.len();
 /// Feature ids, without labels.
-pub(super) const COUNT: usize = offset(Block::DictCover) as usize + DICT_COVER.len();
+pub(super) const COUNT: usize = NAMED + AFFIX_BLOCKS * AFFIX_BUCKETS;
 
 /// The feature of a one-unit span that lies inside a longer name of `field`
 /// the dictionaries know, at its first unit or after it. A run of
@@ -234,6 +254,19 @@ fn id(block: Block, index: usize) -> u32 {
 
 /// `block:feature`, for weight dumps and the schema fingerprint.
 pub(super) fn name(id: u32) -> String {
+    if let Some(affix) = (id as usize).checked_sub(NAMED) {
+        let (block, bucket) = (affix / AFFIX_BUCKETS, affix % AFFIX_BUCKETS);
+        if block < AFFIX_BLOCKS {
+            let side = if block < AFFIX_SIZES.len() {
+                "prefix"
+            } else {
+                "suffix"
+            };
+            let size = AFFIX_SIZES[block % AFFIX_SIZES.len()];
+            return format!("affix:{side}{size}:{bucket}");
+        }
+        return format!("unknown:{id}");
+    }
     let mut first = 0;
     for (block, names) in BLOCKS {
         let index = id as usize - first;
@@ -491,6 +524,32 @@ impl FeatureSet {
         }
     }
 
+    /// The prefixes and suffixes of `word`, the span as one word, each of
+    /// [`AFFIX_SIZES`] characters and shorter than the word, hashed into
+    /// their blocks.
+    pub fn affixes(&mut self, word: &str) {
+        let bounds = word
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(word.len()))
+            .collect::<Vec<_>>();
+        let chars = bounds.len() - 1;
+        for (index, size) in AFFIX_SIZES.into_iter().enumerate() {
+            if chars <= size {
+                break;
+            }
+            let prefix = &word[..bounds[size]];
+            let suffix = &word[bounds[chars - size]..];
+            for (side, affix) in [(0, prefix), (1, suffix)] {
+                let block = side * AFFIX_SIZES.len() + index;
+                let bucket = xxhash_rust::xxh3::xxh3_64_with_seed(affix.as_bytes(), block as u64)
+                    % AFFIX_BUCKETS as u64;
+                self.features
+                    .push((NAMED + block * AFFIX_BUCKETS + bucket as usize) as u32);
+            }
+        }
+    }
+
     /// The span is one number written in parts: "993.5", "1384 1/2".
     pub fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
@@ -539,7 +598,7 @@ impl FeatureSet {
 
 /// Feature ids by name, for hand-set weights and tests.
 pub(super) fn by_name(name: &str) -> u32 {
-    (0..COUNT as u32)
+    (0..NAMED as u32)
         .find(|id| self::name(*id) == name)
         .unwrap_or_else(|| panic!("no feature {name}"))
 }
@@ -554,11 +613,46 @@ mod tests {
         let unique = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), COUNT);
         assert_eq!(name(0), "bias:bias");
-        assert_eq!(name(COUNT as u32 - 1), "dict_cover:country:inside");
+        assert_eq!(name(NAMED as u32 - 1), "dict_cover:country:inside");
+        assert_eq!(name(NAMED as u32), "affix:prefix2:0");
+        assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
         assert_eq!(
             by_name("dict_distance:street:1"),
             id(Block::DictDistance, 7)
         );
+    }
+
+    #[test]
+    fn affixes_hash_the_starts_and_ends_shorter_than_the_word() {
+        let features = |word: &str| {
+            let tokens = Tokens::from_words(&[word]);
+            let infos = [TokenInfo::new(word, &Dictionaries::empty())];
+            let mut set = FeatureSet::new(&tokens, &infos, 0, 1);
+            let before = set.features.len();
+            set.affixes(word);
+            set.features[before..]
+                .iter()
+                .map(|id| name(*id))
+                .collect::<Vec<_>>()
+        };
+        let names = features("bahnhofstrasse");
+        assert_eq!(names.len(), 6);
+        for (index, block) in [
+            "prefix2", "suffix2", "prefix3", "suffix3", "prefix4", "suffix4",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                names[index].starts_with(&format!("affix:{block}:")),
+                "{names:?}"
+            );
+        }
+        // The same ending hashes alike in another word.
+        assert_eq!(features("hauptstrasse")[5], names[5]);
+        assert_eq!(features("abc").len(), 2, "only affixes shorter than it");
+        assert!(features("ab").is_empty());
+        assert_eq!(features("みなとみらい").len(), 6);
     }
 
     #[test]
