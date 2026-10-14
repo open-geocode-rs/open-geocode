@@ -107,11 +107,24 @@ impl Path {
     }
 }
 
-/// The best `n` labellings over the global fallback and every candidate
-/// country, each labelling once, under the country that scores it best.
+/// The countries a lattice is decoded as: every candidate country, or the
+/// global fallback alone when the query points to none. A query whose
+/// dictionary hits and postcode matches point to a country is read with
+/// that country's evidence and transitions, never against a global reading
+/// that leaves its evidence out.
+pub(super) fn countries(lattice: &Lattice) -> Vec<Option<CountryCode>> {
+    if lattice.candidates.is_empty() {
+        vec![None]
+    } else {
+        lattice.candidates.iter().copied().map(Some).collect()
+    }
+}
+
+/// The best `n` labellings over the countries of [`countries`], each
+/// labelling once, under the country that scores it best.
 pub(super) fn best(lattice: &Lattice, weights: &Weights, n: usize) -> Vec<Path> {
-    let mut paths = std::iter::once(None)
-        .chain(lattice.candidates.iter().copied().map(Some))
+    let mut paths = countries(lattice)
+        .into_iter()
         .flat_map(|country| decode(lattice, weights, country, n, None))
         .collect::<Vec<_>>();
     sort_paths(&mut paths);

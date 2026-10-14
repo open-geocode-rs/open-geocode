@@ -238,6 +238,18 @@ fn n_best_paths_are_distinct_labellings_best_first() {
 }
 
 #[test]
+fn a_query_pointing_to_a_country_is_read_as_that_country_only() {
+    let tagger = tagger();
+    // Every hit is Canadian: no reading leaves the Canadian evidence out.
+    let parses = tagger.parse("670 king st w toronto");
+    assert!(!parses.is_empty());
+    assert!(parses.iter().all(|parsed| parsed.country == Some(code("CA"))));
+    // Nothing points to a country: the global fallback reads it.
+    let parses = tagger.parse("12 nowhere lane");
+    assert!(parses.iter().all(|parsed| parsed.country.is_none()));
+}
+
+#[test]
 fn built_in_weights_read_common_address_shapes() {
     use Label::*;
     let tagger = tagger();

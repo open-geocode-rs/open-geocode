@@ -173,9 +173,6 @@ pub fn train_weights(options: &TrainOptions) -> Result<TrainReport> {
 pub(super) struct Row {
     pub tokens: Tokens,
     pub gold: Vec<Label>,
-    /// The country the row is written as, when its template is that
-    /// country's own.
-    pub country: Option<CountryCode>,
     pub suppression: Suppression,
     /// Whether the row was rendered from a block scheme address.
     pub block_address: bool,
@@ -212,12 +209,15 @@ impl Model {
         let gold = lattice.units.expand(&row.gold);
         let wrong = predicted.labels(lattice) != gold;
         if wrong {
-            // The gold labelling as the row's country when that country is
-            // decoded at all, else as the global model.
-            let country = row
-                .country
-                .filter(|country| lattice.candidates.contains(country));
-            let gold = decode::decode(lattice, &self.weights, country, 1, Some(&gold))
+            // The gold labelling under the country that scores it best, of
+            // the countries the lattice is decoded as: which country a row
+            // is read as is not given, as it is not for a query.
+            let mut golds = decode::countries(lattice)
+                .into_iter()
+                .flat_map(|country| decode::decode(lattice, &self.weights, country, 1, Some(&gold)))
+                .collect::<Vec<_>>();
+            decode::sort_paths(&mut golds);
+            let gold = golds
                 .into_iter()
                 .next()
                 .expect("every token is a span, so every labelling has a path");
@@ -854,7 +854,6 @@ impl<'a> Renderer<'a> {
         {
             insert_island(&mut groups, island);
         }
-        let row_country = country.filter(|code| code.as_str() == template_country);
         // Many places write the largest area first and the house number
         // last ("100-0005 東京都千代田区丸の内2-7-2"), whatever order the
         // template states, so some rows run from largest to smallest.
@@ -929,7 +928,6 @@ impl<'a> Renderer<'a> {
         (!tokens.is_empty()).then_some(Row {
             tokens,
             gold,
-            country: row_country,
             suppression,
             block_address: false,
         })
@@ -1235,18 +1233,18 @@ fn read_libpostal(path: &Path) -> Result<Vec<Row>> {
     for line in BufReader::new(file).lines() {
         let line = line?;
         let fields = line.split('\t').collect::<Vec<_>>();
-        let (country, address) = match fields.as_slice() {
-            [_, country, address] | [country, address] => (*country, *address),
+        let address = match fields.as_slice() {
+            [_, _, address] | [_, address] => *address,
             _ => continue,
         };
-        if let Some(row) = libpostal_row(CountryCode::parse(country), address) {
+        if let Some(row) = libpostal_row(address) {
             rows.push(row);
         }
     }
     Ok(rows)
 }
 
-fn libpostal_row(country: Option<CountryCode>, address: &str) -> Option<Row> {
+fn libpostal_row(address: &str) -> Option<Row> {
     let mut tokens = Tokens::default();
     let mut gold = Vec::new();
     let mut pending_break = false;
@@ -1275,7 +1273,6 @@ fn libpostal_row(country: Option<CountryCode>, address: &str) -> Option<Row> {
     (!tokens.is_empty()).then(|| Row {
         tokens,
         gold,
-        country,
         suppression: Suppression::default(),
         block_address: false,
     })
@@ -1454,18 +1451,16 @@ mod tests {
     #[test]
     fn libpostal_rows_keep_labels_and_field_breaks() {
         use Label::*;
-        let row = libpostal_row(
-            CountryCode::parse("us"),
-            "123/house_number main/road st/road ,/SEP new/city york/city ny/state",
-        )
-        .expect("row");
+        let row =
+            libpostal_row("123/house_number main/road st/road ,/SEP new/city york/city ny/state")
+                .expect("row");
         assert_eq!(row.tokens.words, ["123", "main", "st", "new", "york", "ny"]);
         assert_eq!(row.tokens.breaks, [false, false, false, true, false, false]);
         assert_eq!(
             row.gold,
             [HouseNumber, Street, Street, Locality, Locality, Region]
         );
-        assert!(libpostal_row(None, "no-label").is_none());
+        assert!(libpostal_row("no-label").is_none());
     }
 
     #[test]
@@ -1502,7 +1497,6 @@ mod tests {
         let row = |text: &str, gold: Vec<Label>| Row {
             tokens: Tokens::new(text),
             gold,
-            country: None,
             suppression: Suppression::default(),
             block_address: false,
         };
