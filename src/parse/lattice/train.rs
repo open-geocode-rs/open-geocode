@@ -74,6 +74,10 @@ pub struct TrainOptions {
 pub struct TrainReport {
     pub out: String,
     pub rendered_rows: usize,
+    /// Rendered rows with a house number, and rows of block scheme
+    /// addresses (see [`BLOCK_ADDRESS_SHARE`]).
+    pub house_number_rows: usize,
+    pub block_address_rows: usize,
     pub extra_rows: usize,
     pub held_out_rows: usize,
     pub epochs: usize,
@@ -105,6 +109,11 @@ pub fn train_weights(options: &TrainOptions) -> Result<TrainReport> {
     let mut random = Random::new(options.seed);
     let mut rows = Renderer::new(&pack, &tagger).render(options.rows, &mut random)?;
     let rendered_rows = rows.len();
+    let house_number_rows = rows
+        .iter()
+        .filter(|row| row.gold.contains(&Label::HouseNumber))
+        .count();
+    let block_address_rows = rows.iter().filter(|row| row.block_address).count();
     let mut extra_rows = 0;
     for path in &options.extra {
         let extra = read_libpostal(path)?;
@@ -146,6 +155,8 @@ pub fn train_weights(options: &TrainOptions) -> Result<TrainReport> {
     Ok(TrainReport {
         out: options.out.display().to_string(),
         rendered_rows,
+        house_number_rows,
+        block_address_rows,
         extra_rows,
         held_out_rows: test.len(),
         epochs,
@@ -166,6 +177,8 @@ pub(super) struct Row {
     /// country's own.
     pub country: Option<CountryCode>,
     pub suppression: Suppression,
+    /// Whether the row was rendered from a block scheme address.
+    pub block_address: bool,
 }
 
 /// The averaged perceptron's state.
@@ -621,7 +634,9 @@ impl<'a> Renderer<'a> {
     }
 
     /// About `rows` rows from records drawn at random, by layer: mostly
-    /// addresses, then POIs, streets, places and postcodes.
+    /// addresses, then POIs, streets, places and postcodes. Block scheme
+    /// addresses have a share of their own on top of the addresses', so
+    /// their house numbers and the streets beside them are seen often.
     fn render(&mut self, rows: usize, random: &mut Random) -> Result<Vec<Row>> {
         let count = self.pack.records().record_count();
         if count == 0 {
@@ -629,27 +644,45 @@ impl<'a> Renderer<'a> {
         }
         let quota = |share: f64| ((rows as f64 * share).ceil() as usize).max(1);
         let mut quotas = HashMap::from([
-            (Layer::Address, quota(0.55)),
-            (Layer::Poi, quota(0.2)),
-            (Layer::Street, quota(0.15)),
-            (Layer::Locality, quota(0.03)),
-            (Layer::Place, quota(0.02)),
-            (Layer::Neighbourhood, quota(0.01)),
-            (Layer::Postcode, quota(0.04)),
+            (Draw::Layer(Layer::Address), quota(0.40)),
+            (Draw::BlockAddress, quota(BLOCK_ADDRESS_SHARE)),
+            (Draw::Layer(Layer::Poi), quota(0.15)),
+            (Draw::Layer(Layer::Street), quota(0.10)),
+            (Draw::Layer(Layer::Locality), quota(0.03)),
+            (Draw::Layer(Layer::Place), quota(0.02)),
+            (Draw::Layer(Layer::Neighbourhood), quota(0.01)),
+            (Draw::Layer(Layer::Postcode), quota(0.04)),
         ]);
+        let left = |quotas: &HashMap<Draw, usize>, draw: Draw| {
+            quotas.get(&draw).is_some_and(|left| *left > 0)
+        };
         let mut out = Vec::with_capacity(rows);
         for _ in 0..rows.saturating_mul(MAX_DRAWS_PER_ROW) {
             if out.len() >= rows {
                 break;
             }
             let id = random.below(count);
-            let layer = self.pack.records().header(id)?.layer;
-            if quotas.get(&layer).is_none_or(|left| *left == 0) {
+            let layer = Draw::Layer(self.pack.records().header(id)?.layer);
+            let block_left =
+                layer == Draw::Layer(Layer::Address) && left(&quotas, Draw::BlockAddress);
+            if !left(&quotas, layer) && !block_left {
                 continue;
             }
             let record = self.pack.records().record(id)?;
-            if let Some(row) = self.row(id, &record, random)? {
-                *quotas.get_mut(&layer).expect("quota") -= 1;
+            let block = is_block_address(&record);
+            // A block scheme address takes its own share first, any other
+            // record only its layer's.
+            let draw = if block && block_left {
+                Draw::BlockAddress
+            } else {
+                layer
+            };
+            if !left(&quotas, draw) {
+                continue;
+            }
+            if let Some(mut row) = self.row(id, &record, random)? {
+                *quotas.get_mut(&draw).expect("quota") -= 1;
+                row.block_address = block;
                 out.push(row);
             }
         }
@@ -863,6 +896,7 @@ impl<'a> Renderer<'a> {
             gold,
             country: row_country,
             suppression,
+            block_address: false,
         })
     }
 
@@ -1020,6 +1054,23 @@ struct Areas {
     country_code: Option<CountryCode>,
 }
 
+/// What a drawn record is counted against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Draw {
+    Layer(Layer),
+    BlockAddress,
+}
+
+/// The share of rows of block scheme addresses besides the addresses'.
+const BLOCK_ADDRESS_SHARE: f64 = 0.25;
+
+/// Whether a record is an address of the block scheme: numbered in the
+/// areas it states, with no street.
+fn is_block_address(record: &Record) -> bool {
+    matches!(record, Record::Address(record)
+        if record.address.street.is_none() && !record.address.areas.is_empty())
+}
+
 fn address_fields(address: &AddressComponents, fields: &mut Fields) {
     fields.house_number = words(&address.number);
     fields.street = address.street.as_deref().and_then(words);
@@ -1141,6 +1192,7 @@ fn libpostal_row(country: Option<CountryCode>, address: &str) -> Option<Row> {
         gold,
         country,
         suppression: Suppression::default(),
+        block_address: false,
     })
 }
 
@@ -1246,6 +1298,31 @@ mod tests {
     }
 
     #[test]
+    fn block_scheme_addresses_are_numbered_in_areas_without_a_street() {
+        let record = |street: Option<&str>, areas: &[&str]| {
+            Record::Address(crate::record::AddressRecord {
+                address: AddressComponents {
+                    areas: areas.iter().map(|area| area.to_string()).collect(),
+                    number: "10-8".into(),
+                    street: street.map(str::to_string),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                geometry: crate::record::point_geometry(0.0, 0.0),
+                location_precision: crate::record::LocationPrecision::Point,
+                source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+            })
+        };
+        assert!(is_block_address(&record(None, &["5丁目"])));
+        assert!(!is_block_address(&record(Some("King Street"), &["Annex"])));
+        assert!(!is_block_address(&record(None, &[])));
+    }
+
+    #[test]
     fn stated_areas_chain_into_one_field() {
         let address = AddressComponents {
             areas: vec!["西区".into(), "みなとみらい".into(), "3丁目".into()],
@@ -1335,6 +1412,7 @@ mod tests {
             gold,
             country: None,
             suppression: Suppression::default(),
+            block_address: false,
         };
         let rows = [
             row(
