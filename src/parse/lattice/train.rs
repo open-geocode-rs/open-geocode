@@ -594,6 +594,9 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
 const ALT_NAME_SHARE: f64 = 0.3;
 /// Share of rows of records on an island that name it.
 const ISLAND_SHARE: f64 = 0.35;
+/// Share of rows of addresses that state several areas that write them as
+/// one locality field (see [`chained_areas`]).
+const CHAIN_SHARE: f64 = 0.3;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
@@ -708,6 +711,15 @@ impl<'a> Renderer<'a> {
             fields.suburb = context.suburb.as_deref().and_then(words);
         }
         fields.island = self.island(&context, random);
+        if let Some(chain) = stated
+            .filter(|_| random.chance(CHAIN_SHARE))
+            .and_then(|address| chained_areas(address, random))
+        {
+            fields.locality = Some(chain);
+            if random.chance(0.5) {
+                fields.suburb = None;
+            }
+        }
         fields.region = pick(
             stated.and_then(|address| address.region.as_deref()),
             context.region.as_deref(),
@@ -1018,6 +1030,35 @@ fn address_fields(address: &AddressComponents, fields: &mut Fields) {
     fields.postcode = address.postcode.as_deref().and_then(words);
 }
 
+/// The areas an address states, largest first, glued into one field the
+/// way an `addr:city` tag or a written address often holds them:
+/// `神奈川県横浜市西区みなとみらい3丁目` is a region, a city, a ward and a
+/// neighbourhood with no break between them. Names of a script written
+/// without spaces join directly, others with a space. The region leads half
+/// the time. `None` when the address states fewer than two areas.
+fn chained_areas(address: &AddressComponents, random: &mut Random) -> Option<Tokens> {
+    let region = address.region.as_deref().filter(|_| random.chance(0.5));
+    let locality = address.locality.as_deref().or(address.place.as_deref());
+    let parts = region
+        .into_iter()
+        .chain(locality)
+        .chain(address.areas.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut chain = String::new();
+    for part in parts {
+        let glued = chain.chars().last().is_some_and(is_unspaced)
+            || part.chars().next().is_some_and(is_unspaced);
+        if !chain.is_empty() && !glued {
+            chain.push(' ');
+        }
+        chain.push_str(part);
+    }
+    words(&chain)
+}
+
 fn words(value: &str) -> Option<Tokens> {
     let tokens = Tokens::new(value);
     (!tokens.is_empty()).then_some(tokens)
@@ -1202,6 +1243,50 @@ mod tests {
         assert_eq!(labels[2], (Locality, "toronto".to_string(), true));
         assert_eq!(labels[3], (Locality, "honshu".to_string(), true));
         assert_eq!(labels[4], (Region, "on".to_string(), true));
+    }
+
+    #[test]
+    fn stated_areas_chain_into_one_field() {
+        let address = AddressComponents {
+            areas: vec!["西区".into(), "みなとみらい".into(), "3丁目".into()],
+            number: "3-1".into(),
+            street: None,
+            place: None,
+            unit: None,
+            locality: Some("横浜市".into()),
+            region: Some("神奈川県".into()),
+            postcode: None,
+            country: None,
+        };
+        let mut chains = std::collections::BTreeSet::new();
+        let mut random = Random::new(3);
+        for _ in 0..40 {
+            let chain = chained_areas(&address, &mut random).expect("chain");
+            chains.insert(chain.words.join(" "));
+        }
+        assert_eq!(
+            chains.into_iter().collect::<Vec<_>>(),
+            [
+                "横浜市西区みなとみらい3丁目",
+                "神奈川県横浜市西区みなとみらい3丁目"
+            ]
+        );
+        let latin = AddressComponents {
+            areas: vec!["Liberty Village".into()],
+            locality: Some("Toronto".into()),
+            region: None,
+            ..address.clone()
+        };
+        assert_eq!(
+            chained_areas(&latin, &mut random).expect("chain").words,
+            ["toronto", "liberty", "village"]
+        );
+        let alone = AddressComponents {
+            areas: Vec::new(),
+            region: None,
+            ..address
+        };
+        assert!(chained_areas(&alone, &mut random).is_none());
     }
 
     #[test]
