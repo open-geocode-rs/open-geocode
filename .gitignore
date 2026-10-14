@@ -30,3 +30,6 @@ data/
 
 # Vendored parser data, compiled into the binary
 !/src/parse/lattice/data/
+
+# Python bytecode
+__pycache__/

@@ -17,9 +17,15 @@ use open_geocode::{
     builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     pack::{PackReader, RecordId},
-    parse::lattice::{
-        LatticeTagger,
-        train::{TrainOptions, train_weights},
+    parse::{
+        bench::{
+            ParseBenchOptions, TaggerKind, align_predictions, mapping::Scheme, normalize_fixtures,
+            run_parse_bench, write_queries,
+        },
+        lattice::{
+            LatticeTagger,
+            train::{TrainOptions, train_weights},
+        },
     },
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
@@ -252,6 +258,50 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Score address parsing per token against the gold rows, as-is,
+    /// stripped of commas and messy, beside stored baseline predictions for
+    /// the same rows.
+    #[command(name = "parse-bench")]
+    ParseBench {
+        /// Gold directory, <cc>.tsv per country.
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        gold: PathBuf,
+
+        /// Root of stored baseline predictions, <baseline>/<cc>.<variant>.tsv.
+        #[arg(long, default_value = "fixtures/parse/predictions")]
+        predictions: PathBuf,
+
+        /// Countries to score, comma-separated; default every gold file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        /// Pack directory or Pack file, for taggers that read one.
+        #[arg(long)]
+        pack: Option<PathBuf>,
+
+        /// og tagger to score. Repeat to compare several.
+        #[arg(long = "tagger", value_enum, default_values_t = [TaggerKind::Legacy])]
+        taggers: Vec<TaggerKind>,
+
+        /// Baseline to score. Repeat for several; default every one stored.
+        #[arg(long = "baseline")]
+        baselines: Vec<String>,
+
+        /// List this many of the first tagger's worst rows per variant.
+        #[arg(long, default_value_t = 0)]
+        show_misses: usize,
+
+        /// Also write the full results as JSON to this path.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+
+    /// Build parse-bench fixtures: normalize source rows into gold rows,
+    /// export each variant's queries for a baseline, and align its answers
+    /// back to the gold tokens.
+    #[command(name = "parse-fixture", subcommand)]
+    ParseFixture(ParseFixtureCommand),
+
     /// Geocode CSV rows into lat/lon columns using a Pack text index.
     #[command(name = "batch-geocode")]
     BatchGeocode(Box<BatchGeocodeArgs>),
@@ -274,6 +324,67 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParseFixtureCommand {
+    /// Map and normalize raw `lang<TAB>country<TAB>token/label ...` rows,
+    /// <input>/<cc>.tsv, into gold rows, <output>/<cc>.tsv.
+    Normalize {
+        /// Label scheme of the raw rows.
+        #[arg(long, value_enum, default_value_t = Scheme::Libpostal)]
+        scheme: Scheme,
+
+        /// Directory of raw <cc>.tsv files.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Countries to normalize, comma-separated; default every raw file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        /// Gold directory to write <cc>.tsv into.
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        output: PathBuf,
+    },
+
+    /// Write each gold row's query in every variant, one per line, as
+    /// <cc>.as-is.txt, <cc>.stripped.txt and <cc>.messy.txt.
+    Queries {
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        gold: PathBuf,
+
+        /// Countries to export, comma-separated; default every gold file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        #[arg(long)]
+        output: PathBuf,
+    },
+
+    /// Align a baseline's <cc>.<variant>.jsonl answers to the gold tokens and
+    /// store them as <cc>.<variant>.tsv predictions.
+    Align {
+        /// Label scheme of the answers.
+        #[arg(long, value_enum, default_value_t = Scheme::Libpostal)]
+        scheme: Scheme,
+
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        gold: PathBuf,
+
+        /// Countries to align, comma-separated; default every gold file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        /// Directory of raw answers, <cc>.<variant>.jsonl.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Prediction directory for this baseline, for example
+        /// fixtures/parse/predictions/libpostal.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -462,6 +573,32 @@ async fn main() -> Result<()> {
                 "output": output.display().to_string(),
             }))
         }
+        Commands::ParseBench {
+            gold,
+            predictions,
+            countries,
+            pack,
+            taggers,
+            baselines,
+            show_misses,
+            json,
+        } => {
+            let report = run_parse_bench(&ParseBenchOptions {
+                gold,
+                predictions,
+                countries,
+                pack,
+                taggers,
+                baselines: (!baselines.is_empty()).then_some(baselines),
+                show_misses,
+            })?;
+            if let Some(json) = json {
+                write_json_to_path(&report, json)?;
+            }
+            print!("{}", report.to_markdown());
+            Ok(())
+        }
+        Commands::ParseFixture(command) => parse_fixture(command),
         Commands::BatchGeocode(args) => batch_geocode(*args),
         Commands::Serve {
             pack,
@@ -478,6 +615,43 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn parse_fixture(command: ParseFixtureCommand) -> Result<()> {
+    let files = match command {
+        ParseFixtureCommand::Normalize {
+            scheme,
+            input,
+            countries,
+            output,
+        } => normalize_fixtures(scheme, &input, &countries, &output)?
+            .into_iter()
+            .map(|(path, rows, dropped)| {
+                serde_json::json!({ "path": path, "rows": rows, "dropped": dropped })
+            })
+            .collect::<Vec<_>>(),
+        ParseFixtureCommand::Queries {
+            gold,
+            countries,
+            output,
+        } => write_queries(&gold, &countries, &output)?
+            .into_iter()
+            .map(|(path, rows)| serde_json::json!({ "path": path, "rows": rows }))
+            .collect(),
+        ParseFixtureCommand::Align {
+            scheme,
+            gold,
+            countries,
+            input,
+            output,
+        } => align_predictions(scheme, &gold, &countries, &input, &output)?
+            .into_iter()
+            .map(|(path, rows, failed)| {
+                serde_json::json!({ "path": path, "rows": rows, "failed": failed })
+            })
+            .collect(),
+    };
+    write_json(serde_json::json!({ "files": files }))
 }
 
 fn inspect_pack(
