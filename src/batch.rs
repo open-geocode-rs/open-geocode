@@ -25,6 +25,9 @@ pub struct BatchGeocodeOptions {
     pub region_field: Option<String>,
     pub postcode_field: Option<String>,
     pub layer: Option<String>,
+    /// Resolve a row whose house is missing to its street, reported with
+    /// `geocode_layer` `street`.
+    pub street_fallback: bool,
     pub limit: usize,
     pub lat_column: String,
     pub lon_column: String,
@@ -319,6 +322,7 @@ fn geocode_row(
             postcode: postcode.clone(),
             limit: options.limit,
             layer: options.layer.clone(),
+            street_fallback: options.street_fallback,
         })?;
         tried_queries.push(address);
         if let Some(response) = response {
@@ -846,6 +850,7 @@ mod tests {
             region_field: None,
             postcode_field: None,
             layer: None,
+            street_fallback: false,
             limit: 5,
             lat_column: "lat".into(),
             lon_column: "lon".into(),
@@ -903,6 +908,7 @@ a,43.6,-79.4
             region_field: None,
             postcode_field: None,
             layer: None,
+            street_fallback: false,
             limit: 5,
             lat_column: "lat".into(),
             lon_column: "lon".into(),
