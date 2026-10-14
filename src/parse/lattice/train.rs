@@ -42,7 +42,7 @@ use super::{
 use crate::{
     pack::{PackReader, RecordId},
     parse::types::Label,
-    record::{AddressComponents, Layer, Record},
+    record::{AddressComponents, Layer, PlaceLayer, Record},
     text_index::normalize_index_text,
 };
 
@@ -351,6 +351,9 @@ struct Fields {
     region: Option<Tokens>,
     postcode: Option<Tokens>,
     country: Option<Tokens>,
+    /// The field the row is about, which is never dropped: the region or
+    /// country a row of a region or country names.
+    subject: Option<Slot>,
 }
 
 /// A field of a template the parser has a label for.
@@ -666,6 +669,9 @@ impl<'a> Renderer<'a> {
             (Draw::BlockAddress, quota(BLOCK_ADDRESS_SHARE)),
             (Draw::Layer(Layer::Poi), quota(0.15)),
             (Draw::Layer(Layer::Street), quota(0.10)),
+            (Draw::Layer(Layer::Country), quota(0.002)),
+            (Draw::Layer(Layer::Region), quota(0.01)),
+            (Draw::Layer(Layer::District), quota(0.01)),
             (Draw::Layer(Layer::Locality), quota(0.03)),
             (Draw::Layer(Layer::Place), quota(0.02)),
             (Draw::Layer(Layer::Neighbourhood), quota(0.01)),
@@ -727,12 +733,25 @@ impl<'a> Renderer<'a> {
                 }
             }
             Record::Street(_) => fields.street = name,
-            Record::Place(..) => {
-                // A place is named with the areas above it, not within.
-                fields.locality = name;
-                fields.island = self.island(&context, random);
-                fields.region = context.region.as_deref().and_then(words);
+            Record::Place(layer, _) => {
+                // A place is named with the areas above it, not within, in
+                // the field of its layer.
                 fields.country = context.country.as_deref().and_then(words);
+                match layer {
+                    PlaceLayer::Country => {
+                        fields.country = name;
+                        fields.subject = Some(Slot::Country);
+                    }
+                    PlaceLayer::Region => {
+                        fields.region = name;
+                        fields.subject = Some(Slot::Region);
+                    }
+                    _ => {
+                        fields.locality = name;
+                        fields.island = self.island(&context, random);
+                        fields.region = context.region.as_deref().and_then(words);
+                    }
+                }
                 return Ok(self.finish(fields, context.country_code, random));
             }
             Record::Postcode(record) => fields.postcode = words(&record.postcode),
@@ -803,10 +822,10 @@ impl<'a> Renderer<'a> {
         if random.chance(0.5) {
             fields.postcode = None;
         }
-        if random.chance(0.5) {
+        if random.chance(0.5) && fields.subject != Some(Slot::Region) {
             fields.region = None;
         }
-        if random.chance(0.8) {
+        if random.chance(0.8) && fields.subject != Some(Slot::Country) {
             fields.country = None;
         }
         if let Some(street) = fields.street.as_mut()
