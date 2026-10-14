@@ -2,6 +2,11 @@
 
 Fast, lightweight, self-hosted geocoding in pure Rust.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/open-geocode-rs/open-geocode/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/open-geocode-rs/open-geocode/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/open-geocode.svg?style=flat-square)](https://crates.io/crates/open-geocode)
+[![docs.rs](https://img.shields.io/docsrs/open-geocode?style=flat-square)](https://docs.rs/open-geocode)
+[![license](https://img.shields.io/crates/l/open-geocode.svg?style=flat-square)](LICENSE)
+
 `open-geocode` is a minimal Rust-native geocoding engine: address search,
 Tantivy-backed autocomplete, and reverse geocoding from coordinates to
 address-first location context. It turns OpenStreetMap PBF extracts into a
