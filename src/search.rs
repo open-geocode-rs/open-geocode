@@ -503,7 +503,8 @@ impl TieBreak {
             Some(OsmObjectType::Node) => 0,
             Some(OsmObjectType::Way) => 1,
             Some(OsmObjectType::Relation) => 2,
-            None => 3,
+            Some(OsmObjectType::Row) => 3,
+            None => 4,
         };
         Self {
             extra_label_tokens,

@@ -21,6 +21,7 @@ mod emitted;
 mod geometry;
 mod interpolation;
 mod nodes;
+mod open_addresses;
 mod pbf;
 mod place;
 mod postcode;
@@ -62,6 +63,8 @@ use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_co
 use emit::{FeatureOutput, emit_features};
 use emitted::Emitted;
 use nodes::join_nodes;
+pub use open_addresses::AddressFile;
+use open_addresses::{import_addresses, validate};
 use pbf::{for_each_block, input_bytes};
 use postcode::PostcodeAccumulator;
 use scan::scan_block;
@@ -80,6 +83,9 @@ pub struct BuildOsmOptions {
     pub memory_budget_bytes: usize,
     /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
+    /// OpenAddresses-format CSV files of extra addresses, added next to the
+    /// OSM ones.
+    pub addresses: Vec<AddressFile>,
 }
 
 impl Default for BuildOsmOptions {
@@ -89,6 +95,7 @@ impl Default for BuildOsmOptions {
             pack: PathBuf::new(),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             scratch_dir: None,
+            addresses: Vec::new(),
         }
     }
 }
@@ -98,6 +105,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     if !options.input.is_file() {
         bail!("input {} does not exist", options.input.display());
     }
+    validate(&options.addresses)?;
     // Up to four sorters hold memory at the same time (node references or
     // resolved coordinates, the two record sorters, the spatial pairs); the text
     // index buffers take the same share as one sorter while records are written.
@@ -242,6 +250,16 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     )?;
     progress.finish_with_message("4/7 assemble ways complete");
     build.report.phases.feature_emission_ms = phase.elapsed().as_millis();
+
+    // Imported address rows join the OSM addresses before boundaries and
+    // postcode centroids are derived from them.
+    let phase = Instant::now();
+    for file in &options.addresses {
+        let progress = stage_progress("import address rows");
+        import_addresses(file, |emitted| build.absorb(emitted))?;
+        progress.finish_with_message("import address rows complete");
+    }
+    build.report.phases.address_import_ms = phase.elapsed().as_millis();
 
     // Admin boundaries, their place records and postcode centroids.
     let phase = Instant::now();
@@ -530,6 +548,7 @@ impl Audit {
 mod tests {
     use crate::{
         pack::PackReader,
+        record::{OsmObjectType, SourceProvenance},
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
         search::{PackTextSearcher, TextSearchOptions},
     };
@@ -697,6 +716,7 @@ mod tests {
             pack: root.to_path_buf(),
             memory_budget_bytes,
             scratch_dir: None,
+            addresses: Vec::new(),
         })
         .expect("build")
     }
@@ -858,14 +878,137 @@ mod tests {
     }
 
     #[test]
+    fn imports_csv_addresses_beside_osm_ones() {
+        let dir = temp_dir("csv");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let csv = dir.join("rows.csv");
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,UNIT,CITY,DISTRICT,REGION,POSTCODE,HASH,ID\n\
+             -79.41,43.605,77,SPADINA AVENUE,,Toronto,,ON,M5T 9Z9,h1,a\n\
+             -79.411,43.605,,SPADINA AVENUE,,,,,,h2,b\n\
+             -79.412,43.606,5,SPADINA AVENUE,2,,,,,h3,c\n",
+        )
+        .expect("csv");
+        let report = build_osm_pack(BuildOsmOptions {
+            input,
+            pack: dir.join("pack"),
+            addresses: vec![AddressFile {
+                dataset: "oa".to_string(),
+                path: csv,
+            }],
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        assert_eq!(report.scanned.address_rows, 3);
+        assert_eq!(report.accepted.imported_addresses, 2);
+        assert_eq!(report.rejected.by_reason["missing_housenumber"], 1);
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let counts = &reader.manifest().layer_counts;
+        assert_eq!(counts["address"], 7, "five from OSM and two imported rows");
+        assert_eq!(
+            counts["postcode"], 2,
+            "the imported postcode adds a centroid"
+        );
+
+        let row = reader
+            .find_by_source_id("oa:1")
+            .expect("lookup")
+            .expect("imported row 1");
+        let summary = reader.record_summary(row).expect("summary");
+        assert_eq!(summary.source.dataset, "oa");
+        assert_eq!(summary.source.object_type, Some(OsmObjectType::Row));
+        assert_eq!(summary.source.object_id, Some(1));
+        let address = reader.address(row).expect("record").expect("address");
+        assert_eq!(address.source, SourceProvenance::row("oa", 1));
+        assert_eq!(address.address.postcode.as_deref(), Some("M5T 9Z9"));
+        let context = reader
+            .boundary_context(row)
+            .expect("context")
+            .expect("has context");
+        let locality = context.admin_context.locality_record_id.expect("locality");
+        assert_eq!(
+            reader
+                .context_record(locality)
+                .expect("record")
+                .expect("context")
+                .name,
+            "Toronto"
+        );
+
+        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "77 spadina avenue".into(),
+                limit: 1,
+                layer: Some("address".into()),
+            })
+            .expect("search");
+        assert_eq!(hits[0].record.id, "oa:1");
+        assert_eq!(
+            hits[0].record.label,
+            "77 SPADINA AVENUE, Toronto, ON, M5T 9Z9"
+        );
+
+        let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
+        let result = reverse
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.41,
+                lat: 43.605,
+            })
+            .expect("reverse")
+            .result
+            .expect("result");
+        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.id.as_deref(), Some("oa:1"));
+    }
+
+    #[test]
+    fn rejects_duplicate_or_reserved_address_datasets() {
+        let dir = temp_dir("csv-names");
+        let csv = dir.join("rows.csv");
+        fs::write(&csv, "LON,LAT,NUMBER,STREET\n").expect("csv");
+        let file = |dataset: &str| AddressFile {
+            dataset: dataset.to_string(),
+            path: csv.clone(),
+        };
+        assert!(validate(&[file("a"), file("b")]).is_ok());
+        assert!(validate(&[file("a"), file("a")]).is_err());
+        assert!(validate(&[file("osm")]).is_err());
+    }
+
+    #[test]
     fn spilling_to_disk_builds_the_same_pack() {
         let dir = temp_dir("spill");
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
-        let in_memory = build(&dir.join("memory"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let csv = dir.join("rows.csv");
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.41,43.605,77,SPADINA AVENUE,Toronto,M5T 9Z9\n\
+             -79.412,43.606,5,SPADINA AVENUE,,\n",
+        )
+        .expect("csv");
+        let build_with_rows = |root: PathBuf, memory_budget_bytes| {
+            build_osm_pack(BuildOsmOptions {
+                input: input.clone(),
+                pack: root,
+                memory_budget_bytes,
+                scratch_dir: None,
+                addresses: vec![AddressFile {
+                    dataset: "oa".to_string(),
+                    path: csv.clone(),
+                }],
+            })
+            .expect("build")
+        };
+        let in_memory = build_with_rows(dir.join("memory"), DEFAULT_MEMORY_BUDGET_BYTES);
         // A 4-byte budget leaves every sorter one item of memory, so everything
         // goes through run files and multi-round merges.
-        let spilled = build(&dir.join("spilled"), &input, 4);
+        let spilled = build_with_rows(dir.join("spilled"), 4);
         let spilling_sorters = spilled
             .scratch
             .sorters
@@ -880,6 +1023,18 @@ mod tests {
 
         let memory = PackReader::open(dir.join("memory")).expect("memory pack");
         let spilled = PackReader::open(dir.join("spilled")).expect("spilled pack");
+        let row = spilled
+            .find_by_source_id("oa:2")
+            .expect("lookup")
+            .expect("imported row survives the spill");
+        assert_eq!(
+            spilled
+                .address(row)
+                .expect("record")
+                .expect("address")
+                .source,
+            SourceProvenance::row("oa", 2)
+        );
         assert_eq!(
             memory.manifest().record_count,
             spilled.manifest().record_count

@@ -1,5 +1,6 @@
 use crate::record::{
     AddressComponents, InterpolationAddressComponents, InterpolationRange, OsmObjectType,
+    SourceProvenance,
 };
 
 pub fn address_name(components: &AddressComponents) -> String {
@@ -67,6 +68,14 @@ pub fn osm_record_id(object_type: OsmObjectType, object_id: i64) -> String {
     format!("osm:{}:{object_id}", osm_object_type_name(object_type))
 }
 
+/// `osm:node:123` for OSM objects, `dataset:row` for imported address rows.
+pub fn source_record_id(source: &SourceProvenance) -> String {
+    match source.object_type {
+        OsmObjectType::Row => format!("{}:{}", source.dataset, source.object_id),
+        object_type => osm_record_id(object_type, source.object_id),
+    }
+}
+
 pub fn derived_postcode_id(postcode: &str) -> String {
     format!("derived:osm:postcode:{}", url_safe_id_component(postcode))
 }
@@ -95,6 +104,7 @@ pub fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
         OsmObjectType::Node => "node",
         OsmObjectType::Way => "way",
         OsmObjectType::Relation => "relation",
+        OsmObjectType::Row => "row",
     }
 }
 

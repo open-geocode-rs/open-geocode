@@ -424,8 +424,12 @@ fn encode_source(out: &mut Vec<u8>, source: &SourceProvenance) {
         OsmObjectType::Node => 0,
         OsmObjectType::Way => 1,
         OsmObjectType::Relation => 2,
+        OsmObjectType::Row => 3,
     });
     put_i64(out, source.object_id);
+    if source.object_type == OsmObjectType::Row {
+        put_str(out, &source.dataset);
+    }
 }
 
 fn decode_source(input: &mut &[u8]) -> Result<SourceProvenance> {
@@ -433,9 +437,14 @@ fn decode_source(input: &mut &[u8]) -> Result<SourceProvenance> {
         0 => OsmObjectType::Node,
         1 => OsmObjectType::Way,
         2 => OsmObjectType::Relation,
+        3 => OsmObjectType::Row,
         other => bail!("unknown spilled object type {other}"),
     };
-    Ok(SourceProvenance::osm(object_type, get_i64(input)?))
+    let object_id = get_i64(input)?;
+    if object_type == OsmObjectType::Row {
+        return Ok(SourceProvenance::row(&get_string(input)?, object_id));
+    }
+    Ok(SourceProvenance::osm(object_type, object_id))
 }
 
 /// Points keep full precision; they are quantized once, by the record store.
