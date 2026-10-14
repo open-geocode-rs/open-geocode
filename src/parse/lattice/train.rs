@@ -8,8 +8,9 @@
 //! by `scripts/parse_lattice_data.py`, with the noise real queries carry:
 //! commas dropped, fields left out or swapped, street types abbreviated, a
 //! unit added, one-letter typos. Some rows hide the dictionary hits of their
-//! street, locality or region, so the model also learns to read names the
-//! Pack does not know from their shape and place alone. Labelled rows in
+//! street or venue, so the model also learns to read names the Pack does not
+//! know from their shape and place alone; the areas a row names are always
+//! names the Pack knows, as a locality or region must be. Labelled rows in
 //! libpostal's training format can be added.
 //!
 //! The weights are learned by the averaged structured perceptron (Collins,
@@ -914,10 +915,11 @@ impl<'a> Renderer<'a> {
                 tokens.push(word, break_before, joiner);
                 gold.push(group.label);
             }
+            // Streets and venues are open classes: a query names many the
+            // Pack does not hold. Areas are closed: a locality or region is
+            // one the Pack knows, so their hits are never hidden.
             let field = match group.label {
                 Label::Street => Field::Street,
-                Label::Locality => Field::Locality,
-                Label::Region => Field::Region,
                 Label::Other => Field::Poi,
                 _ => continue,
             };

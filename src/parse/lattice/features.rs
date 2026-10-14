@@ -96,6 +96,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("phrase_before", &PHRASE_KINDS),
     ("phrase_after", &PHRASE_KINDS),
     ("chain", &["2", "3", "4+", "with_region"]),
+    ("grounding", &["no_area", "no_postcode"]),
 ];
 
 /// The kinds of vocabulary phrase, in the order of
@@ -238,6 +239,7 @@ enum Block {
     PhraseBefore,
     PhraseAfter,
     Chain,
+    Grounding,
 }
 
 const fn offset(block: Block) -> u32 {
@@ -251,7 +253,7 @@ const fn offset(block: Block) -> u32 {
 }
 
 /// Feature ids of the named blocks.
-const NAMED: usize = offset(Block::Chain) as usize + 4;
+const NAMED: usize = offset(Block::Grounding) as usize + 2;
 /// The lengths of the hashed affixes.
 const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
 /// Buckets of each affix block: one per side and length.
@@ -282,6 +284,29 @@ pub(super) fn chain_feature(chain: super::Chain) -> u32 {
 /// The feature of a chain one of whose names is a region.
 pub(super) fn chain_region() -> u32 {
     id(Block::Chain, 3)
+}
+
+/// Say whether the Pack explains `span` as what a closed-class label names.
+/// A locality, region or country is a place the Pack knows and a postcode
+/// is a pattern some country uses, so a span is one only when the Pack
+/// explains it: an area name of the span, exactly or within a few edits,
+/// or a chain of area names, and a postcode pattern match. `grounding`
+/// features mark the spans the Pack does not explain, and their weights,
+/// one per label, say how unlikely a closed-class label is there.
+pub(super) fn ground(span: &mut Span) {
+    let areas = offset(Block::DictDistance)..offset(Block::DictDistance) + 9;
+    let chains = offset(Block::Chain)..offset(Block::Chain) + 3;
+    let postcodes = offset(Block::PostcodeAny)..offset(Block::PostcodeAny) + 3;
+    let has =
+        |range: &std::ops::Range<u32>| span.features.iter().any(|feature| range.contains(feature));
+    let area = has(&areas) || has(&chains);
+    let postcode = has(&postcodes);
+    if !area {
+        span.features.push(id(Block::Grounding, 0));
+    }
+    if !postcode {
+        span.features.push(id(Block::Grounding, 1));
+    }
 }
 
 fn field_index(field: Field) -> Option<usize> {
@@ -699,7 +724,7 @@ mod tests {
         let unique = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), COUNT);
         assert_eq!(name(0), "bias:bias");
-        assert_eq!(name(NAMED as u32 - 1), "chain:with_region");
+        assert_eq!(name(NAMED as u32 - 1), "grounding:no_postcode");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
         assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
         assert_eq!(

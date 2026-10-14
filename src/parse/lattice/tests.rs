@@ -107,6 +107,29 @@ fn the_lattice_has_every_token_and_the_spans_the_dictionaries_know() {
 }
 
 #[test]
+fn spans_the_pack_does_not_explain_as_places_or_postcodes_say_so() {
+    let tagger = tagger();
+    let tokens = Tokens::new("670 nowhere toronto m5v 1m9");
+    let lattice = tagger.lattice(&tokens, &Suppression::default());
+    let features = |start, end| {
+        &lattice
+            .spans
+            .iter()
+            .find(|span| (span.start, span.end) == (start, end))
+            .expect("span")
+            .features
+    };
+    let (no_area, no_postcode) = (
+        by_name("grounding:no_area"),
+        by_name("grounding:no_postcode"),
+    );
+    assert!(features(1, 2).contains(&no_area) && features(1, 2).contains(&no_postcode));
+    assert!(!features(2, 3).contains(&no_area), "a known locality");
+    assert!(!features(3, 5).contains(&no_postcode), "a postcode pattern");
+    assert!(features(3, 5).contains(&no_area));
+}
+
+#[test]
 fn hidden_dictionary_hits_leave_only_the_token_spans() {
     let tagger = tagger();
     let tokens = Tokens::new("670 king street west");
@@ -243,7 +266,11 @@ fn a_query_pointing_to_a_country_is_read_as_that_country_only() {
     // Every hit is Canadian: no reading leaves the Canadian evidence out.
     let parses = tagger.parse("670 king st w toronto");
     assert!(!parses.is_empty());
-    assert!(parses.iter().all(|parsed| parsed.country == Some(code("CA"))));
+    assert!(
+        parses
+            .iter()
+            .all(|parsed| parsed.country == Some(code("CA")))
+    );
     // Nothing points to a country: the global fallback reads it.
     let parses = tagger.parse("12 nowhere lane");
     assert!(parses.iter().all(|parsed| parsed.country.is_none()));

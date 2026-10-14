@@ -763,6 +763,9 @@ impl LatticeTagger {
             }
             spans.push(set.into_span());
         }
+        for span in &mut spans {
+            features::ground(span);
+        }
         let candidates = countries.top(MAX_CANDIDATE_COUNTRIES, &self.weights);
         Lattice::new(units, spans, candidates)
     }
