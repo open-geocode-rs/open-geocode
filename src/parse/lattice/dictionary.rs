@@ -786,8 +786,10 @@ impl DictionaryBuilder {
             contexts,
             country_codes,
         } = self;
-        // The ids of the areas each area name names.
+        // The ids of the areas each area name names, and the levels of the
+        // areas each name names.
         let mut places = BTreeMap::<String, Vec<u32>>::new();
+        let mut levels = HashMap::<String, u8>::new();
         let mut aliases = HashMap::<String, Alias>::new();
         for (
             area,
@@ -817,25 +819,23 @@ impl DictionaryBuilder {
                     }
                 }
                 names.entry((*field, key.clone())).or_default().merge(stats);
+                *levels.entry(key.clone()).or_default() |= level;
                 places.entry(key).or_default().extend(id);
             }
         }
         // An alias of areas of one level joins their names, unless it is
-        // already a name of an area of another level ("京都" of "京都府"
-        // and "京都市" is neither).
+        // already the name of an area of another level, or names areas of
+        // two ("京都" of "京都府" and "京都市" is neither). Names that only
+        // records state ("addr:city=東京") are no areas, and often the very
+        // area the alias names.
         for (key, alias) in aliases {
             let [field] = alias.fields[..] else {
                 continue;
             };
-            if alias.stats.levels.count_ones() != 1 {
-                continue;
-            }
-            let other_level = Field::AREAS.iter().any(|area| {
-                names
-                    .get(&(*area, key.clone()))
-                    .is_some_and(|stats| stats.levels & !alias.stats.levels != 0)
-            });
-            if other_level {
+            let other_level = levels
+                .get(&key)
+                .is_some_and(|levels| levels & !alias.stats.levels != 0);
+            if alias.stats.levels.count_ones() != 1 || other_level {
                 continue;
             }
             names
