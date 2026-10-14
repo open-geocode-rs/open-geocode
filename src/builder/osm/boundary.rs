@@ -3,9 +3,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
 
-use geo::{
-    Area, BoundingRect, Centroid, Contains, Covers, LineString, MultiPolygon, Point, Polygon, Rect,
-};
+use geo::{Area, BoundingRect, Centroid, Contains, LineString, MultiPolygon, Point, Polygon, Rect};
+use rayon::prelude::*;
 use rstar::{AABB, RTree, RTreeObject};
 
 use crate::{
@@ -18,6 +17,7 @@ use crate::{
 };
 
 use super::{
+    containment::AreaShape,
     place::place_layer,
     tags::{OsmTags, alternate_names, name_tags},
 };
@@ -83,16 +83,18 @@ pub(crate) struct SourceContext<'a> {
     pub place: Option<&'a str>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct AcceptedBoundary {
     record_id: RecordId,
     layer: PlaceLayer,
     name: String,
-    admin_level: u8,
+    /// `None` for a place drawn as an area.
+    admin_level: Option<u8>,
     inferred_country_record_id: Option<RecordId>,
     source_object_type: OsmObjectType,
     source_object_id: i64,
-    geometry: MultiPolygon<f64>,
+    bounds: Rect<f64>,
+    shape: AreaShape,
     area: f64,
 }
 
@@ -102,9 +104,15 @@ struct BoundaryBox {
     boundary_id: usize,
 }
 
+/// An area records lie in: an admin boundary, or a place drawn as a closed
+/// way or a multipolygon (`place=island`, `place=suburb`).
 struct BuiltBoundary {
     layer: PlaceLayer,
-    admin_level: u8,
+    /// `None` for a place area, which takes its layer from its `place` tag
+    /// and stays out of the admin level ranking.
+    admin_level: Option<u8>,
+    /// The `place` tag of a place area, its record's place type.
+    place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
     /// The layer its `place` tag names, if any (`place=city` is a locality).
@@ -151,7 +159,11 @@ impl BoundarySet {
         }
         for (index, candidate) in self.candidates.iter().enumerate() {
             let boundary = &candidate.boundary;
-            report.accept_place(boundary.layer);
+            if boundary.admin_level.is_some() {
+                report.accept_place(boundary.layer);
+            } else {
+                report.accept_place_area(boundary.layer);
+            }
             records.push((
                 ContextOrigin::Boundary(index as u32),
                 Record::Place(
@@ -159,7 +171,11 @@ impl BoundarySet {
                     PlaceRecord {
                         name: boundary.name.clone(),
                         alt_names: boundary.alt_names.clone(),
-                        place_type: format!("admin_level:{}", boundary.admin_level),
+                        place_type: match (boundary.admin_level, &boundary.place_type) {
+                            (Some(level), _) => format!("admin_level:{level}"),
+                            (None, Some(place)) => place.clone(),
+                            (None, None) => "area".to_string(),
+                        },
                         geometry: point_geometry(
                             boundary.representative_point[0],
                             boundary.representative_point[1],
@@ -227,7 +243,8 @@ impl BoundarySet {
         boundaries.chain(derived).collect()
     }
 
-    /// Index the boundaries under their final record ids.
+    /// Index the boundaries under their final record ids. Edge indexes of
+    /// large areas are built in parallel.
     pub(crate) fn into_index(
         self,
         boundary_record_ids: &[RecordId],
@@ -235,14 +252,16 @@ impl BoundarySet {
     ) -> BoundaryIndex {
         let accepted = self
             .candidates
-            .into_iter()
+            .into_par_iter()
             .zip(boundary_record_ids)
-            .map(|(candidate, record_id)| {
+            .filter_map(|(candidate, record_id)| {
                 let boundary = candidate.boundary;
-                AcceptedBoundary {
+                let bounds = boundary.geometry.bounding_rect()?;
+                Some(AcceptedBoundary {
                     record_id: *record_id,
                     layer: boundary.layer,
                     area: boundary.geometry.unsigned_area(),
+                    bounds,
                     inferred_country_record_id: boundary
                         .inferred_country_code
                         .as_deref()
@@ -251,8 +270,8 @@ impl BoundarySet {
                     admin_level: boundary.admin_level,
                     source_object_type: candidate.source_object_type,
                     source_object_id: candidate.source_object_id,
-                    geometry: boundary.geometry,
-                }
+                    shape: AreaShape::new(boundary.geometry),
+                })
             })
             .collect();
         BoundaryIndex::new(accepted)
@@ -322,12 +341,9 @@ impl BoundaryIndex {
         let boxes = boundaries
             .iter()
             .enumerate()
-            .filter_map(|(boundary_id, boundary)| {
-                let bbox = boundary.geometry.bounding_rect()?;
-                Some(BoundaryBox {
-                    envelope: envelope_from_rect(bbox),
-                    boundary_id,
-                })
+            .map(|(boundary_id, boundary)| BoundaryBox {
+                envelope: envelope_from_rect(boundary.bounds),
+                boundary_id,
             })
             .collect::<Vec<_>>();
         Self {
@@ -346,12 +362,11 @@ impl BoundaryIndex {
             return RecordContext::default();
         }
 
-        let point = Point::new(lon, lat);
         let envelope = AABB::from_point([lon, lat]);
         let mut covered = Vec::new();
         for boundary_box in self.tree.locate_in_envelope_intersecting(&envelope) {
             let boundary = &self.boundaries[boundary_box.boundary_id];
-            if boundary.geometry.covers(&point) {
+            if boundary.shape.covers(lon, lat) {
                 covered.push(boundary);
             }
         }
@@ -390,8 +405,10 @@ impl BoundaryIndex {
     }
 }
 
-pub(crate) fn has_admin_boundary_tags(tags: &BTreeMap<String, String>) -> bool {
-    admin_boundary_parts(tags).is_some()
+/// Whether the tags make an area records can lie in: an admin boundary, or
+/// a named place of a layer the Pack has (see [`area_parts`]).
+pub(crate) fn has_area_tags(tags: &BTreeMap<String, String>) -> bool {
+    area_parts(tags).is_some()
 }
 
 pub(crate) fn relation_member_role(value: &str) -> Option<BoundaryMemberRole> {
@@ -457,7 +474,9 @@ fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, Pla
 
     let mut sources = BTreeMap::new();
     for candidate in candidates {
-        if candidate.boundary.layer != PlaceLayer::Region {
+        if candidate.boundary.layer != PlaceLayer::Region
+            || candidate.boundary.admin_level.is_none()
+        {
             continue;
         }
         let Some(code) = &candidate.boundary.inferred_country_code else {
@@ -487,13 +506,14 @@ fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, Pla
 }
 
 fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
-    let AdminParts {
+    let AreaParts {
         layer,
         admin_level,
+        place_type,
         name,
         alt_names,
         place_layer,
-    } = admin_boundary_parts(&way.tags)?;
+    } = area_parts(&way.tags)?;
     let inferred_country_code = country_code_from_tags(&way.tags, layer);
     let closed = ends(&way.vertices).is_some_and(|(first, last)| first == last);
     if way.vertices.len() < 4 || !closed {
@@ -508,6 +528,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
     Some(BuiltBoundary {
         layer,
         admin_level,
+        place_type,
         name,
         alt_names,
         place_layer,
@@ -521,13 +542,14 @@ fn boundary_from_relation(
     stub: &BoundaryRelationStub,
     member_lines: &HashMap<i64, Option<&[Vertex]>>,
 ) -> Option<BuiltBoundary> {
-    let AdminParts {
+    let AreaParts {
         layer,
         admin_level,
+        place_type,
         name,
         alt_names,
         place_layer,
-    } = admin_boundary_parts(&stub.tags)?;
+    } = area_parts(&stub.tags)?;
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
@@ -553,6 +575,7 @@ fn boundary_from_relation(
     Some(BuiltBoundary {
         layer,
         admin_level,
+        place_type,
         name,
         alt_names,
         place_layer,
@@ -661,31 +684,54 @@ fn join_segment(ring: &mut Vec<Vertex>, mut segment: Vec<Vertex>) {
     }
 }
 
-/// What the tags of an admin boundary say about it.
-struct AdminParts {
+/// What the tags of an area say about it.
+struct AreaParts {
     layer: PlaceLayer,
-    admin_level: u8,
+    admin_level: Option<u8>,
+    place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
     place_layer: Option<PlaceLayer>,
 }
 
-fn admin_boundary_parts(tags: &BTreeMap<String, String>) -> Option<AdminParts> {
+/// An admin boundary, or else a named place of a layer the Pack has drawn as
+/// an area: an island, a city or a district mapped as a closed way or a
+/// multipolygon rather than as a node.
+fn area_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
+    admin_boundary_parts(tags).or_else(|| place_area_parts(tags))
+}
+
+fn admin_boundary_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
     if tags.cleaned("boundary").as_deref() != Some("administrative") {
         return None;
     }
     let admin_level = tags.cleaned("admin_level")?.parse::<u8>().ok()?;
     let layer = admin_level_layer(admin_level)?;
     let name = tags.cleaned("name")?;
-    Some(AdminParts {
+    Some(AreaParts {
         layer,
-        admin_level,
+        admin_level: Some(admin_level),
+        place_type: None,
         alt_names: alternate_names(tags, &name),
         name,
         place_layer: tags
             .cleaned("place")
             .and_then(|place| place_layer(&place))
             .filter(|layer| *layer != PlaceLayer::Place),
+    })
+}
+
+fn place_area_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
+    let place = tags.cleaned("place")?;
+    let layer = place_layer(&place)?;
+    let name = tags.cleaned("name")?;
+    Some(AreaParts {
+        layer,
+        admin_level: None,
+        place_type: Some(place),
+        alt_names: alternate_names(tags, &name),
+        name,
+        place_layer: None,
     })
 }
 
@@ -797,7 +843,10 @@ fn assign_layers_by_containment(candidates: &mut [BoundaryCandidate]) {
     let mut unconventional: BTreeMap<Option<String>, BTreeSet<u8>> = BTreeMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let country = countries[index].clone();
-        let level = candidate.boundary.admin_level;
+        // A place area keeps the layer its `place` tag names.
+        let Some(level) = candidate.boundary.admin_level else {
+            continue;
+        };
         match tagged
             .get(&(country.clone(), level))
             .copied()
@@ -841,7 +890,10 @@ fn assign_layers_by_containment(candidates: &mut [BoundaryCandidate]) {
     }
 
     for (index, candidate) in candidates.iter_mut().enumerate() {
-        let key = (countries[index].clone(), candidate.boundary.admin_level);
+        let Some(level) = candidate.boundary.admin_level else {
+            continue;
+        };
+        let key = (countries[index].clone(), level);
         if let Some(layer) = tagged.get(&key).or_else(|| promoted.get(&key)) {
             candidate.boundary.layer = *layer;
         } else if let Some(layer) = conventional_admin_layer(key.1) {
@@ -860,12 +912,15 @@ fn tagged_level_layers(
     let mut votes: BTreeMap<(Option<String>, u8), BTreeMap<PlaceLayer, usize>> = BTreeMap::new();
     for (candidate, country) in candidates.iter().zip(countries) {
         let boundary = &candidate.boundary;
-        if boundary.admin_level <= COUNTRY_ADMIN_LEVEL {
+        let Some(level) = boundary
+            .admin_level
+            .filter(|level| *level > COUNTRY_ADMIN_LEVEL)
+        else {
             continue;
-        }
+        };
         if let Some(layer) = boundary.place_layer {
             *votes
-                .entry((country.clone(), boundary.admin_level))
+                .entry((country.clone(), level))
                 .or_default()
                 .entry(layer)
                 .or_default() += 1;
@@ -922,7 +977,12 @@ fn conventional_admin_layer_depth(layer: &PlaceLayer) -> Option<u8> {
 fn country_of_each_boundary(candidates: &[BoundaryCandidate]) -> Vec<Option<String>> {
     let country_boundaries = candidates
         .iter()
-        .filter(|candidate| candidate.boundary.admin_level <= COUNTRY_ADMIN_LEVEL)
+        .filter(|candidate| {
+            candidate
+                .boundary
+                .admin_level
+                .is_some_and(|level| level <= COUNTRY_ADMIN_LEVEL)
+        })
         .filter_map(|candidate| {
             candidate
                 .boundary
@@ -993,8 +1053,11 @@ fn compare_boundary(
         .map(|value| same_text(value, &right.name))
         .unwrap_or(false);
 
+    // An admin boundary of the layer wins over a place drawn as an area,
+    // which fills the layers admin boundaries leave empty.
     right_match
         .cmp(&left_match)
+        .then_with(|| left.admin_level.is_none().cmp(&right.admin_level.is_none()))
         .then_with(|| {
             left.area
                 .partial_cmp(&right.area)
@@ -1196,7 +1259,8 @@ mod tests {
                 source_object_id: index as i64 + 1,
                 boundary: BuiltBoundary {
                     layer: admin_level_layer(level).expect("layer"),
-                    admin_level: level,
+                    admin_level: Some(level),
+                    place_type: None,
                     name: format!("level {level}"),
                     alt_names: Vec::new(),
                     place_layer,
@@ -1210,7 +1274,7 @@ mod tests {
         let mut layers = BTreeMap::new();
         for candidate in &candidates {
             let layer = *layers
-                .entry(candidate.boundary.admin_level)
+                .entry(candidate.boundary.admin_level.expect("admin"))
                 .or_insert(candidate.boundary.layer);
             assert_eq!(layer, candidate.boundary.layer, "one layer per level");
         }
@@ -1346,12 +1410,13 @@ mod tests {
             record_id,
             layer,
             name: name.to_string(),
-            admin_level: 8,
+            admin_level: Some(8),
             inferred_country_record_id: None,
             source_object_type: OsmObjectType::Relation,
             source_object_id: record_id as i64,
             area: geometry.unsigned_area(),
-            geometry,
+            bounds: geometry.bounding_rect().expect("bounds"),
+            shape: AreaShape::new(geometry),
         }
     }
 }

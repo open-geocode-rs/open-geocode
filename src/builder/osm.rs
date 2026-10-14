@@ -16,6 +16,7 @@
 
 mod address;
 mod boundary;
+mod containment;
 mod emit;
 mod emitted;
 mod geometry;
@@ -991,6 +992,106 @@ mod tests {
             assert!(dictionaries.contains(field, key), "{field:?} {key}");
         }
         assert!(!dictionaries.contains(Field::Locality, "not a name"));
+    }
+
+    /// Places drawn as areas: an island multipolygon, a suburb drawn as a
+    /// closed way, and a route relation with a `place` tag that draws no
+    /// area. The address inside them lies in both.
+    #[test]
+    fn places_drawn_as_areas_are_places_and_context() {
+        let dir = temp_dir("island");
+        let input = dir.join("island.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 35.0, 135.0, &[]),
+                    node(2, 35.0, 136.0, &[]),
+                    node(3, 36.0, 136.0, &[]),
+                    node(4, 36.0, 135.0, &[]),
+                    node(5, 35.4, 135.4, &[]),
+                    node(6, 35.4, 135.6, &[]),
+                    node(7, 35.6, 135.6, &[]),
+                    node(8, 35.6, 135.4, &[]),
+                    node(
+                        10,
+                        35.5,
+                        135.5,
+                        &[
+                            ("addr:neighbourhood", "5丁目"),
+                            ("addr:block_number", "10"),
+                            ("addr:housenumber", "8"),
+                        ],
+                    ),
+                ],
+                vec![
+                    way(500, &[1, 2, 3], &[("natural", "coastline")]),
+                    way(501, &[3, 4, 1], &[("natural", "coastline")]),
+                    way(
+                        502,
+                        &[5, 6, 7, 8, 5],
+                        &[("place", "suburb"), ("name", "港北")],
+                    ),
+                ],
+                vec![
+                    relation(
+                        900,
+                        &[(500, "outer"), (501, "outer")],
+                        &[
+                            ("type", "multipolygon"),
+                            ("place", "island"),
+                            ("name", "本州"),
+                            ("name:en", "Honshu"),
+                        ],
+                    ),
+                    relation(
+                        901,
+                        &[(500, "")],
+                        &[("type", "route"), ("place", "island"), ("name", "Route")],
+                    ),
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        assert_eq!(report.accepted.place_areas, 2);
+        assert_eq!(report.accepted.by_layer.get("place"), Some(&1));
+        assert_eq!(report.accepted.by_layer.get("neighbourhood"), Some(&1));
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let island = reader
+            .find_by_source_id("osm:relation:900")
+            .expect("lookup")
+            .expect("island");
+        let suburb = reader
+            .find_by_source_id("osm:way:502")
+            .expect("lookup")
+            .expect("suburb");
+        assert!(
+            reader
+                .find_by_source_id("osm:relation:901")
+                .expect("lookup")
+                .is_none()
+        );
+        let address = reader
+            .find_by_source_id("osm:node:10")
+            .expect("lookup")
+            .expect("address");
+        let context = reader
+            .boundary_context(address)
+            .expect("context")
+            .expect("address context")
+            .admin_context;
+        assert_eq!(context.place_record_id, Some(island));
+        assert_eq!(context.neighbourhood_record_id, Some(suburb));
+
+        let tagger = crate::parse::lattice::LatticeTagger::open(&dir.join("pack")).expect("tagger");
+        use crate::parse::lattice::dictionary::Field;
+        for key in ["本州", "honshu", "港北"] {
+            assert!(
+                tagger.dictionaries().contains(Field::Locality, key),
+                "{key}"
+            );
+        }
     }
 
     /// The town plus named POIs: one with an address, one without, a station

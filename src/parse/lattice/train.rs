@@ -332,6 +332,8 @@ struct Fields {
     street: Option<Tokens>,
     suburb: Option<Tokens>,
     locality: Option<Tokens>,
+    /// The place area the record lies in outside the admin areas: an island.
+    island: Option<Tokens>,
     region: Option<Tokens>,
     postcode: Option<Tokens>,
     country: Option<Tokens>,
@@ -345,6 +347,7 @@ enum Slot {
     Street,
     Suburb,
     Locality,
+    Island,
     Region,
     Postcode,
     Country,
@@ -360,6 +363,7 @@ impl Slot {
             "city" | "town" | "village" | "hamlet" | "municipality" | "postal_city" => {
                 Self::Locality
             }
+            "island" | "archipelago" => Self::Island,
             "state" | "state_code" | "province" | "region" => Self::Region,
             "postcode" => Self::Postcode,
             "country" => Self::Country,
@@ -372,7 +376,7 @@ impl Slot {
             Self::House => Label::Other,
             Self::HouseNumber => Label::HouseNumber,
             Self::Street => Label::Street,
-            Self::Suburb | Self::Locality => Label::Locality,
+            Self::Suburb | Self::Locality | Self::Island => Label::Locality,
             Self::Region => Label::Region,
             Self::Postcode => Label::Postcode,
             Self::Country => Label::Country,
@@ -386,6 +390,7 @@ impl Slot {
             Self::Street => fields.street.as_ref(),
             Self::Suburb => fields.suburb.as_ref(),
             Self::Locality => fields.locality.as_ref(),
+            Self::Island => fields.island.as_ref(),
             Self::Region => fields.region.as_ref(),
             Self::Postcode => fields.postcode.as_ref(),
             Self::Country => fields.country.as_ref(),
@@ -504,6 +509,46 @@ fn reverse_groups(groups: &mut [Group]) {
     }
 }
 
+/// Whether `nodes` have a place for `slot`.
+fn writes_slot(nodes: &[Node], slot: Slot) -> bool {
+    nodes.iter().any(|node| match node {
+        Node::Slot(written) => *written == slot,
+        Node::First(alternatives) => alternatives.iter().any(|nodes| writes_slot(nodes, slot)),
+        _ => false,
+    })
+}
+
+/// Few templates write an island; a query writes it as a field of its own
+/// after the localities and before the region.
+fn insert_island(groups: &mut Vec<Group>, island: &Tokens) {
+    let at = groups
+        .iter()
+        .rposition(|group| group.label == Label::Locality)
+        .map(|index| index + 1)
+        .or_else(|| {
+            groups.iter().position(|group| {
+                matches!(
+                    group.label,
+                    Label::Region | Label::Postcode | Label::Country
+                )
+            })
+        })
+        .unwrap_or(groups.len());
+    if let Some(next) = groups.get_mut(at) {
+        next.break_before = true;
+        next.joiner = None;
+    }
+    groups.insert(
+        at,
+        Group {
+            label: Label::Locality,
+            words: island.clone(),
+            break_before: at > 0,
+            joiner: None,
+        },
+    );
+}
+
 fn has_value(nodes: &[Node], fields: &Fields) -> bool {
     nodes.iter().any(|node| match node {
         Node::Slot(slot) => slot.value(fields).is_some(),
@@ -547,6 +592,8 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
 /// (`name:ja-Hira`, `name:en`, ...) when it has any, so the model sees names
 /// in the other scripts and languages queries write them in.
 const ALT_NAME_SHARE: f64 = 0.3;
+/// Share of rows of records on an island that name it.
+const ISLAND_SHARE: f64 = 0.35;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
@@ -628,6 +675,7 @@ impl<'a> Renderer<'a> {
             Record::Place(..) => {
                 // A place is named with the areas above it, not within.
                 fields.locality = name;
+                fields.island = self.island(&context, random);
                 fields.region = context.region.as_deref().and_then(words);
                 fields.country = context.country.as_deref().and_then(words);
                 return Ok(self.finish(fields, context.country_code, random));
@@ -658,6 +706,7 @@ impl<'a> Renderer<'a> {
         if fields.suburb.is_none() && random.chance(0.3) {
             fields.suburb = context.suburb.as_deref().and_then(words);
         }
+        fields.island = self.island(&context, random);
         fields.region = pick(
             stated.and_then(|address| address.region.as_deref()),
             context.region.as_deref(),
@@ -741,6 +790,11 @@ impl<'a> Renderer<'a> {
             .expect("the vendored templates have a default");
         let mut groups = Vec::new();
         render(template, &fields, &mut groups, &mut false);
+        if let Some(island) = &fields.island
+            && !writes_slot(template, Slot::Island)
+        {
+            insert_island(&mut groups, island);
+        }
         let row_country = country.filter(|code| code.as_str() == template_country);
         // Many places write the largest area first and the house number
         // last ("100-0005 東京都千代田区丸の内2-7-2"), whatever order the
@@ -797,6 +851,16 @@ impl<'a> Renderer<'a> {
             country: row_country,
             suppression,
         })
+    }
+
+    /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
+    /// records on one.
+    fn island(&self, context: &Areas, random: &mut Random) -> Option<Tokens> {
+        context
+            .island
+            .as_deref()
+            .filter(|_| random.chance(ISLAND_SHARE))
+            .and_then(words)
     }
 
     /// A unit, as its own field after the street ("unit 602"), before the
@@ -870,11 +934,7 @@ impl<'a> Renderer<'a> {
         };
         let tuple = context.admin_context;
         let mut locality = None;
-        for area in [
-            tuple.locality_record_id,
-            tuple.place_record_id,
-            tuple.district_record_id,
-        ] {
+        for area in [tuple.locality_record_id, tuple.district_record_id] {
             if locality.is_none() {
                 locality = self.name(area, random)?;
             }
@@ -888,6 +948,7 @@ impl<'a> Renderer<'a> {
         let country = pick_name(&countries, random).map(str::to_string);
         Ok(Areas {
             locality,
+            island: self.name(tuple.place_record_id, random)?,
             suburb: self.name(tuple.neighbourhood_record_id, random)?,
             region: self.name(tuple.region_record_id, random)?,
             country,
@@ -936,6 +997,8 @@ fn pick_name<'n, S: AsRef<str>>(names: &'n [S], random: &mut Random) -> Option<&
 #[derive(Debug, Default)]
 struct Areas {
     locality: Option<String>,
+    /// The place area the record lies in (see [`Fields::island`]).
+    island: Option<String>,
     suburb: Option<String>,
     region: Option<String>,
     country: Option<String>,
@@ -1117,6 +1180,25 @@ mod tests {
         no_number.house_number = None;
         assert_eq!(rendered("CA", &no_number)[0].0, Street);
         assert!(templates().len() > 200 && templates().contains_key("ZZ"));
+    }
+
+    #[test]
+    fn an_island_is_a_field_between_the_localities_and_the_region() {
+        use Label::*;
+        let mut with_island = fields();
+        with_island.island = words("Honshu");
+        let template = &templates()["CA"];
+        assert!(!writes_slot(template, Slot::Island));
+        let mut groups = Vec::new();
+        render(template, &with_island, &mut groups, &mut false);
+        insert_island(&mut groups, with_island.island.as_ref().expect("island"));
+        let labels = groups
+            .iter()
+            .map(|group| (group.label, group.words.words.join(" "), group.break_before))
+            .collect::<Vec<_>>();
+        assert_eq!(labels[2], (Locality, "toronto".to_string(), true));
+        assert_eq!(labels[3], (Locality, "honshu".to_string(), true));
+        assert_eq!(labels[4], (Region, "on".to_string(), true));
     }
 
     #[test]

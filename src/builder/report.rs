@@ -72,6 +72,7 @@ impl BuilderReport {
         self.accepted.street_segments += accepted.street_segments;
         self.accepted.postcode_records += accepted.postcode_records;
         self.accepted.place_nodes += accepted.place_nodes;
+        self.accepted.place_areas += accepted.place_areas;
         self.accepted.poi_nodes += accepted.poi_nodes;
         self.accepted.poi_way_centroids += accepted.poi_way_centroids;
         self.accepted.pois_with_address += accepted.pois_with_address;
@@ -217,6 +218,9 @@ pub struct AcceptedCounts {
     pub street_segments: u64,
     pub postcode_records: u64,
     pub place_nodes: u64,
+    /// Places drawn as a closed way or a multipolygon, not admin boundaries.
+    #[serde(default)]
+    pub place_areas: u64,
     pub poi_nodes: u64,
     pub poi_way_centroids: u64,
     /// POIs that carry an address instead of being an address record.
@@ -540,6 +544,12 @@ impl BuilderReport {
     pub(crate) fn accept_place(&mut self, layer: PlaceLayer) {
         self.accept_layer(layer.as_str());
         self.accepted.place_nodes += 1;
+    }
+
+    /// A place drawn as an area, counted with the places and on its own.
+    pub(crate) fn accept_place_area(&mut self, layer: PlaceLayer) {
+        self.accept_place(layer);
+        self.accepted.place_areas += 1;
     }
 
     pub(crate) fn accept_poi(&mut self, poi: &PoiRecord) {

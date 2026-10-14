@@ -113,21 +113,22 @@ impl Default for PackWriterOptions {
 }
 
 /// The names of the areas a record lies in that its text document carries:
-/// every name of each area but its country, which is indexed by its `name`
-/// alone. A country has hundreds of names, one per language, and every
-/// record in it would carry them all; the parser's country dictionary still
-/// holds every one.
+/// every name of each area but its country and the place area it lies in
+/// (an island), which are indexed by their `name` alone. A country or an
+/// island has hundreds of names, one per language, and every record in it
+/// would carry them all; the parser's dictionaries still hold every one.
 fn indexed_area_names<'a>(
     context: &RecordContext,
     names: &'a HashMap<RecordId, Vec<String>>,
 ) -> impl Iterator<Item = &'a str> {
-    let country = context.admin_context.country_record_id;
+    let tuple = context.admin_context;
+    let large = [tuple.country_record_id, tuple.place_record_id];
     context
         .admin_context
         .parent_record_ids()
         .filter_map(move |id| {
             let names = names.get(&id)?;
-            Some(if Some(id) == country {
+            Some(if large.contains(&Some(id)) {
                 &names[..names.len().min(1)]
             } else {
                 &names[..]

@@ -21,7 +21,7 @@ use super::{
         validate_address_tags,
     },
     boundary::{
-        BoundaryRelationMember, BoundaryRelationStub, boundary_tags, has_admin_boundary_tags,
+        BoundaryRelationMember, BoundaryRelationStub, boundary_tags, has_area_tags,
         relation_member_role,
     },
     emitted::Emitted,
@@ -209,7 +209,7 @@ fn scan_way<'a>(
         )
     };
 
-    if has_admin_boundary_tags(&all_tags) && !refs().is_empty() {
+    if has_area_tags(&all_tags) && !refs().is_empty() {
         output
             .ways
             .push(feature(WayKind::Boundary, boundary_tags(&all_tags)));
@@ -297,13 +297,24 @@ fn scan_way<'a>(
     output.ways.push(feature(kind, tags));
 }
 
+/// Whether a relation's members draw its area: an admin boundary, or a
+/// multipolygon, not a route, site or collection that happens to carry a
+/// `place` tag.
+fn is_area_relation(tags: &BTreeMap<String, String>) -> bool {
+    tags.get("boundary").map(String::as_str) == Some("administrative")
+        || matches!(
+            tags.get("type").map(String::as_str),
+            None | Some("multipolygon" | "boundary")
+        )
+}
+
 fn scan_relation(
     output: &mut ScanOutput,
     object_id: i64,
     all_tags: BTreeMap<String, String>,
     members: Vec<BoundaryRelationMember>,
 ) {
-    if has_admin_boundary_tags(&all_tags) {
+    if has_area_tags(&all_tags) && is_area_relation(&all_tags) {
         if !members.is_empty() {
             output.relations.push(BoundaryRelationStub {
                 object_id,
