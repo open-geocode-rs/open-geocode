@@ -356,17 +356,18 @@ pub(super) struct TokenInfo {
 impl TokenInfo {
     pub fn new(word: &str, dictionaries: &Dictionaries) -> Self {
         let chars = word.chars().count();
+        // A numeral of any script counts as a digit (see [`super::is_numeral`]).
         let digits = word
             .chars()
-            .filter(|character| character.is_numeric())
+            .filter(|character| super::is_numeral(*character))
             .count();
         let leading_digits = word
             .chars()
-            .take_while(|character| character.is_numeric())
+            .take_while(|character| super::is_numeral(*character))
             .count();
         let leading_letters = word
             .chars()
-            .take_while(|character| character.is_alphabetic())
+            .take_while(|character| character.is_alphabetic() && !super::is_numeral(*character))
             .count();
         let shape = if digits == chars {
             Shape::Digits
@@ -723,5 +724,10 @@ mod tests {
         assert_eq!(shape("m5v"), Shape::Mixed);
         assert_eq!(shape("1st"), Shape::Mixed);
         assert_eq!(TokenInfo::new("улица", &dictionaries).script, Some(2));
+        // Numerals of any script are digits.
+        assert_eq!(shape("１２"), Shape::Digits);
+        assert_eq!(shape("八"), Shape::Digits);
+        assert_eq!(shape("٣"), Shape::Digits);
+        assert_eq!(shape("丁"), Shape::Alpha);
     }
 }

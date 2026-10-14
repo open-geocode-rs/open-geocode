@@ -28,8 +28,10 @@ pub mod train;
 pub mod weights;
 
 use std::{
+    collections::HashMap,
     fmt,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result};
@@ -216,6 +218,38 @@ pub fn is_unspaced(character: char) -> bool {
             | 0xFF66..=0xFF9F
             | 0x20000..=0x3FFFF
     )
+}
+
+/// `character<TAB>value` rows of the ideographs that are numerals, from the
+/// Unihan kPrimaryNumeric property (Unicode License V3, see
+/// `data/LICENSE-unicode.txt`), vendored by `scripts/parse_lattice_words.py`.
+pub(super) const NUMERALS: &str = include_str!("lattice/data/numerals.tsv");
+
+/// The value of a numeral character that Unicode does not class as a
+/// number: an ideograph of [`NUMERALS`].
+pub fn numeral_value(character: char) -> Option<u32> {
+    static TABLE: OnceLock<HashMap<char, u32>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            NUMERALS
+                .lines()
+                .filter_map(|line| {
+                    let (character, value) = line.split_once('\t')?;
+                    let mut chars = character.chars();
+                    let character = chars.next().filter(|_| chars.next().is_none())?;
+                    Some((character, value.trim().parse().ok()?))
+                })
+                .collect()
+        })
+        .get(&character)
+        .copied()
+}
+
+/// Whether `character` is a numeral of any script: a Unicode number (`Nd`,
+/// `Nl`, `No`, so fullwidth and other scripts' digits) or a numeral
+/// ideograph of [`NUMERALS`].
+pub fn is_numeral(character: char) -> bool {
+    character.is_numeric() || numeral_value(character).is_some()
 }
 
 /// The key a name is stored under in the parser's dictionaries: its
@@ -630,7 +664,9 @@ impl LatticeTagger {
                         }
                     }
                 }
-                if is_number_in_parts(tokens, &infos, start, end) {
+                if is_number_in_parts(tokens, &infos, start, end)
+                    || is_glued_numeral(&units, &infos, start, end)
+                {
                     evidence = true;
                     set.number_in_parts();
                 }
@@ -885,6 +921,16 @@ fn is_number_in_parts(tokens: &Tokens, infos: &[TokenInfo], start: usize, end: u
         && !start
             .checked_sub(1)
             .is_some_and(|before| digits(&infos[before]))
+}
+
+/// Whether `start..end` is two or more glued units that are all numerals: a
+/// number written in numeral ideographs, one unit per character.
+fn is_glued_numeral(units: &Units, infos: &[TokenInfo], start: usize, end: usize) -> bool {
+    end - start >= 2
+        && units.unspaced(start, end)
+        && infos[start..end]
+            .iter()
+            .all(|info| info.shape == features::Shape::Digits)
 }
 
 /// A dictionary key with street-type and direction abbreviations expanded,

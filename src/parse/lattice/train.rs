@@ -32,7 +32,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use super::{
-    CountryCode, FIELD_BREAKS, LatticeTagger, Suppression, Tokens,
+    CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
     decode::{self, END, LABELS, Lattice, Path as LabelPath, START, STATES},
     dictionary::{Dictionaries, Field},
     is_unspaced,
@@ -612,6 +612,9 @@ const POI_ADDRESS_SHARE: f64 = 0.7;
 /// Share of written units whose unit, PO box or level word follows the
 /// number instead of leading it.
 const UNIT_WORD_AFTER_SHARE: f64 = 0.3;
+/// Share of rows with words of a script written without spaces whose
+/// numbers are written in numeral ideographs.
+const NUMERAL_SHARE: f64 = 0.1;
 /// Share of rows of records on an island that name it.
 const ISLAND_SHARE: f64 = 0.35;
 /// Share of rows of addresses that state several areas that write them as
@@ -869,6 +872,27 @@ impl<'a> Renderer<'a> {
             } else {
                 let last = groups.pop().expect("groups");
                 groups.insert(0, last);
+            }
+        }
+        // Rows of a script written without spaces write their numbers in
+        // numeral ideographs some of the time ("二丁目7番2号").
+        let unspaced = groups.iter().any(|group| {
+            group
+                .words
+                .words
+                .iter()
+                .any(|word| word.chars().any(is_unspaced))
+        });
+        if unspaced && random.chance(NUMERAL_SHARE) {
+            for group in groups
+                .iter_mut()
+                .filter(|group| group.label != Label::Postcode)
+            {
+                for word in &mut group.words.words {
+                    if random.chance(0.5) {
+                        *word = in_numerals(word);
+                    }
+                }
             }
         }
         let keep_breaks = random.chance(0.2);
@@ -1142,6 +1166,35 @@ fn chained_areas(address: &AddressComponents, random: &mut Random) -> Option<Tok
     words(&chain)
 }
 
+/// `word` with its ASCII digits written as the numeral ideographs of the
+/// same value (see [`super::numeral_value`]), digit by digit.
+fn in_numerals(word: &str) -> String {
+    static DIGITS: OnceLock<[Option<char>; 10]> = OnceLock::new();
+    let digits = DIGITS.get_or_init(|| {
+        let mut digits = [None; 10];
+        for line in NUMERALS.lines() {
+            if let Some((character, value)) = line.split_once('\t')
+                && let (Some(character), Ok(value)) =
+                    (character.chars().next(), value.trim().parse::<usize>())
+                && value < 10
+                && digits[value].is_none()
+            {
+                digits[value] = Some(character);
+            }
+        }
+        digits
+    });
+    word.chars()
+        .map(|character| {
+            character
+                .to_digit(10)
+                .filter(|_| character.is_ascii_digit())
+                .and_then(|digit| digits[digit as usize])
+                .unwrap_or(character)
+        })
+        .collect()
+}
+
 fn words(value: &str) -> Option<Tokens> {
     let tokens = Tokens::new(value);
     (!tokens.is_empty()).then_some(tokens)
@@ -1413,6 +1466,13 @@ mod tests {
             [HouseNumber, Street, Street, Locality, Locality, Region]
         );
         assert!(libpostal_row(None, "no-label").is_none());
+    }
+
+    #[test]
+    fn numbers_are_written_in_numeral_ideographs_digit_by_digit() {
+        assert_eq!(in_numerals("10-8"), "一零-八");
+        assert_eq!(in_numerals("3丁目"), "三丁目");
+        assert!(in_numerals("205").chars().all(super::super::is_numeral));
     }
 
     #[test]
