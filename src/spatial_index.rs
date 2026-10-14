@@ -892,6 +892,7 @@ mod tests {
     fn address(lon: f64, lat: f64, object_id: i64) -> Record {
         Record::Address(AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: "10".to_string(),
                 street: Some("King Street".to_string()),
                 place: None,
@@ -1038,6 +1039,7 @@ mod tests {
     fn indexes_line_segments_with_fraction() {
         let street = |object_id: i64, lon: f64| {
             Record::Street(StreetRecord {
+                alt_names: Vec::new(),
                 name: "King Street".to_string(),
                 geometry: Geometry::new(GeometryValue::LineString {
                     coordinates: vec![

@@ -1534,6 +1534,7 @@ mod tests {
         let street = street.map(str::to_string);
         AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: "10".to_string(),
                 street,
                 place: None,

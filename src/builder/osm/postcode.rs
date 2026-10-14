@@ -122,6 +122,7 @@ mod tests {
 
     fn address(postcode: &str) -> AddressComponents {
         AddressComponents {
+            areas: Vec::new(),
             number: "1".to_string(),
             street: Some("King Street".to_string()),
             place: None,

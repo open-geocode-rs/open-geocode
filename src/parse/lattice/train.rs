@@ -543,11 +543,17 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("southwest", "sw"),
 ];
 
+/// Share of rows that name a record or an area by one of its alternate names
+/// (`name:ja-Hira`, `name:en`, ...) when it has any, so the model sees names
+/// in the other scripts and languages queries write them in.
+const ALT_NAME_SHARE: f64 = 0.3;
+
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
     pack: &'a PackReader,
     tagger: &'a LatticeTagger,
-    names: HashMap<RecordId, Option<String>>,
+    /// Every name of each area record, its `name` first.
+    names: HashMap<RecordId, Vec<String>>,
     unit_words: Vec<String>,
     template_countries: Vec<String>,
 }
@@ -600,16 +606,17 @@ impl<'a> Renderer<'a> {
     }
 
     fn row(&mut self, id: RecordId, record: &Record, random: &mut Random) -> Result<Option<Row>> {
-        let context = self.context(id)?;
+        let context = self.context(id, random)?;
         let mut fields = Fields::default();
         let mut stated = None;
+        let name = pick_name(&record.names(), random).and_then(words);
         match record {
             Record::Address(record) => {
                 stated = Some(&record.address);
                 address_fields(&record.address, &mut fields);
             }
             Record::Poi(record) => {
-                fields.house = words(&record.name);
+                fields.house = name;
                 if let Some(address) = &record.address
                     && random.chance(0.5)
                 {
@@ -617,10 +624,10 @@ impl<'a> Renderer<'a> {
                     address_fields(address, &mut fields);
                 }
             }
-            Record::Street(record) => fields.street = words(&record.name),
-            Record::Place(_, record) => {
+            Record::Street(_) => fields.street = name,
+            Record::Place(..) => {
                 // A place is named with the areas above it, not within.
-                fields.locality = words(&record.name);
+                fields.locality = name;
                 fields.region = context.region.as_deref().and_then(words);
                 fields.country = context.country.as_deref().and_then(words);
                 return Ok(self.finish(fields, context.country_code, random));
@@ -628,7 +635,13 @@ impl<'a> Renderer<'a> {
             Record::Postcode(record) => fields.postcode = words(&record.postcode),
             Record::Interpolation(_) => return Ok(None),
         }
-        if fields.house.is_none() && fields.street.is_none() && fields.postcode.is_none() {
+        // A block scheme address is its number in its areas.
+        let numbered_in_area = fields.house_number.is_some() && fields.suburb.is_some();
+        if fields.house.is_none()
+            && fields.street.is_none()
+            && fields.postcode.is_none()
+            && !numbered_in_area
+        {
             return Ok(None);
         }
         // Where the record is: as it states it, or the areas it lies in.
@@ -642,7 +655,7 @@ impl<'a> Renderer<'a> {
         let stated_locality =
             stated.and_then(|address| address.locality.as_deref().or(address.place.as_deref()));
         fields.locality = pick(stated_locality, context.locality.as_deref(), random);
-        if random.chance(0.3) {
+        if fields.suburb.is_none() && random.chance(0.3) {
             fields.suburb = context.suburb.as_deref().and_then(words);
         }
         fields.region = pick(
@@ -851,7 +864,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// The names of the areas a record lies in, and its country's code.
-    fn context(&mut self, id: RecordId) -> Result<Areas> {
+    fn context(&mut self, id: RecordId, random: &mut Random) -> Result<Areas> {
         let Some(context) = self.pack.boundary_context(id)? else {
             return Ok(Areas::default());
         };
@@ -863,35 +876,60 @@ impl<'a> Renderer<'a> {
             tuple.district_record_id,
         ] {
             if locality.is_none() {
-                locality = self.name(area)?;
+                locality = self.name(area, random)?;
             }
         }
-        let country = self.name(tuple.country_record_id)?;
-        let country_code = country
-            .as_deref()
-            .and_then(normalize_index_text)
+        let countries = self.names(tuple.country_record_id)?;
+        let country_code = countries
+            .first()
+            .and_then(|name| normalize_index_text(name))
             .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
             .and_then(|entry| entry.country);
+        let country = pick_name(&countries, random).map(str::to_string);
         Ok(Areas {
             locality,
-            suburb: self.name(tuple.neighbourhood_record_id)?,
-            region: self.name(tuple.region_record_id)?,
+            suburb: self.name(tuple.neighbourhood_record_id, random)?,
+            region: self.name(tuple.region_record_id, random)?,
             country,
             country_code,
         })
     }
 
-    fn name(&mut self, id: Option<RecordId>) -> Result<Option<String>> {
-        let Some(id) = id else {
-            return Ok(None);
-        };
-        if let Some(name) = self.names.get(&id) {
-            return Ok(name.clone());
-        }
-        let name = self.pack.context_record(id)?.map(|record| record.name);
-        self.names.insert(id, name.clone());
-        Ok(name)
+    /// One name of an area, as [`pick_name`] picks it.
+    fn name(&mut self, id: Option<RecordId>, random: &mut Random) -> Result<Option<String>> {
+        let names = self.names(id)?;
+        Ok(pick_name(&names, random).map(str::to_string))
     }
+
+    /// Every name of an area, its `name` first.
+    fn names(&mut self, id: Option<RecordId>) -> Result<Vec<String>> {
+        let Some(id) = id else {
+            return Ok(Vec::new());
+        };
+        if let Some(names) = self.names.get(&id) {
+            return Ok(names.clone());
+        }
+        let names = self.pack.records().names(id)?;
+        self.names.insert(id, names.clone());
+        Ok(names)
+    }
+}
+
+/// A record's `name`, or one of its alternate names in [`ALT_NAME_SHARE`]
+/// of draws. `names` holds the `name` first.
+fn pick_name<'n, S: AsRef<str>>(names: &'n [S], random: &mut Random) -> Option<&'n str> {
+    let name = match names {
+        [] => return None,
+        [only] => only,
+        [first, others @ ..] => {
+            if random.chance(ALT_NAME_SHARE) {
+                &others[random.below(others.len() as u64) as usize]
+            } else {
+                first
+            }
+        }
+    };
+    Some(name.as_ref())
 }
 
 /// The areas a record lies in.
@@ -907,6 +945,9 @@ struct Areas {
 fn address_fields(address: &AddressComponents, fields: &mut Fields) {
     fields.house_number = words(&address.number);
     fields.street = address.street.as_deref().and_then(words);
+    // The areas an address states, largest first as Japanese addresses
+    // write them: the ward, quarter and neighbourhood a block number is in.
+    fields.suburb = words(&address.areas.join(" "));
     fields.unit = address.unit.as_deref().and_then(words);
     fields.postcode = address.postcode.as_deref().and_then(words);
 }

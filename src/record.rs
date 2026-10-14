@@ -39,6 +39,8 @@ pub struct InterpolationRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreetRecord {
     pub name: String,
+    /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
+    pub alt_names: Vec<String>,
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
@@ -56,6 +58,8 @@ pub struct PostcodeRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoiRecord {
     pub name: String,
+    /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
+    pub alt_names: Vec<String>,
     /// The tag that made it a POI, as `key:value`, for example `amenity:cafe`.
     pub category: String,
     pub address: Option<AddressComponents>,
@@ -66,7 +70,15 @@ pub struct PoiRecord {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaceRecord {
+    /// The OSM `name`, the label the record is shown by.
     pub name: String,
+    /// Every other name the feature is known by, in tag order: each
+    /// `name:<lang>` (`name:ja-Hira`, `name:en`), `alt_name`, `official_name`,
+    /// `short_name` and `old_name`, and their `:<lang>` forms, with
+    /// `;`-separated values split. None repeats `name` or another one,
+    /// compared case-insensitively. Search and the parser know the record
+    /// by all of them.
+    pub alt_names: Vec<String>,
     pub place_type: String,
     pub geometry: Geometry,
     pub source: SourceProvenance,
@@ -199,12 +211,29 @@ pub struct AddressComponents {
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
+    /// The areas below the locality the address states, outermost first:
+    /// `addr:suburb`, `addr:quarter` and `addr:neighbourhood`. An address
+    /// of the Japanese block scheme names no street, only these and its
+    /// block and house numbers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub areas: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+}
+
+impl AddressComponents {
+    /// What the house number is on: the street, else the `addr:place`, else
+    /// the innermost area the address states.
+    pub fn subject(&self) -> Option<&str> {
+        self.street
+            .as_deref()
+            .or(self.place.as_deref())
+            .or(self.areas.last().map(String::as_str))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +371,20 @@ impl Record {
             Record::Place(_, record) => record.label(),
             Record::Poi(record) => record.label(),
         }
+    }
+
+    /// The names of a named record (street, place, POI): its `name`, then
+    /// its alternate names. Empty for the other layers.
+    pub fn names(&self) -> Vec<&str> {
+        let (name, alt_names) = match self {
+            Record::Street(record) => (&record.name, &record.alt_names),
+            Record::Place(_, record) => (&record.name, &record.alt_names),
+            Record::Poi(record) => (&record.name, &record.alt_names),
+            _ => return Vec::new(),
+        };
+        std::iter::once(name.as_str())
+            .chain(alt_names.iter().map(String::as_str))
+            .collect()
     }
 
     pub fn geometry(&self) -> &Geometry {
@@ -493,10 +536,11 @@ impl StreetRecord {
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 6)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 7)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
+        serialize_alt_names(&mut state, &self.alt_names)?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
         state.serialize_field("source", &self.source)?;
@@ -547,10 +591,11 @@ impl PlaceRecord {
 
 impl Serialize for PlaceRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PlaceRecord", 6)?;
+        let mut state = serializer.serialize_struct("PlaceRecord", 7)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
+        serialize_alt_names(&mut state, &self.alt_names)?;
         state.serialize_field("place_type", &self.place_type)?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("source", &self.source)?;
@@ -570,10 +615,11 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 8)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
+        serialize_alt_names(&mut state, &self.alt_names)?;
         state.serialize_field("category", &self.category)?;
         if let Some(address) = &self.address {
             state.serialize_field("address", address)?;
@@ -584,6 +630,17 @@ impl Serialize for PoiRecord {
         state.serialize_field("location_precision", &self.location_precision)?;
         state.serialize_field("source", &self.source)?;
         state.end()
+    }
+}
+
+fn serialize_alt_names<S: SerializeStruct>(
+    state: &mut S,
+    alt_names: &[String],
+) -> Result<(), S::Error> {
+    if alt_names.is_empty() {
+        state.skip_field("alt_names")
+    } else {
+        state.serialize_field("alt_names", alt_names)
     }
 }
 

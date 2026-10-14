@@ -1844,6 +1844,7 @@ mod tests {
                     &Record::Place(
                         PlaceLayer::Locality,
                         PlaceRecord {
+                            alt_names: Vec::new(),
                             name: name.to_string(),
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
@@ -1903,6 +1904,7 @@ mod tests {
                 &Record::Place(
                     PlaceLayer::Locality,
                     PlaceRecord {
+                        alt_names: Vec::new(),
                         name: "Muskoka Lakes Township".to_string(),
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-79.5, 45.1),
@@ -1913,7 +1915,7 @@ mod tests {
             )
             .expect("township");
         writer.set_context_names(
-            [(township, "Muskoka Lakes Township".to_string())]
+            [(township, vec!["Muskoka Lakes Township".to_string()])]
                 .into_iter()
                 .collect(),
         );
@@ -1925,6 +1927,7 @@ mod tests {
             flags: 0,
         });
         let poi = |object_id, name: &str, address| PoiRecord {
+            alt_names: Vec::new(),
             name: name.to_string(),
             category: "amenity:fire_station".to_string(),
             address,
@@ -2546,6 +2549,7 @@ mod tests {
                     &Record::Place(
                         PlaceLayer::Locality,
                         PlaceRecord {
+                            alt_names: Vec::new(),
                             name: name.to_string(),
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
@@ -2560,8 +2564,8 @@ mod tests {
         let st_catharines = locality("St. Catharines", 101);
         writer.set_context_names(
             [
-                (toronto, "Toronto".to_string()),
-                (st_catharines, "St. Catharines".to_string()),
+                (toronto, vec!["Toronto".to_string()]),
+                (st_catharines, vec!["St. Catharines".to_string()]),
             ]
             .into_iter()
             .collect(),
@@ -2933,6 +2937,7 @@ mod tests {
         writer
             .write(
                 &PoiRecord {
+                    alt_names: Vec::new(),
                     name: "St. Clair Spadina Dental".to_string(),
                     category: "amenity:dentist".to_string(),
                     address: Some(dental),
@@ -3140,6 +3145,7 @@ mod tests {
                 &Record::Place(
                     PlaceLayer::Locality,
                     PlaceRecord {
+                        alt_names: Vec::new(),
                         name: "Huron East".to_string(),
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-81.4, 43.5),
@@ -3204,6 +3210,7 @@ mod tests {
             .unwrap_or(1);
         AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: number.to_string(),
                 street: Some(street.to_string()),
                 place: None,
@@ -3230,6 +3237,7 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(9);
         StreetRecord {
+            alt_names: Vec::new(),
             name: label.to_string(),
             geometry: point_geometry(-79.0, 43.0),
             representative_point: [-79.0, 43.0],

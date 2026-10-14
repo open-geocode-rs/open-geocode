@@ -215,6 +215,18 @@ pub fn is_unspaced(character: char) -> bool {
     )
 }
 
+/// The key a name is stored under in the parser's dictionaries: its
+/// normalized words as [`Units`], glued as a query's are, so a name written
+/// with spaces between characters of a script without spaces
+/// ("とうきょう たからづかげきじょう") is found by the units of a query that
+/// writes it.
+pub fn dictionary_key(name: &str) -> Option<String> {
+    let normalized = crate::text_index::normalize_index_text(name)?;
+    let words = normalized.split(' ').collect::<Vec<_>>();
+    let units = Units::of(&Tokens::from_words(&words));
+    Some(units.key(0, units.len()))
+}
+
 /// The units a lattice is built on: the tokens of a [`Tokens`], except that
 /// a token holding characters of a script written without spaces is split
 /// into one unit per such character and one per run of other characters

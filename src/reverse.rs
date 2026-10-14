@@ -618,6 +618,7 @@ mod tests {
         writer
             .write(
                 &PoiRecord {
+                    alt_names: Vec::new(),
                     name: "Corner Bench Park".to_string(),
                     category: "leisure:park".to_string(),
                     address: None,
@@ -632,6 +633,7 @@ mod tests {
         writer
             .write(
                 &PoiRecord {
+                    alt_names: Vec::new(),
                     name: "Queen Bakery".to_string(),
                     category: "shop:bakery".to_string(),
                     address: Some(address_record().address),
@@ -667,6 +669,7 @@ mod tests {
     fn address_record() -> AddressRecord {
         AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: "10".to_string(),
                 street: Some("Queen Street".to_string()),
                 place: None,
@@ -684,6 +687,7 @@ mod tests {
 
     fn place_record() -> PlaceRecord {
         PlaceRecord {
+            alt_names: Vec::new(),
             name: "Toronto".to_string(),
             place_type: "admin_level:8".to_string(),
             geometry: point_geometry(-79.0, 43.0),
@@ -716,6 +720,7 @@ mod tests {
 
     fn street_record() -> StreetRecord {
         StreetRecord {
+            alt_names: Vec::new(),
             name: "Queen Street".to_string(),
             geometry: line_geometry(),
             representative_point: [-79.0, 43.0005],

@@ -5,11 +5,15 @@ use crate::{
     record::{OsmObjectType, Record, SourceProvenance, StreetRecord},
 };
 
-use super::{emitted::Emitted, geometry::line_string_geometry, tags::OsmTags};
+use super::{
+    emitted::Emitted,
+    geometry::line_string_geometry,
+    tags::{OsmTags, alternate_names, name_tags},
+};
 
-/// Tags a street feature keeps after the scan: the name it is indexed under and
-/// what the audit needs to explain a rejection.
-const STREET_TAG_KEYS: [&str; 3] = ["highway", "name", "ref"];
+/// Tags a street feature keeps after the scan besides its names: what the
+/// audit needs to explain a rejection.
+const STREET_TAG_KEYS: [&str; 2] = ["highway", "ref"];
 
 pub(crate) fn has_highway_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("highway")
@@ -23,6 +27,7 @@ pub(crate) fn street_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, S
     STREET_TAG_KEYS
         .into_iter()
         .filter_map(|key| Some((key.to_string(), tags.get(key)?.clone())))
+        .chain(name_tags(tags))
         .collect()
 }
 
@@ -44,6 +49,7 @@ pub(crate) fn emit_street(
     let record = street_name(tags).zip(points).and_then(|(name, points)| {
         let built = line_string_geometry(points)?;
         Some(StreetRecord {
+            alt_names: alternate_names(tags, &name),
             name,
             geometry: built.geometry,
             representative_point: built.representative_point,

@@ -58,7 +58,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 6;
+pub const PACK_SCHEMA_VERSION: u32 = 7;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -112,6 +112,31 @@ impl Default for PackWriterOptions {
     }
 }
 
+/// The names of the areas a record lies in that its text document carries:
+/// every name of each area but its country, which is indexed by its `name`
+/// alone. A country has hundreds of names, one per language, and every
+/// record in it would carry them all; the parser's country dictionary still
+/// holds every one.
+fn indexed_area_names<'a>(
+    context: &RecordContext,
+    names: &'a HashMap<RecordId, Vec<String>>,
+) -> impl Iterator<Item = &'a str> {
+    let country = context.admin_context.country_record_id;
+    context
+        .admin_context
+        .parent_record_ids()
+        .filter_map(move |id| {
+            let names = names.get(&id)?;
+            Some(if Some(id) == country {
+                &names[..names.len().min(1)]
+            } else {
+                &names[..]
+            })
+        })
+        .flatten()
+        .map(String::as_str)
+}
+
 /// Writes records in their final order. Record ids are assigned sequentially.
 pub struct PackWriter {
     destination: PathBuf,
@@ -122,7 +147,7 @@ pub struct PackWriter {
     text: TextIndexWriter,
     spatial: SpatialIndexWriter,
     layer_counts: BTreeMap<Layer, u64>,
-    context_names: HashMap<RecordId, String>,
+    context_names: HashMap<RecordId, Vec<String>>,
     postcode_areas: PostcodeAreas,
     dictionaries: DictionaryBuilder,
     parse_weights: Option<Weights>,
@@ -211,9 +236,10 @@ impl PackWriter {
         self.records.record_count()
     }
 
-    /// Names of the records admin contexts point at, so the records written
-    /// after this can be indexed under the areas they lie in.
-    pub fn set_context_names(&mut self, names: HashMap<RecordId, String>) {
+    /// Names of the records admin contexts point at, each area's `name`
+    /// first, so the records written after this can be indexed under the
+    /// areas they lie in.
+    pub fn set_context_names(&mut self, names: HashMap<RecordId, Vec<String>>) {
         self.context_names = names;
     }
 
@@ -256,8 +282,7 @@ impl PackWriter {
                 let record_id = first + offset as u64;
                 let names = context
                     .iter()
-                    .flat_map(|context| context.admin_context.parent_record_ids())
-                    .filter_map(|id| context_names.get(&id).map(String::as_str))
+                    .flat_map(|context| indexed_area_names(context, context_names))
                     .collect::<Vec<_>>();
                 Ok((
                     fields.document(record_id, record, &names, postcode_areas),
@@ -612,6 +637,7 @@ mod tests {
     fn address_record(object_id: i64, number: &str, street: &str) -> Record {
         Record::Address(AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: number.to_string(),
                 street: Some(street.to_string()),
                 place: None,

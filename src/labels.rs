@@ -3,14 +3,11 @@ use crate::record::{
 };
 
 pub fn address_name(components: &AddressComponents) -> String {
-    [
-        Some(components.number.as_str()),
-        components.street.as_deref().or(components.place.as_deref()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" ")
+    [Some(components.number.as_str()), components.subject()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn address_label(components: &AddressComponents) -> String {
@@ -184,6 +181,7 @@ mod tests {
     #[test]
     fn composes_poi_labels_from_name_address_and_locality() {
         let address = AddressComponents {
+            areas: Vec::new(),
             number: "123".to_string(),
             street: Some("King Street West".to_string()),
             place: None,

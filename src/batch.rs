@@ -811,6 +811,7 @@ mod tests {
                 .write(
                     &AddressRecord {
                         address: AddressComponents {
+                            areas: Vec::new(),
                             number: number.into(),
                             street: Some(street.into()),
                             place: None,

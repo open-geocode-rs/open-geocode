@@ -481,6 +481,7 @@ mod router_tests {
             .write(
                 &AddressRecord {
                     address: AddressComponents {
+                        areas: Vec::new(),
                         number: "10".to_string(),
                         street: Some("King Street".to_string()),
                         place: None,

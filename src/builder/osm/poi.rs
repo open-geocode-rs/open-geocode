@@ -10,7 +10,11 @@ use crate::record::{
     LocationPrecision, OsmObjectType, PoiRecord, Record, SourceProvenance, point_geometry,
 };
 
-use super::{address::address_components, emitted::Emitted, tags::OsmTags};
+use super::{
+    address::address_components,
+    emitted::Emitted,
+    tags::{OsmTags, alternate_names, name_tags},
+};
 
 /// Keys that make a named object a POI, in category order: an object tagged
 /// `amenity=school` and `building=school` is an `amenity:school`.
@@ -73,16 +77,17 @@ pub(crate) fn is_poi(tags: &BTreeMap<String, String>) -> bool {
     poi_name(tags).is_some() && poi_category(tags).is_some()
 }
 
-/// The tags a POI keeps: its name, its category tags and, when they state a
+/// The tags a POI keeps: its names, its category tags and, when they state a
 /// valid address, its `addr:*` tags.
 pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
-    ["name", "information"]
+    ["information"]
         .into_iter()
         .chain(POI_KEYS)
         .filter_map(|key| Some((key.to_string(), tags.get(key)?.clone())))
+        .chain(name_tags(tags))
         .chain(
             address_tags
                 .into_iter()
@@ -99,6 +104,7 @@ pub(crate) fn emit_poi(candidate: PoiCandidate, out: &mut Emitted) {
         return;
     };
     let record = PoiRecord {
+        alt_names: alternate_names(tags, &name),
         name,
         category,
         address: address_components(tags).ok(),

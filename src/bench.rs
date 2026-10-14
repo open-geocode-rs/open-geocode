@@ -629,6 +629,7 @@ mod tests {
                     &Record::Place(
                         layer,
                         PlaceRecord {
+                            alt_names: Vec::new(),
                             name: name.to_string(),
                             place_type: "admin_level:8".to_string(),
                             geometry: point_geometry(-79.4, 43.6),
@@ -645,9 +646,9 @@ mod tests {
         let hamilton = area(PlaceLayer::Locality, "Hamilton", 3);
         writer.set_context_names(
             [
-                (toronto, "Toronto".to_string()),
-                (north_york, "North York".to_string()),
-                (hamilton, "Hamilton".to_string()),
+                (toronto, vec!["Toronto".to_string()]),
+                (north_york, vec!["North York".to_string()]),
+                (hamilton, vec!["Hamilton".to_string()]),
             ]
             .into_iter()
             .collect(),
@@ -676,6 +677,7 @@ mod tests {
             (16, "Ali Baba", downtown),
         ] {
             let poi = PoiRecord {
+                alt_names: Vec::new(),
                 name: name.to_string(),
                 category: "amenity:cafe".to_string(),
                 address: None,
@@ -833,6 +835,7 @@ mod tests {
             .write(
                 &AddressRecord {
                     address: AddressComponents {
+                        areas: Vec::new(),
                         number: "10".to_string(),
                         street: Some("King Street".to_string()),
                         place: None,

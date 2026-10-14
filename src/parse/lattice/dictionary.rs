@@ -1,8 +1,10 @@
 //! The parser's dictionaries, written into the Pack at build time.
 //!
-//! Each field is one FST section, `parse/<field>`, mapping a normalized name
-//! (the same `normalize_index_text` the search path uses) to how often the
-//! Pack uses it and the country it is used in most. Street, locality, region
+//! Each field is one FST section, `parse/<field>`, mapping a name's
+//! [`dictionary_key`] (the `normalize_index_text` the search path uses,
+//! glued as a query's units are) to how often the Pack uses it and the
+//! country it is used in most. Every name a record has counts: its `name`
+//! and its alternate names (`name:ja-Hira`, `name:en`, `alt_name`, ...). Street, locality, region
 //! and country names come from the Pack's own records, so the Pack stays the
 //! only copy of place data. Street-type words are the words that start or end
 //! many of those street names, plus a vendored list of common types and
@@ -21,16 +23,15 @@ use anyhow::{Context, Result};
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
 
-use super::CountryCode;
+use super::{CountryCode, dictionary_key};
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     pack::{RecordContext, RecordId},
     record::{AddressComponents, PlaceLayer, Record},
-    text_index::normalize_index_text,
 };
 
 /// Format version of every `parse/` dictionary section.
-pub const DICTIONARY_VERSION: u32 = 1;
+pub const DICTIONARY_VERSION: u32 = 2;
 /// Bits of an FST value that hold the count; the country code sits above.
 const COUNT_BITS: u32 = 40;
 const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
@@ -332,15 +333,21 @@ impl RecordNames {
                 names.add(Field::Region, address.region.as_deref());
                 names.country_name(address.country.as_deref());
             }
-            Record::Street(record) => names.add(Field::Street, Some(&record.name)),
-            Record::Place(layer, record) => {
+            Record::Street(_) => {
+                for name in record.names() {
+                    names.add(Field::Street, Some(name));
+                }
+            }
+            Record::Place(layer, place) => {
                 let field = match layer {
                     PlaceLayer::Country => Field::Country,
                     PlaceLayer::Region => Field::Region,
                     _ => Field::Locality,
                 };
-                names.add(field, Some(&record.name));
-                if let Some(code) = record.place_type.strip_prefix("derived_country:") {
+                for name in record.names() {
+                    names.add(field, Some(name));
+                }
+                if let Some(code) = place.place_type.strip_prefix("derived_country:") {
                     names.country = CountryCode::parse(code);
                 }
             }
@@ -353,6 +360,9 @@ impl RecordNames {
         self.add(Field::Street, address.street.as_deref());
         self.add(Field::Locality, address.place.as_deref());
         self.add(Field::Locality, address.locality.as_deref());
+        for area in &address.areas {
+            self.add(Field::Locality, Some(area));
+        }
         self.add(Field::Region, address.region.as_deref());
         self.country_name(address.country.as_deref());
     }
@@ -367,7 +377,7 @@ impl RecordNames {
     }
 
     fn add(&mut self, field: Field, value: Option<&str>) {
-        if let Some(name) = value.and_then(normalize_index_text) {
+        if let Some(name) = value.and_then(dictionary_key) {
             self.names.push((field, name));
         }
     }
@@ -395,9 +405,9 @@ impl NameStats {
         }
     }
 
-    fn merge(&mut self, other: NameStats) {
+    fn merge(&mut self, other: &NameStats) {
         self.count += other.count;
-        for (country, count) in other.countries {
+        for &(country, count) in &other.countries {
             self.add_country(country, count);
         }
     }
@@ -464,11 +474,12 @@ impl DictionaryBuilder {
     }
 
     /// Write every dictionary section. `area_names` names the admin areas
-    /// records were counted in.
+    /// records were counted in, each area's `name` first; every name of an
+    /// area is counted for the records lying in it.
     pub fn finish(
         self,
         pack: &mut ContainerWriter,
-        area_names: &HashMap<RecordId, String>,
+        area_names: &HashMap<RecordId, Vec<String>>,
     ) -> Result<()> {
         let Self {
             mut names,
@@ -476,18 +487,22 @@ impl DictionaryBuilder {
             country_codes,
         } = self;
         for (area, (field, stats)) in areas {
-            if let Some(name) = area_names
+            let keys = area_names
                 .get(&area)
-                .and_then(|name| normalize_index_text(name))
-            {
-                names.entry((field, name)).or_default().merge(stats);
+                .into_iter()
+                .flatten()
+                .filter_map(|name| dictionary_key(name))
+                .collect::<HashSet<_>>();
+            for key in keys {
+                names.entry((field, key)).or_default().merge(&stats);
             }
         }
         // A country is also written as its code ("ca"), as people write it.
         for (area, code) in &country_codes {
             let count = area_names
                 .get(area)
-                .and_then(|name| normalize_index_text(name))
+                .and_then(|names| names.first())
+                .and_then(|name| dictionary_key(name))
                 .and_then(|name| names.get(&(Field::Country, name)))
                 .map_or(1, |stats| stats.count.max(1));
             names
@@ -569,7 +584,7 @@ fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
     list.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(normalize_index_text)
+        .filter_map(dictionary_key)
         .map(|word| {
             (
                 word,
@@ -672,9 +687,69 @@ mod tests {
     }
 
     #[test]
+    fn places_are_named_by_every_name_with_unspaced_scripts_glued() {
+        let place = Record::Place(
+            PlaceLayer::Locality,
+            crate::record::PlaceRecord {
+                name: "横浜市".into(),
+                alt_names: vec!["よこはま し".into(), "Yokohama-shi".into()],
+                place_type: "admin_level:7".into(),
+                geometry: crate::record::point_geometry(139.6, 35.4),
+                source: crate::record::SourceProvenance::osm(
+                    crate::record::OsmObjectType::Relation,
+                    1,
+                ),
+            },
+        );
+        assert_eq!(
+            RecordNames::of(&place).names,
+            vec![
+                (Field::Locality, "横浜市".to_string()),
+                (Field::Locality, "よこはまし".to_string()),
+                (Field::Locality, "yokohama shi".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_name_of_an_area_counts_the_records_in_it() {
+        let mut builder = DictionaryBuilder::default();
+        let context = RecordContext {
+            admin_context: crate::pack::AdminContextTuple {
+                locality_record_id: Some(9),
+                ..Default::default()
+            },
+            flags: 0,
+        };
+        for _ in 0..3 {
+            builder.add(RecordNames::default(), Some(&context));
+        }
+        let names = HashMap::from([(9, vec!["千代田区".to_string(), "Chiyoda".to_string()])]);
+        let dir = std::env::temp_dir().join(format!("og-dictionary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("pack.ogp");
+        let mut pack = ContainerWriter::create(&path).expect("pack");
+        builder.finish(&mut pack, &names).expect("finish");
+        pack.finish().expect("seal");
+        let dictionaries =
+            Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
+        for key in ["千代田区", "chiyoda"] {
+            assert_eq!(
+                dictionaries
+                    .get(Field::Locality, key)
+                    .map(|entry| entry.count),
+                Some(3),
+                "{key}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn records_name_their_streets_areas_and_country() {
         let names = RecordNames::of(&Record::Address(crate::record::AddressRecord {
             address: AddressComponents {
+                areas: vec!["Liberty Village".into()],
                 number: "670".into(),
                 street: Some("King Street West".into()),
                 place: None,
@@ -693,6 +768,7 @@ mod tests {
             vec![
                 (Field::Street, "king street west".to_string()),
                 (Field::Locality, "toronto".to_string()),
+                (Field::Locality, "liberty village".to_string()),
                 (Field::Region, "on".to_string()),
                 (Field::Country, "ca".to_string()),
             ]

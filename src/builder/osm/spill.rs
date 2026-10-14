@@ -244,13 +244,16 @@ fn record_heap_bytes(record: &Record) -> usize {
         Record::Address(record) => address_heap_bytes(&record.address),
         Record::Poi(record) => {
             record.name.len()
+                + strings_heap_bytes(&record.alt_names)
                 + record.category.len()
                 + record.address.as_ref().map_or(0, address_heap_bytes)
         }
         Record::Interpolation(_) => 96,
-        Record::Street(record) => record.name.len(),
+        Record::Street(record) => record.name.len() + strings_heap_bytes(&record.alt_names),
         Record::Postcode(record) => record.postcode.len(),
-        Record::Place(_, record) => record.name.len() + record.place_type.len(),
+        Record::Place(_, record) => {
+            record.name.len() + strings_heap_bytes(&record.alt_names) + record.place_type.len()
+        }
     };
     let positions = match &record.geometry().value {
         GeometryValue::LineString { coordinates } => coordinates.len() * 40,
@@ -274,6 +277,26 @@ fn address_heap_bytes(address: &AddressComponents) -> usize {
         .flatten()
         .map(String::len)
         .sum::<usize>()
+        + strings_heap_bytes(&address.areas)
+}
+
+fn strings_heap_bytes(values: &[String]) -> usize {
+    values.iter().map(|value| value.len() + 24).sum()
+}
+
+fn put_strs(out: &mut Vec<u8>, values: &[String]) {
+    put_u64(out, values.len() as u64);
+    for value in values {
+        put_str(out, value);
+    }
+}
+
+fn get_strings(input: &mut &[u8]) -> Result<Vec<String>> {
+    let count = get_u64(input)?;
+    if count > input.len() as u64 {
+        bail!("spilled string list is truncated");
+    }
+    (0..count).map(|_| get_string(input)).collect()
 }
 
 fn encode_record(out: &mut Vec<u8>, record: &Record) {
@@ -292,6 +315,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
         }
         Record::Poi(record) => {
             put_str(out, &record.name);
+            put_strs(out, &record.alt_names);
             put_str(out, &record.category);
             match &record.address {
                 Some(address) => {
@@ -328,6 +352,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
         }
         Record::Street(record) => {
             put_str(out, &record.name);
+            put_strs(out, &record.alt_names);
             encode_point(out, record.representative_point);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
@@ -339,6 +364,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
         }
         Record::Place(_, record) => {
             put_str(out, &record.name);
+            put_strs(out, &record.alt_names);
             put_str(out, &record.place_type);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
@@ -359,6 +385,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
         }),
         Layer::Poi => Record::Poi(PoiRecord {
             name: get_string(input)?,
+            alt_names: get_strings(input)?,
             category: get_string(input)?,
             address: match get_u8(input)? {
                 0 => None,
@@ -397,6 +424,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
         }
         Layer::Street => Record::Street(StreetRecord {
             name: get_string(input)?,
+            alt_names: get_strings(input)?,
             representative_point: decode_point(input)?,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
@@ -410,6 +438,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
             layer.place_layer().expect("remaining layers are places"),
             PlaceRecord {
                 name: get_string(input)?,
+                alt_names: get_strings(input)?,
                 place_type: get_string(input)?,
                 source: decode_source(input)?,
                 geometry: decode_geometry(input)?,
@@ -431,6 +460,7 @@ fn encode_address(out: &mut Vec<u8>, address: &AddressComponents) {
     ] {
         put_opt_str(out, value.as_deref());
     }
+    put_strs(out, &address.areas);
 }
 
 fn decode_address(input: &mut &[u8]) -> Result<AddressComponents> {
@@ -441,6 +471,7 @@ fn decode_address(input: &mut &[u8]) -> Result<AddressComponents> {
     }
     let [street, place, unit, locality, region, postcode, country] = fields;
     Ok(AddressComponents {
+        areas: get_strings(input)?,
         number,
         street,
         place,
@@ -621,6 +652,7 @@ mod tests {
     #[test]
     fn out_of_range_line_coordinates_are_not_spilled_as_zero() {
         let record = Record::Street(StreetRecord {
+            alt_names: Vec::new(),
             name: "Edge Road".into(),
             geometry: Geometry::new(GeometryValue::LineString {
                 coordinates: vec![vec![-79.0, 43.0].into(), vec![300.0, 43.1].into()],
@@ -668,6 +700,7 @@ mod tests {
         let records = [
             Record::Address(AddressRecord {
                 address: AddressComponents {
+                    areas: Vec::new(),
                     number: "10".into(),
                     street: Some("King Street".into()),
                     place: None,
@@ -682,6 +715,7 @@ mod tests {
                 source: SourceProvenance::osm(OsmObjectType::Way, 12),
             }),
             Record::Street(StreetRecord {
+                alt_names: Vec::new(),
                 name: "King Street".into(),
                 geometry: line.clone(),
                 representative_point: [-79.0, 43.05],
@@ -715,6 +749,7 @@ mod tests {
             Record::Place(
                 PlaceLayer::Neighbourhood,
                 PlaceRecord {
+                    alt_names: Vec::new(),
                     name: "Annex".into(),
                     place_type: "suburb".into(),
                     geometry: point_geometry(-79.4, 43.67),
@@ -722,9 +757,11 @@ mod tests {
                 },
             ),
             Record::Poi(PoiRecord {
+                alt_names: Vec::new(),
                 name: "Tim Hortons".into(),
                 category: "amenity:cafe".into(),
                 address: Some(AddressComponents {
+                    areas: Vec::new(),
                     number: "123".into(),
                     street: Some("King Street West".into()),
                     place: None,
@@ -739,6 +776,7 @@ mod tests {
                 source: SourceProvenance::osm(OsmObjectType::Way, 16),
             }),
             Record::Poi(PoiRecord {
+                alt_names: Vec::new(),
                 name: "Riverdale Farm".into(),
                 category: "tourism:attraction".into(),
                 address: None,

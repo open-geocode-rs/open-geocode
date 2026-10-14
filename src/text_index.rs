@@ -114,7 +114,9 @@ pub struct TextIndexDocument {
     pub content_text: String,
     pub context_text: String,
     pub name: Option<String>,
-    pub street: Option<String>,
+    /// The names of the street (see [`TextIndexFields::street_text`]): a
+    /// street's every name, an address's one.
+    pub streets: Vec<String>,
     pub address_number: Option<String>,
     pub postcode: Option<String>,
     pub autocomplete_subject_text: String,
@@ -313,7 +315,9 @@ impl TextIndexFields {
             document.add_text(self.context_text, &projected.context_text);
         }
         add_text_if_present(&mut document, self.name_text, projected.name.as_deref());
-        add_text_if_present(&mut document, self.street_text, projected.street.as_deref());
+        for street in &projected.streets {
+            add_text_if_present(&mut document, self.street_text, Some(street));
+        }
         // Each value of a list ("12;14") is a house number of its own.
         for number in projected
             .address_number
@@ -408,6 +412,9 @@ impl TextIndexDocument {
     fn project_poi(record_id: RecordId, poi: &PoiRecord) -> ProjectionBuilder {
         let mut builder = ProjectionBuilder::new(record_id, Layer::Poi.as_str());
         builder.name(&poi.name);
+        for name in &poi.alt_names {
+            builder.name(name);
+        }
         builder.add_content_text(&poi.category);
         if let Some(address) = &poi.address {
             builder.also_layer(Layer::Address.as_str());
@@ -432,8 +439,10 @@ impl TextIndexDocument {
 
     fn project_street(record_id: RecordId, street: &StreetRecord) -> ProjectionBuilder {
         let mut builder = ProjectionBuilder::new(record_id, "street");
-        builder.name(&street.name);
-        builder.street(Some(&street.name));
+        for name in std::iter::once(&street.name).chain(&street.alt_names) {
+            builder.name(name);
+            builder.street(Some(name));
+        }
         builder
     }
 
@@ -447,6 +456,9 @@ impl TextIndexDocument {
     fn project_place(record_id: RecordId, layer: &str, place: &PlaceRecord) -> ProjectionBuilder {
         let mut builder = ProjectionBuilder::new(record_id, layer);
         builder.name(&place.name);
+        for name in &place.alt_names {
+            builder.name(name);
+        }
         builder
     }
 }
@@ -624,7 +636,7 @@ impl ProjectionBuilder {
                 content_text: String::new(),
                 context_text: String::new(),
                 name: None,
-                street: None,
+                streets: Vec::new(),
                 address_number: None,
                 postcode: None,
                 autocomplete_subject_text: String::new(),
@@ -654,23 +666,29 @@ impl ProjectionBuilder {
         self.add_content_text(value);
     }
 
-    /// The street or place a house number is on, spelled as
+    /// A name of the street or place a house number is on, spelled as
     /// [`street_search_text`] gives.
     fn street(&mut self, value: Option<&str>) {
-        self.projected.street = value.and_then(street_search_text);
+        if let Some(street) = value.and_then(street_search_text)
+            && !self.projected.streets.contains(&street)
+        {
+            self.projected.streets.push(street);
+        }
     }
 
     fn address(&mut self, address: &AddressComponents) {
-        self.street(address.street.as_deref().or(address.place.as_deref()));
+        self.street(address.subject());
         self.projected.address_number = collapse_whitespace(&address.number);
         self.add_content_text(&address.number);
         self.add_optional_content_text(address.street.as_deref());
         self.add_optional_content_text(address.place.as_deref());
         self.add_optional_content_text(address.unit.as_deref());
         self.add_optional_context_text(address.locality.as_deref());
+        for area in &address.areas {
+            self.add_optional_context_text(Some(area));
+        }
         self.add_optional_context_text(address.region.as_deref());
-        let address_subject = address.street.as_deref().or(address.place.as_deref());
-        self.add_optional_autocomplete_text(address_subject);
+        self.add_optional_autocomplete_text(address.subject());
         self.projected.postcode = self.add_optional_postcode_text(address.postcode.as_deref());
         self.add_optional_context_text(address.country.as_deref());
     }
@@ -1065,6 +1083,7 @@ mod tests {
     fn projects_address_fields_for_search() {
         let record = AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: "221B".to_string(),
                 street: Some("Baker Street".to_string()),
                 place: None,
@@ -1144,6 +1163,7 @@ mod tests {
             source: DerivedSourceProvenance::osm_address_records(2),
         };
         let place = PlaceRecord {
+            alt_names: Vec::new(),
             name: "Toronto".to_string(),
             place_type: "city".to_string(),
             geometry: point_geometry(-79.4, 43.6),
@@ -1174,9 +1194,11 @@ mod tests {
     #[test]
     fn projects_poi_name_category_address_and_context() {
         let poi = PoiRecord {
+            alt_names: Vec::new(),
             name: "Tim Hortons".to_string(),
             category: "amenity:cafe".to_string(),
             address: Some(AddressComponents {
+                areas: Vec::new(),
                 number: "123".to_string(),
                 street: Some("King Street West".to_string()),
                 place: None,
@@ -1204,7 +1226,7 @@ mod tests {
             Some("tim hortons"),
             "the address is its street's, not the name's"
         );
-        assert_eq!(projected.street.as_deref(), Some("king street west"));
+        assert_eq!(projected.streets, vec!["king street west"]);
         assert_eq!(projected.address_number.as_deref(), Some("123"));
         assert_eq!(projected.rank_postcode.as_deref(), Some("m5v1a1"));
         for text in ["tim hortons", "amenity cafe", "king street west"] {
@@ -1221,6 +1243,7 @@ mod tests {
         let plain = PoiRecord {
             name: "Walmer Road Parkette".to_string(),
             address: Some(AddressComponents {
+                areas: Vec::new(),
                 number: "227".to_string(),
                 street: Some("Walmer Road".to_string()),
                 place: None,
@@ -1240,7 +1263,7 @@ mod tests {
         let projected =
             TextIndexDocument::from_record(4, &plain.clone().into(), &["Toronto"], &areas);
         assert_eq!(projected.name.as_deref(), Some("walmer road parkette"));
-        assert_eq!(projected.street.as_deref(), Some("walmer road"));
+        assert_eq!(projected.streets, vec!["walmer road"]);
         assert_eq!(
             projected.rank_postcode.as_deref(),
             Some("m5r2z3"),

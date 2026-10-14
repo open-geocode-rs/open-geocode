@@ -876,6 +876,123 @@ mod tests {
         assert_eq!(build_metrics.scratch, report.scratch);
     }
 
+    /// A ward with names in several scripts, a block scheme address in it
+    /// and a street with an English name.
+    #[test]
+    fn indexes_every_name_and_accepts_block_scheme_addresses() {
+        let dir = temp_dir("ward");
+        let input = dir.join("ward.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 35.67, 139.74, &[]),
+                    node(2, 35.67, 139.78, &[]),
+                    node(3, 35.70, 139.78, &[]),
+                    node(4, 35.70, 139.74, &[]),
+                    node(
+                        10,
+                        35.68,
+                        139.76,
+                        &[
+                            ("addr:province", "東京都"),
+                            ("addr:city", "千代田区"),
+                            ("addr:neighbourhood", "丸の内一丁目"),
+                            ("addr:block_number", "9"),
+                            ("addr:housenumber", "1"),
+                        ],
+                    ),
+                    node(11, 35.685, 139.75, &[]),
+                    node(12, 35.686, 139.751, &[]),
+                ],
+                vec![
+                    way(
+                        500,
+                        &[1, 2, 3, 4, 1],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "8"),
+                            ("name", "千代田区"),
+                            ("name:en", "Chiyoda"),
+                            ("name:ja-Hira", "ちよだく"),
+                            ("name:etymology", "not a name"),
+                        ],
+                    ),
+                    way(
+                        600,
+                        &[11, 12],
+                        &[
+                            ("highway", "primary"),
+                            ("name", "内堀通り"),
+                            ("name:en", "Uchibori-dori"),
+                        ],
+                    ),
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        assert_eq!(report.accepted.by_layer.get("address"), Some(&1));
+        assert_eq!(report.rejected.total, 0);
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let address = reader
+            .find_by_source_id("osm:node:10")
+            .expect("lookup")
+            .expect("block address");
+        let json = reader.record_json(address).expect("json");
+        assert_eq!(json["address"]["number"], "9-1");
+        assert_eq!(
+            json["address"]["areas"],
+            serde_json::json!(["丸の内一丁目"])
+        );
+        assert_eq!(json["address"]["region"], "東京都");
+        let ward = reader
+            .find_by_source_id("osm:way:500")
+            .expect("lookup")
+            .expect("ward");
+        assert_eq!(
+            reader.records().names(ward).expect("names"),
+            vec!["千代田区", "Chiyoda", "ちよだく"]
+        );
+
+        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let first = |query: &str, layer: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.into(),
+                    limit: 1,
+                    layer: Some(layer.into()),
+                })
+                .expect("search")
+                .first()
+                .map(|hit| hit.record.id.clone())
+        };
+        assert_eq!(
+            first("Uchibori-dori", "street").as_deref(),
+            Some("osm:way:600")
+        );
+        assert_eq!(first("Chiyoda", "locality").as_deref(), Some("osm:way:500"));
+        assert_eq!(
+            first("ちよだく", "locality").as_deref(),
+            Some("osm:way:500")
+        );
+
+        let tagger = crate::parse::lattice::LatticeTagger::open(&dir.join("pack")).expect("tagger");
+        let dictionaries = tagger.dictionaries();
+        use crate::parse::lattice::dictionary::Field;
+        for (field, key) in [
+            (Field::Locality, "千代田区"),
+            (Field::Locality, "ちよだく"),
+            (Field::Locality, "chiyoda"),
+            (Field::Locality, "丸の内一丁目"),
+            (Field::Region, "東京都"),
+            (Field::Street, "uchibori dori"),
+        ] {
+            assert!(dictionaries.contains(field, key), "{field:?} {key}");
+        }
+        assert!(!dictionaries.contains(Field::Locality, "not a name"));
+    }
+
     /// The town plus named POIs: one with an address, one without, a station
     /// building, a namesake outside the town, and objects that are not POIs.
     fn town_with_pois() -> Vec<Vec<TestElement>> {

@@ -52,28 +52,56 @@ pub(crate) fn address_record_from_candidate(
     })
 }
 
+/// The areas below the locality an address may state, outermost first.
+const AREA_KEYS: [&str; 3] = ["addr:suburb", "addr:quarter", "addr:neighbourhood"];
+/// The areas that place a house number when no street does: the Japanese
+/// block scheme numbers blocks within a quarter or neighbourhood
+/// (`addr:quarter=八乙女中央`, `addr:neighbourhood=5丁目`,
+/// `addr:block_number=10`, `addr:housenumber=8`).
+const BLOCK_AREA_KEYS: [&str; 2] = ["addr:quarter", "addr:neighbourhood"];
+
 /// The address `addr:*` tags state, if they name a house number and a street
-/// or place.
+/// or place, or a number of the block scheme.
+///
+/// A block scheme address has an `addr:block_number`, or a house number in
+/// an `addr:quarter` or `addr:neighbourhood`, and no street. Its number is
+/// the block and house numbers joined as they are written, `10-8`, or the
+/// one of them it has, and its areas say where the block is.
 pub(crate) fn address_components(
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<AddressComponents, CandidateIssue> {
-    let house_number = tags
-        .cleaned("addr:housenumber")
-        .ok_or(CandidateIssue::MissingHouseNumber)?;
+    let house_number = tags.cleaned("addr:housenumber");
+    let block_number = tags.cleaned("addr:block_number");
     let street = tags.cleaned("addr:street");
     let place = tags.cleaned("addr:place");
-
-    if street.is_none() && place.is_none() {
+    let block_scheme =
+        block_number.is_some() || BLOCK_AREA_KEYS.into_iter().any(|key| tags.has(key));
+    let number = match (block_number, house_number) {
+        (Some(block), Some(house)) => format!("{block}-{house}"),
+        (Some(block), None) => block,
+        (None, Some(house)) => house,
+        (None, None) => return Err(CandidateIssue::MissingHouseNumber),
+    };
+    if street.is_none() && place.is_none() && !block_scheme {
         return Err(CandidateIssue::MissingStreetOrPlace);
+    }
+    let mut areas = Vec::new();
+    for area in AREA_KEYS.into_iter().filter_map(|key| tags.cleaned(key)) {
+        if !areas.contains(&area) {
+            areas.push(area);
+        }
     }
 
     Ok(AddressComponents {
-        number: house_number,
+        number,
         street,
         place,
         unit: tags.cleaned("addr:unit"),
         locality: tags.cleaned("addr:city"),
-        region: tags.cleaned("addr:state"),
+        areas,
+        region: tags
+            .cleaned("addr:state")
+            .or_else(|| tags.cleaned("addr:province")),
         postcode: tags.cleaned("addr:postcode"),
         country: tags.cleaned("addr:country"),
     })
@@ -101,13 +129,7 @@ pub(crate) fn collect_addr_tags_from_map(
 pub(crate) fn validate_address_tags(
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<(), CandidateIssue> {
-    if !tags.has("addr:housenumber") {
-        return Err(CandidateIssue::MissingHouseNumber);
-    }
-    if !tags.has("addr:street") && !tags.has("addr:place") {
-        return Err(CandidateIssue::MissingStreetOrPlace);
-    }
-    Ok(())
+    address_components(tags).map(|_| ())
 }
 
 #[cfg(test)]
@@ -166,6 +188,54 @@ mod tests {
         assert_eq!(
             address_record_from_candidate(&candidate(&[("addr:housenumber", "10")])),
             Err(CandidateIssue::MissingStreetOrPlace)
+        );
+    }
+
+    #[test]
+    fn accepts_block_scheme_addresses_without_a_street() {
+        let record = address_record_from_candidate(&candidate(&[
+            ("addr:province", "宮城県"),
+            ("addr:city", "仙台市"),
+            ("addr:suburb", "泉区"),
+            ("addr:quarter", "八乙女中央"),
+            ("addr:neighbourhood", "5丁目"),
+            ("addr:block_number", "10"),
+            ("addr:housenumber", "8"),
+        ]))
+        .expect("block address");
+        let address = &record.address;
+        assert_eq!(address.number, "10-8");
+        assert_eq!(address.street, None);
+        assert_eq!(address.areas, vec!["泉区", "八乙女中央", "5丁目"]);
+        assert_eq!(address.locality.as_deref(), Some("仙台市"));
+        assert_eq!(address.region.as_deref(), Some("宮城県"));
+        assert_eq!(record.name(), "10-8 5丁目");
+
+        // A block with no house number is numbered by the block.
+        let block = address_record_from_candidate(&candidate(&[
+            ("addr:neighbourhood", "遠藤"),
+            ("addr:block_number", "4262"),
+        ]))
+        .expect("block number only");
+        assert_eq!(block.address.number, "4262");
+        // A house number in a quarter.
+        let quarter = address_record_from_candidate(&candidate(&[
+            ("addr:quarter", "中荻野"),
+            ("addr:housenumber", "1"),
+        ]))
+        .expect("quarter");
+        assert_eq!(quarter.address.number, "1");
+        // A suburb alone places no house number.
+        assert_eq!(
+            address_record_from_candidate(&candidate(&[
+                ("addr:suburb", "泉区"),
+                ("addr:housenumber", "1"),
+            ])),
+            Err(CandidateIssue::MissingStreetOrPlace)
+        );
+        assert_eq!(
+            address_record_from_candidate(&candidate(&[("addr:quarter", "中荻野")])),
+            Err(CandidateIssue::MissingHouseNumber)
         );
     }
 
