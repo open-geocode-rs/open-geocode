@@ -36,6 +36,11 @@ tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
+[features]
+# The lattice parser's tagger in `parse-bench --tagger lattice`; needs
+# `src/parse/lattice.rs`.
+lattice = []
+
 [dev-dependencies]
 # Used only by the in-crate router tests to drive the Router via `oneshot`.
 tower = { version = "0.5", features = ["util"] }

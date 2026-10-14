@@ -1384,19 +1384,19 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
 /// and words after the street with digits ("fl36") only rank (see
 /// [`PackTextSearcher::build_query`]).
 #[derive(Debug, Default, PartialEq)]
-struct QueryPlan {
+pub(crate) struct QueryPlan {
     /// The leading required word when it reads as a house number ("670",
     /// "221b", "993_5") and other required words follow.
-    house_number: Option<HouseNumber>,
-    required: Vec<String>,
-    optional: Vec<String>,
+    pub(crate) house_number: Option<HouseNumber>,
+    pub(crate) required: Vec<String>,
+    pub(crate) optional: Vec<String>,
     /// The words of each part after the subject, in order.
-    context: Vec<Vec<String>>,
+    pub(crate) context: Vec<Vec<String>>,
 }
 
 impl QueryPlan {
     /// Plan a normalized query whose parts are separated by commas.
-    fn parse(query: &str) -> Option<Self> {
+    pub(crate) fn parse(query: &str) -> Option<Self> {
         let parts = query
             .split(',')
             .map(|part| part.split_whitespace().collect::<Vec<_>>())
@@ -1486,8 +1486,8 @@ impl QueryPlan {
 
 /// A house number as the address number field indexes it ("407a", "993 5").
 #[derive(Debug, Clone, PartialEq)]
-struct HouseNumber {
-    text: String,
+pub(crate) struct HouseNumber {
+    pub(crate) text: String,
     /// The number it starts with.
     base: u32,
 }
@@ -1519,7 +1519,7 @@ impl HouseNumber {
 
 /// A context part with a digit names a postcode ("M6G 1B8", "SW1A", "10115"),
 /// not a locality.
-fn is_postcode_part(part: &[String]) -> bool {
+pub(crate) fn is_postcode_part(part: &[String]) -> bool {
     part.iter()
         .any(|word| word.chars().any(|character| character.is_ascii_digit()))
 }
@@ -1528,7 +1528,7 @@ fn is_postcode_part(part: &[String]) -> bool {
 /// value has no digit ("unit b", "suite b"). The short designators "ste",
 /// "fl" and "rm" also abbreviate place names (Sainte, Florida), so only they
 /// need a digit to be read as a unit.
-fn is_unit_part<T: AsRef<str>>(words: &[T]) -> bool {
+pub(crate) fn is_unit_part<T: AsRef<str>>(words: &[T]) -> bool {
     let [designator, value] = words else {
         return false;
     };
@@ -1539,7 +1539,7 @@ fn is_unit_part<T: AsRef<str>>(words: &[T]) -> bool {
 
 /// Words that identify a place, and unit text: a unit designator followed by
 /// a value with a digit ("unit 602", "suite 4b").
-fn split_unit_words(words: &[&str]) -> (Vec<String>, Vec<String>) {
+pub(crate) fn split_unit_words(words: &[&str]) -> (Vec<String>, Vec<String>) {
     let mut identifying = Vec::new();
     let mut unit = Vec::new();
     let mut index = 0;
@@ -1561,7 +1561,7 @@ fn split_unit_words(words: &[&str]) -> (Vec<String>, Vec<String>) {
 
 /// The query as the index spells it (normalized, abbreviations expanded),
 /// then without unit text, each keeping its comma-separated parts.
-fn search_query_variants(query_text: &str) -> Vec<String> {
+pub(crate) fn search_query_variants(query_text: &str) -> Vec<String> {
     let Some(expanded) = map_query_parts(query_text, |part| {
         let (number, rest) = join_fractional_house_number(part);
         let rest = normalize_index_text(rest).map(|rest| expand_address_abbreviations(&rest));
@@ -1662,7 +1662,7 @@ fn strip_unit_terms(value: &str) -> Option<String> {
     (!stripped.is_empty()).then_some(stripped)
 }
 
-fn is_unit_designator(token: &str) -> bool {
+pub(crate) fn is_unit_designator(token: &str) -> bool {
     matches!(
         token,
         "apt"
@@ -1681,7 +1681,7 @@ fn is_unit_designator(token: &str) -> bool {
     )
 }
 
-fn is_unit_value_token(token: &str) -> bool {
+pub(crate) fn is_unit_value_token(token: &str) -> bool {
     token.chars().any(|character| character.is_ascii_digit())
 }
 
