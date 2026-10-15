@@ -1,0 +1,53 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.01,
+          43.0005
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "interpolated",
+        "address": {
+          "housenumber": "50",
+          "locality": "Toronto",
+          "street": "Queen Street"
+        },
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:way:13:interp:2-98",
+        "label": "50 Queen Street, Toronto",
+        "layer": "interpolation",
+        "name": "50 Queen Street",
+        "record_id": 6,
+        "score": 2.3705626,
+        "source": {
+          "dataset": "osm",
+          "object_id": 13,
+          "object_type": "way"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "query": "50 Queen Street",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

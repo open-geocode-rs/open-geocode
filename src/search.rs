@@ -21,6 +21,7 @@ use tantivy::{
 };
 
 use crate::{
+    api::Address,
     labels,
     pack::{PackReader, RecordId, RecordPoint, RecordPointPrecision, RecordSource, RecordSummary},
     parse::{
@@ -898,6 +899,13 @@ impl PackTextSearcher {
         if let Some(label) = labels::estimated_address_label(number, &interpolation.address) {
             record.label = label;
         }
+        if let Some(name) = labels::estimated_address_name(number, &interpolation.address) {
+            record.name = name;
+        }
+        record.address = Address {
+            housenumber: Some(number.to_string()),
+            ..Address::from(&interpolation.address)
+        };
         Ok(true)
     }
 
@@ -1116,7 +1124,9 @@ impl PackTextSearcher {
             record: RecordSummary {
                 id: labels::estimated_address_id(number, &id(low)?, &id(high)?),
                 layer: Layer::Address.as_str().to_string(),
+                name: labels::address_name(&address),
                 label: labels::address_label(&address),
+                address: Address::from(&address),
                 category: None,
                 point: Some(RecordPoint {
                     lon,

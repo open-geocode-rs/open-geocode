@@ -1,13 +1,20 @@
-import { API_BASE, createDemoMap, escapeHtml, icon, spinner, syncZoomControls } from "./shared.js";
+import {
+  API_BASE,
+  createDemoMap,
+  escapeHtml,
+  featurePoint,
+  featureRowHtml,
+  icon,
+  spinner,
+  syncZoomControls,
+} from "./shared.js";
 
 const AUTOCOMPLETE = {
   endpoint: "autocomplete",
-  field: "suggestions",
   emptyLabel: "No address suggestions",
 };
 const FORWARD_SEARCH = {
   endpoint: "search",
-  field: "results",
   emptyLabel: "No address results",
 };
 
@@ -197,7 +204,7 @@ async function runAddressQuery(query, mode) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error("Address search unavailable");
-    renderAddressSuggestions(payload[mode.field] ?? [], mode.emptyLabel);
+    renderAddressSuggestions(payload.features ?? [], mode.emptyLabel);
   } catch (error) {
     if (error.name === "AbortError") return;
     resultsList.replaceChildren();
@@ -211,11 +218,10 @@ async function runAddressQuery(query, mode) {
   }
 }
 
-function renderAddressSuggestions(results, emptyLabel) {
-  const pointResults = results.filter((result) => result.point);
+function renderAddressSuggestions(features, emptyLabel) {
   resultsList.replaceChildren();
 
-  if (pointResults.length === 0) {
+  if (features.length === 0) {
     resultsGroup.hidden = true;
     setStatus(emptyLabel);
     return;
@@ -223,42 +229,33 @@ function renderAddressSuggestions(results, emptyLabel) {
 
   setStatus("");
   resultsGroup.hidden = false;
-  for (const result of pointResults) {
-    resultsList.appendChild(makeAddressRow(result));
+  for (const feature of features) {
+    resultsList.appendChild(makeAddressRow(feature));
   }
 }
 
-function makeAddressRow(address) {
+function makeAddressRow(feature) {
   const item = document.createElement("li");
   const button = document.createElement("button");
   button.className = "command-item address-item";
   button.type = "button";
   button.setAttribute("role", "option");
-  button.innerHTML = `
-    <span class="command-item-icon result-pin" aria-hidden="true">
-      ${icon("map-pin", "command-item-svg")}
-    </span>
-    <span class="command-item-content">
-      <span class="command-item-label">${escapeHtml(address.label)}</span>
-    </span>
-  `;
-  button.addEventListener("click", () => selectAddress(address));
+  button.innerHTML = featureRowHtml(feature);
+  button.addEventListener("click", () => selectAddress(feature));
   item.appendChild(button);
   return item;
 }
 
-function selectAddress(address) {
-  if (!address.point) return;
-
+function selectAddress(feature) {
   window.clearTimeout(addressDebounce);
   currentAddressSearch?.abort();
   setAddressLoading(false);
   selectedAddress = {
-    label: address.label,
-    point: address.point,
+    label: feature.properties.label,
+    point: featurePoint(feature),
   };
   selectedStoreId = null;
-  locatorInput.value = address.label;
+  locatorInput.value = selectedAddress.label;
   clearLocator.hidden = false;
   renderStores(stores, selectedAddress);
   fitStores(stores, 350);

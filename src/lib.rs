@@ -1,8 +1,11 @@
+pub mod api;
 pub mod batch;
 pub mod bench;
 pub mod builder;
 pub mod container;
 pub mod context;
+#[cfg(test)]
+mod contract_tests;
 pub mod extsort;
 pub mod geocode_bench;
 mod http;

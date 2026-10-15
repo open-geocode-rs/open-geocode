@@ -1,21 +1,23 @@
 import {
   API_BASE,
+  accuracyClass,
   createDemoMap,
   emptyFeatureCollection,
   escapeHtml,
+  featurePoint,
+  featureRowHtml,
   icon,
   spinner,
   syncZoomControls,
 } from "./shared.js";
 
-// Forward search and autocomplete are the same request flow; they differ
-// only in endpoint, the response field, and how results fit the map.
+// Forward search and autocomplete are the same request flow and the same
+// answer; they differ only in endpoint and how results fit the map.
 const AUTOCOMPLETE = {
   endpoint: "autocomplete",
-  field: "suggestions",
   options: { emptyLabel: "No suggestions", fitMap: false },
 };
-const FORWARD_SEARCH = { endpoint: "search", field: "results", options: {} };
+const FORWARD_SEARCH = { endpoint: "search", options: {} };
 
 const searchForm = document.querySelector("#search-form");
 const searchIcon = document.querySelector("#search-icon");
@@ -184,7 +186,7 @@ async function runQuery(query, mode) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error("Search unavailable");
-    renderResults(payload[mode.field] ?? [], mode.options);
+    renderResults(payload.features ?? [], mode.options);
   } catch (error) {
     if (error.name === "AbortError") return;
     clearMapResults();
@@ -199,14 +201,13 @@ async function runQuery(query, mode) {
   }
 }
 
-function renderResults(results, options = {}) {
+function renderResults(features, options = {}) {
   const emptyLabel = options.emptyLabel ?? "No results";
   const fitMap = options.fitMap ?? true;
   resultsList.replaceChildren();
   clearMapResults();
 
-  const pointResults = results.filter((result) => result.point);
-  if (results.length === 0) {
+  if (features.length === 0) {
     resultsGroup.hidden = true;
     resultsList.hidden = true;
     setStatus(emptyLabel);
@@ -218,63 +219,47 @@ function renderResults(results, options = {}) {
   resultsList.hidden = false;
   collapsedResults = false;
 
-  for (const result of results) {
+  for (const feature of features) {
     const item = document.createElement("li");
     const button = document.createElement("button");
     button.className = "command-item";
     button.type = "button";
     button.setAttribute("role", "option");
-    button.innerHTML = `
-      <span class="command-item-icon result-pin" aria-hidden="true">
-        ${icon("map-pin", "command-item-svg")}
-      </span>
-      <span class="command-item-content">
-        <span class="command-item-label">${escapeHtml(result.label)}</span>
-      </span>
-    `;
-    button.addEventListener("click", () => selectResult(result));
+    button.innerHTML = featureRowHtml(feature);
+    button.addEventListener("click", () => selectResult(feature));
     item.appendChild(button);
     resultsList.appendChild(item);
 
-    if (result.point) {
-      const marker = makeResultMarker(result).addTo(map);
-      searchMarkers.push(marker);
-      markerById.set(result.record_id, marker);
-    }
+    const marker = makeResultMarker(feature).addTo(map);
+    searchMarkers.push(marker);
+    markerById.set(feature.properties.record_id, marker);
   }
 
   if (!fitMap) {
     return;
   }
 
-  if (pointResults.length === 1) {
-    const { lat, lon } = pointResults[0].point;
+  if (features.length === 1) {
+    const { lat, lon } = featurePoint(features[0]);
     map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), 15), duration: 0.35 * 1000 });
-  } else if (pointResults.length > 1) {
+  } else {
     const bounds = new maplibregl.LngLatBounds();
-    for (const result of pointResults) {
-      bounds.extend([result.point.lon, result.point.lat]);
+    for (const feature of features) {
+      bounds.extend(feature.geometry.coordinates);
     }
     map.fitBounds(bounds, { padding: 42, maxZoom: 13, duration: 350 });
   }
 }
 
-function makeResultMarker(result) {
-  const { lat, lon, precision } = result.point;
-  const modifier =
-    precision === "representative_point"
-      ? "is-representative"
-      : precision === "centroid"
-        ? "is-centroid"
-        : "is-point";
+function makeResultMarker(feature) {
   const element = document.createElement("div");
-  element.className = `result-pin-marker ${modifier}`;
-  const marker = new maplibregl.Marker({ element }).setLngLat([lon, lat]);
+  element.className = `result-pin-marker ${accuracyClass(feature.properties.accuracy)}`;
+  const marker = new maplibregl.Marker({ element }).setLngLat(feature.geometry.coordinates);
   const popup = new maplibregl.Popup({
     offset: 12,
     closeButton: false,
     maxWidth: "280px",
-  }).setHTML(searchPopup(result.label));
+  }).setHTML(searchPopup(feature.properties.label));
   marker.setPopup(popup);
   return marker;
 }
@@ -342,11 +327,13 @@ function hideReverseCoords() {
 }
 
 function renderReverse(payload, lngLat, origin) {
-  const result = payload.result;
+  // The answers run precise to broad: the first is the address, street or
+  // area the point is at, the rest the areas around it.
+  const feature = payload.features?.[0];
   const popup = origin.getPopup();
   // Clicked coordinates are shown regardless of whether an address was found.
   showReverseCoords(lngLat.lat, lngLat.lng);
-  if (!result) {
+  if (!feature) {
     reversePanel.hidden = false;
     reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
     reverseLabel.textContent = "No address found";
@@ -356,28 +343,23 @@ function renderReverse(payload, lngLat, origin) {
 
   reversePanel.hidden = false;
   reverseIcon.innerHTML = icon("map-pin", "command-item-svg");
-  reverseLabel.textContent = result.label;
-  popup.setHTML(reversePopup(result.label));
+  reverseLabel.textContent = feature.properties.label;
+  popup.setHTML(reversePopup(feature.properties.label));
 
-  if (result.point) {
-    const target = makeReverseTargetMarker(result).addTo(map);
-    reverseMarkers.push(target);
+  const target = makeReverseTargetMarker(feature).addTo(map);
+  reverseMarkers.push(target);
 
-    const movedFarEnough =
-      Math.abs(result.point.lon - lngLat.lng) > 1e-6 || Math.abs(result.point.lat - lngLat.lat) > 1e-6;
-    if (movedFarEnough) {
-      map.getSource("reverse-line")?.setData({
-        type: "Feature",
-        properties: {},
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [lngLat.lng, lngLat.lat],
-            [result.point.lon, result.point.lat],
-          ],
-        },
-      });
-    }
+  const point = featurePoint(feature);
+  const movedFarEnough = Math.abs(point.lon - lngLat.lng) > 1e-6 || Math.abs(point.lat - lngLat.lat) > 1e-6;
+  if (movedFarEnough) {
+    map.getSource("reverse-line")?.setData({
+      type: "Feature",
+      properties: {},
+      geometry: {
+        type: "LineString",
+        coordinates: [[lngLat.lng, lngLat.lat], feature.geometry.coordinates],
+      },
+    });
   }
 }
 
@@ -399,10 +381,10 @@ function makeReverseOriginMarker(lngLat) {
   return new maplibregl.Marker({ element, anchor: "bottom" }).setLngLat(lngLat);
 }
 
-function makeReverseTargetMarker(result) {
+function makeReverseTargetMarker(feature) {
   const element = document.createElement("div");
   element.className = "reverse-target-marker";
-  return new maplibregl.Marker({ element }).setLngLat([result.point.lon, result.point.lat]);
+  return new maplibregl.Marker({ element }).setLngLat(feature.geometry.coordinates);
 }
 
 function reversePopup(title) {
@@ -423,22 +405,20 @@ function searchPopup(title) {
   </div>`;
 }
 
-function selectResult(result) {
-  searchInput.value = result.label;
+function selectResult(feature) {
+  searchInput.value = feature.properties.label;
   clearSearch.hidden = false;
   // Collapse the list down to just the selected place; the X button
   // brings the previous list back.
   resultsGroup.hidden = true;
   resultsList.hidden = true;
   collapsedResults = true;
-  if (result.point) {
-    map.flyTo({
-      center: [result.point.lon, result.point.lat],
-      zoom: Math.max(map.getZoom(), 16),
-      duration: 0.45 * 1000,
-    });
-  }
-  const marker = markerById.get(result.record_id);
+  map.flyTo({
+    center: feature.geometry.coordinates,
+    zoom: Math.max(map.getZoom(), 16),
+    duration: 0.45 * 1000,
+  });
+  const marker = markerById.get(feature.properties.record_id);
   const popup = marker?.getPopup();
   if (marker && popup && !popup.isOpen()) {
     marker.togglePopup();

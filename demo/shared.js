@@ -21,6 +21,58 @@ const PMTILES_URL = cfg.pmtilesUrl;
 
 export const emptyFeatureCollection = { type: "FeatureCollection", features: [] };
 
+// Every API answer is a GeoJSON FeatureCollection (ADR 0022). These read one
+// of its features.
+export function featurePoint(feature) {
+  const [lon, lat] = feature.geometry.coordinates;
+  return { lon, lat };
+}
+
+// A result row's two lines: the thing itself, then where it is. The label
+// leads with the name where it can; a street or place labelled by its name
+// alone is placed by the areas it lies in.
+export function featureLines(feature) {
+  const { name, label, context = {} } = feature.properties;
+  if (label.startsWith(`${name}, `)) {
+    return { title: name, subtitle: label.slice(name.length + 2) };
+  }
+  if (label !== name) {
+    return { title: label, subtitle: "" };
+  }
+  const areas = ["neighbourhood", "locality", "district", "region", "country"]
+    .map((level) => context[level]?.name)
+    .filter((area) => area && area !== name);
+  return { title: name, subtitle: [...new Set(areas)].join(", ") };
+}
+
+// Marker style by how the point relates to the thing: a point on it, a point
+// on its street, or the middle of an area.
+export function accuracyClass(accuracy) {
+  switch (accuracy) {
+    case "rooftop":
+    case "interpolated":
+      return "is-point";
+    case "street":
+      return "is-street";
+    default:
+      return "is-area";
+  }
+}
+
+// A command-list row for a feature: its pin, title and subtitle.
+export function featureRowHtml(feature) {
+  const { title, subtitle } = featureLines(feature);
+  return `
+    <span class="command-item-icon result-pin" aria-hidden="true">
+      ${icon("map-pin", "command-item-svg")}
+    </span>
+    <span class="command-item-content">
+      <span class="command-item-label">${escapeHtml(title)}</span>
+      ${subtitle ? `<span class="command-item-sub">${escapeHtml(subtitle)}</span>` : ""}
+    </span>
+  `;
+}
+
 // Ontario-only demo: lock the map to the province so users can't pan or zoom
 // out to areas the pack has no data for.
 export const ontarioBounds = [
