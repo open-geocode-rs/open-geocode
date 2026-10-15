@@ -1,0 +1,76 @@
+# libpostal resources/dictionaries/*/{staircases}.txt (MIT)
+# bg
+стълбище
+stŭlbishte|stulbishte
+# bs
+stubište|stubiste
+# ca
+escala|esc
+# cs
+schodiště|schodiste
+# da
+stiege|stg
+trappe
+# de
+stiege|stg
+treppe
+# el
+σκάλα|σκαλα
+skála|skala
+# en
+stair
+staircase
+stairway
+# es
+escalera|esc|esca
+escalinata|escal|escalin
+# et
+trepikoda
+# eu
+eskailera|eskra
+# fi
+portaikko
+# fr
+escalier|esc
+# hr
+stubište|stubiste
+# is
+stigi
+# it
+scala
+# lt
+laiptai
+# lv
+kāpņu|kapnu
+kāpņu telpa|kapnu telpa
+# nb
+stiege|stg
+trapp
+# nl
+stiege|stg
+trap
+# pl
+schody
+# pt
+escadaria|esc|esca
+# ro
+scara|sc
+# ru
+лестница
+lestnitsa
+# sk
+schodisko
+# sl
+stopnišče|stopnisce
+# sr
+степениште
+stepenište|stepeniste
+# sv
+uppgång|uppgaang|uppgang
+uppgång höger|uh|u.h|u h|uppgaang hoger|uppgang hoger
+uppgång vänster|uv|u.v|u v|uppgaang vanster|uppgang vanster
+# tr
+merdiven
+# uk
+сходи
+skhody

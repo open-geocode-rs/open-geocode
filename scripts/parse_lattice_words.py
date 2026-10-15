@@ -16,6 +16,9 @@ Writes under src/parse/lattice/data/:
   side.
 - LICENSE-unicode.txt: the Unicode licence.
 
+The numeral table and its licence are only regenerated when --unihan is
+given.
+
 Every upstream file is read as data only. Usage:
 
     python -I scripts/parse_lattice_words.py \\
@@ -44,6 +47,13 @@ LISTS = {
     "street_types": ["street_types"],
     "directionals": ["directionals"],
     "qualifiers": ["qualifiers"],
+    "staircases": ["staircases"],
+    "entrances": ["entrances"],
+    "near": ["near"],
+    "concatenated_suffixes": [
+        "concatenated_suffixes_separable",
+        "concatenated_suffixes_inseparable",
+    ],
 }
 
 BRACKETED = re.compile(r"^\s*[\(（\[].*[\)）\]]\s*$")
@@ -85,8 +95,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dictionaries", required=True)
     parser.add_argument("--libpostal-license", required=True)
-    parser.add_argument("--unihan", required=True)
-    parser.add_argument("--unicode-license", required=True)
+    parser.add_argument("--unihan", help="regenerate numerals.tsv from this file")
+    parser.add_argument("--unicode-license")
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
     os.makedirs(os.path.join(args.out_dir, "libpostal"), exist_ok=True)
@@ -110,6 +120,8 @@ def main():
                     for row in dict.fromkeys(rows):
                         out.write(row + "\n")
     copy(args.libpostal_license, os.path.join(args.out_dir, "LICENSE-libpostal.txt"))
+    if not args.unihan:
+        return
     copy(args.unicode_license, os.path.join(args.out_dir, "LICENSE-unicode.txt"))
     with open(os.path.join(args.out_dir, "numerals.tsv"), "w", encoding="utf-8", newline="\n") as out:
         for character, value in numerals(args.unihan):
