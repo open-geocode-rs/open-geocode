@@ -20,6 +20,7 @@
 //! Pack, the postcode patterns and address templates are vendored data, and
 //! the weights are learned from the Pack's own records (see [`train`]).
 
+mod abbreviations;
 mod decode;
 pub mod dictionary;
 mod features;
@@ -651,14 +652,19 @@ impl LatticeTagger {
     }
 
     /// Whether `path` reads its query as one address can be written: each
-    /// of the country, the region and the postcode is one field at most, a
+    /// of the country, the region, the district and the postcode is one field at most, a
     /// house number has a number, and the places it names that the Pack
     /// knows are each named once and lie one in another (a ward in its city,
     /// the city in its region), so no admin level is named twice.
     /// The model scores parts of a labelling; this holds of the whole.
     fn is_one_address(&self, lattice: &Lattice, path: &decode::Path) -> bool {
         let labels = path.labels(lattice);
-        for label in [Label::Country, Label::Region, Label::Postcode] {
+        for label in [
+            Label::Country,
+            Label::Region,
+            Label::District,
+            Label::Postcode,
+        ] {
             let fields = labels
                 .iter()
                 .enumerate()
@@ -687,7 +693,7 @@ impl LatticeTagger {
             .filter(|segment| {
                 matches!(
                     segment.label,
-                    Label::Locality | Label::Region | Label::Country
+                    Label::Locality | Label::District | Label::Region | Label::Country
                 )
             })
             .filter_map(|segment| {
@@ -745,6 +751,13 @@ impl LatticeTagger {
                     set.phrase(kinds);
                 }
                 set.phrase_neighbours(phrases.ending[start], phrases.starting[end]);
+                if end - start == 1
+                    && !infos[start].unspaced
+                    && let Some(field) = self.glued_phrase(&tokens.words[start])
+                {
+                    evidence = true;
+                    set.glued_phrase(field);
+                }
                 let mut key = SpanKey::new(units.key(start, end), &infos[start..end]);
                 // A word's affixes: of a token, or of glued units as one.
                 let glued = end - start > 1 && units.unspaced(start, end);
@@ -856,6 +869,31 @@ impl LatticeTagger {
         lattice
     }
 
+    /// The vocabulary a token glues to its number: "4og" is a floor, "apt4"
+    /// a unit. The token is one run of digits and one of letters, either way
+    /// round, and the letters a unit, PO box or level phrase.
+    fn glued_phrase(&self, word: &str) -> Option<Field> {
+        let split = word
+            .char_indices()
+            .skip(1)
+            .find(|(index, character)| {
+                let previous = word[..*index].chars().next_back().expect("a character");
+                previous.is_numeric() != character.is_numeric()
+            })
+            .map(|(index, _)| index)?;
+        let (head, tail) = word.split_at(split);
+        let numeric = |part: &str| part.chars().all(char::is_numeric);
+        let letters = |part: &str| part.chars().all(char::is_alphabetic);
+        let phrase = match (numeric(head), numeric(tail)) {
+            (true, false) if letters(tail) => tail,
+            (false, true) if letters(head) => head,
+            _ => return None,
+        };
+        [Field::Level, Field::Unit, Field::PoBox]
+            .into_iter()
+            .find(|field| self.dictionaries.contains(*field, phrase))
+    }
+
     /// The best hit of `key` in `field`: exact, as written or with its
     /// abbreviations expanded the way the text index expands them, else the
     /// nearest name the key's fuzzy automaton accepts.
@@ -863,6 +901,7 @@ impl LatticeTagger {
         let exact = [Some(&key.key), Some(&key.expanded), key.masked.as_ref()]
             .into_iter()
             .flatten()
+            .chain(&key.spellings)
             .filter_map(|key| self.dictionaries.get(field, key))
             .max_by_key(|entry| entry.count);
         if let Some(entry) = exact {
@@ -1042,6 +1081,9 @@ struct SpanKey {
     /// The key with its numerals masked ([`mask_numerals`]), which names
     /// the numbered areas of a kind the Pack holds many of.
     masked: Option<String>,
+    /// The key with its street types and directions in their other forms,
+    /// in every language ([`abbreviations::Abbreviations::spellings`]).
+    spellings: Vec<String>,
     /// Whether the span may be a typo of a name: it is at least
     /// [`MIN_FUZZY_CHARS`] long, has no digit, not every word of it is a
     /// known word, and it is not of a script written without spaces. A house
@@ -1067,6 +1109,7 @@ impl SpanKey {
         Self {
             tokens: expanded.split(' ').count(),
             masked: mask_numerals(&key),
+            spellings: abbreviations::abbreviations().spellings(&key),
             key,
             expanded,
             fuzzy,

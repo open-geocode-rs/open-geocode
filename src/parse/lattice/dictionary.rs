@@ -48,7 +48,7 @@ use crate::{
 };
 
 /// Format version of every `parse/` dictionary section.
-pub const DICTIONARY_VERSION: u32 = 3;
+pub const DICTIONARY_VERSION: u32 = 4;
 /// The Pack section mapping each area name's key to where its areas are
 /// listed in [`AREA_IDS_SECTION`].
 pub const AREAS_SECTION: &str = "parse/areas";
@@ -63,6 +63,9 @@ const MAX_AREAS_PER_NAME: usize = 64;
 /// Bits of an FST value that hold the count; the country code sits above.
 const COUNT_BITS: u32 = 40;
 const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
+/// The lowest bit of an FST value that holds the admin levels, above the
+/// country code.
+const LEVELS_SHIFT: u32 = 56;
 /// A word that starts or ends at least this share of the Pack's street names
 /// is a street type ("street", "rue", "chemin")...
 const STREET_TYPE_SHARE: f64 = 0.002;
@@ -87,6 +90,12 @@ const LIBPOSTAL_LEVEL_TYPES: &str = include_str!("data/libpostal/level_types.txt
 const LIBPOSTAL_BUILDING_TYPES: &str = include_str!("data/libpostal/building_types.txt");
 const LIBPOSTAL_STREET_TYPES: &str = include_str!("data/libpostal/street_types.txt");
 const LIBPOSTAL_DIRECTIONALS: &str = include_str!("data/libpostal/directionals.txt");
+/// Words of a staircase or an entrance ("stiege", "eingang"), which libpostal
+/// labels as parts of a unit.
+const LIBPOSTAL_STAIRCASES: &str = include_str!("data/libpostal/staircases.txt");
+const LIBPOSTAL_ENTRANCES: &str = include_str!("data/libpostal/entrances.txt");
+/// Words that ask for what is near a place ("near", "in der nähe von").
+const LIBPOSTAL_NEAR: &str = include_str!("data/libpostal/near.txt");
 /// libpostal's qualifiers: words that say what kind of place a name is, its
 /// admin type words among them ("県", "bezirk", "township").
 const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/libpostal/qualifiers.txt");
@@ -99,7 +108,7 @@ const ADMIN_TYPES: &str = include_str!("data/admin_types.txt");
 const MIN_NUMBERED_NAMES: usize = 5;
 
 /// The admin levels a name is used at, one bit each.
-mod level {
+pub(super) mod level {
     pub const COUNTRY: u8 = 1;
     pub const REGION: u8 = 1 << 1;
     pub const DISTRICT: u8 = 1 << 2;
@@ -140,10 +149,13 @@ pub enum Field {
     Building,
     /// Compass directions ("north", "nw"), from libpostal.
     Directional,
+    /// Words that ask for what is near a place ("near", "in der nähe"),
+    /// from libpostal.
+    Near,
 }
 
 impl Field {
-    pub const ALL: [Field; 12] = [
+    pub const ALL: [Field; 13] = [
         Field::Locality,
         Field::Region,
         Field::Street,
@@ -156,6 +168,7 @@ impl Field {
         Field::Level,
         Field::Building,
         Field::Directional,
+        Field::Near,
     ];
     /// The fields of names that a whole span of a query can be.
     pub const NAMES: [Field; 5] = [
@@ -169,13 +182,14 @@ impl Field {
     pub const AREAS: [Field; 3] = [Field::Locality, Field::Region, Field::Country];
     /// The fields of vocabulary phrases a span of a query can be: words
     /// that say what the words beside them are.
-    pub const PHRASES: [Field; 6] = [
+    pub const PHRASES: [Field; 7] = [
         Field::Unit,
         Field::PoBox,
         Field::Level,
         Field::Building,
         Field::StreetType,
         Field::Directional,
+        Field::Near,
     ];
 
     /// The Pack section that holds the field.
@@ -193,6 +207,7 @@ impl Field {
             Field::Level => "parse/level",
             Field::Building => "parse/building",
             Field::Directional => "parse/directional",
+            Field::Near => "parse/near",
         }
     }
 
@@ -220,6 +235,9 @@ pub struct Entry {
     pub count: u64,
     /// The country most of those records are in, when known.
     pub country: Option<CountryCode>,
+    /// The admin levels of the areas it names, bits of [`level`]: whether a
+    /// locality name is a city, a district or a neighbourhood.
+    pub levels: u8,
 }
 
 impl Entry {
@@ -228,12 +246,14 @@ impl Entry {
             | self
                 .country
                 .map_or(0, |country| u64::from(country.to_u16()) << COUNT_BITS)
+            | u64::from(self.levels) << LEVELS_SHIFT
     }
 
     fn decode(value: u64) -> Self {
         Self {
             count: value & COUNT_MASK,
             country: CountryCode::from_u16((value >> COUNT_BITS) as u16),
+            levels: (value >> LEVELS_SHIFT) as u8,
         }
     }
 }
@@ -706,6 +726,7 @@ impl NameStats {
                 .iter()
                 .max_by_key(|(code, count)| (*count, std::cmp::Reverse(*code)))
                 .map(|(code, _)| *code),
+            levels: self.levels,
         }
     }
 }
@@ -960,6 +981,8 @@ impl DictionaryBuilder {
         fields[Field::StreetType.index()] = street_types(&fields[Field::Street.index()]);
         let mut units = vocabulary(UNIT_WORDS);
         units.extend(vocabulary(LIBPOSTAL_UNIT_TYPES));
+        units.extend(vocabulary(LIBPOSTAL_STAIRCASES));
+        units.extend(vocabulary(LIBPOSTAL_ENTRANCES));
         for (word, entry) in &fields[Field::Unit.index()] {
             if entry.count >= MIN_UNIT_WORD_VALUES {
                 units.entry(word.clone()).or_insert(*entry).count = entry.count;
@@ -971,6 +994,7 @@ impl DictionaryBuilder {
             (Field::Level, LIBPOSTAL_LEVEL_TYPES),
             (Field::Building, LIBPOSTAL_BUILDING_TYPES),
             (Field::Directional, LIBPOSTAL_DIRECTIONALS),
+            (Field::Near, LIBPOSTAL_NEAR),
         ] {
             fields[field.index()] = vocabulary(list);
         }
@@ -988,6 +1012,7 @@ impl DictionaryBuilder {
                         .or_insert(Entry {
                             count: 0,
                             country: None,
+                            levels: 0,
                         })
                         .count += 1;
                 }
@@ -1162,6 +1187,7 @@ fn street_types(streets: &BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
                 .or_insert(Entry {
                     count: 0,
                     country: None,
+                    levels: 0,
                 })
                 .count += count;
         }
@@ -1211,6 +1237,7 @@ pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
                 Entry {
                     count: 1,
                     country: None,
+                    levels: 0,
                 },
             )
         })
@@ -1234,6 +1261,7 @@ mod tests {
         Entry {
             count,
             country: country.and_then(CountryCode::parse),
+            levels: 0,
         }
     }
 

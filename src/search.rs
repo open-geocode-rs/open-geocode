@@ -1498,7 +1498,11 @@ impl QueryPlan {
                         .split_whitespace()
                         .map(str::to_string),
                 ),
-                Label::Locality | Label::Region | Label::Postcode | Label::Country => {
+                Label::Locality
+                | Label::District
+                | Label::Region
+                | Label::Postcode
+                | Label::Country => {
                     plan.context.push(ContextPart { label, words });
                 }
             }

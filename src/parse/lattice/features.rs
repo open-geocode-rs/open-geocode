@@ -22,7 +22,7 @@
 use super::{
     CountryCode, MAX_SPAN_TOKENS, Tokens,
     decode::Span,
-    dictionary::{Dictionaries, Field, Match},
+    dictionary::{Dictionaries, Field, Match, level},
 };
 
 /// The feature blocks, in id order, with the names of their features.
@@ -97,6 +97,11 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("phrase_after", &PHRASE_KINDS),
     ("chain", &["2", "3", "4+", "with_region"]),
     (
+        "dict_level",
+        &["district", "locality", "neighbourhood", "place"],
+    ),
+    ("glued_phrase", &["unit", "po_box", "level"]),
+    (
         "grounding",
         &["no_locality", "no_region", "no_country", "no_postcode"],
     ),
@@ -104,13 +109,14 @@ const BLOCKS: &[(&str, &[&str])] = &[
 
 /// The kinds of vocabulary phrase, in the order of
 /// [`Field::PHRASES`](super::dictionary::Field::PHRASES).
-const PHRASE_KINDS: [&str; 6] = [
+const PHRASE_KINDS: [&str; 7] = [
     "unit",
     "po_box",
     "level",
     "building",
     "street_type",
     "directional",
+    "near",
 ];
 
 const DICT_COVER: [&str; 10] = [
@@ -242,6 +248,8 @@ enum Block {
     PhraseBefore,
     PhraseAfter,
     Chain,
+    DictLevel,
+    GluedPhrase,
     Grounding,
 }
 
@@ -608,6 +616,23 @@ impl FeatureSet {
             self.country_features
                 .push((country, id(Block::DictInCountry, field_index)));
         }
+        // Which admin level a locality name names: a district and a city
+        // are both in the locality dictionary, and only this tells them apart.
+        if field == Field::Locality {
+            for (index, bit) in [
+                level::DISTRICT,
+                level::LOCALITY,
+                level::NEIGHBOURHOOD,
+                level::PLACE,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if hit.entry.levels & bit != 0 {
+                    self.push(Block::DictLevel, index);
+                }
+            }
+        }
     }
 
     /// The prefixes and suffixes of `word`, the span as one word, each of
@@ -672,6 +697,18 @@ impl FeatureSet {
     }
 
     /// The span is one number written in parts: "993.5", "1384 1/2".
+    /// The span is one token that glues a number to a unit, PO box or level
+    /// phrase ("4og", "apt4").
+    pub fn glued_phrase(&mut self, field: Field) {
+        let index = match field {
+            Field::Unit => 0,
+            Field::PoBox => 1,
+            Field::Level => 2,
+            _ => return,
+        };
+        self.push(Block::GluedPhrase, index);
+    }
+
     pub fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
     }

@@ -124,6 +124,8 @@ impl Weights {
                 (Unit, -2.0),
                 (Street, 0.0),
                 (Locality, -0.5),
+                // No hand-set feature tells a district from a locality.
+                (District, -4.0),
                 (Region, -2.0),
                 (Postcode, -2.0),
                 (Country, -2.0),
@@ -139,6 +141,7 @@ impl Weights {
         let not_a_name = [
             (Street, -2.0),
             (Locality, -4.0),
+            (District, -4.0),
             (Region, -4.0),
             (Country, -4.0),
         ];

@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
+    abbreviations::abbreviations,
     decode::{self, END, LABELS, Lattice, Path as LabelPath, START, STATES},
     dictionary::{Dictionaries, Field, admin_aliases},
     dictionary_key, is_unspaced,
@@ -75,6 +76,8 @@ const HELD_OUT_SHARE: f64 = 0.05;
 const OVERSAMPLE: f64 = 1.25;
 /// Rows a shard holds to read its rows in an order of its own each epoch.
 const SHUFFLE_WINDOW: usize = 1 << 16;
+/// Rows whose lattices a shard builds side by side before learning them.
+const LATTICE_BATCH: usize = 1 << 10;
 /// Held-out rows labelled per parallel batch.
 const EVALUATE_BATCH: usize = 1 << 12;
 
@@ -266,7 +269,16 @@ pub fn train(
     let mut shuffled =
         ExternalSorter::<Shuffled>::new(scratch, "parse-rows", memory, sort_budget_bytes);
     let mut renderer = Renderer::new(&pack, &tagger);
-    for (country, candidates) in sample.candidates(&mut random) {
+    let candidates = sample.candidates(&mut random);
+    // Records in no country stand for a country only in a Pack that has
+    // none, such as a city extract cut inside its country's boundary. Beside
+    // countries they are the strip an extract takes past a border, and would
+    // take a whole country's rows.
+    let in_countries = candidates.keys().any(Option::is_some);
+    for (country, candidates) in candidates {
+        if country.is_none() && in_countries {
+            continue;
+        }
         let mut drawn = BTreeMap::<Draw, Vec<(usize, Row)>>::new();
         for candidate in candidates {
             let record = pack.records().record(candidate.id)?;
@@ -353,12 +365,19 @@ pub fn train(
                 let mut order = Random::new(SEED ^ ((epoch as u64) << 32 | shard as u64));
                 let mut model = Model::from_weights(mixed.clone());
                 let (mut errors, mut lattice, mut learn) = (0, 0.0, 0.0);
-                for_each_shuffled(part.reader()?, &mut order, |row| {
+                // A lattice does not depend on the weights, so a batch's are
+                // built on every core and the rows learned in order after.
+                for_each_shuffled(part.reader()?, &mut order, |batch| {
                     let at = Instant::now();
-                    let built = tagger.lattice(&row.tokens, &row.suppression);
+                    let built = batch
+                        .par_iter()
+                        .map(|row| tagger.lattice(&row.tokens, &row.suppression))
+                        .collect::<Vec<_>>();
                     lattice += at.elapsed().as_secs_f64();
                     let at = Instant::now();
-                    errors += usize::from(model.learn(&built, &row));
+                    for (row, built) in batch.iter().zip(&built) {
+                        errors += usize::from(model.learn(built, row));
+                    }
                     learn += at.elapsed().as_secs_f64();
                 })?;
                 Ok((model.averaged(), model.weights, errors, lattice, learn))
@@ -382,14 +401,16 @@ pub fn train(
     Ok((Some(weights), report))
 }
 
-/// Call `visit` on every row of `rows`, in a random order drawn through a
-/// window of [`SHUFFLE_WINDOW`] rows.
+/// Call `visit` on batches of [`LATTICE_BATCH`] rows of `rows`, every row
+/// once, in a random order drawn through a window of [`SHUFFLE_WINDOW`]
+/// rows.
 fn for_each_shuffled(
     rows: SpoolReader<Row>,
     random: &mut Random,
-    mut visit: impl FnMut(Row),
+    mut visit: impl FnMut(Vec<Row>),
 ) -> Result<()> {
     let mut window = Vec::with_capacity(SHUFFLE_WINDOW);
+    let mut batch = Vec::with_capacity(LATTICE_BATCH);
     for row in rows {
         let row = row?;
         if window.len() < SHUFFLE_WINDOW {
@@ -397,10 +418,20 @@ fn for_each_shuffled(
             continue;
         }
         let at = random.below(window.len() as u64) as usize;
-        visit(std::mem::replace(&mut window[at], row));
+        batch.push(std::mem::replace(&mut window[at], row));
+        if batch.len() == LATTICE_BATCH {
+            visit(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(LATTICE_BATCH),
+            ));
+        }
     }
     random.shuffle(&mut window);
-    window.into_iter().for_each(visit);
+    batch.extend(window);
+    while !batch.is_empty() {
+        let rest = batch.split_off(batch.len().min(LATTICE_BATCH));
+        visit(std::mem::replace(&mut batch, rest));
+    }
     Ok(())
 }
 
@@ -757,6 +788,8 @@ struct Fields {
     locality: Option<Tokens>,
     /// The place area the record lies in outside the admin areas: an island.
     island: Option<Tokens>,
+    /// The area between the locality and the region: a county, a Kreis.
+    district: Option<Tokens>,
     region: Option<Tokens>,
     postcode: Option<Tokens>,
     country: Option<Tokens>,
@@ -774,6 +807,7 @@ enum Slot {
     Suburb,
     Locality,
     Island,
+    District,
     Region,
     Postcode,
     Country,
@@ -790,6 +824,7 @@ impl Slot {
                 Self::Locality
             }
             "island" | "archipelago" => Self::Island,
+            "county" | "state_district" => Self::District,
             "state" | "state_code" | "province" | "region" => Self::Region,
             "postcode" => Self::Postcode,
             "country" => Self::Country,
@@ -803,6 +838,7 @@ impl Slot {
             Self::HouseNumber => Label::HouseNumber,
             Self::Street => Label::Street,
             Self::Suburb | Self::Locality | Self::Island => Label::Locality,
+            Self::District => Label::District,
             Self::Region => Label::Region,
             Self::Postcode => Label::Postcode,
             Self::Country => Label::Country,
@@ -817,6 +853,7 @@ impl Slot {
             Self::Suburb => fields.suburb.as_ref(),
             Self::Locality => fields.locality.as_ref(),
             Self::Island => fields.island.as_ref(),
+            Self::District => fields.district.as_ref(),
             Self::Region => fields.region.as_ref(),
             Self::Postcode => fields.postcode.as_ref(),
             Self::Country => fields.country.as_ref(),
@@ -944,12 +981,12 @@ fn writes_slot(nodes: &[Node], slot: Slot) -> bool {
     })
 }
 
-/// Few templates write an island; a query writes it as a field of its own
-/// after the localities and before the region.
-fn insert_island(groups: &mut Vec<Group>, island: &Tokens) {
+/// Few templates write an island or a district; a query writes each as a
+/// field of its own after the localities and before the region.
+fn insert_area(groups: &mut Vec<Group>, label: Label, words: &Tokens) {
     let at = groups
         .iter()
-        .rposition(|group| group.label == Label::Locality)
+        .rposition(|group| matches!(group.label, Label::Locality | Label::District))
         .map(|index| index + 1)
         .or_else(|| {
             groups.iter().position(|group| {
@@ -967,8 +1004,8 @@ fn insert_island(groups: &mut Vec<Group>, island: &Tokens) {
     groups.insert(
         at,
         Group {
-            label: Label::Locality,
-            words: island.clone(),
+            label,
+            words: words.clone(),
             break_before: at > 0,
             joiner: None,
         },
@@ -983,37 +1020,6 @@ fn has_value(nodes: &[Node], fields: &Fields) -> bool {
     })
 }
 
-/// The abbreviations people write for street types and directions, the
-/// inverse of the expansions the text index applies.
-const ABBREVIATIONS: &[(&str, &str)] = &[
-    ("street", "st"),
-    ("avenue", "ave"),
-    ("road", "rd"),
-    ("drive", "dr"),
-    ("boulevard", "blvd"),
-    ("court", "crt"),
-    ("crescent", "cres"),
-    ("place", "pl"),
-    ("lane", "ln"),
-    ("highway", "hwy"),
-    ("parkway", "pkwy"),
-    ("terrace", "terr"),
-    ("trail", "trl"),
-    ("square", "sq"),
-    ("circle", "cir"),
-    ("gardens", "gdns"),
-    ("heights", "hts"),
-    ("grove", "grv"),
-    ("east", "e"),
-    ("west", "w"),
-    ("north", "n"),
-    ("south", "s"),
-    ("northeast", "ne"),
-    ("northwest", "nw"),
-    ("southeast", "se"),
-    ("southwest", "sw"),
-];
-
 /// Share of rows that name a record or an area by one of its alternate names
 /// (`name:ja-Hira`, `name:en`, ...) when it has any, so the model sees names
 /// in the other scripts and languages queries write them in.
@@ -1025,11 +1031,20 @@ const POI_ADDRESS_SHARE: f64 = 0.7;
 /// Share of written units whose unit, PO box or level word follows the
 /// number instead of leading it.
 const UNIT_WORD_AFTER_SHARE: f64 = 0.3;
+/// Share of written units of one word and a number that glue the two into
+/// one token ("4og", "apt4"), in scripts written with spaces.
+const GLUED_UNIT_SHARE: f64 = 0.3;
+/// Share of the rows of a venue or a place that ask for what is near it
+/// ("cafe near toronto", "haus in der nähe von köln"), the phrase labelled
+/// other as libpostal labels it.
+const NEAR_SHARE: f64 = 0.04;
 /// Share of rows with words of a script written without spaces whose
 /// numbers are written in numeral ideographs.
 const NUMERAL_SHARE: f64 = 0.1;
 /// Share of rows of records on an island that name it.
 const ISLAND_SHARE: f64 = 0.35;
+/// Share of rows of records in a district that name it.
+const DISTRICT_SHARE: f64 = 0.4;
 /// Share of rows of addresses that state several areas that write them as
 /// one locality field (see [`chained_areas`]).
 const CHAIN_SHARE: f64 = 0.5;
@@ -1047,6 +1062,8 @@ struct Renderer<'a> {
     /// The words a unit is written with: the Pack's unit words, PO box
     /// words and level words.
     unit_words: [Vec<String>; 3],
+    /// The words that ask for what is near a place.
+    near: Vec<String>,
     template_countries: Vec<String>,
 }
 
@@ -1059,6 +1076,7 @@ impl<'a> Renderer<'a> {
             // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
+            near: tagger.dictionaries().keys(Field::Near),
             template_countries: templates().keys().cloned().collect(),
         }
     }
@@ -1096,9 +1114,15 @@ impl<'a> Renderer<'a> {
                         fields.region = name;
                         fields.subject = Some(Slot::Region);
                     }
+                    PlaceLayer::District => {
+                        fields.district = name;
+                        fields.subject = Some(Slot::District);
+                        fields.region = context.region.as_deref().and_then(words);
+                    }
                     _ => {
                         fields.locality = name;
                         fields.island = self.island(&context, random);
+                        fields.district = self.district(&context, random);
                         fields.region = context.region.as_deref().and_then(words);
                     }
                 }
@@ -1131,6 +1155,7 @@ impl<'a> Renderer<'a> {
             fields.suburb = context.suburb.as_deref().and_then(words);
         }
         fields.island = self.island(&context, random);
+        fields.district = self.district(&context, random);
         if let Some(chain) = stated
             .filter(|_| random.chance(CHAIN_SHARE))
             .and_then(|address| chained_areas(address, random))
@@ -1181,16 +1206,22 @@ impl<'a> Renderer<'a> {
         if let Some(street) = fields.street.as_mut()
             && random.chance(0.5)
         {
+            // Street types and directions in another of their forms, from
+            // every language's list: "straße" as "str", "hauptstraße" as
+            // "hauptstr", "north" as "n".
+            let table = abbreviations();
             for word in street.words.iter_mut() {
-                if let Some((_, short)) = ABBREVIATIONS.iter().find(|(long, _)| *long == word) {
-                    if random.chance(0.7) {
-                        *word = short.to_string();
-                    }
-                } else if let Some(stem) = word.strip_suffix("strasse")
-                    && !stem.is_empty()
-                    && random.chance(0.7)
-                {
-                    *word = format!("{stem}str");
+                if !random.chance(0.7) {
+                    continue;
+                }
+                let short = table.short_forms(word);
+                let other = if short.is_empty() {
+                    table.unglued(word)
+                } else {
+                    short.to_vec()
+                };
+                if !other.is_empty() {
+                    *word = other[random.below(other.len() as u64) as usize].clone();
                 }
             }
         }
@@ -1226,7 +1257,12 @@ impl<'a> Renderer<'a> {
         if let Some(island) = &fields.island
             && !writes_slot(template, Slot::Island)
         {
-            insert_island(&mut groups, island);
+            insert_area(&mut groups, Label::Locality, island);
+        }
+        if let Some(district) = &fields.district
+            && !writes_slot(template, Slot::District)
+        {
+            insert_area(&mut groups, Label::District, district);
         }
         // Many places write the largest area first and the house number
         // last ("100-0005 東京都千代田区丸の内2-7-2"), whatever order the
@@ -1268,6 +1304,13 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
+        if (fields.house.is_some() || fields.subject.is_some())
+            && !self.near.is_empty()
+            && random.chance(NEAR_SHARE)
+            && let Some(phrase) = words(&self.near[random.below(self.near.len() as u64) as usize])
+        {
+            self.add_near(&mut groups, phrase);
+        }
         let keep_breaks = random.chance(0.2);
         let mut tokens = Tokens::default();
         let mut gold = Vec::new();
@@ -1308,6 +1351,16 @@ impl<'a> Renderer<'a> {
         })
     }
 
+    /// The district the record lies in, in [`DISTRICT_SHARE`] of the rows of
+    /// records in one.
+    fn district(&self, context: &Areas, random: &mut Random) -> Option<Tokens> {
+        context
+            .district
+            .as_deref()
+            .filter(|_| random.chance(DISTRICT_SHARE))
+            .and_then(words)
+    }
+
     /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
     /// records on one.
     fn island(&self, context: &Areas, random: &mut Random) -> Option<Tokens> {
@@ -1316,6 +1369,37 @@ impl<'a> Renderer<'a> {
             .as_deref()
             .filter(|_| random.chance(ISLAND_SHARE))
             .and_then(words)
+    }
+
+    /// A near phrase before the areas of a row ("cafe near toronto"), or
+    /// after everything when it names none ("cafe near me").
+    fn add_near(&self, groups: &mut Vec<Group>, phrase: Tokens) {
+        let at = groups
+            .iter()
+            .position(|group| {
+                matches!(
+                    group.label,
+                    Label::Locality
+                        | Label::District
+                        | Label::Region
+                        | Label::Postcode
+                        | Label::Country
+                )
+            })
+            .unwrap_or(groups.len());
+        if let Some(next) = groups.get_mut(at) {
+            next.break_before = false;
+            next.joiner = None;
+        }
+        groups.insert(
+            at,
+            Group {
+                label: Label::Other,
+                words: phrase,
+                break_before: false,
+                joiner: None,
+            },
+        );
     }
 
     /// A unit, as its own field after the street ("unit 602"), before the
@@ -1367,7 +1451,24 @@ impl<'a> Renderer<'a> {
             .then(|| &vocabulary[random.below(vocabulary.len() as u64) as usize])
             .and_then(|phrase| words(phrase));
         let after = random.chance(UNIT_WORD_AFTER_SHARE);
+        let glue = phrase.as_ref().is_some_and(|phrase| {
+            phrase.words.len() == 1 && !phrase.words[0].chars().any(is_unspaced)
+        }) && value.words.len() == 1
+            && value.words[0].chars().all(char::is_numeric)
+            && random.chance(GLUED_UNIT_SHARE);
         let mut words = Tokens::default();
+        if glue {
+            let (phrase, number) = (&phrase.as_ref().expect("phrase").words[0], &value.words[0]);
+            words.push(
+                if after {
+                    format!("{number}{phrase}")
+                } else {
+                    format!("{phrase}{number}")
+                },
+                false,
+                None,
+            );
+        }
         let push_phrase = |words: &mut Tokens| {
             if let Some(phrase) = &phrase {
                 for (word, joiner) in phrase.words.iter().zip(&phrase.joiners) {
@@ -1375,14 +1476,16 @@ impl<'a> Renderer<'a> {
                 }
             }
         };
-        if !after {
-            push_phrase(&mut words);
-        }
-        for (word, joiner) in value.words.into_iter().zip(value.joiners) {
-            words.push(word, false, joiner);
-        }
-        if after {
-            push_phrase(&mut words);
+        if !glue {
+            if !after {
+                push_phrase(&mut words);
+            }
+            for (word, joiner) in value.words.into_iter().zip(value.joiners) {
+                words.push(word, false, joiner);
+            }
+            if after {
+                push_phrase(&mut words);
+            }
         }
         let street_end = groups
             .iter()
@@ -1411,12 +1514,8 @@ impl<'a> Renderer<'a> {
             return Ok(Areas::default());
         };
         let tuple = context.admin_context;
-        let mut locality = None;
-        for area in [tuple.locality_record_id, tuple.district_record_id] {
-            if locality.is_none() {
-                locality = self.admin_name(area, Field::Locality, random)?;
-            }
-        }
+        let locality = self.admin_name(tuple.locality_record_id, Field::Locality, random)?;
+        let district = self.admin_name(tuple.district_record_id, Field::Locality, random)?;
         let countries = self.names(tuple.country_record_id)?;
         let country_code = countries
             .first()
@@ -1426,6 +1525,7 @@ impl<'a> Renderer<'a> {
         let country = pick_name(&countries, random).map(str::to_string);
         Ok(Areas {
             locality,
+            district,
             island: self.name(tuple.place_record_id, random)?,
             suburb: self.name(tuple.neighbourhood_record_id, random)?,
             region: self.admin_name(tuple.region_record_id, Field::Region, random)?,
@@ -1502,6 +1602,7 @@ fn pick_name<'n, S: AsRef<str>>(names: &'n [S], random: &mut Random) -> Option<&
 #[derive(Debug, Default)]
 struct Areas {
     locality: Option<String>,
+    district: Option<String>,
     /// The place area the record lies in (see [`Fields::island`]).
     island: Option<String>,
     suburb: Option<String>,
@@ -1717,7 +1818,11 @@ mod tests {
         assert!(!writes_slot(template, Slot::Island));
         let mut groups = Vec::new();
         render(template, &with_island, &mut groups, &mut false);
-        insert_island(&mut groups, with_island.island.as_ref().expect("island"));
+        insert_area(
+            &mut groups,
+            Label::Locality,
+            with_island.island.as_ref().expect("island"),
+        );
         let labels = groups
             .iter()
             .map(|group| (group.label, group.words.words.join(" "), group.break_before))
@@ -1887,6 +1992,7 @@ mod tests {
         let entry = Entry {
             count: 10,
             country: None,
+            levels: 0,
         };
         let dictionaries = Dictionaries::from_entries([
             (Field::Locality, "toronto", entry),

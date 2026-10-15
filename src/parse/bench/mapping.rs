@@ -39,6 +39,16 @@ impl std::fmt::Display for Scheme {
     }
 }
 
+/// A predicted label as the gold scheme writes it: libpostal labels a
+/// district (`state_district`) as one of its regions, so a district is scored
+/// as a region.
+pub fn scored(label: Label) -> Label {
+    match label {
+        Label::District => Label::Region,
+        label => label,
+    }
+}
+
 fn libpostal(label: &str) -> Option<Mapped> {
     Some(Mapped::Label(match label {
         "house_number" => Label::HouseNumber,

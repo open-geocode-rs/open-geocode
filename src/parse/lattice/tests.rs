@@ -13,6 +13,7 @@ fn entry(count: u64, country: &str) -> Entry {
     Entry {
         count,
         country: CountryCode::parse(country),
+        levels: 0,
     }
 }
 
@@ -829,4 +830,20 @@ fn numbered_names_share_one_form_of_any_numerals() {
     assert_eq!(mask_numerals("sector 12").as_deref(), Some("sector #"));
     assert_eq!(mask_numerals("toronto"), None);
     assert_eq!(mask_numerals("12"), None);
+}
+
+#[test]
+fn a_number_glued_to_a_unit_or_level_word_is_one_token_of_that_kind() {
+    let tagger = LatticeTagger::new(
+        Dictionaries::from_entries([
+            (Field::Level, "og", entry(1, "")),
+            (Field::Unit, "apt", entry(1, "")),
+        ]),
+        Weights::built_in(),
+    );
+    assert_eq!(tagger.glued_phrase("4og"), Some(Field::Level));
+    assert_eq!(tagger.glued_phrase("apt4"), Some(Field::Unit));
+    assert_eq!(tagger.glued_phrase("12a"), None);
+    assert_eq!(tagger.glued_phrase("4og5"), None);
+    assert_eq!(tagger.glued_phrase("og"), None);
 }
