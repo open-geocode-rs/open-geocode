@@ -1,0 +1,12 @@
+{
+  "features": [],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "point": {
+      "lat": 10.0,
+      "lon": 10.0
+    },
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

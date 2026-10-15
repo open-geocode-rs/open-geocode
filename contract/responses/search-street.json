@@ -1,0 +1,135 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "rooftop",
+        "address": {
+          "housenumber": "10",
+          "postcode": "M5V 1A1",
+          "street": "King Street"
+        },
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:node:10",
+        "label": "10 King Street, M5V 1A1",
+        "layer": "address",
+        "name": "10 King Street",
+        "record_id": 3,
+        "score": 15.537057,
+        "source": {
+          "dataset": "osm",
+          "object_id": 10,
+          "object_type": "node"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0005
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "street",
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:way:12",
+        "label": "King Street",
+        "layer": "street",
+        "name": "King Street",
+        "record_id": 5,
+        "score": 15.083338,
+        "source": {
+          "dataset": "osm",
+          "object_id": 12,
+          "object_type": "way"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.005,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "address": {
+          "housenumber": "12",
+          "postcode": "M5V 1A1",
+          "street": "King Street"
+        },
+        "category": "shop:bakery",
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:way:11",
+        "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
+        "layer": "poi",
+        "name": "Queen Bakery",
+        "record_id": 4,
+        "score": 1.8904963,
+        "source": {
+          "dataset": "osm",
+          "object_id": 11,
+          "object_type": "way"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "query": "King Street",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

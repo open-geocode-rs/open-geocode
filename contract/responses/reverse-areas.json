@@ -1,0 +1,82 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "id": "osm:relation:1",
+        "label": "Toronto, Ontario, Canada",
+        "layer": "country",
+        "name": "Canada",
+        "record_id": 0,
+        "source": {
+          "dataset": "osm",
+          "object_id": 1,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "id": "osm:relation:3",
+        "label": "Toronto",
+        "layer": "locality",
+        "name": "Toronto",
+        "record_id": 2,
+        "source": {
+          "dataset": "osm",
+          "object_id": 3,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "id": "osm:relation:2",
+        "label": "Ontario",
+        "layer": "region",
+        "name": "Ontario",
+        "record_id": 1,
+        "source": {
+          "dataset": "osm",
+          "object_id": 2,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "point": {
+      "lat": 43.2,
+      "lon": -79.2
+    },
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

@@ -2,6 +2,7 @@ use std::{
     fs::File,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use open_geocode::{
+    api,
     batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
     bench::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
@@ -829,20 +831,28 @@ fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `/search` answer for `query`, as the Runtime gives it.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
-    let searcher = PackTextSearcher::open(pack)?;
+    let pack = Arc::new(PackReader::open(pack)?);
+    let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
     let hits = searcher.search(TextSearchOptions {
-        query,
+        query: query.clone(),
         limit,
         layer,
     })?;
-    write_json(serde_json::to_value(hits)?)
+    write_json(serde_json::to_value(api::forward_collection(
+        &pack, query, hits,
+    )?)?)
 }
 
+/// The `/reverse` answer for a point, as the Runtime gives it.
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
-    let geocoder = PackReverseGeocoder::open(pack)?;
+    let pack = Arc::new(PackReader::open(pack)?);
+    let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
     let response = geocoder.reverse(ReverseGeocodeOptions { lon, lat })?;
-    write_json(serde_json::to_value(response)?)
+    write_json(serde_json::to_value(api::reverse_collection(
+        &pack, &response,
+    )?)?)
 }
 
 fn bench_pack(

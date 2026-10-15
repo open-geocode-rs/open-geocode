@@ -47,6 +47,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
+    api::Address,
     container::{Bytes, Container, ContainerWriter},
     extsort::Scratch,
     memory::{MemoryBudget, Reservation},
@@ -100,7 +101,13 @@ pub struct ContextRef {
 pub struct RecordSummary {
     pub id: String,
     pub layer: String,
+    /// The thing itself: a POI's, place's or street's name, an address's
+    /// house number and street, a postcode.
+    pub name: String,
     pub label: String,
+    /// The address parts the record states.
+    #[serde(skip_serializing_if = "Address::is_empty")]
+    pub address: Address,
     /// A POI's category, for example `amenity:cafe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
@@ -126,6 +133,8 @@ pub enum RecordPointPrecision {
     RepresentativePoint,
 }
 
+/// Where a record comes from: an OSM object, or the address records a
+/// derived record (a postcode) was made from.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RecordSource {
     pub dataset: String,
@@ -732,17 +741,21 @@ impl RecordsReader {
         })
     }
 
-    /// Id, label, layer, point and source without decoding geometry.
+    /// Id, name, label, address, layer, point and source without decoding
+    /// geometry.
     pub fn summary(&self, id: RecordId) -> Result<RecordSummary> {
         let (header, mut fields) = self.body(id)?;
         let source = header.source()?;
         let mut category = None;
-        let (record_id, label) = match header.layer {
+        let mut stated = Address::default();
+        let (record_id, name, label) = match header.layer {
             Layer::Address => {
                 let address = self.address_components(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.osm_source()?;
+                stated = Address::from(&address);
                 (
                     crate::labels::osm_record_id(object_type, object_id),
+                    crate::labels::address_name(&address),
                     crate::labels::address_label(&address),
                 )
             }
@@ -751,8 +764,12 @@ impl RecordsReader {
                     self.poi_fields(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.osm_source()?;
                 category = Some(poi_category.to_string());
+                if let Some(address) = &address {
+                    stated = Address::from(address);
+                }
                 (
                     crate::labels::osm_record_id(object_type, object_id),
+                    name.to_string(),
                     crate::labels::poi_label(name, address.as_ref(), None),
                 )
             }
@@ -760,26 +777,29 @@ impl RecordsReader {
                 let (address, range, anchors) =
                     self.interpolation_fields(header.strings, &mut fields)?;
                 let (_, way_id) = header.osm_source()?;
+                let name = crate::labels::interpolation_name(&address);
+                stated = Address::from(&address);
                 (
                     crate::labels::interpolation_record_id(way_id, anchors[0], anchors[1]),
-                    crate::labels::interpolation_label(
-                        &crate::labels::interpolation_name(&address),
-                        &range,
-                        &address,
-                    ),
+                    name.clone(),
+                    crate::labels::interpolation_label(&name, &range, &address),
                 )
             }
             Layer::Street => {
                 let (object_type, object_id) = header.osm_source()?;
+                let name = self.string_field(header.strings, &mut fields)?.to_string();
                 (
                     crate::labels::osm_record_id(object_type, object_id),
-                    self.string_field(header.strings, &mut fields)?.to_string(),
+                    name.clone(),
+                    name,
                 )
             }
             Layer::Postcode => {
                 let postcode = self.string_field(header.strings, &mut fields)?;
+                stated = Address::postcode(postcode);
                 (
                     crate::labels::derived_postcode_id(postcode),
+                    postcode.to_string(),
                     postcode.to_string(),
                 )
             }
@@ -790,13 +810,16 @@ impl RecordsReader {
                 (
                     crate::labels::place_record_id(object_type, object_id, place_type),
                     name.to_string(),
+                    name.to_string(),
                 )
             }
         };
         Ok(RecordSummary {
             id: record_id,
             layer: header.layer.as_str().to_string(),
+            name,
             label,
+            address: stated,
             category,
             point: Some(header.point()),
             source,
@@ -878,7 +901,7 @@ impl RecordsReader {
         Ok(Some(ContextRecord {
             id: summary.id,
             layer: summary.layer,
-            name: summary.label.clone(),
+            name: summary.name,
             postcode: (header.layer == Layer::Postcode).then(|| summary.label.clone()),
             label: summary.label,
             point: summary.point,
