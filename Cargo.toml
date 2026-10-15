@@ -28,6 +28,8 @@ indicatif = "0.17"
 levenshtein_automata = "0.2"
 memmap2 = "0.9"
 osmpbf = "0.3"
+# The interactive `og` interface, drawn inline below the prompt.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rayon = "1.12"
 # Per-country postcode patterns in the parser.
 regex = "1.12"
