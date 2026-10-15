@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tantivy::TantivyDocument;
 
 use crate::{
     container::{Container, ContainerWriter},
@@ -36,12 +37,11 @@ use crate::{
     parse::lattice::{
         CountryCode,
         dictionary::{DictionaryBuilder, RecordNames},
-        weights::{WEIGHTS_SECTION, WEIGHTS_VERSION, Weights},
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
     spatial_index::{RecordCells, SpatialIndexWriter},
-    text_index::{PostcodeAreas, TextIndexWriter},
+    text_index::{PostcodeAreas, TextIndexFields, TextIndexWriter},
 };
 
 pub use crate::{
@@ -148,10 +148,9 @@ pub struct PackWriter {
     text: TextIndexWriter,
     spatial: SpatialIndexWriter,
     layer_counts: BTreeMap<Layer, u64>,
-    context_names: HashMap<RecordId, Vec<String>>,
-    postcode_areas: PostcodeAreas,
+    context_names: Arc<HashMap<RecordId, Vec<String>>>,
+    postcode_areas: Arc<PostcodeAreas>,
     dictionaries: DictionaryBuilder,
-    parse_weights: Option<Weights>,
 }
 
 /// A finished, unpublished Pack.
@@ -215,10 +214,9 @@ impl PackWriter {
             destination,
             generation,
             layer_counts: BTreeMap::new(),
-            context_names: HashMap::new(),
-            postcode_areas: PostcodeAreas::default(),
+            context_names: Arc::default(),
+            postcode_areas: Arc::default(),
             dictionaries: DictionaryBuilder::default(),
-            parse_weights: None,
         })
     }
 
@@ -241,7 +239,7 @@ impl PackWriter {
     /// first, so the records written after this can be indexed under the
     /// areas they lie in.
     pub fn set_context_names(&mut self, names: HashMap<RecordId, Vec<String>>) {
-        self.context_names = names;
+        self.context_names = Arc::new(names);
     }
 
     /// Country codes of the country records admin contexts point at, so the
@@ -250,17 +248,10 @@ impl PackWriter {
         self.dictionaries.set_country_codes(codes);
     }
 
-    /// Trained parser weights to carry in the Pack (`parse/weights`).
-    /// Without them the parser reads a weights file beside the Pack file, or
-    /// its built-in weights.
-    pub fn set_parse_weights(&mut self, weights: Weights) {
-        self.parse_weights = Some(weights);
-    }
-
     /// Postcode centroids, so the records written after this that state no
     /// postcode are ranked by the nearest one.
     pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {
-        self.postcode_areas = areas;
+        self.postcode_areas = Arc::new(areas);
     }
 
     pub fn write(&mut self, record: &Record, context: Option<RecordContext>) -> Result<RecordId> {
@@ -269,44 +260,54 @@ impl PackWriter {
         Ok(first)
     }
 
-    /// Write records in order. Text documents and spatial cells are computed in
-    /// parallel; the store itself is appended sequentially.
+    /// Write records in order: [`BatchPreparer::prepare`], then [`Self::commit`].
     pub fn write_batch(&mut self, batch: &[(Record, Option<RecordContext>)]) -> Result<()> {
+        let prepared = self.preparer().prepare(batch.to_vec())?;
+        self.commit(prepared)
+    }
+
+    /// What computes the text documents, spatial cells and dictionary names
+    /// of the records written next, apart from the writer, so a builder can
+    /// prepare one batch while the writer appends the one before.
+    pub fn preparer(&self) -> BatchPreparer {
+        BatchPreparer {
+            next: self.records.record_count(),
+            fields: self.text.fields(),
+            context_names: Arc::clone(&self.context_names),
+            postcode_areas: Arc::clone(&self.postcode_areas),
+        }
+    }
+
+    /// Append a prepared batch. The store, the text index and the spatial
+    /// pairs take records one at a time, in order.
+    pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
         let first = self.records.record_count();
-        let fields = self.text.fields();
-        let context_names = &self.context_names;
-        let postcode_areas = &self.postcode_areas;
-        let prepared = batch
-            .par_iter()
-            .enumerate()
-            .map(|(offset, (record, context))| {
-                let record_id = first + offset as u64;
-                let names = context
-                    .iter()
-                    .flat_map(|context| indexed_area_names(context, context_names))
-                    .collect::<Vec<_>>();
-                Ok((
-                    fields.document(record_id, record, &names, postcode_areas),
-                    RecordCells::for_record(record_id, record)?,
-                    RecordNames::of(record),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (offset, ((record, context), (document, cells, names))) in
-            batch.iter().zip(prepared).enumerate()
-        {
+        if batch.first != first {
+            bail!(
+                "batch prepared for record {} was committed at record {first}",
+                batch.first
+            );
+        }
+        for (offset, prepared) in batch.records.into_iter().enumerate() {
+            let PreparedRecord {
+                record,
+                context,
+                document,
+                cells,
+                names,
+            } = prepared;
             let record_id = first + offset as u64;
-            if let Some(context) = context
+            if let Some(context) = &context
                 && names.is_place()
             {
                 self.dictionaries.add_place(record_id, context, &names);
             }
             self.dictionaries.add(names, context.as_ref());
             let context = match context {
-                Some(context) => self.contexts.intern(*context)?,
+                Some(context) => self.contexts.intern(context)?,
                 None => None,
             };
-            self.records.write(record, context)?;
+            self.records.write(&record, context)?;
             self.text.add(document)?;
             self.spatial.add(cells)?;
             *self.layer_counts.entry(record.layer()).or_default() += 1;
@@ -327,7 +328,6 @@ impl PackWriter {
             layer_counts,
             context_names,
             dictionaries,
-            parse_weights,
             ..
         } = self;
         let path = generation.path.join(PACK_FILE);
@@ -342,9 +342,6 @@ impl PackWriter {
         let spatial_commit = spatial.finish(&mut pack)?;
         dictionaries.finish(&mut pack, &context_names)?;
         drop(context_names);
-        if let Some(weights) = parse_weights {
-            pack.add(WEIGHTS_SECTION, WEIGHTS_VERSION, &weights.to_bytes())?;
-        }
 
         let manifest = PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -416,6 +413,20 @@ impl SealedPack {
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The Pack file, to read before it is published.
+    pub fn path(&self) -> PathBuf {
+        self.generation.path.join(PACK_FILE)
+    }
+
+    /// Add a section made from the sealed Pack itself, such as the parser
+    /// weights trained on its records. Nothing reads the Pack file yet.
+    pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
+        let mut pack = ContainerWriter::append(self.path())?;
+        pack.add(name, version, bytes)?;
+        self.bytes = pack.finish()?;
+        Ok(())
     }
 
     /// Validate the Pack with the serving readers, then point `CURRENT` at it.
@@ -623,6 +634,83 @@ impl PackReader {
         }
         Ok(rejections)
     }
+}
+
+/// Computes what a batch of records adds to the Pack's indexes, in parallel,
+/// for the record ids they will be written at. See [`PackWriter::preparer`].
+pub struct BatchPreparer {
+    next: RecordId,
+    fields: TextIndexFields,
+    context_names: Arc<HashMap<RecordId, Vec<String>>>,
+    postcode_areas: Arc<PostcodeAreas>,
+}
+
+impl BatchPreparer {
+    /// Prepare the records that follow the last batch this prepared.
+    pub fn prepare(
+        &mut self,
+        batch: Vec<(Record, Option<RecordContext>)>,
+    ) -> Result<PreparedBatch> {
+        let first = self.next;
+        let records = batch
+            .into_par_iter()
+            .enumerate()
+            .map(|(offset, (record, context))| {
+                let record_id = first + offset as u64;
+                let names = context
+                    .iter()
+                    .flat_map(|context| indexed_area_names(context, &self.context_names))
+                    .collect::<Vec<_>>();
+                Ok(PreparedRecord {
+                    document: self.fields.document(
+                        record_id,
+                        &record,
+                        &names,
+                        &self.postcode_areas,
+                    ),
+                    cells: RecordCells::for_record(record_id, &record)?,
+                    names: RecordNames::of(&record),
+                    record,
+                    context,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.next += records.len() as u64;
+        Ok(PreparedBatch { first, records })
+    }
+}
+
+/// Records with their text documents, spatial cells and dictionary names,
+/// ready for [`PackWriter::commit`].
+pub struct PreparedBatch {
+    first: RecordId,
+    records: Vec<PreparedRecord>,
+}
+
+impl PreparedBatch {
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// The records with the ids they will be written at.
+    pub fn records(&self) -> impl Iterator<Item = (RecordId, &Record)> {
+        self.records
+            .iter()
+            .enumerate()
+            .map(|(offset, prepared)| (self.first + offset as u64, &prepared.record))
+    }
+}
+
+struct PreparedRecord {
+    record: Record,
+    context: Option<RecordContext>,
+    document: TantivyDocument,
+    cells: RecordCells,
+    names: RecordNames,
 }
 
 #[cfg(test)]

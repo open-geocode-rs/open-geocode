@@ -24,10 +24,7 @@ use open_geocode::{
             ParseBenchOptions, TaggerKind, align_predictions, mapping::Scheme, normalize_fixtures,
             run_parse_bench, write_queries,
         },
-        lattice::{
-            LatticeTagger,
-            train::{TrainOptions, train_weights},
-        },
+        lattice::LatticeTagger,
     },
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
@@ -66,12 +63,6 @@ enum Commands {
         /// Directory for scratch files. Defaults to inside the Pack directory.
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
-
-        /// Trained address parser weights (from `parse-train`) to carry in
-        /// the Pack. Without them the parser uses a `parse.weights` file
-        /// beside the Pack file, or its built-in weights.
-        #[arg(long)]
-        parse_weights: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -144,37 +135,6 @@ enum Commands {
 
         /// Address query to label.
         query: String,
-    },
-
-    /// Train the address parser's weights on addresses rendered from the
-    /// Pack's own records, and write them for `build --parse-weights`.
-    #[command(name = "parse-train")]
-    ParseTrain {
-        /// Pack directory or Pack file whose records and dictionaries to train
-        /// on.
-        #[arg(long)]
-        pack: PathBuf,
-
-        /// Extra labelled addresses in libpostal's training format
-        /// (`country<TAB>address` with `token/label` pairs). Repeatable.
-        #[arg(long)]
-        extra: Vec<PathBuf>,
-
-        /// Output weights file.
-        #[arg(long)]
-        out: PathBuf,
-
-        /// Rendered training rows.
-        #[arg(long, default_value_t = 200_000)]
-        rows: usize,
-
-        /// Passes over the training rows.
-        #[arg(long, default_value_t = 5)]
-        epochs: usize,
-
-        /// Seed of the record draw and the noise.
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
     },
 
     /// Reverse geocode one coordinate from a Pack spatial index.
@@ -478,7 +438,6 @@ async fn main() -> Result<()> {
             pack,
             memory_budget_mb,
             scratch_dir,
-            parse_weights,
         } => {
             let report = build_osm_pack(BuildOsmOptions {
                 input,
@@ -486,7 +445,6 @@ async fn main() -> Result<()> {
                 memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
-                parse_weights,
             })?;
             write_json(serde_json::json!({
                 "records": report.output.record_count,
@@ -523,24 +481,6 @@ async fn main() -> Result<()> {
         } => search_pack(pack, query, layer, limit),
         Commands::ReversePack { pack, lon, lat } => reverse_pack(pack, lon, lat),
         Commands::Parse { pack, query } => parse_query(pack, &query),
-        Commands::ParseTrain {
-            pack,
-            extra,
-            out,
-            rows,
-            epochs,
-            seed,
-        } => {
-            let report = train_weights(&TrainOptions {
-                pack,
-                extra,
-                out,
-                rows,
-                epochs,
-                seed,
-            })?;
-            write_json(serde_json::to_value(report)?)
-        }
         Commands::BenchPack {
             pack,
             queries,

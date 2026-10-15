@@ -27,14 +27,9 @@ pub mod postcode;
 pub mod train;
 pub mod weights;
 
-use std::{
-    collections::HashMap,
-    fmt,
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
+use std::{collections::HashMap, fmt, path::Path, sync::OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use levenshtein_automata::{DFA, LevenshteinAutomatonBuilder};
 use unicode_script::{Script, UnicodeScript};
 
@@ -48,7 +43,7 @@ use self::{
 use super::types::{Label, Tagged, Tagger};
 use crate::{
     container::Container,
-    pack::{PACK_FILE, resolve_pack_path},
+    pack::resolve_pack_path,
     text_index::{expand_address_abbreviations, expand_final_direction},
 };
 
@@ -65,9 +60,6 @@ pub const N_BEST: usize = 3;
 const CONSTRAINED_PATHS: usize = 8;
 /// How many candidate countries are decoded besides the global fallback.
 const MAX_CANDIDATE_COUNTRIES: usize = 3;
-/// The file a Pack's trained weights are read from when the Pack does not
-/// carry them, next to the Pack file.
-pub const WEIGHTS_FILE: &str = "parse.weights";
 /// Spans shorter than this many characters are only looked up exactly: one
 /// edit turns most two- and three-letter words into many others.
 const MIN_FUZZY_CHARS: usize = 4;
@@ -573,27 +565,16 @@ impl fmt::Debug for LatticeTagger {
 
 impl LatticeTagger {
     /// Open the dictionaries of a Pack file or Pack directory, and the
-    /// weights it carries, or that lie next to it, or else the built-in ones.
+    /// weights trained on it when it was built, or else the built-in ones.
     pub fn open(pack: &Path) -> Result<Self> {
         let path = resolve_pack_path(pack)?;
-        let container = Container::open(&path)?;
-        Self::from_container(&container, &path)
+        Self::from_container(&Container::open(&path)?)
     }
 
-    /// The tagger of an open Pack file at `path`.
-    pub fn from_container(container: &Container, path: &Path) -> Result<Self> {
+    /// The tagger of an open Pack file.
+    pub fn from_container(container: &Container) -> Result<Self> {
         let dictionaries = Dictionaries::open(container)?;
-        let weights = match Weights::from_container(container)? {
-            Some(weights) => weights,
-            None => {
-                let beside = weights_path(path);
-                if beside.is_file() {
-                    Weights::read(&beside)?
-                } else {
-                    Weights::built_in()
-                }
-            }
-        };
+        let weights = Weights::from_container(container)?.unwrap_or_else(Weights::built_in);
         Ok(Self::new(dictionaries, weights))
     }
 
@@ -944,20 +925,6 @@ impl Tagger for LatticeTagger {
                     .collect()
             })
     }
-}
-
-/// Where a Pack file's weights are read from when it does not carry them.
-pub fn weights_path(pack_file: &Path) -> PathBuf {
-    pack_file.with_file_name(WEIGHTS_FILE)
-}
-
-/// The Pack file of a Pack directory or file, for writing weights beside it.
-pub fn pack_file(pack: &Path) -> Result<PathBuf> {
-    let path = resolve_pack_path(pack)?;
-    path.file_name()
-        .filter(|name| *name == PACK_FILE)
-        .context("not a Pack file")?;
-    Ok(path)
 }
 
 /// A span that is area names written one after the other.

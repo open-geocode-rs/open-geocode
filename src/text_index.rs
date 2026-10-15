@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    fmt, fs, io, mem,
+    fmt, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -20,7 +20,6 @@ use tantivy::{
         Directory, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr,
         error::{DeleteError, OpenReadError, OpenWriteError},
     },
-    indexer::UserOperation,
     merge_policy::NoMergePolicy,
     schema::{FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions},
 };
@@ -49,7 +48,15 @@ pub(crate) const POSTCODE_AREA_RADIUS_M: f64 = 10_000.0;
 /// when given less) and gains little beyond 1.6 GB.
 const MIN_INDEX_MEMORY_BYTES: usize = 16 << 20;
 const MAX_INDEX_MEMORY_BYTES: usize = 1_600_000_000;
-const TEXT_INDEX_BATCH_SIZE: usize = 10_000;
+/// Memory each indexing thread gets at least: less makes many small segments
+/// for the final merge to join.
+const INDEX_THREAD_MEMORY_BYTES: usize = 32 << 20;
+/// Indexing threads at most. Tantivy's default is 8, which leaves the cores of
+/// a larger machine idle while every record waits on the index.
+const MAX_INDEX_THREADS: usize = 16;
+/// Segments the finished text index keeps, one per merge run in parallel
+/// (Tantivy merges on four threads).
+const MERGED_SEGMENTS: usize = 4;
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
 const INTERPOLATION_END_FIELD: &str = "interpolation_end";
@@ -65,7 +72,6 @@ pub struct TextIndexWriter {
     index: Index,
     path: PathBuf,
     fields: TextIndexFields,
-    pending_documents: Vec<TantivyDocument>,
     document_count: u64,
 }
 
@@ -131,7 +137,6 @@ impl fmt::Debug for TextIndexWriter {
         formatter
             .debug_struct("TextIndexWriter")
             .field("fields", &self.fields)
-            .field("pending_document_count", &self.pending_documents.len())
             .field("document_count", &self.document_count)
             .finish_non_exhaustive()
     }
@@ -156,7 +161,6 @@ impl TextIndexWriter {
             index,
             path,
             fields,
-            pending_documents: Vec::with_capacity(TEXT_INDEX_BATCH_SIZE),
             document_count: 0,
         })
     }
@@ -173,9 +177,14 @@ impl TextIndexWriter {
             if !memory.try_grow(self.memory_bytes) {
                 memory.force_grow(self.memory_bytes);
             }
+            let threads = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(MAX_INDEX_THREADS)
+                .min(self.memory_bytes / INDEX_THREAD_MEMORY_BYTES)
+                .max(1);
             let writer = self
                 .index
-                .writer(self.memory_bytes)
+                .writer_with_num_threads(threads, self.memory_bytes)
                 .context("failed to create Tantivy index writer")?;
             // Disable background auto-merges during the build so the only
             // merge is the single deterministic one forced in `finish()`.
@@ -185,46 +194,49 @@ impl TextIndexWriter {
         Ok(&mut self.writer.as_mut().expect("writer created").0)
     }
 
+    /// Index one document. Tantivy's indexing queue holds a bounded number of
+    /// messages, so handing it documents one at a time bounds the documents
+    /// waiting in memory: when the indexer falls behind, this blocks instead
+    /// of queuing every record of the build (a batch of documents would be
+    /// one message, and the queue would hold thousands of batches).
     pub fn add(&mut self, document: TantivyDocument) -> Result<()> {
-        self.pending_documents.push(document);
-        self.document_count += 1;
-        if self.pending_documents.len() >= TEXT_INDEX_BATCH_SIZE {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        if self.pending_documents.is_empty() {
-            return Ok(());
-        }
-        let documents = mem::replace(
-            &mut self.pending_documents,
-            Vec::with_capacity(TEXT_INDEX_BATCH_SIZE),
-        );
         self.writer()?
-            .run(documents.into_iter().map(UserOperation::Add))
-            .context("failed to batch index records")?;
+            .add_document(document)
+            .context("failed to index record")?;
+        self.document_count += 1;
         Ok(())
     }
 
     /// Commit, merge to a single segment and copy the index into the Pack.
     pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<TextIndexCommit> {
-        self.flush()?;
         self.writer()?;
         let (mut writer, memory) = self.writer.take().expect("writer created");
         writer
             .commit()
             .context("failed to commit Tantivy text index")?;
+        // Join the segments the indexing threads wrote into a few, merged side
+        // by side: one merge of every segment runs on one thread, and search
+        // reads a few segments as well as one.
         let segment_ids = self
             .index
             .searchable_segment_ids()
             .context("failed to list text index segments")?;
-        if segment_ids.len() > 1 {
-            writer
-                .merge(&segment_ids)
-                .wait()
-                .context("failed to merge text index segments")?;
+        let groups = segment_ids.len().min(MERGED_SEGMENTS);
+        if segment_ids.len() > groups {
+            let mut merges = vec![Vec::new(); groups];
+            for (index, segment) in segment_ids.into_iter().enumerate() {
+                merges[index % groups].push(segment);
+            }
+            let pending = merges
+                .iter()
+                .filter(|segments| segments.len() > 1)
+                .map(|segments| writer.merge(segments))
+                .collect::<Vec<_>>();
+            for merge in pending {
+                merge
+                    .wait()
+                    .context("failed to merge text index segments")?;
+            }
             writer
                 .commit()
                 .context("failed to commit merged text index")?;

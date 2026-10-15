@@ -8,7 +8,7 @@
 //! share one code path.
 //!
 //! [`Spool`] is the unsorted sibling: an append-only scratch file replayed in
-//! write order.
+//! write order, once or, closed into a [`SpoolFile`], as often as needed.
 
 use std::{
     cmp::Reverse,
@@ -376,6 +376,46 @@ impl<T: Spill> Spool<T> {
         let mut reader = SpoolReader::open(&self.path, IO_BUFFER_BYTES)?;
         reader.remove_on_drop = true;
         Ok(reader)
+    }
+
+    /// Close the spool to read it back as many times as needed. The file is
+    /// removed once the [`SpoolFile`] is dropped.
+    pub fn finish(self) -> Result<SpoolFile<T>> {
+        let items = self.writer.items;
+        self.writer.finish()?;
+        Ok(SpoolFile {
+            path: self.path,
+            items,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// A closed spool, read from the start by each [`SpoolFile::reader`].
+pub struct SpoolFile<T> {
+    path: PathBuf,
+    items: u64,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Spill> SpoolFile<T> {
+    pub fn reader(&self) -> Result<SpoolReader<T>> {
+        SpoolReader::open(&self.path, IO_BUFFER_BYTES)
+    }
+
+    /// Items the spool holds.
+    pub fn len(&self) -> u64 {
+        self.items
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items == 0
+    }
+}
+
+impl<T> Drop for SpoolFile<T> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 

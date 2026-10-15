@@ -3,11 +3,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    parse::lattice::train::TrainReport,
     record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 14;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -28,6 +29,8 @@ pub struct BuilderReport {
     pub throughput: Throughput,
     pub scratch: ScratchReport,
     pub output: PackOutputReport,
+    /// The address parser trained on the Pack's records.
+    pub parser_training: TrainReport,
 }
 
 impl BuilderReport {
@@ -403,6 +406,8 @@ pub struct PhaseTimings {
     pub record_write_ms: u128,
     /// Finish the text and spatial indexes and write the Pack file.
     pub pack_seal_ms: u128,
+    /// Train the address parser and add its weights to the Pack file.
+    pub parser_training_ms: u128,
     pub total_ms: u128,
 }
 

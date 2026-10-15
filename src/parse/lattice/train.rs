@@ -1,8 +1,12 @@
-//! Training the parser's weights from the Pack's own records.
+//! Training the parser's weights from the Pack's own records, inside `build`.
 //!
-//! Records drawn from the Pack (addresses, POIs, streets, places, postcodes)
-//! are written out the way people write addresses: through an address
-//! template of OpenCageData's address-formatting
+//! While the builder writes records, a [`Sampler`] draws a uniform sample of
+//! them for each country and kind of record (Vitter's Algorithm R), so a
+//! planet build trains each country on as many rows as a build of that
+//! country alone, in memory that does not grow with the input. Once the Pack
+//! is sealed, [`train`] reads the drawn records back in Pack order and writes
+//! them out the way people write addresses: through an address template of
+//! OpenCageData's address-formatting
 //! (<https://github.com/OpenCageData/address-formatting>, MIT, see
 //! `data/LICENSE-address-formatting.txt`), vendored as `data/templates.tsv`
 //! by `scripts/parse_lattice_data.py`, with the noise real queries carry:
@@ -10,27 +14,25 @@
 //! unit added, one-letter typos. Some rows hide the dictionary hits of their
 //! street or venue, so the model also learns to read names the Pack does not
 //! know from their shape and place alone; the areas a row names are always
-//! names the Pack knows, as a locality or region must be. Labelled rows in
-//! libpostal's training format can be added.
+//! names the Pack knows, as a locality or region must be.
 //!
 //! The weights are learned by the averaged structured perceptron (Collins,
 //! 2002): decode each row, and when the best labelling is wrong, move the
 //! weights toward the features of the gold labelling and away from those of
 //! the prediction. Averaging the weights over every step keeps the model
-//! from following the last rows it saw.
+//! from following the last rows it saw. Rows stream from scratch files, so
+//! training memory does not grow with the number of countries either.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::File,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-    sync::OnceLock,
+    path::Path,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
@@ -40,59 +42,103 @@ use super::{
     weights::Weights,
 };
 use crate::{
+    extsort::{ExternalSorter, Scratch, Spill, Spool, SpoolFile, SpoolReader},
+    memory::MemoryBudget,
     pack::{PackReader, RecordId},
     parse::types::Label,
     record::{AddressComponents, Layer, PlaceLayer, Record},
     text_index::normalize_index_text,
+    util::codec::{get_string, get_u8, get_u64, put_str, put_u64},
 };
 
 /// `CC<TAB>template` rows, `ZZ` the default.
 const TEMPLATES: &str = include_str!("data/templates.tsv");
-/// Rows decoded per parallel batch: lattices are built in parallel, the
-/// weights updated in order.
-const BATCH_ROWS: usize = 2_048;
+/// Training rows rendered for each country of the Pack. Deepparse trains on
+/// 100,000 addresses per country; on the Japan Pack 200,000 rows label the
+/// held-out rows and the libpostal bench as well as 400,000, and 100,000
+/// worse.
+pub const ROWS_PER_COUNTRY: usize = 200_000;
+/// Passes over the training rows.
+pub const EPOCHS: usize = 5;
+/// Seed of the record draw, the noise and the row order, so a build of the
+/// same input trains the same weights.
+const SEED: u64 = 1;
+/// A Pack that renders fewer rows than this parses with the built-in
+/// weights: too few rows teach a model less than the hand-set weights know.
+const MIN_TRAIN_ROWS: usize = 1_000;
+/// Shards trained side by side, at most: more shards see fewer rows between
+/// two mixes and converge slower.
+const MAX_TRAIN_SHARDS: usize = 4;
 /// The share of rendered rows held out to measure the model.
 const HELD_OUT_SHARE: f64 = 0.05;
-/// How many records are drawn per wanted row at most, so a Pack without some
-/// layer still finishes.
-const MAX_DRAWS_PER_ROW: usize = 40;
+/// Records drawn per wanted row: a few draws render no row.
+const OVERSAMPLE: f64 = 1.25;
+/// Rows a shard holds to read its rows in an order of its own each epoch.
+const SHUFFLE_WINDOW: usize = 1 << 16;
+/// Held-out rows labelled per parallel batch.
+const EVALUATE_BATCH: usize = 1 << 12;
 
-/// What [`train_weights`] trains on and where it writes the weights.
-#[derive(Debug, Clone)]
-pub struct TrainOptions {
-    pub pack: PathBuf,
-    /// Labelled rows in libpostal's format, used as they are.
-    pub extra: Vec<PathBuf>,
-    pub out: PathBuf,
-    /// Rows rendered from the Pack's records.
-    pub rows: usize,
-    pub epochs: usize,
-    pub seed: u64,
+/// What one country's rows are made of: mostly addresses, then POIs,
+/// streets, places and postcodes. Block scheme addresses have a share of
+/// their own on top of the addresses', so their house numbers and the
+/// streets beside them are seen often.
+const SHARES: [(Draw, f64); 11] = [
+    (Draw::Layer(Layer::Address), 0.40),
+    (Draw::BlockAddress, BLOCK_ADDRESS_SHARE),
+    (Draw::Layer(Layer::Poi), 0.15),
+    (Draw::Layer(Layer::Street), 0.10),
+    (Draw::Layer(Layer::Country), 0.002),
+    (Draw::Layer(Layer::Region), 0.01),
+    (Draw::Layer(Layer::District), 0.01),
+    (Draw::Layer(Layer::Locality), 0.03),
+    (Draw::Layer(Layer::Place), 0.02),
+    (Draw::Layer(Layer::Neighbourhood), 0.01),
+    (Draw::Layer(Layer::Postcode), 0.04),
+];
+
+/// The rows one country renders of a kind of record, or `None` for a kind
+/// that is not trained on.
+fn quota(draw: Draw) -> Option<usize> {
+    SHARES
+        .iter()
+        .find(|(kind, _)| *kind == draw)
+        .map(|(_, share)| ((ROWS_PER_COUNTRY as f64 * share).ceil() as usize).max(1))
 }
 
 /// What a training run did and how well the weights label held-out rows.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TrainReport {
-    pub out: String,
+    pub rows_per_country: usize,
+    /// Rendered rows by the `name` of the country record they lie in.
+    pub rows_by_country: BTreeMap<String, usize>,
     pub rendered_rows: usize,
     /// Rendered rows with a house number, and rows of block scheme
     /// addresses (see [`BLOCK_ADDRESS_SHARE`]).
     pub house_number_rows: usize,
     pub block_address_rows: usize,
-    pub extra_rows: usize,
     pub held_out_rows: usize,
+    /// Memory the record sample held while records were written.
+    pub sample_bytes: u64,
+    pub shards: usize,
     pub epochs: usize,
     /// Training rows the model got wrong in each epoch.
     pub epoch_errors: Vec<usize>,
     /// Countries with their own transition table.
     pub countries: Vec<String>,
-    pub built_in: Accuracy,
-    pub trained: Accuracy,
+    /// Whether the Pack carries the trained weights; without them it parses
+    /// with the built-in ones.
+    pub trained: bool,
+    pub accuracy: Accuracy,
     pub seconds: f64,
+    /// Seconds spent rendering rows from the Pack, building their lattices,
+    /// and learning from them.
+    pub render_seconds: f64,
+    pub lattice_seconds: f64,
+    pub learn_seconds: f64,
 }
 
 /// Token and whole-row accuracy on the held-out rows.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Accuracy {
     pub tokens: f64,
     pub rows: f64,
@@ -100,73 +146,307 @@ pub struct Accuracy {
     pub by_label: BTreeMap<String, f64>,
 }
 
-/// Train weights on `options.pack` and write them to `options.out`.
-pub fn train_weights(options: &TrainOptions) -> Result<TrainReport> {
-    let started = Instant::now();
-    let pack = PackReader::open(&options.pack)?;
-    // Only the dictionaries: the weights the Pack carries are what this
-    // replaces, and may be of another feature layout.
-    let tagger = LatticeTagger::new(Dictionaries::open(pack.container())?, Weights::zero());
-    let mut random = Random::new(options.seed);
-    let mut rows = Renderer::new(&pack, &tagger).render(options.rows, &mut random)?;
-    let rendered_rows = rows.len();
-    let house_number_rows = rows
-        .iter()
-        .filter(|row| row.gold.contains(&Label::HouseNumber))
-        .count();
-    let block_address_rows = rows.iter().filter(|row| row.block_address).count();
-    let mut extra_rows = 0;
-    for path in &options.extra {
-        let extra = read_libpostal(path)?;
-        extra_rows += extra.len();
-        rows.extend(extra);
-    }
-    if rows.len() < 2 {
-        bail!("the Pack has too few records to train on");
-    }
-    random.shuffle(&mut rows);
-    let held_out = ((rows.len() as f64 * HELD_OUT_SHARE) as usize).clamp(1, rows.len() - 1);
-    let (test, train) = rows.split_at(held_out);
+/// Records drawn for training while the Pack is written: for each country
+/// and kind of record a uniform sample of a fixed size.
+#[derive(Debug)]
+pub struct Sampler {
+    reservoirs: BTreeMap<(Option<RecordId>, Draw), Reservoir>,
+    random: Random,
+}
 
-    let epochs = options.epochs.max(1);
-    let mut model = Model::default();
-    let mut order = (0..train.len()).collect::<Vec<_>>();
-    let mut epoch_errors = Vec::new();
-    for _ in 0..epochs {
-        random.shuffle(&mut order);
-        let mut errors = 0;
-        for batch in order.chunks(BATCH_ROWS) {
-            let lattices = batch
-                .par_iter()
-                .map(|index| {
-                    let row = &train[*index];
-                    tagger.lattice(&row.tokens, &row.suppression)
-                })
-                .collect::<Vec<_>>();
-            for (index, lattice) in batch.iter().zip(&lattices) {
-                errors += usize::from(model.learn(lattice, &train[*index]));
+#[derive(Debug, Default)]
+struct Reservoir {
+    seen: u64,
+    ids: Vec<RecordId>,
+}
+
+impl Default for Sampler {
+    fn default() -> Self {
+        Self {
+            reservoirs: BTreeMap::new(),
+            random: Random::new(SEED),
+        }
+    }
+}
+
+impl Sampler {
+    /// Offer record `id`, which lies in the country record `country`. Offers
+    /// come in record order, so the sample depends on the input alone.
+    pub fn offer(&mut self, id: RecordId, country: Option<RecordId>, record: &Record) {
+        self.add(country, Draw::Layer(record.layer()), id);
+        if is_block_address(record) {
+            self.add(country, Draw::BlockAddress, id);
+        }
+    }
+
+    fn add(&mut self, country: Option<RecordId>, draw: Draw, id: RecordId) {
+        let Some(quota) = quota(draw) else {
+            return;
+        };
+        let capacity = (quota as f64 * OVERSAMPLE).ceil() as usize;
+        let reservoir = self.reservoirs.entry((country, draw)).or_default();
+        reservoir.seen += 1;
+        if reservoir.ids.len() < capacity {
+            reservoir.ids.push(id);
+        } else {
+            let at = self.random.below(reservoir.seen) as usize;
+            if at < capacity {
+                reservoir.ids[at] = id;
             }
         }
-        epoch_errors.push(errors);
     }
-    let weights = model.averaged();
-    weights.write(&options.out)?;
-    let built_in = evaluate(&tagger, &Weights::built_in(), test);
-    let trained = evaluate(&tagger, &weights, test);
-    Ok(TrainReport {
-        out: options.out.display().to_string(),
-        rendered_rows,
-        house_number_rows,
-        block_address_rows,
-        extra_rows,
-        held_out_rows: test.len(),
-        epochs,
-        epoch_errors,
-        countries: weights.countries().map(|code| code.to_string()).collect(),
-        built_in,
-        trained,
-        seconds: started.elapsed().as_secs_f64(),
-    })
+
+    /// Bytes the sample holds.
+    pub fn resident_bytes(&self) -> usize {
+        self.reservoirs
+            .values()
+            .map(|reservoir| {
+                std::mem::size_of::<((Option<RecordId>, Draw), Reservoir)>()
+                    + reservoir.ids.capacity() * std::mem::size_of::<RecordId>()
+            })
+            .sum()
+    }
+
+    /// The drawn records of each country, each with the kind it was drawn
+    /// as and its rank in a random order of its kind's draws, in record
+    /// order. A block scheme address drawn for both of its kinds is drawn
+    /// once, as a block address.
+    fn candidates(self, random: &mut Random) -> BTreeMap<Option<RecordId>, Vec<Candidate>> {
+        let mut countries = BTreeMap::<Option<RecordId>, Vec<Candidate>>::new();
+        for ((country, draw), reservoir) in self.reservoirs {
+            let mut ids = reservoir.ids;
+            random.shuffle(&mut ids);
+            countries.entry(country).or_default().extend(
+                ids.into_iter()
+                    .enumerate()
+                    .map(|(rank, id)| Candidate { id, draw, rank }),
+            );
+        }
+        for candidates in countries.values_mut() {
+            candidates.sort_unstable_by_key(|candidate| {
+                (candidate.id, candidate.draw != Draw::BlockAddress)
+            });
+            candidates.dedup_by_key(|candidate| candidate.id);
+        }
+        countries
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    id: RecordId,
+    draw: Draw,
+    rank: usize,
+}
+
+/// Train weights on the records `sample` drew from the sealed, unpublished
+/// Pack file at `pack`. The weights are `None` when the Pack renders too few
+/// rows to learn from.
+pub fn train(
+    pack: &Path,
+    sample: Sampler,
+    scratch: &Arc<Scratch>,
+    memory: &Arc<MemoryBudget>,
+    sort_budget_bytes: usize,
+) -> Result<(Option<Weights>, TrainReport)> {
+    let started = Instant::now();
+    let mut report = TrainReport {
+        rows_per_country: ROWS_PER_COUNTRY,
+        sample_bytes: sample.resident_bytes() as u64,
+        epochs: EPOCHS,
+        ..TrainReport::default()
+    };
+    let pack = PackReader::open(pack)?;
+    // Only the dictionaries: the weights are what this trains.
+    let tagger = LatticeTagger::new(Dictionaries::open(pack.container())?, Weights::zero());
+    let mut random = Random::new(SEED);
+
+    // Each country's rows, rendered from its drawn records read in Pack
+    // order, and sorted by a random key into one random order of all rows.
+    let mut shuffled =
+        ExternalSorter::<Shuffled>::new(scratch, "parse-rows", memory, sort_budget_bytes);
+    let mut renderer = Renderer::new(&pack, &tagger);
+    for (country, candidates) in sample.candidates(&mut random) {
+        let mut drawn = BTreeMap::<Draw, Vec<(usize, Row)>>::new();
+        for candidate in candidates {
+            let record = pack.records().record(candidate.id)?;
+            if let Some(mut row) = renderer.row(candidate.id, &record, &mut random)? {
+                row.block_address = is_block_address(&record);
+                drawn
+                    .entry(candidate.draw)
+                    .or_default()
+                    .push((candidate.rank, row));
+            }
+        }
+        // The areas of one country are not those of the next.
+        renderer.names.clear();
+        let mut rows = 0;
+        for (draw, mut drawn) in drawn {
+            drawn.sort_unstable_by_key(|(rank, _)| *rank);
+            let quota = quota(draw).expect("only kinds with a quota are drawn");
+            for (_, row) in drawn.into_iter().take(quota) {
+                shuffled.push(Shuffled {
+                    key: random.next(),
+                    row,
+                })?;
+                rows += 1;
+            }
+        }
+        let name = match country {
+            Some(id) => pack
+                .records()
+                .names(id)?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| format!("record {id}")),
+            None => "none".to_string(),
+        };
+        *report.rows_by_country.entry(name).or_default() += rows;
+    }
+    drop(renderer);
+
+    // Every row is held out or goes to one shard, in the random order.
+    let shards = rayon::current_num_threads().clamp(1, MAX_TRAIN_SHARDS);
+    report.shards = shards;
+    let mut held_out = Spool::<Row>::create(scratch, "parse-held-out")?;
+    let mut parts = (0..shards)
+        .map(|_| Spool::<Row>::create(scratch, "parse-train"))
+        .collect::<Result<Vec<_>>>()?;
+    let mut train_rows = 0;
+    for item in shuffled.finish()? {
+        let Shuffled { row, .. } = item?;
+        report.rendered_rows += 1;
+        report.house_number_rows += usize::from(row.gold.contains(&Label::HouseNumber));
+        report.block_address_rows += usize::from(row.block_address);
+        if random.chance(HELD_OUT_SHARE) {
+            held_out.write(&row)?;
+        } else {
+            parts[train_rows % shards].write(&row)?;
+            train_rows += 1;
+        }
+    }
+    let held_out = held_out.finish()?;
+    let parts = parts
+        .into_iter()
+        .map(Spool::finish)
+        .collect::<Result<Vec<_>>>()?;
+    report.held_out_rows = held_out.len() as usize;
+    report.render_seconds = started.elapsed().as_secs_f64();
+    if report.rendered_rows < MIN_TRAIN_ROWS {
+        report.seconds = started.elapsed().as_secs_f64();
+        return Ok((None, report));
+    }
+
+    // Iterative parameter mixing (McDonald, Hall and Mann 2010): every epoch
+    // each shard of the rows trains its own perceptron from the mixed weights,
+    // in parallel, and the shards' weights are averaged. The result is the
+    // average over epochs of the shards' averaged weights. Each shard reads
+    // its rows in an order of its own seed, so the weights do not depend on
+    // scheduling.
+    let mut mixed = Weights::zero();
+    let mut averages = Vec::with_capacity(EPOCHS);
+    for epoch in 0..EPOCHS {
+        let results = parts
+            .par_iter()
+            .enumerate()
+            .map(|(shard, part)| -> Result<_> {
+                let mut order = Random::new(SEED ^ ((epoch as u64) << 32 | shard as u64));
+                let mut model = Model::from_weights(mixed.clone());
+                let (mut errors, mut lattice, mut learn) = (0, 0.0, 0.0);
+                for_each_shuffled(part.reader()?, &mut order, |row| {
+                    let at = Instant::now();
+                    let built = tagger.lattice(&row.tokens, &row.suppression);
+                    lattice += at.elapsed().as_secs_f64();
+                    let at = Instant::now();
+                    errors += usize::from(model.learn(&built, &row));
+                    learn += at.elapsed().as_secs_f64();
+                })?;
+                Ok((model.averaged(), model.weights, errors, lattice, learn))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Per-shard seconds, spread over the shards that ran side by side.
+        report.lattice_seconds +=
+            results.iter().map(|result| result.3).sum::<f64>() / shards as f64;
+        report.learn_seconds += results.iter().map(|result| result.4).sum::<f64>() / shards as f64;
+        report
+            .epoch_errors
+            .push(results.iter().map(|result| result.2).sum());
+        mixed = Weights::mean(results.iter().map(|result| &result.1));
+        averages.push(Weights::mean(results.iter().map(|result| &result.0)));
+    }
+    let weights = Weights::mean(averages.iter());
+    report.accuracy = evaluate_file(&tagger, &weights, &held_out)?;
+    report.countries = weights.countries().map(|code| code.to_string()).collect();
+    report.trained = true;
+    report.seconds = started.elapsed().as_secs_f64();
+    Ok((Some(weights), report))
+}
+
+/// Call `visit` on every row of `rows`, in a random order drawn through a
+/// window of [`SHUFFLE_WINDOW`] rows.
+fn for_each_shuffled(
+    rows: SpoolReader<Row>,
+    random: &mut Random,
+    mut visit: impl FnMut(Row),
+) -> Result<()> {
+    let mut window = Vec::with_capacity(SHUFFLE_WINDOW);
+    for row in rows {
+        let row = row?;
+        if window.len() < SHUFFLE_WINDOW {
+            window.push(row);
+            continue;
+        }
+        let at = random.below(window.len() as u64) as usize;
+        visit(std::mem::replace(&mut window[at], row));
+    }
+    random.shuffle(&mut window);
+    window.into_iter().for_each(visit);
+    Ok(())
+}
+
+/// A row with the random key that orders it among all rows.
+#[derive(Debug)]
+struct Shuffled {
+    key: u64,
+    row: Row,
+}
+
+impl PartialEq for Shuffled {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Shuffled {}
+
+impl PartialOrd for Shuffled {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Shuffled {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl Spill for Shuffled {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.key);
+        self.row.encode(out);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        Ok(Self {
+            key: get_u64(input)?,
+            row: Row::decode(input)?,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<u64>() + self.row.resident_bytes()
+    }
 }
 
 /// One labelled training row.
@@ -179,6 +459,95 @@ pub(super) struct Row {
     pub block_address: bool,
 }
 
+/// The dictionaries a training row hides its hits in.
+const HIDDEN_FIELDS: [Field; 2] = [Field::Street, Field::Poi];
+
+impl Spill for Row {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.tokens.words.len() as u64);
+        for ((word, break_before), joiner) in self
+            .tokens
+            .words
+            .iter()
+            .zip(&self.tokens.breaks)
+            .zip(&self.tokens.joiners)
+        {
+            put_str(out, word);
+            out.push(u8::from(*break_before));
+            put_u64(out, joiner.map_or(0, u64::from));
+        }
+        put_u64(out, self.gold.len() as u64);
+        out.extend(self.gold.iter().map(|label| *label as u8));
+        put_u64(out, self.suppression.0.len() as u64);
+        for (field, start, end) in &self.suppression.0 {
+            let field = HIDDEN_FIELDS
+                .iter()
+                .position(|hidden| hidden == field)
+                .expect("training rows hide street and venue hits only");
+            out.push(field as u8);
+            put_u64(out, *start as u64);
+            put_u64(out, *end as u64);
+        }
+        out.push(u8::from(self.block_address));
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let mut tokens = Tokens::default();
+        for _ in 0..get_u64(input)? {
+            let word = get_string(input)?;
+            let break_before = get_u8(input)? != 0;
+            let joiner = match get_u64(input)? {
+                0 => None,
+                code => Some(
+                    u32::try_from(code)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| anyhow::anyhow!("invalid joiner in a training row"))?,
+                ),
+            };
+            tokens.words.push(word);
+            tokens.breaks.push(break_before);
+            tokens.joiners.push(joiner);
+        }
+        let mut gold = Vec::new();
+        for _ in 0..get_u64(input)? {
+            let Some(label) = Label::ALL.get(usize::from(get_u8(input)?)) else {
+                bail!("invalid label in a training row");
+            };
+            gold.push(*label);
+        }
+        let mut suppression = Suppression::default();
+        for _ in 0..get_u64(input)? {
+            let Some(field) = HIDDEN_FIELDS.get(usize::from(get_u8(input)?)) else {
+                bail!("invalid hidden field in a training row");
+            };
+            let start = get_u64(input)? as usize;
+            let end = get_u64(input)? as usize;
+            suppression.hide(*field, start, end);
+        }
+        Ok(Self {
+            tokens,
+            gold,
+            suppression,
+            block_address: get_u8(input)? != 0,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .tokens
+                .words
+                .iter()
+                .map(|word| word.capacity() + std::mem::size_of::<String>())
+                .sum::<usize>()
+            + self.tokens.breaks.capacity()
+            + self.tokens.joiners.capacity() * std::mem::size_of::<Option<char>>()
+            + self.gold.capacity()
+            + self.suppression.0.capacity() * std::mem::size_of::<(Field, usize, usize)>()
+    }
+}
+
 /// The averaged perceptron's state.
 #[derive(Debug)]
 struct Model {
@@ -188,17 +557,16 @@ struct Model {
     step: f32,
 }
 
-impl Default for Model {
-    fn default() -> Self {
+impl Model {
+    /// A perceptron that starts from `weights`.
+    fn from_weights(weights: Weights) -> Self {
         Self {
-            weights: Weights::zero(),
+            weights,
             totals: Weights::zero(),
             step: 1.0,
         }
     }
-}
 
-impl Model {
     /// Decode `row` and update toward its gold labels when it is wrong.
     /// Returns whether it was wrong.
     fn learn(&mut self, lattice: &Lattice, row: &Row) -> bool {
@@ -285,55 +653,96 @@ impl Model {
                 .weights
                 .countries
                 .iter()
-                .map(|(country, table)| (*country, average(table, &self.totals.countries[country])))
+                .map(|(country, table)| {
+                    let totals = self.totals.countries.get(country);
+                    let average = match totals {
+                        Some(totals) => average(table, totals),
+                        None => table.clone(),
+                    };
+                    (*country, average)
+                })
                 .collect(),
         }
     }
 }
 
-/// Token and row accuracy of `weights` on `rows`.
-fn evaluate(tagger: &LatticeTagger, weights: &Weights, rows: &[Row]) -> Accuracy {
-    let results = rows
-        .par_iter()
-        .map(|row| {
-            let lattice = tagger.lattice(&row.tokens, &Suppression::default());
-            decode::best(&lattice, weights, 1)
-                .into_iter()
-                .next()
-                .map(|path| lattice.units.collapse(&path.labels(&lattice)))
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>();
-    let mut right = 0usize;
-    let mut tokens = 0usize;
-    let mut whole = 0usize;
-    let mut by_label = BTreeMap::<Label, (usize, usize)>::new();
-    for (row, labels) in rows.iter().zip(&results) {
-        whole += usize::from(*labels == row.gold);
-        for (gold, label) in row.gold.iter().zip(labels) {
-            let counts = by_label.entry(*gold).or_default();
-            counts.1 += 1;
-            tokens += 1;
-            if gold == label {
-                counts.0 += 1;
-                right += 1;
+/// Token and row accuracy of `weights` on the rows of `rows`, read in
+/// batches.
+fn evaluate_file(
+    tagger: &LatticeTagger,
+    weights: &Weights,
+    rows: &SpoolFile<Row>,
+) -> Result<Accuracy> {
+    let mut tally = Tally::default();
+    let mut reader = rows.reader()?;
+    loop {
+        let batch = reader
+            .by_ref()
+            .take(EVALUATE_BATCH)
+            .collect::<Result<Vec<_>>>()?;
+        if batch.is_empty() {
+            break;
+        }
+        tally.add(tagger, weights, &batch);
+    }
+    Ok(tally.accuracy())
+}
+
+/// Counts of rows and tokens labelled right.
+#[derive(Debug, Default)]
+struct Tally {
+    rows: usize,
+    whole: usize,
+    tokens: usize,
+    right: usize,
+    by_label: BTreeMap<Label, (usize, usize)>,
+}
+
+impl Tally {
+    fn add(&mut self, tagger: &LatticeTagger, weights: &Weights, rows: &[Row]) {
+        let results = rows
+            .par_iter()
+            .map(|row| {
+                let lattice = tagger.lattice(&row.tokens, &Suppression::default());
+                decode::best(&lattice, weights, 1)
+                    .into_iter()
+                    .next()
+                    .map(|path| lattice.units.collapse(&path.labels(&lattice)))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        for (row, labels) in rows.iter().zip(&results) {
+            self.rows += 1;
+            self.whole += usize::from(*labels == row.gold);
+            for (gold, label) in row.gold.iter().zip(labels) {
+                let counts = self.by_label.entry(*gold).or_default();
+                counts.1 += 1;
+                self.tokens += 1;
+                if gold == label {
+                    counts.0 += 1;
+                    self.right += 1;
+                }
             }
         }
     }
-    let share = |part: usize, all: usize| {
-        if all == 0 {
-            0.0
-        } else {
-            part as f64 / all as f64
+
+    fn accuracy(&self) -> Accuracy {
+        let share = |part: usize, all: usize| {
+            if all == 0 {
+                0.0
+            } else {
+                part as f64 / all as f64
+            }
+        };
+        Accuracy {
+            tokens: share(self.right, self.tokens),
+            rows: share(self.whole, self.rows),
+            by_label: self
+                .by_label
+                .iter()
+                .map(|(label, (right, all))| (label.name().to_string(), share(*right, *all)))
+                .collect(),
         }
-    };
-    Accuracy {
-        tokens: share(right, tokens),
-        rows: share(whole, rows.len()),
-        by_label: by_label
-            .into_iter()
-            .map(|(label, (right, all))| (label.name().to_string(), share(right, all)))
-            .collect(),
     }
 }
 
@@ -652,65 +1061,6 @@ impl<'a> Renderer<'a> {
                 .map(|field| tagger.dictionaries().keys(field)),
             template_countries: templates().keys().cloned().collect(),
         }
-    }
-
-    /// About `rows` rows from records drawn at random, by layer: mostly
-    /// addresses, then POIs, streets, places and postcodes. Block scheme
-    /// addresses have a share of their own on top of the addresses', so
-    /// their house numbers and the streets beside them are seen often.
-    fn render(&mut self, rows: usize, random: &mut Random) -> Result<Vec<Row>> {
-        let count = self.pack.records().record_count();
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let quota = |share: f64| ((rows as f64 * share).ceil() as usize).max(1);
-        let mut quotas = HashMap::from([
-            (Draw::Layer(Layer::Address), quota(0.40)),
-            (Draw::BlockAddress, quota(BLOCK_ADDRESS_SHARE)),
-            (Draw::Layer(Layer::Poi), quota(0.15)),
-            (Draw::Layer(Layer::Street), quota(0.10)),
-            (Draw::Layer(Layer::Country), quota(0.002)),
-            (Draw::Layer(Layer::Region), quota(0.01)),
-            (Draw::Layer(Layer::District), quota(0.01)),
-            (Draw::Layer(Layer::Locality), quota(0.03)),
-            (Draw::Layer(Layer::Place), quota(0.02)),
-            (Draw::Layer(Layer::Neighbourhood), quota(0.01)),
-            (Draw::Layer(Layer::Postcode), quota(0.04)),
-        ]);
-        let left = |quotas: &HashMap<Draw, usize>, draw: Draw| {
-            quotas.get(&draw).is_some_and(|left| *left > 0)
-        };
-        let mut out = Vec::with_capacity(rows);
-        for _ in 0..rows.saturating_mul(MAX_DRAWS_PER_ROW) {
-            if out.len() >= rows {
-                break;
-            }
-            let id = random.below(count);
-            let layer = Draw::Layer(self.pack.records().header(id)?.layer);
-            let block_left =
-                layer == Draw::Layer(Layer::Address) && left(&quotas, Draw::BlockAddress);
-            if !left(&quotas, layer) && !block_left {
-                continue;
-            }
-            let record = self.pack.records().record(id)?;
-            let block = is_block_address(&record);
-            // A block scheme address takes its own share first, any other
-            // record only its layer's.
-            let draw = if block && block_left {
-                Draw::BlockAddress
-            } else {
-                layer
-            };
-            if !left(&quotas, draw) {
-                continue;
-            }
-            if let Some(mut row) = self.row(id, &record, random)? {
-                *quotas.get_mut(&draw).expect("quota") -= 1;
-                row.block_address = block;
-                out.push(row);
-            }
-        }
-        Ok(out)
     }
 
     fn row(&mut self, id: RecordId, record: &Record, random: &mut Random) -> Result<Option<Row>> {
@@ -1161,7 +1511,7 @@ struct Areas {
 }
 
 /// What a drawn record is counted against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Draw {
     Layer(Layer),
     BlockAddress,
@@ -1276,60 +1626,6 @@ fn typo(word: &str, random: &mut Random) -> String {
     chars.into_iter().collect()
 }
 
-/// Rows in libpostal's training format: `language<TAB>country<TAB>address`
-/// or `country<TAB>address`, the address as space-separated `token/label`
-/// pairs with `,/SEP` or `/FSEP` between fields.
-fn read_libpostal(path: &Path) -> Result<Vec<Row>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut rows = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let address = match fields.as_slice() {
-            [_, _, address] | [_, address] => *address,
-            _ => continue,
-        };
-        if let Some(row) = libpostal_row(address) {
-            rows.push(row);
-        }
-    }
-    Ok(rows)
-}
-
-fn libpostal_row(address: &str) -> Option<Row> {
-    let mut tokens = Tokens::default();
-    let mut gold = Vec::new();
-    let mut pending_break = false;
-    for pair in address.split_whitespace() {
-        let (text, label) = pair.rsplit_once('/')?;
-        let label = match label {
-            "SEP" | "FSEP" => {
-                pending_break = true;
-                continue;
-            }
-            "house_number" => Label::HouseNumber,
-            "road" => Label::Street,
-            "unit" | "level" | "entrance" | "staircase" => Label::Unit,
-            "city" | "suburb" | "city_district" | "island" => Label::Locality,
-            "state" | "state_district" | "country_region" => Label::Region,
-            "postcode" => Label::Postcode,
-            "country" => Label::Country,
-            _ => Label::Other,
-        };
-        let words = Tokens::new(text);
-        for (word, joiner) in words.words.into_iter().zip(words.joiners) {
-            tokens.push(word, std::mem::take(&mut pending_break), joiner);
-            gold.push(label);
-        }
-    }
-    (!tokens.is_empty()).then(|| Row {
-        tokens,
-        gold,
-        suppression: Suppression::default(),
-        block_address: false,
-    })
-}
-
 /// SplitMix64: small, fast and the same on every platform, so a seed gives
 /// the same rows and weights everywhere.
 #[derive(Debug, Clone)]
@@ -1431,29 +1727,95 @@ mod tests {
         assert_eq!(labels[4], (Region, "on".to_string(), true));
     }
 
+    fn address(street: Option<&str>, areas: &[&str]) -> Record {
+        Record::Address(crate::record::AddressRecord {
+            address: AddressComponents {
+                areas: areas.iter().map(|area| area.to_string()).collect(),
+                number: "10-8".into(),
+                street: street.map(str::to_string),
+                place: None,
+                unit: None,
+                locality: None,
+                region: None,
+                postcode: None,
+                country: None,
+            },
+            geometry: crate::record::point_geometry(0.0, 0.0),
+            location_precision: crate::record::LocationPrecision::Point,
+            source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+        })
+    }
+
+    #[test]
+    fn the_sample_holds_a_fixed_share_of_each_country() {
+        let street = address(Some("King Street"), &[]);
+        let block = address(None, &["5丁目"]);
+        let mut sampler = Sampler::default();
+        let addresses = quota(Draw::Layer(Layer::Address)).expect("quota");
+        let blocks = quota(Draw::BlockAddress).expect("quota");
+        // One large country, one small, and records in no country.
+        for id in 0..3 * addresses as u64 {
+            sampler.offer(id, Some(1), &street);
+        }
+        for id in 0..10 {
+            sampler.offer(1_000_000 + id, Some(2), &block);
+            sampler.offer(2_000_000 + id, None, &street);
+        }
+        let capacity = |quota: usize| (quota as f64 * OVERSAMPLE).ceil() as usize;
+        let held = |country, draw| sampler.reservoirs[&(country, draw)].ids.len();
+        assert_eq!(
+            held(Some(1), Draw::Layer(Layer::Address)),
+            capacity(addresses)
+        );
+        assert!(capacity(blocks) > 10);
+        assert_eq!(held(Some(2), Draw::Layer(Layer::Address)), 10);
+        assert_eq!(held(Some(2), Draw::BlockAddress), 10);
+        assert_eq!(held(None, Draw::Layer(Layer::Address)), 10);
+
+        let candidates = sampler.candidates(&mut Random::new(5));
+        // The large country's draws spread over all its records.
+        let large = &candidates[&Some(1)];
+        assert!(large.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(large.last().expect("drawn").id > 2 * addresses as u64);
+        // A block address drawn for both of its kinds is drawn once.
+        let small = &candidates[&Some(2)];
+        assert_eq!(small.len(), 10);
+        assert!(
+            small
+                .iter()
+                .all(|candidate| candidate.draw == Draw::BlockAddress)
+        );
+    }
+
+    #[test]
+    fn rows_round_trip_through_scratch_files() {
+        let mut tokens = Tokens::new("670 king st, toronto 1/2");
+        tokens.push("東京".to_string(), true, Some('-'));
+        let mut suppression = Suppression::default();
+        suppression.hide(Field::Street, 1, 3);
+        suppression.hide(Field::Poi, 0, 1);
+        let row = Row {
+            gold: vec![Label::HouseNumber; tokens.len()],
+            tokens,
+            suppression,
+            block_address: true,
+        };
+        let mut bytes = Vec::new();
+        row.encode(&mut bytes);
+        let mut input = bytes.as_slice();
+        let read = Row::decode(&mut input).expect("decode");
+        assert!(input.is_empty());
+        assert_eq!(read.tokens, row.tokens);
+        assert_eq!(read.gold, row.gold);
+        assert_eq!(read.suppression.0, row.suppression.0);
+        assert!(read.block_address);
+    }
+
     #[test]
     fn block_scheme_addresses_are_numbered_in_areas_without_a_street() {
-        let record = |street: Option<&str>, areas: &[&str]| {
-            Record::Address(crate::record::AddressRecord {
-                address: AddressComponents {
-                    areas: areas.iter().map(|area| area.to_string()).collect(),
-                    number: "10-8".into(),
-                    street: street.map(str::to_string),
-                    place: None,
-                    unit: None,
-                    locality: None,
-                    region: None,
-                    postcode: None,
-                    country: None,
-                },
-                geometry: crate::record::point_geometry(0.0, 0.0),
-                location_precision: crate::record::LocationPrecision::Point,
-                source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
-            })
-        };
-        assert!(is_block_address(&record(None, &["5丁目"])));
-        assert!(!is_block_address(&record(Some("King Street"), &["Annex"])));
-        assert!(!is_block_address(&record(None, &[])));
+        assert!(is_block_address(&address(None, &["5丁目"])));
+        assert!(!is_block_address(&address(Some("King Street"), &["Annex"])));
+        assert!(!is_block_address(&address(None, &[])));
     }
 
     #[test]
@@ -1498,21 +1860,6 @@ mod tests {
             ..address
         };
         assert!(chained_areas(&alone, &mut random).is_none());
-    }
-
-    #[test]
-    fn libpostal_rows_keep_labels_and_field_breaks() {
-        use Label::*;
-        let row =
-            libpostal_row("123/house_number main/road st/road ,/SEP new/city york/city ny/state")
-                .expect("row");
-        assert_eq!(row.tokens.words, ["123", "main", "st", "new", "york", "ny"]);
-        assert_eq!(row.tokens.breaks, [false, false, false, true, false, false]);
-        assert_eq!(
-            row.gold,
-            [HouseNumber, Street, Street, Locality, Locality, Region]
-        );
-        assert!(libpostal_row("no-label").is_none());
     }
 
     #[test]
@@ -1563,13 +1910,15 @@ mod tests {
             ),
             row("9 king street", vec![HouseNumber, Street, Street]),
         ];
-        let mut model = Model::default();
+        let mut model = Model::from_weights(Weights::zero());
         for _ in 0..10 {
             for row in &rows {
                 model.learn(&tagger.lattice(&row.tokens, &row.suppression), row);
             }
         }
-        let accuracy = evaluate(&tagger, &model.averaged(), &rows);
+        let mut tally = Tally::default();
+        tally.add(&tagger, &model.averaged(), &rows);
+        let accuracy = tally.accuracy();
         assert_eq!(accuracy.rows, 1.0, "{accuracy:?}");
     }
 }

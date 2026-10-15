@@ -16,8 +16,8 @@
 
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::{self, BufWriter, Seek, Write},
+    fs::{File, OpenOptions},
+    io::{self, BufWriter, Seek, SeekFrom, Write},
     ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
@@ -78,6 +78,36 @@ impl ContainerWriter {
             file,
             offset: HEADER_BYTES,
             sections: BTreeMap::new(),
+            open: None,
+        })
+    }
+
+    /// Reopen a finished Pack file that nothing reads yet to add sections
+    /// after its last one. The table of contents is cut off here and written
+    /// again, with the new sections, by [`Self::finish`].
+    pub fn append(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        // The mapping is dropped before the file is cut: a mapped file cannot
+        // be shortened on Windows.
+        let sections = Container::open(&path)?.sections().clone();
+        let end = sections
+            .values()
+            .map(|info| info.offset + info.len)
+            .max()
+            .unwrap_or(HEADER_BYTES);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.set_len(end).with_context(|| {
+            format!("failed to cut the table of contents of {}", path.display())
+        })?;
+        file.seek(SeekFrom::Start(end))?;
+        Ok(Self {
+            path,
+            file: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+            offset: end,
+            sections,
             open: None,
         })
     }
@@ -392,6 +422,32 @@ mod tests {
         let container = Container::open(&path).expect("open");
         let error = container.verify().unwrap_err().to_string();
         assert!(error.contains("alpha"), "{error}");
+    }
+
+    #[test]
+    fn appends_sections_to_a_finished_file() {
+        let path = temp_file("append");
+        let mut writer = ContainerWriter::create(&path).expect("writer");
+        writer.add("alpha", 1, b"first").expect("alpha");
+        writer.finish().expect("finish");
+
+        let mut writer = ContainerWriter::append(&path).expect("append");
+        writer.add("beta", 2, b"added later").expect("beta");
+        assert!(writer.add("alpha", 1, b"again").is_err());
+        let size = writer.finish().expect("finish");
+
+        let container = Container::open(&path).expect("open");
+        assert_eq!(container.file_size(), size);
+        container.verify().expect("intact");
+        assert_eq!(
+            container.section("alpha", 1).expect("alpha").as_slice(),
+            b"first"
+        );
+        assert_eq!(
+            container.section("beta", 2).expect("beta").as_slice(),
+            b"added later"
+        );
+        assert_eq!(container.sections()["beta"].offset % SECTION_ALIGN, 0);
     }
 
     #[test]

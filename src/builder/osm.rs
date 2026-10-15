@@ -11,7 +11,10 @@
 //! pass 2  read way blocks                 -> boundary relation member ways
 //! pass 3  read node blocks, merge-join    -> coordinates per way position
 //! emit    ways + coordinates (parallel)   -> address, POI, street, interpolation records
-//! write   context records, then the rest, each in Hilbert order
+//! write   context records, then the rest, each in Hilbert order,
+//!         drawing a sample of each country's records
+//! seal    text, spatial and parser dictionary indexes into the Pack file
+//! train   the address parser on the sample, its weights added to the Pack
 //! ```
 
 mod address;
@@ -56,7 +59,10 @@ use crate::{
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
     },
-    parse::lattice::weights::Weights,
+    parse::lattice::{
+        train::{self, Sampler},
+        weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
+    },
     record::{Record, RejectedRecord},
     records::quantize,
     text_index::PostcodeAreas,
@@ -84,8 +90,6 @@ pub struct BuildOsmOptions {
     pub memory_budget_bytes: usize,
     /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
-    /// Trained address parser weights to carry in the Pack.
-    pub parse_weights: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -95,7 +99,6 @@ impl Default for BuildOsmOptions {
             pack: PathBuf::new(),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             scratch_dir: None,
-            parse_weights: None,
         }
     }
 }
@@ -106,8 +109,9 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         bail!("input {} does not exist", options.input.display());
     }
     // Up to four sorters hold memory at the same time (node references or
-    // resolved coordinates, the two record sorters, the spatial pairs); the text
-    // index buffers take the same share as one sorter while records are written.
+    // resolved coordinates, the two record sorters, the spatial pairs). While
+    // records are written the text index is what every record waits on, so its
+    // buffers take two sorters' share: more indexing threads, fewer segments.
     let sorter_budget = (options.memory_budget_bytes / 4).max(1);
     let memory = MemoryBudget::new(options.memory_budget_bytes);
     let mut writer = PackWriter::create_with(
@@ -116,12 +120,9 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
             sort_budget_bytes: sorter_budget,
-            text_index_memory_bytes: sorter_budget,
+            text_index_memory_bytes: sorter_budget * 2,
         },
     )?;
-    if let Some(path) = &options.parse_weights {
-        writer.set_parse_weights(Weights::read(path)?);
-    }
     let scratch = Arc::clone(writer.scratch());
     let mut build = Build {
         report: BuilderReport {
@@ -156,7 +157,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let mut way_blobs = Vec::new();
     for_each_block(
         &options.input,
-        "1/7 scan OSM objects",
+        "1/8 scan OSM objects",
         None,
         |offset, block| Ok((offset, scan_block(&block))),
         |(offset, output)| {
@@ -204,7 +205,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     if !member_ids.is_empty() {
         for_each_block(
             &options.input,
-            "2/7 read boundary member ways",
+            "2/8 read boundary member ways",
             Some(&way_blobs),
             |_, block| Ok(member_ways(&block, &member_ids)),
             |found| {
@@ -241,7 +242,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let phase = Instant::now();
     let resolved_stats = resolved.stats();
     let mut boundary_ways = Vec::new();
-    let progress = item_progress_bar(features.written(), "4/7 assemble ways");
+    let progress = item_progress_bar(features.written(), "4/8 assemble ways");
     let mut member_vertices = emit_features(
         features.into_reader()?,
         resolved.finish()?,
@@ -251,7 +252,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
             build.absorb(output.emitted)
         },
     )?;
-    progress.finish_with_message("4/7 assemble ways complete");
+    progress.finish_with_message("4/8 assemble ways complete");
     build.report.phases.feature_emission_ms = phase.elapsed().as_millis();
 
     // Admin boundaries, their place records and postcode centroids.
@@ -331,22 +332,25 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
     let context_count = ordered.written();
+    let mut sample = Sampler::default();
     write_ordered(
         &mut writer,
+        &mut sample,
         ordered.into_reader()?,
         context_count,
         &index,
-        "5/7 write context records",
+        "5/8 write context records",
     )?;
     report.phases.context_record_write_ms = phase.elapsed().as_millis();
 
     let phase = Instant::now();
     write_ordered(
         &mut writer,
+        &mut sample,
         records.finish()?,
         record_stats.items,
         &index,
-        "6/7 write records",
+        "6/8 write records",
     )?;
     drop(index);
     report.phases.record_write_ms = phase.elapsed().as_millis();
@@ -354,11 +358,30 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let phase = Instant::now();
     report.scratch.spilled_bytes = scratch.spilled_bytes();
     report.scratch.peak_tracked_bytes = memory.peak() as u64;
-    drop(scratch);
-    let progress = stage_progress("7/7 finish Pack indexes");
-    let (sealed, stats) = writer.seal()?;
-    progress.finish_with_message("7/7 finish Pack indexes complete");
+    let progress = stage_progress("7/8 finish Pack indexes");
+    let (mut sealed, mut stats) = writer.seal()?;
+    progress.finish_with_message("7/8 finish Pack indexes complete");
     report.phases.pack_seal_ms = phase.elapsed().as_millis();
+
+    // The parser learns from the sealed Pack's dictionaries and the records
+    // drawn while they were written, and its weights join the Pack before it
+    // is published.
+    let phase = Instant::now();
+    let progress = stage_progress("8/8 train address parser");
+    let (weights, training) =
+        train::train(&sealed.path(), sample, &scratch, &memory, sorter_budget)?;
+    if let Some(weights) = weights {
+        let bytes = weights.to_bytes();
+        sealed.add_section(WEIGHTS_SECTION, WEIGHTS_VERSION, &bytes)?;
+        stats.bytes = sealed.bytes();
+        stats
+            .sections
+            .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
+    }
+    drop(scratch);
+    progress.finish_with_message("8/8 train address parser complete");
+    report.parser_training = training;
+    report.phases.parser_training_ms = phase.elapsed().as_millis();
 
     for (name, stats) in [
         ("node_requests", request_stats),
@@ -473,35 +496,67 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
         .collect()
 }
 
-/// Write sorted records in batches, computing admin context in parallel.
-/// Boundary and derived-country records describe context and get none.
+/// Write sorted records in batches, computing admin context in parallel, and
+/// offer each record to the parser's training sample under the country it
+/// lies in. Boundary and derived-country records describe context and get
+/// none, but are offered under the country their point lies in.
 fn write_ordered(
     writer: &mut PackWriter,
-    records: impl Iterator<Item = Result<PendingRecord>>,
+    sample: &mut Sampler,
+    records: impl Iterator<Item = Result<PendingRecord>> + Send,
     total: u64,
     index: &BoundaryIndex,
     message: &'static str,
 ) -> Result<()> {
     let progress = item_progress_bar(total, message);
-    let mut records = records.peekable();
-    while records.peek().is_some() {
-        let batch = records
-            .by_ref()
-            .take(WRITE_BATCH_RECORDS)
-            .collect::<Result<Vec<_>>>()?;
-        let batch = batch
-            .into_par_iter()
-            .map(|pending| {
-                let context: Option<RecordContext> = match pending.origin {
-                    Some(_) => None,
-                    None => record_context(index, &pending.record),
-                };
-                (pending.record, context)
-            })
-            .collect::<Vec<_>>();
-        writer.write_batch(&batch)?;
-        progress.inc(batch.len() as u64);
-    }
+    let mut preparer = writer.preparer();
+    // One thread reads and prepares the next batch while this one appends the
+    // batch before: the store, the text index and the spatial pairs take
+    // records in order, and would otherwise wait on the preparing.
+    std::thread::scope(|scope| -> Result<()> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        scope.spawn(move || {
+            let mut records = records.peekable();
+            while records.peek().is_some() {
+                let prepared = records
+                    .by_ref()
+                    .take(WRITE_BATCH_RECORDS)
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|batch| {
+                        let (batch, countries): (Vec<_>, Vec<_>) = batch
+                            .into_par_iter()
+                            .map(|pending| {
+                                let located = record_context(index, &pending.record);
+                                let country = located
+                                    .and_then(|context| context.admin_context.country_record_id);
+                                let context: Option<RecordContext> = match pending.origin {
+                                    Some(_) => None,
+                                    None => located,
+                                };
+                                ((pending.record, context), country)
+                            })
+                            .unzip();
+                        preparer
+                            .prepare(batch)
+                            .map(|prepared| (prepared, countries))
+                    });
+                let failed = prepared.is_err();
+                if sender.send(prepared).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        for prepared in receiver {
+            let (prepared, countries) = prepared?;
+            for ((id, record), country) in prepared.records().zip(countries) {
+                sample.offer(id, country, record);
+            }
+            let len = prepared.len() as u64;
+            writer.commit(prepared)?;
+            progress.inc(len);
+        }
+        Ok(())
+    })?;
     progress.finish_with_message(format!("{message} complete"));
     Ok(())
 }
@@ -716,7 +771,6 @@ mod tests {
             pack: root.to_path_buf(),
             memory_budget_bytes,
             scratch_dir: None,
-            parse_weights: None,
         })
         .expect("build")
     }

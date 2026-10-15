@@ -3,10 +3,10 @@
 //! An edge scores the sum of the weights of its features under its label; a
 //! path adds the transition between each pair of consecutive labels, from the
 //! global table plus the table of the country it is decoded as. Weights are
-//! learned by [`super::train`] and stored in the Pack (`parse/weights`) or in
-//! a file beside it, in the format [`Weights::to_bytes`] writes. Without
-//! either, [`Weights::built_in`] holds hand-set weights that read the common
-//! address shapes, so a Pack parses before anything was trained for it.
+//! learned by [`super::train`] when the Pack is built and stored in it
+//! (`parse/weights`), in the format [`Weights::to_bytes`] writes. A Pack too
+//! small to train on carries none, and [`Weights::built_in`] holds hand-set
+//! weights that read the common address shapes for it.
 //!
 //! ```text
 //! magic "OGPARSEW" | version u32 | schema u64 | features u32 | labels u32
@@ -16,7 +16,7 @@
 //!
 //! Every number is little-endian.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -61,6 +61,41 @@ impl Transitions<'_> {
 
 impl Weights {
     /// All weights zero.
+    /// The mean of `all`, each table entry by entry. A country one of them
+    /// has no table for counts as zeros there.
+    pub(super) fn mean<'a>(all: impl Iterator<Item = &'a Weights>) -> Self {
+        let mut sum = Self::zero();
+        let mut count = 0usize;
+        for weights in all {
+            count += 1;
+            for (total, value) in sum.edge.iter_mut().zip(&weights.edge) {
+                *total += value;
+            }
+            for (total, value) in sum.global.iter_mut().zip(&weights.global) {
+                *total += value;
+            }
+            for (country, table) in &weights.countries {
+                let totals = sum
+                    .countries
+                    .entry(*country)
+                    .or_insert_with(|| vec![0.0; table.len()]);
+                for (total, value) in totals.iter_mut().zip(table) {
+                    *total += value;
+                }
+            }
+        }
+        let scale = 1.0 / count.max(1) as f32;
+        for value in sum
+            .edge
+            .iter_mut()
+            .chain(sum.global.iter_mut())
+            .chain(sum.countries.values_mut().flatten())
+        {
+            *value *= scale;
+        }
+        sum
+    }
+
     pub fn zero() -> Self {
         Self {
             edge: vec![0.0; features::COUNT * LABELS],
@@ -348,18 +383,6 @@ impl Weights {
         Self::from_bytes(&bytes)
             .with_context(|| format!("invalid Pack section {WEIGHTS_SECTION}"))
             .map(Some)
-    }
-
-    pub fn read(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read parser weights {}", path.display()))?;
-        Self::from_bytes(&bytes)
-            .with_context(|| format!("invalid parser weights {}", path.display()))
-    }
-
-    pub fn write(&self, path: &Path) -> Result<()> {
-        fs::write(path, self.to_bytes())
-            .with_context(|| format!("failed to write parser weights {}", path.display()))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

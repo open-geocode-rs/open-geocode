@@ -140,10 +140,7 @@ impl PackTextSearcher {
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
         let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
-        let tagger = Arc::new(LatticeTagger::from_container(
-            pack.container(),
-            pack.path(),
-        )?);
+        let tagger = Arc::new(LatticeTagger::from_container(pack.container())?);
         let mut columns = HashMap::new();
         for segment in reader.searcher().segment_readers() {
             let fast_fields = segment.fast_fields();
