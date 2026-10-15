@@ -27,7 +27,7 @@ fixtures/parse/
   predictions/libpostal/<cc>.messy.tsv
 ```
 
-Only `jp` is committed so far; the other four countries are prepared with the same commands.
+`jp` and `de` are committed so far; the other three countries are prepared with the same commands.
 
 A gold row is `lang<TAB>cc<TAB>fields`, with the fields separated by single spaces.
 A field is `token/label`, or a bare `,` that marks where the corpus separated two parts of the address (its `SEP` and `FSEP`).
@@ -36,7 +36,7 @@ A label is one of og's eight: `house_number`, `unit`, `street`, `locality`, `reg
 
 A predictions file has one row per gold row, in the same order and format, with the variant's tokens and libpostal's labels.
 A row libpostal failed on is stored as `lang<TAB>cc<TAB>!failed` and scored wrong on every token, never dropped.
-The committed `jp` predictions have no failed rows.
+The committed `jp` and `de` predictions have no failed rows.
 
 Each variant has its own predictions file rather than one file with a variant column, so every file is in the gold format and is checked token for token against the variant it answers.
 
