@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     fmt,
     fs::File,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -304,11 +305,14 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
         }
     };
 
-    let mut output = create_csv(&options.output, &output_header, delimiter)?;
+    // The output starts as the input does, so a program that reads the
+    // mark as UTF-8 reads both alike.
+    let mark = starts_with_byte_order_mark(&options.input)?;
+    let mut output = create_csv(&options.output, &output_header, delimiter, mark)?;
     let mut audit = options
         .audit
         .as_ref()
-        .map(|path| create_csv(path, &audit_header, delimiter))
+        .map(|path| create_csv(path, &audit_header, delimiter, mark))
         .transpose()?;
     let mut report = BatchGeocodeReport {
         rows: 0,
@@ -361,7 +365,6 @@ const SNIFF_BYTES: usize = 64 << 10;
 /// the one that splits most of its first lines into the same number of
 /// fields, more than one. A comma when none does.
 pub fn detect_delimiter(path: &Path) -> Result<u8> {
-    use std::io::Read;
     let mut sample = Vec::with_capacity(SNIFF_BYTES);
     File::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
@@ -414,14 +417,24 @@ pub fn open_delimited(path: &Path, delimiter: u8) -> Result<csv::Reader<File>> {
         .with_context(|| format!("failed to open {}", path.display()))
 }
 
-/// The byte order mark some files start with.
+/// The byte order mark some files start with. Reading leaves it out.
 const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 
+/// Whether a file starts with [`BYTE_ORDER_MARK`].
+fn starts_with_byte_order_mark(path: &Path) -> Result<bool> {
+    let mut start = Vec::with_capacity(BYTE_ORDER_MARK.len());
+    File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .take(BYTE_ORDER_MARK.len() as u64)
+        .read_to_end(&mut start)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(start == BYTE_ORDER_MARK)
+}
+
 /// A cell as text. Bytes that are not UTF-8, such as a Latin-1 file's
-/// accents, become replacement characters instead of failing the row, and a
-/// byte order mark is left out.
+/// accents, become replacement characters instead of failing the row.
 pub fn text(cell: &[u8]) -> Cow<'_, str> {
-    String::from_utf8_lossy(cell.strip_prefix(BYTE_ORDER_MARK).unwrap_or(cell))
+    String::from_utf8_lossy(cell)
 }
 
 /// A row's cells as [`text`].
@@ -624,7 +637,12 @@ fn read_csv(path: &Path) -> Result<CsvTable> {
     Ok(CsvTable { headers, rows })
 }
 
-fn create_csv(path: &Path, header: &ByteRecord, delimiter: u8) -> Result<PendingCsv> {
+fn create_csv(
+    path: &Path,
+    header: &ByteRecord,
+    delimiter: u8,
+    byte_order_mark: bool,
+) -> Result<PendingCsv> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -636,8 +654,12 @@ fn create_csv(path: &Path, header: &ByteRecord, delimiter: u8) -> Result<Pending
         .with_context(|| format!("{} is not a file path", path.display()))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let file = File::create(&temporary)
+    let mut file = File::create(&temporary)
         .with_context(|| format!("failed to create {}", temporary.display()))?;
+    if byte_order_mark {
+        file.write_all(BYTE_ORDER_MARK)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+    }
     let mut writer = WriterBuilder::new().delimiter(delimiter).from_writer(file);
     writer
         .write_byte_record(header)
