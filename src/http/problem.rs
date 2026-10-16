@@ -3,12 +3,19 @@
 //! ADR 0017 Decisions 29 and 31: public-demo API errors use correct status codes
 //! and a standard problem shape instead of an ad hoc error body, and must not
 //! leak stack traces, filesystem paths, or Pack internals.
+//!
+//! An internal error still keeps its cause, privately: the Problem carries it
+//! into the response extensions, never the body, so the request-id middleware
+//! can log it under the request id (issue #2).
+
+use std::sync::Arc;
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use tokio::task::JoinError;
 
 /// One `invalid_params` entry, a safe extension member naming a rejected field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,6 +53,10 @@ struct ProblemInner {
     /// Value for the `Allow` response header (405 only); never serialized.
     #[serde(skip)]
     allow: Option<String>,
+    /// What went wrong behind a 500, for the log only; never serialized
+    /// (Decision 31). An `Arc` because response extensions must be `Clone`.
+    #[serde(skip)]
+    cause: Option<Arc<anyhow::Error>>,
 }
 
 /// An RFC 9457 problem response. Boxed so it stays small in the `Err` position of
@@ -67,6 +78,7 @@ impl Problem {
             error_code: Some(error_code.to_string()),
             invalid_params: Vec::new(),
             allow: None,
+            cause: None,
         }))
     }
 
@@ -84,6 +96,11 @@ impl Problem {
     pub(crate) fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.0.request_id = Some(request_id.into());
         self
+    }
+
+    /// The private cause of an internal error, for the log only.
+    pub(crate) fn cause(&self) -> Option<&anyhow::Error> {
+        self.0.cause.as_deref()
     }
 
     // Read accessors, used only by tests to assert on a constructed Problem
@@ -147,26 +164,28 @@ impl Problem {
 
     // --- 500 ---------------------------------------------------------------
 
-    /// A generic 500. Carries no detail so internal errors never leak.
-    pub(crate) fn internal() -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+    /// A generic 500. The body carries no detail so internal errors never
+    /// leak; the cause rides along privately for the log.
+    pub(crate) fn internal(cause: anyhow::Error) -> Self {
+        let mut problem = Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        problem.0.cause = Some(Arc::new(cause));
+        problem
     }
-}
 
-impl IntoResponse for Problem {
-    fn into_response(self) -> Response {
+    /// The problem document with its status and headers. Unlike
+    /// [`IntoResponse`], this leaves the Problem out of the extensions.
+    pub(crate) fn render(&self) -> Response {
         let status =
             StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let allow = self.0.allow.clone();
-        let body = serde_json::to_vec(&self).unwrap_or_else(|_| b"{}".to_vec());
+        let body = serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec());
 
         let mut response = (status, body).into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
         );
-        if let Some(allow) = allow
-            && let Ok(value) = HeaderValue::from_str(&allow)
+        if let Some(allow) = &self.0.allow
+            && let Ok(value) = HeaderValue::from_str(allow)
         {
             response.headers_mut().insert(header::ALLOW, value);
         }
@@ -174,17 +193,49 @@ impl IntoResponse for Problem {
     }
 }
 
-/// Map a search/autocomplete error into a Problem without leaking internals.
+/// The response also carries the Problem itself as an extension, so the
+/// request-id middleware can put the request id in the body and log the cause
+/// of a 500 without any handler having to remember either.
+impl IntoResponse for Problem {
+    fn into_response(self) -> Response {
+        let mut response = self.render();
+        response.extensions_mut().insert(self);
+        response
+    }
+}
+
+/// Map a geocoder error into a Problem without leaking internals, so handlers
+/// can just use `?`.
 ///
 /// `PackTextSearcher` reports a Tantivy query-parse failure with a message that
 /// contains `"failed to parse search query"`; that is a client error (400).
-/// Everything else is an unexpected runtime failure (500, no detail).
-pub(crate) fn classify_search_error(error: anyhow::Error) -> Problem {
-    let details = format!("{error:#}");
-    if details.contains("failed to parse search query") {
-        Problem::invalid_query("invalid search query")
-    } else {
-        Problem::internal()
+/// Everything else is an unexpected runtime failure (500, no detail) and keeps
+/// its cause for the log.
+impl From<anyhow::Error> for Problem {
+    fn from(error: anyhow::Error) -> Self {
+        if format!("{error:#}").contains("failed to parse search query") {
+            Problem::invalid_query("invalid search query")
+        } else {
+            Problem::internal(error)
+        }
+    }
+}
+
+/// A blocking task that panicked is a 500 whose cause is the panic message, so
+/// the log says what broke rather than just that the task failed.
+impl From<JoinError> for Problem {
+    fn from(error: JoinError) -> Self {
+        if !error.is_panic() {
+            return Problem::internal(anyhow::anyhow!("blocking task was cancelled"));
+        }
+        // `panic!` with a literal carries a `&str`, with a format a `String`.
+        let payload = error.into_panic();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("(payload is not a string)");
+        Problem::internal(anyhow::anyhow!("blocking task panicked: {message}"))
     }
 }
 
@@ -241,23 +292,31 @@ mod tests {
 
     #[tokio::test]
     async fn internal_error_leaks_no_detail() {
-        let (status, value) = body_json(Problem::internal()).await;
+        let problem = Problem::internal(anyhow::anyhow!("section offset past end of file"));
+        let (status, value) = body_json(problem).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(value.get("detail").is_none());
+        assert!(!value.to_string().contains("section offset"));
         assert_eq!(value["error_code"], "internal_error");
     }
 
     #[test]
-    fn classify_maps_parse_error_to_400() {
-        let problem = classify_search_error(anyhow::anyhow!("failed to parse search query \"(\""));
+    fn parse_error_converts_to_400_without_a_cause() {
+        let problem = Problem::from(anyhow::anyhow!("failed to parse search query \"(\""));
         assert_eq!(problem.status(), 400);
         assert_eq!(problem.error_code(), Some("invalid_query"));
+        assert!(problem.cause().is_none());
     }
 
     #[test]
-    fn classify_maps_other_errors_to_500_without_detail() {
-        let problem = classify_search_error(anyhow::anyhow!("tantivy index read failed"));
+    fn other_errors_convert_to_500_keeping_the_cause() {
+        let error = anyhow::anyhow!("tantivy index read failed").context("search failed");
+        let problem = Problem::from(error);
         assert_eq!(problem.status(), 500);
         assert!(problem.detail().is_none());
+        assert_eq!(
+            format!("{:#}", problem.cause().expect("cause kept")),
+            "search failed: tantivy index read failed"
+        );
     }
 }

@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    Extension, Json, Router,
-    extract::{Query, State},
+    Json, Router,
+    extract::{Query, State, rejection::QueryRejection},
     handler::{Handler, HandlerWithoutStateExt},
     middleware,
     routing::{MethodFilter, MethodRouter, on},
@@ -23,8 +23,8 @@ use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
         bounds, health, method,
-        problem::{Problem, classify_search_error},
-        request_id::{self, RequestId},
+        problem::Problem,
+        request_id::{self, ErrorLog},
     },
     pack::PackReader,
     resources::Resources,
@@ -46,6 +46,7 @@ pub(crate) struct AppState {
     searcher: Arc<PackTextSearcher>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
+    error_log: ErrorLog,
 }
 
 impl AppState {
@@ -62,6 +63,7 @@ impl AppState {
             searcher: Arc::new(searcher),
             reverse_geocoder: Arc::new(reverse_geocoder),
             ready: Arc::new(AtomicBool::new(true)),
+            error_log: ErrorLog::default(),
         })
     }
 
@@ -147,10 +149,15 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     // is replaced with a Problem Details 404 so unknown paths don't fall through
     // to a static-file response (Decision 37). `method_not_allowed_fallback`
     // turns method mismatches into a Problem 405 instead of an empty body. The
-    // request-id layer is outermost so it also wraps both fallbacks.
+    // request-id layer is outermost so it also wraps both fallbacks, which puts
+    // the id in every Problem and logs every 500 in one place.
+    let error_log = state.error_log.clone();
     app.method_not_allowed_fallback(method::method_not_allowed)
         .fallback_service(ServeDir::new(demo).not_found_service(method::not_found.into_service()))
-        .layer(middleware::from_fn(request_id::propagate))
+        .layer(middleware::from_fn_with_state(
+            error_log,
+            request_id::propagate,
+        ))
         .with_state(state)
 }
 
@@ -164,109 +171,86 @@ where
     on(MethodFilter::GET, handler).on(MethodFilter::HEAD, method::method_not_allowed)
 }
 
-/// Attach the request id (if present) to a Problem so it appears in the body.
-fn with_id(problem: Problem, request_id: &Option<String>) -> Problem {
-    match request_id {
-        Some(id) => problem.with_request_id(id.clone()),
-        None => problem,
-    }
+/// Run geocoder work, GeoJSON included, on the blocking pool. Its errors and
+/// a panic both become Problems here, with their cause kept for the log, so a
+/// handler only needs `?`.
+async fn blocking<T, F>(work: F) -> Result<T, Problem>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    task::spawn_blocking(work).await?.map_err(Problem::from)
+}
+
+/// A query string that does not parse; the rejection's own text is not shown.
+fn malformed_parameters(_: QueryRejection) -> Problem {
+    Problem::malformed_parameter("could not parse query parameters")
 }
 
 async fn search(
     State(state): State<AppState>,
-    request_id: Option<Extension<RequestId>>,
-    params: Result<Query<SearchParams>, axum::extract::rejection::QueryRejection>,
+    params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
-    let request_id = request_id.map(|Extension(RequestId(id))| id);
-    let Query(params) = params.map_err(|_| {
-        with_id(
-            Problem::malformed_parameter("could not parse query parameters"),
-            &request_id,
-        )
-    })?;
+    let Query(params) = params.map_err(malformed_parameters)?;
 
-    let query = bounds::validate_query(params.q.as_deref().unwrap_or_default())
-        .map_err(|problem| with_id(problem, &request_id))?;
-    bounds::validate_search_limit(params.limit).map_err(|problem| with_id(problem, &request_id))?;
+    let query = bounds::validate_query(params.q.as_deref().unwrap_or_default())?;
+    bounds::validate_search_limit(params.limit)?;
 
     let options = TextSearchOptions {
         query: query.clone(),
         limit: params.limit,
         layer: params.layer,
     };
-    let collection = task::spawn_blocking(move || {
+    let collection = blocking(move || {
         let hits = state.searcher.search(options)?;
         api::forward_collection(&state.pack, query, hits)
     })
-    .await
-    .map_err(|_| with_id(Problem::internal(), &request_id))?
-    .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+    .await?;
 
     Ok(Json(collection))
 }
 
 async fn autocomplete(
     State(state): State<AppState>,
-    request_id: Option<Extension<RequestId>>,
-    params: Result<Query<SearchParams>, axum::extract::rejection::QueryRejection>,
+    params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
-    let request_id = request_id.map(|Extension(RequestId(id))| id);
-    let Query(params) = params.map_err(|_| {
-        with_id(
-            Problem::malformed_parameter("could not parse query parameters"),
-            &request_id,
-        )
-    })?;
+    let Query(params) = params.map_err(malformed_parameters)?;
 
     // Autocomplete tolerates an empty/short query (it returns no suggestions), so
     // only bound the length here; the searcher caps the result count internally.
-    let query = bounds::validate_query_length(params.q.as_deref().unwrap_or_default())
-        .map_err(|problem| with_id(problem, &request_id))?;
-    bounds::validate_autocomplete_limit(params.limit)
-        .map_err(|problem| with_id(problem, &request_id))?;
+    let query = bounds::validate_query_length(params.q.as_deref().unwrap_or_default())?;
+    bounds::validate_autocomplete_limit(params.limit)?;
 
     let options = TextAutocompleteOptions {
         query: query.clone(),
         limit: params.limit,
         layer: params.layer,
     };
-    let collection = task::spawn_blocking(move || {
+    let collection = blocking(move || {
         let hits = state.searcher.autocomplete(options)?;
         api::forward_collection(&state.pack, query, hits)
     })
-    .await
-    .map_err(|_| with_id(Problem::internal(), &request_id))?
-    .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+    .await?;
 
     Ok(Json(collection))
 }
 
 async fn reverse(
     State(state): State<AppState>,
-    request_id: Option<Extension<RequestId>>,
-    params: Result<Query<ReverseParams>, axum::extract::rejection::QueryRejection>,
+    params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
-    let request_id = request_id.map(|Extension(RequestId(id))| id);
-    let Query(params) = params.map_err(|_| {
-        with_id(
-            Problem::malformed_parameter("could not parse query parameters"),
-            &request_id,
-        )
-    })?;
+    let Query(params) = params.map_err(malformed_parameters)?;
 
-    bounds::validate_coords(params.lon, params.lat)
-        .map_err(|problem| with_id(problem, &request_id))?;
+    bounds::validate_coords(params.lon, params.lat)?;
 
-    let collection = task::spawn_blocking(move || {
+    let collection = blocking(move || {
         let response = state.reverse_geocoder.reverse(ReverseGeocodeOptions {
             lon: params.lon,
             lat: params.lat,
         })?;
         api::reverse_collection(&state.pack, &response)
     })
-    .await
-    .map_err(|_| with_id(Problem::internal(), &request_id))?
-    .map_err(|_| with_id(Problem::internal(), &request_id))?;
+    .await?;
 
     Ok(Json(collection))
 }
@@ -550,5 +534,126 @@ mod router_tests {
 
         let _ = std::fs::remove_dir_all(&pack);
         let _ = std::fs::remove_file(&basemap);
+    }
+
+    /// A router whose routes fail on purpose, behind the same request-id layer
+    /// as the real one, logging into `log`.
+    fn failing_router(log: &ErrorLog) -> Router {
+        Router::new()
+            .route(
+                "/error",
+                axum::routing::get(|| async {
+                    blocking(|| -> Result<()> {
+                        Err(anyhow::anyhow!("section offset past end of file")
+                            .context("failed to build the GeoJSON"))
+                    })
+                    .await
+                }),
+            )
+            .route(
+                "/panic",
+                axum::routing::get(|| async {
+                    blocking(|| -> Result<()> { panic!("label {} out of range", 7) }).await
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                log.clone(),
+                request_id::propagate,
+            ))
+    }
+
+    fn log_lines(log: &ErrorLog) -> Vec<serde_json::Value> {
+        log.lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("log line is JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn internal_error_is_a_bare_500_with_its_cause_logged() {
+        let log = ErrorLog::capture();
+        let mut tagged = request("GET", "/error?q=12%20Private%20Lane");
+        tagged
+            .headers_mut()
+            .insert("cf-ray", header::HeaderValue::from_static("ray-500"));
+        let reply = send(failing_router(&log), tagged).await;
+
+        // The client sees a bare 500 with the request id and nothing else.
+        assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.request_id().as_deref(), Some("ray-500"));
+        let body = reply.json();
+        assert_eq!(body["error_code"], "internal_error");
+        assert_eq!(body["request_id"], "ray-500");
+        assert!(body.get("detail").is_none());
+        assert!(!body.to_string().contains("section offset"));
+
+        // The log has one line naming the request, route and cause, and not
+        // the query, which is personal data.
+        let lines = log_lines(&log);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert_eq!(line["level"], "error");
+        assert_eq!(line["request_id"], "ray-500");
+        assert_eq!(line["route"], "/error");
+        assert_eq!(line["status"], 500);
+        assert!(line["latency_ms"].is_u64());
+        assert_eq!(
+            line["cause"],
+            "failed to build the GeoJSON: section offset past end of file"
+        );
+        assert!(!log.lines()[0].contains("Private"));
+    }
+
+    #[tokio::test]
+    async fn panic_in_blocking_work_is_logged_with_its_message() {
+        let log = ErrorLog::capture();
+        let reply = send(failing_router(&log), request("GET", "/panic")).await;
+
+        assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!reply.json().to_string().contains("out of range"));
+        let lines = log_lines(&log);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]["cause"],
+            "blocking task panicked: label 7 out of range"
+        );
+        assert_eq!(
+            lines[0]["request_id"].as_str(),
+            reply.request_id().as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_errors_are_not_logged() {
+        let pack = temp_path("user-errors");
+        write_pack(&pack);
+        let demo = temp_path("user-errors-demo");
+        let no_basemap = temp_path("user-errors-no-basemap");
+        let log = ErrorLog::capture();
+        let mut state = state_for(&pack, true);
+        state.error_log = log.clone();
+        let router = build_router(state, &demo, &no_basemap);
+
+        for (method, uri, status) in [
+            ("GET", "/search?q=", StatusCode::BAD_REQUEST),
+            ("GET", "/reverse?lon=999&lat=0", StatusCode::BAD_REQUEST),
+            ("GET", "/does-not-exist", StatusCode::NOT_FOUND),
+            ("POST", "/search", StatusCode::METHOD_NOT_ALLOWED),
+            ("GET", "/search?q=King%20Street", StatusCode::OK),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(reply.status, status, "{method} {uri}");
+            // Every Problem still carries the id the middleware gave it.
+            if status != StatusCode::OK {
+                assert_eq!(
+                    reply.json()["request_id"].as_str(),
+                    reply.request_id().as_deref()
+                );
+            }
+        }
+        assert!(log.lines().is_empty());
+
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }
