@@ -100,8 +100,9 @@ pub struct TextIndexFields {
     /// The number a stated house number starts with ("407" of "407A"), so a
     /// search finds the numbers nearest one that no record states.
     pub house_number: Field,
-    /// The postcode a record is ranked by: the one it states, else the
-    /// nearest postcode centroid (see [`PostcodeAreas`]).
+    /// The postcode a record is ranked by: the one it states, else the one
+    /// whose area it lies in, else the nearest postcode point (see
+    /// [`PostcodeAreas`]).
     pub rank_postcode: Field,
 }
 
@@ -299,18 +300,21 @@ impl TextIndexFields {
 
     /// Tantivy document for a record. Pure, so callers can build documents in
     /// parallel before handing them to the writer. `context_names` are the
-    /// admin areas the record lies in.
+    /// admin areas the record lies in, and `area_postcode` the postcode whose
+    /// area it lies in.
     pub fn document(
         self,
         record_id: RecordId,
         record: &Record,
         context_names: &[&str],
+        area_postcode: Option<&str>,
         postcode_areas: &PostcodeAreas,
     ) -> TantivyDocument {
         self.to_tantivy_document(&TextIndexDocument::from_record(
             record_id,
             record,
             context_names,
+            area_postcode,
             postcode_areas,
         ))
     }
@@ -378,11 +382,13 @@ impl TextIndexDocument {
     /// most addresses carry no `addr:city`.
     ///
     /// Every record but a place is ranked by the postcode it states, or else
-    /// by the nearest of `postcode_areas`.
+    /// by `area_postcode`, the postcode whose area it lies in, or else by the
+    /// nearest of `postcode_areas`.
     pub fn from_record(
         record_id: RecordId,
         record: &Record,
         context_names: &[&str],
+        area_postcode: Option<&str>,
         postcode_areas: &PostcodeAreas,
     ) -> Self {
         let builder = match record {
@@ -396,7 +402,7 @@ impl TextIndexDocument {
         let mut document = builder.build(context_names);
         document.rank_postcode = match record {
             Record::Place(..) => None,
-            _ => match document.postcode.as_deref() {
+            _ => match document.postcode.as_deref().or(area_postcode) {
                 Some(postcode) => compact_postcode(postcode),
                 None => record
                     .display_point()
@@ -999,9 +1005,9 @@ pub(crate) fn compact_postcode(value: &str) -> Option<String> {
     normalize_index_text(value.trim()).map(|value| value.split_whitespace().collect())
 }
 
-/// Postcode centroids, so a record that states no postcode can be ranked by
-/// the one nearest it. Most addresses state none, and without this a query's
-/// postcode could rank only the few that do.
+/// Postcode points, so a record that states no postcode and lies in no
+/// postcode area can be ranked by the one nearest it. Most addresses state
+/// none, and without this a query's postcode could rank only the few that do.
 #[derive(Default)]
 pub struct PostcodeAreas {
     /// Centroids as unit vectors, where straight-line nearness is nearness
@@ -1115,6 +1121,7 @@ mod tests {
             42,
             &record.into(),
             &["Westminster"],
+            None,
             &PostcodeAreas::default(),
         );
 
@@ -1159,7 +1166,7 @@ mod tests {
         };
 
         let projected =
-            TextIndexDocument::from_record(7, &record.into(), &[], &PostcodeAreas::default());
+            TextIndexDocument::from_record(7, &record.into(), &[], None, &PostcodeAreas::default());
 
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
@@ -1174,6 +1181,7 @@ mod tests {
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(2),
+            area: None,
         };
         let place = PlaceRecord {
             alt_names: Vec::new(),
@@ -1188,12 +1196,18 @@ mod tests {
             },
         };
 
-        let postcode =
-            TextIndexDocument::from_record(1, &postcode.into(), &[], &PostcodeAreas::default());
+        let postcode = TextIndexDocument::from_record(
+            1,
+            &postcode.into(),
+            &[],
+            None,
+            &PostcodeAreas::default(),
+        );
         let place = TextIndexDocument::from_record(
             2,
             &Record::Place(PlaceLayer::Locality, place),
             &[],
+            None,
             &PostcodeAreas::default(),
         );
 
@@ -1230,6 +1244,7 @@ mod tests {
             3,
             &poi.clone().into(),
             &["Toronto", "Ontario"],
+            None,
             &PostcodeAreas::default(),
         );
 
@@ -1274,7 +1289,7 @@ mod tests {
             ("K0J 1K0".to_string(), [-79.38, 43.8]),
         ]);
         let projected =
-            TextIndexDocument::from_record(4, &plain.clone().into(), &["Toronto"], &areas);
+            TextIndexDocument::from_record(4, &plain.clone().into(), &["Toronto"], None, &areas);
         assert_eq!(projected.name.as_deref(), Some("walmer road parkette"));
         assert_eq!(projected.streets, vec!["walmer road"]);
         assert_eq!(
@@ -1295,8 +1310,13 @@ mod tests {
             address: None,
             ..plain
         };
-        let projected =
-            TextIndexDocument::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default());
+        let projected = TextIndexDocument::from_record(
+            5,
+            &unaddressed.into(),
+            &[],
+            None,
+            &PostcodeAreas::default(),
+        );
         assert_eq!(projected.layers, vec!["poi"]);
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.rank_postcode, None, "no postcode data nearby");

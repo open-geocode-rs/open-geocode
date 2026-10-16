@@ -20,11 +20,12 @@ use super::{
     admin_levels::{self, admin_levels},
     containment::AreaShape,
     place::place_layer,
+    postcode::{PostcodeArea, PostcodeAreaIndex, postcode_area_code},
     tags::{OsmTags, alternate_names, name_tags},
 };
 
 /// Tags a boundary keeps after the scan besides its names.
-const BOUNDARY_TAG_KEYS: [&str; 8] = [
+const BOUNDARY_TAG_KEYS: [&str; 10] = [
     "ISO3166-1:alpha2",
     "ISO3166-1:alpha3",
     "ISO3166-2",
@@ -33,6 +34,8 @@ const BOUNDARY_TAG_KEYS: [&str; 8] = [
     "country_code",
     "designation",
     "place",
+    "postal_code",
+    "ref",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +77,7 @@ pub(crate) struct BoundaryWay {
 pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
     tree: RTree<BoundaryBox>,
+    postcodes: PostcodeAreaIndex,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,12 +144,16 @@ struct BoundaryCandidate {
 pub(crate) enum ContextOrigin {
     Boundary(u32),
     DerivedCountry(String),
+    /// A postcode drawn by an area, which records in the area point at.
+    Postcode(String),
 }
 
-/// Admin boundaries built from the input, before record ids are known.
+/// Admin boundaries and postcode areas built from the input, before record
+/// ids are known.
 pub(crate) struct BoundarySet {
     candidates: Vec<BoundaryCandidate>,
     derived_countries: Vec<(String, PlaceRecord)>,
+    postcode_areas: Vec<PostcodeArea>,
     /// The ways and relations libpostal's admin table names for the
     /// countries of the input that the input does not have.
     unmatched_admin_ids: Vec<String>,
@@ -160,6 +168,12 @@ impl BoundarySet {
 
     pub(crate) fn len(&self) -> usize {
         self.candidates.len()
+    }
+
+    /// The areas `boundary=postal_code` ways and relations draw, in input
+    /// order.
+    pub(crate) fn postcode_areas(&self) -> &[PostcodeArea] {
+        &self.postcode_areas
     }
 
     /// Place records for every boundary and derived country.
@@ -303,13 +317,15 @@ impl BoundarySet {
             .collect()
     }
 
-    /// Index the boundaries under their final record ids. Edge indexes of
-    /// large areas are built in parallel.
+    /// Index the boundaries and the postcode areas under their final record
+    /// ids. Edge indexes of large areas are built in parallel.
     pub(crate) fn into_index(
         self,
         boundary_record_ids: &[RecordId],
         country_record_ids: &HashMap<String, RecordId>,
+        postcode_record_ids: &HashMap<String, RecordId>,
     ) -> BoundaryIndex {
+        let postcodes = PostcodeAreaIndex::new(self.postcode_areas, postcode_record_ids);
         let accepted = self
             .candidates
             .into_par_iter()
@@ -334,15 +350,32 @@ impl BoundarySet {
                 })
             })
             .collect();
-        BoundaryIndex::new(accepted)
+        BoundaryIndex {
+            postcodes,
+            ..BoundaryIndex::new(accepted)
+        }
     }
 }
 
 /// Admin context for a record, from the boundaries covering its display point.
 /// Values the source data states (an `addr:city`, a place's own name) win ties
 /// between overlapping boundaries.
+///
+/// A record that states no postcode also takes the postcode whose area covers
+/// it, so one is never contradicted. A place and a postcode take none: a
+/// place spans postcodes, and a postcode is its own.
 pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<RecordContext> {
     let [lon, lat] = record.display_point()?;
+    let takes_area_postcode = match record {
+        Record::Address(record) => record.address.postcode.is_none(),
+        Record::Interpolation(record) => record.address.postcode.is_none(),
+        Record::Poi(record) => record
+            .address
+            .as_ref()
+            .is_none_or(|address| address.postcode.is_none()),
+        Record::Street(_) => true,
+        Record::Place(..) | Record::Postcode(_) => false,
+    };
     let source = match record {
         Record::Address(record) => SourceContext {
             country: record.address.country.as_deref(),
@@ -377,7 +410,11 @@ pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<R
         },
         Record::Street(_) | Record::Postcode(_) => SourceContext::default(),
     };
-    Some(index.context_for_point(lon, lat, source))
+    let mut context = index.context_for_point(lon, lat, source);
+    if takes_area_postcode {
+        context.admin_context.postcode_record_id = index.postcodes.postcode_at(lon, lat);
+    }
+    Some(context)
 }
 
 pub(crate) fn boundary_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -409,6 +446,7 @@ impl BoundaryIndex {
         Self {
             boundaries,
             tree: RTree::bulk_load(boxes),
+            postcodes: PostcodeAreaIndex::default(),
         }
     }
 
@@ -465,10 +503,11 @@ impl BoundaryIndex {
     }
 }
 
-/// Whether the tags make an area records can lie in: an admin boundary, or
-/// a named place of a layer the Pack has (see [`area_parts`]).
+/// Whether the tags make an area records can lie in: an admin boundary, a
+/// named place of a layer the Pack has (see [`area_parts`]), or a postcode's
+/// area.
 pub(crate) fn has_area_tags(tags: &BTreeMap<String, String>) -> bool {
-    area_parts(tags).is_some()
+    area_parts(tags).is_some() || postcode_area_code(tags).is_some()
 }
 
 pub(crate) fn relation_member_role(value: &str) -> Option<BoundaryMemberRole> {
@@ -495,8 +534,17 @@ pub(crate) fn build_boundaries(
     member_lines: &HashMap<i64, Option<&[Vertex]>>,
 ) -> BoundarySet {
     let mut candidates = Vec::new();
+    let mut postcode_areas = Vec::new();
     for way in ways {
-        if let Some(boundary) = boundary_from_way(way) {
+        if postcode_area_code(&way.tags).is_some() {
+            postcode_areas.extend(way_geometry(&way.vertices).and_then(|geometry| {
+                PostcodeArea::new(
+                    &way.tags,
+                    SourceProvenance::osm(OsmObjectType::Way, way.object_id),
+                    geometry,
+                )
+            }));
+        } else if let Some(boundary) = boundary_from_way(way) {
             candidates.push(BoundaryCandidate {
                 source_object_type: OsmObjectType::Way,
                 source_object_id: way.object_id,
@@ -505,7 +553,15 @@ pub(crate) fn build_boundaries(
         }
     }
     for stub in relations {
-        if let Some(boundary) = boundary_from_relation(stub, member_lines) {
+        if postcode_area_code(&stub.tags).is_some() {
+            postcode_areas.extend(relation_geometry(stub, member_lines).and_then(|geometry| {
+                PostcodeArea::new(
+                    &stub.tags,
+                    SourceProvenance::osm(OsmObjectType::Relation, stub.object_id),
+                    geometry,
+                )
+            }));
+        } else if let Some(boundary) = boundary_from_relation(stub, member_lines) {
             candidates.push(BoundaryCandidate {
                 source_object_type: OsmObjectType::Relation,
                 source_object_id: stub.object_id,
@@ -520,6 +576,7 @@ pub(crate) fn build_boundaries(
     BoundarySet {
         candidates,
         derived_countries,
+        postcode_areas,
         unmatched_admin_ids,
     }
 }
@@ -577,15 +634,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
         designation,
     } = area_parts(&way.tags)?;
     let inferred_country_code = country_code_from_tags(&way.tags, layer);
-    let closed = ends(&way.vertices).is_some_and(|(first, last)| first == last);
-    if way.vertices.len() < 4 || !closed {
-        return None;
-    }
-    let polygon = Polygon::new(ring_line_string(&way.vertices), Vec::new());
-    if polygon.unsigned_area() <= f64::EPSILON {
-        return None;
-    }
-    let geometry = MultiPolygon::new(vec![polygon]);
+    let geometry = way_geometry(&way.vertices)?;
     let representative_point = representative_point(&geometry)?;
     Some(BuiltBoundary {
         layer,
@@ -615,6 +664,41 @@ fn boundary_from_relation(
         designation,
     } = area_parts(&stub.tags)?;
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
+    let geometry = relation_geometry(stub, member_lines)?;
+    let representative_point = representative_point(&geometry)?;
+    Some(BuiltBoundary {
+        layer,
+        admin_level,
+        place_type,
+        name,
+        alt_names,
+        place_layer,
+        designation,
+        inferred_country_code,
+        geometry,
+        representative_point,
+    })
+}
+
+/// The area a closed way draws, if it has one.
+fn way_geometry(vertices: &[Vertex]) -> Option<MultiPolygon<f64>> {
+    let closed = ends(vertices).is_some_and(|(first, last)| first == last);
+    if vertices.len() < 4 || !closed {
+        return None;
+    }
+    let polygon = Polygon::new(ring_line_string(vertices), Vec::new());
+    if polygon.unsigned_area() <= f64::EPSILON {
+        return None;
+    }
+    Some(MultiPolygon::new(vec![polygon]))
+}
+
+/// The area a relation's members draw, or `None` when a member did not
+/// resolve or the outer rings do not close.
+fn relation_geometry(
+    stub: &BoundaryRelationStub,
+    member_lines: &HashMap<i64, Option<&[Vertex]>>,
+) -> Option<MultiPolygon<f64>> {
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
@@ -634,20 +718,7 @@ fn boundary_from_relation(
         return None;
     }
     let inner_rings = stitch_rings(inner_segments);
-    let geometry = multipolygon_from_rings(outer_rings, inner_rings)?;
-    let representative_point = representative_point(&geometry)?;
-    Some(BuiltBoundary {
-        layer,
-        admin_level,
-        place_type,
-        name,
-        alt_names,
-        place_layer,
-        designation,
-        inferred_country_code,
-        geometry,
-        representative_point,
-    })
+    multipolygon_from_rings(outer_rings, inner_rings)
 }
 
 fn multipolygon_from_rings(
@@ -1608,7 +1679,11 @@ mod tests {
         assert_eq!(places[1].1.id(), "osm:relation:100");
         assert_eq!(report.accepted.place_nodes, 2);
 
-        let index = set.into_index(&[5], &HashMap::from([("CA".to_string(), 4)]));
+        let index = set.into_index(
+            &[5],
+            &HashMap::from([("CA".to_string(), 4)]),
+            &HashMap::new(),
+        );
         let context = index.context_for_point(-75.0, 45.0, SourceContext::default());
         assert_eq!(context.admin_context.region_record_id, Some(5));
         assert_eq!(context.admin_context.country_record_id, Some(4));

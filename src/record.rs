@@ -50,7 +50,13 @@ pub struct StreetRecord {
 pub struct PostcodeRecord {
     pub postcode: String,
     pub geometry: Geometry,
+    /// The accepted addresses that state the postcode.
     pub source: DerivedSourceProvenance,
+    /// The `boundary=postal_code` way or relation that draws the postcode's
+    /// area, when the input has one. The record's point then lies inside
+    /// that area, and the records in it that state no postcode take this one
+    /// as context.
+    pub area: Option<SourceProvenance>,
 }
 
 /// A named point of interest. One that also states a valid address carries it,
@@ -564,13 +570,18 @@ impl PostcodeRecord {
 
 impl Serialize for PostcodeRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PostcodeRecord", 6)?;
+        let mut state = serializer.serialize_struct("PostcodeRecord", 7)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
         state.serialize_field("postcode", &self.postcode)?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("source", &self.source)?;
+        if let Some(area) = &self.area {
+            state.serialize_field("area", area)?;
+        } else {
+            state.skip_field("area")?;
+        }
         state.end()
     }
 }

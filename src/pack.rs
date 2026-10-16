@@ -58,7 +58,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 7;
+pub const PACK_SCHEMA_VERSION: u32 = 8;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -114,9 +114,10 @@ impl Default for PackWriterOptions {
 
 /// The names of the areas a record lies in that its text document carries:
 /// every name of each area but its country and the place area it lies in
-/// (an island), which are indexed by their `name` alone. A country or an
-/// island has hundreds of names, one per language, and every record in it
-/// would carry them all; the parser's dictionaries still hold every one.
+/// (an island), which are indexed by their `name` alone, and the postcode
+/// whose area it lies in. A country or an island has hundreds of names, one
+/// per language, and every record in it would carry them all; the parser's
+/// dictionaries still hold every one.
 fn indexed_area_names<'a>(
     context: &RecordContext,
     names: &'a HashMap<RecordId, Vec<String>>,
@@ -126,6 +127,7 @@ fn indexed_area_names<'a>(
     context
         .admin_context
         .parent_record_ids()
+        .chain(tuple.postcode_record_id)
         .filter_map(move |id| {
             let names = names.get(&id)?;
             Some(if large.contains(&Some(id)) {
@@ -666,11 +668,16 @@ impl BatchPreparer {
                     .iter()
                     .flat_map(|context| indexed_area_names(context, &self.context_names))
                     .collect::<Vec<_>>();
+                let area_postcode = context
+                    .and_then(|context| context.admin_context.postcode_record_id)
+                    .and_then(|id| self.context_names.get(&id)?.first())
+                    .map(String::as_str);
                 Ok(PreparedRecord {
                     document: self.fields.document(
                         record_id,
                         &record,
                         &names,
+                        area_postcode,
                         &self.postcode_areas,
                     ),
                     cells: RecordCells::for_record(record_id, &record)?,

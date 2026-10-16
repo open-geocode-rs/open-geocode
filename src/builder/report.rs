@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     builder::plan::BuildPlan,
     parse::lattice::train::TrainReport,
-    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
+    record::{
+        AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord, PostcodeRecord,
+    },
     resources::Resources,
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 17;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -80,6 +82,7 @@ impl BuilderReport {
         self.accepted.interpolation_ranges += accepted.interpolation_ranges;
         self.accepted.street_segments += accepted.street_segments;
         self.accepted.postcode_records += accepted.postcode_records;
+        self.accepted.postcode_areas += accepted.postcode_areas;
         self.accepted.place_nodes += accepted.place_nodes;
         self.accepted.place_areas += accepted.place_areas;
         self.accepted.poi_nodes += accepted.poi_nodes;
@@ -241,6 +244,9 @@ pub struct AcceptedCounts {
     pub interpolation_ranges: u64,
     pub street_segments: u64,
     pub postcode_records: u64,
+    /// Postcodes placed inside the `boundary=postal_code` area that draws
+    /// them, counted with the postcodes and on their own.
+    pub postcode_areas: u64,
     pub place_nodes: u64,
     /// Places drawn as a closed way or a multipolygon, not admin boundaries.
     #[serde(default)]
@@ -562,9 +568,12 @@ impl BuilderReport {
         self.accepted.street_segments += 1;
     }
 
-    pub(crate) fn accept_postcode(&mut self) {
+    pub(crate) fn accept_postcode(&mut self, record: &PostcodeRecord) {
         self.accept_layer("postcode");
         self.accepted.postcode_records += 1;
+        if record.area.is_some() {
+            self.accepted.postcode_areas += 1;
+        }
     }
 
     pub(crate) fn accept_place(&mut self, layer: PlaceLayer) {

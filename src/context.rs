@@ -1,13 +1,14 @@
 //! Boundary-derived admin context.
 //!
 //! Most records share their admin context with many neighbours, so contexts are
-//! interned as tuples of place record ids. A record body stores only the tuple
-//! id ([`ContextRef`]); this module stores the tuple table.
+//! interned as tuples of context record ids: the place records of the areas a
+//! record lies in, and the postcode whose area it lies in. A record body stores
+//! only the tuple id ([`ContextRef`]); this module stores the tuple table.
 //!
 //! ```text
-//! context/tuples  tuple_count u64, then per tuple 6 x u32 record ids
-//!                 (country, region, district, locality, neighbourhood, place),
-//!                 u32::MAX for absent
+//! context/tuples  tuple_count u64, then per tuple 7 x u32 record ids
+//!                 (country, region, district, locality, neighbourhood, place,
+//!                 postcode), u32::MAX for absent
 //! ```
 
 use std::collections::HashMap;
@@ -23,10 +24,10 @@ use crate::{
 };
 
 pub const SECTION_TUPLES: &str = "context/tuples";
-pub const CONTEXT_VERSION: u32 = 1;
+pub const CONTEXT_VERSION: u32 = 2;
 pub const CONTEXT_FLAG_AMBIGUOUS_ADMIN: u16 = 1;
 
-const TUPLE_BYTES: usize = 24;
+const TUPLE_BYTES: usize = 28;
 const MISSING_ID: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -37,6 +38,9 @@ pub struct AdminContextTuple {
     pub locality_record_id: Option<RecordId>,
     pub neighbourhood_record_id: Option<RecordId>,
     pub place_record_id: Option<RecordId>,
+    /// The postcode whose `boundary=postal_code` area the record lies in,
+    /// given only to a record that states no postcode of its own.
+    pub postcode_record_id: Option<RecordId>,
 }
 
 /// Admin context of one record plus assignment flags.
@@ -52,15 +56,15 @@ impl AdminContextTuple {
     }
 
     /// Most specific first: place, neighbourhood, locality, district, region,
-    /// country.
+    /// country. The postcode is not a parent area: it cuts across them.
     pub fn parent_record_ids(self) -> impl Iterator<Item = RecordId> {
-        let [country, region, district, locality, neighbourhood, place] = self.ids();
+        let [country, region, district, locality, neighbourhood, place, _] = self.ids();
         [place, neighbourhood, locality, district, region, country]
             .into_iter()
             .flatten()
     }
 
-    fn ids(self) -> [Option<RecordId>; 6] {
+    fn ids(self) -> [Option<RecordId>; 7] {
         [
             self.country_record_id,
             self.region_record_id,
@@ -68,10 +72,11 @@ impl AdminContextTuple {
             self.locality_record_id,
             self.neighbourhood_record_id,
             self.place_record_id,
+            self.postcode_record_id,
         ]
     }
 
-    fn from_ids(ids: [Option<RecordId>; 6]) -> Self {
+    fn from_ids(ids: [Option<RecordId>; 7]) -> Self {
         let [
             country_record_id,
             region_record_id,
@@ -79,6 +84,7 @@ impl AdminContextTuple {
             locality_record_id,
             neighbourhood_record_id,
             place_record_id,
+            postcode_record_id,
         ] = ids;
         Self {
             country_record_id,
@@ -87,6 +93,7 @@ impl AdminContextTuple {
             locality_record_id,
             neighbourhood_record_id,
             place_record_id,
+            postcode_record_id,
         }
     }
 }
@@ -189,6 +196,7 @@ mod tests {
             country_record_id: Some(1),
             region_record_id: Some(2),
             locality_record_id: Some(3),
+            postcode_record_id: Some(4),
             ..AdminContextTuple::default()
         };
         let mut writer = ContextTupleWriter::default();

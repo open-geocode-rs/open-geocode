@@ -723,6 +723,7 @@ fn boundary_context_json(reader: &PackReader, record_id: RecordId) -> Result<Val
             ("locality", tuple.locality_record_id),
             ("neighbourhood", tuple.neighbourhood_record_id),
             ("place", tuple.place_record_id),
+            ("postcode", tuple.postcode_record_id),
         ] {
             if let Some(parent_id) = value
                 && let Some(record) = reader.context_record(parent_id)?

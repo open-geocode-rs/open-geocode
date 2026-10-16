@@ -995,6 +995,7 @@ mod tests {
                     postcode: format!("P{index}"),
                     geometry: point_geometry(-79.4 + next() * spread, 43.7 + next() * spread),
                     source: DerivedSourceProvenance::osm_address_records(1),
+                    area: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -1026,6 +1027,7 @@ mod tests {
             postcode: "M5V".to_string(),
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(1),
+            area: None,
         })]);
         let hits = reader
             .context_candidates(-79.39, 43.6, 5_000.0, 5)

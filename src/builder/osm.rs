@@ -290,7 +290,8 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     progress.finish_with_message("4/8 assemble ways complete");
     build.report.phases.feature_emission_ms = phase.elapsed().as_millis();
 
-    // Admin boundaries, their place records and postcode centroids.
+    // Admin boundaries and their place records, postcode areas and the
+    // postcode records they and addresses make.
     let phase = Instant::now();
     let member_vertices: HashMap<i64, Option<Vec<Vertex>>> = members
         .into_iter()
@@ -328,13 +329,18 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     for (origin, record) in boundaries.place_records(&mut build.report) {
         build.push(record, Some(origin))?;
     }
-    let mut postcode_centroids = Vec::new();
-    for record in std::mem::take(&mut build.postcodes).into_records() {
-        build.report.accept_postcode();
+    let postcodes = std::mem::take(&mut build.postcodes).into_records(boundaries.postcode_areas());
+    let mut postcode_points = Vec::new();
+    for record in postcodes {
+        build.report.accept_postcode(&record);
         if let Some(point) = point_lon_lat(&record.geometry) {
-            postcode_centroids.push((record.postcode.clone(), point));
+            postcode_points.push((record.postcode.clone(), point));
         }
-        build.push(Record::Postcode(record), None)?;
+        let origin = record
+            .area
+            .is_some()
+            .then(|| ContextOrigin::Postcode(record.postcode.clone()));
+        build.push(Record::Postcode(record), origin)?;
     }
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
 
@@ -353,6 +359,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let mut ordered = Spool::<PendingRecord>::create(&scratch, "context-ordered")?;
     let mut boundary_ids = vec![0; boundaries.len()];
     let mut country_ids = HashMap::new();
+    let mut postcode_ids = HashMap::new();
     let first_id = writer.record_count();
     for (index, item) in context_records.finish()?.enumerate() {
         let item = item?;
@@ -362,15 +369,26 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             Some(ContextOrigin::DerivedCountry(code)) => {
                 country_ids.insert(code.clone(), record_id);
             }
+            Some(ContextOrigin::Postcode(postcode)) => {
+                postcode_ids.insert(postcode.clone(), record_id);
+            }
             None => {}
         }
         ordered.write(&item)?;
     }
-    writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
+    // A postcode area is named by its postcode, so the records in it are
+    // found and ranked by the postcode they lie in.
+    let mut context_names = boundaries.context_names(&boundary_ids, &country_ids);
+    context_names.extend(
+        postcode_ids
+            .iter()
+            .map(|(postcode, record_id)| (*record_id, vec![postcode.clone()])),
+    );
+    writer.set_context_names(context_names);
     writer.set_country_codes(boundaries.country_codes(&boundary_ids, &country_ids));
     writer.set_region_groups(boundaries.region_groups(&boundary_ids));
-    writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
-    let index = boundaries.into_index(&boundary_ids, &country_ids);
+    writer.set_postcode_areas(PostcodeAreas::new(postcode_points));
+    let index = boundaries.into_index(&boundary_ids, &country_ids, &postcode_ids);
     let context_count = ordered.written();
     let mut sample = Sampler::default();
     write_ordered(
@@ -574,9 +592,14 @@ fn write_ordered(
                                 let located = record_context(index, &pending.record);
                                 let country = located
                                     .and_then(|context| context.admin_context.country_record_id);
+                                // Areas describe context and lie in none, but a
+                                // postcode drawn by an area lies in admin areas.
                                 let context: Option<RecordContext> = match pending.origin {
-                                    Some(_) => None,
-                                    None => located,
+                                    Some(
+                                        ContextOrigin::Boundary(_)
+                                        | ContextOrigin::DerivedCountry(_),
+                                    ) => None,
+                                    Some(ContextOrigin::Postcode(_)) | None => located,
                                 };
                                 ((pending.record, context), country)
                             })
@@ -647,10 +670,14 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use crate::{
+        api::Contexts,
         pack::{PackReader, RecordPointPrecision},
-        record::Record,
+        record::{OsmObjectType, Record, SourceProvenance},
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
-        search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+        search::{
+            AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchHit,
+            TextSearchOptions,
+        },
     };
 
     use super::{
@@ -1197,6 +1224,150 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// Postcode areas: 10115 drawn by an L-shaped relation, whose centroid
+    /// lies outside it, and 10117 by a square way no address states. 99999
+    /// is stated by an address only. Addresses in the L that state no
+    /// postcode take 10115 as context; those that state one keep it.
+    #[test]
+    fn postcode_areas_place_postcodes_and_give_them_as_context() {
+        let dir = temp_dir("postcode-areas");
+        let input = dir.join("postcodes.osm.pbf");
+        // Grid units of 0.01 degrees from 13.40 E, 52.50 N.
+        let at = |x: f64, y: f64| (52.50 + y * 0.01, 13.40 + x * 0.01);
+        let corner = |id, x, y| {
+            let (lat, lon) = at(x, y);
+            node(id, lat, lon, &[])
+        };
+        let address = |id, x, y, number, postcode| {
+            let (lat, lon) = at(x, y);
+            let mut tags = vec![("addr:housenumber", number), ("addr:street", "Torstraße")];
+            if let Some(postcode) = postcode {
+                tags.push(("addr:postcode", postcode));
+            }
+            node(id, lat, lon, &tags)
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    corner(1, 0.0, 0.0),
+                    corner(2, 3.0, 0.0),
+                    corner(3, 3.0, 1.0),
+                    corner(4, 1.0, 1.0),
+                    corner(5, 1.0, 3.0),
+                    corner(6, 0.0, 3.0),
+                    corner(7, 4.0, 0.0),
+                    corner(8, 6.0, 0.0),
+                    corner(9, 6.0, 2.0),
+                    corner(10, 4.0, 2.0),
+                    address(20, 0.5, 2.5, "5", None),
+                    address(21, 2.5, 0.5, "7", Some("10115")),
+                    address(22, 0.5, 0.5, "9", Some("99999")),
+                    address(23, 10.0, 0.0, "11", None),
+                ],
+                vec![
+                    way(600, &[1, 2, 3, 4], &[]),
+                    way(601, &[4, 5, 6, 1], &[]),
+                    way(
+                        602,
+                        &[7, 8, 9, 10, 7],
+                        &[("boundary", "postal_code"), ("ref", "10117")],
+                    ),
+                ],
+                vec![relation(
+                    950,
+                    &[(600, "outer"), (601, "outer")],
+                    &[
+                        ("type", "boundary"),
+                        ("boundary", "postal_code"),
+                        ("postal_code", "10115"),
+                    ],
+                )],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.postcode_records, 3);
+        assert_eq!(report.accepted.postcode_areas, 2);
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let find = |id: &str| {
+            reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id}"))
+        };
+        let postcode = |id: &str| match reader.records().record(find(id)).expect("record") {
+            Record::Postcode(record) => record,
+            other => panic!("{id} is a {:?}", other.layer()),
+        };
+
+        let l_shape = postcode("derived:osm:postcode:10115");
+        assert_eq!(
+            l_shape.area,
+            Some(SourceProvenance::osm(OsmObjectType::Relation, 950))
+        );
+        assert_eq!(l_shape.source.record_count, 1);
+        let [lon, lat] = point_lon_lat(&l_shape.geometry).expect("point");
+        let (x, y) = ((lon - 13.40) / 0.01, (lat - 52.50) / 0.01);
+        assert!(
+            (0.0..=3.0).contains(&x) && (0.0..=3.0).contains(&y) && (x <= 1.0 || y <= 1.0),
+            "inside the L, not at its centroid (1.1, 1.1): {x} {y}"
+        );
+
+        let square = postcode("derived:osm:postcode:10117");
+        assert_eq!(
+            square.area,
+            Some(SourceProvenance::osm(OsmObjectType::Way, 602))
+        );
+        assert_eq!(square.source.record_count, 0);
+        let [lon, lat] = point_lon_lat(&square.geometry).expect("point");
+        assert!((lon - 13.45).abs() < 1e-6 && (lat - 52.51).abs() < 1e-6);
+
+        let stated = postcode("derived:osm:postcode:99999");
+        assert_eq!(stated.area, None);
+        let [lon, lat] = point_lon_lat(&stated.geometry).expect("point");
+        assert!((lon - 13.405).abs() < 1e-6 && (lat - 52.505).abs() < 1e-6);
+
+        let area_postcode = |id: &str| {
+            reader
+                .boundary_context(find(id))
+                .expect("context")
+                .and_then(|context| context.admin_context.postcode_record_id)
+        };
+        let l_shape_id = find("derived:osm:postcode:10115");
+        assert_eq!(area_postcode("osm:node:20"), Some(l_shape_id));
+        assert_eq!(area_postcode("osm:node:21"), None, "states its postcode");
+        assert_eq!(area_postcode("osm:node:22"), None, "states another one");
+        assert_eq!(area_postcode("osm:node:23"), None, "outside every area");
+        let context = Contexts::new(&reader)
+            .of(find("osm:node:20"))
+            .expect("context");
+        assert_eq!(context.postcode.expect("postcode area").name, "10115");
+
+        // A stated postcode is checked against the area's: 10117 shares the
+        // first characters and lies near, but the address is in 10115.
+        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let geocode = |postcode: &str| {
+            searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "5 Torstraße".into(),
+                    locality: None,
+                    region: None,
+                    postcode: Some(postcode.into()),
+                    limit: 1,
+                    layer: Some("address".into()),
+                })
+                .expect("geocode")
+                .map(|hit| hit.hit.record.id)
+        };
+        assert_eq!(geocode("10115").as_deref(), Some("osm:node:20"));
+        assert_ne!(
+            geocode("10117").as_deref(),
+            Some("osm:node:20"),
+            "the address in the 10115 area contradicts 10117"
+        );
     }
 
     /// The town plus named POIs: one with an address, one without, a station

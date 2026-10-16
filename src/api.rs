@@ -285,7 +285,7 @@ fn stated(value: Option<&str>) -> Option<String> {
 }
 
 /// The areas a record lies in, one per level: the admin areas most specific
-/// first, then the place area.
+/// first, then the place area, then the postcode area.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Context {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,6 +302,10 @@ pub struct Context {
     /// smaller than a locality or larger than a region (Honshu).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<ContextArea>,
+    /// The postcode whose `boundary=postal_code` area the record lies in,
+    /// for a record that states none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<ContextArea>,
 }
 
 impl Context {
@@ -377,6 +381,7 @@ impl<'a> Contexts<'a> {
             region: self.area(tuple.region_record_id)?,
             country: self.area(tuple.country_record_id)?,
             place: self.area(tuple.place_record_id)?,
+            postcode: self.area(tuple.postcode_record_id)?,
         })
     }
 
@@ -668,6 +673,7 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
         ("context_region", area(|context| &context.region)),
         ("context_country", area(|context| &context.country)),
         ("context_place", area(|context| &context.place)),
+        ("context_postcode", area(|context| &context.postcode)),
         ("source_dataset", field(&|p| Some(p.source.dataset.clone()))),
         (
             "source_object_type",

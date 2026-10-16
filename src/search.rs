@@ -679,7 +679,19 @@ impl PackTextSearcher {
     /// the requested postcode's leading characters, the hit is somewhere else.
     /// With no postcode data nearby there is nothing to contradict the row.
     fn hit_in_postcode(&self, hit: &TextSearchHit, desired: &str) -> Result<bool> {
-        if let Some(postcode) = self.pack.records().postcode(hit.record_id)? {
+        // The postcode a record states, else the one whose area it lies in.
+        let postcode = match self.pack.records().postcode(hit.record_id)? {
+            Some(postcode) => Some(postcode),
+            None => match self
+                .pack
+                .boundary_context(hit.record_id)?
+                .and_then(|context| context.admin_context.postcode_record_id)
+            {
+                Some(area) => self.pack.records().postcode(area)?,
+                None => None,
+            },
+        };
+        if let Some(postcode) = postcode {
             return Ok(compact_postcode(&postcode).is_none_or(|postcode| {
                 postcode.starts_with(desired) || desired.starts_with(postcode.as_str())
             }));
@@ -1763,6 +1775,7 @@ mod tests {
                     postcode: "K0J 1K0".to_string(),
                     geometry: point_geometry(-76.881, 45.631),
                     source: DerivedSourceProvenance::osm_address_records(5),
+                    area: None,
                 }
                 .into(),
                 None,
@@ -1805,6 +1818,7 @@ mod tests {
                         postcode: code,
                         geometry: point_geometry(lon, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(1),
+                        area: None,
                     }
                     .into(),
                     None,
@@ -2122,6 +2136,7 @@ mod tests {
                     postcode: "M5V".to_string(),
                     geometry: point_geometry(-79.4, 43.6),
                     source: DerivedSourceProvenance::osm_address_records(2),
+                    area: None,
                 }
                 .into(),
                 None,

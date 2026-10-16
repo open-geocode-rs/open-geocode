@@ -210,6 +210,10 @@ impl Spill for PendingRecord {
                 out.push(2);
                 put_str(out, code);
             }
+            Some(ContextOrigin::Postcode(postcode)) => {
+                out.push(3);
+                put_str(out, postcode);
+            }
         }
         encode_record(out, &self.record);
     }
@@ -222,6 +226,7 @@ impl Spill for PendingRecord {
                 0 => None,
                 1 => Some(ContextOrigin::Boundary(get_u32(input)?)),
                 2 => Some(ContextOrigin::DerivedCountry(get_string(input)?)),
+                3 => Some(ContextOrigin::Postcode(get_string(input)?)),
                 other => bail!("unknown record origin {other}"),
             },
             record: decode_record(input)?,
@@ -360,6 +365,13 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
         Record::Postcode(record) => {
             put_str(out, &record.postcode);
             put_u64(out, record.source.record_count);
+            match &record.area {
+                Some(area) => {
+                    out.push(1);
+                    encode_source(out, area);
+                }
+                None => out.push(0),
+            }
             encode_geometry(out, &record.geometry);
         }
         Record::Place(_, record) => {
@@ -432,6 +444,10 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
         Layer::Postcode => Record::Postcode(PostcodeRecord {
             postcode: get_string(input)?,
             source: DerivedSourceProvenance::osm_address_records(get_u64(input)?),
+            area: match get_u8(input)? {
+                0 => None,
+                _ => Some(decode_source(input)?),
+            },
             geometry: decode_geometry(input)?,
         }),
         layer => Record::Place(
@@ -745,6 +761,13 @@ mod tests {
                 postcode: "M5V".into(),
                 geometry: point_geometry(-79.0, 43.0),
                 source: DerivedSourceProvenance::osm_address_records(3),
+                area: None,
+            }),
+            Record::Postcode(PostcodeRecord {
+                postcode: "M5V 2T6".into(),
+                geometry: point_geometry(-79.0, 43.0),
+                source: DerivedSourceProvenance::osm_address_records(0),
+                area: Some(SourceProvenance::osm(OsmObjectType::Relation, 18)),
             }),
             Record::Place(
                 PlaceLayer::Neighbourhood,
@@ -792,6 +815,7 @@ mod tests {
                 origin: match seq {
                     0 => None,
                     1 => Some(ContextOrigin::Boundary(4)),
+                    2 => Some(ContextOrigin::Postcode("M5V 2T6".into())),
                     _ => Some(ContextOrigin::DerivedCountry("CA".into())),
                 },
                 record,

@@ -25,6 +25,7 @@ geocode_context_district
 geocode_context_region
 geocode_context_country
 geocode_context_place
+geocode_context_postcode
 geocode_source_dataset
 geocode_source_object_type
 geocode_source_object_id

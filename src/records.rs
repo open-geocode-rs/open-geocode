@@ -22,7 +22,8 @@
 //!                     a street's, place's or POI's alternate names follow its name
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way;
-//!                     a POI's address follows a presence byte
+//!                     a POI's address and a postcode's area follow a presence
+//!                     byte, the area as an object type byte and a zigzag id
 //!       geometry      line strings only: varint count, then zigzag deltas
 //! ```
 //!
@@ -64,7 +65,7 @@ use crate::{
 pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 6;
+pub const RECORDS_VERSION: u32 = 7;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -483,6 +484,15 @@ impl RecordsWriter {
                     bail!("unsupported postcode source {}", record.source.derived_from);
                 }
                 put_u64(out, u64::from(self.strings.id(&record.postcode)?));
+                match &record.area {
+                    Some(area) => {
+                        let (kind, id) = osm_source(area);
+                        out.push(1);
+                        out.push(kind as u8);
+                        put_u64(out, id);
+                    }
+                    None => out.push(0),
+                }
             }
             Record::Place(_, record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
@@ -722,6 +732,7 @@ impl RecordsReader {
             }),
             Layer::Postcode => Record::Postcode(PostcodeRecord {
                 postcode: self.string_field(header.strings, &mut fields)?.to_string(),
+                area: postcode_area(&mut fields)?,
                 geometry: geometry(&mut fields)?,
                 source: DerivedSourceProvenance::osm_address_records(header.source_value),
             }),
@@ -1167,6 +1178,7 @@ impl RecordsReader {
             }
             Layer::Postcode => {
                 get_u32(fields)?;
+                postcode_area(fields)?;
             }
             _ => {
                 get_u32(fields)?;
@@ -1204,6 +1216,21 @@ impl RecordsReader {
         }
         Ok(points)
     }
+}
+
+/// The area a postcode's fields name after its postcode, if any.
+fn postcode_area(fields: &mut &[u8]) -> Result<Option<SourceProvenance>> {
+    if get_u8(fields)? == 0 {
+        return Ok(None);
+    }
+    let object_type = match get_u8(fields)? {
+        0 => OsmObjectType::Node,
+        1 => OsmObjectType::Way,
+        2 => OsmObjectType::Relation,
+        kind => bail!("postcode area has an unknown object type {kind}"),
+    };
+    let object_id = crate::util::codec::unzigzag(get_u64(fields)?);
+    Ok(Some(SourceProvenance::osm(object_type, object_id)))
 }
 
 fn osm_source(source: &SourceProvenance) -> (SourceKind, u64) {
@@ -1304,6 +1331,7 @@ mod tests {
                 postcode: "M5V 1A1".into(),
                 geometry: point_geometry(-79.0, 43.0),
                 source: DerivedSourceProvenance::osm_address_records(12),
+                area: None,
             }),
             Record::Interpolation(InterpolationRecord {
                 address: InterpolationAddressComponents {
@@ -1383,6 +1411,12 @@ mod tests {
                 source: SourceProvenance::osm(OsmObjectType::Relation, 4),
             },
         ));
+        records.push(Record::Postcode(PostcodeRecord {
+            postcode: "M5V 2T6".into(),
+            geometry: point_geometry(-79.0, 43.0),
+            source: DerivedSourceProvenance::osm_address_records(3),
+            area: Some(SourceProvenance::osm(OsmObjectType::Relation, 77)),
+        }));
         records
     }
 
