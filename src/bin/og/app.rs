@@ -249,7 +249,7 @@ impl App {
     }
 
     /// The rows of the region list. Browsing shows the region itself first,
-    /// as "All of ...", then its children. A search shows every region whose
+    /// as the first row, then its children. A search shows every region whose
     /// name matches, with the regions above it.
     pub fn region_rows(&self) -> Vec<RegionRow> {
         let tree = regions::tree();
@@ -290,7 +290,7 @@ impl App {
     }
 
     /// Rows the list can show from the current scroll: browsing at the top
-    /// spends one on the line under "All of ...".
+    /// spends one on the line under the region itself.
     pub fn region_capacity(&self) -> usize {
         if self.region_browsing() && self.region_scroll == 0 {
             REGION_ROWS - 1

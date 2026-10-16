@@ -135,7 +135,6 @@ fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
         .map(|(source, _)| source.name)
         .collect();
     let lines = vec![
-        choice("Build", vec![plain("a new Pack")]),
         choice("Region", region),
         choice("Sources", vec![plain(sources.join(" + "))]),
         choice(
@@ -151,7 +150,7 @@ fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
 
 /// What a started build leaves in terminal history.
 pub fn choices(app: &App) -> Vec<Line<'static>> {
-    answers(app, 4)
+    answers(app, 3)
 }
 
 pub fn stage_done(build: &Build, index: usize) -> Line<'static> {
@@ -306,17 +305,10 @@ fn input_line(text: &str, placeholder: &str) -> Line<'static> {
 }
 
 fn region(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, list] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(app::REGION_ROWS as u16 + 4),
-    ])
-    .areas(area);
-    frame.render_widget(Paragraph::new(answers(app, 1)), done);
-
     let tree = regions::tree();
     let rows = app.region_rows();
     let browsing = app.region_browsing();
-    let inner = list.width.saturating_sub(2) as usize;
+    let inner = area.width.saturating_sub(2) as usize;
     let mut lines = vec![
         input_line(
             &app.region_query,
@@ -341,7 +333,7 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
             inner,
         ));
         room -= 1;
-        // A line under "All of ..." sets it apart from the regions below.
+        // A line under the region itself sets it apart from the regions below.
         if all && rows.len() > 1 && room > 0 {
             lines.push(Line::from(span(
                 format!("  {}", "─".repeat(inner.saturating_sub(4))),
@@ -377,7 +369,7 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
             .right_aligned(),
         );
     }
-    frame.render_widget(Paragraph::new(lines).block(block), list);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
     let hints: &[(&str, &str)] = if browsing {
         &[
             ("↑↓", "move"),
@@ -407,7 +399,7 @@ fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<
     let hit = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
     let name = match (all, region.is_world()) {
         (true, true) => region.name.clone(),
-        (true, false) => format!("All of {}", region.name),
+        (true, false) => region.label.clone(),
         (false, _) => region.name.clone(),
     };
     let mut spans = vec![if selected {
@@ -461,13 +453,13 @@ fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<
 
 fn sources(frame: &mut Frame, area: Rect, app: &App) {
     let [done, list, _, _] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(answers(app, 2)), done);
+    frame.render_widget(Paragraph::new(answers(app, 1)), done);
     let inner = list.width.saturating_sub(2) as usize;
     let lines: Vec<Line> = mock::SOURCES
         .iter()
@@ -542,13 +534,13 @@ fn button(label: &str, selected: bool, enabled: bool) -> Span<'static> {
 
 fn confirm(frame: &mut Frame, area: Rect, app: &App) {
     let [done, panel_area, _, _] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(2),
         Constraint::Length(11),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(answers(app, 3)), done);
+    frame.render_widget(Paragraph::new(answers(app, 2)), done);
     let download = match (app.download_mb(), app.region.local()) {
         (0.0, Some(path)) => vec![plain("nothing"), span(format!("  using {path}"), DIM)],
         (mb, _) => vec![
