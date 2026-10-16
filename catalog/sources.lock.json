@@ -1,0 +1,25 @@
+{
+  "geofabrik": {
+    "index": "https://download.geofabrik.de/index-v1-nogeom.json",
+    "index_sha256": "265afa7d9e5929934cb523afcb1aa05e16add94887b87eb9acb138eeccc3b151",
+    "planet": "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf",
+    "fetched": "2026-10-16T20:52:15Z",
+    "snapshot": "upstream/geofabrik.json",
+    "sha256": "bb321b75f774f17128e3e45c5f06397e3dfc90c5cd3df145b89f44c43e8595ca"
+  },
+  "openaddresses": {
+    "api": "https://batch.openaddresses.io/api/data",
+    "fetched": "2026-10-16T20:55:21Z",
+    "snapshot": "upstream/openaddresses.json",
+    "sha256": "7a3d7b297c94a8128cbf4dd2d0c1f753674d31b538791fea7ad7635c97d1812f"
+  },
+  "overture": {
+    "release": "2026-09-23.1",
+    "bucket": "s3://overturemaps-us-west-2/release/2026-09-23.1/",
+    "boundaries": "https://download.geofabrik.de/index-v1.json",
+    "boundaries_sha256": "9b1d170b09eee255c0e56925788eb367646397c1ba1882f36b4c5c79133691fc",
+    "fetched": "2026-10-16T21:24:29Z",
+    "snapshot": "upstream/overture.json",
+    "sha256": "92a058c354983743ba47bc6d4ffb9a3fa9d06b4cf35155412e1abc23acbd9f3f"
+  }
+}

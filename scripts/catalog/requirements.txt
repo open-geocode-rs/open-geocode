@@ -1,0 +1,4 @@
+# Only `update overture` needs these; generate and check use the standard library.
+duckdb==1.5.6
+numpy==2.5.4
+shapely==2.2.0
