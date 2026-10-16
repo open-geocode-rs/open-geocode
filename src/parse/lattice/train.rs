@@ -22,7 +22,9 @@
 //! labellings, both from forward-backward over the row's lattice. Averaging
 //! the weights over every step keeps the model from following the last rows
 //! it saw. Rows stream from scratch files, so training memory does not grow
-//! with the number of countries either.
+//! with the number of countries either. A lattice does not depend on the
+//! weights, so each row's is built once and read by every epoch: from memory
+//! while the build's pool grants it, else from a scratch file.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -44,11 +46,12 @@ use super::{
     weights::Weights,
 };
 use crate::{
-    extsort::{ExternalSorter, Scratch, Spill, Spool, SpoolFile, SpoolReader},
-    memory::MemoryBudget,
+    extsort::{ExternalSorter, IndexedSpool, IndexedSpoolFile, Scratch, Spill, Spool, SpoolFile},
+    memory::{MemoryBudget, Reservation, Spillable},
     pack::{PackReader, RecordId},
     parse::types::Label,
     record::{AddressComponents, Layer, PlaceLayer, Record},
+    resources::Resources,
     text_index::normalize_index_text,
     util::codec::{get_string, get_u8, get_u64, put_str, put_u64},
 };
@@ -68,16 +71,17 @@ const SEED: u64 = 1;
 /// A Pack that renders fewer rows than this parses with the built-in
 /// weights: too few rows teach a model less than the hand-set weights know.
 const MIN_TRAIN_ROWS: usize = 1_000;
-/// Shards trained side by side, at most: more shards see fewer rows between
-/// two mixes and converge slower.
-const MAX_TRAIN_SHARDS: usize = 4;
+/// Shards trained side by side: more shards see fewer rows between two mixes
+/// and converge slower. Fixed, not taken from the cores, so a build trains
+/// the same weights on every machine.
+const TRAIN_SHARDS: usize = 4;
 /// The share of rendered rows held out to measure the model.
 const HELD_OUT_SHARE: f64 = 0.05;
 /// Records drawn per wanted row: a few draws render no row.
 const OVERSAMPLE: f64 = 1.25;
 /// Rows a shard holds to read its rows in an order of its own each epoch.
 const SHUFFLE_WINDOW: usize = 1 << 16;
-/// Rows whose lattices a shard builds side by side before learning them.
+/// Rows whose lattices are built side by side.
 const LATTICE_BATCH: usize = 1 << 10;
 /// Held-out rows labelled per parallel batch.
 const EVALUATE_BATCH: usize = 1 << 12;
@@ -125,8 +129,10 @@ pub struct TrainReport {
     pub sample_bytes: u64,
     pub shards: usize,
     pub epochs: usize,
-    /// Training rows the model got wrong in each epoch.
-    pub epoch_errors: Vec<usize>,
+    /// Training rows the model got wrong in the last epoch. Only the last
+    /// epoch decodes each row before learning it: the count is all the
+    /// decode is for, and it costs a pass of Viterbi per row.
+    pub last_epoch_errors: usize,
     /// Countries with their own transition table.
     pub countries: Vec<String>,
     /// Whether the Pack carries the trained weights; without them it parses
@@ -139,6 +145,14 @@ pub struct TrainReport {
     pub render_seconds: f64,
     pub lattice_seconds: f64,
     pub learn_seconds: f64,
+    /// Bytes the training rows' lattices took, in memory and in scratch
+    /// files, and how many shards read theirs from a file.
+    pub lattice_memory_bytes: u64,
+    pub lattice_file_bytes: u64,
+    pub lattice_file_shards: usize,
+    /// Whether the Pack was read into memory up front, as it is when it
+    /// fits in half the memory available.
+    pub pack_prefaulted: bool,
 }
 
 /// Token and whole-row accuracy on the held-out rows.
@@ -261,6 +275,10 @@ pub fn train(
         ..TrainReport::default()
     };
     let pack = PackReader::open(pack)?;
+    // Every lattice looks names up all over the dictionaries.
+    report.pack_prefaulted = pack
+        .container()
+        .advise_random_reads(Resources::probe().available_memory_bytes);
     // Only the dictionaries: the weights are what this trains.
     let tagger = LatticeTagger::new(Dictionaries::open(pack.container())?, Weights::zero());
     let mut random = Random::new(SEED);
@@ -319,7 +337,7 @@ pub fn train(
     drop(renderer);
 
     // Every row is held out or goes to one shard, in the random order.
-    let shards = rayon::current_num_threads().clamp(1, MAX_TRAIN_SHARDS);
+    let shards = TRAIN_SHARDS;
     report.shards = shards;
     let mut held_out = Spool::<Row>::create(scratch, "parse-held-out")?;
     let mut parts = (0..shards)
@@ -350,6 +368,53 @@ pub fn train(
         return Ok((None, report));
     }
 
+    // Every row's lattice, built once on every core. Each shard's cache is
+    // open on the pool before any is filled, so they split it fairly.
+    let at = Instant::now();
+    let mut caches = parts
+        .iter()
+        .map(|_| LatticeCache::new(scratch, memory))
+        .collect::<Vec<_>>();
+    for (part, cache) in parts.iter().zip(&mut caches) {
+        let mut rows = part.reader()?;
+        loop {
+            let batch = rows
+                .by_ref()
+                .take(LATTICE_BATCH)
+                .collect::<Result<Vec<_>>>()?;
+            if batch.is_empty() {
+                break;
+            }
+            let built = batch
+                .into_par_iter()
+                .map(|row| Learned {
+                    lattice: tagger.lattice(&row.tokens, &row.suppression),
+                    gold: row.gold,
+                })
+                .collect::<Vec<_>>();
+            for row in built {
+                cache.push(row)?;
+            }
+        }
+    }
+    drop(parts);
+    let caches = caches
+        .into_iter()
+        .map(LatticeCache::finish)
+        .collect::<Result<Vec<_>>>()?;
+    report.lattice_seconds = at.elapsed().as_secs_f64();
+    for cache in &caches {
+        match cache {
+            Lattices::Memory(_, reservation) => {
+                report.lattice_memory_bytes += reservation.bytes() as u64;
+            }
+            Lattices::File(file) => {
+                report.lattice_file_bytes += file.bytes();
+                report.lattice_file_shards += 1;
+            }
+        }
+    }
+
     // Iterative parameter mixing (McDonald, Hall and Mann 2010): every epoch
     // each shard of the rows trains its own model from the mixed weights,
     // in parallel, and the shards' weights are averaged. The result is the
@@ -359,41 +424,38 @@ pub fn train(
     let mut mixed = Weights::zero();
     let mut averages = Vec::with_capacity(EPOCHS);
     for epoch in 0..EPOCHS {
-        let results = parts
+        let results = caches
             .par_iter()
             .enumerate()
-            .map(|(shard, part)| -> Result<_> {
+            .map(|(shard, cache)| -> Result<_> {
                 let mut order = Random::new(SEED ^ ((epoch as u64) << 32 | shard as u64));
                 let mut model = Model::from_weights(mixed.clone());
-                let (mut errors, mut lattice, mut learn) = (0, 0.0, 0.0);
-                // A lattice does not depend on the weights, so a batch's are
-                // built on every core and the rows learned in order after.
-                for_each_shuffled(part.reader()?, &mut order, |batch| {
-                    let at = Instant::now();
-                    let built = batch
-                        .par_iter()
-                        .map(|row| tagger.lattice(&row.tokens, &row.suppression))
-                        .collect::<Vec<_>>();
-                    lattice += at.elapsed().as_secs_f64();
-                    let at = Instant::now();
-                    for (row, built) in batch.iter().zip(&built) {
-                        errors += usize::from(model.learn(built, row));
-                    }
-                    learn += at.elapsed().as_secs_f64();
-                })?;
-                Ok((model.averaged(), model.weights, errors, lattice, learn))
+                let mut errors = 0;
+                let count = epoch + 1 == EPOCHS;
+                let at = Instant::now();
+                for index in shuffled_order(cache.len(), &mut order) {
+                    cache.visit(index as usize, |row| {
+                        if count {
+                            errors += usize::from(model.is_wrong(&row.lattice, &row.gold));
+                        }
+                        model.learn(&row.lattice, &row.gold);
+                    })?;
+                }
+                Ok((
+                    model.averaged(),
+                    model.weights,
+                    errors,
+                    at.elapsed().as_secs_f64(),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         // Per-shard seconds, spread over the shards that ran side by side.
-        report.lattice_seconds +=
-            results.iter().map(|result| result.3).sum::<f64>() / shards as f64;
-        report.learn_seconds += results.iter().map(|result| result.4).sum::<f64>() / shards as f64;
-        report
-            .epoch_errors
-            .push(results.iter().map(|result| result.2).sum());
+        report.learn_seconds += results.iter().map(|result| result.3).sum::<f64>() / shards as f64;
+        report.last_epoch_errors = results.iter().map(|result| result.2).sum();
         mixed = Weights::mean(results.iter().map(|result| &result.1));
         averages.push(Weights::mean(results.iter().map(|result| &result.0)));
     }
+    drop(caches);
     let weights = Weights::mean(averages.iter());
     report.accuracy = evaluate_file(&tagger, &weights, &held_out)?;
     report.countries = weights.countries().map(|code| code.to_string()).collect();
@@ -402,38 +464,136 @@ pub fn train(
     Ok((Some(weights), report))
 }
 
-/// Call `visit` on batches of [`LATTICE_BATCH`] rows of `rows`, every row
-/// once, in a random order drawn through a window of [`SHUFFLE_WINDOW`]
-/// rows.
-fn for_each_shuffled(
-    rows: SpoolReader<Row>,
-    random: &mut Random,
-    mut visit: impl FnMut(Vec<Row>),
-) -> Result<()> {
-    let mut window = Vec::with_capacity(SHUFFLE_WINDOW);
-    let mut batch = Vec::with_capacity(LATTICE_BATCH);
-    for row in rows {
-        let row = row?;
+/// The indices `0..len` in a random order drawn through a window of
+/// [`SHUFFLE_WINDOW`] indices: once the window is full, each next index
+/// takes the place of a random one in it, which comes next, and the window
+/// ends in a random order of its own. A shard reads its rows in this order.
+fn shuffled_order(len: usize, random: &mut Random) -> Vec<u32> {
+    let mut order = Vec::with_capacity(len);
+    let mut window = Vec::with_capacity(SHUFFLE_WINDOW.min(len));
+    for index in 0..len as u32 {
         if window.len() < SHUFFLE_WINDOW {
-            window.push(row);
+            window.push(index);
             continue;
         }
         let at = random.below(window.len() as u64) as usize;
-        batch.push(std::mem::replace(&mut window[at], row));
-        if batch.len() == LATTICE_BATCH {
-            visit(std::mem::replace(
-                &mut batch,
-                Vec::with_capacity(LATTICE_BATCH),
-            ));
-        }
+        order.push(std::mem::replace(&mut window[at], index));
     }
     random.shuffle(&mut window);
-    batch.extend(window);
-    while !batch.is_empty() {
-        let rest = batch.split_off(batch.len().min(LATTICE_BATCH));
-        visit(std::mem::replace(&mut batch, rest));
+    order.extend(window);
+    order
+}
+
+/// A training row as learning reads it: its gold labels and its lattice.
+#[derive(Debug, Clone, PartialEq)]
+struct Learned {
+    gold: Vec<Label>,
+    lattice: Lattice,
+}
+
+impl Spill for Learned {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.gold.len() as u64);
+        out.extend(self.gold.iter().map(|label| *label as u8));
+        self.lattice.encode(out);
     }
-    Ok(())
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let mut gold = Vec::new();
+        for _ in 0..get_u64(input)? {
+            let Some(label) = Label::ALL.get(usize::from(get_u8(input)?)) else {
+                bail!("invalid label in a training lattice");
+            };
+            gold.push(*label);
+        }
+        Ok(Self {
+            gold,
+            lattice: Lattice::decode(input)?,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.gold.capacity() + self.lattice.resident_bytes()
+            - std::mem::size_of::<Lattice>()
+    }
+}
+
+/// One shard's rows with their lattices, as they are built: in memory while
+/// its fair share of the pool grants them, else, from the row the pool
+/// refuses on, every row in a scratch file read back by index.
+struct LatticeCache {
+    scratch: Arc<Scratch>,
+    reservation: Spillable,
+    rows: Vec<Learned>,
+    file: Option<IndexedSpool<Learned>>,
+}
+
+/// One shard's rows with their lattices, built.
+enum Lattices {
+    Memory(Vec<Learned>, Reservation),
+    File(IndexedSpoolFile<Learned>),
+}
+
+impl LatticeCache {
+    fn new(scratch: &Arc<Scratch>, memory: &Arc<MemoryBudget>) -> Self {
+        Self {
+            scratch: Arc::clone(scratch),
+            reservation: Spillable::new(memory),
+            rows: Vec::new(),
+            file: None,
+        }
+    }
+
+    fn push(&mut self, row: Learned) -> Result<()> {
+        if let Some(file) = &mut self.file {
+            return file.write(&row);
+        }
+        let bytes = row.resident_bytes();
+        let fits = self.reservation.bytes() + bytes <= self.reservation.share(usize::MAX)
+            && self.reservation.reservation().try_grow(bytes)
+            && self.rows.try_reserve(1).is_ok();
+        if fits {
+            self.rows.push(row);
+            return Ok(());
+        }
+        // The encoded rows take less than their resident bytes.
+        self.scratch
+            .check_room((self.reservation.bytes() + bytes) as u64)?;
+        let mut file = IndexedSpool::create(&self.scratch, "parse-lattices")?;
+        for held in self.rows.drain(..) {
+            file.write(&held)?;
+        }
+        file.write(&row)?;
+        self.rows = Vec::new();
+        self.reservation.reservation().release_all();
+        self.file = Some(file);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Lattices> {
+        Ok(match self.file {
+            Some(file) => Lattices::File(file.finish()?),
+            None => Lattices::Memory(self.rows, self.reservation.into_reservation()),
+        })
+    }
+}
+
+impl Lattices {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(rows, _) => rows.len(),
+            Self::File(file) => file.len(),
+        }
+    }
+
+    /// Call `visit` with row `index`.
+    fn visit(&self, index: usize, visit: impl FnOnce(&Learned)) -> Result<()> {
+        match self {
+            Self::Memory(rows, _) => visit(&rows[index]),
+            Self::File(file) => visit(&file.get(index)?),
+        }
+        Ok(())
+    }
 }
 
 /// A row with the random key that orders it among all rows.
@@ -618,16 +778,20 @@ impl Model {
         }
     }
 
-    /// Learn from one row. Returns whether the best labelling before the
-    /// update was wrong.
-    fn learn(&mut self, lattice: &Lattice, row: &Row) -> bool {
+    /// Whether the best labelling of a row, labelled `gold` by token, is
+    /// wrong under the current weights.
+    fn is_wrong(&self, lattice: &Lattice, gold: &[Label]) -> bool {
         let predicted = decode::best(lattice, &self.weights, 1)
             .into_iter()
             .next()
             .expect("a lattice with tokens has a path");
+        predicted.labels(lattice) != lattice.units.expand(gold)
+    }
+
+    /// Learn from one row, labelled `gold` by token.
+    fn learn(&mut self, lattice: &Lattice, gold: &[Label]) {
         // A token's label is the label of every unit of it.
-        let gold = lattice.units.expand(&row.gold);
-        let wrong = predicted.labels(lattice) != gold;
+        let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
         for (index, value) in gradient.edge {
             let delta = adagrad(&mut self.squares.edge[index], value);
@@ -645,7 +809,6 @@ impl Model {
             }
         }
         self.step += 1.0;
-        wrong
     }
 
     /// The weights averaged over every step.
@@ -2514,12 +2677,92 @@ mod tests {
         let mut model = Model::from_weights(Weights::zero());
         for _ in 0..10 {
             for row in &rows {
-                model.learn(&tagger.lattice(&row.tokens, &row.suppression), row);
+                model.learn(&tagger.lattice(&row.tokens, &row.suppression), &row.gold);
             }
         }
         let mut tally = Tally::default();
         tally.add(&tagger, &model.averaged(), &rows);
         let accuracy = tally.accuracy();
         assert_eq!(accuracy.rows, 1.0, "{accuracy:?}");
+    }
+
+    #[test]
+    fn rows_are_read_in_the_order_the_shuffle_window_draws() {
+        // The window as it shuffled the rows themselves, before the lattices
+        // were cached: each epoch must read the rows in this same order.
+        fn through_window(len: usize, random: &mut Random) -> Vec<u32> {
+            let mut window = Vec::new();
+            let mut order = Vec::new();
+            for row in 0..len as u32 {
+                if window.len() < SHUFFLE_WINDOW {
+                    window.push(row);
+                    continue;
+                }
+                let at = random.below(window.len() as u64) as usize;
+                order.push(std::mem::replace(&mut window[at], row));
+            }
+            random.shuffle(&mut window);
+            order.extend(window);
+            order
+        }
+        for len in [0, 1, 7, SHUFFLE_WINDOW, SHUFFLE_WINDOW + 4_321] {
+            let order = shuffled_order(len, &mut Random::new(len as u64));
+            assert_eq!(order, through_window(len, &mut Random::new(len as u64)));
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert!(sorted.into_iter().eq(0..len as u32), "every row once");
+        }
+    }
+
+    #[test]
+    fn lattices_read_back_from_scratch_equal_those_kept_in_memory() {
+        let entry = |country| Entry {
+            count: 10,
+            country: CountryCode::parse(country),
+            levels: 0,
+        };
+        let dictionaries = Dictionaries::from_entries([
+            (Field::Locality, "toronto", entry("CA")),
+            (Field::Street, "king street", entry("CA")),
+            (Field::Region, "ontario", entry("CA")),
+        ])
+        .with_areas(&[("toronto", &[7]), ("ontario", &[3])], &[(7, 3)]);
+        let tagger = LatticeTagger::new(dictionaries, Weights::zero());
+        let rows = [
+            "670 King Street West, Toronto, ON M5V 1M9",
+            "Kign Stret 12 Torono",
+            "東京都千代田区丸の内2-7-2",
+            "toronto",
+        ]
+        .into_iter()
+        .map(|text| {
+            let tokens = Tokens::new(text);
+            Learned {
+                gold: vec![Label::Other; tokens.len()],
+                lattice: tagger.lattice(&tokens, &Suppression::default()),
+            }
+        })
+        .collect::<Vec<_>>();
+        let scratch = Scratch::create(
+            std::env::temp_dir().join(format!("open-geocode-lattices-{}", uuid::Uuid::new_v4())),
+        )
+        .expect("scratch");
+        for (budget, in_memory) in [
+            (MemoryBudget::unlimited(), true),
+            (MemoryBudget::new(1), false),
+        ] {
+            let mut cache = LatticeCache::new(&scratch, &budget);
+            for row in &rows {
+                cache.push(row.clone()).expect("push");
+            }
+            let cache = cache.finish().expect("finish");
+            assert_eq!(matches!(cache, Lattices::Memory(..)), in_memory);
+            assert_eq!(cache.len(), rows.len());
+            for index in [2, 0, 3, 1] {
+                cache
+                    .visit(index, |row| assert_eq!(row, &rows[index]))
+                    .expect("visit");
+            }
+        }
     }
 }

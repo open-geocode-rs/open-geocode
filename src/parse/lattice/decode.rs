@@ -7,8 +7,13 @@
 //! the same label are one labelling, so each decoding cell keeps the best
 //! path per label sequence and the n best are n different labellings.
 
-use super::{CountryCode, Units, weights::Weights};
-use crate::parse::types::Label;
+use anyhow::{Context, Result};
+
+use super::{CountryCode, Tokens, Units, weights::Weights};
+use crate::{
+    parse::types::Label,
+    util::codec::{get_string, get_u8, get_u32, get_u64, put_str, put_u64},
+};
 
 /// Labels, then the start and end states of the transition table.
 pub(super) const LABELS: usize = Label::ALL.len();
@@ -41,7 +46,7 @@ impl Span {
 
 /// The spans over the units of one query, and the countries worth decoding
 /// it for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct Lattice {
     /// How many units the query has.
     pub len: usize,
@@ -78,6 +83,154 @@ impl Lattice {
             .iter()
             .find(|place| place.0 == start && place.1 == end)
             .map(|place| place.2.as_slice())
+    }
+
+    /// Bytes the lattice holds, its heap data included.
+    pub fn resident_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let tokens = &self.units.tokens;
+        size_of::<Self>()
+            + tokens
+                .words
+                .iter()
+                .map(|word| size_of::<String>() + word.capacity())
+                .sum::<usize>()
+            + tokens.breaks.capacity()
+            + tokens.joiners.capacity() * size_of::<Option<char>>()
+            + self.units.token_of.capacity() * size_of::<usize>()
+            + self.units.glued.capacity()
+            + self.spans.capacity() * size_of::<Span>()
+            + self
+                .spans
+                .iter()
+                .map(|span| {
+                    span.features.capacity() * size_of::<u32>()
+                        + span.country_features.capacity() * size_of::<(CountryCode, u32)>()
+                })
+                .sum::<usize>()
+            + self.candidates.capacity() * size_of::<CountryCode>()
+            + self.places.capacity() * size_of::<(usize, usize, Vec<u32>)>()
+            + self
+                .places
+                .iter()
+                .map(|place| place.2.capacity() * size_of::<u32>())
+                .sum::<usize>()
+            + self.by_end.capacity() * size_of::<Vec<usize>>()
+            + self
+                .by_end
+                .iter()
+                .map(|spans| spans.capacity() * size_of::<usize>())
+                .sum::<usize>()
+    }
+
+    /// Write the lattice for [`Self::decode`], which reads back an equal one.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let units = &self.units;
+        put_u64(out, units.len() as u64);
+        for index in 0..units.len() {
+            put_str(out, &units.tokens.words[index]);
+            out.push(u8::from(units.tokens.breaks[index]) | u8::from(units.glued[index]) << 1);
+            put_u64(out, units.tokens.joiners[index].map_or(0, u64::from));
+            put_u64(out, units.token_of[index] as u64);
+        }
+        put_u64(out, self.spans.len() as u64);
+        for span in &self.spans {
+            put_u64(out, span.start as u64);
+            put_u64(out, span.end as u64);
+            put_u64(out, span.features.len() as u64);
+            for feature in &span.features {
+                put_u64(out, u64::from(*feature));
+            }
+            put_u64(out, span.country_features.len() as u64);
+            for (country, feature) in &span.country_features {
+                put_u64(out, u64::from(country.to_u16()));
+                put_u64(out, u64::from(*feature));
+            }
+        }
+        put_u64(out, self.candidates.len() as u64);
+        for country in &self.candidates {
+            put_u64(out, u64::from(country.to_u16()));
+        }
+        put_u64(out, self.places.len() as u64);
+        for (start, end, ids) in &self.places {
+            put_u64(out, *start as u64);
+            put_u64(out, *end as u64);
+            put_u64(out, ids.len() as u64);
+            for id in ids {
+                put_u64(out, u64::from(*id));
+            }
+        }
+    }
+
+    pub fn decode(input: &mut &[u8]) -> Result<Self> {
+        let country = |input: &mut &[u8]| -> Result<CountryCode> {
+            u16::try_from(get_u64(input)?)
+                .ok()
+                .and_then(CountryCode::from_u16)
+                .context("invalid country in a lattice")
+        };
+        let count = |input: &mut &[u8]| -> Result<usize> {
+            usize::try_from(get_u64(input)?).context("lattice length out of range")
+        };
+        let mut units = Units {
+            tokens: Tokens::default(),
+            token_of: Vec::new(),
+            glued: Vec::new(),
+        };
+        for _ in 0..count(input)? {
+            units.tokens.words.push(get_string(input)?);
+            let flags = get_u8(input)?;
+            units.tokens.breaks.push(flags & 1 != 0);
+            units.glued.push(flags & 2 != 0);
+            let joiner = match get_u64(input)? {
+                0 => None,
+                code => Some(
+                    u32::try_from(code)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .context("invalid joiner in a lattice")?,
+                ),
+            };
+            units.tokens.joiners.push(joiner);
+            units.token_of.push(count(input)?);
+        }
+        let span_count = count(input)?;
+        // A corrupt count must not reserve more than the input could hold.
+        let mut spans = Vec::with_capacity(span_count.min(input.len()));
+        for _ in 0..span_count {
+            let start = count(input)?;
+            let end = count(input)?;
+            let features = (0..count(input)?)
+                .map(|_| get_u32(input))
+                .collect::<Result<Vec<_>>>()?;
+            let country_features = (0..count(input)?)
+                .map(|_| Ok((country(input)?, get_u32(input)?)))
+                .collect::<Result<Vec<_>>>()?;
+            if start >= end || end > units.len() {
+                anyhow::bail!("invalid span in a lattice");
+            }
+            spans.push(Span {
+                start,
+                end,
+                features,
+                country_features,
+            });
+        }
+        let candidates = (0..count(input)?)
+            .map(|_| country(input))
+            .collect::<Result<Vec<_>>>()?;
+        let mut places = Vec::new();
+        for _ in 0..count(input)? {
+            let start = count(input)?;
+            let end = count(input)?;
+            let ids = (0..count(input)?)
+                .map(|_| get_u32(input))
+                .collect::<Result<Vec<_>>>()?;
+            places.push((start, end, ids));
+        }
+        let mut lattice = Self::new(units, spans, candidates);
+        lattice.places = places;
+        Ok(lattice)
     }
 }
 

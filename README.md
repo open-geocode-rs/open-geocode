@@ -51,10 +51,16 @@ A region fits in the budget and never touches disk; a country or the planet spil
 cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-budget-mb 16384 --scratch-dir /mnt/fast-ssd/og-scratch
 ```
 
-- `--memory-budget-mb` (default 1024, minimum 64) is one shared pool for the build's large buffers: sort buffers (counted by capacity), the string table of the current segment, merge read buffers, and the text indexing buffers.
-  Each sorter gets a quarter of the pool and the text index a quarter, reserved only while records are written.
-  A sort buffer that would overflow the pool spills to disk.
-  The build report records the tracked peak (`scratch.peak_tracked_bytes`).
+- Before it starts, the build probes what the process can use: CPUs (the affinity mask, a cgroup quota or a Windows Job object's CPU cap) and memory (available memory, the Windows commit limit, a cgroup, Job object or rlimit limit).
+  It then checks the input against the memory and disk it needs and stops, naming each shortfall and its fix, unless `--force` is given.
+  The build report records the probe, the sizes chosen and the check (`resources`).
+- `--memory-budget-mb` (minimum 64) sets the one shared pool for the build's large buffers: sort buffers (counted by capacity), the string table of the current segment, merge read buffers, the text indexing buffers and the parser's training lattices.
+  Without it the pool is half of the available memory less what the build holds outside the pool, between 256 MiB and 1 GiB.
+  A larger pool spills less but builds slower: sorting, hashing and indexing in buffers far larger than the CPU caches costs more than the spill saves.
+  The text index takes half of the pool while records are written, and the sorters split the rest fairly, so a sorter running alone may use all of it.
+  A buffer that would overflow its share spills to disk, and so does one that would push the heap past 85% of the memory that was available.
+  The build report records the tracked peak (`scratch.peak_tracked_bytes`) and the heap's (`scratch.peak_heap_bytes`).
+- The build runs one pool of worker threads, one per usable CPU unless the memory beside the budget cannot hold 64 MiB for each; `RAYON_NUM_THREADS` overrides it.
 - The string table cannot spill, so it starts a new segment once it uses an eighth of the pool (or after 1,048,576 records); with a small budget, common strings such as country names are then stored a few more times.
 - A few reservations are needed to make progress and are taken even when the pool is full, so the tracked peak can pass a very small budget:
   merge read buffers (64 KiB to 1 MiB per run file being merged, sized from the sorter's share) and the text index's minimum of 16 MiB.

@@ -3,7 +3,9 @@
 //! Memory stays bounded by the sorter budget whatever the input size: features,
 //! node references, resolved coordinates and finished records all flow through
 //! scratch files and external sorts. A region fits in the budget and never
-//! touches disk; a planet spills and merges through the same code.
+//! touches disk; a planet spills and merges through the same code. The budget
+//! and the worker threads are sized to what the machine can give before the
+//! build starts (see [`plan_build`]).
 //!
 //! ```text
 //! pass 1  scan every block (parallel)    -> records for nodes, way features,
@@ -51,7 +53,9 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::{
+    alloc,
     builder::{
+        plan::{BuildPlan, plan_build},
         progress::{item_progress_bar, stage_progress},
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
     },
@@ -66,6 +70,7 @@ use crate::{
     },
     record::{Record, RejectedRecord},
     records::quantize,
+    resources::Resources,
     text_index::PostcodeAreas,
     util::{geo::point_lon_lat, hilbert::hilbert_key},
 };
@@ -78,77 +83,106 @@ use postcode::PostcodeAccumulator;
 use scan::scan_block;
 use spill::{NodeRequest, PendingRecord, ResolvedRef, WayFeature, WayKind};
 
-/// Default memory for build sorters before they spill to disk.
-pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 1 << 30;
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BuildOsmOptions {
     pub input: PathBuf,
     pub pack: PathBuf,
-    /// Memory for sort buffers. Inputs that need more spill to scratch files.
-    pub memory_budget_bytes: usize,
+    /// Memory for the build's buffers; inputs that need more spill to
+    /// scratch files. Derived from the memory the process can use when not
+    /// set.
+    pub memory_budget_bytes: Option<usize>,
     /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
+    /// Build even when the pre-flight check finds too little memory or disk.
+    pub force: bool,
 }
 
-impl Default for BuildOsmOptions {
-    fn default() -> Self {
-        Self {
-            input: PathBuf::new(),
-            pack: PathBuf::new(),
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            scratch_dir: None,
-        }
-    }
-}
-
-pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
-    let started = Instant::now();
+/// Plan a build of `options` on this machine: probe it, size the budget and
+/// the threads, and check the memory and disk the input needs.
+pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     if !options.input.is_file() {
         bail!("input {} does not exist", options.input.display());
     }
-    // Up to four sorters hold memory at the same time (node references or
-    // resolved coordinates, the two record sorters, the spatial pairs). While
-    // records are written the text index is what every record waits on, so its
-    // buffers take two sorters' share: more indexing threads, fewer segments.
-    let sorter_budget = (options.memory_budget_bytes / 4).max(1);
-    let memory = MemoryBudget::new(options.memory_budget_bytes);
+    let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
+    plan_build(
+        input_bytes(&options.input)?,
+        scratch,
+        &options.pack,
+        options.memory_budget_bytes,
+        options.force,
+    )
+}
+
+pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
+    let plan = plan_osm_build(&options)?;
+    build_planned_osm_pack(options, plan)
+}
+
+/// Build with a plan made by [`plan_osm_build`]. The caller sizes the
+/// process's rayon pool to `plan.threads` before any parallel work, since
+/// one pool serves every stage.
+pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
+    let started = Instant::now();
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let budget = usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX);
+    // The sorters and the parser's lattice cache split what the others leave
+    // of the pool by fair shares. While records are written the text index
+    // is what every record waits on, so it takes half: more indexing
+    // threads, fewer segments. The context record and spatial sorters hold
+    // a few times less than the others, and are capped to stay so.
+    let memory = MemoryBudget::new(budget);
+    memory.sample(&plan.resources);
     let mut writer = PackWriter::create_with(
         &options.pack,
         PackWriterOptions {
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
-            sort_budget_bytes: sorter_budget,
-            text_index_memory_bytes: sorter_budget * 2,
+            sort_budget_bytes: (budget / 4).max(1),
+            text_index_memory_bytes: (budget / 2).max(1),
         },
     )?;
     let scratch = Arc::clone(writer.scratch());
+    let input_bytes = input_bytes(&options.input)?;
+    // Spill files stay in the page cache while they fit in a quarter of what
+    // the build leaves free: the rest keeps the Pack and the input it
+    // rereads, and dirty pages the lazy writer holds back are not free.
+    scratch.set_cache_bytes(
+        plan.resources
+            .available_memory_bytes
+            .saturating_sub(plan.memory_budget_bytes + plan.untracked_bytes(input_bytes))
+            / 4,
+    );
     let mut build = Build {
         report: BuilderReport {
             schema_version: BUILD_REPORT_SCHEMA_VERSION,
             input: options.input.display().to_string(),
             pack: options.pack.display().to_string(),
-            input_bytes: input_bytes(&options.input)?,
+            input_bytes,
             ..BuilderReport::default()
         },
         audit: Audit::create(writer.generation())?,
         postcodes: PostcodeAccumulator::default(),
-        records: ExternalSorter::new(&scratch, "records", &memory, sorter_budget),
+        records: ExternalSorter::new(&scratch, "records", &memory, budget),
         context_records: ExternalSorter::new(
             &scratch,
             "context-records",
             &memory,
-            sorter_budget / 4,
+            (budget / 16).max(1),
         ),
         seq: 0,
     };
-    build.report.scratch.memory_budget_bytes = options.memory_budget_bytes as u64;
+    build.report.scratch.memory_budget_bytes = plan.memory_budget_bytes;
+    build.report.resources.threads = rayon::current_num_threads();
+    build.report.resources.plan = plan;
 
     // Pass 1: classify everything.
     let phase = Instant::now();
-    let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, sorter_budget);
+    let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, budget);
     let mut features = Spool::<WayFeature>::create(&scratch, "way-features")?;
     let mut relations = Vec::new();
     // Boundary ways kept by pass 1. When one is also a relation member, its
@@ -229,7 +263,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let request_stats = requests.stats();
     build.report.geometry_resolution.required_node_refs = request_stats.items;
     let mut resolved =
-        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, sorter_budget);
+        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, budget);
     let join = join_nodes(
         &options.input,
         &node_blobs,
@@ -374,8 +408,12 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     // is published.
     let phase = Instant::now();
     let progress = stage_progress("8/8 train address parser");
-    let (weights, training) =
-        train::train(&sealed.path(), sample, &scratch, &memory, sorter_budget)?;
+    // By now the build has used memory and page cache a fresh process would
+    // have: sample again what is left.
+    let resources = Resources::probe();
+    memory.sample(&resources);
+    report.resources.at_training = resources;
+    let (weights, training) = train::train(&sealed.path(), sample, &scratch, &memory, budget)?;
     if let Some(weights) = weights {
         let bytes = weights.to_bytes();
         sealed.add_section(WEIGHTS_SECTION, WEIGHTS_VERSION, &bytes)?;
@@ -415,6 +453,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     report.output.text_index_bytes = stats.text_index_bytes;
     report.output.sections = stats.sections;
     report.output.rejection_count = audit.count;
+    report.scratch.peak_heap_bytes = alloc::peak_bytes().unwrap_or_default() as u64;
     report.phases.total_ms = started.elapsed().as_millis();
     report.finalize_throughput();
     audit.finish(&report)?;
@@ -771,12 +810,12 @@ mod tests {
         ]
     }
 
-    fn build(root: &Path, input: &Path, memory_budget_bytes: usize) -> BuilderReport {
+    fn build(root: &Path, input: &Path, memory_budget_bytes: Option<usize>) -> BuilderReport {
         build_osm_pack(BuildOsmOptions {
             input: input.to_path_buf(),
             pack: root.to_path_buf(),
             memory_budget_bytes,
-            scratch_dir: None,
+            ..BuildOsmOptions::default()
         })
         .expect("build")
     }
@@ -786,7 +825,7 @@ mod tests {
         let dir = temp_dir("town");
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
-        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let report = build(&dir.join("pack"), &input, None);
 
         let reader = PackReader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
@@ -991,7 +1030,7 @@ mod tests {
                 ],
             ],
         );
-        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let report = build(&dir.join("pack"), &input, None);
         assert_eq!(report.accepted.by_layer.get("address"), Some(&1));
         assert_eq!(report.rejected.total, 0);
 
@@ -1118,7 +1157,7 @@ mod tests {
                 ],
             ],
         );
-        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let report = build(&dir.join("pack"), &input, None);
         assert_eq!(report.accepted.place_areas, 2);
         assert_eq!(report.accepted.by_layer.get("place"), Some(&1));
         assert_eq!(report.accepted.by_layer.get("neighbourhood"), Some(&1));
@@ -1230,7 +1269,7 @@ mod tests {
         let dir = temp_dir("pois");
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town_with_pois());
-        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let report = build(&dir.join("pack"), &input, None);
 
         let reader = PackReader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
@@ -1344,10 +1383,10 @@ mod tests {
         let dir = temp_dir("spill");
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town_with_pois());
-        let in_memory = build(&dir.join("memory"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let in_memory = build(&dir.join("memory"), &input, None);
         // A 4-byte budget leaves every sorter one item of memory, so everything
         // goes through run files and multi-round merges.
-        let spilled = build(&dir.join("spilled"), &input, 4);
+        let spilled = build(&dir.join("spilled"), &input, Some(4));
         let spilling_sorters = spilled
             .scratch
             .sorters

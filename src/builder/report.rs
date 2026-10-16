@@ -3,12 +3,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    builder::plan::BuildPlan,
     parse::lattice::train::TrainReport,
     record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
+    resources::Resources,
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 16;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -27,6 +29,7 @@ pub struct BuilderReport {
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
     pub throughput: Throughput,
+    pub resources: ResourceReport,
     pub scratch: ScratchReport,
     pub output: PackOutputReport,
     /// The address parser trained on the Pack's records.
@@ -173,12 +176,27 @@ fn merge_samples<T>(
     }
 }
 
+/// What the machine gave the build.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ResourceReport {
+    /// The probe, the sizes chosen from it and the pre-flight check.
+    pub plan: BuildPlan,
+    /// Worker threads the build ran on.
+    pub threads: usize,
+    /// The probe again when the parser's training started.
+    pub at_training: Resources,
+}
+
 /// Disk used for build scratch files and how often each sorter spilled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ScratchReport {
     pub memory_budget_bytes: u64,
-    /// Most memory held at once by sort, merge and text indexing buffers.
+    /// Most memory held at once by sort, merge, text indexing and lattice
+    /// buffers.
     pub peak_tracked_bytes: u64,
+    /// Most bytes the heap held at once, as the global allocator counts
+    /// them; 0 when it does not.
+    pub peak_heap_bytes: u64,
     pub spilled_bytes: u64,
     pub sorters: BTreeMap<String, SorterReport>,
 }

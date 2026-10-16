@@ -10,13 +10,14 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use open_geocode::{
+    alloc::CountingAlloc,
     api,
     batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
     bench::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
     },
-    builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
+    builder::{BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     pack::{PackReader, RecordId},
     parse::{
@@ -26,10 +27,18 @@ use open_geocode::{
         },
         lattice::LatticeTagger,
     },
+    resources,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
+
+/// mimalloc, counted. The Windows process heap serializes a many-threaded
+/// build on its lock once the heap has churned (LLVM measured a ThinLTO link
+/// 16 times slower on it than on mimalloc); mimalloc's heaps are per thread.
+/// The count lets the build's memory pool see the heap it does not track.
+#[global_allocator]
+static ALLOCATOR: CountingAlloc<mimalloc::MiMalloc> = CountingAlloc::new(mimalloc::MiMalloc);
 
 #[derive(Debug, Parser)]
 #[command(name = "open-geocode")]
@@ -51,18 +60,24 @@ enum Commands {
         #[arg(long)]
         pack: PathBuf,
 
-        /// Memory for build sort buffers, in MiB (64 to 1048576). Larger inputs
-        /// spill to scratch files on disk instead of using more memory.
+        /// Memory for the build's buffers, in MiB (64 to 1048576). Larger
+        /// inputs spill to scratch files on disk instead of using more memory.
+        /// Defaults to half of the memory this process can use, less what the
+        /// build holds outside its buffers.
         #[arg(
             long,
-            default_value_t = (DEFAULT_MEMORY_BUDGET_BYTES >> 20) as u64,
             value_parser = clap::value_parser!(u64).range(MIN_MEMORY_BUDGET_MB..=MAX_MEMORY_BUDGET_MB),
         )]
-        memory_budget_mb: u64,
+        memory_budget_mb: Option<u64>,
 
         /// Directory for scratch files. Defaults to inside the Pack directory.
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
+
+        /// Build even when the pre-flight check finds too little memory or
+        /// disk for the input.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -438,14 +453,44 @@ async fn main() -> Result<()> {
             pack,
             memory_budget_mb,
             scratch_dir,
+            force,
         } => {
-            let report = build_osm_pack(BuildOsmOptions {
+            resources::opt_out_of_power_throttling();
+            let options = BuildOsmOptions {
                 input,
                 pack,
-                memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
+                memory_budget_bytes: memory_budget_mb
+                    .map(|mb| usize::try_from(mb << 20))
+                    .transpose()
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
-            })?;
+                force,
+            };
+            let plan = plan_osm_build(&options)?;
+            // One pool serves every stage of the build, sized by the plan
+            // unless RAYON_NUM_THREADS sets it.
+            if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(plan.threads)
+                    .build_global()
+                    .context("failed to start the build's worker threads")?;
+            }
+            let found = &plan.resources;
+            eprintln!(
+                "{} MiB memory budget ({}), {} threads; {} usable CPUs ({}), {} MiB memory available ({})",
+                plan.memory_budget_bytes >> 20,
+                if plan.memory_budget_derived {
+                    "derived"
+                } else {
+                    "set"
+                },
+                rayon::current_num_threads(),
+                found.usable_cpus,
+                found.cpu_limit,
+                found.available_memory_bytes >> 20,
+                found.memory_limit,
+            );
+            let report = build_planned_osm_pack(options, plan)?;
             write_json(serde_json::json!({
                 "records": report.output.record_count,
                 "rejections": report.output.rejection_count,
@@ -876,31 +921,33 @@ mod tests {
 
     use super::*;
 
-    fn build_budget(value: &str) -> Result<usize, clap::Error> {
-        let cli = Cli::try_parse_from([
+    fn build_budget(value: Option<&str>) -> Result<Option<u64>, clap::Error> {
+        let mut args = vec![
             "open-geocode",
             "build",
             "--input",
             "in.osm.pbf",
             "--pack",
             "pack",
-            "--memory-budget-mb",
-            value,
-        ])?;
-        match cli.command {
+        ];
+        if let Some(value) = value {
+            args.extend(["--memory-budget-mb", value]);
+        }
+        match Cli::try_parse_from(args)?.command {
             Commands::Build {
                 memory_budget_mb, ..
-            } => Ok(memory_budget_mb as usize),
+            } => Ok(memory_budget_mb),
             _ => unreachable!("parsed a build command"),
         }
     }
 
     #[test]
     fn memory_budget_must_be_usable() {
-        assert!(build_budget("0").is_err());
-        assert!(build_budget("63").is_err());
-        assert!(build_budget("99999999999999999").is_err());
-        assert_eq!(build_budget("64").expect("minimum"), 64);
-        assert_eq!(build_budget("16384").expect("planet"), 16_384);
+        assert!(build_budget(Some("0")).is_err());
+        assert!(build_budget(Some("63")).is_err());
+        assert!(build_budget(Some("99999999999999999")).is_err());
+        assert_eq!(build_budget(Some("64")).expect("minimum"), Some(64));
+        assert_eq!(build_budget(Some("16384")).expect("planet"), Some(16_384));
+        assert_eq!(build_budget(None).expect("derived"), None);
     }
 }

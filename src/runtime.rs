@@ -27,6 +27,7 @@ use crate::{
         request_id::{self, RequestId},
     },
     pack::PackReader,
+    resources::Resources,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     search::{PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
 };
@@ -50,6 +51,10 @@ pub(crate) struct AppState {
 impl AppState {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let pack = Arc::new(PackReader::open(path)?);
+        // Every query looks things up all over the Pack: read it in now
+        // when it fits, so the first queries do not each wait on faults.
+        pack.container()
+            .advise_random_reads(Resources::probe().available_memory_bytes);
         let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         Ok(Self {

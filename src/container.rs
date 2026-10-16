@@ -242,6 +242,22 @@ impl Container {
         self.bytes.len() as u64
     }
 
+    /// Tell the OS how a reader that looks things up all over the Pack
+    /// (the server, parser training) will touch the mapping, given the memory
+    /// available. A Pack that fits in half of it is read in now in large
+    /// reads, so no lookup waits on a fault of its own (`MADV_POPULATE_READ`
+    /// on Linux, `PrefetchVirtualMemory` on Windows); one that does not is
+    /// read without readahead (`MADV_RANDOM`), which would otherwise pull in
+    /// pages no lookup asked for and push out those it did. Mapped files
+    /// stay safe while they fit (Crotty, Leis and Pavlo, CIDR 2022). The
+    /// mapping is read-only and never flushed. Returns whether the Pack was
+    /// read in; a hint the OS refuses changes nothing else.
+    pub fn advise_random_reads(&self, available_memory_bytes: u64) -> bool {
+        let fits = self.file_size() <= available_memory_bytes / 2;
+        advise(&self.bytes.0, fits);
+        fits
+    }
+
     pub fn sections(&self) -> &BTreeMap<String, SectionInfo> {
         &self.sections
     }
@@ -331,6 +347,41 @@ fn parse_toc(bytes: &[u8]) -> Result<BTreeMap<String, SectionInfo>> {
         bail!("Pack table of contents has trailing bytes");
     }
     Ok(sections)
+}
+
+#[cfg(unix)]
+fn advise(mmap: &Mmap, prefault: bool) {
+    use memmap2::Advice;
+    if !prefault {
+        let _ = mmap.advise(Advice::Random);
+        return;
+    }
+    // Before Linux 5.14 there is no populate advice; read ahead instead.
+    #[cfg(target_os = "linux")]
+    if mmap.advise(Advice::PopulateRead).is_ok() {
+        return;
+    }
+    let _ = mmap.advise(Advice::WillNeed);
+}
+
+#[cfg(windows)]
+fn advise(mmap: &Mmap, prefault: bool) {
+    use windows_sys::Win32::System::{
+        Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY},
+        Threading::GetCurrentProcess,
+    };
+    // Windows has no advice against readahead on a mapped view.
+    if !prefault || mmap.is_empty() {
+        return;
+    }
+    let range = WIN32_MEMORY_RANGE_ENTRY {
+        VirtualAddress: mmap.as_ptr().cast_mut().cast(),
+        NumberOfBytes: mmap.len(),
+    };
+    // SAFETY: the range is the live mapping, which the call only reads in.
+    unsafe {
+        PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+    }
 }
 
 #[derive(Clone)]

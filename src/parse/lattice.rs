@@ -28,7 +28,7 @@ pub mod postcode;
 pub mod train;
 pub mod weights;
 
-use std::{collections::HashMap, fmt, path::Path, sync::OnceLock};
+use std::{collections::HashMap, fmt, path::Path, rc::Rc, sync::OnceLock};
 
 use anyhow::Result;
 use levenshtein_automata::{DFA, LevenshteinAutomatonBuilder};
@@ -551,8 +551,16 @@ pub struct LatticeTagger {
     dictionaries: Dictionaries,
     postcodes: &'static PostcodeTable,
     weights: Weights,
-    one_edit: LevenshteinAutomatonBuilder,
-    two_edits: LevenshteinAutomatonBuilder,
+}
+
+/// The builder of the automata of names within `edits` edits (one or two),
+/// transpositions counted as one: built once per process and shared, as
+/// Tantivy shares its builders, since the two-edit one takes milliseconds
+/// and megabytes to build.
+fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuilder {
+    static BUILDERS: [OnceLock<LevenshteinAutomatonBuilder>; 2] =
+        [OnceLock::new(), OnceLock::new()];
+    BUILDERS[usize::from(edits - 1)].get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true))
 }
 
 impl fmt::Debug for LatticeTagger {
@@ -584,8 +592,6 @@ impl LatticeTagger {
             dictionaries,
             postcodes: PostcodeTable::global(),
             weights,
-            one_edit: LevenshteinAutomatonBuilder::new(1, true),
-            two_edits: LevenshteinAutomatonBuilder::new(2, true),
         }
     }
 
@@ -727,7 +733,7 @@ impl LatticeTagger {
         let mut covers = vec![0u16; tokens.len()];
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
         let runs = units.runs();
-        let phrases = Phrases::new(self, &units, longest);
+        let mut phrases = Phrases::new(self, &units, longest);
         // Exact area names, `(start, end, is a region)`, and the glued
         // spans without other evidence, which may be chains of them.
         let mut areas = Vec::new();
@@ -756,7 +762,7 @@ impl LatticeTagger {
                     evidence = true;
                     set.glued_phrase(field);
                 }
-                let mut key = SpanKey::new(units.key(start, end), &infos[start..end]);
+                let mut key = SpanKey::new(phrases.take_key(start, end), &infos[start..end]);
                 // A word's affixes: of a token, or of glued units as one.
                 let glued = end - start > 1 && units.unspaced(start, end);
                 if (end - start == 1 && !infos[start].unspaced) || glued {
@@ -928,17 +934,16 @@ impl LatticeTagger {
         if let Some(entry) = exact {
             return Some(Match { entry, distance: 0 });
         }
-        let first = key.expanded.chars().next().map_or(0, char::len_utf8);
-        let prefix = key.expanded[..first].to_string();
-        if field == Field::Poi {
-            if key.tokens < 2 && key.chars < MIN_FUZZY_POI_CHARS {
-                return None;
-            }
-            let dfa = key.poi_dfa(self)?;
-            return self.dictionaries.fuzzy(field, dfa, &prefix);
+        if field == Field::Poi && key.tokens < 2 && key.chars < MIN_FUZZY_POI_CHARS {
+            return None;
         }
-        let dfa = key.dfa(self)?;
-        self.dictionaries.fuzzy(field, dfa, &prefix)
+        let dfa = if field == Field::Poi {
+            key.poi_dfa()?
+        } else {
+            key.dfa()?
+        };
+        let first = key.expanded.chars().next().map_or(0, char::len_utf8);
+        self.dictionaries.fuzzy(field, &dfa, &key.expanded[..first])
     }
 
     /// The countries whose postcode pattern `start..end` matches, written
@@ -1058,10 +1063,15 @@ impl Chains {
 
 /// The vocabulary phrases of a query's units (see [`Field::PHRASES`]): the
 /// kinds of phrase each span is, one bit per field, and the kinds of the
-/// phrases that end before and start at each unit.
+/// phrases that end before and start at each unit. The dictionary key of
+/// every span is made here once, and taken by the lattice after.
 struct Phrases {
     /// `(start, end, kinds)` of every span that is a phrase.
     spans: Vec<(usize, usize, u8)>,
+    /// The key of every span looked up, in the order they are looked up.
+    keys: Vec<String>,
+    /// The index in `keys` of the first span starting at each unit.
+    first_key: Vec<usize>,
     /// `ending[unit]`: the kinds of the phrases that end right before `unit`.
     ending: Vec<u8>,
     /// `starting[unit]`: the kinds of the phrases that start at `unit`; one
@@ -1074,10 +1084,13 @@ impl Phrases {
         let len = units.len();
         let mut phrases = Self {
             spans: Vec::new(),
+            keys: Vec::with_capacity(len * MAX_SPAN_TOKENS),
+            first_key: Vec::with_capacity(len),
             ending: vec![0; len + 1],
             starting: vec![0; len + 1],
         };
         for start in 0..len {
+            phrases.first_key.push(phrases.keys.len());
             for end in start + 1..=(start + longest).min(len) {
                 if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
                     break;
@@ -1093,9 +1106,15 @@ impl Phrases {
                     phrases.ending[end] |= kinds;
                     phrases.starting[start] |= kinds;
                 }
+                phrases.keys.push(key);
             }
         }
         phrases
+    }
+
+    /// The key of `start..end`, a span this looked up; once.
+    fn take_key(&mut self, start: usize, end: usize) -> String {
+        std::mem::take(&mut self.keys[self.first_key[start] + (end - start - 1)])
     }
 
     fn kinds(&self, start: usize, end: usize) -> u8 {
@@ -1128,9 +1147,11 @@ struct SpanKey {
     /// Tokens and characters of the expanded key.
     tokens: usize,
     chars: usize,
-    dfa: Option<DFA>,
-    /// The automaton of the names within one edit, for the POI names.
-    poi_dfa: Option<DFA>,
+    /// The automaton of the names within one or two edits, and that of the
+    /// names within one for the POI names: one automaton when both allow
+    /// one edit.
+    dfa: Option<Rc<DFA>>,
+    poi_dfa: Option<Rc<DFA>>,
 }
 
 impl SpanKey {
@@ -1153,37 +1174,47 @@ impl SpanKey {
         }
     }
 
+    /// Edits the automaton of the names allows: two for keys of
+    /// [`TWO_EDIT_CHARS`] to [`MAX_TWO_EDIT_CHARS`] characters, else one.
+    fn edits(&self) -> u8 {
+        if (TWO_EDIT_CHARS..=MAX_TWO_EDIT_CHARS).contains(&self.chars) {
+            2
+        } else {
+            1
+        }
+    }
+
     /// The automaton of the names within one edit of the expanded key, for
     /// the POI names: they are many, and two edits of a span reach many
     /// venues. `None` when the span is no typo.
-    fn poi_dfa(&mut self, tagger: &LatticeTagger) -> Option<&DFA> {
+    fn poi_dfa(&mut self) -> Option<Rc<DFA>> {
         if !self.fuzzy {
             return None;
         }
         if self.poi_dfa.is_none() {
-            self.poi_dfa = Some(tagger.one_edit.build_dfa(&self.expanded));
+            self.poi_dfa = Some(match &self.dfa {
+                Some(dfa) if self.edits() == 1 => Rc::clone(dfa),
+                _ => Rc::new(automaton_builder(1).build_dfa(&self.expanded)),
+            });
         }
-        self.poi_dfa.as_ref()
+        self.poi_dfa.clone()
     }
 
-    /// The automaton of the names within one edit of the expanded key, or
-    /// two for keys of [`TWO_EDIT_CHARS`] to [`MAX_TWO_EDIT_CHARS`]; `None` when the span is no typo. Names are only
+    /// The automaton of the names within [`Self::edits`] edits of the
+    /// expanded key; `None` when the span is no typo. Names are only
     /// matched when they start with the key's first character, which typing
     /// errors seldom change (see [`Dictionaries::fuzzy`]).
-    fn dfa(&mut self, tagger: &LatticeTagger) -> Option<&DFA> {
+    fn dfa(&mut self) -> Option<Rc<DFA>> {
         if !self.fuzzy {
             return None;
         }
         if self.dfa.is_none() {
-            let chars = self.expanded.chars().count();
-            let builder = if (TWO_EDIT_CHARS..=MAX_TWO_EDIT_CHARS).contains(&chars) {
-                &tagger.two_edits
-            } else {
-                &tagger.one_edit
-            };
-            self.dfa = Some(builder.build_dfa(&self.expanded));
+            self.dfa = Some(match &self.poi_dfa {
+                Some(dfa) if self.edits() == 1 => Rc::clone(dfa),
+                _ => Rc::new(automaton_builder(self.edits()).build_dfa(&self.expanded)),
+            });
         }
-        self.dfa.as_ref()
+        self.dfa.clone()
     }
 }
 
