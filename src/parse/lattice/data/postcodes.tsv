@@ -1,3 +1,4 @@
+# Google libaddressinput postal code patterns (Apache-2.0, see NOTICE)
 AC	ASCN 1ZZ
 AD	AD[1-7]0\d
 AF	\d{4}

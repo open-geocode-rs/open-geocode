@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{qualifiers}.txt (MIT)
+# libpostal resources/dictionaries/*/{qualifiers}.txt (MIT, see NOTICE)
 # af
 noordekant
 oostekant

@@ -3,8 +3,7 @@
 //! training writes a name's "straße" as "str" some of the time.
 //!
 //! The phrases are libpostal's street types and directionals (MIT, see
-//! `data/LICENSE-libpostal.txt`), vendored by `scripts/parse_lattice_words.py`,
-//! each line a phrase and its `|`-separated variants. The languages that
+//! `NOTICE`), each line a phrase and its `|`-separated variants. The languages that
 //! glue a street type onto the name ("hauptstraße", "kerkstraat") are those
 //! libpostal lists concatenated suffixes for, and in them a name ending in a
 //! variant also ends in each other form of it ("hauptstr" is "hauptstraße").
@@ -17,9 +16,9 @@ use std::{
 
 use crate::text_index::normalize_index_text;
 
-const STREET_TYPES: &str = include_str!("data/libpostal/street_types.txt");
-const DIRECTIONALS: &str = include_str!("data/libpostal/directionals.txt");
-const CONCATENATED_SUFFIXES: &str = include_str!("data/libpostal/concatenated_suffixes.txt");
+const STREET_TYPES: &str = include_str!("data/street_types.txt");
+const DIRECTIONALS: &str = include_str!("data/directionals.txt");
+const CONCATENATED_SUFFIXES: &str = include_str!("data/concatenated_suffixes.txt");
 
 /// Spellings of one key looked up besides the key, at most.
 const MAX_SPELLINGS: usize = 8;

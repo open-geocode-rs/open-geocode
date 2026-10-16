@@ -33,3 +33,7 @@ data/
 
 # Python bytecode
 __pycache__/
+
+# One-off vendoring scripts for the parser data; their outputs are committed.
+/scripts/parse_lattice_words.py
+/scripts/parse_lattice_data.py

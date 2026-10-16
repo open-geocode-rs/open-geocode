@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{concatenated_suffixes_separable,concatenated_suffixes_inseparable}.txt (MIT)
+# libpostal resources/dictionaries/*/{concatenated_suffixes_separable,concatenated_suffixes_inseparable}.txt (MIT, see NOTICE)
 # af
 hof|h.
 laan|ln.

@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{unit_types_numbered,unit_types_standalone}.txt (MIT)
+# libpostal resources/dictionaries/*/{unit_types_numbered,unit_types_standalone}.txt (MIT, see NOTICE)
 # be
 кватэра|кв
 kvatera|kv

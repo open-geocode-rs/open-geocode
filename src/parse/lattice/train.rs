@@ -7,9 +7,8 @@
 //! is sealed, [`train`] reads the drawn records back in Pack order and writes
 //! them out the way people write addresses: through an address template of
 //! OpenCageData's address-formatting
-//! (<https://github.com/OpenCageData/address-formatting>, MIT, see
-//! `data/LICENSE-address-formatting.txt`), vendored as `data/templates.tsv`
-//! by `scripts/parse_lattice_data.py`, with the noise real queries carry:
+//! (<https://github.com/OpenCageData/address-formatting>, MIT, see `NOTICE`),
+//! vendored as `data/templates.tsv`, with the noise real queries carry:
 //! commas dropped, fields left out or swapped, street types abbreviated, a
 //! unit added, one-letter typos. Some rows hide the dictionary hits of their
 //! street or venue, so the model also learns to read names the Pack does not

@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{level_types_numbered,level_types_standalone,level_types_basement,level_types_mezzanine,level_types_sub_basement}.txt (MIT)
+# libpostal resources/dictionaries/*/{level_types_numbered,level_types_standalone,level_types_basement,level_types_mezzanine,level_types_sub_basement}.txt (MIT, see NOTICE)
 # bg
 этаж|эт
 etazh|et

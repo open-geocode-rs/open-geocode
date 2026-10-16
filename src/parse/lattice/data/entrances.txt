@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{entrances}.txt (MIT)
+# libpostal resources/dictionaries/*/{entrances}.txt (MIT, see NOTICE)
 # bg
 вход|вх
 vkhod|vkh

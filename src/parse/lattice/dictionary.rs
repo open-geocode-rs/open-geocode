@@ -78,27 +78,27 @@ const MIN_UNIT_WORD_VALUES: u64 = 20;
 
 /// Street types and their common abbreviations in many languages, one per
 /// line; vocabulary, not place data.
-const STREET_TYPE_WORDS: &str = include_str!("data/street_types.txt");
+const STREET_TYPE_WORDS: &str = include_str!("data/street_words.txt");
 /// Words that introduce a unit, floor or building part, one per line.
 const UNIT_WORDS: &str = include_str!("data/unit_words.txt");
-/// libpostal's open word lists (MIT, see `data/LICENSE-libpostal.txt`),
+/// libpostal's open word lists (MIT, see `NOTICE`),
 /// every language of a list in one file, one phrase per line with its
-/// `|`-separated variants. Vendored by `scripts/parse_lattice_words.py`.
-const LIBPOSTAL_UNIT_TYPES: &str = include_str!("data/libpostal/unit_types.txt");
-const LIBPOSTAL_PO_BOXES: &str = include_str!("data/libpostal/po_boxes.txt");
-const LIBPOSTAL_LEVEL_TYPES: &str = include_str!("data/libpostal/level_types.txt");
-const LIBPOSTAL_BUILDING_TYPES: &str = include_str!("data/libpostal/building_types.txt");
-const LIBPOSTAL_STREET_TYPES: &str = include_str!("data/libpostal/street_types.txt");
-const LIBPOSTAL_DIRECTIONALS: &str = include_str!("data/libpostal/directionals.txt");
+/// `|`-separated variants. Vendored.
+const LIBPOSTAL_UNIT_TYPES: &str = include_str!("data/unit_types.txt");
+const LIBPOSTAL_PO_BOXES: &str = include_str!("data/po_boxes.txt");
+const LIBPOSTAL_LEVEL_TYPES: &str = include_str!("data/level_types.txt");
+const LIBPOSTAL_BUILDING_TYPES: &str = include_str!("data/building_types.txt");
+const LIBPOSTAL_STREET_TYPES: &str = include_str!("data/street_types.txt");
+const LIBPOSTAL_DIRECTIONALS: &str = include_str!("data/directionals.txt");
 /// Words of a staircase or an entrance ("stiege", "eingang"), which libpostal
 /// labels as parts of a unit.
-const LIBPOSTAL_STAIRCASES: &str = include_str!("data/libpostal/staircases.txt");
-const LIBPOSTAL_ENTRANCES: &str = include_str!("data/libpostal/entrances.txt");
+const LIBPOSTAL_STAIRCASES: &str = include_str!("data/staircases.txt");
+const LIBPOSTAL_ENTRANCES: &str = include_str!("data/entrances.txt");
 /// Words that ask for what is near a place ("near", "in der nähe von").
-const LIBPOSTAL_NEAR: &str = include_str!("data/libpostal/near.txt");
+const LIBPOSTAL_NEAR: &str = include_str!("data/near.txt");
 /// libpostal's qualifiers: words that say what kind of place a name is, its
 /// admin type words among them ("県", "bezirk", "township").
-const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/libpostal/qualifiers.txt");
+const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/qualifiers.txt");
 /// Admin type words libpostal's qualifiers lack ("freistaat",
 /// "comunidad de", "-도"), with how they attach to a name.
 const ADMIN_TYPES: &str = include_str!("data/admin_types.txt");

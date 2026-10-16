@@ -248,7 +248,7 @@ fn fold_width(word: &str) -> String {
 
 /// `character<TAB>value` rows of the ideographs that are numerals, from the
 /// Unihan kPrimaryNumeric property (Unicode License V3, see
-/// `data/LICENSE-unicode.txt`), vendored by `scripts/parse_lattice_words.py`.
+/// `NOTICE`), vendored.
 pub(super) const NUMERALS: &str = include_str!("lattice/data/numerals.tsv");
 
 /// The value of a numeral character that Unicode does not class as a

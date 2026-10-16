@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{near}.txt (MIT)
+# libpostal resources/dictionaries/*/{near}.txt (MIT, see NOTICE)
 # bg
 близо до
 blizo do

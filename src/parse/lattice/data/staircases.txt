@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{staircases}.txt (MIT)
+# libpostal resources/dictionaries/*/{staircases}.txt (MIT, see NOTICE)
 # bg
 стълбище
 stŭlbishte|stulbishte
