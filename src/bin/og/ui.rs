@@ -199,26 +199,18 @@ pub fn done_summary(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-/// Rows the current screen needs; the viewport is resized to fit.
-pub fn height(app: &App) -> u16 {
-    match app.screen {
-        Screen::Home => 10,
-        Screen::Region => 16,
-        Screen::Sources => 9,
-        Screen::Confirm => 16,
-        Screen::Build if app.show_logs => 19,
-        Screen::Build => 14,
-        Screen::Done => 15,
-        Screen::Query => 14,
-        Screen::Json => 18,
-    }
-}
+/// Rows of the window every screen is drawn into. The window never changes
+/// size: a short screen leaves blank rows, and the key hints stay on the last
+/// row.
+pub const HEIGHT: u16 = 20;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
+    // The last row belongs to the key hints.
     let area = Rect {
         x: full.x + 1,
         width: full.width.saturating_sub(2).min(96),
+        height: full.height.saturating_sub(1),
         ..full
     };
     match app.screen {
@@ -233,7 +225,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn footer(frame: &mut Frame, area: Rect, app: &App, hints: &[(&str, &str)]) {
+fn footer(frame: &mut Frame, app: &App, hints: &[(&str, &str)]) {
     let line = match app.flash_text() {
         Some(text) => Line::from(vec![span(" ! ", WARN), span(text.to_string(), WARN)]),
         None => {
@@ -248,11 +240,18 @@ fn footer(frame: &mut Frame, area: Rect, app: &App, hints: &[(&str, &str)]) {
             Line::from(spans)
         }
     };
+    let full = frame.area();
+    let area = Rect {
+        x: full.x + 1,
+        y: full.y + full.height.saturating_sub(1),
+        width: full.width.saturating_sub(2).min(96),
+        height: 1.min(full.height),
+    };
     frame.render_widget(Paragraph::new(line), area);
 }
 
 fn home(frame: &mut Frame, area: Rect, app: &App) {
-    let [_, menu, packs, _, foot] = Layout::vertical([
+    let [_, menu, packs, _, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(6),
         Constraint::Length(1),
@@ -290,7 +289,6 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
     );
     footer(
         frame,
-        foot,
         app,
         &[("↑↓", "move"), ("enter", "select"), ("q", "quit")],
     );
@@ -306,7 +304,7 @@ fn input_line(text: &str, placeholder: &str) -> Line<'static> {
 }
 
 fn region(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, list, _, foot] = Layout::vertical([
+    let [done, list, _, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(13),
         Constraint::Length(1),
@@ -372,7 +370,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     );
     footer(
         frame,
-        foot,
         app,
         &[("↑↓", "move"), ("enter", "select"), ("esc", "back")],
     );
@@ -421,7 +418,7 @@ fn region_row(
 }
 
 fn sources(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, list, _, foot] = Layout::vertical([
+    let [done, list, _, _] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(5),
         Constraint::Length(1),
@@ -469,7 +466,6 @@ fn sources(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(panel("Sources")), list);
     footer(
         frame,
-        foot,
         app,
         &[
             ("↑↓", "move"),
@@ -503,7 +499,7 @@ fn button(label: &str, selected: bool, enabled: bool) -> Span<'static> {
 }
 
 fn confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, panel_area, _, foot] = Layout::vertical([
+    let [done, panel_area, _, _] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(11),
         Constraint::Length(1),
@@ -562,7 +558,6 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
     footer(
         frame,
-        foot,
         app,
         &[
             ("←→", "choose"),
@@ -627,7 +622,7 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let box_rows = if app.show_logs { 17 } else { 12 };
-    let [panel_area, _, foot] = Layout::vertical([
+    let [panel_area, _, _] = Layout::vertical([
         Constraint::Length(box_rows),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -745,14 +740,13 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
     let logs = if app.show_logs { "hide logs" } else { "logs" };
     footer(
         frame,
-        foot,
         app,
         &[("l", logs), ("esc", "cancel, keeps downloads")],
     );
 }
 
 fn done(frame: &mut Frame, area: Rect, app: &App) {
-    let [body, _, foot] = Layout::vertical([
+    let [body, _, _] = Layout::vertical([
         Constraint::Length(13),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -823,7 +817,6 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), body);
     footer(
         frame,
-        foot,
         app,
         &[("←→", "choose"), ("enter", "select"), ("q", "quit")],
     );
@@ -860,7 +853,7 @@ fn label_color(label: &str) -> Color {
 }
 
 fn query(frame: &mut Frame, area: Rect, app: &App) {
-    let [header, input, parsed, _, results, _, foot] = Layout::vertical([
+    let [header, input, parsed, _, results, _, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -982,7 +975,6 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     };
     footer(
         frame,
-        foot,
         app,
         &[
             ("↑↓", "pick"),
@@ -1219,7 +1211,7 @@ fn emit(value: &Json, indent: usize, key: Option<&str>, comma: bool, out: &mut V
 }
 
 fn json(frame: &mut Frame, area: Rect, app: &App) {
-    let [header, panel_area, foot] = Layout::vertical([
+    let [header, panel_area, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(JSON_ROWS as u16 + 2),
         Constraint::Length(1),
@@ -1259,7 +1251,6 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
     };
     footer(
         frame,
-        foot,
         app,
         &[("↑↓", "scroll"), ("a", all), ("y", "copy"), ("esc", "back")],
     );

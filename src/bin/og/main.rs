@@ -9,48 +9,62 @@ mod app;
 mod mock;
 mod ui;
 
-use std::{io, time::Duration};
+use std::{
+    io::{self, IsTerminal},
+    time::Duration,
+};
 
 use ratatui::{
-    DefaultTerminal, Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
-    crossterm::event::{self, Event, KeyEventKind},
+    DefaultTerminal, TerminalOptions, Viewport,
+    crossterm::{
+        event::{self, Event, KeyEventKind},
+        terminal,
+    },
     widgets::{Paragraph, Widget},
 };
 
 use app::App;
 
 fn main() -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        eprintln!("og opens an interactive interface and needs a terminal.");
+        eprintln!("Run `og --help` for the commands that work in scripts.");
+        return Ok(());
+    }
+    // One window of fixed height, drawn below the prompt so finished steps
+    // stay in terminal history. A terminal too short for it gets the whole
+    // screen instead, as atuin does.
+    let inline = terminal::size()?.1 > ui::HEIGHT;
+    let viewport = if inline {
+        Viewport::Inline(ui::HEIGHT)
+    } else {
+        Viewport::Fullscreen
+    };
     let mut app = App::new();
-    let mut height = ui::height(&app);
-    let mut terminal = ratatui::init_with_options(TerminalOptions {
-        viewport: Viewport::Inline(height),
-    });
-    let result = run(&mut terminal, &mut app, &mut height);
-    let flushed = print_scrollback(&mut terminal, &mut app);
+    let mut terminal = ratatui::init_with_options(TerminalOptions { viewport });
+    let result = run(&mut terminal, &mut app, inline);
     let cleared = terminal.clear();
     ratatui::restore();
+    // Without scrollback, what the window would have pushed up is printed
+    // as plain lines once the screen is back.
+    for line in &app.scrollback {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        println!("{text}");
+    }
     for line in &app.farewell {
         println!("  {line}");
     }
-    result.and(flushed).and(cleared)
+    result.and(cleared)
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App, height: &mut u16) -> io::Result<()> {
+fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Result<()> {
     while !app.quit {
-        print_scrollback(terminal, app)?;
-        let wanted = ui::height(app);
-        if wanted != *height {
-            // An inline viewport has a fixed height: clear it and open a new
-            // one at the same place.
-            terminal.clear()?;
-            *terminal = Terminal::with_options(
-                CrosstermBackend::new(io::stdout()),
-                TerminalOptions {
-                    viewport: Viewport::Inline(wanted),
-                },
-            )?;
-            *height = wanted;
+        if inline {
+            print_scrollback(terminal, app)?;
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(Duration::from_millis(40))?
@@ -61,10 +75,13 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, height: &mut u16) -> io::R
         }
         app.tick();
     }
+    if inline {
+        print_scrollback(terminal, app)?;
+    }
     Ok(())
 }
 
-/// Prints the lines waiting for terminal history above the viewport.
+/// Prints the lines waiting for terminal history above the window.
 fn print_scrollback(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     if app.scrollback.is_empty() {
         return Ok(());
@@ -99,7 +116,7 @@ mod preview {
     }
 
     fn show(app: &App, name: &str) {
-        let mut terminal = Terminal::new(TestBackend::new(84, ui::height(app))).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(84, ui::HEIGHT)).unwrap();
         terminal.draw(|frame| ui::draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
         println!("=== {name}");
