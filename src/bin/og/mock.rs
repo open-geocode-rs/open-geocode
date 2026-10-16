@@ -53,13 +53,6 @@ pub struct Stage {
     pub summary: String,
 }
 
-impl Stage {
-    /// `Scanning OSM objects`.
-    pub fn doing_text(&self) -> String {
-        format!("{} {}", self.doing, self.object)
-    }
-}
-
 pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
     let mut stages = Vec::new();
     if region.local().is_none() {

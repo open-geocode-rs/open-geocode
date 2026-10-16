@@ -190,17 +190,6 @@ pub fn stage_done(build: &Build, index: usize, inner: usize) -> Vec<Line<'static
     vec![finished_line(&build.stages[index], inner), Line::raw("")]
 }
 
-pub fn cancelled(build: &Build) -> Line<'static> {
-    Line::from(vec![
-        span("  ✗ ", ERR),
-        plain(format!(
-            "Build cancelled while {}.",
-            build.stage().doing_text().to_lowercase()
-        )),
-        span(" Downloaded files are kept.", DIM),
-    ])
-}
-
 pub fn done_summary(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
@@ -1645,16 +1634,6 @@ pub fn batch_header(app: &App) -> Vec<Line<'static>> {
         ]),
         Line::raw(""),
     ]
-}
-
-pub fn batch_cancelled(build: &Build) -> Line<'static> {
-    Line::from(vec![
-        plain("    "),
-        plain(format!(
-            "Cancelled while {}.",
-            build.stage().doing_text().to_lowercase()
-        )),
-    ])
 }
 
 /// How a column's role reads above it; the selected column's is in brackets.

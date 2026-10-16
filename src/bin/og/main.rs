@@ -17,7 +17,8 @@ use std::{
 };
 
 use ratatui::{
-    DefaultTerminal, TerminalOptions, Viewport,
+    DefaultTerminal, Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
     crossterm::{
         cursor::{MoveTo, Show},
         event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
@@ -94,6 +95,15 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
         if inline {
             print_scrollback(terminal, app)?;
         }
+        if let Some(lines) = app.erase.take() {
+            if inline {
+                erase_above(terminal, lines)?;
+            } else {
+                // Not printed yet: take them back.
+                let keep = app.scrollback.len().saturating_sub(lines);
+                app.scrollback.truncate(keep);
+            }
+        }
         terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(Duration::from_millis(40))? {
             // Take everything waiting before drawing again: a paste sent as
@@ -115,6 +125,26 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
     if inline {
         print_scrollback(terminal, app)?;
     }
+    Ok(())
+}
+
+/// Erases the lines just above the window and opens the window again where
+/// they began, so a finished flow leaves nothing stacked above the next
+/// screen.
+fn erase_above(terminal: &mut DefaultTerminal, lines: usize) -> io::Result<()> {
+    let top = terminal.get_frame().area().y;
+    let from = top.saturating_sub(u16::try_from(lines).unwrap_or(u16::MAX));
+    execute!(
+        io::stdout(),
+        MoveTo(0, from),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    *terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(ui::HEIGHT),
+        },
+    )?;
     Ok(())
 }
 
@@ -275,6 +305,31 @@ B,24 sussex dr,Ottawa,ON
         assert!(session.file.header_found);
         assert_eq!(session.query(0), "100 queen st w, Toronto, ON");
         show(&app, "batch setup from a file");
+    }
+
+    #[test]
+    fn leaving_a_flow_erases_its_history() {
+        use std::time::{Duration, Instant};
+
+        let mut app = App::new(false);
+        press(&mut app, &[KeyCode::Char('b')]);
+        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        app.screen = Screen::Confirm;
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.screen == Screen::Build);
+        assert!(app.flow_lines > 0);
+        for _ in 0..12 {
+            if let Some(build) = app.build.as_mut() {
+                build.stage_started = Instant::now() - Duration::from_secs(60);
+            }
+            app.tick();
+        }
+        assert!(app.screen == Screen::Done);
+        let printed = app.flow_lines;
+        assert!(printed > 6, "the stages are in history");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.erase, Some(printed));
+        assert_eq!(app.flow_lines, 0);
     }
 
     #[test]

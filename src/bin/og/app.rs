@@ -125,6 +125,12 @@ pub struct App {
     pub quit: bool,
     /// Lines to print above the live area: they stay in terminal history.
     pub scrollback: Vec<Line<'static>>,
+    /// Lines a build or a batch run has put into history, so they can be
+    /// erased when the flow is left.
+    pub flow_lines: usize,
+    /// How many lines above the window to erase: asked for here, done by the
+    /// loop that owns the terminal.
+    pub erase: Option<usize>,
     /// Plain lines printed after the interface closes.
     pub farewell: Vec<String>,
     pub flash: Option<(String, Instant)>,
@@ -175,6 +181,8 @@ impl App {
             screen: Screen::Home,
             quit: false,
             scrollback: ui::logo(),
+            flow_lines: 0,
+            erase: None,
             farewell: Vec::new(),
             flash: None,
             started: Instant::now(),
@@ -394,6 +402,21 @@ impl App {
         self.flash = Some((text.into(), Instant::now()));
     }
 
+    /// Puts lines of a flow into history, to be erased when it is left.
+    fn push_flow(&mut self, lines: Vec<Line<'static>>) {
+        self.flow_lines += lines.len();
+        self.scrollback.extend(lines);
+    }
+
+    /// Asks for what the flow put into history to be erased, so the next
+    /// screen starts where the flow did and not under its leftovers.
+    fn erase_flow(&mut self) {
+        if self.flow_lines > 0 {
+            self.erase = Some(self.flow_lines);
+            self.flow_lines = 0;
+        }
+    }
+
     pub fn tick(&mut self) {
         let Some(build) = &mut self.build else {
             return;
@@ -401,11 +424,10 @@ impl App {
         if build.progress() < 1.0 {
             return;
         }
-        self.scrollback.extend(ui::stage_done(
-            build,
-            build.current,
-            ui::content_width(self.width),
-        ));
+        // The fields are used one by one: the build is borrowed from `self`.
+        let lines = ui::stage_done(build, build.current, ui::content_width(self.width));
+        self.flow_lines += lines.len();
+        self.scrollback.extend(lines);
         if build.current + 1 < build.stages.len() {
             build.current += 1;
             build.stage_started = Instant::now();
@@ -598,8 +620,9 @@ impl App {
     }
 
     fn start_build(&mut self) {
-        self.scrollback.extend(ui::choices(self));
-        self.scrollback.extend(ui::build_header(self));
+        let mut lines = ui::choices(self);
+        lines.extend(ui::build_header(self));
+        self.push_flow(lines);
         self.build = Some(Build {
             stages: mock::stages(self.region, &self.sources),
             current: 0,
@@ -613,9 +636,8 @@ impl App {
         match key.code {
             KeyCode::Char('l') => self.show_logs ^= true,
             KeyCode::Esc => {
-                if let Some(build) = self.build.take() {
-                    self.scrollback.push(ui::cancelled(&build));
-                }
+                self.build = None;
+                self.erase_flow();
                 self.screen = Screen::Confirm;
             }
             _ => {}
@@ -632,7 +654,7 @@ impl App {
             }
             KeyCode::Enter => match self.done_cursor {
                 0 => {
-                    self.scrollback.extend(ui::done_summary(self));
+                    self.erase_flow();
                     self.active_name = self.region.name.clone();
                     self.active_records = mock::PACK.records;
                     self.open_query(Mode::Search);
@@ -886,15 +908,15 @@ impl App {
             current: 0,
             stage_started: Instant::now(),
         });
-        self.scrollback.extend(ui::batch_header(self));
+        let lines = ui::batch_header(self);
+        self.push_flow(lines);
         self.screen = Screen::BatchRun;
     }
 
     fn batch_run_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
-            if let Some(build) = self.build.take() {
-                self.scrollback.push(ui::batch_cancelled(&build));
-            }
+            self.build = None;
+            self.erase_flow();
             self.screen = Screen::BatchSetup;
         }
     }
@@ -906,10 +928,19 @@ impl App {
             KeyCode::Right | KeyCode::Tab => self.batch_button = (self.batch_button + 1) % buttons,
             KeyCode::Enter => match self.batch_button {
                 0 => self.flash("Reviewing the rows with no match is not wired in this preview."),
-                1 => self.open_query(Mode::Search),
-                _ => self.screen = Screen::Home,
+                1 => {
+                    self.erase_flow();
+                    self.open_query(Mode::Search);
+                }
+                _ => {
+                    self.erase_flow();
+                    self.screen = Screen::Home;
+                }
             },
-            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Home,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.erase_flow();
+                self.screen = Screen::Home;
+            }
             _ => {}
         }
     }
