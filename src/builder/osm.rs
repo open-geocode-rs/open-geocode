@@ -3,19 +3,26 @@
 //! Memory stays bounded by the sorter budget whatever the input size: features,
 //! node references, resolved coordinates and finished records all flow through
 //! scratch files and external sorts. A region fits in the budget and never
-//! touches disk; a planet spills and merges through the same code.
+//! touches disk; a planet spills and merges through the same code. The budget
+//! and the worker threads are sized to what the machine can give before the
+//! build starts (see [`plan_build`]).
 //!
 //! ```text
 //! pass 1  scan every block (parallel)    -> records for nodes, way features,
 //!                                           node references, boundary relations
 //! pass 2  read way blocks                 -> boundary relation member ways
 //! pass 3  read node blocks, merge-join    -> coordinates per way position
-//! emit    ways + coordinates (parallel)   -> address, street, interpolation records
-//! write   context records, then the rest, each in Hilbert order
+//! emit    ways + coordinates (parallel)   -> address, POI, street, interpolation records
+//! write   context records, then the rest, each in Hilbert order,
+//!         drawing a sample of each country's records
+//! seal    text, spatial and parser dictionary indexes into the Pack file
+//! train   the address parser on the sample, its weights added to the Pack
 //! ```
 
 mod address;
+mod admin_levels;
 mod boundary;
+mod containment;
 mod emit;
 mod emitted;
 mod geometry;
@@ -23,6 +30,7 @@ mod interpolation;
 mod nodes;
 mod pbf;
 mod place;
+mod poi;
 mod postcode;
 mod scan;
 mod spill;
@@ -45,7 +53,9 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::{
+    alloc,
     builder::{
+        plan::{BuildPlan, plan_build},
         progress::{item_progress_bar, stage_progress},
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
     },
@@ -54,9 +64,15 @@ use crate::{
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
     },
+    parse::lattice::{
+        train::{self, Sampler},
+        weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
+    },
     record::{Record, RejectedRecord},
     records::quantize,
-    util::hilbert::hilbert_key,
+    resources::Resources,
+    text_index::PostcodeAreas,
+    util::{geo::point_lon_lat, hilbert::hilbert_key},
 };
 use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_context};
 use emit::{FeatureOutput, emit_features};
@@ -67,76 +83,106 @@ use postcode::PostcodeAccumulator;
 use scan::scan_block;
 use spill::{NodeRequest, PendingRecord, ResolvedRef, WayFeature, WayKind};
 
-/// Default memory for build sorters before they spill to disk.
-pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 1 << 30;
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BuildOsmOptions {
     pub input: PathBuf,
     pub pack: PathBuf,
-    /// Memory for sort buffers. Inputs that need more spill to scratch files.
-    pub memory_budget_bytes: usize,
+    /// Memory for the build's buffers; inputs that need more spill to
+    /// scratch files. Derived from the memory the process can use when not
+    /// set.
+    pub memory_budget_bytes: Option<usize>,
     /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
+    /// Build even when the pre-flight check finds too little memory or disk.
+    pub force: bool,
 }
 
-impl Default for BuildOsmOptions {
-    fn default() -> Self {
-        Self {
-            input: PathBuf::new(),
-            pack: PathBuf::new(),
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            scratch_dir: None,
-        }
-    }
-}
-
-pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
-    let started = Instant::now();
+/// Plan a build of `options` on this machine: probe it, size the budget and
+/// the threads, and check the memory and disk the input needs.
+pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     if !options.input.is_file() {
         bail!("input {} does not exist", options.input.display());
     }
-    // Up to four sorters hold memory at the same time (node references or
-    // resolved coordinates, the two record sorters, the spatial pairs); the text
-    // index buffers take the same share as one sorter while records are written.
-    let sorter_budget = (options.memory_budget_bytes / 4).max(1);
-    let memory = MemoryBudget::new(options.memory_budget_bytes);
+    let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
+    plan_build(
+        input_bytes(&options.input)?,
+        scratch,
+        &options.pack,
+        options.memory_budget_bytes,
+        options.force,
+    )
+}
+
+pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
+    let plan = plan_osm_build(&options)?;
+    build_planned_osm_pack(options, plan)
+}
+
+/// Build with a plan made by [`plan_osm_build`]. The caller sizes the
+/// process's rayon pool to `plan.threads` before any parallel work, since
+/// one pool serves every stage.
+pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
+    let started = Instant::now();
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let budget = usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX);
+    // The sorters and the parser's lattice cache split what the others leave
+    // of the pool by fair shares. While records are written the text index
+    // is what every record waits on, so it takes half: more indexing
+    // threads, fewer segments. The context record and spatial sorters hold
+    // a few times less than the others, and are capped to stay so.
+    let memory = MemoryBudget::new(budget);
+    memory.sample(&plan.resources);
     let mut writer = PackWriter::create_with(
         &options.pack,
         PackWriterOptions {
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
-            sort_budget_bytes: sorter_budget,
-            text_index_memory_bytes: sorter_budget,
+            sort_budget_bytes: (budget / 4).max(1),
+            text_index_memory_bytes: (budget / 2).max(1),
         },
     )?;
     let scratch = Arc::clone(writer.scratch());
+    let input_bytes = input_bytes(&options.input)?;
+    // Spill files stay in the page cache while they fit in a quarter of what
+    // the build leaves free: the rest keeps the Pack and the input it
+    // rereads, and dirty pages the lazy writer holds back are not free.
+    scratch.set_cache_bytes(
+        plan.resources
+            .available_memory_bytes
+            .saturating_sub(plan.memory_budget_bytes + plan.untracked_bytes(input_bytes))
+            / 4,
+    );
     let mut build = Build {
         report: BuilderReport {
             schema_version: BUILD_REPORT_SCHEMA_VERSION,
             input: options.input.display().to_string(),
             pack: options.pack.display().to_string(),
-            input_bytes: input_bytes(&options.input)?,
+            input_bytes,
             ..BuilderReport::default()
         },
         audit: Audit::create(writer.generation())?,
         postcodes: PostcodeAccumulator::default(),
-        records: ExternalSorter::new(&scratch, "records", &memory, sorter_budget),
+        records: ExternalSorter::new(&scratch, "records", &memory, budget),
         context_records: ExternalSorter::new(
             &scratch,
             "context-records",
             &memory,
-            sorter_budget / 4,
+            (budget / 16).max(1),
         ),
         seq: 0,
     };
-    build.report.scratch.memory_budget_bytes = options.memory_budget_bytes as u64;
+    build.report.scratch.memory_budget_bytes = plan.memory_budget_bytes;
+    build.report.resources.threads = rayon::current_num_threads();
+    build.report.resources.plan = plan;
 
     // Pass 1: classify everything.
     let phase = Instant::now();
-    let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, sorter_budget);
+    let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, budget);
     let mut features = Spool::<WayFeature>::create(&scratch, "way-features")?;
     let mut relations = Vec::new();
     // Boundary ways kept by pass 1. When one is also a relation member, its
@@ -146,7 +192,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let mut way_blobs = Vec::new();
     for_each_block(
         &options.input,
-        "1/7 scan OSM objects",
+        "1/8 scan OSM objects",
         None,
         |offset, block| Ok((offset, scan_block(&block))),
         |(offset, output)| {
@@ -160,6 +206,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
                 let resolution = &mut build.report.geometry_resolution;
                 match feature.kind {
                     WayKind::Address => resolution.address_way_stubs += 1,
+                    WayKind::Poi => resolution.poi_way_stubs += 1,
                     WayKind::Street => resolution.street_way_stubs += 1,
                     WayKind::Interpolation => resolution.interpolation_way_stubs += 1,
                     WayKind::Boundary => {
@@ -193,7 +240,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     if !member_ids.is_empty() {
         for_each_block(
             &options.input,
-            "2/7 read boundary member ways",
+            "2/8 read boundary member ways",
             Some(&way_blobs),
             |_, block| Ok(member_ways(&block, &member_ids)),
             |found| {
@@ -216,7 +263,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let request_stats = requests.stats();
     build.report.geometry_resolution.required_node_refs = request_stats.items;
     let mut resolved =
-        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, sorter_budget);
+        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, budget);
     let join = join_nodes(
         &options.input,
         &node_blobs,
@@ -230,7 +277,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let phase = Instant::now();
     let resolved_stats = resolved.stats();
     let mut boundary_ways = Vec::new();
-    let progress = item_progress_bar(features.written(), "4/7 assemble ways");
+    let progress = item_progress_bar(features.written(), "4/8 assemble ways");
     let mut member_vertices = emit_features(
         features.into_reader()?,
         resolved.finish()?,
@@ -240,7 +287,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
             build.absorb(output.emitted)
         },
     )?;
-    progress.finish_with_message("4/7 assemble ways complete");
+    progress.finish_with_message("4/8 assemble ways complete");
     build.report.phases.feature_emission_ms = phase.elapsed().as_millis();
 
     // Admin boundaries, their place records and postcode centroids.
@@ -267,6 +314,10 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         member_lines.insert(*way_id, line.as_deref());
     }
     let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines);
+    build
+        .report
+        .unmatched_admin_level_ids
+        .extend_from_slice(boundaries.unmatched_admin_ids());
     drop(member_lines);
     drop((
         boundary_ways,
@@ -277,8 +328,12 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     for (origin, record) in boundaries.place_records(&mut build.report) {
         build.push(record, Some(origin))?;
     }
+    let mut postcode_centroids = Vec::new();
     for record in std::mem::take(&mut build.postcodes).into_records() {
         build.report.accept_postcode();
+        if let Some(point) = point_lon_lat(&record.geometry) {
+            postcode_centroids.push((record.postcode.clone(), point));
+        }
         build.push(Record::Postcode(record), None)?;
     }
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
@@ -311,24 +366,31 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         }
         ordered.write(&item)?;
     }
+    writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
+    writer.set_country_codes(boundaries.country_codes(&boundary_ids, &country_ids));
+    writer.set_region_groups(boundaries.region_groups(&boundary_ids));
+    writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
     let context_count = ordered.written();
+    let mut sample = Sampler::default();
     write_ordered(
         &mut writer,
+        &mut sample,
         ordered.into_reader()?,
         context_count,
         &index,
-        "5/7 write context records",
+        "5/8 write context records",
     )?;
     report.phases.context_record_write_ms = phase.elapsed().as_millis();
 
     let phase = Instant::now();
     write_ordered(
         &mut writer,
+        &mut sample,
         records.finish()?,
         record_stats.items,
         &index,
-        "6/7 write records",
+        "6/8 write records",
     )?;
     drop(index);
     report.phases.record_write_ms = phase.elapsed().as_millis();
@@ -336,11 +398,34 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     let phase = Instant::now();
     report.scratch.spilled_bytes = scratch.spilled_bytes();
     report.scratch.peak_tracked_bytes = memory.peak() as u64;
-    drop(scratch);
-    let progress = stage_progress("7/7 finish Pack indexes");
-    let (sealed, stats) = writer.seal()?;
-    progress.finish_with_message("7/7 finish Pack indexes complete");
+    let progress = stage_progress("7/8 finish Pack indexes");
+    let (mut sealed, mut stats) = writer.seal()?;
+    progress.finish_with_message("7/8 finish Pack indexes complete");
     report.phases.pack_seal_ms = phase.elapsed().as_millis();
+
+    // The parser learns from the sealed Pack's dictionaries and the records
+    // drawn while they were written, and its weights join the Pack before it
+    // is published.
+    let phase = Instant::now();
+    let progress = stage_progress("8/8 train address parser");
+    // By now the build has used memory and page cache a fresh process would
+    // have: sample again what is left.
+    let resources = Resources::probe();
+    memory.sample(&resources);
+    report.resources.at_training = resources;
+    let (weights, training) = train::train(&sealed.path(), sample, &scratch, &memory, budget)?;
+    if let Some(weights) = weights {
+        let bytes = weights.to_bytes();
+        sealed.add_section(WEIGHTS_SECTION, WEIGHTS_VERSION, &bytes)?;
+        stats.bytes = sealed.bytes();
+        stats
+            .sections
+            .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
+    }
+    drop(scratch);
+    progress.finish_with_message("8/8 train address parser complete");
+    report.parser_training = training;
+    report.phases.parser_training_ms = phase.elapsed().as_millis();
 
     for (name, stats) in [
         ("node_requests", request_stats),
@@ -368,6 +453,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     report.output.text_index_bytes = stats.text_index_bytes;
     report.output.sections = stats.sections;
     report.output.rejection_count = audit.count;
+    report.scratch.peak_heap_bytes = alloc::peak_bytes().unwrap_or_default() as u64;
     report.phases.total_ms = started.elapsed().as_millis();
     report.finalize_throughput();
     audit.finish(&report)?;
@@ -380,7 +466,7 @@ struct Build {
     report: BuilderReport,
     audit: Audit,
     postcodes: PostcodeAccumulator,
-    /// Addresses, interpolations and streets.
+    /// Addresses, POIs, interpolations and streets.
     records: ExternalSorter<PendingRecord>,
     /// Places and postcodes: everything a context tuple can point at.
     context_records: ExternalSorter<PendingRecord>,
@@ -455,35 +541,67 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
         .collect()
 }
 
-/// Write sorted records in batches, computing admin context in parallel.
-/// Boundary and derived-country records describe context and get none.
+/// Write sorted records in batches, computing admin context in parallel, and
+/// offer each record to the parser's training sample under the country it
+/// lies in. Boundary and derived-country records describe context and get
+/// none, but are offered under the country their point lies in.
 fn write_ordered(
     writer: &mut PackWriter,
-    records: impl Iterator<Item = Result<PendingRecord>>,
+    sample: &mut Sampler,
+    records: impl Iterator<Item = Result<PendingRecord>> + Send,
     total: u64,
     index: &BoundaryIndex,
     message: &'static str,
 ) -> Result<()> {
     let progress = item_progress_bar(total, message);
-    let mut records = records.peekable();
-    while records.peek().is_some() {
-        let batch = records
-            .by_ref()
-            .take(WRITE_BATCH_RECORDS)
-            .collect::<Result<Vec<_>>>()?;
-        let batch = batch
-            .into_par_iter()
-            .map(|pending| {
-                let context: Option<RecordContext> = match pending.origin {
-                    Some(_) => None,
-                    None => record_context(index, &pending.record),
-                };
-                (pending.record, context)
-            })
-            .collect::<Vec<_>>();
-        writer.write_batch(&batch)?;
-        progress.inc(batch.len() as u64);
-    }
+    let mut preparer = writer.preparer();
+    // One thread reads and prepares the next batch while this one appends the
+    // batch before: the store, the text index and the spatial pairs take
+    // records in order, and would otherwise wait on the preparing.
+    std::thread::scope(|scope| -> Result<()> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        scope.spawn(move || {
+            let mut records = records.peekable();
+            while records.peek().is_some() {
+                let prepared = records
+                    .by_ref()
+                    .take(WRITE_BATCH_RECORDS)
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|batch| {
+                        let (batch, countries): (Vec<_>, Vec<_>) = batch
+                            .into_par_iter()
+                            .map(|pending| {
+                                let located = record_context(index, &pending.record);
+                                let country = located
+                                    .and_then(|context| context.admin_context.country_record_id);
+                                let context: Option<RecordContext> = match pending.origin {
+                                    Some(_) => None,
+                                    None => located,
+                                };
+                                ((pending.record, context), country)
+                            })
+                            .unzip();
+                        preparer
+                            .prepare(batch)
+                            .map(|prepared| (prepared, countries))
+                    });
+                let failed = prepared.is_err();
+                if sender.send(prepared).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        for prepared in receiver {
+            let (prepared, countries) = prepared?;
+            for ((id, record), country) in prepared.records().zip(countries) {
+                sample.offer(id, country, record);
+            }
+            let len = prepared.len() as u64;
+            writer.commit(prepared)?;
+            progress.inc(len);
+        }
+        Ok(())
+    })?;
     progress.finish_with_message(format!("{message} complete"));
     Ok(())
 }
@@ -529,9 +647,10 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use crate::{
-        pack::PackReader,
+        pack::{PackReader, RecordPointPrecision},
+        record::Record,
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
-        search::{PackTextSearcher, TextSearchOptions},
+        search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
     };
 
     use super::{
@@ -691,12 +810,12 @@ mod tests {
         ]
     }
 
-    fn build(root: &Path, input: &Path, memory_budget_bytes: usize) -> BuilderReport {
+    fn build(root: &Path, input: &Path, memory_budget_bytes: Option<usize>) -> BuilderReport {
         build_osm_pack(BuildOsmOptions {
             input: input.to_path_buf(),
             pack: root.to_path_buf(),
             memory_budget_bytes,
-            scratch_dir: None,
+            ..BuildOsmOptions::default()
         })
         .expect("build")
     }
@@ -706,7 +825,7 @@ mod tests {
         let dir = temp_dir("town");
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
-        let report = build(&dir.join("pack"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        let report = build(&dir.join("pack"), &input, None);
 
         let reader = PackReader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
@@ -857,15 +976,417 @@ mod tests {
         assert_eq!(build_metrics.scratch, report.scratch);
     }
 
+    /// A ward with names in several scripts, a block scheme address in it
+    /// and a street with an English name.
+    #[test]
+    fn indexes_every_name_and_accepts_block_scheme_addresses() {
+        let dir = temp_dir("ward");
+        let input = dir.join("ward.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 35.67, 139.74, &[]),
+                    node(2, 35.67, 139.78, &[]),
+                    node(3, 35.70, 139.78, &[]),
+                    node(4, 35.70, 139.74, &[]),
+                    node(
+                        10,
+                        35.68,
+                        139.76,
+                        &[
+                            ("addr:province", "東京都"),
+                            ("addr:city", "千代田区"),
+                            ("addr:neighbourhood", "丸の内一丁目"),
+                            ("addr:block_number", "9"),
+                            ("addr:housenumber", "1"),
+                        ],
+                    ),
+                    node(11, 35.685, 139.75, &[]),
+                    node(12, 35.686, 139.751, &[]),
+                ],
+                vec![
+                    way(
+                        500,
+                        &[1, 2, 3, 4, 1],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "8"),
+                            ("name", "千代田区"),
+                            ("name:en", "Chiyoda"),
+                            ("name:ja-Hira", "ちよだく"),
+                            ("name:etymology", "not a name"),
+                        ],
+                    ),
+                    way(
+                        600,
+                        &[11, 12],
+                        &[
+                            ("highway", "primary"),
+                            ("name", "内堀通り"),
+                            ("name:en", "Uchibori-dori"),
+                        ],
+                    ),
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.by_layer.get("address"), Some(&1));
+        assert_eq!(report.rejected.total, 0);
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let address = reader
+            .find_by_source_id("osm:node:10")
+            .expect("lookup")
+            .expect("block address");
+        let json = reader.record_json(address).expect("json");
+        assert_eq!(json["address"]["number"], "9-1");
+        assert_eq!(
+            json["address"]["areas"],
+            serde_json::json!(["丸の内一丁目"])
+        );
+        assert_eq!(json["address"]["region"], "東京都");
+        let ward = reader
+            .find_by_source_id("osm:way:500")
+            .expect("lookup")
+            .expect("ward");
+        assert_eq!(
+            reader.records().names(ward).expect("names"),
+            vec!["千代田区", "Chiyoda", "ちよだく", "chiyodaku"]
+        );
+
+        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let first = |query: &str, layer: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.into(),
+                    limit: 1,
+                    layer: Some(layer.into()),
+                })
+                .expect("search")
+                .first()
+                .map(|hit| hit.record.id.clone())
+        };
+        assert_eq!(
+            first("Uchibori-dori", "street").as_deref(),
+            Some("osm:way:600")
+        );
+        assert_eq!(first("Chiyoda", "locality").as_deref(), Some("osm:way:500"));
+        assert_eq!(
+            first("ちよだく", "locality").as_deref(),
+            Some("osm:way:500")
+        );
+        assert_eq!(
+            first("chiyodaku", "locality").as_deref(),
+            Some("osm:way:500"),
+            "the Latin form of a kana name"
+        );
+
+        let tagger = crate::parse::lattice::LatticeTagger::open(&dir.join("pack")).expect("tagger");
+        let dictionaries = tagger.dictionaries();
+        use crate::parse::lattice::dictionary::Field;
+        for (field, key) in [
+            (Field::Locality, "千代田区"),
+            (Field::Locality, "ちよだく"),
+            (Field::Locality, "chiyoda"),
+            (Field::Locality, "chiyodaku"),
+            (Field::Locality, "丸の内一丁目"),
+            (Field::Region, "東京都"),
+            (Field::Street, "uchibori dori"),
+        ] {
+            assert!(dictionaries.contains(field, key), "{field:?} {key}");
+        }
+        assert!(!dictionaries.contains(Field::Locality, "not a name"));
+    }
+
+    /// Places drawn as areas: an island multipolygon, a suburb drawn as a
+    /// closed way, and a route relation with a `place` tag that draws no
+    /// area. The address inside them lies in both.
+    #[test]
+    fn places_drawn_as_areas_are_places_and_context() {
+        let dir = temp_dir("island");
+        let input = dir.join("island.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 35.0, 135.0, &[]),
+                    node(2, 35.0, 136.0, &[]),
+                    node(3, 36.0, 136.0, &[]),
+                    node(4, 36.0, 135.0, &[]),
+                    node(5, 35.4, 135.4, &[]),
+                    node(6, 35.4, 135.6, &[]),
+                    node(7, 35.6, 135.6, &[]),
+                    node(8, 35.6, 135.4, &[]),
+                    node(
+                        10,
+                        35.5,
+                        135.5,
+                        &[
+                            ("addr:neighbourhood", "5丁目"),
+                            ("addr:block_number", "10"),
+                            ("addr:housenumber", "8"),
+                        ],
+                    ),
+                ],
+                vec![
+                    way(500, &[1, 2, 3], &[("natural", "coastline")]),
+                    way(501, &[3, 4, 1], &[("natural", "coastline")]),
+                    way(
+                        502,
+                        &[5, 6, 7, 8, 5],
+                        &[("place", "suburb"), ("name", "港北")],
+                    ),
+                ],
+                vec![
+                    relation(
+                        900,
+                        &[(500, "outer"), (501, "outer")],
+                        &[
+                            ("type", "multipolygon"),
+                            ("place", "island"),
+                            ("name", "本州"),
+                            ("name:en", "Honshu"),
+                        ],
+                    ),
+                    relation(
+                        901,
+                        &[(500, "")],
+                        &[("type", "route"), ("place", "island"), ("name", "Route")],
+                    ),
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_areas, 2);
+        assert_eq!(report.accepted.by_layer.get("place"), Some(&1));
+        assert_eq!(report.accepted.by_layer.get("neighbourhood"), Some(&1));
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let island = reader
+            .find_by_source_id("osm:relation:900")
+            .expect("lookup")
+            .expect("island");
+        let suburb = reader
+            .find_by_source_id("osm:way:502")
+            .expect("lookup")
+            .expect("suburb");
+        assert!(
+            reader
+                .find_by_source_id("osm:relation:901")
+                .expect("lookup")
+                .is_none()
+        );
+        let address = reader
+            .find_by_source_id("osm:node:10")
+            .expect("lookup")
+            .expect("address");
+        let context = reader
+            .boundary_context(address)
+            .expect("context")
+            .expect("address context")
+            .admin_context;
+        assert_eq!(context.place_record_id, Some(island));
+        assert_eq!(context.neighbourhood_record_id, Some(suburb));
+
+        let tagger = crate::parse::lattice::LatticeTagger::open(&dir.join("pack")).expect("tagger");
+        use crate::parse::lattice::dictionary::Field;
+        for key in ["本州", "honshu", "港北"] {
+            assert!(
+                tagger.dictionaries().contains(Field::Locality, key),
+                "{key}"
+            );
+        }
+    }
+
+    /// The town plus named POIs: one with an address, one without, a station
+    /// building, a namesake outside the town, and objects that are not POIs.
+    fn town_with_pois() -> Vec<Vec<TestElement>> {
+        let mut blocks = town();
+        blocks.insert(
+            2,
+            vec![
+                node(
+                    2001,
+                    43.65,
+                    -79.38,
+                    &[
+                        ("name", "Tim Hortons"),
+                        ("amenity", "cafe"),
+                        ("addr:housenumber", "123"),
+                        ("addr:street", "King Street West"),
+                        ("addr:postcode", "M5V 1A1"),
+                    ],
+                ),
+                node(
+                    2002,
+                    43.66,
+                    -79.36,
+                    &[("name", "Riverdale Farm"), ("tourism", "attraction")],
+                ),
+                node(
+                    2003,
+                    43.661,
+                    -79.361,
+                    &[("name", "Memorial Bench"), ("amenity", "bench")],
+                ),
+                node(
+                    2004,
+                    43.662,
+                    -79.362,
+                    &[
+                        ("amenity", "cafe"),
+                        ("addr:housenumber", "7"),
+                        ("addr:street", "Mill Street"),
+                    ],
+                ),
+                node(2005, 43.6450, -79.3810, &[]),
+                node(2006, 43.6450, -79.3800, &[]),
+                node(2007, 43.6456, -79.3800, &[]),
+                node(2008, 43.6456, -79.3810, &[]),
+                node(
+                    2009,
+                    43.2,
+                    -79.8,
+                    &[("name", "Tim Hortons"), ("amenity", "fast_food")],
+                ),
+            ],
+        );
+        blocks[3].push(way(
+            700,
+            &[2005, 2006, 2007, 2008, 2005],
+            &[
+                ("name", "Union Station"),
+                ("railway", "station"),
+                ("building", "train_station"),
+            ],
+        ));
+        blocks
+    }
+
+    #[test]
+    fn builds_named_pois_findable_by_name_locality_and_address() {
+        let dir = temp_dir("pois");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town_with_pois());
+        let report = build(&dir.join("pack"), &input, None);
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let counts = &reader.manifest().layer_counts;
+        assert_eq!(counts.get("poi"), Some(&4), "{counts:?}");
+        assert_eq!(
+            counts.get("address"),
+            Some(&6),
+            "the unnamed cafe stays an address; the named one does not"
+        );
+        assert_eq!(report.accepted.pois_with_address, 1);
+        assert_eq!(report.accepted.poi_nodes, 3);
+        assert_eq!(report.accepted.poi_way_centroids, 1);
+        assert_eq!(report.accepted.poi_categories.get("amenity"), Some(&2));
+        assert_eq!(report.geometry_resolution.poi_way_stubs, 1);
+
+        // One record for the cafe, carrying its address.
+        let ids = (0..reader.manifest().record_count)
+            .map(|id| reader.record_summary(id).expect("summary").id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.iter().filter(|id| *id == "osm:node:2001").count(), 1);
+        assert!(!ids.iter().any(|id| id == "osm:node:2003"), "bench");
+        let cafe = reader
+            .find_by_source_id("osm:node:2001")
+            .expect("lookup")
+            .expect("cafe");
+        let Record::Poi(poi) = reader.records().record(cafe).expect("record") else {
+            panic!("the cafe is a POI");
+        };
+        assert_eq!(poi.category, "amenity:cafe");
+        assert_eq!(
+            poi.address.expect("address").street.as_deref(),
+            Some("King Street West")
+        );
+
+        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.into(),
+                    limit: 5,
+                    layer: layer.map(str::to_string),
+                })
+                .expect("search")
+        };
+        let ids = |hits: &[TextSearchHit]| {
+            hits.iter()
+                .map(|hit| hit.record.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // By name and the locality it lies in, though its tags name none. The
+        // locality leaves out the others, unless it matches nothing at all.
+        let hits = search("Tim Hortons, Toronto", None);
+        assert_eq!(ids(&hits), vec!["osm:node:2001"]);
+        assert_eq!(search("Tim Hortons, Atlantis", None).len(), 2);
+        assert_eq!(hits[0].record.layer, "poi");
+        assert_eq!(hits[0].record.category.as_deref(), Some("amenity:cafe"));
+        assert_eq!(
+            hits[0].record.label,
+            "Tim Hortons, 123 King Street West, Toronto, M5V 1A1"
+        );
+        assert_eq!(search("Tim Hortons", Some("poi")).len(), 2);
+        assert_eq!(
+            search("Riverdale Farm Toronto", Some("poi"))[0]
+                .record
+                .label,
+            "Riverdale Farm, Toronto"
+        );
+        // By its address, also under the address layer filter.
+        assert_eq!(
+            ids(&search("123 King Street West", Some("address"))),
+            vec!["osm:node:2001"]
+        );
+        assert!(search("Riverdale Farm", Some("address")).is_empty());
+        let station = search("Union Station Toronto", Some("poi"));
+        assert_eq!(ids(&station), vec!["osm:way:700"]);
+        assert_eq!(
+            station[0].record.point.expect("point").precision,
+            RecordPointPrecision::Centroid
+        );
+        assert!(search("Memorial Bench", None).is_empty());
+
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "riverdale fa".into(),
+                limit: 5,
+                layer: None,
+            })
+            .expect("autocomplete");
+        assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);
+
+        // Reverse answers with the cafe's address, as it did when the cafe was
+        // an address record.
+        let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
+        let result = reverse
+            .reverse(ReverseGeocodeOptions {
+                lon: -79.38,
+                lat: 43.65,
+            })
+            .expect("reverse")
+            .result
+            .expect("result");
+        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
+        assert_eq!(result.label, "123 King Street West, M5V 1A1");
+        assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
     #[test]
     fn spilling_to_disk_builds_the_same_pack() {
         let dir = temp_dir("spill");
         let input = dir.join("town.osm.pbf");
-        write_pbf(&input, &town());
-        let in_memory = build(&dir.join("memory"), &input, DEFAULT_MEMORY_BUDGET_BYTES);
+        write_pbf(&input, &town_with_pois());
+        let in_memory = build(&dir.join("memory"), &input, None);
         // A 4-byte budget leaves every sorter one item of memory, so everything
         // goes through run files and multi-round merges.
-        let spilled = build(&dir.join("spilled"), &input, 4);
+        let spilled = build(&dir.join("spilled"), &input, Some(4));
         let spilling_sorters = spilled
             .scratch
             .sorters

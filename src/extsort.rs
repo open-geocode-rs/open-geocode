@@ -1,6 +1,6 @@
 //! Disk-backed sorting and spooling for builds larger than memory.
 //!
-//! [`ExternalSorter`] buffers items until its share of the build
+//! [`ExternalSorter`] buffers items until its fair share of the build
 //! [`MemoryBudget`] is used (or the shared pool runs out), sorts the buffer,
 //! and writes it to a run file in the build scratch directory. Reading merges
 //! every run with a k-way heap. When everything fits no run is written and the
@@ -8,7 +8,8 @@
 //! share one code path.
 //!
 //! [`Spool`] is the unsorted sibling: an append-only scratch file replayed in
-//! write order.
+//! write order, once or, closed into a [`SpoolFile`], as often as needed.
+//! [`IndexedSpool`] is read back by index, in any order.
 
 use std::{
     cmp::Reverse,
@@ -23,11 +24,12 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 
 use crate::{
-    memory::{MemoryBudget, Reservation},
+    memory::{MemoryBudget, Reservation, Spillable},
+    resources,
     util::codec::{get_u64, put_u64},
 };
 
@@ -55,11 +57,20 @@ pub trait Spill: Sized {
 }
 
 /// Build scratch directory. Removed with everything in it when dropped.
+///
+/// Scratch files are never synced: a build that stops starts over, so only
+/// the published Pack is made durable. On Windows they are marked temporary
+/// while what was spilled fits the page cache the build leaves free (see
+/// [`Scratch::set_cache_bytes`]): the lazy writer then keeps them in memory
+/// instead of writing them out, which pays while they fit, but past that it
+/// would push the Pack and the input out of the cache.
 #[derive(Debug)]
 pub struct Scratch {
     path: PathBuf,
     next_file: AtomicU64,
     spilled_bytes: AtomicU64,
+    /// Spilled bytes up to which new files are marked temporary.
+    cache_bytes: AtomicU64,
 }
 
 impl Scratch {
@@ -71,7 +82,43 @@ impl Scratch {
             path,
             next_file: AtomicU64::new(0),
             spilled_bytes: AtomicU64::new(0),
+            cache_bytes: AtomicU64::new(0),
         }))
+    }
+
+    /// Mark new scratch files temporary while fewer than `bytes` have been
+    /// spilled.
+    pub fn set_cache_bytes(&self, bytes: u64) {
+        self.cache_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Fail with a clear message when about `bytes` more would not fit in
+    /// 90% of the scratch volume's free space, as DuckDB caps its spill,
+    /// instead of failing in the middle of a write.
+    pub fn check_room(&self, bytes: u64) -> Result<()> {
+        if let Some(free) = resources::free_disk(&self.path)
+            && bytes > free / 10 * 9
+        {
+            bail!(
+                "scratch volume of {} has {} MiB free, and the build needs about {} MiB more; free space there or pass --scratch-dir on a larger volume",
+                self.path.display(),
+                free >> 20,
+                bytes >> 20
+            );
+        }
+        Ok(())
+    }
+
+    /// Create a scratch file for writing.
+    fn create_file(&self, path: &Path) -> std::io::Result<File> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        if self.spilled_bytes() < self.cache_bytes.load(Ordering::Relaxed) {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.attributes(windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY);
+        }
+        options.open(path)
     }
 
     pub fn path(&self) -> &Path {
@@ -106,10 +153,11 @@ pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
     budget: Arc<MemoryBudget>,
     label: &'static str,
-    /// Bytes this sorter may buffer before it spills.
+    /// The most bytes this sorter may buffer before it spills, whatever its
+    /// fair share of the pool.
     share_bytes: usize,
     /// Buffer capacity plus the heap bytes of buffered items.
-    reservation: Reservation,
+    reservation: Spillable,
     buffer: Vec<T>,
     runs: Vec<PathBuf>,
     stats: SortStats,
@@ -127,7 +175,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             budget: Arc::clone(budget),
             label,
             share_bytes: share_bytes.max(1),
-            reservation: Reservation::empty(budget),
+            reservation: Spillable::new(budget),
             buffer: Vec::new(),
             runs: Vec::new(),
             stats: SortStats::default(),
@@ -138,20 +186,33 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
         let heap = item
             .resident_bytes()
             .saturating_sub(std::mem::size_of::<T>());
-        let (mut growth, mut needed) = self.needed(heap);
-        let over_share = self.reservation.bytes() + needed > self.share_bytes;
-        if over_share || !self.reservation.try_grow(needed) {
+        let share = self.reservation.share(self.share_bytes);
+        let (mut growth, mut needed) = self.needed(heap, share);
+        let over_share = self.reservation.bytes() + needed > share;
+        if over_share || !self.reservation.reservation().try_grow(needed) {
             // Spill when the share is used up, or when the pool is full and
             // the buffer is big enough to be worth a run.
-            if over_share || self.reservation.bytes() >= self.share_bytes / MIN_RUN_FRACTION {
+            if over_share || self.reservation.bytes() >= share / MIN_RUN_FRACTION {
                 self.spill()?;
-                (growth, needed) = self.needed(heap);
+                (growth, needed) = self.needed(heap, share);
             }
-            if !self.reservation.try_grow(needed) {
-                self.reservation.force_grow(needed);
+            if !self.reservation.reservation().try_grow(needed) {
+                self.reservation.reservation().force_grow(needed);
             }
         }
-        self.buffer.reserve_exact(growth);
+        if self.buffer.try_reserve_exact(growth).is_err() {
+            // The allocator refused to grow the buffer: spill it and grow
+            // from empty, as GNU sort halves its buffer rather than fail.
+            self.spill()?;
+            (growth, needed) = self.needed(heap, share);
+            self.reservation.reservation().force_grow(needed);
+            self.buffer.try_reserve_exact(growth).map_err(|_| {
+                anyhow!(
+                    "out of memory: the {} sorter cannot buffer one item after spilling",
+                    self.label
+                )
+            })?;
+        }
         self.buffer.push(item);
         self.stats.items += 1;
         Ok(())
@@ -159,10 +220,10 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
 
     /// Items the buffer must grow by to take one more item, and the bytes that
     /// costs including the item's own heap data.
-    fn needed(&self, heap: usize) -> (usize, usize) {
+    fn needed(&self, heap: usize, share: usize) -> (usize, usize) {
         let growth = if self.buffer.len() == self.buffer.capacity() {
             // Double, but never past what the share can hold.
-            let share_items = (self.share_bytes / std::mem::size_of::<T>().max(1)).max(1);
+            let share_items = (share / std::mem::size_of::<T>().max(1)).max(1);
             self.buffer
                 .capacity()
                 .max(MIN_CAPACITY)
@@ -184,7 +245,8 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             // Stable sort plus run-order tie-breaking keeps equal items in push order.
             self.buffer.par_sort();
             let reservation =
-                std::mem::replace(&mut self.reservation, Reservation::empty(&self.budget));
+                std::mem::replace(&mut self.reservation, Spillable::new(&self.budget))
+                    .into_reservation();
             return Ok(Sorted::Memory(
                 std::mem::take(&mut self.buffer).into_iter(),
                 reservation,
@@ -193,27 +255,25 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
         // Once anything spilled, the tail is spilled too, so a finished sorter
         // holds only merge read buffers while later phases fill their own.
         self.spill()?;
+        let share = self.reservation.share(self.share_bytes);
         while self.runs.len() > MAX_MERGE_FAN_IN {
             let batch = self.runs.drain(..MAX_MERGE_FAN_IN).collect::<Vec<_>>();
             let merged = self.scratch.new_file(self.label);
             let mut writer = SpoolWriter::<T>::create(&self.scratch, &merged)?;
-            for item in Merge::<T>::open(&batch, &self.budget, self.share_bytes)? {
+            for item in Merge::<T>::open(&batch, &self.budget, share)? {
                 writer.write(&item?)?;
             }
             writer.finish()?;
             self.runs.insert(0, merged);
         }
-        Ok(Sorted::Merge(Merge::open(
-            &self.runs,
-            &self.budget,
-            self.share_bytes,
-        )?))
+        Ok(Sorted::Merge(Merge::open(&self.runs, &self.budget, share)?))
     }
 
     fn spill(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
+        self.scratch.check_room(self.reservation.bytes() as u64)?;
         self.buffer.par_sort();
         let path = self.scratch.new_file(self.label);
         let mut writer = SpoolWriter::create(&self.scratch, &path)?;
@@ -223,7 +283,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
         writer.finish()?;
         // Return the memory to the pool, not just the items.
         self.buffer = Vec::new();
-        self.reservation.release_all();
+        self.reservation.reservation().release_all();
         self.runs.push(path);
         self.stats.runs += 1;
         Ok(())
@@ -377,6 +437,46 @@ impl<T: Spill> Spool<T> {
         reader.remove_on_drop = true;
         Ok(reader)
     }
+
+    /// Close the spool to read it back as many times as needed. The file is
+    /// removed once the [`SpoolFile`] is dropped.
+    pub fn finish(self) -> Result<SpoolFile<T>> {
+        let items = self.writer.items;
+        self.writer.finish()?;
+        Ok(SpoolFile {
+            path: self.path,
+            items,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// A closed spool, read from the start by each [`SpoolFile::reader`].
+pub struct SpoolFile<T> {
+    path: PathBuf,
+    items: u64,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Spill> SpoolFile<T> {
+    pub fn reader(&self) -> Result<SpoolReader<T>> {
+        SpoolReader::open(&self.path, IO_BUFFER_BYTES)
+    }
+
+    /// Items the spool holds.
+    pub fn len(&self) -> u64 {
+        self.items
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items == 0
+    }
+}
+
+impl<T> Drop for SpoolFile<T> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 struct SpoolWriter<T> {
@@ -384,18 +484,22 @@ struct SpoolWriter<T> {
     scratch: Arc<Scratch>,
     buffer: Vec<u8>,
     items: u64,
+    /// Bytes written so far.
+    bytes: u64,
     _marker: PhantomData<T>,
 }
 
 impl<T: Spill> SpoolWriter<T> {
     fn create(scratch: &Arc<Scratch>, path: &Path) -> Result<Self> {
-        let file = File::create(path)
+        let file = scratch
+            .create_file(path)
             .with_context(|| format!("failed to create scratch file {}", path.display()))?;
         Ok(Self {
             file: BufWriter::with_capacity(IO_BUFFER_BYTES, file),
             scratch: Arc::clone(scratch),
             buffer: Vec::new(),
             items: 0,
+            bytes: 0,
             _marker: PhantomData,
         })
     }
@@ -407,15 +511,113 @@ impl<T: Spill> SpoolWriter<T> {
         put_u64(&mut prefix, self.buffer.len() as u64);
         self.file.write_all(&prefix)?;
         self.file.write_all(&self.buffer)?;
+        let bytes = (prefix.len() + self.buffer.len()) as u64;
         self.scratch
             .spilled_bytes
-            .fetch_add((prefix.len() + self.buffer.len()) as u64, Ordering::Relaxed);
+            .fetch_add(bytes, Ordering::Relaxed);
         self.items += 1;
+        self.bytes += bytes;
         Ok(())
     }
 
     fn finish(mut self) -> Result<()> {
         self.file.flush().context("failed to flush scratch file")
+    }
+}
+
+/// A scratch file of items read back by their index, in any order and as
+/// often as needed.
+pub struct IndexedSpool<T> {
+    writer: SpoolWriter<T>,
+    path: PathBuf,
+    offsets: Vec<u64>,
+}
+
+impl<T: Spill> IndexedSpool<T> {
+    pub fn create(scratch: &Arc<Scratch>, label: &str) -> Result<Self> {
+        let path = scratch.new_file(label);
+        Ok(Self {
+            writer: SpoolWriter::create(scratch, &path)?,
+            path,
+            offsets: Vec::new(),
+        })
+    }
+
+    pub fn write(&mut self, item: &T) -> Result<()> {
+        self.offsets.push(self.writer.bytes);
+        self.writer.write(item)
+    }
+
+    /// Bytes written so far.
+    pub fn bytes(&self) -> u64 {
+        self.writer.bytes
+    }
+
+    /// Close the file and map it to read items by index. The file is
+    /// removed once the [`IndexedSpoolFile`] is dropped.
+    pub fn finish(self) -> Result<IndexedSpoolFile<T>> {
+        self.writer.finish()?;
+        let file = File::open(&self.path)
+            .with_context(|| format!("failed to open scratch file {}", self.path.display()))?;
+        // SAFETY: the scratch file is this build's own and is not written
+        // again while mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("failed to map scratch file {}", self.path.display()))?;
+        Ok(IndexedSpoolFile {
+            map: Some(map),
+            path: self.path,
+            offsets: self.offsets,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// A closed [`IndexedSpool`].
+pub struct IndexedSpoolFile<T> {
+    /// Taken before the file is removed: Windows cannot remove a mapped file.
+    map: Option<memmap2::Mmap>,
+    path: PathBuf,
+    offsets: Vec<u64>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Spill> IndexedSpoolFile<T> {
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// Bytes the file holds.
+    pub fn bytes(&self) -> u64 {
+        self.map.as_ref().map_or(0, |map| map.len() as u64)
+    }
+
+    /// Item `index`, decoded.
+    pub fn get(&self, index: usize) -> Result<T> {
+        let bytes = self.map.as_deref().unwrap_or_default();
+        let mut input = usize::try_from(self.offsets[index])
+            .ok()
+            .and_then(|offset| bytes.get(offset..))
+            .with_context(|| format!("scratch file {} is truncated", self.path.display()))?;
+        let len = usize::try_from(get_u64(&mut input)?).context("scratch item too large")?;
+        let mut item = input
+            .get(..len)
+            .with_context(|| format!("scratch file {} is truncated", self.path.display()))?;
+        let value = T::decode(&mut item)?;
+        if !item.is_empty() {
+            bail!("scratch item in {} has trailing bytes", self.path.display());
+        }
+        Ok(value)
+    }
+}
+
+impl<T> Drop for IndexedSpoolFile<T> {
+    fn drop(&mut self) {
+        drop(self.map.take());
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -444,6 +646,13 @@ impl<T: Spill> SpoolReader<T> {
         let Some(len) = self.read_len()? else {
             return Ok(None);
         };
+        self.buffer.clear();
+        self.buffer.try_reserve_exact(len).map_err(|_| {
+            anyhow!(
+                "scratch item of {len} bytes in {} does not fit in memory",
+                self.path.display()
+            )
+        })?;
         self.buffer.resize(len, 0);
         self.file
             .read_exact(&mut self.buffer)

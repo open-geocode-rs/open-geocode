@@ -1,18 +1,44 @@
-use std::{fs::File, net::SocketAddr, path::PathBuf};
+use std::{
+    fs::File,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use open_geocode::{
+    alloc::CountingAlloc,
+    api,
     batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
-    bench::{PackBenchmarkOptions, benchmark_pack},
-    builder::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack},
+    bench::{
+        BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
+        sample_poi_fixture,
+    },
+    builder::{BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
+    geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     pack::{PackReader, RecordId},
+    parse::{
+        bench::{
+            ParseBenchOptions, TaggerKind, align_predictions, mapping::Scheme, normalize_fixtures,
+            run_parse_bench, write_queries,
+        },
+        lattice::LatticeTagger,
+    },
+    resources,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     runtime::{ServeOptions, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
+
+/// mimalloc, counted. The Windows process heap serializes a many-threaded
+/// build on its lock once the heap has churned (LLVM measured a ThinLTO link
+/// 16 times slower on it than on mimalloc); mimalloc's heaps are per thread.
+/// The count lets the build's memory pool see the heap it does not track.
+#[global_allocator]
+static ALLOCATOR: CountingAlloc<mimalloc::MiMalloc> = CountingAlloc::new(mimalloc::MiMalloc);
 
 #[derive(Debug, Parser)]
 #[command(name = "open-geocode")]
@@ -34,18 +60,24 @@ enum Commands {
         #[arg(long)]
         pack: PathBuf,
 
-        /// Memory for build sort buffers, in MiB (64 to 1048576). Larger inputs
-        /// spill to scratch files on disk instead of using more memory.
+        /// Memory for the build's buffers, in MiB (64 to 1048576). Larger
+        /// inputs spill to scratch files on disk instead of using more memory.
+        /// Defaults to half of the memory this process can use, less what the
+        /// build holds outside its buffers.
         #[arg(
             long,
-            default_value_t = (DEFAULT_MEMORY_BUDGET_BYTES >> 20) as u64,
             value_parser = clap::value_parser!(u64).range(MIN_MEMORY_BUDGET_MB..=MAX_MEMORY_BUDGET_MB),
         )]
-        memory_budget_mb: u64,
+        memory_budget_mb: Option<u64>,
 
         /// Directory for scratch files. Defaults to inside the Pack directory.
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
+
+        /// Build even when the pre-flight check finds too little memory or
+        /// disk for the input.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -109,6 +141,17 @@ enum Commands {
         limit: usize,
     },
 
+    /// Label the tokens of an address query with the Pack's parser, and print
+    /// its best labellings.
+    Parse {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Address query to label.
+        query: String,
+    },
+
     /// Reverse geocode one coordinate from a Pack spatial index.
     #[command(name = "reverse-pack")]
     ReversePack {
@@ -149,6 +192,99 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Score forward geocoding against authoritative coordinates, in frozen
+    /// distance buckets plus geohash agreement. Separate from bench-pack
+    /// because that matches object ids and this measures distance.
+    #[command(name = "bench-geocode")]
+    BenchGeocode {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// JSON fixture of cases carrying expect_lat/expect_lon.
+        #[arg(long)]
+        queries: PathBuf,
+
+        /// Candidates inspected per query. At least 5, for hit@5.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        /// Optional output path for the JSON report.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Sample a seeded answer key of named POIs for bench-pack: each case
+    /// queries "<name>, <locality>" and expects that POI.
+    #[command(name = "sample-poi-fixture")]
+    SamplePoiFixture {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Number of POIs to draw.
+        #[arg(long, default_value_t = 500)]
+        count: usize,
+
+        /// Seed of the draw; the same Pack and seed give the same fixture.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+
+        /// Output path for the fixture JSON.
+        #[arg(long)]
+        output: PathBuf,
+    },
+
+    /// Score address parsing per token against the gold rows, as-is,
+    /// stripped of commas and messy, beside stored baseline predictions for
+    /// the same rows.
+    #[command(name = "parse-bench")]
+    ParseBench {
+        /// Gold directory, <cc>.tsv per country.
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        gold: PathBuf,
+
+        /// Root of stored baseline predictions, <baseline>/<cc>.<variant>.tsv.
+        #[arg(long, default_value = "fixtures/parse/predictions")]
+        predictions: PathBuf,
+
+        /// Countries to score, comma-separated; default every gold file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        /// Pack directory or Pack file, for taggers that read one.
+        #[arg(long)]
+        pack: Option<PathBuf>,
+
+        /// og tagger to score. Repeat to compare several.
+        #[arg(long = "tagger", value_enum, default_values_t = [TaggerKind::Legacy])]
+        taggers: Vec<TaggerKind>,
+
+        /// Baseline to score. Repeat for several; default every one stored.
+        #[arg(long = "baseline")]
+        baselines: Vec<String>,
+
+        /// List this many of the first tagger's worst rows per variant.
+        #[arg(long, default_value_t = 0)]
+        show_misses: usize,
+
+        /// Also score every system apart on the rows whose locality, region
+        /// and street names the Pack's dictionaries all hold, and on the
+        /// others. Needs --pack.
+        #[arg(long)]
+        coverage: bool,
+
+        /// Also write the full results as JSON to this path.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+
+    /// Build parse-bench fixtures: normalize source rows into gold rows,
+    /// export each variant's queries for a baseline, and align its answers
+    /// back to the gold tokens.
+    #[command(name = "parse-fixture", subcommand)]
+    ParseFixture(ParseFixtureCommand),
+
     /// Geocode CSV rows into lat/lon columns using a Pack text index.
     #[command(name = "batch-geocode")]
     BatchGeocode(Box<BatchGeocodeArgs>),
@@ -171,6 +307,67 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParseFixtureCommand {
+    /// Map and normalize raw `lang<TAB>country<TAB>token/label ...` rows,
+    /// <input>/<cc>.tsv, into gold rows, <output>/<cc>.tsv.
+    Normalize {
+        /// Label scheme of the raw rows.
+        #[arg(long, value_enum, default_value_t = Scheme::Libpostal)]
+        scheme: Scheme,
+
+        /// Directory of raw <cc>.tsv files.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Countries to normalize, comma-separated; default every raw file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        /// Gold directory to write <cc>.tsv into.
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        output: PathBuf,
+    },
+
+    /// Write each gold row's query in every variant, one per line, as
+    /// <cc>.as-is.txt, <cc>.stripped.txt and <cc>.messy.txt.
+    Queries {
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        gold: PathBuf,
+
+        /// Countries to export, comma-separated; default every gold file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        #[arg(long)]
+        output: PathBuf,
+    },
+
+    /// Align a baseline's <cc>.<variant>.jsonl answers to the gold tokens and
+    /// store them as <cc>.<variant>.tsv predictions.
+    Align {
+        /// Label scheme of the answers.
+        #[arg(long, value_enum, default_value_t = Scheme::Libpostal)]
+        scheme: Scheme,
+
+        #[arg(long, default_value = "fixtures/parse/gold")]
+        gold: PathBuf,
+
+        /// Countries to align, comma-separated; default every gold file.
+        #[arg(long, value_delimiter = ',')]
+        countries: Vec<String>,
+
+        /// Directory of raw answers, <cc>.<variant>.jsonl.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Prediction directory for this baseline, for example
+        /// fixtures/parse/predictions/libpostal.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -256,14 +453,44 @@ async fn main() -> Result<()> {
             pack,
             memory_budget_mb,
             scratch_dir,
+            force,
         } => {
-            let report = build_osm_pack(BuildOsmOptions {
+            resources::opt_out_of_power_throttling();
+            let options = BuildOsmOptions {
                 input,
                 pack,
-                memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
+                memory_budget_bytes: memory_budget_mb
+                    .map(|mb| usize::try_from(mb << 20))
+                    .transpose()
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
-            })?;
+                force,
+            };
+            let plan = plan_osm_build(&options)?;
+            // One pool serves every stage of the build, sized by the plan
+            // unless RAYON_NUM_THREADS sets it.
+            if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(plan.threads)
+                    .build_global()
+                    .context("failed to start the build's worker threads")?;
+            }
+            let found = &plan.resources;
+            eprintln!(
+                "{} MiB memory budget ({}), {} threads; {} usable CPUs ({}), {} MiB memory available ({})",
+                plan.memory_budget_bytes >> 20,
+                if plan.memory_budget_derived {
+                    "derived"
+                } else {
+                    "set"
+                },
+                rayon::current_num_threads(),
+                found.usable_cpus,
+                found.cpu_limit,
+                found.available_memory_bytes >> 20,
+                found.memory_limit,
+            );
+            let report = build_planned_osm_pack(options, plan)?;
             write_json(serde_json::json!({
                 "records": report.output.record_count,
                 "rejections": report.output.rejection_count,
@@ -298,6 +525,7 @@ async fn main() -> Result<()> {
             limit,
         } => search_pack(pack, query, layer, limit),
         Commands::ReversePack { pack, lon, lat } => reverse_pack(pack, lon, lat),
+        Commands::Parse { pack, query } => parse_query(pack, &query),
         Commands::BenchPack {
             pack,
             queries,
@@ -305,6 +533,67 @@ async fn main() -> Result<()> {
             warmup,
             output,
         } => bench_pack(pack, queries, iterations, warmup, output),
+        Commands::BenchGeocode {
+            pack,
+            queries,
+            limit,
+            output,
+        } => {
+            let report = benchmark_geocode(GeocodeBenchmarkOptions {
+                pack,
+                fixture: queries,
+                limit,
+                output: None,
+            })?;
+            let value = serde_json::to_value(report)?;
+            if let Some(output) = output {
+                write_json_to_path(&value, output)
+            } else {
+                write_json(value)
+            }
+        }
+        Commands::SamplePoiFixture {
+            pack,
+            count,
+            seed,
+            output,
+        } => {
+            let fixture = sample_poi_fixture(PoiFixtureOptions { pack, count, seed })?;
+            let cases = fixture.search.len();
+            write_fixture_to_path(&fixture, &output)?;
+            write_json(serde_json::json!({
+                "cases": cases,
+                "output": output.display().to_string(),
+            }))
+        }
+        Commands::ParseBench {
+            gold,
+            predictions,
+            countries,
+            pack,
+            taggers,
+            baselines,
+            show_misses,
+            coverage,
+            json,
+        } => {
+            let report = run_parse_bench(&ParseBenchOptions {
+                gold,
+                predictions,
+                countries,
+                pack,
+                taggers,
+                baselines: (!baselines.is_empty()).then_some(baselines),
+                show_misses,
+                coverage,
+            })?;
+            if let Some(json) = json {
+                write_json_to_path(&report, json)?;
+            }
+            print!("{}", report.to_markdown());
+            Ok(())
+        }
+        Commands::ParseFixture(command) => parse_fixture(command),
         Commands::BatchGeocode(args) => batch_geocode(*args),
         Commands::Serve {
             pack,
@@ -321,6 +610,43 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn parse_fixture(command: ParseFixtureCommand) -> Result<()> {
+    let files = match command {
+        ParseFixtureCommand::Normalize {
+            scheme,
+            input,
+            countries,
+            output,
+        } => normalize_fixtures(scheme, &input, &countries, &output)?
+            .into_iter()
+            .map(|(path, rows, dropped)| {
+                serde_json::json!({ "path": path, "rows": rows, "dropped": dropped })
+            })
+            .collect::<Vec<_>>(),
+        ParseFixtureCommand::Queries {
+            gold,
+            countries,
+            output,
+        } => write_queries(&gold, &countries, &output)?
+            .into_iter()
+            .map(|(path, rows)| serde_json::json!({ "path": path, "rows": rows }))
+            .collect(),
+        ParseFixtureCommand::Align {
+            scheme,
+            gold,
+            countries,
+            input,
+            output,
+        } => align_predictions(scheme, &gold, &countries, &input, &output)?
+            .into_iter()
+            .map(|(path, rows, failed)| {
+                serde_json::json!({ "path": path, "rows": rows, "failed": failed })
+            })
+            .collect(),
+    };
+    write_json(serde_json::json!({ "files": files }))
 }
 
 fn inspect_pack(
@@ -427,31 +753,91 @@ fn write_json(value: Value) -> Result<()> {
     Ok(())
 }
 
-fn write_json_to_path(value: &Value, output: PathBuf) -> Result<()> {
+/// A query fixture as one compact JSON object per case. Pretty-printing 500
+/// cases spans 4,500 lines; a line per case stays greppable and keeps a
+/// regenerated answer key to a readable diff.
+fn write_fixture_to_path(fixture: &BenchmarkFixture, output: &Path) -> Result<()> {
+    create_output_dir(output)?;
+    let body = fixture
+        .search
+        .iter()
+        .map(|case| Ok(format!("    {}", serde_json::to_string(case)?)))
+        .collect::<Result<Vec<_>>>()?
+        .join(",\n");
+    std::fs::write(output, format!("{{\n  \"search\": [\n{body}\n  ]\n}}\n"))?;
+    Ok(())
+}
+
+fn create_output_dir(output: &Path) -> Result<()> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+fn write_json_to_path(value: &impl serde::Serialize, output: PathBuf) -> Result<()> {
+    create_output_dir(&output)?;
     let file = File::create(&output)?;
     serde_json::to_writer_pretty(file, value)?;
     Ok(())
 }
 
+/// Each token with its label, then the n-best labellings with their scores.
+fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
+    let tagger = LatticeTagger::open(&pack)?;
+    let parses = tagger.parse(query);
+    let Some(best) = parses.first() else {
+        bail!("the query has no words to label");
+    };
+    let width = best
+        .tokens
+        .iter()
+        .map(|tagged| tagged.token.chars().count())
+        .max()
+        .unwrap_or_default();
+    for tagged in &best.tokens {
+        println!("{:width$}  {}", tagged.token, tagged.label.name());
+    }
+    println!();
+    for (rank, parse) in parses.iter().enumerate() {
+        let country = parse
+            .country
+            .map_or("--".to_string(), |code| code.to_string());
+        let labelled = parse
+            .pieces
+            .iter()
+            .map(|tagged| format!("{}/{}", tagged.token, tagged.label.name()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{}. {:8.3} {country}  {labelled}", rank + 1, parse.score);
+    }
+    Ok(())
+}
+
+/// The `/search` answer for `query`, as the Runtime gives it.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
-    let searcher = PackTextSearcher::open(pack)?;
+    let pack = Arc::new(PackReader::open(pack)?);
+    let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
     let hits = searcher.search(TextSearchOptions {
-        query,
+        query: query.clone(),
         limit,
         layer,
     })?;
-    write_json(serde_json::to_value(hits)?)
+    write_json(serde_json::to_value(api::forward_collection(
+        &pack, query, hits,
+    )?)?)
 }
 
+/// The `/reverse` answer for a point, as the Runtime gives it.
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
-    let geocoder = PackReverseGeocoder::open(pack)?;
+    let pack = Arc::new(PackReader::open(pack)?);
+    let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
     let response = geocoder.reverse(ReverseGeocodeOptions { lon, lat })?;
-    write_json(serde_json::to_value(response)?)
+    write_json(serde_json::to_value(api::reverse_collection(
+        &pack, &response,
+    )?)?)
 }
 
 fn bench_pack(
@@ -535,31 +921,33 @@ mod tests {
 
     use super::*;
 
-    fn build_budget(value: &str) -> Result<usize, clap::Error> {
-        let cli = Cli::try_parse_from([
+    fn build_budget(value: Option<&str>) -> Result<Option<u64>, clap::Error> {
+        let mut args = vec![
             "open-geocode",
             "build",
             "--input",
             "in.osm.pbf",
             "--pack",
             "pack",
-            "--memory-budget-mb",
-            value,
-        ])?;
-        match cli.command {
+        ];
+        if let Some(value) = value {
+            args.extend(["--memory-budget-mb", value]);
+        }
+        match Cli::try_parse_from(args)?.command {
             Commands::Build {
                 memory_budget_mb, ..
-            } => Ok(memory_budget_mb as usize),
+            } => Ok(memory_budget_mb),
             _ => unreachable!("parsed a build command"),
         }
     }
 
     #[test]
     fn memory_budget_must_be_usable() {
-        assert!(build_budget("0").is_err());
-        assert!(build_budget("63").is_err());
-        assert!(build_budget("99999999999999999").is_err());
-        assert_eq!(build_budget("64").expect("minimum"), 64);
-        assert_eq!(build_budget("16384").expect("planet"), 16_384);
+        assert!(build_budget(Some("0")).is_err());
+        assert!(build_budget(Some("63")).is_err());
+        assert!(build_budget(Some("99999999999999999")).is_err());
+        assert_eq!(build_budget(Some("64")).expect("minimum"), Some(64));
+        assert_eq!(build_budget(Some("16384")).expect("planet"), Some(16_384));
+        assert_eq!(build_budget(None).expect("derived"), None);
     }
 }

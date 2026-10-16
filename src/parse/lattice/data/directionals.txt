@@ -1,0 +1,488 @@
+# libpostal resources/dictionaries/*/{directionals}.txt (MIT, see NOTICE)
+# af
+noord|n
+noordoos|noord oos|no|n.o.|n.o|n o
+noordooste|noord ooste|no|n.o.|n.o|n o
+noordwes|noord wes|nw|n.w.|n.w|n w
+noordweste|noord weste|nw|n.w.|n.w|n w
+oos|o
+suidoos|zuid oost|so|s.o.|s.o|s o
+suidooste|suid ooste|so|s.o.|s.o|s o
+suidwest|sw|s.w.|s.w|s w
+suidwesten|sw|s.w.|s.w|s w
+suid|s
+west|w
+# az
+cənub|cenub
+cənub-şərq|cənub şərq|cənubşərq|cenub serq|cenub-serq|cenubserq
+cənub-qərb|cənub qərb|cənubqərb|cenub qerb|cenub-qerb|cenubqerb
+qərb|qerb
+şərq|serq
+şimal|simal
+şimal-şərq|şimal şərq|şimalşərq|simal serq|simal-serq|simalserq
+şimal-qərb|şimal qərb|şimalqərb|simal qerb|simal-qerb|simalqerb
+# be
+ўсход|усход
+ŭschod|uschod
+ŭskhod|uskhod
+усходняя
+ŭschodniaj|uschodniaj
+uskhodnyaya
+поўнач
+poŭnač|pounac
+poŭnačh|pounach
+паўночная
+paŭnochnaya|paunochnaya
+паўднёвая
+paŭdnyëvaya|paudnyevaya
+paŭdniovaja|paudniovaja
+Захад
+zachad
+zakhad
+заходняя
+zakhodnyaya
+zachodniaja
+паўднёвы
+paŭdniovy|padniovy
+paŭdnyëvy|paudnyevy
+паўночны
+paŭnochny|paunochny
+# bg
+изток
+istok
+север
+sever
+юг
+yug
+запад
+zapad
+# bs
+istok|i
+jug|j
+sjever|s
+zapad|z
+# ca
+est|e
+nord|nort|n
+nordest|nord est|ne|n e
+nordoest|nord oest|no|n o
+occident
+oest|o
+sud|s
+sudest|sud est|se|s e
+sudoest|sud oest|so|s o
+# cs
+jih|j
+sever|s
+východ|vychod|v
+západ|zapad|z
+# cy
+gogledd|ogledd
+dwyrain|ddwyrain
+de|dde
+gorllewin|orllewin
+# da
+centrum|c
+nordre|ndr
+nord|n
+nordøst|nø
+nordvest|nv
+øst|ø|ost|o
+østre|ostre
+søndre|sondre|sdr
+syd|s
+sydøst|sø
+sydvest|sv
+vest|v
+vestre
+# de
+nord|n
+norden
+nördlich|nördl|nordl|nordlich|noerdlich
+nördliche|nordliche|noerdliche
+nördlicher|nordlicher|noerdlicher
+nördliches|nordliches|noerdliches
+nordost|no
+nordosten
+nordöstlich|nordostlich|nordoestlich
+nordwest|nw
+nordwestliche
+ost|o
+osten
+östlich|östl|ostlich|ostl|oestlich
+östliche|ostliche|oestliche
+östlicher|ostlicher|oestlicher
+östliches|ostliches|oestliches
+süd|s|sud|sued
+süden|suden|sueden
+südlich|südl|sudl|sudlich|suedlich
+südliche|sudliche|suedliche
+südlicher|sudlicher|suedlicher
+südliches|sudliches|suedliches
+südost|so|sudost|suedost
+südosten|sudosten|suedosten
+südöstlich|sudostlich|suedoestlich
+südöstliche|sudostliche|suedoestliche
+südöstlicher|sudostlicher|suedoestlicher
+südöstliches|sudostliches|suedoestliches
+südwest|sw|sudwest|suedwest
+südwesten|sudwesten|suedwesten
+südwestlich|sudwestlich|suedwestlich
+südwestliche|sudwestliche|suedwestliche
+südwestlicher|sudwestlicher|suedwestlicher
+südwestliches|sudwestliches|suedwestliches
+west|w
+westen
+westlich|westl
+westliche
+westlicher
+westliches
+# en
+center|c|ctr
+central|c|cn|ctrl|cntrl
+centre|c|ctr
+east|e
+eastern|eastrn|estrn|estn
+lower|lowr|lwr
+middle|mdl|midle|mddl
+north|n|n.|nrt|nrth|nth|norh|nort|no
+northeast|north east|northe|north e|neast|n east|ne|n e|nrteast|nrt east|nrte|nrt e|nrtheast|nrth east|nrthe|nrth e|ntheast|nth east|nthe|nth e|norheast|norh east|norhe|norh e|norteast|nort east|norte|nort e
+northeastern|north eastern|northeastrn|north eastrn|northestrn|north estrn|northestn|north estn|neastern|n eastern|neastrn|n eastrn|nestrn|n estrn|nestn|n estn|nrteastern|nrt eastern|nrteastrn|nrt eastrn|nrtestrn|nrt estrn|nrtestn|nrt estn|nrtheastern|nrth eastern|nrtheastrn|nrth eastrn|nrthestrn|nrth estrn|nrthestn|nrth estn|ntheastern|nth eastern|ntheastrn|nth eastrn|nthestrn|nth estrn|nthestn|nth estn|norheastern|norh eastern|norheastrn|norh eastrn|norhestrn|norh estrn|norhestn|norh estn|norteastern|nort eastern|norteastrn|nort eastrn|nortestrn|nort estrn|nortestn|nort estn
+northwest|north west|northw|north w|northwst|north wst|nwest|n west|nw|n w|nwst|n wst|nrtwest|nrt west|nrtw|nrt w|nrtwst|nrt wst|nrthwest|nrth west|nrthw|nrth w|nrthwst|nrth wst|nthwest|nth west|nthw|nth w|nthwst|nth wst|norhwest|norh west|norhw|norh w|norhwst|norh wst|nortwest|nort west|nortw|nort w|nortwst|nort wst
+northwestern|north western|northwestrn|north westrn|northwstrn|north wstrn|northwstn|north wstn|nwestern|n western|nwestrn|n westrn|nwstrn|n wstrn|nwstn|n wstn|nrtwestern|nrt western|nrtwestrn|nrt westrn|nrtwstrn|nrt wstrn|nrtwstn|nrt wstn|nrthwestern|nrth western|nrthwestrn|nrth westrn|nrthwstrn|nrth wstrn|nrthwstn|nrth wstn|nthwestern|nth western|nthwestrn|nth westrn|nthwstrn|nth wstrn|nthwstn|nth wstn|norhwestern|norh western|norhwestrn|norh westrn|norhwstrn|norh wstrn|norhwstn|norh wstn|nortwestern|nort western|nortwestrn|nort westrn|nortwstrn|nort wstrn|nortwstn|nort wstn
+south|s|so|sth
+southeast|south east|southe|south e|seast|s east|se|s e|soeast|so east|so e|stheast|sth east|sthe|sth e
+southeastern|south eastern|southeastrn|south eastrn|southestrn|south estrn|southestn|south estn|seastern|s eastern|seastrn|s eastrn|sestrn|s estrn|sestn|s estn|soeastern|so eastern|soeastrn|so eastrn|soestrn|so estrn|soestn|so estn|stheastern|sth eastern|stheastrn|sth eastrn|sthestrn|sth estrn|sthestn|sth estn
+southwest|south west|southw|south w|southwst|south wst|swest|s west|sw|s w|swst|s wst|sowest|so west|so w|sowst|so wst|sthwest|sth west|sthw|sth w|sthwst|sth wst
+southwestern|south western|southwestrn|south westrn|southwstrn|south wstrn|southwstn|south wstn|swestern|s western|swestrn|s westrn|swstrn|s wstrn|swstn|s wstn|sowestern|so western|sowestrn|so westrn|sowstrn|so wstrn|sowstn|so wstn|sthwestern|sth western|sthwestrn|sth westrn|sthwstrn|sth wstrn|sthwstn|sth wstn
+upper|uppr|upr|up
+west|w|wst
+western|westrn|wstrn|wstn
+# es
+este|e
+norte|n
+noreste|nordeste|ne|n.e.|n.e|n e
+noroeste|nw|n.w.|n.w|n w
+occidente
+occidental
+oeste|w
+oriente|ote
+oriental
+poniente|pte
+sur|s
+sureste|se|s.e.|s.e|s e
+suroeste|sw|s.w.|s.w|s w
+# et
+edelasse
+ida
+kagu
+kirde
+lääs|laas
+loe
+lõuna|louna|l
+põhi|pohi|p
+põhja|pohja
+# fi
+etelä|etela
+itään|itaan
+länsi|lansi
+pohja
+# fr
+central|ctrl
+centre|c|ctre|cntre
+est|e
+levant
+nord|n
+nord est|ne|n.e.|n.e|n e
+nord ouest|no|n.o.|n.o|n o
+orient
+ouest|o
+sud|s
+sud est|se|s.e.|s.e|s e
+sud ouest|so|s.o.|s.o|s o
+# gd
+deas
+ear
+iar
+meadhain
+meadhanach
+tuath
+# gl
+leste|este|e
+norte|n
+nordeste|ne
+noroeste|no
+oeste|o
+sur|s
+sueste|se
+suroeste|so
+# hi
+dakshin|दक्षिण
+uttar|उत्तर
+poorva|poorav|पूर्व
+paschim|पश्चिम
+# hr
+istok|i
+jug|j
+sjever|s
+zapad|z
+# hu
+dél|del|d
+délnyugat|delnyugat
+délkeleti|delkeleti
+észak|eszak|e
+északnyugat|eszaknyugat
+északkeleti|eszakkeleti
+kelet|k
+nyugat|n
+# id
+barat|bar|brt|brat|kulon|kln|klon
+barat daya|brt dy|bar day|brat dya
+barat laut|brt lt|bar laut
+selatan|sel|sltn|slatan|kidul|kdl|kdul
+tengah|teng|tngh
+tenggara|teng|tnggra
+timur|tim|tmur|wetan|wtan
+timur laut|tim laut|tmur laut
+utara|ut|utra|utr|lor
+# is
+austur|a
+norður|norour|n
+suður|suour|s
+vestur|v
+# it
+levante
+nord|n
+nord est|nordest|ne|n e
+nord ovest|nordovest|no|n o
+est|e
+occidentale|occid.le
+orientale|orrient.le
+ovest|o
+sud|s
+sud est|sudest|se|s e
+sud ovest|sudovest|so|s o
+# ja
+北
+kita
+南
+minami
+東
+higashi
+西
+nishi
+北東
+hokutō|hokuto|hokutou
+北西
+hokusei
+南東
+nantō|nanto|nantou
+南西
+nansei
+# ko
+북
+book
+bug
+남
+nahm
+nam
+동
+dohng
+dong
+서
+seo
+북동
+book dohng
+bookdohng
+bug dong
+bugdong
+북서
+book seo
+bookseo
+bug seo
+bugseo
+남동
+nahm dohng
+nahndohng
+nam dong
+namdong
+남서
+nahm seo
+nahmseo
+nam seo
+namseo
+# lt
+pietūs|pietus
+rytai
+šiaurė|siaure
+vakarai
+# lv
+ziemeļu|ziemelu|z
+dienvidu|d
+austrumu|a
+rietumu|r
+# ms
+barat
+barat daya
+barat laut
+selatan
+tengah
+tenggara
+timur
+timur laut
+utara
+# nb
+nordre|ndr
+nord|n
+nordøst|nø
+nordvest|nv
+øst|ø|ost|o
+østre|ostre
+sentrum|s
+søndre|sondre|sdr
+syd|s
+sydøst|sø
+sydvest|sv
+vest|v
+vestre
+# nl
+noord|n
+noorden|n
+noordelijke
+noordoost|noord oost|no|n.o.|n.o|n o
+noordoosten|noord oosten|no|n.o.|n.o|n o
+noordwest|noord west|nw|n.w.|n.w|n w
+noordwesten|noord westen|nw|n.w.|n.w|n w
+oost|o
+oosten|o
+oostelijke
+west|w
+westen|w
+westelijke
+zuidoost|zuid oost|zo|z.o.|z.o|z o
+zuidoosten|zuid oosten|zo|z.o.|z.o|z o
+zuidwest|zw|z.w.|z.w|z w
+zuidwesten|zw|z.w.|z.w|z w
+zuid|z
+zuiden|z
+zuidlijke
+# pl
+północ|polnoc|płn|pln
+północny wschód|polnocny wschod|pn.-wsch.|pn-wsch|pn wsch|płn.-wsch.|płn-wsch|płn wsch|pln.-wsch.|pln-wsch|pln wsch
+północny zachód|polnocny zachod|pn.-zach.|pn-zach|pn zach|płn.-zach.|płn-zach|płn zach|pln.-zach.|pln-zach|pln zach
+wschód|wschod|w|wsch
+południe|poludnie|pd|płd|pld
+południowy wschód|poludniowy wschod|pd.-wsch.|pd-wsch|pd wsch|płd.-wsch.|płd-wsch|płd wsch|pld.-wsch.|pld-wsch|pld wsch
+południowy zachód|poludniowy zachod|pd.-zach.|pd-zach|pd zach|płd.-zach.|płd-zach|płd zach|pld.-zach.|pld-zach|pld zach
+zachód|zachod|z|zach
+# pt
+este|e
+norte|n
+noredeste|ne|n.e.|n.e|n e
+noroeste|no|n.o.|n.o|n o
+oeste|o
+sudeste|se|s.e.|s.e|s e
+sudoeste|so|s.o.|s.o|s o
+sul|s
+# ro
+est|e
+nord|n
+sud|s
+vest|v
+# ru
+север|с
+sever|s
+северо-востоку|северо востоку
+severo-vostoku|severo vostoku
+северо-Запад|северо Запад
+severo-zapad|severo zapad
+восток|в
+vostok|v
+юг|ю
+yug|y
+юго-востоку|юго востоку
+yugo-vostoku|yugo vostoku
+юго-западу|юго западу
+yugo-zapadu|yugo zapadu
+запад|з
+zapad|z
+# sk
+centrum|centr
+juh|j
+južná|juzna
+južné|juzne
+južný|juzny
+juhovýchod|juhovychod
+juhozápad|juhozapad
+sever|s
+severná|severna
+severné|severne
+severný|severny
+severovýchod|severovychod
+severozápad|severozapad
+východ|vychod|v
+východná|vychodna
+východné|vychodne
+východný|vychodny
+západ|zapad|z
+západná|zapadna
+západné|zapadne
+západný|zapadny
+# sl
+jug|j
+sever|s
+vzhod|v
+zahod|z
+# sr
+исток|и
+istok|i
+југ|ј
+jug|j
+север|с
+sever|s
+запад|з
+zapad|z
+# sv
+norr|n
+norra|n:a
+öst|ost|oest|ö|o
+östra|ostra|oestra|ö:a|o:a
+söd|s|sod|soed
+södra|sodra|soedra|s:a
+väst|vast|vaest|v
+västra|vastra|vaestra|v:a
+# tr
+batı|bati|b
+doğu|dogu|d
+güney|guney|g
+kuzey|k
+# uk
+схід|с
+skhid|s
+північ|півн
+pivnikh|pivn
+південь|півд
+pivden'|pivden|pivd
+захід|з
+zakhid|z
+# zh
+北
+běi|bei
+东
+dōng|dong
+南
+nán|nan
+西
+xī|xi
+西北
+xīběi|xibei
+xī běi|xi bei
+西南
+xīnán|xinan
+xī nán|xi nan
+东北
+dōngběi|dongbei
+dōng běi|dong bei
+东南
+dōngnán|dongnan
+dōng nán|dong nan

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,10 +10,14 @@ use csv::{ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 
 use crate::{
-    pack::{RecordPointPrecision, RecordSource},
-    record::OsmObjectType,
+    api::{self, Contexts},
+    pack::PackReader,
     search::{AddressGeocodeOptions, PackTextSearcher},
 };
+
+/// The audit columns' file name in `contract/`, which the contract tests
+/// keep equal to [`audit_columns`].
+pub const AUDIT_COLUMNS_FILE: &str = "batch-audit-columns.txt";
 
 #[derive(Debug, Clone)]
 pub struct BatchGeocodeOptions {
@@ -45,24 +50,17 @@ pub struct BatchGeocodeReport {
     pub resolved: usize,
 }
 
+/// What the audit CSV appends to an input row: how the row went, then the
+/// columns of the feature it resolved to ([`api::flat_columns`]).
 #[derive(Debug, Clone, Default)]
 struct AuditFields {
     status: String,
     query: String,
-    score: String,
-    record_id: String,
-    id: String,
-    layer: String,
-    label: String,
+    reason: String,
     lat: String,
     lon: String,
-    precision: String,
-    source_dataset: String,
-    source_object_type: String,
-    source_object_id: String,
-    source_derived_from: String,
-    source_record_count: String,
-    reason: String,
+    /// One value per [`api::flat_columns`] column, empty when unresolved.
+    result: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,24 +82,30 @@ struct JoinedCoordinate {
     audit_fields: HashMap<String, String>,
 }
 
-const AUDIT_HEADERS: [&str; 16] = [
-    "geocode_status",
-    "geocode_query",
-    "geocode_score",
-    "geocode_record_id",
-    "geocode_id",
-    "geocode_layer",
-    "geocode_label",
-    "geocode_lat",
-    "geocode_lon",
-    "geocode_precision",
-    "geocode_source_dataset",
-    "geocode_source_object_type",
-    "geocode_source_object_id",
-    "geocode_source_derived_from",
-    "geocode_source_record_count",
-    "geocode_reason",
-];
+const AUDIT_PREFIX: &str = "geocode_";
+
+/// The columns the audit CSV appends to the input's, in order.
+pub fn audit_columns() -> Vec<String> {
+    let mut columns = vec![
+        format!("{AUDIT_PREFIX}status"),
+        format!("{AUDIT_PREFIX}query"),
+    ];
+    columns.extend(
+        api::flat_columns(None)
+            .into_iter()
+            .map(|(name, _)| format!("{AUDIT_PREFIX}{name}")),
+    );
+    columns.push(format!("{AUDIT_PREFIX}reason"));
+    columns
+}
+
+/// [`audit_columns`] one per line, as `contract/` records them.
+pub fn audit_columns_text() -> String {
+    audit_columns()
+        .into_iter()
+        .map(|column| format!("{column}\n"))
+        .collect()
+}
 
 /// Rows read, geocoded and written per chunk. Chunks keep memory flat for
 /// inputs of any size.
@@ -139,7 +143,7 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
         &options.lon_column,
     )?;
     let mut audit_headers = original_headers.clone();
-    audit_headers.extend(AUDIT_HEADERS.iter().map(|header| (*header).to_string()));
+    audit_headers.extend(audit_columns());
 
     let resolver = match options.join.as_ref() {
         Some(join) => Resolver::Join {
@@ -148,14 +152,21 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
                 .with_context(|| format!("missing join key column {:?}", join.key_column))?,
         },
         None => {
-            let pack = options
+            let path = options
                 .pack
                 .as_ref()
                 .context("--pack is required when geocoding address fields")?;
-            Resolver::Pack(Box::new(
-                PackTextSearcher::open(pack)
-                    .with_context(|| format!("failed to open Pack {}", pack.display()))?,
-            ))
+            let open = || -> Result<(Arc<PackReader>, PackTextSearcher)> {
+                let pack = Arc::new(PackReader::open(path)?);
+                let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+                Ok((pack, searcher))
+            };
+            let (pack, searcher) =
+                open().with_context(|| format!("failed to open Pack {}", path.display()))?;
+            Resolver::Pack {
+                pack,
+                searcher: Box::new(searcher),
+            }
         }
     };
 
@@ -206,7 +217,10 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
 }
 
 enum Resolver {
-    Pack(Box<PackTextSearcher>),
+    Pack {
+        pack: Arc<PackReader>,
+        searcher: Box<PackTextSearcher>,
+    },
     Join {
         lookup: HashMap<String, JoinedCoordinate>,
         key_index: usize,
@@ -233,18 +247,19 @@ impl Resolver {
                             status: "unresolved".to_string(),
                             reason: "join key not found or joined coordinates are blank"
                                 .to_string(),
+                            result: column_values(None),
                             ..AuditFields::default()
                         },
                     }
                 })
                 .collect()),
-            Resolver::Pack(searcher) => {
+            Resolver::Pack { pack, searcher } => {
                 let mut order = (0..rows.len()).collect::<Vec<_>>();
                 order.sort_by_cached_key(|&index| locality_key(&rows[index], options, headers));
                 let mut results = order
                     .into_par_iter()
                     .map(|index| {
-                        geocode_row(searcher, options, headers, &rows[index])
+                        geocode_row(pack, searcher, options, headers, &rows[index])
                             .map(|audit| (index, audit))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -298,6 +313,7 @@ pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<String>>> {
 }
 
 fn geocode_row(
+    pack: &PackReader,
     searcher: &PackTextSearcher,
     options: &BatchGeocodeOptions,
     headers: &HashMap<String, usize>,
@@ -322,23 +338,14 @@ fn geocode_row(
         })?;
         tried_queries.push(address);
         if let Some(response) = response {
-            let point = response
-                .hit
-                .record
-                .point
-                .expect("geocode_address only returns hits with points");
+            let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
             return Ok(AuditFields {
                 status: "resolved".to_string(),
                 query: response.query,
-                score: response.hit.score.to_string(),
-                record_id: response.hit.record_id.to_string(),
-                id: response.hit.record.id,
-                layer: response.hit.record.layer,
-                label: response.hit.record.label,
-                lat: format_coordinate(point.lat),
-                lon: format_coordinate(point.lon),
-                precision: precision_name(point.precision).to_string(),
-                ..source_audit_fields(response.hit.record.source)
+                reason: String::new(),
+                lat: format_coordinate(feature.lat()),
+                lon: format_coordinate(feature.lon()),
+                result: column_values(Some(&feature)),
             });
         }
     }
@@ -347,6 +354,7 @@ fn geocode_row(
         status: "unresolved".to_string(),
         query: tried_queries.join(" | "),
         reason: "no engine result with matching coordinates and context".to_string(),
+        result: column_values(None),
         ..AuditFields::default()
     })
 }
@@ -593,136 +601,47 @@ fn compose_query(
 
 fn audit_record(headers: &[String], row: &[String], audit: &AuditFields) -> Vec<String> {
     let mut record = padded_row(row, headers.len());
-    record.extend([
-        audit.status.clone(),
-        audit.query.clone(),
-        audit.score.clone(),
-        audit.record_id.clone(),
-        audit.id.clone(),
-        audit.layer.clone(),
-        audit.label.clone(),
-        audit.lat.clone(),
-        audit.lon.clone(),
-        audit.precision.clone(),
-        audit.source_dataset.clone(),
-        audit.source_object_type.clone(),
-        audit.source_object_id.clone(),
-        audit.source_derived_from.clone(),
-        audit.source_record_count.clone(),
-        audit.reason.clone(),
-    ]);
+    record.push(audit.status.clone());
+    record.push(audit.query.clone());
+    record.extend(audit.result.iter().cloned());
+    record.push(audit.reason.clone());
     record
 }
 
+fn column_values(feature: Option<&api::ForwardFeature>) -> Vec<String> {
+    api::flat_columns(feature)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// A joined row's audit: the joined file's own audit columns where it has
+/// them (it may be an earlier run's audit CSV), and its coordinates.
 fn audit_from_joined(joined: &JoinedCoordinate) -> AuditFields {
-    AuditFields {
-        status: joined
+    let column = |name: &str| {
+        joined
             .audit_fields
-            .get("geocode_status")
+            .get(&format!("{AUDIT_PREFIX}{name}"))
             .cloned()
+            .unwrap_or_default()
+    };
+    let result = api::flat_columns(None)
+        .into_iter()
+        .map(|(name, _)| match name {
+            "lat" => joined.lat.clone(),
+            "lon" => joined.lon.clone(),
+            name => column(name),
+        })
+        .collect();
+    AuditFields {
+        status: Some(column("status"))
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "joined".to_string()),
-        query: joined
-            .audit_fields
-            .get("geocode_query")
-            .cloned()
-            .unwrap_or_default(),
-        score: joined
-            .audit_fields
-            .get("geocode_score")
-            .cloned()
-            .unwrap_or_default(),
-        record_id: joined
-            .audit_fields
-            .get("geocode_record_id")
-            .cloned()
-            .unwrap_or_default(),
-        id: joined
-            .audit_fields
-            .get("geocode_id")
-            .cloned()
-            .unwrap_or_default(),
-        layer: joined
-            .audit_fields
-            .get("geocode_layer")
-            .cloned()
-            .unwrap_or_default(),
-        label: joined
-            .audit_fields
-            .get("geocode_label")
-            .cloned()
-            .unwrap_or_default(),
+        query: column("query"),
+        reason: column("reason"),
         lat: joined.lat.clone(),
         lon: joined.lon.clone(),
-        precision: joined
-            .audit_fields
-            .get("geocode_precision")
-            .cloned()
-            .unwrap_or_default(),
-        source_dataset: joined
-            .audit_fields
-            .get("geocode_source_dataset")
-            .cloned()
-            .unwrap_or_default(),
-        source_object_type: joined
-            .audit_fields
-            .get("geocode_source_object_type")
-            .cloned()
-            .unwrap_or_default(),
-        source_object_id: joined
-            .audit_fields
-            .get("geocode_source_object_id")
-            .cloned()
-            .unwrap_or_default(),
-        source_derived_from: joined
-            .audit_fields
-            .get("geocode_source_derived_from")
-            .cloned()
-            .unwrap_or_default(),
-        source_record_count: joined
-            .audit_fields
-            .get("geocode_source_record_count")
-            .cloned()
-            .unwrap_or_default(),
-        reason: joined
-            .audit_fields
-            .get("geocode_reason")
-            .cloned()
-            .unwrap_or_default(),
-    }
-}
-
-fn source_audit_fields(source: RecordSource) -> AuditFields {
-    AuditFields {
-        source_dataset: source.dataset,
-        source_object_type: source.object_type.map(object_type_name).unwrap_or_default(),
-        source_object_id: source
-            .object_id
-            .map(|object_id| object_id.to_string())
-            .unwrap_or_default(),
-        source_derived_from: source.derived_from.unwrap_or_default(),
-        source_record_count: source
-            .record_count
-            .map(|count| count.to_string())
-            .unwrap_or_default(),
-        ..AuditFields::default()
-    }
-}
-
-fn object_type_name(object_type: OsmObjectType) -> String {
-    match object_type {
-        OsmObjectType::Node => "node",
-        OsmObjectType::Way => "way",
-        OsmObjectType::Relation => "relation",
-    }
-    .to_string()
-}
-
-fn precision_name(precision: RecordPointPrecision) -> &'static str {
-    match precision {
-        RecordPointPrecision::Point => "point",
-        RecordPointPrecision::Centroid => "centroid",
-        RecordPointPrecision::RepresentativePoint => "representative_point",
+        result,
     }
 }
 
@@ -794,8 +713,8 @@ mod tests {
         use crate::{
             pack::PackWriter,
             record::{
-                AddressComponents, AddressRecord, LocationPrecision, SourceProvenance,
-                point_geometry,
+                AddressComponents, AddressRecord, LocationPrecision, OsmObjectType,
+                SourceProvenance, point_geometry,
             },
         };
 
@@ -810,6 +729,7 @@ mod tests {
                 .write(
                     &AddressRecord {
                         address: AddressComponents {
+                            areas: Vec::new(),
                             number: number.into(),
                             street: Some(street.into()),
                             place: None,

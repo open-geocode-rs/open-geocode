@@ -1,0 +1,125 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.01,
+          43.0005
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "interpolated",
+        "address": {
+          "housenumber": "50",
+          "locality": "Toronto",
+          "street": "Queen Street"
+        },
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "distance_m": 16.26445434808834,
+        "id": "osm:way:13:interp:2-98",
+        "label": "50 Queen Street, Toronto, Ontario, Canada",
+        "layer": "interpolation",
+        "name": "50 Queen Street",
+        "record_id": 6,
+        "source": {
+          "dataset": "osm",
+          "object_id": 13,
+          "object_type": "way"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "id": "osm:relation:3",
+        "label": "Toronto",
+        "layer": "locality",
+        "name": "Toronto",
+        "record_id": 2,
+        "source": {
+          "dataset": "osm",
+          "object_id": 3,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "id": "osm:relation:2",
+        "label": "Ontario",
+        "layer": "region",
+        "name": "Ontario",
+        "record_id": 1,
+        "source": {
+          "dataset": "osm",
+          "object_id": 2,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "id": "osm:relation:1",
+        "label": "Canada",
+        "layer": "country",
+        "name": "Canada",
+        "record_id": 0,
+        "source": {
+          "dataset": "osm",
+          "object_id": 1,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "point": {
+      "lat": 43.0005,
+      "lon": -79.0102
+    },
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

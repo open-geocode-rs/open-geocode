@@ -1,0 +1,54 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.005,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "address": {
+          "housenumber": "12",
+          "postcode": "M5V 1A1",
+          "street": "King Street"
+        },
+        "category": "shop:bakery",
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:way:11",
+        "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
+        "layer": "poi",
+        "name": "Queen Bakery",
+        "record_id": 4,
+        "score": 1.0,
+        "source": {
+          "dataset": "osm",
+          "object_id": 11,
+          "object_type": "way"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "query": "Quee",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

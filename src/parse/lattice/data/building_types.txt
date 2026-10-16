@@ -1,0 +1,167 @@
+# libpostal resources/dictionaries/*/{building_types}.txt (MIT, see NOTICE)
+# az
+mənzil|menzil
+# be
+корпус|к
+korpus|k
+# bs
+zgrada
+# cy
+bythynnod
+fferm
+fflat
+tŷ|ty
+tyddyn
+# da
+bygning
+hus
+huse
+# el
+κτίριο|κτιριο|κτ
+ktírio|ktirio|kt
+# en
+annex|anex|annx|anx
+annexe
+building|bdg|bld|bldg|blg
+bungalow|bongalow|bunglow|bungalo|bngw|bnglw
+cabin|cabn
+cottage|ctg|ctge
+duplex|dup|dupl
+factory|fcty|fty|fy
+farm|frm
+garage|grge
+house|hse|hous|hs|ho
+maisonette|msnt
+reserve|rsve|rsrv|rsv
+shed|shd
+tower|twr
+townhouse|tnhs
+trailer|trlr
+villa|vlla|vl
+warehouse|we|whs
+# es
+caserío|caserio|csrio
+casa
+casita
+chalet|chlet
+complejo|compj|compl|complj
+condominio|cond
+conjunto|cjto|conj|cto
+cooperativa|coop
+cortijo|crtjo
+edificio|edifc|edfc|edif
+estancia|estanc|est
+local|loc|lc
+residencial|resid|res
+torre|to
+vivienda|vvda
+# et
+ehitusala|ehit
+maja
+talu|tl
+# fi
+huvila
+koti
+talo
+# fr
+bâtiment|batiment|bat|bât|bt
+immeuble|imm
+maison
+villa|vla
+# ga
+leithlanna
+foirgnimh
+iostáin|iostain
+teaghais
+feirm
+mionárasáin|mionarasain
+árasáin|arasain
+halla
+teach
+tithe
+lóiste|loiste
+teaghaiseáin|teaghaiseain
+mainéar|mainear
+arais
+túr|tur
+bailtíní|bailtini
+# gd
+cotaichean
+flataichean
+pàirc gnìomhachais|pairc gniomhachais
+pàirc gnothachais|pairc gnothachais
+pàirc malairt|pairc malairt
+pàirc reic|pairc reic
+raon gnìomhachais|raon gniomhachais
+togalaichean
+# hi
+mandir|मन्दिर|मंदिर
+station
+police station
+post office
+office
+# hr
+zgrada
+# id
+apartemen|apart|aprtmn
+garasi|grs
+gedung|gd|gdg
+gudang|gdang
+kebun|kebon|kbn
+rumah|rmah|rmh
+vila|vla|vl
+# it
+casa|c|ca|ca'
+casetto|c.etto
+edificio|edif.o|edifo
+palazzina
+palazzo|pal.zo|palzo
+# ja
+番
+ban
+番地
+banchi
+番地の
+banchi no|banchino
+# lt
+vienkiemis|vienk
+# ms
+apartment|aparment|apartmen|apt
+bangunan|bgn
+dewan
+kondominium|kondo
+pangsapuri|p/puri
+residensi|residen
+rumah|rmh
+rumah kediaman
+rumah pangsa
+menara
+# nb
+gård|gaard
+gården|gaarden
+kontoret
+# nl
+gebouw
+# pl
+budowa|bud
+# pt
+bloco|bl
+condominio
+edifício|edificio|edf|edif
+habitação|habitacao|hab
+residencia|res
+torre|tr
+vivenda|vv|vvda
+# ro
+anexa
+bloc|blc|bl
+casa
+cladirea|cladire
+complex
+garaj
+# ru
+корпус|к
+korpus|k
+# zh
+栋
+dòng|dong

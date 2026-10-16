@@ -1,0 +1,5 @@
+# Vendored vocabulary words the parser drops because they clash with what
+# queries mean by them, as Pelias drops libpostal words with `!` lines.
+# One `<dictionary><TAB><phrase>` row per word, the dictionary one of unit,
+# po_box, level, building, street_type, directional, near and category.
+# A word is only listed when a parse benchmark shows the clash.

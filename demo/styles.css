@@ -253,13 +253,17 @@ body {
   white-space: nowrap;
 }
 
-/* Secondary line under a label, e.g. the lat/lon of a reverse-geocoded address. */
+/* Secondary line under a label: where a result is, or the lat/lon of a
+   reverse-geocoded address. */
 .command-item-sub {
+  overflow: hidden;
   margin-top: 2px;
   font-size: 12px;
   line-height: 1.3;
   color: hsl(var(--muted-foreground));
   font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .command-item-sub[hidden] {
@@ -420,7 +424,8 @@ body {
   color: hsl(var(--accent-foreground));
 }
 
-/* Result point markers, styled by point precision. */
+/* Result point markers, styled by accuracy: on the thing, on its street,
+   or the middle of an area. */
 .result-pin-marker {
   box-sizing: border-box;
   border-radius: 50%;
@@ -434,14 +439,14 @@ body {
   border: 1px solid #075f61;
 }
 
-.result-pin-marker.is-centroid {
+.result-pin-marker.is-area {
   width: 11px;
   height: 11px;
   background: #d95d39;
   border: 1px solid #8f2f21;
 }
 
-.result-pin-marker.is-representative {
+.result-pin-marker.is-street {
   width: 13px;
   height: 13px;
   background: #375e97;

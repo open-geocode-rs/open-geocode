@@ -1,0 +1,66 @@
+# Words that introduce a unit, floor or building part, many languages.
+# Vocabulary for the parser's unit dictionary. One word per line.
+# English
+apartment
+apt
+appt
+basement
+bldg
+building
+dept
+department
+fl
+flat
+floor
+flr
+level
+lvl
+office
+penthouse
+ph
+rm
+room
+ste
+suite
+unit
+# French
+app
+appartement
+bureau
+bâtiment
+bat
+esc
+escalier
+étage
+etage
+etg
+porte
+# German, Dutch, Scandinavian
+etage
+og
+stock
+stiege
+top
+wohnung
+whg
+verdieping
+lejlighed
+lgh
+# Spanish, Portuguese, Italian
+apto
+depto
+departamento
+dpto
+interior
+int
+oficina
+piso
+planta
+pta
+puerta
+andar
+sala
+appartamento
+interno
+piano
+scala

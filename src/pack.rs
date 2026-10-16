@@ -1,7 +1,8 @@
 //! Pack writer and reader.
 //!
 //! A Pack is one container file (see [`crate::container`]) holding the record
-//! store, admin context table, text index and spatial index. Builds write a new
+//! store, admin context table, text index, spatial index and the address
+//! parser's dictionaries and weights (see [`crate::parse::lattice`]). Builds write a new
 //! generation next to the published one and switch the `CURRENT` pointer only
 //! after the new Pack passes validation, so running servers never see a
 //! partial Pack.
@@ -13,7 +14,7 @@
 //! ```
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -25,16 +26,22 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tantivy::TantivyDocument;
 
 use crate::{
     container::{Container, ContainerWriter},
     context::{ContextReader, ContextTupleWriter},
     extsort::Scratch,
+    labels,
     memory::MemoryBudget,
-    record::{AddressRecord, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
+    parse::lattice::{
+        CountryCode,
+        dictionary::{DictionaryBuilder, RecordNames},
+    },
+    record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
     spatial_index::{RecordCells, SpatialIndexWriter},
-    text_index::TextIndexWriter,
+    text_index::{PostcodeAreas, TextIndexFields, TextIndexWriter},
 };
 
 pub use crate::{
@@ -51,7 +58,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 6;
+pub const PACK_SCHEMA_VERSION: u32 = 7;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -105,6 +112,32 @@ impl Default for PackWriterOptions {
     }
 }
 
+/// The names of the areas a record lies in that its text document carries:
+/// every name of each area but its country and the place area it lies in
+/// (an island), which are indexed by their `name` alone. A country or an
+/// island has hundreds of names, one per language, and every record in it
+/// would carry them all; the parser's dictionaries still hold every one.
+fn indexed_area_names<'a>(
+    context: &RecordContext,
+    names: &'a HashMap<RecordId, Vec<String>>,
+) -> impl Iterator<Item = &'a str> {
+    let tuple = context.admin_context;
+    let large = [tuple.country_record_id, tuple.place_record_id];
+    context
+        .admin_context
+        .parent_record_ids()
+        .filter_map(move |id| {
+            let names = names.get(&id)?;
+            Some(if large.contains(&Some(id)) {
+                &names[..names.len().min(1)]
+            } else {
+                &names[..]
+            })
+        })
+        .flatten()
+        .map(String::as_str)
+}
+
 /// Writes records in their final order. Record ids are assigned sequentially.
 pub struct PackWriter {
     destination: PathBuf,
@@ -115,6 +148,9 @@ pub struct PackWriter {
     text: TextIndexWriter,
     spatial: SpatialIndexWriter,
     layer_counts: BTreeMap<Layer, u64>,
+    context_names: Arc<HashMap<RecordId, Vec<String>>>,
+    postcode_areas: Arc<PostcodeAreas>,
+    dictionaries: DictionaryBuilder,
 }
 
 /// A finished, unpublished Pack.
@@ -178,6 +214,9 @@ impl PackWriter {
             destination,
             generation,
             layer_counts: BTreeMap::new(),
+            context_names: Arc::default(),
+            postcode_areas: Arc::default(),
+            dictionaries: DictionaryBuilder::default(),
         })
     }
 
@@ -196,34 +235,84 @@ impl PackWriter {
         self.records.record_count()
     }
 
+    /// Names of the records admin contexts point at, each area's `name`
+    /// first, so the records written after this can be indexed under the
+    /// areas they lie in.
+    pub fn set_context_names(&mut self, names: HashMap<RecordId, Vec<String>>) {
+        self.context_names = Arc::new(names);
+    }
+
+    /// Country codes of the country records admin contexts point at, so the
+    /// parser's dictionaries know which country each name is used in.
+    pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
+        self.dictionaries.set_country_codes(codes);
+    }
+
+    /// The groups of regions each region lies in, by the region's id.
+    pub fn set_region_groups(&mut self, groups: HashMap<RecordId, Vec<RecordId>>) {
+        self.dictionaries.set_region_groups(groups);
+    }
+
+    /// Postcode centroids, so the records written after this that state no
+    /// postcode are ranked by the nearest one.
+    pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {
+        self.postcode_areas = Arc::new(areas);
+    }
+
     pub fn write(&mut self, record: &Record, context: Option<RecordContext>) -> Result<RecordId> {
         let first = self.records.record_count();
         self.write_batch(std::slice::from_ref(&(record.clone(), context)))?;
         Ok(first)
     }
 
-    /// Write records in order. Text documents and spatial cells are computed in
-    /// parallel; the store itself is appended sequentially.
+    /// Write records in order: [`BatchPreparer::prepare`], then [`Self::commit`].
     pub fn write_batch(&mut self, batch: &[(Record, Option<RecordContext>)]) -> Result<()> {
+        let prepared = self.preparer().prepare(batch.to_vec())?;
+        self.commit(prepared)
+    }
+
+    /// What computes the text documents, spatial cells and dictionary names
+    /// of the records written next, apart from the writer, so a builder can
+    /// prepare one batch while the writer appends the one before.
+    pub fn preparer(&self) -> BatchPreparer {
+        BatchPreparer {
+            next: self.records.record_count(),
+            fields: self.text.fields(),
+            context_names: Arc::clone(&self.context_names),
+            postcode_areas: Arc::clone(&self.postcode_areas),
+        }
+    }
+
+    /// Append a prepared batch. The store, the text index and the spatial
+    /// pairs take records one at a time, in order.
+    pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
         let first = self.records.record_count();
-        let fields = self.text.fields();
-        let prepared = batch
-            .par_iter()
-            .enumerate()
-            .map(|(offset, (record, _))| {
-                let record_id = first + offset as u64;
-                Ok((
-                    fields.document(record_id, record),
-                    RecordCells::for_record(record_id, record)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for ((record, context), (document, cells)) in batch.iter().zip(prepared) {
+        if batch.first != first {
+            bail!(
+                "batch prepared for record {} was committed at record {first}",
+                batch.first
+            );
+        }
+        for (offset, prepared) in batch.records.into_iter().enumerate() {
+            let PreparedRecord {
+                record,
+                context,
+                document,
+                cells,
+                names,
+            } = prepared;
+            let record_id = first + offset as u64;
+            if let Some(context) = &context
+                && names.is_place()
+            {
+                self.dictionaries.add_place(record_id, context, &names);
+            }
+            self.dictionaries.add(names, context.as_ref());
             let context = match context {
-                Some(context) => self.contexts.intern(*context)?,
+                Some(context) => self.contexts.intern(context)?,
                 None => None,
             };
-            self.records.write(record, context)?;
+            self.records.write(&record, context)?;
             self.text.add(document)?;
             self.spatial.add(cells)?;
             *self.layer_counts.entry(record.layer()).or_default() += 1;
@@ -242,6 +331,9 @@ impl PackWriter {
             text,
             spatial,
             layer_counts,
+            context_names,
+            dictionaries,
+            ..
         } = self;
         let path = generation.path.join(PACK_FILE);
         let mut pack = ContainerWriter::create(&path)?;
@@ -253,6 +345,8 @@ impl PackWriter {
         contexts.finish(&mut pack)?;
         let text_commit = text.finish(&mut pack)?;
         let spatial_commit = spatial.finish(&mut pack)?;
+        dictionaries.finish(&mut pack, &context_names)?;
+        drop(context_names);
 
         let manifest = PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -324,6 +418,20 @@ impl SealedPack {
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The Pack file, to read before it is published.
+    pub fn path(&self) -> PathBuf {
+        self.generation.path.join(PACK_FILE)
+    }
+
+    /// Add a section made from the sealed Pack itself, such as the parser
+    /// weights trained on its records. Nothing reads the Pack file yet.
+    pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
+        let mut pack = ContainerWriter::append(self.path())?;
+        pack.add(name, version, bytes)?;
+        self.bytes = pack.finish()?;
+        Ok(())
     }
 
     /// Validate the Pack with the serving readers, then point `CURRENT` at it.
@@ -422,8 +530,34 @@ impl PackReader {
             .collect()
     }
 
+    /// The summary search and autocomplete return. A POI whose address states
+    /// no locality is labelled with the locality it lies in.
     pub fn record_summary(&self, record_id: RecordId) -> Result<RecordSummary> {
-        self.records.summary(record_id)
+        let mut summary = self.records.summary(record_id)?;
+        if summary.layer == Layer::Poi.as_str()
+            && let Record::Poi(poi) = self.records.record(record_id)?
+            && poi
+                .address
+                .as_ref()
+                .is_none_or(|address| address.locality.is_none())
+            && let Some(locality) = self.locality(record_id)?
+        {
+            summary.label = labels::poi_label(&poi.name, poi.address.as_ref(), Some(&locality));
+        }
+        Ok(summary)
+    }
+
+    /// Name of the locality a record lies in, from its boundary context, or
+    /// of its district where no locality covers it: a single-tier city such as
+    /// Toronto is a district with no locality over its core.
+    pub fn locality(&self, record_id: RecordId) -> Result<Option<String>> {
+        let Some(area_id) = self.boundary_context(record_id)?.and_then(|context| {
+            let tuple = context.admin_context;
+            tuple.locality_record_id.or(tuple.district_record_id)
+        }) else {
+            return Ok(None);
+        };
+        Ok(self.context_record(area_id)?.map(|record| record.name))
     }
 
     pub fn record_json(&self, record_id: RecordId) -> Result<Value> {
@@ -453,13 +587,6 @@ impl PackReader {
             }
         }
         Ok(None)
-    }
-
-    pub fn address(&self, record_id: RecordId) -> Result<Option<AddressRecord>> {
-        Ok(match self.records.record(record_id)? {
-            Record::Address(record) => Some(record),
-            _ => None,
-        })
     }
 
     pub fn interpolation(&self, record_id: RecordId) -> Result<Option<InterpolationRecord>> {
@@ -514,13 +641,91 @@ impl PackReader {
     }
 }
 
+/// Computes what a batch of records adds to the Pack's indexes, in parallel,
+/// for the record ids they will be written at. See [`PackWriter::preparer`].
+pub struct BatchPreparer {
+    next: RecordId,
+    fields: TextIndexFields,
+    context_names: Arc<HashMap<RecordId, Vec<String>>>,
+    postcode_areas: Arc<PostcodeAreas>,
+}
+
+impl BatchPreparer {
+    /// Prepare the records that follow the last batch this prepared.
+    pub fn prepare(
+        &mut self,
+        batch: Vec<(Record, Option<RecordContext>)>,
+    ) -> Result<PreparedBatch> {
+        let first = self.next;
+        let records = batch
+            .into_par_iter()
+            .enumerate()
+            .map(|(offset, (record, context))| {
+                let record_id = first + offset as u64;
+                let names = context
+                    .iter()
+                    .flat_map(|context| indexed_area_names(context, &self.context_names))
+                    .collect::<Vec<_>>();
+                Ok(PreparedRecord {
+                    document: self.fields.document(
+                        record_id,
+                        &record,
+                        &names,
+                        &self.postcode_areas,
+                    ),
+                    cells: RecordCells::for_record(record_id, &record)?,
+                    names: RecordNames::of(&record),
+                    record,
+                    context,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.next += records.len() as u64;
+        Ok(PreparedBatch { first, records })
+    }
+}
+
+/// Records with their text documents, spatial cells and dictionary names,
+/// ready for [`PackWriter::commit`].
+pub struct PreparedBatch {
+    first: RecordId,
+    records: Vec<PreparedRecord>,
+}
+
+impl PreparedBatch {
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// The records with the ids they will be written at.
+    pub fn records(&self) -> impl Iterator<Item = (RecordId, &Record)> {
+        self.records
+            .iter()
+            .enumerate()
+            .map(|(offset, prepared)| (self.first + offset as u64, &prepared.record))
+    }
+}
+
+struct PreparedRecord {
+    record: Record,
+    context: Option<RecordContext>,
+    document: TantivyDocument,
+    cells: RecordCells,
+    names: RecordNames,
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
 
     use crate::{
         record::{
-            AddressComponents, LocationPrecision, OsmObjectType, SourceProvenance, point_geometry,
+            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
+            point_geometry,
         },
         search::{PackTextSearcher, TextSearchOptions},
     };
@@ -534,6 +739,7 @@ mod tests {
     fn address_record(object_id: i64, number: &str, street: &str) -> Record {
         Record::Address(AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: number.to_string(),
                 street: Some(street.to_string()),
                 place: None,

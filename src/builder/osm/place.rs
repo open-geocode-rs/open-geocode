@@ -6,7 +6,10 @@ use crate::{
     util::text::normalize_for_compare,
 };
 
-use super::{emitted::Emitted, tags::OsmTags};
+use super::{
+    emitted::Emitted,
+    tags::{OsmTags, alternate_names},
+};
 
 pub(crate) fn has_place_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("place")
@@ -51,6 +54,7 @@ fn place_record_from_node(
 
     Ok((
         PlaceRecord {
+            alt_names: alternate_names(tags, &name),
             name,
             place_type,
             geometry: point_geometry(lon, lat),
@@ -60,7 +64,7 @@ fn place_record_from_node(
     ))
 }
 
-fn place_layer(place_type: &str) -> Option<PlaceLayer> {
+pub(crate) fn place_layer(place_type: &str) -> Option<PlaceLayer> {
     match normalize_for_compare(place_type).as_str() {
         "country" => Some(PlaceLayer::Country),
         "state" | "province" | "region" => Some(PlaceLayer::Region),

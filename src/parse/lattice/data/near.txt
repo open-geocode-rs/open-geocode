@@ -1,0 +1,310 @@
+# libpostal resources/dictionaries/*/{near}.txt (MIT, see NOTICE)
+# bg
+близо до
+blizo do
+близо до мен
+blizo do men
+наблизо
+nablizo
+около
+okolo
+по целия тук
+po tseliya tuk
+тук
+tuk
+в
+v
+в близост до
+v blizost do
+в близост до тук
+v blizost do tuk
+в района на
+v raĭona na
+# bs
+ovde
+u
+u blizini
+u blizini mene
+u blizini ovdje
+# ca
+a
+a prop de
+a prop
+a prop d'aquí|a prop d'aqui|a prop daquí|a prop daqui
+a prop meu
+aquí|aqui
+dins
+en
+prop
+prop de
+proper
+proper a
+# cs
+blízko|blizko
+okolo
+poblíž|pobliz
+tady
+tady poblíž|tady pobliz
+u
+v
+v blízkém okolí|v blizkem okoli
+v blízkosti|v blizkosti
+v blízkosti mně|v blizkosti mne
+v okolí|v okoli
+ve
+# da
+i
+i nærheden af ​​mig|i naerheden af mig
+i nærheden|i naerheden
+i nærheden af|i naerheden af
+nær|naer
+nær her|naer her
+nær mig|naer mig
+om
+omkring her
+på|paa
+rundt her
+tæt på her|taet paa her|taet pa her
+tæt på mig|taet paa mig|taet pa mig
+tæt ved|taet ved
+# de
+bei
+hier in der nähe|hier in der nahe|hier in der naehe
+hier in der gegend
+in
+in der nähe|in der nahe|in der naehe
+in der nähe hier|in der nahe hier|in der naehe hier
+in der nähe von|in der nahe von|in der naehe von
+in meiner nähe|in meiner nahe|in meiner naehe
+in der nähe zu mir|in der nahe zu mir|in der naehe zu mir
+im
+nah
+nähe|nahe|naehe
+nahe an
+um
+nahe gelegen
+# en
+around
+around here
+in
+near
+near me
+near here
+nearby
+# es
+acá
+aca
+cerca
+cerca de
+cerca de acá|cerca de aca
+cerca de aquí|cerca de aqui
+cerca de mì|cerca de mi
+en
+por aquí|por aqui
+próximo|proximo
+# et
+lähedal|lahedal
+lähedal mulle|lahedal mulle
+siin lähedal|siin lahedal
+siinkandis
+# eu
+hemen
+hemen gertu
+gertu
+gertuko
+me gertu
+# fi
+lähellä|lahella
+lähellä minua|lahella minua
+lähistöllä|lahistolla
+täällä|taalla
+tässä lähellä|tassa lahella
+# fr
+a
+à
+à coté|a cote
+à coté de|a cote de
+à proximité de|a proximite de
+à proximité de là|a proximite de la
+à proximité de moi|a proximite de moi
+aux environs de
+dans
+dans les alentours
+en
+par ici
+près de|pres de
+près de moi|pres de moi
+près d'ici|pres d'ici|près dici|pres dici
+près de là|pres de la
+proche
+proche de
+proche de chez moi
+proches des
+# hr
+oko ovdje
+u
+u blizini
+u blizini mene
+u blizini ovdje
+# hu
+közelben|kozelben
+közelében|kozeleben
+közelemben|kozelemben
+# id
+sekitar|sktr
+dalam|dalem|dlm|dlam
+dekat|dkt|dkat
+# is
+hér|her
+hérna|herna
+í|i
+nálægt|nalaegt
+nálægt hér|nalaegt her
+nálægt mér|nalaegt mer
+# it
+a
+ad
+in
+intorno a qui
+nelle vicinanze
+presso a
+qui vicino
+vicino
+vicino a
+vicino a me
+# nb
+i
+i nærheten av meg|i naerheten av meg
+i nærheten|i naerheten
+i nærheten av|i naerheten av
+i nærheten her|i naerheten her
+nær meg|naer meg
+rundt her
+# nl
+bij
+in
+in de buurt
+in de buurt van
+in de buurt van me
+nabij
+te
+# pl
+blisko
+koło|kolo|k
+niedaleko
+obok
+przy
+w
+w pobliżu|w poblizu
+w pobliżu mnie|w poblizu mnie
+w pobliżu tutaj|w poblizu tutaj
+wokół tutaj|wokol tutaj
+we
+# pt
+aqui
+aqui perto
+de
+em
+na
+no
+perto
+perto daqui
+perto de
+perto de mim
+perto do
+por aqui
+próximo|proximo
+# ro
+aici
+aproape de aici
+din
+in apropiere de
+în apropiere|in apropiere
+în jurul aici|in jurul aici
+lângă mine|langa mine|lângă|langa
+# ru
+близ
+bliz
+около
+okolo
+под
+pod
+поблизости
+poblizosti
+рядом
+ryadom
+рядом с
+ryadom s
+рядом с мной
+ryadom s mnoy
+рядом здесь
+ryadom zdes'|ryadom zdes
+у
+u
+в
+v
+возле
+vozle
+вблизи
+vblizi
+здесь
+zdes'|zdes
+# sk
+blízko|blizko
+blízkosti|blizkosti
+okolo
+tady
+tady blízkosti|tady blizkosti
+tu
+u
+v
+v blízkosti tu|v blizkosti tu
+v blízkosti|v blizkosti
+v blízkosti mne
+v okolí|v okoli
+vo
+# sl
+blizu mene
+okoli tukaj
+pri
+tukaj
+v
+v bližini|v blizini
+v bližini tukaj|v blizini tukaj
+# sv
+i
+i närheten av mig|i narheten av mig
+i närheten|i narheten
+i närheten av|i narheten av
+nära|nara
+nära här|nara har
+nära till här|nara till har
+nära mig|nara mig
+omkring här|omkring har
+på|paa
+runt här|runt har
+# uk
+біля
+bilya
+близько
+blyzʹko|blyzko
+навколо
+navkolo
+під
+pid
+поблизу
+poblyzu
+поруч
+poruch
+поруч тут
+poruch tut
+поруч з
+poruch z
+поруч зі мною
+poruch zi mnoyu
+тут
+tut
+у
+u
+в
+v

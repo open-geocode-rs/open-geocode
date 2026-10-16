@@ -3,11 +3,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer},
+    builder::plan::BuildPlan,
+    parse::lattice::train::TrainReport,
+    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
+    resources::Resources,
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 13;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -26,8 +29,14 @@ pub struct BuilderReport {
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
     pub throughput: Throughput,
+    pub resources: ResourceReport,
     pub scratch: ScratchReport,
     pub output: PackOutputReport,
+    /// The address parser trained on the Pack's records.
+    pub parser_training: TrainReport,
+    /// Ways and relations libpostal's admin level table names for the
+    /// input's countries that the input lacks: rules that apply to nothing.
+    pub unmatched_admin_level_ids: Vec<String>,
 }
 
 impl BuilderReport {
@@ -72,6 +81,11 @@ impl BuilderReport {
         self.accepted.street_segments += accepted.street_segments;
         self.accepted.postcode_records += accepted.postcode_records;
         self.accepted.place_nodes += accepted.place_nodes;
+        self.accepted.place_areas += accepted.place_areas;
+        self.accepted.poi_nodes += accepted.poi_nodes;
+        self.accepted.poi_way_centroids += accepted.poi_way_centroids;
+        self.accepted.pois_with_address += accepted.pois_with_address;
+        merge_counts(&mut self.accepted.poi_categories, accepted.poi_categories);
 
         self.rejected.total += rejected.total;
         merge_counts(&mut self.rejected.by_reason, rejected.by_reason);
@@ -133,6 +147,7 @@ impl BuilderReport {
         self.geometry_resolution.interpolation_way_stubs += geometry.interpolation_way_stubs;
         self.geometry_resolution.street_way_stubs += geometry.street_way_stubs;
         self.geometry_resolution.boundary_way_stubs += geometry.boundary_way_stubs;
+        self.geometry_resolution.poi_way_stubs += geometry.poi_way_stubs;
         self.geometry_resolution.required_node_refs += geometry.required_node_refs;
         self.geometry_resolution.resolved_node_refs += geometry.resolved_node_refs;
 
@@ -161,12 +176,27 @@ fn merge_samples<T>(
     }
 }
 
+/// What the machine gave the build.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ResourceReport {
+    /// The probe, the sizes chosen from it and the pre-flight check.
+    pub plan: BuildPlan,
+    /// Worker threads the build ran on.
+    pub threads: usize,
+    /// The probe again when the parser's training started.
+    pub at_training: Resources,
+}
+
 /// Disk used for build scratch files and how often each sorter spilled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ScratchReport {
     pub memory_budget_bytes: u64,
-    /// Most memory held at once by sort, merge and text indexing buffers.
+    /// Most memory held at once by sort, merge, text indexing and lattice
+    /// buffers.
     pub peak_tracked_bytes: u64,
+    /// Most bytes the heap held at once, as the global allocator counts
+    /// them; 0 when it does not.
+    pub peak_heap_bytes: u64,
     pub spilled_bytes: u64,
     pub sorters: BTreeMap<String, SorterReport>,
 }
@@ -212,6 +242,15 @@ pub struct AcceptedCounts {
     pub street_segments: u64,
     pub postcode_records: u64,
     pub place_nodes: u64,
+    /// Places drawn as a closed way or a multipolygon, not admin boundaries.
+    #[serde(default)]
+    pub place_areas: u64,
+    pub poi_nodes: u64,
+    pub poi_way_centroids: u64,
+    /// POIs that carry an address instead of being an address record.
+    pub pois_with_address: u64,
+    /// POIs by the key of their category, for example `amenity`.
+    pub poi_categories: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -356,6 +395,7 @@ pub struct GeometryResolutionCounts {
     pub interpolation_way_stubs: u64,
     pub street_way_stubs: u64,
     pub boundary_way_stubs: u64,
+    pub poi_way_stubs: u64,
     pub required_node_refs: u64,
     pub resolved_node_refs: u64,
 }
@@ -387,6 +427,8 @@ pub struct PhaseTimings {
     pub record_write_ms: u128,
     /// Finish the text and spatial indexes and write the Pack file.
     pub pack_seal_ms: u128,
+    /// Train the address parser and add its weights to the Pack file.
+    pub parser_training_ms: u128,
     pub total_ms: u128,
 }
 
@@ -528,6 +570,29 @@ impl BuilderReport {
     pub(crate) fn accept_place(&mut self, layer: PlaceLayer) {
         self.accept_layer(layer.as_str());
         self.accepted.place_nodes += 1;
+    }
+
+    /// A place drawn as an area, counted with the places and on its own.
+    pub(crate) fn accept_place_area(&mut self, layer: PlaceLayer) {
+        self.accept_place(layer);
+        self.accepted.place_areas += 1;
+    }
+
+    pub(crate) fn accept_poi(&mut self, poi: &PoiRecord) {
+        self.accept_layer("poi");
+        match poi.location_precision {
+            LocationPrecision::Point => self.accepted.poi_nodes += 1,
+            LocationPrecision::Centroid => self.accepted.poi_way_centroids += 1,
+        }
+        if poi.address.is_some() {
+            self.accepted.pois_with_address += 1;
+        }
+        let key = poi.category.split(':').next().unwrap_or_default();
+        *self
+            .accepted
+            .poi_categories
+            .entry(key.to_string())
+            .or_default() += 1;
     }
 
     fn accept_layer(&mut self, layer: &str) {
@@ -1505,6 +1570,7 @@ mod tests {
         let street = street.map(str::to_string);
         AddressRecord {
             address: AddressComponents {
+                areas: Vec::new(),
                 number: "10".to_string(),
                 street,
                 place: None,

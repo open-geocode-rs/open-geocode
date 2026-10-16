@@ -21,6 +21,7 @@ use super::{
     emitted::Emitted,
     geometry::centroid,
     interpolation::{InterpolationNode, emit_interpolation},
+    poi::{PoiCandidate, emit_poi},
     spill::{ResolvedRef, WayFeature, WayKind},
     street::emit_street,
 };
@@ -40,44 +41,59 @@ pub(crate) fn emit_features(
     resolved: Sorted<ResolvedRef>,
     mut sink: impl FnMut(FeatureOutput) -> Result<()>,
 ) -> Result<HashMap<u64, Vec<Vertex>>> {
-    let mut resolved = resolved.peekable();
-    let mut owner = 0u64;
-    let mut features = features.peekable();
-    while features.peek().is_some() {
-        let mut chunk = Vec::with_capacity(FEATURES_PER_CHUNK);
-        for feature in features.by_ref().take(FEATURES_PER_CHUNK) {
-            let mut refs = Vec::new();
-            while let Some(next) =
-                resolved.next_if(|next| next.as_ref().map_or(true, |next| next.owner <= owner))
-            {
-                refs.push(next?);
+    // One thread reads features and joins them to their coordinates while
+    // this one emits the chunk before and hands it to the sink, so neither
+    // waits on the other.
+    std::thread::scope(|scope| -> Result<HashMap<u64, Vec<Vertex>>> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let reader = scope.spawn(move || -> Result<HashMap<u64, Vec<Vertex>>> {
+            let mut resolved = resolved.peekable();
+            let mut owner = 0u64;
+            let mut features = features.peekable();
+            while features.peek().is_some() {
+                let mut chunk = Vec::with_capacity(FEATURES_PER_CHUNK);
+                for feature in features.by_ref().take(FEATURES_PER_CHUNK) {
+                    let mut refs = Vec::new();
+                    while let Some(next) = resolved
+                        .next_if(|next| next.as_ref().map_or(true, |next| next.owner <= owner))
+                    {
+                        refs.push(next?);
+                    }
+                    chunk.push((feature?, refs));
+                    owner += 1;
+                }
+                if sender.send(chunk).is_err() {
+                    return Ok(HashMap::new());
+                }
             }
-            chunk.push((feature?, refs));
-            owner += 1;
-        }
-        let outputs = chunk
-            .into_par_iter()
-            .map(|(feature, refs)| {
-                let mut output = FeatureOutput::default();
-                emit_feature(feature, refs, &mut output);
-                output
-            })
-            .collect::<Vec<_>>();
-        for output in outputs {
-            sink(output)?;
-        }
-    }
-
-    let mut members: HashMap<u64, Vec<Vertex>> = HashMap::new();
-    for item in resolved {
-        let item = item?;
-        members.entry(item.owner).or_default().push(Vertex {
-            node_id: item.node_id,
-            lat: item.lat(),
-            lon: item.lon(),
+            drop(sender);
+            // What is left are the boundary member ways, past every feature.
+            let mut members: HashMap<u64, Vec<Vertex>> = HashMap::new();
+            for item in resolved {
+                let item = item?;
+                members.entry(item.owner).or_default().push(Vertex {
+                    node_id: item.node_id,
+                    lat: item.lat(),
+                    lon: item.lon(),
+                });
+            }
+            Ok(members)
         });
-    }
-    Ok(members)
+        for chunk in receiver {
+            let outputs = chunk
+                .into_par_iter()
+                .map(|(feature, refs)| {
+                    let mut output = FeatureOutput::default();
+                    emit_feature(feature, refs, &mut output);
+                    output
+                })
+                .collect::<Vec<_>>();
+            for output in outputs {
+                sink(output)?;
+            }
+        }
+        reader.join().expect("feature reader panicked")
+    })
 }
 
 fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut FeatureOutput) {
@@ -111,6 +127,30 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
                     &feature.tags,
                     Some(&feature.tags),
                     Some("address"),
+                ),
+            }
+        }
+        WayKind::Poi => {
+            let center = if complete { centroid(&points()) } else { None };
+            match center {
+                Some((lat, lon)) => emit_poi(
+                    PoiCandidate {
+                        object_type: OsmObjectType::Way,
+                        object_id: feature.way_id,
+                        lat,
+                        lon,
+                        location_precision: LocationPrecision::Centroid,
+                        tags: feature.tags,
+                    },
+                    out,
+                ),
+                None => out.reject(
+                    CandidateIssue::WayWithoutResolvedNodes,
+                    OsmObjectType::Way,
+                    feature.way_id,
+                    &feature.tags,
+                    None,
+                    Some("poi"),
                 ),
             }
         }

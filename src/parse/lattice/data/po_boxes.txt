@@ -1,0 +1,112 @@
+# libpostal resources/dictionaries/*/{post_office}.txt (MIT, see NOTICE)
+# bg
+пощенска кутия|пк|п.к|п к
+poshtenska kutiya|pk|p.k|p k
+# bs
+postanški pretinac|p.p|pp|p p|postanski pretinac
+# ca
+apartat|apt
+# cs
+poštovní přihrádka|postovni prihradka
+# da
+boks
+postboks|pb|post boks|p.b
+# de
+postfach|pf
+# el
+ταχυδρομική θυρίδα|τ.θ|τθ|τ θ|ταχυδρομικη θυριδα
+tachydromikí thyrída|t.th|tth|t thtachydromiki thyrida
+# en
+bag
+box
+locked mail bag|lb|lmb|mailbag|lockedbag|mail bag|locked bag
+community mail bag|cmb
+general post office box|gpo box|gpo
+post office box|p.o. box|p.o box|pobox|postbox|post box|po box|p o box|p office box|pb|pob|p o b
+post mail box|pmb
+locked bag
+mailservice|ms|m s|mail service
+mailcenter|mail center|mail centre|mc|m c
+roadside mail box|rmb|road mail box|r m b|roadside mailbox|rms box|road mailbox
+roadside delivery|rsd
+roadside mail service|rmd
+rural mail box|rmb|r m b
+private bag
+private mail box|pmb
+# es
+apartado|apdo|aptdo
+apartado de correos|apdo de correos
+apartado postal|apdo postal|aptdo postal
+casilla de correos|c.c|cc|c c
+# et
+abonementpostkast
+kast
+# eu
+posta-kutxa|posta kutxa|p.-ku|p.ku|p ku|pku
+# fi
+postilokero|pl
+# fr
+boîte postale|boite postale|bp|b.p.|b.p|b p|bte postale
+case postale|cp|c.p.|c.p|c p
+cedex
+# he
+תיבת דואר|ת.ד.
+ta doar
+# hr
+postanški pretinac|p.p|pp|p p|postanski pretinac
+# hu
+postafiók|pf|postafiok
+# is
+pósthólf|ph|postholf
+# it
+casella postale|cp|c.p.|c.p|c p|cpt|cas pos
+presso|co|c \ o|c / o
+# ja
+私 書 箱
+shishobako
+# ko
+사서함
+saseoham
+# lt
+pašto dėžutė|pasto dezute|p.d|p d|pd
+# ms
+beg
+mel
+surat
+# nb
+postboks
+# nl
+postbus
+# pl
+skrytka pocztowa|skr poczt
+# pt
+apartado|apdo|aptdo
+caixa postal|cp|c.p|c p|cxp
+# ro
+căsuță poștală|cp|casuta postala
+# ru
+абонементна скринька
+abonementnykh skrynʹka|abonementnykh skrynka
+# sk
+poštová priehradka|postova priehradka
+# sl
+poštni predal|p.p|pp|p p|postni predal
+# sr
+поштански фах|пф|п.ф|п ф|пошт фах
+poštanski fah|pf|p.f|p f|postanski fah|pošt fah
+поштански претинац
+poštanski pretinac|pošt pretinac|postanski pretinac|post pretinac
+поштански преградак
+poštanski pregradak|pošt pregradak|postanski pregradak|post pregradak
+# sv
+box
+postlåda|postlaada|postlada|pl
+# tr
+posta kutusu|pk|p.k|p k
+# uk
+абонементна скринька|а / с
+abonementnykh skrynʹka|abonementnykh skrynka|a / s
+# zh
+邮政信箱
+郵政信箱
+yóuzhèng xìnxiāng|youzheng xinxiang

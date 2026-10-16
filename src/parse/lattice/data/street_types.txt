@@ -1,0 +1,1955 @@
+# libpostal resources/dictionaries/*/{street_types}.txt (MIT, see NOTICE)
+# af
+baan
+boulevard|blvd
+dijk|dk
+dwarsstraat|dwstr
+dwarsweg|dwwg
+hof|h
+hoofstraat
+kade|kd
+laan|ln
+lange|l
+lang|l
+pad
+park|pk
+plein|pln
+plantsoen|plnts
+singel|sngl
+sloot
+straat|str
+steenweg|stwg
+verlengde|verl
+weg|wg
+# ar
+شارع
+الطريق
+طريق
+السيار
+نهج
+الطريق الدائري
+جادة
+حارة
+ميدان
+الشارع
+ساحة
+# ast
+cai
+camín|camin
+paséu|paseu
+# az
+bazi
+bulvar|bul
+çıxılmaz|cixilmaz
+dalan
+keçid|kecid
+küçə|kuce
+küçəsi|kucesi
+meydanı
+prospekt|prosp|pr
+prospekti|prosp|pr
+sahə|sahe
+şose|sose
+şosesi|sosesi
+üzük|uzuk
+xətt|xett
+xiyabanı
+yol
+yolu
+# be
+алея|ал
+alieja|al
+бульвар|бульв|бул
+bulvar|bul|bulv
+дарога|дар
+daroha|dar
+кальцавая
+kaĺcavaja|kalcavaja
+лінія|лін
+linija|lin
+набярэжная|наб
+nabiarežnaja|nab
+плошча|пл
+plošča|plosca|pl
+праезд|пр
+prajezd|pr
+праспект|прасп
+praspiekt|prasp
+шаша|ш
+šaša|sasa|s
+шашэйная
+šašejnaja|sasejnaja
+тупік|туп
+tupik|tup
+вуліца|вул
+vulica|vul
+завулак|зав
+zavulak|zav
+# bg
+Булевард|бул
+bulevard|bul
+площад|пл
+ploshtad|pl
+улица|ул
+ulitsa|ul
+# br
+alez
+alezioù|aleziou
+bali
+banell
+boulouard
+etrezek
+gardenn
+gourhent
+gwaremm
+gwenodenn
+gwenojenn
+gwenod
+hent
+hent-bras|hent bras|hentbras
+hent-dall|hent dall|hentdall
+hent-don|hent don|hentdon
+hent moned
+hentoù|hentou
+hent-tro|hent tro|henttro
+impase
+kae
+kêr|ker
+kêrig|kerig
+kloz
+kroas-hent|kroas hent|kroashent
+kroasnent-tro|kroasnent tro|kroasnenttro
+kroashent-tro|kroashent tro|kroashenttro
+kroazhent-tro|kroazhent tro|kroazhenttro
+lodennaoueg
+mailh
+plasenn
+pont
+reper
+ru
+ruioù|ruiou
+skwar
+strad
+straed
+streat
+straedoù|straedou
+# bs
+aleja|al
+avenija|av
+bulevar|bul
+cesta|c
+drvored
+klanac
+most
+prilaz
+put
+šetalište|setaliste
+trg
+ulica|ul
+# ca
+autopista|auto|autop
+autovia|autov
+avinguda|av|avd|avda|avgda
+camí|cami
+carrer|carr|c /
+carrera|cra|carra
+carreró|cró|carrero|cro|carro|carr
+carretera|ctra
+cinturó|cint|cinturo
+diagonal|diag
+drecera|drec
+eix
+eix diagonal
+entrada|entr
+gran vía|gran via|gv|g v
+passadís|pdís|passadis|pdis
+passatge|ptge
+passeig|pg
+plaça|pl|placa|pça|pca|plç|plc
+portal|ptal
+rambla|rbla
+ronda|rda
+rotonda|rtda
+sortida|sort
+transversal|trval|trvsal
+travessera|trav
+travessia|trv|trav
+via|v
+# cs
+nábřeží|nabrezi|nábř|nabr
+náměstí|nám|namesti|nam
+příčná|pricna
+třída|tř|trida|tr
+ulice|ul|u
+ulička|ulicka
+# cy
+cae
+cae'r
+cilgant
+clos
+coedlan
+cwrt
+ffordd
+gerddi
+heol
+llys
+llwyn
+lôn|lon
+maes
+plas
+porth
+rhes
+rhodfa
+rhodfa'r|rhodfar
+sgwâr|sgwar
+stryd
+strydoedd
+stryt
+# da
+allé|alle
+anlæg|anlaeg
+bakken
+banen
+boulevard
+boulevarden
+buen
+dammen
+dossering
+gade
+gangen
+get
+grænsen
+haven
+have
+havn
+høj|hoj
+højen|hojen
+holmen
+huset
+kær|kaer
+krænten|kraenten
+længen|laengen
+marken
+park
+parken
+passagen
+plads
+siden
+stien
+stræde|straede
+svinget
+toften
+torv
+vangen
+varden
+vej|v
+vænge|vaenge
+# de
+allee|a|al
+autobahn
+bach
+bad
+bahnhof|bhf|bf
+boulevard|bd
+brücke|br|brucke|bruecke
+bühl|buhl|buehl
+chaussee|ch
+damm|d
+forsthaus|fh
+gasse|g
+graben|gr
+großser|grosser
+große|grosse|gr|g
+großes|grosses
+heiligen
+hof|h
+kamp|k
+obere|ob
+oberer|ob
+oberes
+pfad
+platz|pl
+quelle|qu
+rundwanderweg|rww
+siedlung|sdlg
+steg
+stiege|stg
+straße|str|strasse
+ufer
+untere|u
+unterer
+unteres
+weg|w
+wiese|ws
+# el
+οδός
+odós|odos|odhos
+λεωφόρος|λεωφορος|λ|λεωφ
+leofóros|leoforos|l|leof
+πλατεία|πλατεια|πλ
+plateía|plateia|pl
+# en
+abbey|abby
+access|accs|acc
+acres|acrs
+alley|aly|ally|alee|al
+alleyway|alwy|allyway|allwy
+amble|ambl
+anchorage|ancg
+annex|anx
+apartments|apts|appartments
+approach|app|apch|appr
+arcade|arc
+arterial|artl
+artery|art|arty
+avenue|av|ave|aven|avenu|avn|avnu|avnue
+avenues|avs|aves|avens|avenus|avns|avnus|avnues
+autoroute|aut
+back|bk
+bank|bnk
+basin|basn|bsn
+bay|by
+bayou|byu|bayoo
+beach|baech|bch|beech
+belt|blt
+bend|bnd
+block|blk|blck
+bluff|blf|bluf|bluffs|blfs
+boardwalk|bwk|bwlk|board walk
+boulevard|blvd|bd|bde|blv|bl|blvde|blvrd|boulavard|boul|boulv|bvd|boulevarde
+bottom|bot|bottm|btm|bttm
+bottoms|bttms|btms|bottms
+boundary|bdy
+bowl|bl
+brace|br|brce
+branch|br|brnch|brch
+brae|br
+break|brk
+bridge|bdge|br|brdg|bri|brg
+broadway|bdwy|bway|bwy|brdway
+brook|brk
+brooks|brks
+brow|brw
+burg|bg
+burgs|brgs
+burrow|burw
+butte|btte|bte
+bypass|bypa|byps|bps|byp
+byway|bywy
+camp|cp
+cape|cpe|cp
+canyon|cyn|cnyn
+caravan|cvan|cvn|c van
+causeway|csway|cswy|causewy|caus|cause|cway
+center|centre|cetr|cntr|ctr|c|cen
+centers|ctrs
+centreway|cnwy
+chase|ch|chas
+circle|cir|circel|cirlce
+circles|cirs
+circlet|clt
+circuit|crct|circ|cct|cirt|ci|circt
+circus|crcs|crc
+claim|clm
+cliff|clf
+cliffs|clfs
+close|cl|cls|clse
+cluster|clr|clstr
+colonnade|clde|clnde
+common|cmmn|comm|cmn|com|cm
+commons|cmmns|cmns|comms
+concord|cncd|cncrd
+concession|conc
+concourse|con|concs|concse|cnc
+connection|cntn|cxn
+connector|conr|cnctr|cntr
+copse|cps
+corner|cnr|crn|cor
+corners|cnrs|crns|cors
+corseo|cseo
+corso|cso
+county highway|ch|c.h.|c.h|c h|c.hw|c hw|co.hw|co hw|cty.hw|cty hw|c.hgwy|c hgwy|co.hgwy|co hgwy|cty.hgwy|cty hgwy|c.hway|c hway|co.hway|co hway|cty.hway|cty hway|c.hwy|c hwy|co.hwy|co hwy|cty.hwy|cty hwy|c.hi|c hi|co.hi|co hi|cty.hi|cty hi
+county road|cr|c.r.|c.r|c r|co.r|co r|c.rd|c rd|co.rd|co rd|cty.r|cty r|cty.rd|cty rd
+county route|cr|c.r.|c.r|c r|co.r|co r|c.rt|c rt|co.rt|co rt|cty.r|cty r|cty.rt|cty rt|c.rte|c rte|co.rte|co rte|cty.rte|cty rte|county touring route
+course|crse
+court|ct|crt
+courts|crts|cts
+courtyard|cyd|ctyd
+cove|cov|ce|cv
+creek|cr|crk
+crescent|cr|cres|crs|crecent
+crest|crst|cst
+crief|crf
+croft|cft
+cross|cs|crss
+crossing|crsg|xing|csg|x ing|x-ing
+crossroad|crd|cross road|xroad|x-road|x road|xrd|x-rd|x rd
+crossroads|cross roads|xrds
+crossway|cowy|crwy|xway|xwy|x-way|x way|x-wy
+cruiseway|cuwy|crwy
+cul
+cul de sac|cul-de-sac|culdesac|cds|cusac|csac
+curve|cve|crv|crve|curv
+cutting|cttg|ctg|cutt
+dale|dle
+dell
+dene
+deviation|devn
+dip
+distributor|dstr
+divide|div
+diversion|divers
+down|dn
+downs|dns|dwns
+drive|dr|drv|dv|dve|d
+driveway|drwy|dvwy|dwy|dway|drvwy
+drove|drov
+easement|esmt
+edge|edg
+elbow|elb
+elm
+end
+entrance|ent|entr
+esplanade|esp|espl
+estate|est
+estates|ests
+exit
+expressway|exp|expwy|expway|expy|exwy
+extension|ex|ext|extn|exten
+extensions|exts
+fairway|fawy|fy
+fall|fl
+falls|fls
+fare
+farm|frm
+farms|frms
+farm to market|fm|farm-to-market
+fern
+ferry|fry|fy
+field|fld|fd
+fields|flds|fds
+fireline|fline|fire line|flne
+firetrack|ftrk|fire track
+firetrail|fit|fitr|fire trail
+flat|fl|flt
+flats|flts
+follow|folw
+footway|ftwy|foot way
+ford|frd
+foreshore|fshr|fore shore
+formation|form|fmtn
+freeway|frwy|fw|fwy|fway
+front|frnt
+frontage|frtg|fr
+gap|gp
+garden|gdn|grd|grdn
+gardens|gdns|grds|grdns
+gate|ga|gte
+gates|gtes
+gateway|gwy|gway|gtwy|gtway
+glade|gl|gld|glde
+glen|gln
+grand boulevard|gbd|grbd|grdbd|gdbd|g bd|gr bd|grd bd|gd bd|g blvd|gr blvd|grd blvd|gd blvd|g bde|gr bde|grd bde|gd bde|g blvrd|gr blvrd|grd blvrd|gd blvrd|g boul|gr boul|grd boul|gd boul|g bvd|gr bvd|grd bvd|gd bvd|g bld|gr bld|grd bld|gd bld
+grange|gra
+green|grn|gn|gren
+greenway|grwy
+ground|grnd
+grounds|grnds
+grove|gr|grv|grve|gro
+gulch|glch
+gully|gly
+hanger|hngr
+harbor|harbour|hbr|hrbr
+harbors|hbrs
+haven|hvn|havn
+head|hd
+heads|hds
+heath|hth|heth
+heights|hghts|hgts|hieghts|ht|hts|hgths
+highlands|hghlds|hlds|hglds
+highroad|hrd|high road|hird|hi.rd|hi rd
+highway|hgwy|hw|hway|hwy|hi|hwye|hywy
+hill|hl
+hills|hls|hils
+hollow|hllw|holw
+hub
+impasse|imp
+inlet|inlt
+interchange|intg|intchg|inter change
+intersection|intn|inter section|intsctn
+interstate|inter state|i|ih|i h
+island|is|id|i|isl|isld
+islands|iss|ids|islds
+isle
+junction|jct|jnc|jnct|jctn|jtn|junct|j
+junctions|jcts
+key|ky
+keys|kys
+knob
+knoll|knol|knl
+knolls|knls
+ladder|ladr
+lagoon|lagn|lgn|lagon
+land
+landing|ldg|lndg|landng
+lane|l|ln|la
+laneway|lnwy
+lees
+light|lgt|lt
+limits|lmts
+line|ln
+link|lnk|lk
+little|ltl|lttl|littl|litl|lit|lt
+loaf|lf
+lookout|lkt|look out
+loop|lp
+loops|lps
+lot|lt
+lynne|lynn
+mall|ml
+manor|mnr
+maze
+meadow|mdw
+meadows|mdws|mead
+mead|md
+meander|mndr|mdr|mr
+mew|mw
+mews|mws
+mile|mi
+mill|ml
+mills|mls
+moor
+motorway|mway|mwy|mtwy
+mount|mt
+neaves|nvs
+nook|nk
+number|#|nbr|num|no|nmbr|nr
+oaks
+outlet|otlt
+outlook|out|otlk
+oval
+overbridge|ovrb|over bridge
+overlook|over look|ovlk
+overpass|over pass|opas
+paddock|padk
+palms|plms
+parade|pde|prd|prde|pard
+park|pk|prk
+parklands|pkld|pklds|parkland|park lands|park land
+parkway|pkwy|parkwy|pky|pkway|prkwy|prkway|pkw|pwy|prkw
+parkways|pkwys
+part|prt
+pass|ps
+passage|psge|pass|pasg
+path|pth
+pathway|phwy|pway|pthway|pthwy|ptway|ptwy
+peninsula|psla
+piazza|piaz|pzza
+pier
+pike|pk|pke
+pine|pne|pn
+pines|pns|pnes
+pond
+place|pl|pla|plc|plac
+plain|pln|pl
+plains|plns|pls
+plateau|plat|plt
+plaza|plz|plza|pz
+prarie|pr
+pocket|pkt|pokt|pckt
+point|piont|pnt|pt
+pointe|pte|pnte
+port|prt
+ports|prts
+prairie|pr
+priors|prrs
+private|pvt
+promenade|prom|prm
+pursuit|pur
+quad|qd
+quadrangle|qdgl
+quadrant|qdrt|qd
+quay|quy|qy
+quays|quys|qys
+radial|radl
+ramble|ra|rmbl
+ramp|rmp
+ranae|ran
+ranch|rnch
+rapid|rpd
+rapids|rpds
+range|rng|rnge|rang
+range road|rge rd|range rd|rr
+reach|rch
+reef
+reserve|res|resrv|resv|rsrv|rserv|rserve|rsrve
+rest|rst
+retreat|rt|rtt
+return|rtn
+ride
+ridge|rdge|rdg
+ridges|rdgs
+ridgeway|rgwy|rdgwy|ridge way
+right of way|rowy|rightofway|rofw|row|r o w|r of w
+ring
+rise|ri
+riverway|rvwy
+riviera|rvra
+road|rd|ro|r|roa|raod
+roads|raods|rds
+roadside|rdsd|road side
+roadway|rdwy|rdw|rdy
+rocks|rks
+ronde|rnde
+rosebowl|rsbl|rose bowl
+rotary|rty
+round|rnd
+roundabout
+route|rt|rte
+row|rw
+run|rn
+rural route|rr|r.r|r r
+service road|svc rd|svc road|service rd|sv rd|svrd
+serviceway|swy|svwy|svcwy
+shoal|shl
+shoals|shls
+shore|shor|shr
+shores|shors|shrs
+shunt|shun|shnt
+siding|sdng|sdg
+skyway|skwy
+slip
+slope|slpe|slp
+sound|snd
+space|spc
+spring|spg|sprng|sprn
+springs|spgs|sprngs|spns
+spur|spr
+square|sq|sqr
+squares|sqs
+stairs|strs
+stairway|stwy|strwy|stair way|st.wy|st wy|str.way|str way
+state highway|s.highway|s highway|st.highway|st highway|sh|s.h.|s.h|s h|st.h|st h|s.hw|s hw|st.hw|st hw|s.hwy|s hwy|shwy|s.hgwy|s hgwy|st.hgwy|st hgwy|s.hway|s hway|st.hway|st hway|st.hwy|st hwy|s.hi|s hi|st.hi|st hi|statehighway
+state road|sr|stateroad|s.r.|s.r|s r|s.road|s road|st.road|st road|staterd|srd|s.rd|s rd|state rd|strd|st.rd|st rd
+state route|sr|stateroute|s.r.|s.r|s r|s.route|s route|st.route|st route|statert|srt|s.rt|s rt|srte|s.rte|s rte|state rt|state rte|strt|strte|st.rt|st rt|st.rte|st rte
+steps|stps
+strand|stra|strnd|strd
+strands|strnds|strds
+stravenue|stra|strav
+street|st|str|stre|stree|strt
+streets|sts
+strip|strp
+subdivision|subdiv
+subway|sbwy
+summit|smt|sumt
+tarn|tn
+terrace|tce|ter|tr|terr|terace|terrac|terrasse|tsse
+thicket|thick
+thoroughfare|thor|throughfare|thorough fare|thfr
+thoroughway|thwy
+throughway|thru|thro|thruway|trwy|thwy
+tollway|tlwy|twy
+top
+tor
+township highway|th|t.h.|t.h|t h|twp.h|twp h|tshp.h|tshp h|t.hw|t hw|twp.hw|twp hw|tshp.hw|tshp hw|t.hgwy|t hgwy|twp.hgwy|twp hgwy|tshp.hgwy|tshp hgwy|t.hway|t hway|twp.hway|twp hway|tshp.hway|tshp hway|t.hwy|t hwy|twp.hwy|twp hwy|tshp.hwy|tshp hwy|t.hi|t hi|twp.hi|twp hi|tshp.hi|tshp hi
+township road|tr|t.r.|t.r|t r|t rd|t.rd|trd|twpr|twp.r|twp r|twp.rd|twp rd|tshp.r|tshp r|tshp.rd|tshp rd|township rd|tp rd
+township route|tr|t.r.|t.r|t r|t rt|t.rt|trt|t.rte|t rte|twpr|twp.r|twp r|twp.rt|twp rt|twp.rte|twp rte|tshp.r|tshp r|tshp.rt|tshp rt|tshp.rte|tshp rte
+tower|twr
+towers|twrs
+townline|tline
+trace|trce|trc
+track|tr|trk|trak
+trafficway|trfy
+trail|tr|trl
+trailer|trlr
+tram
+tramway|tmwy
+trees|trs
+triangle|tri
+truck trail|trktrl
+trunkway|tkwy
+tunnel|tun|tunl
+turnabout|trnabt
+turn|tn|trn
+turnpike|tpk|tpke
+underpass|upas|upass|ups|under pass
+union|un
+unions|uns
+us highway|us hwy|u s hwy
+us route|us rte|u s rte
+vale|va|vl
+valley|vlly|vly|vy
+valleys|vlys|vllys
+vennel
+viaduct|via|viad|vdct|viadct
+view|vw
+views|vws
+villa|vla
+village|vlge
+villas|vlas
+vista|vst|vsta|vis
+vue
+wade
+walk|wlk|wk
+walkway|wkwy|wky|wlkwy
+waters|wtrs
+way|wy
+ways|wys
+well|wl
+wells|wls
+wharf|whrf|whf
+wynd|wyn
+yard|yd|yrd
+# es
+acceso|acces
+alameda|alam
+alquería|alqueria|alque
+andador|andad
+angosta|angta
+apeadero|apdro
+autopista|auto|autop|aut|ap
+autovía|autovia|autov
+avenida|av|avd|avda|av /
+avenida calle|ac|av cl|av|cll|av calle
+avenida carrera|ak|av cr|av cra|avda cra|avda cr
+bajada|bjada
+banda|bda
+barranco|branc
+barranquillo|bqllo
+barriada|barda
+brazal|brzal
+bulevar|bulev|blev|blv|bv|bl|br|boulevard|blvd|bvd
+calle|c|cl|cll|c /|ca|call
+calleja|cllja
+callejón|callejon|callej|cjón|cjon|cllon|cllón|cj
+calle privada|calle priv|c priv|cl priv|cll priv|c / priv
+callejuela|cjla
+callizo|cllzo
+calzada|czada|calz
+camino|cno|cmo|cmno|cm
+camino hondo|ch|c.h.|c.h|c h
+camino nuevo|cn|c.n.|c.n|c n
+camino viejo|cv|c.v.|c.v|c v
+caminito|cmt
+camping|campg
+cantera|cantr
+cantón|canton|cant
+carrera|cra|carra|carr|cr|kra|kr
+carretera|ctra|cr|ct
+carreterín|carreterin|ctrin
+carretil|crtil
+carril|crril
+cerrada|cda|cer
+cinturón|cinturon|cint
+circular|cq
+circuito|cto
+circunvalar|cv|crv|cirv
+circunvalación|circunvalacion|ccvcn
+corredor|crrdo
+costanilla|cstan
+costera
+cuesta|custa
+diagonal|diag|dg
+diseminado|disem
+espalda|eslda
+estrada|estda
+explanada|expla
+extensión|ext|extension
+extramuros|extrm
+galería|galeria|gale
+glorieta|gta|g
+gran vía|gran via|gv|g v
+hacienda|hda
+ladera|ldera
+laderas|lderas
+llanura|llnra
+malecón|malecon|malec
+mirador|mrdor
+muelle|meull
+pantano|pant
+paraje|praje
+parque|pque|parq|pq|pqe
+particular|parti
+partida|ptda
+pasadizo|pzo
+pasaje|psaje|psj
+paseo|pº|p°|po|pso|pseo|pas|ps|p|p.o|p.º|p.°
+paseo maritimo|psmar|ps mar
+paso
+pasillo|psllo
+peatonal|peat
+periferico|perif
+plaza|pl|plza|pza|p.za|pz
+plazoleta|pzta|plzta|plta
+plazuela|plzla
+poblado|pbdo
+polígono residencial|poligono residencial|políg res|polig res|pol.res|pol res|pgres|pg res|pr|p.r.|p.r|p r
+polígono industrial|poligono industrial|políg ind|polig ind|pol.ind|pol ind|pgind|pg ind|pi|p.i.|p.i|p i
+prolongación|prolongacion|prol
+puebla|pbla
+pueblo|pblo
+puente|pnte
+rambla|rbla
+rampla|rampa|rpla
+retorno|ret|rt
+rincón|rincon|rcon|rin|rncn|rncon
+rinconada|rcda|rcnda
+ronda|rda
+rotonda|rtda
+ruta|rta
+sector|sect
+sendera|sedra
+sendero|send|sedro
+subida|sbida
+tránsito|transito|trans
+transversal|trval|trvsal|tv|tr
+trasera|tras
+travesía|travesia|trva|trvsía|trvsia
+vereda|vreda|ver
+viaducto|vcto|vd
+via|v
+vista|vst|vsta|vist
+# et
+allee
+esplanaadi
+maantee|mnt
+pargi
+plats
+puiestee|pst
+raudtee|rdt
+raudteejaam|rdtj
+tänav|tanav|tn
+tee|t
+# eu
+autobidea
+autopista
+bide
+bidea
+bidexka
+enparantza
+errepidea|err
+etorbidea|etorb
+hiribidea
+ibilbidea
+kalea|k
+kale
+karrika
+korridorea
+pasealekua|pas
+plaza|pl
+zeharbidea|zehb
+zumardia|zum
+# fa
+خیابان
+بلوار
+کوچه
+جاده
+بزرگراه
+آزادراه
+کوی
+# fi
+alue|al
+aukio|auk
+bulevard
+bulevardi
+esplanadi
+kaari|kri
+katu|k
+kuja|kj
+penger|pgr
+polku|p
+puistikko|pko
+puisto|ps
+puistotie
+raitti|r
+ranta|rt
+rinne|rn
+taival|tvl
+tie|t
+tori|tr
+väylä|vaeylae|vlä|vlae
+# fil
+daan
+kalye
+lansangan
+# fr
+allée|allee|all
+allées|alls|allees
+ancien chemin|ach|a ch
+ancienne route|art
+anciennes routes|arts
+anse
+arcade|arc
+autoroute|aut
+avenue|av|ave|aven|avenu|avn|avnu|avnue
+avenues|avs|aves|avens|avenus|avns|avnus|avnues
+barriêre|barriere|bre
+barriêres|barrieres|bres
+bas chemin|bch|b ch
+berge|ber
+berges|bers
+bois
+boucle|bcle
+boulevard|bd|bde|blv|blvd|blvde|blvrd|boulavard|boul|boulv|bvd|boulevarde|bld
+butte|but
+côte|cote
+côteau|coteau
+cale
+camp
+campagne|cgne
+carreau|cau|carru
+carrefour|carf|carref
+carrière|carriere|care
+carrières|carrieres|cares
+carré|carre|carr|car
+cavée|cavee|cav
+cercle|cercl
+chalet|chl
+champ
+chaussée|chaussee|chs|chee
+chaussées|chaussees|chss|chees
+chemin|ch|che
+chemin vicinal|chv|chev|ch v|che v
+cheminement|chem
+chemins|ches
+chemins vicinaux|chsv|chs v
+château|chateau|cht
+cloître|cloitre|cloi
+clos
+col
+contour|ctr
+corniche|cor
+corniches|cors
+cour
+cours|crs
+degré|degre|deg
+degrés|degres|degs
+descente|dsg
+descentes|dsgs
+digue|dig
+digues|digs
+échangeur|éch
+écluse|ecluse|ecl|écl
+écluses|ecluses|ecls|écls
+enclave|env
+enclos|enc
+espace|espa
+esplanade|esp
+esplanades|esps
+fosse|fos
+fosses|fos|foss
+foyer|foyr
+galerie|gal
+galeries|gals
+garenne|garn
+grand boulevard|gbd|grbd|grdbd|gdbd|g bd|gr bd|grd bd|gd bd|g blvd|gr blvd|grd blvd|gd blvd|g bde|gr bde|grd bde|gd bde|g blvrd|gr blvrd|grd blvrd|gd blvrd|g boul|gr boul|grd boul|gd boul|g bvd|gr bvd|grd bvd|gd bvd|g bld|gr bld|grd bld|gd bld
+grand chemin|gch|grch|gdch|grdch|g ch|gr ch|grd ch|gd ch|g chemin|gr chemin|grd chemin|gd chemin
+grand ensemble|gden|gd en|g en|gr en|gdens|gd ens|g ens|gr ens
+grand rue|grand'rue|grandrue|gr|grdr|gdr|g r|gr r|grd r|gd r|g rue|gr rue|grd rue|gd rue
+grand rues|grs|g rs|gr rs|grd rs|gd rs|g rues|gr rues|grd rues|gd rues
+grands ensembles|gdsen|gds ens|gs ens|grs ens|grds ens|gdsens
+grille|gri
+grimpette|grim
+hameau|ham
+haut chemin|hch|h ch
+hauts chemins|hchs|h chs|hschs|hs chs
+impasse|imp
+impasses|imps
+jetée|jetee|jte
+jetées|jetees|jtes
+levée|levee|leve|lve
+montée|montee|mte
+montées|montees|mtes
+métro|metro|mét|met
+nouvelle route|nte
+parc|prc
+parcs|prcs
+parvis|prv
+passage|pas|psg
+passage à niveau|passage a niveau|pn|p.n.|p.n|p n
+passe|pass
+passerelle|ple
+passerelles|ples
+passes
+patio|pat
+périphérique|peripherique|peri|péri
+petit chemin|p ch|p chemin|pt ch|pt chemin
+petite allée|petite allee|pta|pt a|pt allee|p a|p allee
+petite avenue|pae|pt ae|pt ave|p ave|pt avn|p avn
+petite impasse|pim|p im|pt im|p impasse|pt impasse
+petite route|prt|p rt|pt rt|p route|pt route|p rte|pt rte
+petite rue|ptr|pt r|p rue|pt rue
+petite allées|petites allees|ptas|pt as|pt allees|p a|p allees
+place|pl
+placis|plci
+plage|plag
+plages|plags
+plaine|pln
+plan
+plateau|plt|plat
+plateaux|pltx|platx
+pointe|pte|pnte
+pont
+ponts
+portique|porq|portq
+portiques|porqs|portqs
+pourtour|pour
+presqu’île|presquîle|presqu'ile|presquile|prq|prql
+promenade|prom
+peripherique|peri
+quai|au
+raccourci|rac|racc
+raidillon|raid
+rampe|rpe|rmpe|rmp
+rang
+rempart|rem|remp
+rocade|rocd
+ronde|rnde
+rond point|rondpoint|rdpt|rd pt|rpt
+roquet|roqt
+rotonde|rtd|rtnd|rtde|rtnde
+route|rt|rte
+routes|rts|rtes
+route nationale|rn|r.n.|r.n|r n
+rue|r
+ruelle|rle
+ruelles|rles
+rues|rs
+residence|res
+residences|ress
+sente|sen
+sentes|sens
+sentier|sent
+sentiers|sents
+square|sq
+terrain|terr|trn
+terrasse|tsse
+terrasses|tsses
+terre plein|tpl|t pl|trpl|tr pl
+terte|trt
+tertes|trts
+traverse|tra|trvs|trvrs
+vallon|val
+valée|vallee|val
+venelle|ven
+venelles|vens
+via
+vieille route|vte|v rt|vrt|v rte|vrte|v route|vroute
+vieux chemin|vche|v che|vch|v ch|v chemin
+voie|voi
+voies|vois
+# ga
+áirse|airse
+ard
+arda
+ardán|ardan
+ascaill
+barra
+bealach
+bogha
+bruach
+brí|bri
+bóithrín|boithrin
+bóthar|bothar
+búlbhard|bulbhard
+calafort
+caolbhealach
+ceapach
+cearnóg|cearnog
+ceathrú|ceathru
+cluain
+clós|clos
+cnoc
+cnocán|cnocan
+coill
+coillte
+colúnra|colunra
+corrán|corran
+cosán|cosan
+croit
+crosaire
+cumairín|cumairin
+céide|ceide
+céimeanna|ceimeanna
+cé|ce
+cúirt|cuirt
+diamont
+diméin|dimein
+droichead
+duga
+dugaí|dugai
+dumhcha
+eachlann
+earann
+eastát|eastat
+faiche
+feirm
+fothair
+fraoch
+gabhal
+gairdíní|gairdini
+garda
+geata
+gleann
+gleanntán|gleanntan
+gleannán|gleannan
+gléib|gleib
+goirtín|goirtin
+gort
+gráig|graig
+gráinseach|grainseach
+iothlainn
+lána|lana
+mairdíog|mairdiog
+margadh
+marglann
+meal
+mulláin|mullain
+móinteán|mointean
+móinéar|moinear
+oileán|oilean
+óstaí|ostai
+paráid|paraid
+pasáiste|pasaiste
+plás|plas
+plásóg|plasog
+promanáid|promanaid
+páirc|pairc
+póna|pona
+radharc
+rae
+raon
+roschoill
+rosán|rosan
+scabhat
+scair
+scaireanna
+seamlas
+sráidbhaile|sraidbhaile
+sráid|sraid
+stuara
+síneadh|sineadh
+taobh
+trian
+trá|tra
+ubhchruth
+úllord|ullord
+# gd
+àilean
+aircèad|aircead
+aitreabhan
+barraid
+bealach
+bogha
+bothar
+bràigh|braigh
+bruthach
+bulabhard
+cabhsair
+cadha
+caigeann
+caolraid
+ceann-rathaid|ceann rathaid|ceannrathaid
+cearcall
+ceàrn|cearn
+ceàrnag|cearnag
+ceum
+cidhe
+clobhsa
+cnoc
+corran
+craobhraid
+crois
+croit
+cuairt-rathad|cuairt rathad|cuairtrathad
+cùirt|cuirt
+doire
+frith-rathad|frith rathad
+gàrradh|garradh
+grainnseach
+iadh-rathad|iadh rathad|iadhrathad
+loinn
+malla
+marclann
+meadhraid
+measlann
+pàirc|pairc
+pairèad|pairead
+promanàd|promanad
+rathad
+seach-rathad|seach rathad|seachrathad
+sealladh
+sgaoil-rathad|sgaoil rathad|sgaoilrathad
+slighe
+snaidhm-rathaid|snaidhm rathaid|snaidhmrathaid
+sràid|sraid
+sreath
+stairean
+stuagh
+uchd
+# gl
+autovía|autovia
+autopista|auto|autop
+avenida|av|avd|avda
+alameda
+baixada
+camiño|camino
+costa
+encosta
+estrada
+glorieta
+paseo
+praza|pr|pza
+praciña|pracina
+prazuela|przla
+rambla|rbla
+ronda|rda
+rotonda|rtda
+rúa|rua|r|ru
+rúas|ruas|rs
+ruela
+sendeiro
+suba
+subida|sbida
+travesía|travesia|trav
+vía|via
+viela
+# gsw
+gass
+gàss
+hof
+platz|pl
+stross
+wäg|wag|waeg|w
+waj|w
+wäj|waej|w.
+# he
+שדרות
+כביש
+סמטת
+כיכר
+רחוב
+צומת
+כביש מהיר
+כביש ראשי
+# hi
+bazaar|bazar
+marg
+flyover
+रोड
+# hr
+aleja|al
+avenija|av
+bulevar|bul
+cesta|c
+klanac
+most
+prilaz
+put
+šetalište|setaliste
+stube
+trg
+ulica|ul
+# hu
+árok|arok
+dűlő|dulo|d.|d
+fasor
+fasora
+főközlekedési út|főút|fout
+határút|hatarut
+kapu
+kert
+körönd|korond|krnd
+körvasútsor|korvasutsor
+körút|korut|krt
+köz|koz
+lakótelep|lakotelep|ltp.|ltp
+lejtő|lejto
+lépcső|lepcso
+liget
+mező|mezo
+országút|orszagut
+park
+parkja
+rakpart|rkpt|rkp|rpt
+sétány|setany|stny.|stny
+sor|s.|s
+sétány|setany|sét
+sugárút|sugarut|sgrt.|sgrt|srt.|srt|sgt.|sgt
+sziget
+telep
+tér|ter
+tere
+tanya|t.|t
+udvar
+utca|u.|u
+út|ut|u.|u
+útja|utja
+# id
+alun-alun|alun alun|alunalun
+gang|gg
+jalan|jln|jl|jl.
+jalur
+jembatan
+lorong|lrong
+terowongan
+# is
+barð|baro
+borg
+borgir
+braut
+byggð|byggo
+fell
+gata
+gerði|geroi
+grund
+hagi
+háls|hals
+hjalli
+hlíð|hlio
+holt
+land
+lundur
+melur
+múli|muli
+nes
+sel
+sendi
+stræti|straeti
+teigur
+torg
+tún|tun
+vangur
+vegi
+vegur
+vellir
+# it
+accesso|acc.so|accso
+alto|alt
+alzaia|alz
+androna|and
+angolo|ang.|ang
+arco|arc
+autostrada|aut.da|autda|aut
+audostradale|aut.sle|autsle|aut sle|aut.ale|autale
+autostrade|aut.de|autde
+baluardo|bdo
+banchina|bna
+bivio|biv
+borgata|bga
+borgo|b.go|bgo
+bretella|br.lla|brlla
+bretelle|br.lle|brlle
+brigata|bgt
+calata|clt
+calle|cal
+campiello|cpl
+campo|c.po|cpo
+canale|cnl
+cantone|cat
+casale|cas
+cascina|c.na|cna
+cavalcavia|cavalc.a|cavalca
+chiusa|c.usa|cusa
+circonvallazione|circonv.e|circonve|crv
+contrà|con|contra'
+contrada|contr.a|contra|c.da|cda|cnt
+corso|c.so|cso
+corte|c.te|cte
+cortile|c.ile|ctile|c.le|cle
+cortina|ctn
+costa|cta
+crocevia|cra
+cupa|cup
+discesa|dis
+ferrata|f.rata|frata
+fondamenta|f.ta|fta|fon
+fondo|fdo
+forca|f.ca|fca
+forcella|forc.la|forcla
+foro|for
+frazione|fraz.e|fraze|frz|fraz
+frazioni|fraz.i|frazi
+galleria|gall.a|galla|gal
+gallerie|gall.e|galle
+genna|g.na|gna
+genne|g.ne|gne
+gradini|grd
+interrato|int
+larghetto|lgt
+largo|l.go|lgo
+logge|lge
+lungadige|lgd
+lungargine|lug
+lungarno|lno
+lungo|lun
+lungolago|llg
+lungomare|lre
+lungotevere|lgv
+località|localita|loc|loc.ta|locta
+molo|mlo
+monte|mte
+passaggio|pas
+passeggiata|pss
+piazza|p.za|p.zza|pza|pzza
+piazzale|p.le|ple
+piazzetta|p.ta|pta|pzt
+ponte|p.te|pte
+pontile|ptl
+porta|p.ta|pta
+portici|prt
+portico|pro
+presso|pre
+prolungamento|plg
+provinciale
+quartiere|qua
+rampa|rpa
+rampe|rpe
+regione|reg
+rio|rii
+rio terà|rit|rio tera'
+ripa|ri
+riva|rva
+riviera|riv
+rotabile|rtb
+rotonda|rtd
+sacca|scc
+salita|sal
+salizada|s.da|sda
+scala|scl
+scale|sce
+scali|sci
+scalinata|sca
+sdrucciolo|sdr
+sestiere|ses
+sottopassaggio|sps
+spadaria|spd
+spalto|spa
+stazione|staz|sta
+strada|s|str.a|stra|str
+strada comunale|sc|s.c.|s.c|s c|stc
+strada nuova|snu
+strada provinciale|sp|s.p.|s.p|s p|str provinciale|s provinciale|str.prov|str prov|s.prov|s prov|stp
+strada privata|spr
+strada regionale|sr|s.r.|s.r|s r|str.reg|str reg|str r|str.r|str reginale|s reginale
+strada statale|ss|s.s.|s.s|s s|str.s|str s|str.st|str st|str statale|s statale|sts
+strada vecchia|sve
+strada vicinale|sv|s.v.|s.v|s v|str.vic|str vic|str vicinale|s vicinale|svc
+stradale|sdl
+stradello|stl
+stradetta|stt
+stradone|std
+stretta|str.ta|strta
+strette|str.te|strte
+stretti|str.ti|strti
+stretto|str.to|strto|sto
+superstrada
+supportico|sup
+tangenziale
+traversa|tra
+traversa nuova|tnu
+traversa privata|tpr
+traversa strada statale|tra s.s.
+traversa vicinale|tvc
+varco|var
+via|v
+via comunale|vc|v.c.|v.c|v c|vcm
+via nuova|vnu
+via privata|vpr
+via provincale|vp|v.p.|v.p|v p|v provinciale|vpv
+via statale|vs|v.s.|v.s|v s
+via vecchia|vve
+via vicinale|vvc
+viale|v.le|vle|vl
+viale privato|vlp
+vicoletto|vct
+vicolo|v.lo|vlo
+vicolo largo|vcl
+vicolo privato|vcp
+vicolo nuovo|vcn
+vicolo vecchio|vcv
+vico|vic
+villa|vla
+villaggio|vil
+viuzzo|vzo
+vocabolo|voc
+volta|vta
+zona industriale|zin|z.i.
+# ja
+バイパス道路
+baipasu dōro|baipasu doro|baipasudōro|baipasudoro
+バイパス
+baipasu
+ブールバール
+būrubāru|burubaru
+道路
+dōro|doro
+街路
+gairo
+ハイ・ストリート
+hai·sutorīto|hai sutorīto|haisutorīto|hai·sutorito|hai sutorito|haisutorito
+一般道道
+一般府道
+一般県道
+一般社団法人
+一般都道
+一般財団法人
+自動車道
+jidōshadō|jidoshado
+街道
+kaidō|kaido
+環状道路
+kanjō dōro|kanjo doro|kanjōdōro
+経路
+keiro
+公道
+kōdō|kodo
+公園道路
+kōen dōro|koen doro|kōendōro|koendoro
+国道
+kokudō|kokudo
+高速道路
+kōzokudōro|kozokudoro|kozoku doro|kōzoku dōro|kosukudoro|kosoku doro
+クルドサック
+kurudosakku
+道
+michi
+表通り
+omotedōri|omotedori
+大通り
+ōdōri|odori
+メーンストリート
+mēnsutorīto|mensutorito
+メロディーロード
+merodīrōdo|merodirodo
+路地
+roji
+ローマ街道
+rōma kaidō|roma kaido|rōmakaidō|romakaido
+私道
+shidō|shido
+州間高速道路
+shūkankōsokudōro|shukankosokudoro
+主要地方道
+ストリート
+sutorīto|sutorito
+通り
+tōri|tori
+通り道
+tōrimichi|torimichi
+都市高速道路
+toshi kōzokudōro|toshi kozokudoro|toshikōzokudōro|toshikozokudoro
+通路
+tsūro|tsuro
+有料道路
+yūryō dōro|yuryo doro|yūryōdōro|yuryodoro
+# ka
+ქუჩა|ქ
+ქუჩის
+ქუჩაზე
+ქუცა
+შესახვევი|შეს
+გამზირი|გამზ
+მოედანი
+ხიდი
+ხეივანი
+გზატკეცილი
+ბულვარი
+ჩიხი
+# ko
+로
+ro
+lo
+no
+길
+gil
+가
+ga
+# lb
+gaass
+strooss
+wee
+# lt
+aikštė|a|aikste
+alėja|al|aleja
+akligatvis
+gatvė|g|gatve
+plentas|pl
+prospektas|pr
+skersgatvis|skg
+# lv
+bulvāris|bulvaris
+ceļš|cels
+gatve|g
+iela
+prospekts
+# ms
+awang|awg
+bulatan
+cerunan|crn
+changkat|ckt
+dalaman|dlm
+dataran|dtr
+dayang|dyg
+denai
+haji|hj
+halaman|hlm
+hilir|hlr
+jalan|jln|jl
+kampung|kampong|kg
+laluan
+laman|lmn
+langgak|lgk
+lapangan
+lebuh|lbh|luh
+lebuhraya|lebuh raya|lbh raya|l/raya|lbr
+lengkok|lkk
+lingkaran|lkr
+lintang|ltg
+lorong|lrg
+medan|mdn
+pengiran|pg
+persiaran|psn|psrn
+rapat
+simpangan|spn
+simpang|spg
+sisiran|ssr
+solok|slk
+sungai|sngai|sg
+taman|tmn
+tepian|tpn
+tingkat|tkt
+# mt
+dawret
+pjazza
+sqaq
+trejqet
+triq
+vjal
+# nb
+allè|alle
+allèen|alleen
+bakken
+bukt
+byen
+dalen
+flate
+gata|g|gt
+gate|g|gt
+gaten
+lia
+park
+plassen|pl
+stortorget
+stredet
+svingen
+veg|v
+vegen|v|vn
+vei|v
+veien|v|vn
+# nl
+baan
+dijk|dk
+dwarsstraat|dwstr
+dwarsweg|dwwg
+gracht|gr
+hof|h
+hoofdstraat
+kade|kd
+laan|ln
+lange|l
+lang|l
+leane
+loane
+park|pk
+plein|pln
+plantsoen|plnts
+singel|sngl
+straat|str
+steenweg|stwg
+verlengde|verl
+vliet|vlt
+weg|wg
+# oc
+avenguda
+camin
+carrièra|carriera
+pas
+plaça|pl|placa|pça|pca|plç|plc
+# pap
+kaya
+kaminda
+# pl
+aleja|al
+autostrada
+boczna
+bulwar|bulw
+droga
+obwodnica
+ogród
+osiedle|os
+park
+plac|pl
+rondo
+rynek
+skwer
+szosa
+ulica|ul
+wybrzeże|wyb
+wyspa
+zaulek
+# pt
+acesso
+alameda|al
+autoestrada|auto estrada|auto estr|autoestr
+avenida|av|ava|ave
+avenida marginal|ave marg|av marg|ava marg
+azinhaga|az
+bairro|b|bº|b°|bo|brº|br°|bro
+beco|bc|bco
+calçada|calcada|cc
+calçadinha|caclcadinha|ccnh
+câmara municipal|camara municipal|cm|c.m.|c. m.
+caminho|cam|camno
+direito|dto|dt
+esquerdo|esq
+estrada|estr
+estrada marginal|estr marg
+estrada municipal|em|e m|estr m
+estrada nacional|en|e n|estr n
+estrada regional|er|e r|estr r
+frei|fr
+frente|ft
+itinerário complementar|itinerario complementar|ic|i c
+itinerário principal|itinerario principal|ip|i p
+largo|lg|l
+lugar|lg|lug
+parada|pda
+particular|part
+ponto|pto|pnto
+praça|praca|pç|pc|pr|pça|pca
+praceta|pct|pctª|pcta
+projectada|proj
+prolongamento|prolng
+quinta|qu|qta
+rampa
+retorno|ret
+rodovia|rod|rvia|rdvia
+rodoanel
+rotunda|rot
+rua|r
+rua particular|r part|rpart
+ruas|rs
+ruela
+sitio
+transversal|transv
+travessa|tv|trav|trv
+tunel
+urbanizacao|urb
+via|v
+viaduto|vd|vdto
+viela|ve
+vila|vl
+volta
+zona|zn
+# ro
+aleea|ale|alea|al
+bulevardul|bd|bul|bdul|blv|blvd|b-dul|b.dul|bulev|bulevardu|bulevard
+calea|cale|cal
+drumul|drum
+fundătura|fundatura|fnd
+fundacul|fdc
+intrarea|int|intr
+piaţa|piata|piață|pta|pţa|p-ta|p-ţa
+strada|str|st
+stradela|str-la|sdla
+șoseaua|soseaua|sos|șos
+splaiul|sp|spl
+vârful|varful|virful|vîrful|varf|vf
+# ru
+аллея|ал
+alleya|al
+бульвар|бул
+bulvar|bul
+дорога|дор
+doroga|dor
+кольцевая
+kol'tsevaya|koltsevaya
+набережная|наб
+naberezhnaya|nab
+переулок|пер
+pereulok|per
+площадь|пл
+ploshchad|pl
+проезд|пр
+proyezd
+проспект|просп|пр
+prospekt|pr
+линия|лин
+linya|lin
+шоссе|ш
+shosse|sh
+шоссейная
+shosseynaya
+тупик|туп
+tupik|tup
+улица|ул
+ulitsa|ulica|ul
+# si
+mawatha|mw
+para
+# sk
+alej
+brána|brana
+cesta
+chodnik|chodnick
+dvor
+haj
+hradska
+kopec
+korzo
+mólo|molo
+nábrežie|nábr|nabrezie|nabr
+nadvorie
+námestie|nám|namestie|nam
+park
+pole
+promenada
+terasa
+trať|trat
+ulica|ul
+ulička|ulicka
+# sl
+cesta|c
+pot
+trg
+ulica|ul
+# sr
+булевар|бул
+bulevar|bul
+bulevardi
+магистрала
+magistrala
+обилазница
+obilaznica
+прилаз
+prilaz
+пут
+put
+трг
+trg
+улица|ул
+ulica|ul
+# sv
+allé|alle
+gata|g
+gatan
+gränd|graend
+liden
+plan
+plats|pl
+platsen
+stig|st
+stigen
+torg
+väg|vag|vaeg|v
+vägen|vagen|vaegen
+# th
+ซอย
+soi|sxy
+ซอยเทศบาล
+soi thetsaban|sxy theṣ̄bāl|sxy tesbal
+ถนน
+thanon|t̄hnn|thnn
+ทางด่วน
+ไฮเวย์
+ตรอก
+trok|trxk
+# tr
+bulvar
+bulvarı|bulvari|bl|blv
+cadde|cd|cad
+caddesi|cd|cad
+çevre yolu|çevreyolu|cevre yolu|cevreyolu
+köprüsü|koprusu
+otoyolu
+sokak|sk|sok
+sokağı|sokagi|sk|sok
+yolu|yol
+# uk
+аллея|ал
+alleya|al
+бульвар|бул
+bulvar|bul
+boulevard|blvd
+дорога|дор
+doroha|dor
+набережна|наб
+naberezhna|nab
+провулок|пров
+provulok|pro
+площа|пл
+ploshcha|pl
+проїзд|пр
+proyizd
+проспект|просп|пр
+prospekt|pr|prkt
+лінія|лін
+liniya|lin
+liniia|lin
+шосе|ш
+shose|sh
+тупик|туп
+tupyk|tup
+вулиця|вул
+vulytsya|vul
+# ur
+گلی
+روڈ
+لین
+سڑک
+شاہراہ
+ایکسپریس وے
+ہائی وے
+# vi
+công trường|cong truong|ct|c t
+đại lộ|dai lo|đl|d l
+đường|duong|d
+đường hẻm|duong hem
+đường nhỏ|duong nho
+đường phố|duong pho
+ngõ
+quảng trường|quang truong|qt|q t
+quốc lộ|quoc lo|ql|q l
+tỉnh lộ|tinh lo|tl|t l
+# zh
+村道
+cūn dào|cun dao|cūndào|cundao
+大道
+dàdào|dadao
+大街
+dàjiē|dajie
+道
+dào|dao
+大院
+dà yuàn|dayuan
+国道
+guódào|guodao
+胡同
+hútòng|hutong
+街
+jiē|jie
+路
+lù|lu
+省道
+shěng dào|sheng dao|shěngdào|shengdao
+县道
+xiàn dào|xian dao|xiàndào|xiandao
+巷
+xiàng|xiang
+乡道
+xiāng dào|xiang dao|xiāngdào|xiangdao
+段
+duàn|duan
+弄
+nòng|nong

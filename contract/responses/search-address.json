@@ -1,0 +1,53 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "rooftop",
+        "address": {
+          "housenumber": "10",
+          "postcode": "M5V 1A1",
+          "street": "King Street"
+        },
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:node:10",
+        "label": "10 King Street, M5V 1A1",
+        "layer": "address",
+        "name": "10 King Street",
+        "record_id": 3,
+        "score": 3.1327698,
+        "source": {
+          "dataset": "osm",
+          "object_id": 10,
+          "object_type": "node"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "query": "10 King Street",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

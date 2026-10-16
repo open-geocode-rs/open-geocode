@@ -15,20 +15,21 @@ use axum::{
     middleware,
     routing::{MethodFilter, MethodRouter, on},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::{net::TcpListener, task};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
+    api::{self, ForwardCollection, ReverseCollection},
     http::{
         bounds, health, method,
         problem::{Problem, classify_search_error},
         request_id::{self, RequestId},
     },
-    pack::{PackReader, RecordPoint, RecordPointPrecision, RecordSource},
-    record::OsmObjectType,
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseGeocodeResponse},
-    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+    pack::PackReader,
+    resources::Resources,
+    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
 };
 
 #[derive(Debug, Clone)]
@@ -41,17 +42,23 @@ pub struct ServeOptions {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
+    pack: Arc<PackReader>,
     searcher: Arc<PackTextSearcher>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
 }
 
 impl AppState {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let pack = Arc::new(PackReader::open(path)?);
+        // Every query looks things up all over the Pack: read it in now
+        // when it fits, so the first queries do not each wait on faults.
+        pack.container()
+            .advise_random_reads(Resources::probe().available_memory_bytes);
         let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
-        let reverse_geocoder = PackReverseGeocoder::from_pack(pack)?;
+        let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         Ok(Self {
+            pack,
             searcher: Arc::new(searcher),
             reverse_geocoder: Arc::new(reverse_geocoder),
             ready: Arc::new(AtomicBool::new(true)),
@@ -77,58 +84,6 @@ struct SearchParams {
 struct ReverseParams {
     lon: f64,
     lat: f64,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-pub struct SearchResponse {
-    pub query: String,
-    pub results: Vec<SearchApiResult>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-pub struct AutocompleteResponse {
-    pub query: String,
-    pub suggestions: Vec<SearchApiResult>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-pub struct SearchApiResult {
-    pub record_id: u64,
-    pub id: String,
-    pub layer: String,
-    pub label: String,
-    pub score: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub point: Option<SearchApiPoint>,
-    pub source: SearchApiSource,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct SearchApiPoint {
-    pub lon: f64,
-    pub lat: f64,
-    pub precision: SearchApiPointPrecision,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchApiPointPrecision {
-    Point,
-    Centroid,
-    RepresentativePoint,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SearchApiSource {
-    pub dataset: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_type: Option<OsmObjectType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub derived_from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub record_count: Option<u64>,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -221,7 +176,7 @@ async fn search(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
     params: Result<Query<SearchParams>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<SearchResponse>, Problem> {
+) -> Result<Json<ForwardCollection>, Problem> {
     let request_id = request_id.map(|Extension(RequestId(id))| id);
     let Query(params) = params.map_err(|_| {
         with_id(
@@ -239,23 +194,22 @@ async fn search(
         limit: params.limit,
         layer: params.layer,
     };
-    let searcher = Arc::clone(&state.searcher);
-    let hits = task::spawn_blocking(move || searcher.search(options))
-        .await
-        .map_err(|_| with_id(Problem::internal(), &request_id))?
-        .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+    let collection = task::spawn_blocking(move || {
+        let hits = state.searcher.search(options)?;
+        api::forward_collection(&state.pack, query, hits)
+    })
+    .await
+    .map_err(|_| with_id(Problem::internal(), &request_id))?
+    .map_err(|error| with_id(classify_search_error(error), &request_id))?;
 
-    Ok(Json(SearchResponse {
-        query,
-        results: hits.into_iter().map(SearchApiResult::from_hit).collect(),
-    }))
+    Ok(Json(collection))
 }
 
 async fn autocomplete(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
     params: Result<Query<SearchParams>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<AutocompleteResponse>, Problem> {
+) -> Result<Json<ForwardCollection>, Problem> {
     let request_id = request_id.map(|Extension(RequestId(id))| id);
     let Query(params) = params.map_err(|_| {
         with_id(
@@ -276,23 +230,22 @@ async fn autocomplete(
         limit: params.limit,
         layer: params.layer,
     };
-    let searcher = Arc::clone(&state.searcher);
-    let hits = task::spawn_blocking(move || searcher.autocomplete(options))
-        .await
-        .map_err(|_| with_id(Problem::internal(), &request_id))?
-        .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+    let collection = task::spawn_blocking(move || {
+        let hits = state.searcher.autocomplete(options)?;
+        api::forward_collection(&state.pack, query, hits)
+    })
+    .await
+    .map_err(|_| with_id(Problem::internal(), &request_id))?
+    .map_err(|error| with_id(classify_search_error(error), &request_id))?;
 
-    Ok(Json(AutocompleteResponse {
-        query,
-        suggestions: hits.into_iter().map(SearchApiResult::from_hit).collect(),
-    }))
+    Ok(Json(collection))
 }
 
 async fn reverse(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
     params: Result<Query<ReverseParams>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<ReverseGeocodeResponse>, Problem> {
+) -> Result<Json<ReverseCollection>, Problem> {
     let request_id = request_id.map(|Extension(RequestId(id))| id);
     let Query(params) = params.map_err(|_| {
         with_id(
@@ -304,146 +257,18 @@ async fn reverse(
     bounds::validate_coords(params.lon, params.lat)
         .map_err(|problem| with_id(problem, &request_id))?;
 
-    let geocoder = Arc::clone(&state.reverse_geocoder);
-    let response = task::spawn_blocking(move || {
-        geocoder.reverse(ReverseGeocodeOptions {
+    let collection = task::spawn_blocking(move || {
+        let response = state.reverse_geocoder.reverse(ReverseGeocodeOptions {
             lon: params.lon,
             lat: params.lat,
-        })
+        })?;
+        api::reverse_collection(&state.pack, &response)
     })
     .await
     .map_err(|_| with_id(Problem::internal(), &request_id))?
     .map_err(|_| with_id(Problem::internal(), &request_id))?;
 
-    Ok(Json(response))
-}
-
-impl SearchApiResult {
-    fn from_hit(hit: TextSearchHit) -> Self {
-        Self {
-            record_id: hit.record_id,
-            id: hit.record.id,
-            layer: hit.record.layer,
-            label: hit.record.label,
-            score: hit.score,
-            point: hit.record.point.map(SearchApiPoint::from),
-            source: SearchApiSource::from(hit.record.source),
-        }
-    }
-}
-
-impl From<RecordPoint> for SearchApiPoint {
-    fn from(point: RecordPoint) -> Self {
-        Self {
-            lon: point.lon,
-            lat: point.lat,
-            precision: match point.precision {
-                RecordPointPrecision::Point => SearchApiPointPrecision::Point,
-                RecordPointPrecision::Centroid => SearchApiPointPrecision::Centroid,
-                RecordPointPrecision::RepresentativePoint => {
-                    SearchApiPointPrecision::RepresentativePoint
-                }
-            },
-        }
-    }
-}
-
-impl From<RecordSource> for SearchApiSource {
-    fn from(source: RecordSource) -> Self {
-        Self {
-            dataset: source.dataset,
-            object_type: source.object_type,
-            object_id: source.object_id,
-            derived_from: source.derived_from,
-            record_count: source.record_count,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::pack::RecordSummary;
-    use crate::record::OsmObjectType;
-
-    use super::*;
-
-    #[test]
-    fn api_result_shapes_address_point() {
-        let hit = TextSearchHit {
-            record_id: 7,
-            score: 4.25,
-            record: RecordSummary {
-                id: "osm:node:1".to_string(),
-                layer: "address".to_string(),
-                label: "10 King Street, Toronto".to_string(),
-                point: Some(RecordPoint {
-                    lon: -79.3832,
-                    lat: 43.6532,
-                    precision: RecordPointPrecision::Point,
-                }),
-                source: RecordSource {
-                    dataset: "osm".to_string(),
-                    object_type: Some(OsmObjectType::Node),
-                    object_id: Some(1),
-                    derived_from: None,
-                    record_count: None,
-                },
-            },
-        };
-
-        let result = SearchApiResult::from_hit(hit);
-
-        assert_eq!(result.record_id, 7);
-        assert_eq!(result.id, "osm:node:1");
-        assert_eq!(result.layer, "address");
-        assert_eq!(result.label, "10 King Street, Toronto");
-        assert_eq!(
-            result.point,
-            Some(SearchApiPoint {
-                lon: -79.3832,
-                lat: 43.6532,
-                precision: SearchApiPointPrecision::Point,
-            })
-        );
-        assert_eq!(result.source.dataset, "osm");
-        assert_eq!(result.source.object_type, Some(OsmObjectType::Node));
-    }
-
-    #[test]
-    fn api_result_uses_representative_point_for_street() {
-        let hit = TextSearchHit {
-            record_id: 12,
-            score: 3.0,
-            record: RecordSummary {
-                id: "osm:way:9".to_string(),
-                layer: "street".to_string(),
-                label: "King Street".to_string(),
-                point: Some(RecordPoint {
-                    lon: -79.41,
-                    lat: 43.61,
-                    precision: RecordPointPrecision::RepresentativePoint,
-                }),
-                source: RecordSource {
-                    dataset: "osm".to_string(),
-                    object_type: Some(OsmObjectType::Way),
-                    object_id: Some(9),
-                    derived_from: None,
-                    record_count: None,
-                },
-            },
-        };
-
-        let result = SearchApiResult::from_hit(hit);
-
-        assert_eq!(
-            result.point,
-            Some(SearchApiPoint {
-                lon: -79.41,
-                lat: 43.61,
-                precision: SearchApiPointPrecision::RepresentativePoint,
-            })
-        );
-    }
+    Ok(Json(collection))
 }
 
 #[cfg(test)]
@@ -473,6 +298,7 @@ mod router_tests {
             .write(
                 &AddressRecord {
                     address: AddressComponents {
+                        areas: Vec::new(),
                         number: "10".to_string(),
                         street: Some("King Street".to_string()),
                         place: None,

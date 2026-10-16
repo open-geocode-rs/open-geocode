@@ -1,0 +1,291 @@
+# libpostal resources/dictionaries/*/{level_types_numbered,level_types_standalone,level_types_basement,level_types_mezzanine,level_types_sub_basement}.txt (MIT, see NOTICE)
+# bg
+этаж|эт
+etazh|et
+кат
+kat
+ниво
+nivo
+партер
+parter
+приземен етаж|приземен ет
+prizemen etazh|prizemen et
+# bs
+kat
+sprat
+parter
+prizemlje
+podrum
+mezanin
+# ca
+pis
+planta|pl
+àtic|àt|atic|at
+baixos|bxs
+planta baixa|pb
+principal|pr|pral
+sobreàtic|s / àt|s / at|sobreatic|s àt|s at
+soterrani|so
+entresòl|entl|entresol
+sub soterrani|ss|s.s|s s
+# cs
+etáž|etaz
+patro
+nadzemní podlaží|np|nadzemni podlazi
+přízemí|prizemi
+podzemní podlaží|pp|podzemni podlazi
+# da
+etage|et|etg
+sal
+stueetage
+stuen|st
+kælderen|kaelderen|kl|kld
+# de
+etage
+obergeschoss|og|o g
+stock
+erdgeschoss|eg|e g
+oberste etage
+parkdeck
+unterste etage
+untergeschoss|ug|u g
+# el
+όροφος|οροφος
+órofos|orofos
+ισόγειο|ισογειο
+isógeio|isogelo
+υπόγειο|υπογειο
+ypógeio|ypogeio
+ημιώροφος|ημιωροφος
+imiórofos|imiorofos
+# en
+floor|fl|flr|/ f
+level|lev|levl|lvel|lvl|l|/ l
+platform|pf
+storey
+ground|g|gd
+ground floor|gdfl|gd fl|gd/fl|gd / fl|gf|g / f
+ground level|gd lvl|g lvl|g level|gd level|ground lvl|gd / lvl|gl|g / l
+lobby
+lower ground floor|lg|lgf|lgfl|l / g|l / gf|l / g / f|l / g / fl
+lower level|lwr level|lower lvl|lwr lvl
+podium|pd
+podium level|podium lev|podium levl|podium lvel|podium lvl|podium l|pd level|pd lev|pd levl|pd lvel|pd lvl|pd l
+rooftop|rt|rf|r / t
+top floor|top fl|top / f|tf|t.f|t f|t / f
+upper ground floor|ug|ugf|ugfl|ug / f|ug / fl
+upper|uppr|upr
+basement|bsm|bsmt|bsmnt|bsment
+mezzanine|mezz
+mezzanine floor|mezz fl|mezz floor
+mezzanine level|mezz lvl|mezz level
+lower mezzanine|lower mezz|lwr mezz
+upper mezzanine|upper mezz|uppr mezz|upr mezz
+sub basement|sub-basement|subbasement|sb|s.b
+# es
+piso|pi|p
+planta|pl|p
+bajo|bjo|bo|bº|b°
+bajos|bjos|bjs
+planta baja|pb|pl baja
+planta primera|pl primera
+piso principal|pso pral|piso ppal|p ppal|piso pral|p pral
+planta principal|ppl|pl ppal|pl pral|pl pr
+principal|pral|ppal|pr
+sótano|so|só|sotano
+entresuelo|entlo
+sub sótano|ss|s.s|s s
+# et
+korrusel
+kelder
+keldris
+# eu
+solairua|sol
+beheko solairua|beheko sol
+behe-solairua|behe solairua|behe-sol|behe sol
+# fi
+kerros|krs
+# fr
+étage|ét|etage|et
+niveau
+bel étage|bel etage
+dernier étage|dernier etage
+étage noble|etage noble
+parterre
+rez-de-chaussée|rdc|r.d.c|r d c|rez|rez-de-chaussee|rez de chaussée|rez de chaussee|rc|r.c|r c
+rez-de-jardin|rez de jardin
+rez-de-chaussée bas|rcb|r.c.b|r c b
+rez-de-chaussée haut|rch|r.c.h|r c h
+sous-sol|sous sol|soussol
+entresol
+soubassement
+# ga
+díonteach|dionteach
+# he
+קומה|קוֹמָה
+koma
+קומת קרקע|קוֹמַת קַרְקַע
+komát karká|komat karka
+מרתף
+martef
+# hr
+kat
+etaža|et
+parter
+prizemlje
+podrum
+polukat
+# hu
+emelet|em
+földszint|fszt|fsz|foldszint
+alagsor
+félszuterén|felszuteren
+szuterén|szuteren
+pince
+félemelet|felemelet|félem|1/2 em|1/2em
+magasföldszint|magasfoldszint|mgfszt|mgfsz|mfszt|mfsz
+# id
+lantai|lt|ltai|lt.
+lantai atas|lantai ats|lt ats|lt. ats|lt. atas
+lantai dasar|lt dsr|lt dsar|lt. dsr|lt. dasar
+lobi
+# is
+hæð|haeo
+jarðhæð|jarohaeo
+kjallara
+# it
+livello
+piano|pº|p°|p.º|p.°|p.o|p.nº|p.n°|p.no|pnº|pn°|pno
+piano nobile
+piano terra|pt|p.t|p t
+cantina|c.tina|ctina
+seminterrato
+# ja
+階
+kai
+gai
+# ko
+층
+cheung
+# lt
+aukštas|aukstas|auk
+aukšte|aukste|auk
+pirmas aukštas|pirmas aukstas|pirmas auk
+rūsys|rusys
+rūsyje|rusyje
+# lv
+stāvs|stavs
+pirmais stāvs|pirmais stavs
+pagraba
+pagrabs
+# ms
+aras
+tingkat|tkt
+# nb
+etasje|et|etg
+hovedetasje|h
+loftsetasje|l
+loft
+underetasje|u
+# nl
+etage|et
+verdieping|verdiep
+begane grond|begane gro|bg
+benedenverdieping|benedenverdiep
+gelijkvloers
+het gelijkvloers
+parterre
+# pl
+piętro|p|ptr
+parter
+suterena|s
+# pt
+andar
+nível|nivel
+piso|pi|p
+andar terréo|at|a.t|a t|andar terreo
+baixos|bxs
+rés-do-chão|res-do-chao|rés do chão|res do chao|résdochão|resdochao|rc|r / c|r.c|r c|rdc|r / d / c|r/r / chão|r / chao|r-d-c|r d c|r.d.c
+pavimento terréo|pt|p.t|p t|pavimento terreo
+terréo|terreo
+cave|cv|c / v
+mezanino
+sub cave|scv|sub cv|s / c / v|sub c / v
+# ro
+etaj|et|etj
+parter
+# ru
+этаж|эт
+etazh|et
+уровень
+uroven'|uroven
+первый этаж|перв эт
+pervyy etazh|perv et
+нижний этаж|ниж эт
+nizhniy etazh|nizh et
+подвал
+podval
+цокольный этаж|цок эт
+tsokol'nyy etazh|tsokolnyy etazh|tsok et
+# sk
+etáž|etaz
+poschodie
+podlažie|podlazie
+nadzemné podlažie|np|nadzemne podlazie
+prízemie|prizemie
+podzemné podlažie|pp|podzemne podlazie
+# sl
+nadstropje
+parter
+pritličje|pritlicje
+kleti
+# sr
+спрат
+sprat
+кат
+kat
+етажа|ет
+etaža|et
+партер
+parter
+приземље
+prizemlje
+подрум
+podrum
+# sv
+plan
+trappa upp|tr upp
+trappa|tr
+trappor upp|tr upp
+trappor|tr
+våning|vån|vaan|vaning|vaaning
+våningen|vån|vaan|vaningen|vaaningen
+bottenvåning|bottenvaaning|bv|bottenvån
+entréplan|entreplan
+källare|kallare
+vindsvåningen|vindsvaaningen|vindsvaningen
+vinds
+# tr
+kat|k
+zemin kat|zk|z.k|z k
+bodrum
+asma kat
+# uk
+поверх|пов
+poverkh|pov
+рівень
+riven'|riven
+перший поверх|перш пов
+pershyy poverkh|persh pov
+нижній поверх|ниж пов
+nyzhniy poverkh|nyzh pov
+підвал
+pidval
+цокольний поверх|цок пов
+tsokolʹnyy poverkh|tsokolnyy poverkh|tsok pov
+# zh
+楼
+樓
+lóu|lou
+层
+céng|ceng

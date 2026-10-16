@@ -1,0 +1,103 @@
+# Words that name the type of an admin area, which a query often leaves out
+# of the area's name ("愛知県" is written "愛知", "Freistaat Bayern" is
+# written "Bayern"), for the languages and levels libpostal's qualifiers
+# (libpostal/qualifiers.txt) lack. A phrase is a word of its own before or
+# after the name; "-phrase" is written attached after the name and
+# "phrase-" attached before it. Vocabulary, not place data.
+# de
+freistaat
+bundesland
+land
+kanton
+landkreis
+kreis
+regierungsbezirk
+stadt
+amt
+markt
+samtgemeinde
+verbandsgemeinde
+verwaltungsgemeinschaft
+vgem
+verwaltungsverband
+gvv
+# en
+state
+province
+province of
+prefecture
+county
+region
+region of
+district
+municipality
+city of
+borough of
+# es
+comunidad de
+comunidad autónoma de
+comunidad foral de
+región de
+provincia de
+departamento de
+estado de
+municipio de
+# fr
+région
+département de
+département du
+province de
+canton de
+commune de
+# it
+regione
+provincia di
+provincia autonoma di
+comune di
+# ja: the readings of the prefecture and municipality types in kana
+-けん
+-と
+-ふ
+-どう
+-し
+-く
+-ちょう
+-まち
+-むら
+-そん
+# ko
+-도
+-특별시
+-광역시
+-특별자치시
+-특별자치도
+-시
+-군
+# nl
+provincie
+gemeente
+# pl
+województwo
+powiat
+gmina
+# pt
+estado de
+estado do
+região
+município de
+# ru, uk
+область
+край
+республика
+район
+# th
+จังหวัด-
+อำเภอ-
+เขต-
+# zh
+-自治区
+-特别行政区
+-省
+-县
+-镇
+-乡

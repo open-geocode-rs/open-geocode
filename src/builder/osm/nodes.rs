@@ -80,7 +80,7 @@ pub(crate) fn join_nodes(
     join.advance()?;
     for_each_block(
         input,
-        "3/7 join node coordinates",
+        "3/8 join node coordinates",
         Some(node_blobs),
         |_, block| Ok(decode_nodes(&block)),
         |block| join.block(block, resolved),
