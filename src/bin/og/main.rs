@@ -7,6 +7,7 @@
 
 mod app;
 mod mock;
+mod regions;
 mod ui;
 
 use std::{
@@ -134,6 +135,14 @@ mod preview {
         show(&app, "home");
         press(&mut app, &[KeyCode::Enter]);
         show(&app, "region");
+        press(&mut app, &[KeyCode::Down; 7]);
+        press(&mut app, &[KeyCode::Enter]);
+        show(&app, "region north america");
+        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        show(&app, "region canada");
+        press(&mut app, &[KeyCode::PageDown]);
+        show(&app, "region canada scrolled");
+        press(&mut app, &[KeyCode::Left, KeyCode::Left]);
         typed(&mut app, "onta");
         show(&app, "region onta");
         press(&mut app, &[KeyCode::Enter, KeyCode::Char(' ')]);

@@ -9,7 +9,8 @@ use ratatui::{
 };
 
 use crate::{
-    mock::{self, Region, Stage},
+    mock::{self, Stage},
+    regions::{self, Region},
     ui,
 };
 
@@ -59,8 +60,17 @@ pub const HOME_ITEMS: [(&str, &str); 4] = [
 
 pub const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
 pub const MEMORY_STEPS_GB: [u32; 5] = [2, 4, 6, 8, 12];
-/// Rows of the region list, so the box keeps one height while filtering.
-pub const REGION_ROWS: usize = 7;
+/// Rows of the region list, so the box keeps one height while browsing.
+pub const REGION_ROWS: usize = 13;
+
+/// One row of the region list.
+pub struct RegionRow {
+    pub region: &'static Region,
+    /// Matched character positions of the name, for highlighting.
+    pub positions: Vec<usize>,
+    /// The regions above it, shown in search results.
+    pub trail: Option<String>,
+}
 
 pub struct Build {
     pub stages: Vec<Stage>,
@@ -128,6 +138,9 @@ pub struct App {
     pub home_cursor: usize,
     pub region_query: String,
     pub region_cursor: usize,
+    pub region_scroll: usize,
+    /// The regions browsed into, from a continent down. Empty at the top.
+    pub region_path: Vec<usize>,
     pub region: &'static Region,
     pub sources: [bool; 3],
     pub source_cursor: usize,
@@ -156,7 +169,11 @@ impl App {
             home_cursor: 0,
             region_query: String::new(),
             region_cursor: 0,
-            region: &mock::REGIONS[1],
+            region_scroll: 0,
+            region_path: Vec::new(),
+            region: regions::tree()
+                .get("canada/ontario")
+                .unwrap_or_else(|| regions::tree().root()),
             sources: [true, false, false],
             source_cursor: 1,
             memory_step: 2,
@@ -182,10 +199,10 @@ impl App {
     }
 
     pub fn download_mb(&self) -> f64 {
-        let region = if self.region.local.is_some() {
+        let region = if self.region.local().is_some() {
             0.0
         } else {
-            self.region.size_mb
+            self.region.size_mb()
         };
         let extra: f64 = mock::SOURCES
             .iter()
@@ -198,7 +215,7 @@ impl App {
 
     /// Disk the build needs: the downloads plus scratch and the Pack.
     pub fn disk_gb(&self) -> f64 {
-        (self.region.size_mb * 5.5 + self.download_mb()) / 1_000.0
+        (self.region.size_mb() * 5.5 + self.download_mb()) / 1_000.0
     }
 
     pub fn fits_disk(&self) -> bool {
@@ -213,7 +230,7 @@ impl App {
 
     /// The equivalent non-interactive command for this build.
     pub fn command(&self) -> String {
-        let mut command = format!("og build --region {}", self.region.arg());
+        let mut command = format!("og build --region {}", self.region.id);
         for (source, on) in mock::SOURCES.iter().zip(self.sources).skip(1) {
             if on {
                 command.push_str(&format!(" --with {}", source.arg));
@@ -223,21 +240,114 @@ impl App {
         command
     }
 
-    /// Regions matching the search, with the matched character positions.
-    /// The world is not among them: it stays pinned below the list.
-    pub fn region_matches(&self) -> Vec<(&'static Region, Vec<usize>)> {
-        let mut matches: Vec<(&'static Region, Vec<usize>, i64)> = mock::REGIONS
-            .iter()
+    /// The region whose children the list shows.
+    pub fn region_here(&self) -> &'static Region {
+        let tree = regions::tree();
+        self.region_path
+            .last()
+            .map_or_else(|| tree.root(), |index| tree.at(*index))
+    }
+
+    /// The rows of the region list. Browsing shows the region itself first,
+    /// as "All of ...", then its children. A search shows every region whose
+    /// name matches, with the regions above it.
+    pub fn region_rows(&self) -> Vec<RegionRow> {
+        let tree = regions::tree();
+        if self.region_browsing() {
+            let here = self.region_here();
+            let mut rows = vec![RegionRow {
+                region: here,
+                positions: Vec::new(),
+                trail: None,
+            }];
+            rows.extend(here.children.iter().map(|index| RegionRow {
+                region: tree.at(*index),
+                positions: Vec::new(),
+                trail: None,
+            }));
+            return rows;
+        }
+        let mut matches: Vec<(RegionRow, i64)> = tree
+            .searchable()
             .filter_map(|region| {
-                let (positions, score) = fuzzy(&self.region_query, region.name)?;
-                Some((region, positions, score))
+                let trail = tree.trail(region);
+                let (positions, score) = find(&self.region_query, &region.name, &trail)?;
+                let row = RegionRow {
+                    region,
+                    positions,
+                    trail: Some(trail),
+                };
+                Some((row, score))
             })
             .collect();
-        matches.sort_by_key(|(_, _, score)| std::cmp::Reverse(*score));
-        matches
-            .into_iter()
-            .map(|(region, positions, _)| (region, positions))
-            .collect()
+        matches.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        matches.into_iter().map(|(row, _)| row).collect()
+    }
+
+    /// Whether the list shows the browsed region's own children.
+    pub fn region_browsing(&self) -> bool {
+        self.region_query.trim().is_empty()
+    }
+
+    /// Rows the list can show from the current scroll: browsing at the top
+    /// spends one on the line under "All of ...".
+    pub fn region_capacity(&self) -> usize {
+        if self.region_browsing() && self.region_scroll == 0 {
+            REGION_ROWS - 1
+        } else {
+            REGION_ROWS
+        }
+    }
+
+    /// Scrolls so the cursor row is on screen.
+    fn region_follow(&mut self) {
+        if self.region_cursor < self.region_scroll {
+            self.region_scroll = self.region_cursor;
+        } else if self.region_cursor >= self.region_scroll + self.region_capacity() {
+            self.region_scroll = (self.region_cursor + 1).saturating_sub(REGION_ROWS).max(1);
+        }
+    }
+
+    fn region_reset(&mut self, cursor: usize) {
+        self.region_cursor = cursor;
+        self.region_scroll = 0;
+        self.region_follow();
+    }
+
+    /// Opens a region: the list shows what is below it.
+    fn region_open(&mut self, region: &'static Region) {
+        self.region_path = regions::tree().ancestors(region);
+        self.region_path.push(region.index);
+        self.region_query.clear();
+        self.region_reset(0);
+    }
+
+    /// Goes up one level, leaving the cursor on the region just left.
+    fn region_up(&mut self) {
+        let Some(left) = self.region_path.pop() else {
+            return;
+        };
+        let cursor = self
+            .region_rows()
+            .iter()
+            .position(|row| row.region.index == left)
+            .unwrap_or(0);
+        self.region_reset(cursor);
+    }
+
+    /// Takes a region for the build and moves on to its sources. The list
+    /// stays on that region for when the user comes back.
+    fn region_select(&mut self, region: &'static Region) {
+        self.region = region;
+        self.region_query.clear();
+        self.region_path = regions::tree().ancestors(region);
+        let cursor = self
+            .region_rows()
+            .iter()
+            .position(|row| row.region.index == region.index)
+            .unwrap_or(0);
+        self.region_reset(cursor);
+        self.screen = Screen::Sources;
     }
 
     pub fn hits(&self) -> Vec<(&'static mock::Record, f64)> {
@@ -318,32 +428,66 @@ impl App {
     }
 
     fn region_key(&mut self, key: KeyEvent) {
-        let rows = self.region_matches().len() + 1;
+        let rows = self.region_rows();
+        let count = rows.len().max(1);
         match key.code {
-            KeyCode::Up => self.region_cursor = (self.region_cursor + rows - 1) % rows,
-            KeyCode::Down => self.region_cursor = (self.region_cursor + 1) % rows,
-            KeyCode::Enter => {
-                let matches = self.region_matches();
-                self.region = matches
-                    .get(self.region_cursor)
-                    .map_or(&mock::WORLD, |(region, _)| *region);
-                self.screen = Screen::Sources;
+            KeyCode::Up => {
+                self.region_cursor = (self.region_cursor + count - 1) % count;
+                self.region_follow();
             }
+            KeyCode::Down => {
+                self.region_cursor = (self.region_cursor + 1) % count;
+                self.region_follow();
+            }
+            KeyCode::PageUp => {
+                self.region_cursor = self.region_cursor.saturating_sub(REGION_ROWS);
+                self.region_follow();
+            }
+            KeyCode::PageDown => {
+                self.region_cursor = (self.region_cursor + REGION_ROWS).min(count - 1);
+                self.region_follow();
+            }
+            KeyCode::Enter => {
+                let Some(row) = rows.get(self.region_cursor) else {
+                    return;
+                };
+                let all = self.region_browsing() && self.region_cursor == 0;
+                if !all && !row.region.children.is_empty() {
+                    self.region_open(row.region);
+                } else {
+                    self.region_select(row.region);
+                }
+            }
+            KeyCode::Right => {
+                let all = self.region_browsing() && self.region_cursor == 0;
+                if let Some(row) = rows.get(self.region_cursor)
+                    && !all
+                    && !row.region.children.is_empty()
+                {
+                    self.region_open(row.region);
+                }
+            }
+            KeyCode::Left if self.region_browsing() => self.region_up(),
             KeyCode::Esc => {
-                if self.region_query.is_empty() {
+                if !self.region_browsing() {
+                    self.region_query.clear();
+                    self.region_reset(0);
+                } else if self.region_path.is_empty() {
                     self.screen = Screen::Home;
                 } else {
-                    self.region_query.clear();
-                    self.region_cursor = 0;
+                    self.region_up();
                 }
             }
             KeyCode::Backspace => {
-                self.region_query.pop();
-                self.region_cursor = 0;
+                if self.region_query.pop().is_some() {
+                    self.region_reset(0);
+                } else {
+                    self.region_up();
+                }
             }
             KeyCode::Char(c) => {
                 self.region_query.push(c);
-                self.region_cursor = 0;
+                self.region_reset(0);
             }
             _ => {}
         }
@@ -516,31 +660,44 @@ impl App {
     }
 }
 
-/// Subsequence match, case-insensitive. Rewards runs of matched letters and
-/// matches at word starts. An empty query matches everything in list order.
-fn fuzzy(query: &str, text: &str) -> Option<(Vec<usize>, i64)> {
-    let query: Vec<char> = query
-        .to_lowercase()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if query.is_empty() {
-        return Some((Vec::new(), 0));
-    }
-    let chars: Vec<char> = text.to_lowercase().chars().collect();
-    let mut positions = Vec::with_capacity(query.len());
+/// Matches a search against a region: every word of the query must occur in
+/// the name or in the regions above it, so `ont canada` finds Ontario. Words
+/// that start a word of the name rank first, then names that start with the
+/// query, then shorter names. Returns the matched positions in the name.
+fn find(query: &str, name: &str, trail: &str) -> Option<(Vec<usize>, i64)> {
+    let name_chars: Vec<char> = name.to_lowercase().chars().collect();
+    let trail = trail.to_lowercase();
+    let mut positions = Vec::new();
     let mut score = 0;
-    let mut next = 0;
-    for wanted in query {
-        let found = (next..chars.len()).find(|&index| chars[index] == wanted)?;
-        let word_start = found == 0 || !chars[found - 1].is_alphanumeric();
-        let run = positions
-            .last()
-            .is_some_and(|&last: &usize| last + 1 == found);
-        score += 1 + if word_start { 8 } else { 0 } + if run { 4 } else { 0 };
-        positions.push(found);
-        next = found + 1;
+    for word in query.to_lowercase().split_whitespace() {
+        let word: Vec<char> = word.chars().collect();
+        if let Some((at, word_start)) = locate(&name_chars, &word) {
+            score += if word_start { 100 } else { 40 };
+            if at == 0 {
+                score += 50;
+            }
+            positions.extend(at..at + word.len());
+        } else if trail.contains(&word.iter().collect::<String>()) {
+            score += 10;
+        } else {
+            return None;
+        }
     }
-    // Shorter names first among equal matches: "Canada" before its provinces.
-    Some((positions, score * 100 - chars.len() as i64))
+    positions.sort_unstable();
+    positions.dedup();
+    Some((positions, score * 1_000 - name_chars.len() as i64))
+}
+
+/// Where `needle` occurs in `text`, preferring the start of a word.
+fn locate(text: &[char], needle: &[char]) -> Option<(usize, bool)> {
+    let at = |start: usize| text[start..].starts_with(needle);
+    let word_start = |start: usize| start == 0 || !text[start - 1].is_alphanumeric();
+    (0..text.len())
+        .find(|&start| at(start) && word_start(start))
+        .map(|start| (start, true))
+        .or_else(|| {
+            (0..text.len())
+                .find(|&start| at(start))
+                .map(|start| (start, false))
+        })
 }

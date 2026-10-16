@@ -12,8 +12,9 @@ use ratatui::{
 };
 
 use crate::{
-    app::{self, App, Build, Mode, Screen},
+    app::{self, App, Build, Mode, RegionRow, Screen},
     mock::{self, Record},
+    regions,
 };
 
 const ACCENT: Color = Color::Rgb(92, 184, 255);
@@ -98,14 +99,15 @@ pub fn logo() -> Vec<Line<'static>> {
             Span::styled("▀▀▀▀ ", o),
             Span::styled("▀▀▀▀", g),
             plain("   "),
-            span("Self-hosted geocoding from open data.", DIM),
+            span(
+                "Fast, lightweight, self-hosted geocoding in pure Rust.",
+                DIM,
+            ),
         ]),
         Line::raw(""),
+        Line::from(vec![plain("  Build a Pack from open data.")]),
         Line::from(vec![plain(
-            "  Build a Pack once from OpenStreetMap, then serve search,",
-        )]),
-        Line::from(vec![plain(
-            "  autocomplete and reverse geocoding from one binary.",
+            "  Forward, reverse, autocomplete and batch geocoding, all on your machine.",
         )]),
         Line::raw(""),
     ]
@@ -120,10 +122,10 @@ fn choice(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
 /// The wizard's answers so far, one line each.
 fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
     let mut region = vec![
-        plain(app.region.name),
-        span(format!("  {}", mock::size(app.region.size_mb)), DIM),
+        plain(app.region.label.clone()),
+        span(format!("  {}", mock::size(app.region.size_mb())), DIM),
     ];
-    if app.region.local.is_some() {
+    if app.region.local().is_some() {
         region.push(span("  on disk", OK));
     }
     let sources: Vec<&str> = mock::SOURCES
@@ -304,115 +306,155 @@ fn input_line(text: &str, placeholder: &str) -> Line<'static> {
 }
 
 fn region(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, list, _, _] = Layout::vertical([
+    let [done, list] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(13),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(app::REGION_ROWS as u16 + 4),
     ])
     .areas(area);
     frame.render_widget(Paragraph::new(answers(app, 1)), done);
 
-    let matches = app.region_matches();
+    let tree = regions::tree();
+    let rows = app.region_rows();
+    let browsing = app.region_browsing();
     let inner = list.width.saturating_sub(2) as usize;
     let mut lines = vec![
         input_line(
             &app.region_query,
-            &format!("type to search {} regions", mock::REGIONS.len()),
+            &format!("type to search {} regions", tree.searchable().count()),
         ),
         Line::raw(""),
     ];
-    let start = if app.region_cursor < matches.len() {
-        app.region_cursor.saturating_sub(app::REGION_ROWS - 1)
-    } else {
-        matches.len().saturating_sub(app::REGION_ROWS)
-    };
-    if matches.is_empty() {
+    if rows.is_empty() {
         lines.push(Line::from(span(
-            format!("  No region matches \"{}\".", app.region_query),
+            format!("  No region matches \"{}\".", app.region_query.trim()),
             DIM,
         )));
     }
-    for (index, (region, positions)) in matches
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(app::REGION_ROWS)
-    {
+    let mut room = app::REGION_ROWS;
+    let mut next = app.region_scroll;
+    while room > 0 && next < rows.len() {
+        let all = browsing && next == 0;
         lines.push(region_row(
-            region,
-            positions,
-            index == app.region_cursor,
+            &rows[next],
+            next == app.region_cursor,
+            all,
             inner,
         ));
+        room -= 1;
+        // A line under "All of ..." sets it apart from the regions below.
+        if all && rows.len() > 1 && room > 0 {
+            lines.push(Line::from(span(
+                format!("  {}", "─".repeat(inner.saturating_sub(4))),
+                FAINT,
+            )));
+            room -= 1;
+        }
+        next += 1;
     }
-    while lines.len() < 2 + app::REGION_ROWS {
-        lines.push(Line::raw(""));
+
+    let mut trail = vec!["Region".to_string()];
+    if browsing {
+        trail.extend(
+            app.region_path
+                .iter()
+                .map(|index| tree.at(*index).name.clone()),
+        );
+    } else {
+        trail.push("search".to_string());
     }
-    lines.push(Line::from(span(
-        format!("  {}", "─".repeat(inner.saturating_sub(4))),
-        FAINT,
-    )));
-    lines.push(region_row(
-        &mock::WORLD,
-        &[],
-        app.region_cursor == matches.len(),
-        inner,
-    ));
-    let count = Line::from(span(
-        format!(" {} of {} ", matches.len(), mock::REGIONS.len()),
-        DIM,
-    ))
-    .right_aligned();
-    frame.render_widget(
-        Paragraph::new(lines).block(panel("Region").title_bottom(count)),
-        list,
-    );
-    footer(
-        frame,
-        app,
-        &[("↑↓", "move"), ("enter", "select"), ("esc", "back")],
-    );
+    let more = rows.len().saturating_sub(next);
+    let mut block = panel(&trail.join(" › "));
+    if more > 0 {
+        block =
+            block.title_bottom(Line::from(span(format!(" ↓ {more} more "), DIM)).left_aligned());
+    }
+    if !rows.is_empty() {
+        block = block.title_bottom(
+            Line::from(span(
+                format!(" {} of {} ", app.region_cursor + 1, rows.len()),
+                DIM,
+            ))
+            .right_aligned(),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), list);
+    let hints: &[(&str, &str)] = if browsing {
+        &[
+            ("↑↓", "move"),
+            ("enter", "open or select"),
+            ("←→", "up or open"),
+            ("esc", "back"),
+        ]
+    } else {
+        &[
+            ("↑↓", "move"),
+            ("enter", "open or select"),
+            ("esc", "clear search"),
+        ]
+    };
+    footer(frame, app, hints);
 }
 
-fn region_row(
-    region: &mock::Region,
-    positions: &[usize],
-    selected: bool,
-    inner: usize,
-) -> Line<'static> {
+/// One line of the region list: the name, what is around it, and what the
+/// build would cost.
+fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<'static> {
+    let region = row.region;
     let base = if selected {
         Style::new().add_modifier(Modifier::BOLD)
     } else {
         Style::new()
     };
     let hit = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let name = match (all, region.is_world()) {
+        (true, true) => region.name.clone(),
+        (true, false) => format!("All of {}", region.name),
+        (false, _) => region.name.clone(),
+    };
     let mut spans = vec![if selected {
         span(" ❯ ", ACCENT)
     } else {
         plain("   ")
     }];
-    for (index, c) in region.name.chars().enumerate() {
-        let style = if positions.contains(&index) {
+    for (index, c) in name.chars().enumerate() {
+        let style = if row.positions.contains(&index) {
             hit
         } else {
             base
         };
         spans.push(Span::styled(c.to_string(), style));
     }
-    let mut used = 3 + width(region.name);
-    if region.local.is_some() {
-        spans.push(span("  ● on disk", OK));
-        used += 11;
-    }
     let right = format!(
         "{:>8}  {:>9} ",
-        mock::size(region.size_mb),
+        mock::size(region.size_mb()),
         mock::about(region.build_secs())
     );
-    spans.push(plain(
-        " ".repeat(inner.saturating_sub(used + width(&right))),
-    ));
+    let opens = if all || region.children.is_empty() {
+        String::new()
+    } else {
+        format!("  {} {} ›", region.children.len(), region.unit())
+    };
+    let disk = if region.local().is_some() {
+        "  ● on disk"
+    } else {
+        ""
+    };
+    let used = 3 + width(&name) + width(&opens) + width(disk) + width(&right);
+    let mut room = inner.saturating_sub(used);
+    if let Some(trail) = row.trail.as_deref().filter(|trail| !trail.is_empty())
+        && room >= 6
+    {
+        let fitted: String = if width(trail) + 2 <= room {
+            trail.to_string()
+        } else {
+            let keep: String = trail.chars().take(room - 3).collect();
+            format!("{keep}…")
+        };
+        room -= width(&fitted) + 2;
+        spans.push(span(format!("  {fitted}"), DIM));
+    }
+    spans.push(span(opens, DIM));
+    spans.push(span(disk, OK));
+    spans.push(plain(" ".repeat(room)));
     spans.push(span(right, DIM));
     Line::from(spans)
 }
@@ -507,7 +549,7 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(area);
     frame.render_widget(Paragraph::new(answers(app, 3)), done);
-    let download = match (app.download_mb(), app.region.local) {
+    let download = match (app.download_mb(), app.region.local()) {
         (0.0, Some(path)) => vec![plain("nothing"), span(format!("  using {path}"), DIM)],
         (mb, _) => vec![
             plain(mock::size(mb)),
@@ -735,7 +777,7 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
         DIM,
     ))
     .right_aligned();
-    let block = panel(&format!("Building {}", app.region.name)).title_top(corner);
+    let block = panel(&format!("Building {}", app.region.label)).title_top(corner);
     frame.render_widget(Paragraph::new(lines).block(block), panel_area);
     let logs = if app.show_logs { "hide logs" } else { "logs" };
     footer(

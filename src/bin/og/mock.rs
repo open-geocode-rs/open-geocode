@@ -1,82 +1,7 @@
-//! Canned regions, build stages and Pack records for the preview. None of it
+//! Canned build stages and Pack records for the preview. None of it
 //! is read from disk or the network.
 
-pub struct Region {
-    pub name: &'static str,
-    pub size_mb: f64,
-    /// A PBF already on disk, so the build skips the download.
-    pub local: Option<&'static str>,
-}
-
-impl Region {
-    /// The Pack directory name: the last part of the region name.
-    pub fn slug(&self) -> String {
-        if self.is_world() {
-            return "planet".to_string();
-        }
-        let last = self.name.rsplit(" / ").next().unwrap_or(self.name);
-        last.to_lowercase().replace(' ', "-")
-    }
-
-    /// The `--region` value for the equivalent command.
-    pub fn arg(&self) -> String {
-        if self.is_world() {
-            return "planet".to_string();
-        }
-        self.name
-            .to_lowercase()
-            .replace(" / ", "/")
-            .replace(' ', "-")
-    }
-
-    pub fn is_world(&self) -> bool {
-        std::ptr::eq(self, &WORLD)
-    }
-
-    /// Build time from past builds' throughput, about 0.72 s per MB of PBF.
-    pub fn build_secs(&self) -> f64 {
-        self.size_mb * 0.72
-    }
-}
-
-pub const REGIONS: &[Region] = &[
-    region("Canada", 3_400.0),
-    Region {
-        name: "Canada / Ontario",
-        size_mb: 752.0,
-        local: Some("data/pbf/ontario-latest.osm.pbf"),
-    },
-    region("Canada / Quebec", 618.0),
-    region("Canada / British Columbia", 402.0),
-    region("Canada / Alberta", 330.0),
-    region("United States", 11_200.0),
-    region("United States / California", 1_210.0),
-    region("United States / New York", 460.0),
-    region("United States / Texas", 680.0),
-    region("Mexico", 760.0),
-    region("Brazil", 1_900.0),
-    region("United Kingdom", 1_900.0),
-    region("Germany", 4_300.0),
-    region("France", 4_600.0),
-    region("Netherlands", 1_300.0),
-    region("Switzerland", 480.0),
-    region("Italy", 2_000.0),
-    region("Spain", 1_300.0),
-    region("India", 1_500.0),
-    region("Japan", 2_200.0),
-    region("Australia", 900.0),
-    region("New Zealand", 340.0),
-];
-
-pub static WORLD: Region = region("World (planet)", 84_000.0);
-
-const fn region(name: &'static str, size_mb: f64) -> Region {
-    Region {
-        name,
-        size_mb,
-        local: None,
-    }
-}
+use crate::regions::Region;
 
 pub struct Source {
     pub name: &'static str,
@@ -128,7 +53,7 @@ pub struct Stage {
 pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
     let file = format!("{}-latest.osm.pbf", region.slug());
     let mut stages = Vec::new();
-    if region.local.is_none() {
+    if region.local().is_none() {
         stages.push(Stage {
             title: format!("Download {file}"),
             numbered: false,
@@ -136,11 +61,11 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
                 "Fetching the region from Geofabrik.",
                 "The file is checked against its published checksum before use.",
             ],
-            total: Some(region.size_mb),
+            total: Some(region.size_mb()),
             unit: "MB",
             play_secs: 3.0,
             real_secs: 38.0,
-            summary: format!("{}  checksum ok", size(region.size_mb)),
+            summary: format!("{}  checksum ok", size(region.size_mb())),
         });
     }
     for (index, source) in SOURCES.iter().enumerate().skip(1) {
@@ -736,7 +661,9 @@ fn metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 pub fn size(mb: f64) -> String {
-    if mb >= 1_000.0 {
+    if mb < 1.0 {
+        format!("{:.0} KB", mb * 1_000.0)
+    } else if mb >= 1_000.0 {
         format!("{:.1} GB", mb / 1_000.0)
     } else {
         format!("{mb:.0} MB")
@@ -757,7 +684,7 @@ pub fn about(secs: f64) -> String {
     if secs >= 3_600.0 {
         format!("~ {:.0} h", secs / 3_600.0)
     } else {
-        format!("~ {:.0} min", (secs / 60.0).max(1.0))
+        format!("~ {:.0} min", (secs / 60.0).ceil().max(1.0))
     }
 }
 
