@@ -1,7 +1,10 @@
 //! Screen state and key handling. Every action ends in canned data from
 //! `mock`; nothing is built, downloaded or searched for real.
 
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -31,6 +34,8 @@ pub enum Mode {
     Search,
     Autocomplete,
     Reverse,
+    /// Many addresses at once, pasted as CSV.
+    Batch,
 }
 
 impl Mode {
@@ -39,6 +44,7 @@ impl Mode {
             Self::Search => "search",
             Self::Autocomplete => "autocomplete",
             Self::Reverse => "reverse",
+            Self::Batch => "batch",
         }
     }
 
@@ -46,7 +52,8 @@ impl Mode {
         match self {
             Self::Search => Self::Autocomplete,
             Self::Autocomplete => Self::Reverse,
-            Self::Reverse => Self::Search,
+            Self::Reverse => Self::Batch,
+            Self::Batch => Self::Search,
         }
     }
 }
@@ -55,6 +62,12 @@ pub const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
 pub const MEMORY_STEPS_GB: [u32; 5] = [2, 4, 6, 8, 12];
 /// Rows of the region list, so the box keeps one height while browsing.
 pub const REGION_ROWS: usize = 13;
+
+/// One pasted address and the best answer for it.
+pub struct BatchRow {
+    pub input: String,
+    pub hit: Option<(&'static mock::Record, f64)>,
+}
 
 /// One row of the region list.
 pub struct RegionRow {
@@ -153,6 +166,10 @@ pub struct App {
     pub hit_cursor: usize,
     pub json_scroll: usize,
     pub json_all: bool,
+    /// What was pasted or typed in batch mode: CSV text, or a file path.
+    pub batch_text: String,
+    pub batch_rows: Vec<BatchRow>,
+    pub batch_note: String,
 }
 
 impl App {
@@ -188,6 +205,9 @@ impl App {
             hit_cursor: 0,
             json_scroll: 0,
             json_all: false,
+            batch_text: String::new(),
+            batch_rows: Vec::new(),
+            batch_note: String::new(),
         }
     }
 
@@ -357,6 +377,7 @@ impl App {
             Mode::Reverse => mock::point(&self.query)
                 .map(|(lat, lon)| mock::reverse(lat, lon))
                 .unwrap_or_default(),
+            Mode::Batch => self.batch_rows.iter().filter_map(|row| row.hit).collect(),
         }
     }
 
@@ -426,13 +447,16 @@ impl App {
                 let pack = &self.packs[self.home_cursor];
                 self.active_name = pack.name.to_string();
                 self.active_records = pack.records;
-                self.open_query();
+                self.open_query(Mode::Search);
             }
             KeyCode::Char('v') if !on_build => {
                 self.flash("Serving is not wired in this preview.");
             }
             KeyCode::Char('g') if !on_build => {
-                self.flash("Geocoding a file is not wired in this preview.");
+                let pack = &self.packs[self.home_cursor];
+                self.active_name = pack.name.to_string();
+                self.active_records = pack.records;
+                self.open_query(Mode::Batch);
             }
             KeyCode::Char('m') if !on_build => {
                 self.flash("More is not wired in this preview.");
@@ -594,7 +618,7 @@ impl App {
                     self.scrollback.extend(ui::done_summary(self));
                     self.active_name = self.region.name.clone();
                     self.active_records = mock::PACK.records;
-                    self.open_query();
+                    self.open_query(Mode::Search);
                 }
                 1 => self.flash("Serving is not wired in this preview."),
                 _ => {
@@ -610,14 +634,18 @@ impl App {
         }
     }
 
-    fn open_query(&mut self) {
+    fn open_query(&mut self, mode: Mode) {
         self.query.clear();
-        self.mode = Mode::Search;
+        self.mode = mode;
         self.hit_cursor = 0;
         self.screen = Screen::Query;
     }
 
     fn query_key(&mut self, key: KeyEvent) {
+        if self.mode == Mode::Batch {
+            self.batch_key(key);
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let hits = self.hits().len();
         match key.code {
@@ -643,7 +671,7 @@ impl App {
             }
             KeyCode::Esc => {
                 if self.query.is_empty() {
-                    self.quit = true;
+                    self.screen = Screen::Home;
                 } else {
                     self.query.clear();
                     self.hit_cursor = 0;
@@ -656,6 +684,110 @@ impl App {
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
                 self.hit_cursor = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Batch mode edits a block of text: a terminal that does not mark a
+    /// paste sends it as keys, so Enter adds a line instead of submitting.
+    fn batch_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let rows = self.batch_rows.len();
+        match key.code {
+            KeyCode::Tab => {
+                self.mode = self.mode.next();
+                self.hit_cursor = 0;
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.mode = Mode::Reverse;
+                self.query.clear();
+                self.hit_cursor = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.batch_text.clear();
+                self.refresh_batch();
+            }
+            KeyCode::Char('g') if ctrl => {
+                if self
+                    .batch_rows
+                    .get(self.hit_cursor)
+                    .is_some_and(|row| row.hit.is_some())
+                {
+                    self.json_scroll = 0;
+                    self.json_all = false;
+                    self.screen = Screen::Json;
+                } else {
+                    self.flash("That row has no match to show.");
+                }
+            }
+            KeyCode::Char('j') if ctrl => self.push_batch("\n"),
+            KeyCode::Enter => self.push_batch("\n"),
+            KeyCode::Up if rows > 0 => self.hit_cursor = (self.hit_cursor + rows - 1) % rows,
+            KeyCode::Down if rows > 0 => self.hit_cursor = (self.hit_cursor + 1) % rows,
+            KeyCode::Esc => {
+                if self.batch_text.is_empty() {
+                    self.screen = Screen::Home;
+                } else {
+                    self.batch_text.clear();
+                    self.refresh_batch();
+                }
+            }
+            KeyCode::Backspace => {
+                self.batch_text.pop();
+                self.refresh_batch();
+            }
+            KeyCode::Char(c) if !ctrl => self.push_batch(c.encode_utf8(&mut [0; 4])),
+            _ => {}
+        }
+    }
+
+    fn push_batch(&mut self, text: &str) {
+        self.batch_text.push_str(text);
+        self.refresh_batch();
+    }
+
+    /// Reads the batch text again and looks up every address in it. A single
+    /// line that names a CSV file reads that file instead.
+    fn refresh_batch(&mut self) {
+        let typed = self.batch_text.trim().trim_matches('"');
+        let from_file = (!typed.is_empty() && !typed.contains('\n'))
+            .then(|| Path::new(typed))
+            .filter(|path| {
+                path.metadata()
+                    .is_ok_and(|meta| meta.is_file() && meta.len() < 5_000_000)
+            })
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let (addresses, mut note) =
+            mock::batch_parse(from_file.as_deref().unwrap_or(&self.batch_text));
+        if from_file.is_some() {
+            note.push_str(", from a file");
+        }
+        self.batch_rows = addresses
+            .into_iter()
+            .map(|input| BatchRow {
+                hit: mock::search(&input).into_iter().next(),
+                input,
+            })
+            .collect();
+        self.batch_note = note;
+        self.hit_cursor = self.hit_cursor.min(self.batch_rows.len().saturating_sub(1));
+    }
+
+    /// Text pasted into the terminal as one piece.
+    pub fn on_paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        match self.screen {
+            Screen::Query if self.mode == Mode::Batch => self.push_batch(&text),
+            Screen::Query => {
+                self.query
+                    .push_str(text.lines().next().unwrap_or("").trim());
+                self.hit_cursor = 0;
+            }
+            Screen::Region => {
+                self.region_query
+                    .push_str(text.lines().next().unwrap_or("").trim());
+                self.region_reset(0);
             }
             _ => {}
         }

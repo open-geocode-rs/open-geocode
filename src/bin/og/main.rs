@@ -18,8 +18,10 @@ use std::{
 use ratatui::{
     DefaultTerminal, TerminalOptions, Viewport,
     crossterm::{
-        event::{self, Event, KeyEventKind},
-        terminal,
+        cursor::{MoveTo, Show},
+        event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
+        execute,
+        terminal::{self, Clear, ClearType},
     },
     widgets::{Paragraph, Widget},
 };
@@ -45,9 +47,11 @@ fn main() -> io::Result<()> {
     let empty = std::env::args().any(|arg| arg == "--empty");
     let mut app = App::new(empty);
     let mut terminal = ratatui::init_with_options(TerminalOptions { viewport });
+    // A terminal that supports it marks pasted text, so a pasted CSV arrives
+    // in one piece. The others send it as keys.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, &mut app, inline);
-    let cleared = terminal.clear();
-    ratatui::restore();
+    let left = leave(&mut terminal, inline);
     // Without scrollback, what the window would have pushed up is printed
     // as plain lines once the screen is back.
     for line in &app.scrollback {
@@ -61,7 +65,27 @@ fn main() -> io::Result<()> {
     for line in &app.farewell {
         println!("  {line}");
     }
-    result.and(cleared)
+    result.and(left)
+}
+
+/// Gives the terminal back. The window is erased from its first row down, so
+/// the shell prompt returns where the window began and nothing is left to
+/// clear by hand.
+fn leave(terminal: &mut DefaultTerminal, inline: bool) -> io::Result<()> {
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let erased = if inline {
+        let top = terminal.get_frame().area().y;
+        execute!(
+            io::stdout(),
+            MoveTo(0, top),
+            Clear(ClearType::FromCursorDown),
+            Show
+        )
+    } else {
+        Ok(())
+    };
+    ratatui::restore();
+    erased
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Result<()> {
@@ -70,11 +94,19 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
             print_scrollback(terminal, app)?;
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(Duration::from_millis(40))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.on_key(key);
+        if event::poll(Duration::from_millis(40))? {
+            // Take everything waiting before drawing again: a paste sent as
+            // keys is thousands of events.
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Paste(text) => app.on_paste(text),
+                    _ => {}
+                }
+                if app.quit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
         }
         app.tick();
     }
@@ -129,6 +161,20 @@ mod preview {
                 .collect();
             println!("{}", row.trim_end());
         }
+    }
+
+    #[test]
+    fn batch_mode() {
+        let mut app = App::new(false);
+        press(&mut app, &[KeyCode::Char('g')]);
+        show(&app, "batch empty");
+        app.on_paste(
+            "address,id\n100 queen st w toronto,1\n24 sussex dr ottawa,2\n1 yonge st toronto,3\nnowhere road,4\n"
+                .to_string(),
+        );
+        show(&app, "batch pasted");
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        show(&app, "batch geojson");
     }
 
     #[test]

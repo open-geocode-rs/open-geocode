@@ -751,3 +751,40 @@ pub fn count(value: f64) -> String {
         format!("{value:.0}")
     }
 }
+
+/// Reads pasted CSV into one address per row. A header with a column named
+/// like an address picks that column; without one every row is an address.
+/// Returns the addresses and a short note on how they were read.
+pub fn batch_parse(text: &str) -> (Vec<String>, String) {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(text.as_bytes());
+    let records: Vec<csv::StringRecord> = reader.records().filter_map(Result::ok).collect();
+    let column = records.first().and_then(|first| {
+        first.iter().position(|field| {
+            matches!(
+                field.trim().to_lowercase().as_str(),
+                "address" | "addr" | "full_address" | "query" | "q"
+            )
+        })
+    });
+    let (rows, note) = match column {
+        Some(_) => (&records[1..], "address column"),
+        None => (&records[..], "one address per row"),
+    };
+    let addresses = rows
+        .iter()
+        .map(|record| match column {
+            Some(index) => record.get(index).unwrap_or("").trim().to_string(),
+            None => record
+                .iter()
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+        .filter(|address| !address.is_empty())
+        .collect();
+    (addresses, note.to_string())
+}

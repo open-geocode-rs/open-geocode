@@ -318,8 +318,6 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(plain("Pick a region and extra sources.")),
             Line::from(plain("og downloads the open data and")),
             Line::from(plain("builds the Pack on this machine.")),
-            Line::raw(""),
-            action_line("enter", "Start"),
         ]
     } else {
         pack_detail(&app.packs[app.home_cursor])
@@ -333,7 +331,7 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
             ("↑↓", "move"),
             ("enter", "search"),
             ("v", "serve"),
-            ("g", "geocode a file"),
+            ("g", "batch geocode"),
         ];
         if app.packs[app.home_cursor].update.is_some() {
             hints.push(("u", "update"));
@@ -378,11 +376,6 @@ fn detail_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![span(pad(label, 10), DIM), plain(value)])
 }
 
-/// A key and what it does: `v        Serve the API`.
-fn action_line(key: &str, label: &str) -> Line<'static> {
-    Line::from(vec![bold(pad(key, 8)), plain(label.to_string())])
-}
-
 fn pack_detail(pack: &mock::SamplePack) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(bold(pack.name)),
@@ -397,15 +390,7 @@ fn pack_detail(pack: &mock::SamplePack) -> Vec<Line<'static>> {
     if let Some(date) = pack.update {
         lines.push(Line::from(span("↑ Update available", ACCENT)));
         lines.push(Line::from(span(format!("  Newer data from {date}"), DIM)));
-        lines.push(Line::raw(""));
     }
-    lines.push(action_line("enter", "Search"));
-    lines.push(action_line("v", "Serve the API"));
-    lines.push(action_line("g", "Geocode a file"));
-    if pack.update.is_some() {
-        lines.push(action_line("u", "Update"));
-    }
-    lines.push(action_line("m", "More"));
     lines
 }
 
@@ -1006,7 +991,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(6),
+        Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -1023,7 +1008,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         header,
     );
     let mut tabs = Vec::new();
-    for mode in [Mode::Search, Mode::Autocomplete, Mode::Reverse] {
+    for mode in [Mode::Search, Mode::Autocomplete, Mode::Reverse, Mode::Batch] {
         tabs.push(if mode == app.mode {
             Span::styled(
                 format!(" {} ", mode.name()),
@@ -1041,9 +1026,15 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Search => "try: 100 queen st w toronto",
         Mode::Autocomplete => "type a few letters: cn tow",
         Mode::Reverse => "lat, lon   try: 43.6535, -79.3839",
+        Mode::Batch => "paste a CSV, one address per row, or type a file path",
+    };
+    let typed = if app.mode == Mode::Batch {
+        batch_input(app)
+    } else {
+        app.query.clone()
     };
     frame.render_widget(
-        Paragraph::new(input_line(&app.query, placeholder)).block(
+        Paragraph::new(input_line(&typed, placeholder)).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(FAINT)),
@@ -1052,6 +1043,27 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     let parsed_line = match app.mode {
+        Mode::Batch if app.batch_rows.is_empty() => Line::raw(""),
+        Mode::Batch => {
+            let matched = app
+                .batch_rows
+                .iter()
+                .filter(|row| row.hit.is_some())
+                .count();
+            Line::from(vec![
+                span("  ", DIM),
+                bold(app.batch_rows.len().to_string()),
+                span(format!(" rows  ·  {}  ·  ", app.batch_note), DIM),
+                span(
+                    format!("{matched} matched"),
+                    if matched == app.batch_rows.len() {
+                        OK
+                    } else {
+                        DIM
+                    },
+                ),
+            ])
+        }
         Mode::Reverse => match mock::point(&app.query) {
             Some((lat, lon)) => Line::from(vec![
                 span("  point   ", DIM),
@@ -1081,9 +1093,10 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
     frame.render_widget(Paragraph::new(parsed_line), parsed);
-    if !app.query.is_empty() {
+    if !app.query.is_empty() || !app.batch_rows.is_empty() && app.mode == Mode::Batch {
         let millis = match app.mode {
             Mode::Autocomplete => 1 + app.query.len() % 3,
+            Mode::Batch => 2 + app.batch_rows.len() / 40,
             _ => 3 + app.query.len() % 5,
         };
         frame.render_widget(
@@ -1093,14 +1106,16 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let hits = app.hits();
-    let lines: Vec<Line> = if app.query.is_empty() {
+    let lines: Vec<Line> = if app.mode == Mode::Batch {
+        batch_table(app, results)
+    } else if app.query.is_empty() {
         vec![
             Line::from(span(
                 "  Results follow each key you type. Enter shows the picked result as GeoJSON.",
                 DIM,
             )),
             Line::from(span(
-                "  Tab switches between search, autocomplete and reverse.",
+                "  Tab switches between search, autocomplete, reverse and batch.",
                 DIM,
             )),
         ]
@@ -1116,8 +1131,27 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(lines), results);
 
+    if app.mode == Mode::Batch {
+        let esc = if app.batch_text.is_empty() {
+            "back"
+        } else {
+            "clear"
+        };
+        footer(
+            frame,
+            app,
+            &[
+                ("↑↓", "pick"),
+                ("ctrl+g", "GeoJSON"),
+                ("ctrl+u", "clear"),
+                ("tab", "mode"),
+                ("esc", esc),
+            ],
+        );
+        return;
+    }
     let esc = if app.query.is_empty() {
-        "quit"
+        "back"
     } else {
         "clear"
     };
@@ -1132,6 +1166,94 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
             ("esc", esc),
         ],
     );
+}
+
+/// What the batch box shows: the text typed, or how much was pasted.
+fn batch_input(app: &App) -> String {
+    if app.batch_text.contains('\n') {
+        let lines = app
+            .batch_text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        format!("{lines} lines pasted")
+    } else {
+        app.batch_text.clone()
+    }
+}
+
+/// Cuts text to a number of cells, ending it with an ellipsis.
+fn cut(text: &str, cells: usize) -> String {
+    if width(text) > cells {
+        let keep: String = text.chars().take(cells.saturating_sub(1)).collect();
+        format!("{keep}…")
+    } else {
+        text.to_string()
+    }
+}
+
+/// The pasted addresses with the answer for each.
+fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
+    let rows = &app.batch_rows;
+    if rows.is_empty() {
+        return vec![
+            Line::from(span(
+                "  Paste a CSV with one address per row, or type the path of a file.",
+                DIM,
+            )),
+            Line::from(span(
+                "  A column named address is used; without one, each row is one address.",
+                DIM,
+            )),
+            Line::raw(""),
+            Line::from(span("  address", FAINT)),
+            Line::from(span("  100 queen st w toronto", FAINT)),
+            Line::from(span("  24 sussex dr ottawa", FAINT)),
+        ];
+    }
+    let inner = area.width as usize;
+    let address_width = 26.min(inner / 3);
+    let match_width = inner.saturating_sub(3 + 4 + address_width + 2 + 2 + 2 + 5 + 1);
+    let capacity = (area.height as usize).saturating_sub(1).max(1);
+    let start = (app.hit_cursor + 1).saturating_sub(capacity);
+    let mut lines = vec![Line::from(span(
+        format!(
+            "   {:>3}  {}  {}  {:>5}",
+            "#",
+            pad("Address", address_width),
+            pad("Match", match_width + 2),
+            "Score"
+        ),
+        FAINT,
+    ))];
+    for (index, row) in rows.iter().enumerate().skip(start).take(capacity) {
+        let selected = index == app.hit_cursor;
+        let address = pad(&cut(&row.input, address_width), address_width);
+        let mut spans = vec![
+            if selected {
+                span(" ❯ ", ACCENT)
+            } else {
+                plain("   ")
+            },
+            span(format!("{:>3}  ", index + 1), DIM),
+            if selected {
+                bold(address)
+            } else {
+                plain(address)
+            },
+            plain("  "),
+        ];
+        match row.hit {
+            Some((record, value)) => {
+                spans.push(span("✓ ", OK));
+                spans.push(plain(pad(&cut(record.label, match_width), match_width)));
+                spans.push(span(format!("  {value:>5.2}"), DIM));
+            }
+            None => spans.push(span("– no match", DIM)),
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 fn hit_row(record: &Record, value: f64, mode: Mode, selected: bool) -> Line<'static> {
@@ -1253,10 +1375,18 @@ fn feature(record: &Record, value: f64, mode: Mode, row: usize) -> Json {
 /// The answer as the API would return it, one styled line per JSON line.
 pub fn json_lines(app: &App) -> Vec<Line<'static>> {
     let hits = app.hits();
-    let picked: Vec<(usize, &(&Record, f64))> = if app.json_all {
-        hits.iter().enumerate().collect()
+    let picked: Vec<(usize, (&Record, f64))> = if app.mode == Mode::Batch {
+        app.batch_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, batch)| batch.hit.map(|hit| (row, hit)))
+            .filter(|(row, _)| app.json_all || *row == app.hit_cursor)
+            .collect()
+    } else if app.json_all {
+        hits.iter().copied().enumerate().collect()
     } else {
         hits.iter()
+            .copied()
             .enumerate()
             .skip(app.hit_cursor)
             .take(1)
@@ -1271,6 +1401,13 @@ pub fn json_lines(app: &App) -> Vec<Line<'static>> {
                     ("lon", Json::Num(format!("{lon}"))),
                     ("lat", Json::Num(format!("{lat}"))),
                 ]),
+            ),
+        ],
+        (Mode::Batch, _) => vec![
+            ("version", string("1")),
+            (
+                "query",
+                string(&format!("batch of {} rows", app.batch_rows.len())),
             ),
         ],
         _ => vec![
@@ -1288,7 +1425,7 @@ pub fn json_lines(app: &App) -> Vec<Line<'static>> {
             Json::Arr(
                 picked
                     .into_iter()
-                    .map(|(row, (record, value))| feature(record, *value, app.mode, row))
+                    .map(|(row, (record, value))| feature(record, value, app.mode, row))
                     .collect(),
             ),
         ),
@@ -1366,13 +1503,20 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(area);
     let hits = app.hits();
+    let batch = app.mode == Mode::Batch;
     let what = if app.json_all {
         format!("  all {} results", hits.len())
+    } else if batch {
+        format!("  row {} of {}", app.hit_cursor + 1, app.batch_rows.len())
     } else {
         format!("  result {} of {}", app.hit_cursor + 1, hits.len())
     };
-    let label = hits
-        .get(app.hit_cursor)
+    let shown = if batch {
+        app.batch_rows.get(app.hit_cursor).and_then(|row| row.hit)
+    } else {
+        hits.get(app.hit_cursor).copied()
+    };
+    let label = shown
         .filter(|_| !app.json_all)
         .map(|(record, _)| format!(" · {}", record.label))
         .unwrap_or_default();
