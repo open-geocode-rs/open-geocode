@@ -357,7 +357,7 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
 }
 
 /// Field separators a delimited file may use, most common first.
-const DELIMITERS: [u8; 4] = [b',', b';', b'\t', b'|'];
+const DELIMITERS: [u8; 4] = *b",;\t|";
 /// Bytes read from the start of a file to find its separator.
 const SNIFF_BYTES: usize = 64 << 10;
 

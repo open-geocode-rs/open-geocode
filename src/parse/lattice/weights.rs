@@ -492,8 +492,10 @@ impl<'a> Reader<'a> {
     fn floats(&mut self, count: usize) -> Result<Vec<f32>> {
         Ok(self
             .take(count * 4)?
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect())
     }
 }
