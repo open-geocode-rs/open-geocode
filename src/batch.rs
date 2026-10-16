@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     fs::File,
@@ -11,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use csv::{ReaderBuilder, WriterBuilder};
+use csv::{ByteRecord, ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 
 use crate::{
@@ -24,6 +25,15 @@ use crate::{
 /// keep equal to [`audit_columns`].
 pub const AUDIT_COLUMNS_FILE: &str = "batch-audit-columns.txt";
 
+/// A column of the input: by its header name, matched without regard to
+/// ASCII case, or by its place from 0, which also tells apart columns that
+/// share a name or have none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Column {
+    Named(String),
+    At(usize),
+}
+
 #[derive(Clone)]
 pub struct BatchGeocodeOptions {
     pub pack: Option<PathBuf>,
@@ -35,10 +45,12 @@ pub struct BatchGeocodeOptions {
     /// columns are named `column_1`, `column_2` and so on, and the output
     /// starts with those names.
     pub header_row: bool,
-    pub address_field_groups: Vec<Vec<String>>,
-    pub locality_field: Option<String>,
-    pub region_field: Option<String>,
-    pub postcode_field: Option<String>,
+    /// Groups of columns, each joined into one query; tried in order until
+    /// one resolves.
+    pub address_field_groups: Vec<Vec<Column>>,
+    pub locality_field: Option<Column>,
+    pub region_field: Option<Column>,
+    pub postcode_field: Option<Column>,
     pub layer: Option<String>,
     pub limit: usize,
     pub lat_column: String,
@@ -151,6 +163,46 @@ struct JoinedCoordinate {
     audit_fields: HashMap<String, String>,
 }
 
+/// The input columns a run reads, by place.
+struct Fields {
+    groups: Vec<Vec<usize>>,
+    locality: Option<usize>,
+    region: Option<usize>,
+    postcode: Option<usize>,
+}
+
+impl Fields {
+    /// The places of the columns `options` names, among `headers`. A column
+    /// the input does not have is an error, not a column that is always
+    /// empty.
+    fn resolve(options: &BatchGeocodeOptions, headers: &[String]) -> Result<Self> {
+        let lookup = header_lookup(headers);
+        let place = |column: &Column| -> Result<usize> {
+            match column {
+                Column::Named(name) => find_header(&lookup, name)
+                    .with_context(|| format!("{} has no column {name:?}", options.input.display())),
+                Column::At(index) if *index < headers.len() => Ok(*index),
+                Column::At(index) => bail!(
+                    "{} has {} columns, none at place {index}",
+                    options.input.display(),
+                    headers.len()
+                ),
+            }
+        };
+        let optional = |column: &Option<Column>| column.as_ref().map(place).transpose();
+        Ok(Self {
+            groups: options
+                .address_field_groups
+                .iter()
+                .map(|group| group.iter().map(place).collect())
+                .collect::<Result<_>>()?,
+            locality: optional(&options.locality_field)?,
+            region: optional(&options.region_field)?,
+            postcode: optional(&options.postcode_field)?,
+        })
+    }
+}
+
 const AUDIT_PREFIX: &str = "geocode_";
 
 /// The columns the audit CSV appends to the input's, in order.
@@ -183,6 +235,10 @@ const BATCH_CHUNK_ROWS: usize = 50_000;
 /// Geocode a CSV in streaming chunks. Within a chunk, rows are looked up in
 /// parallel and grouped by postcode and place, so neighbouring lookups touch
 /// the same index and record pages; output rows keep the input order.
+///
+/// The output and the audit carry the input's own bytes, row for row, with
+/// the coordinates written in: only the columns a lookup reads are decoded,
+/// so text in another encoding than UTF-8 comes out as it went in.
 pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeReport> {
     if options.address_field_groups.is_empty() == options.join.is_none() {
         bail!("provide either --address-fields or --join-coordinates-from, but not both");
@@ -192,8 +248,8 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
     let delimiter = detect_delimiter(&options.input)?;
     let mut reader = open_delimited(&options.input, delimiter)?;
     let mut records = reader.byte_records();
-    let original_headers = if options.header_row {
-        let first = records
+    let header = if options.header_row {
+        records
             .next()
             .transpose()
             .with_context(|| {
@@ -202,25 +258,31 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
                     options.input.display()
                 )
             })?
-            .unwrap_or_default();
-        header_names(&first)
+            .unwrap_or_default()
     } else {
-        unnamed_columns(&options.input)?
+        unnamed_columns(&options.input)?.iter().collect()
     };
-    let lookup = header_lookup(&original_headers);
+    let original_headers = cells(&header);
+    let fields = Fields::resolve(&options, &original_headers)?;
     let mut output_headers = original_headers.clone();
     let coordinate_columns = ensure_coordinate_columns(
         &mut output_headers,
         &options.lat_column,
         &options.lon_column,
     )?;
-    let mut audit_headers = original_headers.clone();
-    audit_headers.extend(audit_columns());
+    let mut output_header = header.clone();
+    for added in &output_headers[original_headers.len()..] {
+        output_header.push_field(added.as_bytes());
+    }
+    let mut audit_header = header;
+    for column in audit_columns() {
+        audit_header.push_field(column.as_bytes());
+    }
 
     let resolver = match options.join.as_ref() {
         Some(join) => Resolver::Join {
             lookup: read_join_lookup(join)?,
-            key_index: find_header(&lookup, &join.key_column)
+            key_index: find_header(&header_lookup(&original_headers), &join.key_column)
                 .with_context(|| format!("missing join key column {:?}", join.key_column))?,
         },
         None => {
@@ -242,11 +304,11 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
         }
     };
 
-    let mut output = create_csv(&options.output, &output_headers, delimiter)?;
+    let mut output = create_csv(&options.output, &output_header, delimiter)?;
     let mut audit = options
         .audit
         .as_ref()
-        .map(|path| create_csv(path, &audit_headers, delimiter))
+        .map(|path| create_csv(path, &audit_header, delimiter))
         .transpose()?;
     let mut report = BatchGeocodeReport {
         rows: 0,
@@ -260,29 +322,25 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
             .by_ref()
             .take(BATCH_CHUNK_ROWS)
             .map(|record| {
-                Ok(cells(&record.with_context(|| {
+                record.with_context(|| {
                     format!("failed to read CSV record from {}", options.input.display())
-                })?))
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         if chunk.is_empty() {
             break;
         }
-        let audits = resolver.resolve(&options, &lookup, &chunk, report.rows)?;
+        let audits = resolver.resolve(&options, &fields, &chunk, report.rows)?;
         for (row, row_audit) in chunk.iter().zip(audits) {
-            let mut output_row = padded_row(row, output_headers.len());
-            if !row_audit.lat.trim().is_empty() && !row_audit.lon.trim().is_empty() {
-                set_coordinate_values(
-                    &mut output_row,
-                    coordinate_columns,
-                    &row_audit.lat,
-                    &row_audit.lon,
-                );
-                report.resolved += 1;
-            }
-            output.write_record(&output_row)?;
+            let resolved = !row_audit.lat.trim().is_empty() && !row_audit.lon.trim().is_empty();
+            output.write_record(&output_record(
+                row,
+                output_headers.len(),
+                resolved.then_some((coordinate_columns, &row_audit)),
+            ))?;
+            report.resolved += usize::from(resolved);
             if let Some(audit) = &mut audit {
-                audit.write_record(audit_record(&original_headers, row, &row_audit))?;
+                audit.write_record(&audit_record(original_headers.len(), row, &row_audit))?;
             }
             report.rows += 1;
         }
@@ -356,22 +414,19 @@ pub fn open_delimited(path: &Path, delimiter: u8) -> Result<csv::Reader<File>> {
         .with_context(|| format!("failed to open {}", path.display()))
 }
 
-/// A row's cells as text. Bytes that are not UTF-8, such as a Latin-1
-/// file's accents, become replacement characters instead of failing the row.
-pub fn cells(record: &csv::ByteRecord) -> Vec<String> {
-    record
-        .iter()
-        .map(|cell| String::from_utf8_lossy(cell).into_owned())
-        .collect()
+/// The byte order mark some files start with.
+const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
+
+/// A cell as text. Bytes that are not UTF-8, such as a Latin-1 file's
+/// accents, become replacement characters instead of failing the row, and a
+/// byte order mark is left out.
+pub fn text(cell: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(cell.strip_prefix(BYTE_ORDER_MARK).unwrap_or(cell))
 }
 
-/// A header row's names, without the byte order mark some files start with.
-pub fn header_names(record: &csv::ByteRecord) -> Vec<String> {
-    let mut names = cells(record);
-    if let Some(first) = names.first_mut() {
-        *first = first.trim_start_matches('\u{feff}').to_string();
-    }
-    names
+/// A row's cells as [`text`].
+pub fn cells(record: &ByteRecord) -> Vec<String> {
+    record.iter().map(|cell| text(cell).into_owned()).collect()
 }
 
 /// Names for the columns of a CSV without a header row: `column_1`,
@@ -404,16 +459,16 @@ impl Resolver {
     fn resolve(
         &self,
         options: &BatchGeocodeOptions,
-        headers: &HashMap<String, usize>,
-        rows: &[Vec<String>],
+        fields: &Fields,
+        rows: &[ByteRecord],
         first_index: usize,
     ) -> Result<Vec<AuditFields>> {
         match self {
             Resolver::Join { lookup, key_index } => Ok(rows
                 .iter()
                 .map(|row| {
-                    let key = row.get(*key_index).map(String::as_str).unwrap_or_default();
-                    match lookup.get(key).filter(|joined| {
+                    let key = row.get(*key_index).map(text).unwrap_or_default();
+                    match lookup.get(key.as_ref()).filter(|joined| {
                         !joined.lat.trim().is_empty() && !joined.lon.trim().is_empty()
                     }) {
                         Some(joined) => audit_from_joined(joined),
@@ -429,7 +484,7 @@ impl Resolver {
                 .collect()),
             Resolver::Pack { pack, searcher } => {
                 let mut order = (0..rows.len()).collect::<Vec<_>>();
-                order.sort_by_cached_key(|&index| locality_key(&rows[index], options, headers));
+                order.sort_by_cached_key(|&index| locality_key(&rows[index], fields));
                 let mut results = order
                     .into_par_iter()
                     .map(|index| {
@@ -438,7 +493,7 @@ impl Resolver {
                         }
                         let started = Instant::now();
                         let (audit, feature) =
-                            geocode_row(pack, searcher, options, headers, &rows[index])?;
+                            geocode_row(pack, searcher, options, fields, &rows[index])?;
                         if let Some(observer) = &options.observer {
                             observer.row(&BatchRow {
                                 index: first_index + index,
@@ -458,30 +513,27 @@ impl Resolver {
 }
 
 /// Group key: rows in the same postcode and place are geocoded together.
-fn locality_key(
-    row: &[String],
-    options: &BatchGeocodeOptions,
-    headers: &HashMap<String, usize>,
-) -> [String; 4] {
-    let field = |name: Option<&str>| {
-        field_value(row, headers, name)
+fn locality_key(row: &ByteRecord, fields: &Fields) -> [String; 4] {
+    let field = |index: Option<usize>| {
+        field_value(row, index)
             .map(|value| value.to_lowercase())
             .unwrap_or_default()
     };
     [
-        field(options.postcode_field.as_deref()).replace(' ', ""),
-        field(options.region_field.as_deref()),
-        field(options.locality_field.as_deref()),
-        options
-            .address_field_groups
+        field(fields.postcode).replace(' ', ""),
+        field(fields.region),
+        field(fields.locality),
+        fields
+            .groups
             .first()
-            .and_then(|group| compose_query(row, headers, group))
+            .and_then(|group| compose_query(row, group))
             .unwrap_or_default()
             .to_lowercase(),
     ]
 }
 
-pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<String>>> {
+/// `--address-fields` values: each a comma-separated group of column names.
+pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<Column>>> {
     values
         .iter()
         .map(|value| {
@@ -489,7 +541,7 @@ pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<String>>> {
                 .split(',')
                 .map(str::trim)
                 .filter(|field| !field.is_empty())
-                .map(str::to_string)
+                .map(|field| Column::Named(field.to_string()))
                 .collect::<Vec<_>>();
             if fields.is_empty() {
                 bail!("address field group must include at least one column")
@@ -503,16 +555,16 @@ fn geocode_row(
     pack: &PackReader,
     searcher: &PackTextSearcher,
     options: &BatchGeocodeOptions,
-    headers: &HashMap<String, usize>,
-    row: &[String],
+    fields: &Fields,
+    row: &ByteRecord,
 ) -> Result<(AuditFields, Option<ForwardFeature>)> {
-    let locality = field_value(row, headers, options.locality_field.as_deref());
-    let region = field_value(row, headers, options.region_field.as_deref());
-    let postcode = field_value(row, headers, options.postcode_field.as_deref());
+    let locality = field_value(row, fields.locality);
+    let region = field_value(row, fields.region);
+    let postcode = field_value(row, fields.postcode);
 
     let mut tried_queries = Vec::new();
-    for group in &options.address_field_groups {
-        let Some(address) = compose_query(row, headers, group) else {
+    for group in &fields.groups {
+        let Some(address) = compose_query(row, group) else {
             continue;
         };
         let response = searcher.geocode_address(AddressGeocodeOptions {
@@ -572,7 +624,7 @@ fn read_csv(path: &Path) -> Result<CsvTable> {
     Ok(CsvTable { headers, rows })
 }
 
-fn create_csv(path: &Path, headers: &[String], delimiter: u8) -> Result<PendingCsv> {
+fn create_csv(path: &Path, header: &ByteRecord, delimiter: u8) -> Result<PendingCsv> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -586,11 +638,9 @@ fn create_csv(path: &Path, headers: &[String], delimiter: u8) -> Result<PendingC
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let file = File::create(&temporary)
         .with_context(|| format!("failed to create {}", temporary.display()))?;
-    let mut writer = WriterBuilder::new()
-        .delimiter(delimiter)
-        .from_writer(file);
+    let mut writer = WriterBuilder::new().delimiter(delimiter).from_writer(file);
     writer
-        .write_record(headers)
+        .write_byte_record(header)
         .with_context(|| format!("failed to write headers to {}", path.display()))?;
     Ok(PendingCsv {
         writer,
@@ -610,13 +660,9 @@ struct PendingCsv {
 }
 
 impl PendingCsv {
-    fn write_record<I, T>(&mut self, record: I) -> Result<()>
-    where
-        I: IntoIterator<Item = T>,
-        T: AsRef<[u8]>,
-    {
+    fn write_record(&mut self, record: &ByteRecord) -> Result<()> {
         self.writer
-            .write_record(record)
+            .write_byte_record(record)
             .with_context(|| format!("failed to write a row to {}", self.path.display()))
     }
 
@@ -751,38 +797,38 @@ fn ensure_coordinate_columns(
     })
 }
 
-fn padded_row(row: &[String], len: usize) -> Vec<String> {
-    let mut padded = row.to_vec();
-    padded.resize(len, String::new());
-    padded
+/// An input row as the output writes it: its own cells, as many as the
+/// output has columns, with the coordinates written in when it resolved.
+fn output_record(
+    row: &ByteRecord,
+    width: usize,
+    resolved: Option<(CoordinateColumns, &AuditFields)>,
+) -> ByteRecord {
+    let mut record = ByteRecord::with_capacity(row.as_slice().len(), width);
+    for index in 0..width {
+        let cell = match resolved {
+            Some((columns, audit)) if index == columns.lat_index => audit.lat.as_bytes(),
+            Some((columns, audit)) if index == columns.lon_index => audit.lon.as_bytes(),
+            _ => row.get(index).unwrap_or_default(),
+        };
+        record.push_field(cell);
+    }
+    record
 }
 
-fn set_coordinate_values(row: &mut [String], columns: CoordinateColumns, lat: &str, lon: &str) {
-    row[columns.lat_index] = lat.to_string();
-    row[columns.lon_index] = lon.to_string();
-}
-
-fn field_value(
-    row: &[String],
-    headers: &HashMap<String, usize>,
-    field: Option<&str>,
-) -> Option<String> {
-    let index = find_header(headers, field?)?;
-    let value = row.get(index)?.trim();
+/// The text of a cell, trimmed, or `None` when there is none.
+fn field_value(row: &ByteRecord, index: Option<usize>) -> Option<String> {
+    let value = text(row.get(index?)?);
+    let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn compose_query(
-    row: &[String],
-    headers: &HashMap<String, usize>,
-    fields: &[String],
-) -> Option<String> {
-    let parts = fields
+/// The cells of `columns` with their whitespace collapsed, joined by `, `.
+fn compose_query(row: &ByteRecord, columns: &[usize]) -> Option<String> {
+    let parts = columns
         .iter()
-        .filter_map(|field| {
-            let index = find_header(headers, field)?;
-            let value = row
-                .get(index)?
+        .filter_map(|index| {
+            let value = text(row.get(*index)?)
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -792,12 +838,16 @@ fn compose_query(
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-fn audit_record(headers: &[String], row: &[String], audit: &AuditFields) -> Vec<String> {
-    let mut record = padded_row(row, headers.len());
-    record.push(audit.status.clone());
-    record.push(audit.query.clone());
-    record.extend(audit.result.iter().cloned());
-    record.push(audit.reason.clone());
+/// An input row as the audit writes it: its own cells, as many as the input
+/// has columns, then the audit's.
+fn audit_record(width: usize, row: &ByteRecord, audit: &AuditFields) -> ByteRecord {
+    let mut record = output_record(row, width, None);
+    record.push_field(audit.status.as_bytes());
+    record.push_field(audit.query.as_bytes());
+    for value in &audit.result {
+        record.push_field(value.as_bytes());
+    }
+    record.push_field(audit.reason.as_bytes());
     record
 }
 
@@ -853,11 +903,12 @@ mod tests {
             "street2,postalcode".to_string(),
         ])
         .expect("parse groups");
+        let named = |name: &str| Column::Named(name.to_string());
         assert_eq!(
             groups,
             vec![
-                vec!["street1".to_string(), "city".to_string()],
-                vec!["street2".to_string(), "postalcode".to_string()]
+                vec![named("street1"), named("city")],
+                vec![named("street2"), named("postalcode")]
             ]
         );
     }
@@ -882,22 +933,8 @@ mod tests {
 
     #[test]
     fn composes_query_from_configured_fields() {
-        let headers = vec![
-            "street".to_string(),
-            "city".to_string(),
-            "postalcode".to_string(),
-        ];
-        let lookup = header_lookup(&headers);
-        let row = vec![
-            "  1333   Sheppard Ave E ".to_string(),
-            "Toronto".to_string(),
-            "M3C 1J4".to_string(),
-        ];
-        let query = compose_query(
-            &row,
-            &lookup,
-            &["street".to_string(), "postalcode".to_string()],
-        );
+        let row = ByteRecord::from(vec!["  1333   Sheppard Ave E ", "Toronto", "M3C 1J4"]);
+        let query = compose_query(&row, &[0, 2]);
         assert_eq!(query.as_deref(), Some("1333 Sheppard Ave E, M3C 1J4"));
     }
 
@@ -954,7 +991,7 @@ mod tests {
             input,
             output: root.join("out.csv"),
             audit: Some(root.join("audit.csv")),
-            address_field_groups: vec![vec!["street".into()]],
+            address_field_groups: vec![vec![Column::Named("street".into())]],
             limit: 5,
             ..BatchGeocodeOptions::default()
         })
@@ -999,7 +1036,7 @@ mod tests {
             input: bare.clone(),
             output: root.join("bare-out.csv"),
             header_row: false,
-            address_field_groups: vec![vec!["column_2".into()]],
+            address_field_groups: vec![vec![Column::Named("column_2".into())]],
             observer: Some(Arc::clone(&rows) as Arc<dyn BatchObserver>),
             ..BatchGeocodeOptions::default()
         })
@@ -1017,7 +1054,7 @@ mod tests {
             input: bare,
             output: root.join("stopped.csv"),
             header_row: false,
-            address_field_groups: vec![vec!["column_2".into()]],
+            address_field_groups: vec![vec![Column::Named("column_2".into())]],
             cancel: Arc::new(AtomicBool::new(true)),
             ..BatchGeocodeOptions::default()
         })
@@ -1027,7 +1064,7 @@ mod tests {
 
         // A file as offices export it: a byte order mark, semicolons, a
         // Latin-1 byte, a short row. It is read as it is and written back
-        // with its own separator.
+        // with its own separator and its own bytes.
         let messy = root.join("messy.csv");
         let mut bytes = b"\xef\xbb\xbfID;STRASSE;ORT\n".to_vec();
         bytes.extend_from_slice(b"1;20 Queen St;Z\xfcrich\n2;10 King Street\n");
@@ -1037,16 +1074,39 @@ mod tests {
             pack: Some(root.join("pack")),
             input: messy,
             output: root.join("messy-out.csv"),
-            address_field_groups: vec![vec!["strasse".into()]],
+            address_field_groups: vec![vec![Column::Named("strasse".into())]],
             ..BatchGeocodeOptions::default()
         })
         .expect("batch of a messy file");
         assert_eq!(report.resolved, 2);
-        let output = std::fs::read_to_string(root.join("messy-out.csv")).expect("output");
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines[0], "ID;STRASSE;ORT;lat;lon");
-        assert_eq!(lines[1], "1;20 Queen St;Z\u{fffd}rich;43.6000000;-79.4100000");
-        assert_eq!(lines[2], "2;10 King Street;;43.6000000;-79.4000000");
+        let output = std::fs::read(root.join("messy-out.csv")).expect("output");
+        let lines: Vec<&[u8]> = output.split(|byte| *byte == b'\n').collect();
+        assert_eq!(lines[0], b"\xef\xbb\xbfID;STRASSE;ORT;lat;lon");
+        assert_eq!(lines[1], b"1;20 Queen St;Z\xfcrich;43.6000000;-79.4100000");
+        assert_eq!(lines[2], b"2;10 King Street;;43.6000000;-79.4000000");
+
+        // Columns picked by place, where names cannot tell them apart; a
+        // name the file does not have is an error.
+        let twins = root.join("twins.csv");
+        std::fs::write(&twins, "street,street,\nnowhere,10 King Street,x\n").expect("input");
+        let report = run_batch_geocode(BatchGeocodeOptions {
+            pack: Some(root.join("pack")),
+            input: twins.clone(),
+            output: root.join("twins-out.csv"),
+            address_field_groups: vec![vec![Column::At(1)]],
+            ..BatchGeocodeOptions::default()
+        })
+        .expect("batch by place");
+        assert_eq!(report.resolved, 1);
+        let error = run_batch_geocode(BatchGeocodeOptions {
+            pack: Some(root.join("pack")),
+            input: twins,
+            output: root.join("twins-missing.csv"),
+            address_field_groups: vec![vec![Column::Named("adresse".into())]],
+            ..BatchGeocodeOptions::default()
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no column"), "{error:#}");
     }
 
     #[test]
@@ -1106,16 +1166,23 @@ a,43.6,-79.4
 
     #[test]
     fn pads_rows_before_writing_coordinates() {
-        let mut row = padded_row(&["1".to_string()], 3);
-        set_coordinate_values(
-            &mut row,
-            CoordinateColumns {
-                lat_index: 1,
-                lon_index: 2,
-            },
-            "43.1",
-            "-79.2",
+        let audit = AuditFields {
+            lat: "43.1".into(),
+            lon: "-79.2".into(),
+            ..AuditFields::default()
+        };
+        let columns = CoordinateColumns {
+            lat_index: 1,
+            lon_index: 2,
+        };
+        let row = ByteRecord::from(vec!["1"]);
+        assert_eq!(
+            output_record(&row, 3, Some((columns, &audit))),
+            ByteRecord::from(vec!["1", "43.1", "-79.2"])
         );
-        assert_eq!(row, vec!["1", "43.1", "-79.2"]);
+        assert_eq!(
+            output_record(&row, 3, None),
+            ByteRecord::from(vec!["1", "", ""])
+        );
     }
 }

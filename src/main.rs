@@ -12,7 +12,9 @@ use serde_json::Value;
 use open_geocode::{
     alloc::CountingAlloc,
     api,
-    batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
+    batch::{
+        BatchGeocodeOptions, Column, CoordinateJoinOptions, parse_field_groups, run_batch_geocode,
+    },
     bench::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
@@ -899,9 +901,9 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         output: output.clone(),
         audit: Some(audit.clone()),
         address_field_groups,
-        locality_field,
-        region_field,
-        postcode_field,
+        locality_field: locality_field.map(Column::Named),
+        region_field: region_field.map(Column::Named),
+        postcode_field: postcode_field.map(Column::Named),
         layer,
         limit,
         lat_column,
