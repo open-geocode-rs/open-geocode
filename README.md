@@ -52,7 +52,7 @@ Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machin
 `og` is the interactive way to do the same: pick a region, build its Pack, search it, and geocode CSV files.
 
 ```
-cargo run --release --bin og
+cargo run --release --features tui --bin og
 ```
 
 Regions come from the catalog in `catalog/regions.json`, generated from pinned upstream snapshots (see `scripts/catalog/README.md`).
