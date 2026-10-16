@@ -39,8 +39,8 @@ use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
     abbreviations::abbreviations,
     decode::{self, END, LABELS, Lattice, START, STATES},
-    dictionary::{Dictionaries, Field, admin_aliases, level},
-    dictionary_key, is_unspaced,
+    dictionary::{Dictionaries, Field, admin_aliases, is_admin_type, level},
+    dictionary_key, is_numeral, is_unspaced,
     weights::Weights,
 };
 use crate::{
@@ -1258,6 +1258,10 @@ const GLUED_UNIT_SHARE: f64 = 0.3;
 /// ("cafe near toronto", "haus in der nähe von köln"), the phrase labelled
 /// other as libpostal labels it.
 const NEAR_SHARE: f64 = 0.04;
+/// Share of the numbered areas of addresses ("2丁目") written as their
+/// number alone after the area they number ("林2"), as libpostal's data
+/// writes them.
+const NUMBERED_AREA_SHARE: f64 = 0.3;
 /// Share of rows with words of a script written without spaces whose
 /// numbers are written in numeral ideographs.
 const NUMERAL_SHARE: f64 = 0.1;
@@ -1310,6 +1314,7 @@ impl<'a> Renderer<'a> {
             Record::Address(record) => {
                 stated = Some(&record.address);
                 address_fields(&record.address, &mut fields);
+                number_areas(&mut fields, random);
             }
             Record::Poi(record) => {
                 fields.house = name;
@@ -1318,6 +1323,7 @@ impl<'a> Renderer<'a> {
                 {
                     stated = Some(address);
                     address_fields(address, &mut fields);
+                    number_areas(&mut fields, random);
                 }
             }
             Record::Street(_) => fields.street = name,
@@ -1894,6 +1900,28 @@ fn address_fields(address: &AddressComponents, fields: &mut Fields) {
     fields.postcode = address.postcode.as_deref().and_then(words);
 }
 
+/// The numbered areas of an address ("2丁目", "3 chome") written as their
+/// number alone in [`NUMBERED_AREA_SHARE`] of rows, so "林2" is read as one
+/// area with its number.
+fn number_areas(fields: &mut Fields, random: &mut Random) {
+    let Some(areas) = fields.suburb.as_mut() else {
+        return;
+    };
+    for word in &mut areas.words {
+        let split = word
+            .char_indices()
+            .find(|(_, character)| !is_numeral(*character))
+            .map_or(word.len(), |(index, _)| index);
+        let (number, kind) = word.split_at(split);
+        if !number.is_empty()
+            && dictionary_key(kind).is_some_and(|kind| is_admin_type(&kind))
+            && random.chance(NUMBERED_AREA_SHARE)
+        {
+            *word = number.to_string();
+        }
+    }
+}
+
 /// The areas an address states, largest first, glued into one field the
 /// way an `addr:city` tag or a written address often holds them:
 /// `神奈川県横浜市西区みなとみらい3丁目` is a region, a city, a ward and a
@@ -2227,7 +2255,7 @@ mod tests {
     fn numbers_are_written_in_numeral_ideographs_digit_by_digit() {
         assert_eq!(in_numerals("10-8"), "一零-八");
         assert_eq!(in_numerals("3丁目"), "三丁目");
-        assert!(in_numerals("205").chars().all(super::super::is_numeral));
+        assert!(in_numerals("205").chars().all(is_numeral));
     }
 
     #[test]

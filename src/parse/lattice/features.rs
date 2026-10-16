@@ -107,7 +107,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
         "dict_level",
         &["district", "locality", "neighbourhood", "place"],
     ),
-    ("glued_phrase", &["unit", "po_box", "level"]),
+    ("glued_phrase", &["unit", "po_box", "level", "admin_type"]),
     (
         "grounding",
         &["no_locality", "no_region", "no_country", "no_postcode"],
@@ -718,19 +718,19 @@ impl FeatureSet {
         (self.start, self.end)
     }
 
-    /// The span is one number written in parts: "993.5", "1384 1/2".
     /// The span is one token that glues a number to a unit, PO box or level
-    /// phrase ("4og", "apt4").
-    pub fn glued_phrase(&mut self, field: Field) {
-        let index = match field {
-            Field::Unit => 0,
-            Field::PoBox => 1,
-            Field::Level => 2,
-            _ => return,
+    /// phrase or an admin type word ("4og", "apt4", "4chome").
+    pub fn glued_phrase(&mut self, glued: super::Glued) {
+        let index = match glued {
+            super::Glued::Unit => 0,
+            super::Glued::PoBox => 1,
+            super::Glued::Level => 2,
+            super::Glued::AdminType => 3,
         };
         self.push(Block::GluedPhrase, index);
     }
 
+    /// The span is one number written in parts: "993.5", "1384 1/2".
     pub fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
     }

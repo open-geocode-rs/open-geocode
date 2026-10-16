@@ -102,6 +102,9 @@ const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/qualifiers.txt");
 /// Admin type words libpostal's qualifiers lack ("freistaat",
 /// "comunidad de", "-도"), with how they attach to a name.
 const ADMIN_TYPES: &str = include_str!("data/admin_types.txt");
+/// The admin type words libpostal strips from place names, per language, in
+/// the format of [`ADMIN_TYPES`] (`data/admin_affixes.txt`).
+const LIBPOSTAL_ADMIN_AFFIXES: &str = include_str!("data/admin_affixes.txt");
 /// How many area names a numbered form must be shared by to be a name of its
 /// own: a kind of area (`#丁目`), not one name with a numeral in it
 /// (`四日市市`).
@@ -1074,6 +1077,10 @@ enum Attach {
     /// A word of its own before or after the name ("freistaat bayern",
     /// "aichi prefecture").
     Word,
+    /// A word of its own before the name ("landkreis barnim", "aza ...").
+    WordBefore,
+    /// A word of its own after the name ("nagoya shi", "2 chome").
+    WordAfter,
     /// Attached after the name ("愛知県", "경기도").
     After,
     /// Attached before the name ("จังหวัดเชียงใหม่").
@@ -1081,11 +1088,15 @@ enum Attach {
 }
 
 /// The admin type words of [`LIBPOSTAL_QUALIFIERS`] and [`ADMIN_TYPES`] as
-/// dictionary keys with how they attach to a name. In [`ADMIN_TYPES`] a
-/// leading `-` attaches a word after the name and a trailing `-` before it.
-/// A libpostal qualifier of a script written without spaces, or of Hangul,
-/// whose words carry their type attached, attaches after the name; any
-/// other is a word of its own.
+/// dictionary keys with how they attach to a name. In [`ADMIN_TYPES`] and
+/// [`LIBPOSTAL_ADMIN_AFFIXES`] a leading `-` attaches a word after the name
+/// and a trailing `-` before it, `word ~` is a word of its own before the
+/// name and `~ word` one after it, and a bare word is either. A libpostal
+/// qualifier of a script written without spaces, or of Hangul, whose words
+/// carry their type attached, attaches after the name; any other is a word
+/// of its own after it, the side libpostal's qualifiers do not state and a
+/// word before a name cannot be told from the end of the field before it
+/// ("2 chome taitoku" is no "taitoku" chome).
 fn admin_types() -> &'static [(String, Attach)] {
     static TYPES: OnceLock<Vec<(String, Attach)>> = OnceLock::new();
     TYPES.get_or_init(|| {
@@ -1104,15 +1115,19 @@ fn admin_types() -> &'static [(String, Attach)] {
             let attach = if attached {
                 Attach::After
             } else {
-                Attach::Word
+                Attach::WordAfter
             };
             types.extend(dictionary_key(phrase).map(|key| (key, attach)));
         }
-        for phrase in phrases(ADMIN_TYPES) {
+        for phrase in phrases(ADMIN_TYPES).chain(phrases(LIBPOSTAL_ADMIN_AFFIXES)) {
             let (phrase, attach) = if let Some(phrase) = phrase.strip_prefix('-') {
                 (phrase, Attach::After)
             } else if let Some(phrase) = phrase.strip_suffix('-') {
                 (phrase, Attach::Before)
+            } else if let Some(phrase) = phrase.strip_suffix(" ~") {
+                (phrase, Attach::WordBefore)
+            } else if let Some(phrase) = phrase.strip_prefix("~ ") {
+                (phrase, Attach::WordAfter)
             } else {
                 (phrase, Attach::Word)
             };
@@ -1122,6 +1137,11 @@ fn admin_types() -> &'static [(String, Attach)] {
         types.dedup();
         types
     })
+}
+
+/// Whether `key` is a word of an admin area's type ("丁目", "chome", "kreis").
+pub(super) fn is_admin_type(key: &str) -> bool {
+    admin_types().iter().any(|(phrase, _)| phrase == key)
 }
 
 /// The names an admin area's name `key` (a dictionary key) is also written
@@ -1138,6 +1158,16 @@ pub(super) fn admin_aliases(key: &str) -> Vec<String> {
                     .and_then(|rest| rest.strip_suffix(' ')),
                 key.strip_prefix(phrase.as_str())
                     .and_then(|rest| rest.strip_prefix(' ')),
+            ],
+            Attach::WordBefore => [
+                key.strip_prefix(phrase.as_str())
+                    .and_then(|rest| rest.strip_prefix(' ')),
+                None,
+            ],
+            Attach::WordAfter => [
+                key.strip_suffix(phrase.as_str())
+                    .and_then(|rest| rest.strip_suffix(' ')),
+                None,
             ],
             Attach::After => [
                 key.strip_suffix(phrase.as_str())
@@ -1247,6 +1277,21 @@ pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_words_are_dropped_only_on_the_side_they_are_written() {
+        let aliases = |key: &str| admin_aliases(key);
+        assert!(
+            aliases("bundesland nordrhein westfalen").contains(&"nordrhein westfalen".to_string())
+        );
+        assert!(aliases("landkreis barnim").contains(&"barnim".to_string()));
+        assert!(aliases("nagoya shi").contains(&"nagoya".to_string()));
+        assert!(aliases("nagoyashi").contains(&"nagoya".to_string()));
+        // "chome" follows its number: before a name it is the end of the
+        // field before, not this name's type.
+        assert!(!aliases("chome taitoku").contains(&"taitoku".to_string()));
+        assert!(!aliases("shi nagoya").contains(&"nagoya".to_string()));
+    }
 
     /// The names of `names` with their fields.
     fn named(names: &RecordNames) -> Vec<(Field, String)> {

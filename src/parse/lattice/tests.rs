@@ -841,8 +841,9 @@ fn a_number_glued_to_a_unit_or_level_word_is_one_token_of_that_kind() {
         ]),
         Weights::built_in(),
     );
-    assert_eq!(tagger.glued_phrase("4og"), Some(Field::Level));
-    assert_eq!(tagger.glued_phrase("apt4"), Some(Field::Unit));
+    assert_eq!(tagger.glued_phrase("4og"), Some(Glued::Level));
+    assert_eq!(tagger.glued_phrase("apt4"), Some(Glued::Unit));
+    assert_eq!(tagger.glued_phrase("4chome"), Some(Glued::AdminType));
     assert_eq!(tagger.glued_phrase("12a"), None);
     assert_eq!(tagger.glued_phrase("4og5"), None);
     assert_eq!(tagger.glued_phrase("og"), None);

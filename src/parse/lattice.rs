@@ -865,9 +865,10 @@ impl LatticeTagger {
     }
 
     /// The vocabulary a token glues to its number: "4og" is a floor, "apt4"
-    /// a unit. The token is one run of digits and one of letters, either way
-    /// round, and the letters a unit, PO box or level phrase.
-    fn glued_phrase(&self, word: &str) -> Option<Field> {
+    /// a unit, "4chome" a numbered area. The token is one run of digits and
+    /// one of letters, either way round, and the letters a unit, PO box or
+    /// level phrase or an admin type word.
+    fn glued_phrase(&self, word: &str) -> Option<Glued> {
         let split = word
             .char_indices()
             .skip(1)
@@ -884,21 +885,35 @@ impl LatticeTagger {
             (false, true) if letters(head) => head,
             _ => return None,
         };
-        [Field::Level, Field::Unit, Field::PoBox]
-            .into_iter()
-            .find(|field| self.dictionaries.contains(*field, phrase))
+        [
+            (Field::Level, Glued::Level),
+            (Field::Unit, Glued::Unit),
+            (Field::PoBox, Glued::PoBox),
+        ]
+        .into_iter()
+        .find(|(field, _)| self.dictionaries.contains(*field, phrase))
+        .map(|(_, glued)| glued)
+        .or_else(|| dictionary::is_admin_type(phrase).then_some(Glued::AdminType))
     }
 
     /// The best hit of `key` in `field`: exact, as written or with its
     /// abbreviations expanded the way the text index expands them, else the
     /// nearest name the key's fuzzy automaton accepts.
     fn lookup(&self, field: Field, key: &mut SpanKey) -> Option<Match> {
-        let exact = [Some(&key.key), Some(&key.expanded), key.masked.as_ref()]
-            .into_iter()
-            .flatten()
-            .chain(&key.spellings)
-            .filter_map(|key| self.dictionaries.get(field, key))
-            .max_by_key(|entry| entry.count);
+        // The span as written first: another spelling of it (the name
+        // without its type word, an abbreviation in full) is only read when
+        // the span itself names nothing, so "verwaltungsgemeinschaft
+        // stockach" is the district it names, not the city "stockach".
+        let best = |keys: &mut dyn Iterator<Item = &String>| {
+            keys.filter_map(|key| self.dictionaries.get(field, key))
+                .max_by_key(|entry| entry.count)
+        };
+        let exact = best(
+            &mut [Some(&key.key), Some(&key.expanded), key.masked.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .or_else(|| best(&mut key.spellings.iter()));
         if let Some(entry) = exact {
             return Some(Match { entry, distance: 0 });
         }
@@ -1104,7 +1119,7 @@ impl SpanKey {
         Self {
             tokens: expanded.split(' ').count(),
             masked: mask_numerals(&key),
-            spellings: abbreviations::abbreviations().spellings(&key),
+            spellings: spellings(&key),
             key,
             expanded,
             fuzzy,
@@ -1169,6 +1184,31 @@ fn is_glued_numeral(units: &Units, infos: &[TokenInfo], start: usize, end: usize
         && infos[start..end]
             .iter()
             .all(|info| info.shape == features::Shape::Digits)
+}
+
+/// What a number is glued to in one token (see
+/// [`LatticeTagger::glued_phrase`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Glued {
+    Unit,
+    PoBox,
+    Level,
+    /// A type of numbered area ("4chome").
+    AdminType,
+}
+
+/// Other spellings of a dictionary key looked up besides it: its street
+/// types and directions in their other forms, and the key without the admin
+/// type word it is written with ("nordrhein westfalen" of "bundesland
+/// nordrhein westfalen", "nagoya" of "nagoyashi").
+fn spellings(key: &str) -> Vec<String> {
+    let mut spellings = abbreviations::abbreviations().spellings(key);
+    for alias in dictionary::admin_aliases(key) {
+        if !spellings.contains(&alias) {
+            spellings.push(alias);
+        }
+    }
+    spellings
 }
 
 /// A dictionary key with street-type and direction abbreviations expanded,
