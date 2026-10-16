@@ -1012,9 +1012,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         tabs.push(if mode == app.mode {
             Span::styled(
                 format!(" {} ", mode.name()),
-                Style::new()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
             )
         } else {
             span(format!(" {} ", mode.name()), FAINT)
