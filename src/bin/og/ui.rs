@@ -567,9 +567,9 @@ fn sources(frame: &mut Frame, area: Rect, app: &App) {
             let selected = index == app.source_cursor;
             let on = app.sources[index];
             let mark = match (index, on) {
-                (0, _) => span("● ", DIM),
-                (_, true) => span("● ", ACCENT),
-                (_, false) => span("○ ", DIM),
+                (0, _) => span("[✓] ", DIM),
+                (_, true) => span("[✓] ", ACCENT),
+                (_, false) => span("[ ] ", DIM),
             };
             let name = if selected {
                 bold(pad(source.name, 18))
@@ -581,7 +581,7 @@ fn sources(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("+{} ", mock::size(source.download_mb))
             };
-            let used = 5 + 18 + width(source.detail);
+            let used = 3 + 4 + 18 + width(source.detail);
             Line::from(vec![
                 if selected {
                     span(" ❯ ", ACCENT)
@@ -682,7 +682,7 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
             plain("  "),
             button("Start build", app.confirm_cursor == 0, app.fits_disk()),
             plain("  "),
-            button("Cancel", app.confirm_cursor == 1, true),
+            button("Back", app.confirm_cursor == 1, true),
         ]),
     ];
     frame.render_widget(

@@ -569,7 +569,7 @@ impl App {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => self.confirm_cursor ^= 1,
             KeyCode::Char('m') => self.memory_step = (self.memory_step + 1) % MEMORY_STEPS_GB.len(),
-            KeyCode::Enter if self.confirm_cursor == 1 => self.screen = Screen::Home,
+            KeyCode::Enter if self.confirm_cursor == 1 => self.screen = Screen::Sources,
             KeyCode::Enter if !self.fits_disk() => self.flash(format!(
                 "Not enough free disk: {} needs about {:.0} GB. Pick a smaller region.",
                 self.region.name,
