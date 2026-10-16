@@ -15,12 +15,14 @@
 //! know from their shape and place alone; the areas a row names are always
 //! names the Pack knows, as a locality or region must be.
 //!
-//! The weights are learned by the averaged structured perceptron (Collins,
-//! 2002): decode each row, and when the best labelling is wrong, move the
-//! weights toward the features of the gold labelling and away from those of
-//! the prediction. Averaging the weights over every step keeps the model
-//! from following the last rows it saw. Rows stream from scratch files, so
-//! training memory does not grow with the number of countries either.
+//! The weights are those of a semi-Markov conditional random field (Sarawagi
+//! and Cohen, 2004), learned by stochastic gradient ascent on each row's
+//! log-likelihood with AdaGrad step sizes: move every weight by the expected
+//! count of its feature over the gold labellings less that over all
+//! labellings, both from forward-backward over the row's lattice. Averaging
+//! the weights over every step keeps the model from following the last rows
+//! it saw. Rows stream from scratch files, so training memory does not grow
+//! with the number of countries either.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -36,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
     abbreviations::abbreviations,
-    decode::{self, END, LABELS, Lattice, Path as LabelPath, START, STATES},
+    decode::{self, END, LABELS, Lattice, START, STATES},
     dictionary::{Dictionaries, Field, admin_aliases, level},
     dictionary_key, is_unspaced,
     weights::Weights,
@@ -349,7 +351,7 @@ pub fn train(
     }
 
     // Iterative parameter mixing (McDonald, Hall and Mann 2010): every epoch
-    // each shard of the rows trains its own perceptron from the mixed weights,
+    // each shard of the rows trains its own model from the mixed weights,
     // in parallel, and the shards' weights are averaged. The result is the
     // average over epochs of the shards' averaged weights. Each shard reads
     // its rows in an order of its own seed, so the weights do not depend on
@@ -578,27 +580,46 @@ impl Spill for Row {
     }
 }
 
-/// The averaged perceptron's state.
+/// The model being trained: a semi-Markov conditional random field
+/// (Sarawagi and Cohen, 2004) over the lattice, learned by stochastic
+/// gradient ascent on each row's log-likelihood with AdaGrad step sizes
+/// (Duchi, Hazan and Singer, 2011), and averaged over every step.
+///
+/// The likelihood of a row sums over every segmentation that gives its
+/// tokens their gold labels and over the countries the lattice is decoded
+/// as, since neither is given, as neither is for a query. Its gradient is
+/// the expected features of the gold labellings less those of all
+/// labellings, both from forward-backward over the lattice.
 #[derive(Debug)]
 struct Model {
     weights: Weights,
     /// Every update times the step it was made at, to average lazily.
     totals: Weights,
+    /// The sum of every squared gradient, for AdaGrad's step sizes.
+    squares: Weights,
     step: f32,
 }
 
+/// AdaGrad's base step size.
+const LEARNING_RATE: f32 = 0.1;
+/// A feature whose expected count differs by less than this between the gold
+/// labellings and all labellings is left as it is: the cost of a row is then
+/// the spans and labels the model is unsure of, not every one.
+const MIN_GRADIENT: f64 = 1e-4;
+
 impl Model {
-    /// A perceptron that starts from `weights`.
+    /// A model that starts from `weights`.
     fn from_weights(weights: Weights) -> Self {
         Self {
             weights,
             totals: Weights::zero(),
+            squares: Weights::zero(),
             step: 1.0,
         }
     }
 
-    /// Decode `row` and update toward its gold labels when it is wrong.
-    /// Returns whether it was wrong.
+    /// Learn from one row. Returns whether the best labelling before the
+    /// update was wrong.
     fn learn(&mut self, lattice: &Lattice, row: &Row) -> bool {
         let predicted = decode::best(lattice, &self.weights, 1)
             .into_iter()
@@ -607,64 +628,24 @@ impl Model {
         // A token's label is the label of every unit of it.
         let gold = lattice.units.expand(&row.gold);
         let wrong = predicted.labels(lattice) != gold;
-        if wrong {
-            // The gold labelling under the country that scores it best, of
-            // the countries the lattice is decoded as: which country a row
-            // is read as is not given, as it is not for a query.
-            let mut golds = decode::countries(lattice)
-                .into_iter()
-                .flat_map(|country| decode::decode(lattice, &self.weights, country, 1, Some(&gold)))
-                .collect::<Vec<_>>();
-            decode::sort_paths(&mut golds);
-            let gold = golds
-                .into_iter()
-                .next()
-                .expect("every token is a span, so every labelling has a path");
-            self.update(lattice, &gold, 1.0);
-            self.update(lattice, &predicted, -1.0);
+        let gradient = Gradient::of(lattice, &self.weights, &gold);
+        for (index, value) in gradient.edge {
+            let delta = adagrad(&mut self.squares.edge[index], value);
+            self.weights.edge[index] += delta;
+            self.totals.edge[index] += delta * self.step;
+        }
+        for (country, values) in gradient.transitions {
+            for (index, value) in values.into_iter().enumerate() {
+                if f64::from(value).abs() < MIN_GRADIENT {
+                    continue;
+                }
+                let delta = adagrad(&mut table(&mut self.squares, country)[index], value);
+                table(&mut self.weights, country)[index] += delta;
+                table(&mut self.totals, country)[index] += delta * self.step;
+            }
         }
         self.step += 1.0;
         wrong
-    }
-
-    /// Add `sign` times the features of `path` to the weights.
-    fn update(&mut self, lattice: &Lattice, path: &LabelPath, sign: f32) {
-        let mut previous = START;
-        for segment in &path.segments {
-            let label = segment.label as usize;
-            let span = &lattice.spans[segment.span];
-            for feature in span.features_in(path.country) {
-                let index = feature as usize * LABELS + label;
-                self.weights.edge[index] += sign;
-                self.totals.edge[index] += sign * self.step;
-            }
-            self.transition(path.country, previous, label, sign);
-            previous = label;
-        }
-        self.transition(path.country, previous, END, sign);
-    }
-
-    fn transition(
-        &mut self,
-        country: Option<CountryCode>,
-        previous: usize,
-        next: usize,
-        sign: f32,
-    ) {
-        let index = previous * STATES + next;
-        self.weights.global[index] += sign;
-        self.totals.global[index] += sign * self.step;
-        if let Some(country) = country {
-            for (weights, delta) in [
-                (&mut self.weights, sign),
-                (&mut self.totals, sign * self.step),
-            ] {
-                weights
-                    .countries
-                    .entry(country)
-                    .or_insert_with(|| vec![0.0; STATES * STATES])[index] += delta;
-            }
-        }
     }
 
     /// The weights averaged over every step.
@@ -694,6 +675,244 @@ impl Model {
                 .collect(),
         }
     }
+}
+
+/// AdaGrad's step for one weight: the gradient scaled down by the root of
+/// every squared gradient the weight has had.
+fn adagrad(squares: &mut f32, gradient: f32) -> f32 {
+    *squares += gradient * gradient;
+    LEARNING_RATE * gradient / (squares.sqrt() + 1e-6)
+}
+
+/// The transition table of `country` in `weights`, the global one for
+/// `None`, made when it is missing.
+fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
+    match country {
+        None => &mut weights.global,
+        Some(country) => weights
+            .countries
+            .entry(country)
+            .or_insert_with(|| vec![0.0; STATES * STATES]),
+    }
+}
+
+/// The gradient of one row's log-likelihood: per edge weight index, and per
+/// transition table (`None` the global one) by previous and next state.
+#[derive(Debug, Default)]
+struct Gradient {
+    edge: HashMap<usize, f32>,
+    transitions: HashMap<Option<CountryCode>, Vec<f32>>,
+}
+
+impl Gradient {
+    fn of(lattice: &Lattice, weights: &Weights, gold: &[Label]) -> Self {
+        let countries = decode::countries(lattice);
+        let readings = countries
+            .iter()
+            .map(|country| {
+                (
+                    Reading::new(lattice, weights, *country, None),
+                    Reading::new(lattice, weights, *country, Some(gold)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total = |gold: bool| {
+            log_sum(readings.iter().map(
+                |(all, constrained)| {
+                    if gold { constrained.log_z } else { all.log_z }
+                },
+            ))
+        };
+        let (all_z, gold_z) = (total(false), total(true));
+        let mut gradient = Self::default();
+        if !gold_z.is_finite() {
+            return gradient;
+        }
+        for (country, (all, constrained)) in countries.iter().zip(&readings) {
+            for (reading, sign, z) in [(constrained, 1.0, gold_z), (all, -1.0, all_z)] {
+                // How much of the row's probability this country carries.
+                let share = (reading.log_z - z).exp();
+                if share < MIN_GRADIENT {
+                    continue;
+                }
+                reading.add_expectations(lattice, *country, sign * share, &mut gradient);
+            }
+        }
+        gradient
+    }
+}
+
+/// Forward-backward over a lattice decoded as one country, over every
+/// labelling or only those that give each unit its gold label.
+struct Reading<'a> {
+    gold: Option<&'a [Label]>,
+    /// `edges[span][label]`.
+    edges: Vec<[f64; LABELS]>,
+    transitions: [[f64; STATES]; STATES],
+    /// `alpha[position][state]`: the log-sum of the paths ending there.
+    alpha: Vec<[f64; STATES]>,
+    /// `beta[position][state]`: the log-sum of the rest of the paths from a
+    /// segment of `state` ending at `position`.
+    beta: Vec<[f64; STATES]>,
+    log_z: f64,
+}
+
+impl<'a> Reading<'a> {
+    fn new(
+        lattice: &Lattice,
+        weights: &Weights,
+        country: Option<CountryCode>,
+        gold: Option<&'a [Label]>,
+    ) -> Self {
+        let table = weights.transitions(country);
+        let mut transitions = [[0.0; STATES]; STATES];
+        for (previous, row) in transitions.iter_mut().enumerate() {
+            for (next, value) in row.iter_mut().enumerate() {
+                *value = f64::from(table.get(previous, next));
+            }
+        }
+        let edges = lattice
+            .spans
+            .iter()
+            .map(|span| Label::ALL.map(|label| f64::from(weights.edge(span, label, country))))
+            .collect::<Vec<_>>();
+        let allowed = |span: &decode::Span, label: Label| {
+            gold.is_none_or(|gold| gold[span.start..span.end].iter().all(|gold| *gold == label))
+        };
+        let len = lattice.len;
+        let mut alpha = vec![[f64::NEG_INFINITY; STATES]; len + 1];
+        alpha[0][START] = 0.0;
+        let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
+        order.sort_by_key(|index| lattice.spans[*index].end);
+        for &index in &order {
+            let span = &lattice.spans[index];
+            for label in Label::ALL {
+                if !allowed(span, label) {
+                    continue;
+                }
+                let next = label as usize;
+                let incoming = log_sum(
+                    previous_states(span.start)
+                        .map(|previous| alpha[span.start][previous] + transitions[previous][next]),
+                );
+                let value = incoming + edges[index][next];
+                alpha[span.end][next] = log_add(alpha[span.end][next], value);
+            }
+        }
+        let mut beta = vec![[f64::NEG_INFINITY; STATES]; len + 1];
+        for label in 0..LABELS {
+            beta[len][label] = transitions[label][END];
+        }
+        for &index in order.iter().rev() {
+            let span = &lattice.spans[index];
+            for label in Label::ALL {
+                if !allowed(span, label) {
+                    continue;
+                }
+                let next = label as usize;
+                let onward = edges[index][next] + beta[span.end][next];
+                for previous in previous_states(span.start) {
+                    beta[span.start][previous] = log_add(
+                        beta[span.start][previous],
+                        transitions[previous][next] + onward,
+                    );
+                }
+            }
+        }
+        let log_z = log_sum((0..LABELS).map(|label| alpha[len][label] + beta[len][label]));
+        Self {
+            gold,
+            edges,
+            transitions,
+            alpha,
+            beta,
+            log_z,
+        }
+    }
+
+    /// Add `scale` times the expected count of every feature and transition
+    /// under this reading to `gradient`.
+    fn add_expectations(
+        &self,
+        lattice: &Lattice,
+        country: Option<CountryCode>,
+        scale: f64,
+        gradient: &mut Gradient,
+    ) {
+        if !self.log_z.is_finite() {
+            return;
+        }
+        let mut transitions = vec![0.0f64; STATES * STATES];
+        for (index, span) in lattice.spans.iter().enumerate() {
+            for label in Label::ALL {
+                let next = label as usize;
+                if self.gold.is_some_and(|gold| {
+                    gold[span.start..span.end].iter().any(|gold| *gold != label)
+                }) {
+                    continue;
+                }
+                let onward = self.edges[index][next] + self.beta[span.end][next] - self.log_z;
+                let mut probability = 0.0;
+                for previous in previous_states(span.start) {
+                    let marginal = (self.alpha[span.start][previous]
+                        + self.transitions[previous][next]
+                        + onward)
+                        .exp();
+                    transitions[previous * STATES + next] += marginal;
+                    probability += marginal;
+                }
+                let value = scale * probability;
+                if value.abs() < MIN_GRADIENT {
+                    continue;
+                }
+                for feature in span.features_in(country) {
+                    *gradient
+                        .edge
+                        .entry(feature as usize * LABELS + next)
+                        .or_default() += value as f32;
+                }
+            }
+        }
+        let len = lattice.len;
+        for label in 0..LABELS {
+            transitions[label * STATES + END] +=
+                (self.alpha[len][label] + self.beta[len][label] - self.log_z).exp();
+        }
+        let mut tables = vec![None];
+        if country.is_some() {
+            tables.push(country);
+        }
+        for table in tables {
+            let target = gradient
+                .transitions
+                .entry(table)
+                .or_insert_with(|| vec![0.0; STATES * STATES]);
+            for (target, value) in target.iter_mut().zip(&transitions) {
+                *target += (scale * value) as f32;
+            }
+        }
+    }
+}
+
+/// The states a segment starting at `start` can follow.
+fn previous_states(start: usize) -> std::ops::Range<usize> {
+    if start == 0 {
+        START..START + 1
+    } else {
+        0..LABELS
+    }
+}
+
+fn log_add(left: f64, right: f64) -> f64 {
+    let high = left.max(right);
+    if high == f64::NEG_INFINITY {
+        return high;
+    }
+    high + ((left - high).exp() + (right - high).exp()).ln()
+}
+
+fn log_sum(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(f64::NEG_INFINITY, log_add)
 }
 
 /// Token and row accuracy of `weights` on the rows of `rows`, read in
@@ -2024,7 +2243,35 @@ mod tests {
     }
 
     #[test]
-    fn the_perceptron_learns_a_toy_language() {
+    fn forward_backward_sums_every_labelling() {
+        // Two words no dictionary knows: one span each, so every labelling
+        // has one path, and the decoder can list them all.
+        let tagger = LatticeTagger::new(Dictionaries::empty(), Weights::built_in());
+        let lattice = tagger.lattice(&Tokens::new("kingsway 12"), &Suppression::default());
+        assert_eq!(lattice.spans.len(), 2);
+        let weights = Weights::built_in();
+        let paths = decode::decode(&lattice, &weights, None, LABELS * LABELS, None);
+        assert_eq!(paths.len(), LABELS * LABELS);
+        let brute = log_sum(paths.iter().map(|path| f64::from(path.score)));
+        let reading = Reading::new(&lattice, &weights, None, None);
+        assert!(
+            (reading.log_z - brute).abs() < 1e-3,
+            "{} {brute}",
+            reading.log_z
+        );
+        // Every unit has one label in each labelling, so the expected count
+        // of each span's bias over its labels is one.
+        let mut gradient = Gradient::default();
+        reading.add_expectations(&lattice, None, 1.0, &mut gradient);
+        let bias = super::super::features::by_name("bias:bias") as usize;
+        let total = (0..LABELS)
+            .filter_map(|label| gradient.edge.get(&(bias * LABELS + label)))
+            .sum::<f32>();
+        assert!((total - 2.0).abs() < 1e-3, "{total}");
+    }
+
+    #[test]
+    fn the_model_learns_a_toy_language() {
         use Label::*;
         let entry = Entry {
             count: 10,

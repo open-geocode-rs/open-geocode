@@ -13,10 +13,17 @@
 //! no dictionary holds. The word of a span is its one token, or the units of
 //! a script written without spaces glued into one key ("みなとみらい").
 //!
+//! The words themselves are hashed too, each word of a span into
+//! [`WORD_BUCKETS`] buckets, so the model learns the words the Pack it is
+//! trained on writes its streets, venues and places with ("strasse",
+//! "bäckerei", "sebun"). The model stays one per Pack: the words are the
+//! Pack's own, learned when it is built.
+//!
 //! ```text
 //! ids 0 .. NAMED                      the named blocks of BLOCKS, in order
 //! NAMED + (side * 3 + n - 2) * 1024   bucket 0 of the affix block of side
 //!   + bucket                          (0 prefix, 1 suffix) and n (2..=4)
+//! WORDS + bucket                      a word of the span
 //! ```
 
 use super::{
@@ -270,8 +277,12 @@ const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
 /// Buckets of each affix block: one per side and length.
 pub(super) const AFFIX_BUCKETS: usize = 1_024;
 const AFFIX_BLOCKS: usize = 2 * AFFIX_SIZES.len();
+/// The first id of the word block.
+const WORDS: usize = NAMED + AFFIX_BLOCKS * AFFIX_BUCKETS;
+/// Buckets of the word block.
+pub(super) const WORD_BUCKETS: usize = 1 << 15;
 /// Feature ids, without labels.
-pub(super) const COUNT: usize = NAMED + AFFIX_BLOCKS * AFFIX_BUCKETS;
+pub(super) const COUNT: usize = WORDS + WORD_BUCKETS;
 
 /// The feature of a one-unit span that lies inside a longer name of `field`
 /// the dictionaries know, at its first unit or after it. A run of
@@ -345,6 +356,13 @@ fn id(block: Block, index: usize) -> u32 {
 
 /// `block:feature`, for weight dumps and the schema fingerprint.
 pub(super) fn name(id: u32) -> String {
+    if let Some(bucket) = (id as usize).checked_sub(WORDS) {
+        return if bucket < WORD_BUCKETS {
+            format!("word:{bucket}")
+        } else {
+            format!("unknown:{id}")
+        };
+    }
     if let Some(affix) = (id as usize).checked_sub(NAMED) {
         let (block, bucket) = (affix / AFFIX_BUCKETS, affix % AFFIX_BUCKETS);
         if block < AFFIX_BLOCKS {
@@ -519,6 +537,10 @@ impl FeatureSet {
         };
         let len = tokens.len();
         set.push(Block::Bias, 0);
+        for word in &tokens.words[start..end] {
+            let bucket = xxhash_rust::xxh3::xxh3_64(word.as_bytes()) % WORD_BUCKETS as u64;
+            set.features.push((WORDS + bucket as usize) as u32);
+        }
         set.push(Block::SpanTokens, set.length_bucket());
         let position = [
             start == 0,
@@ -774,7 +796,9 @@ mod tests {
         assert_eq!(name(NAMED as u32 - 1), "grounding:no_postcode");
         assert_eq!(name(NAMED as u32 - 4), "grounding:no_locality");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
-        assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
+        assert_eq!(name(WORDS as u32 - 1), "affix:suffix4:1023");
+        assert_eq!(name(WORDS as u32), "word:0");
+        assert_eq!(name(COUNT as u32 - 1), "word:32767");
         assert_eq!(
             by_name("dict_distance:street:1"),
             id(Block::DictDistance, 7)
