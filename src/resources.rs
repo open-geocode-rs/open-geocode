@@ -303,6 +303,8 @@ mod platform {
             if unsafe { libc::getrlimit(resource, &mut limit) } == 0
                 && limit.rlim_cur != libc::RLIM_INFINITY
             {
+                // `rlim_t` is 32 bits on some targets.
+                #[allow(clippy::unnecessary_cast)]
                 let limit = limit.rlim_cur as u64;
                 resources.total_memory_bytes = resources.total_memory_bytes.min(limit);
                 if limit < resources.available_memory_bytes {
