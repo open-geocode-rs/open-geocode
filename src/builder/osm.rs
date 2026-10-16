@@ -42,6 +42,7 @@ mod test_pbf;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -101,7 +102,8 @@ pub struct BuildOsmOptions {
     pub force: bool,
     /// What the input is, for example a region id, kept in the build report.
     pub input_source: Option<String>,
-    /// Told about each stage as it starts, advances and finishes.
+    /// Told about each stage as it starts, advances and finishes, and about
+    /// the plan's warnings.
     pub observer: Arc<dyn BuildObserver>,
     /// Set to stop the build: it then fails with
     /// [`crate::builder::BuildCancelled`] and publishes nothing.
@@ -120,6 +122,21 @@ impl Default for BuildOsmOptions {
             observer: Arc::new(TerminalObserver::new()),
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+impl fmt::Debug for BuildOsmOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BuildOsmOptions")
+            .field("input", &self.input)
+            .field("pack", &self.pack)
+            .field("memory_budget_bytes", &self.memory_budget_bytes)
+            .field("scratch_dir", &self.scratch_dir)
+            .field("force", &self.force)
+            .field("input_source", &self.input_source)
+            .field("cancel", &self.cancel)
+            .finish_non_exhaustive()
     }
 }
 
@@ -149,8 +166,8 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
 /// one pool serves every stage.
 pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
     let started = Instant::now();
-    for warning in &plan.warnings {
-        eprintln!("warning: {warning}");
+    for warning in plan.shortfalls.iter().chain(&plan.warnings) {
+        options.observer.warned(warning);
     }
     let budget = usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX);
     // The sorters and the parser's lattice cache split what the others leave
@@ -1510,6 +1527,8 @@ mod tests {
                 .expect("events")
                 .push((stage, "finished", None));
         }
+
+        fn warned(&self, _: &str) {}
     }
 
     #[test]

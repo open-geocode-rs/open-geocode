@@ -112,6 +112,9 @@ pub trait BuildObserver: Send + Sync {
     /// `units` more of the running stage's work is done.
     fn advanced(&self, units: u64);
     fn finished(&self, stage: BuildStage);
+    /// Something the build should be told about but goes on despite, such
+    /// as the pre-flight check finding memory or disk short of what it needs.
+    fn warned(&self, message: &str);
 }
 
 /// The error a build returns when it was asked to stop.
@@ -235,6 +238,13 @@ impl BuildObserver for TerminalObserver {
                 BuildStage::ALL.len(),
                 stage.description()
             ));
+        }
+    }
+
+    fn warned(&self, message: &str) {
+        match self.bar.lock().expect("progress bar lock").as_ref() {
+            Some(bar) => bar.suspend(|| eprintln!("warning: {message}")),
+            None => eprintln!("warning: {message}"),
         }
     }
 }
