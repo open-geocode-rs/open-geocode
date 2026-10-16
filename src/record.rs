@@ -644,10 +644,13 @@ fn serialize_alt_names<S: SerializeStruct>(
     }
 }
 
+/// The dataset id of records built from OpenStreetMap.
+pub const OSM_DATASET: &str = "osm";
+
 impl SourceProvenance {
     pub fn osm(object_type: OsmObjectType, object_id: i64) -> Self {
         Self {
-            dataset: "osm".to_string(),
+            dataset: OSM_DATASET.to_string(),
             object_type,
             object_id,
             tags: None,
@@ -660,7 +663,7 @@ impl SourceProvenance {
         tags: BTreeMap<String, String>,
     ) -> Self {
         Self {
-            dataset: "osm".to_string(),
+            dataset: OSM_DATASET.to_string(),
             object_type,
             object_id,
             tags: Some(tags),
@@ -673,7 +676,7 @@ pub const DERIVED_FROM_ADDRESS_RECORDS: &str = "accepted_address_records";
 impl DerivedSourceProvenance {
     pub fn osm_address_records(record_count: u64) -> Self {
         Self {
-            dataset: "osm".to_string(),
+            dataset: OSM_DATASET.to_string(),
             derived_from: DERIVED_FROM_ADDRESS_RECORDS.to_string(),
             record_count,
         }

@@ -69,7 +69,7 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{Record, RejectedRecord},
+    record::{OSM_DATASET, Record, RejectedRecord},
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
@@ -207,6 +207,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             input_replication_timestamp: replication_timestamp(&options.input)?,
             pack: options.pack.display().to_string(),
             input_bytes,
+            datasets: vec![OSM_DATASET.to_string()],
             ..BuilderReport::default()
         },
         audit: Audit::create(writer.generation())?,
@@ -1547,6 +1548,7 @@ mod tests {
         .expect("build");
         assert_eq!(report.input_source.as_deref(), Some("town"));
         assert!(report.resources.threads > 0);
+        assert_eq!(report.datasets, [OSM_DATASET]);
 
         let events = recorder.0.lock().expect("events");
         let order: Vec<BuildStage> = events

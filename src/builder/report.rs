@@ -24,6 +24,9 @@ pub struct BuilderReport {
     pub input_replication_timestamp: Option<i64>,
     pub pack: String,
     pub input_bytes: u64,
+    /// The datasets the Pack's records come from, by the id their
+    /// provenance names ([`crate::record::OSM_DATASET`]).
+    pub datasets: Vec<String>,
     pub scanned: ScannedCounts,
     pub accepted: AcceptedCounts,
     pub rejected: RejectedCounts,
