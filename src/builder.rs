@@ -2,7 +2,10 @@ pub mod osm;
 pub mod progress;
 pub mod report;
 
-pub use osm::{BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack};
+pub use osm::{
+    BuildOsmOptions, DEFAULT_MEMORY_BUDGET_BYTES, build_osm_pack, replication_timestamp,
+};
+pub use progress::{BuildCancelled, BuildObserver, BuildStage, StageUnit, TerminalObserver};
 pub use report::{
     AcceptedCounts, BuilderReport, CandidateDispositionCounts, CompletenessCounts,
     GeometryResolutionCounts, IssueAuditCounts, PackOutputReport, PhaseTimings, RejectedCounts,

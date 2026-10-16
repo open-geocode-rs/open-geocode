@@ -1,8 +1,13 @@
 use std::{
     collections::HashMap,
+    fmt,
     fs::File,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +15,7 @@ use csv::{ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 
 use crate::{
-    api::{self, Contexts},
+    api::{self, Contexts, ForwardFeature},
     pack::PackReader,
     search::{AddressGeocodeOptions, PackTextSearcher},
 };
@@ -19,12 +24,17 @@ use crate::{
 /// keep equal to [`audit_columns`].
 pub const AUDIT_COLUMNS_FILE: &str = "batch-audit-columns.txt";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BatchGeocodeOptions {
     pub pack: Option<PathBuf>,
     pub input: PathBuf,
     pub output: PathBuf,
-    pub audit: PathBuf,
+    /// Where to write the audit CSV; none is written without one.
+    pub audit: Option<PathBuf>,
+    /// Whether the input's first row names its columns. Without one, the
+    /// columns are named `column_1`, `column_2` and so on, and the output
+    /// starts with those names.
+    pub header_row: bool,
     pub address_field_groups: Vec<Vec<String>>,
     pub locality_field: Option<String>,
     pub region_field: Option<String>,
@@ -34,7 +44,66 @@ pub struct BatchGeocodeOptions {
     pub lat_column: String,
     pub lon_column: String,
     pub join: Option<CoordinateJoinOptions>,
+    /// Told about every row as it is geocoded.
+    pub observer: Option<Arc<dyn BatchObserver>>,
+    /// Set to stop the run: it then fails with [`BatchCancelled`] and writes
+    /// no output.
+    pub cancel: Arc<AtomicBool>,
 }
+
+impl Default for BatchGeocodeOptions {
+    fn default() -> Self {
+        Self {
+            pack: None,
+            input: PathBuf::new(),
+            output: PathBuf::new(),
+            audit: None,
+            header_row: true,
+            address_field_groups: Vec::new(),
+            locality_field: None,
+            region_field: None,
+            postcode_field: None,
+            layer: None,
+            limit: 10,
+            lat_column: "lat".to_string(),
+            lon_column: "lon".to_string(),
+            join: None,
+            observer: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// One geocoded row, as a [`BatchObserver`] is told about it.
+pub struct BatchRow<'a> {
+    /// The row's place in the input, from 0, header excluded.
+    pub index: usize,
+    /// The address text searched, or the candidates tried, joined by ` | `.
+    pub query: &'a str,
+    /// What the row resolved to.
+    pub feature: Option<&'a ForwardFeature>,
+    /// How long the row took to geocode.
+    pub elapsed: Duration,
+}
+
+/// Receives each row of a batch run as it is geocoded. Rows of one chunk are
+/// geocoded in parallel and in an order of their own, so calls come from
+/// several threads and not in input order.
+pub trait BatchObserver: Send + Sync {
+    fn row(&self, row: &BatchRow);
+}
+
+/// The error a batch run returns when it was asked to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchCancelled;
+
+impl fmt::Display for BatchCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("batch run cancelled")
+    }
+}
+
+impl std::error::Error for BatchCancelled {}
 
 #[derive(Debug, Clone)]
 pub struct CoordinateJoinOptions {
@@ -118,23 +187,28 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
     if options.address_field_groups.is_empty() == options.join.is_none() {
         bail!("provide either --address-fields or --join-coordinates-from, but not both");
     }
-    ensure_distinct_paths(&options.input, &options.output, &options.audit)?;
+    ensure_distinct_paths(&options.input, &options.output, options.audit.as_deref())?;
 
     let mut reader = ReaderBuilder::new()
         .flexible(true)
+        .has_headers(options.header_row)
         .from_path(&options.input)
         .with_context(|| format!("failed to open {}", options.input.display()))?;
-    let original_headers = reader
-        .headers()
-        .with_context(|| {
-            format!(
-                "failed to read CSV headers from {}",
-                options.input.display()
-            )
-        })?
-        .iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let original_headers = if options.header_row {
+        reader
+            .headers()
+            .with_context(|| {
+                format!(
+                    "failed to read CSV headers from {}",
+                    options.input.display()
+                )
+            })?
+            .iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        unnamed_columns(&options.input)?
+    };
     let lookup = header_lookup(&original_headers);
     let mut output_headers = original_headers.clone();
     let coordinate_columns = ensure_coordinate_columns(
@@ -171,13 +245,20 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
     };
 
     let mut output = create_csv(&options.output, &output_headers)?;
-    let mut audit = create_csv(&options.audit, &audit_headers)?;
+    let mut audit = options
+        .audit
+        .as_ref()
+        .map(|path| create_csv(path, &audit_headers))
+        .transpose()?;
     let mut report = BatchGeocodeReport {
         rows: 0,
         resolved: 0,
     };
     let mut records = reader.records();
     loop {
+        if options.cancel.load(Ordering::Relaxed) {
+            return Err(BatchCancelled.into());
+        }
         let chunk = records
             .by_ref()
             .take(BATCH_CHUNK_ROWS)
@@ -194,7 +275,7 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
         if chunk.is_empty() {
             break;
         }
-        let audits = resolver.resolve(&options, &lookup, &chunk)?;
+        let audits = resolver.resolve(&options, &lookup, &chunk, report.rows)?;
         for (row, row_audit) in chunk.iter().zip(audits) {
             let mut output_row = padded_row(row, output_headers.len());
             if !row_audit.lat.trim().is_empty() && !row_audit.lon.trim().is_empty() {
@@ -207,13 +288,36 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
                 report.resolved += 1;
             }
             output.write_record(&output_row)?;
-            audit.write_record(audit_record(&original_headers, row, &row_audit))?;
+            if let Some(audit) = &mut audit {
+                audit.write_record(audit_record(&original_headers, row, &row_audit))?;
+            }
             report.rows += 1;
         }
     }
     output.finish()?;
-    audit.finish()?;
+    if let Some(audit) = audit {
+        audit.finish()?;
+    }
     Ok(report)
+}
+
+/// Names for the columns of a CSV without a header row: `column_1`,
+/// `column_2` and so on, as many as the widest of its first rows has.
+pub fn unnamed_columns(path: &Path) -> Result<Vec<String>> {
+    let width = ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(false)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .records()
+        .take(BATCH_CHUNK_ROWS)
+        .filter_map(Result::ok)
+        .map(|record| record.len())
+        .max()
+        .unwrap_or(0);
+    Ok((1..=width)
+        .map(|number| format!("column_{number}"))
+        .collect())
 }
 
 enum Resolver {
@@ -233,6 +337,7 @@ impl Resolver {
         options: &BatchGeocodeOptions,
         headers: &HashMap<String, usize>,
         rows: &[Vec<String>],
+        first_index: usize,
     ) -> Result<Vec<AuditFields>> {
         match self {
             Resolver::Join { lookup, key_index } => Ok(rows
@@ -259,8 +364,21 @@ impl Resolver {
                 let mut results = order
                     .into_par_iter()
                     .map(|index| {
-                        geocode_row(pack, searcher, options, headers, &rows[index])
-                            .map(|audit| (index, audit))
+                        if options.cancel.load(Ordering::Relaxed) {
+                            return Err(BatchCancelled.into());
+                        }
+                        let started = Instant::now();
+                        let (audit, feature) =
+                            geocode_row(pack, searcher, options, headers, &rows[index])?;
+                        if let Some(observer) = &options.observer {
+                            observer.row(&BatchRow {
+                                index: first_index + index,
+                                query: &audit.query,
+                                feature: feature.as_ref(),
+                                elapsed: started.elapsed(),
+                            });
+                        }
+                        Ok((index, audit))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 results.sort_unstable_by_key(|(index, _)| *index);
@@ -318,7 +436,7 @@ fn geocode_row(
     options: &BatchGeocodeOptions,
     headers: &HashMap<String, usize>,
     row: &[String],
-) -> Result<AuditFields> {
+) -> Result<(AuditFields, Option<ForwardFeature>)> {
     let locality = field_value(row, headers, options.locality_field.as_deref());
     let region = field_value(row, headers, options.region_field.as_deref());
     let postcode = field_value(row, headers, options.postcode_field.as_deref());
@@ -339,24 +457,26 @@ fn geocode_row(
         tried_queries.push(address);
         if let Some(response) = response {
             let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
-            return Ok(AuditFields {
+            let audit = AuditFields {
                 status: "resolved".to_string(),
                 query: response.query,
                 reason: String::new(),
                 lat: format_coordinate(feature.lat()),
                 lon: format_coordinate(feature.lon()),
                 result: column_values(Some(&feature)),
-            });
+            };
+            return Ok((audit, Some(feature)));
         }
     }
 
-    Ok(AuditFields {
+    let audit = AuditFields {
         status: "unresolved".to_string(),
         query: tried_queries.join(" | "),
         reason: "no engine result with matching coordinates and context".to_string(),
         result: column_values(None),
         ..AuditFields::default()
-    })
+    };
+    Ok((audit, None))
 }
 
 fn read_csv(path: &Path) -> Result<CsvTable> {
@@ -450,7 +570,7 @@ impl Drop for PendingCsv {
 
 /// Refuse output paths that name the input or each other, however they are
 /// spelled.
-fn ensure_distinct_paths(input: &Path, output: &Path, audit: &Path) -> Result<()> {
+fn ensure_distinct_paths(input: &Path, output: &Path, audit: Option<&Path>) -> Result<()> {
     let resolve = |path: &Path| -> Result<PathBuf> {
         if path.exists() {
             return path
@@ -464,12 +584,14 @@ fn ensure_distinct_paths(input: &Path, output: &Path, audit: &Path) -> Result<()
         let parent = parent.canonicalize().unwrap_or(parent);
         Ok(parent.join(path.file_name().unwrap_or_default()))
     };
-    let (input, output_path, audit_path) = (resolve(input)?, resolve(output)?, resolve(audit)?);
-    for (first, second, first_name, second_name) in [
-        (&output_path, &input, "--output", "--input"),
-        (&audit_path, &input, "--audit", "--input"),
-        (&output_path, &audit_path, "--output", "--audit"),
-    ] {
+    let (input, output_path) = (resolve(input)?, resolve(output)?);
+    let audit_path = audit.map(resolve).transpose()?;
+    let mut pairs = vec![(&output_path, &input, "--output", "--input")];
+    if let Some(audit_path) = &audit_path {
+        pairs.push((audit_path, &input, "--audit", "--input"));
+        pairs.push((&output_path, audit_path, "--output", "--audit"));
+    }
+    for (first, second, first_name, second_name) in pairs {
         if first == second {
             bail!(
                 "{first_name} and {second_name} name the same file ({}); choose a different path",
@@ -760,16 +882,10 @@ mod tests {
             pack: Some(root.join("pack")),
             input,
             output: root.join("out.csv"),
-            audit: root.join("audit.csv"),
+            audit: Some(root.join("audit.csv")),
             address_field_groups: vec![vec!["street".into()]],
-            locality_field: None,
-            region_field: None,
-            postcode_field: None,
-            layer: None,
             limit: 5,
-            lat_column: "lat".into(),
-            lon_column: "lon".into(),
-            join: None,
+            ..BatchGeocodeOptions::default()
         })
         .expect("batch");
         assert_eq!(
@@ -793,6 +909,50 @@ mod tests {
         let audit = read_csv(&root.join("audit.csv")).expect("audit");
         assert_eq!(audit.rows[1][2], "unresolved");
         assert_eq!(audit.rows[2][6], "osm:node:1");
+
+        // A file without a header row, watched row by row, with no audit.
+        struct Rows(std::sync::Mutex<Vec<(usize, Option<String>)>>);
+        impl BatchObserver for Rows {
+            fn row(&self, row: &BatchRow) {
+                self.0.lock().expect("rows").push((
+                    row.index,
+                    row.feature.map(|feature| feature.properties.id.clone()),
+                ));
+            }
+        }
+        let bare = root.join("bare.csv");
+        std::fs::write(&bare, "a,20 Queen St\nb,nowhere at all\n").expect("input");
+        let rows = Arc::new(Rows(std::sync::Mutex::new(Vec::new())));
+        let report = run_batch_geocode(BatchGeocodeOptions {
+            pack: Some(root.join("pack")),
+            input: bare.clone(),
+            output: root.join("bare-out.csv"),
+            header_row: false,
+            address_field_groups: vec![vec!["column_2".into()]],
+            observer: Some(Arc::clone(&rows) as Arc<dyn BatchObserver>),
+            ..BatchGeocodeOptions::default()
+        })
+        .expect("batch without header");
+        assert_eq!(report.resolved, 1);
+        let mut seen = rows.0.lock().expect("rows").clone();
+        seen.sort();
+        assert_eq!(seen, vec![(0, Some("osm:node:2".to_string())), (1, None)]);
+        let output = read_csv(&root.join("bare-out.csv")).expect("output");
+        assert_eq!(output.headers, vec!["column_1", "column_2", "lat", "lon"]);
+
+        // A run asked to stop writes nothing.
+        let error = run_batch_geocode(BatchGeocodeOptions {
+            pack: Some(root.join("pack")),
+            input: bare,
+            output: root.join("stopped.csv"),
+            header_row: false,
+            address_field_groups: vec![vec!["column_2".into()]],
+            cancel: Arc::new(AtomicBool::new(true)),
+            ..BatchGeocodeOptions::default()
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<BatchCancelled>().is_some());
+        assert!(!root.join("stopped.csv").exists());
     }
 
     #[test]
@@ -817,21 +977,15 @@ a,43.6,-79.4
             pack: None,
             input: input.clone(),
             output,
-            audit,
-            address_field_groups: Vec::new(),
-            locality_field: None,
-            region_field: None,
-            postcode_field: None,
-            layer: None,
+            audit: Some(audit),
             limit: 5,
-            lat_column: "lat".into(),
-            lon_column: "lon".into(),
             join: Some(CoordinateJoinOptions {
                 path: coordinates.clone(),
                 key_column: "id".into(),
                 lat_column: "lat".into(),
                 lon_column: "lon".into(),
             }),
+            ..BatchGeocodeOptions::default()
         };
         // The same file spelled differently must be caught too.
         let same = root.join(".").join("in.csv");

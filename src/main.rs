@@ -445,6 +445,7 @@ async fn main() -> Result<()> {
                 memory_budget_bytes: usize::try_from(memory_budget_mb << 20)
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
+                ..BuildOsmOptions::default()
             })?;
             write_json(serde_json::json!({
                 "records": report.output.record_count,
@@ -558,9 +559,9 @@ async fn main() -> Result<()> {
         } => {
             serve(ServeOptions {
                 pack,
-                demo,
+                demo: Some(demo),
                 bind,
-                basemap,
+                basemap: Some(basemap),
             })
             .await
         }
@@ -851,7 +852,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         pack,
         input,
         output: output.clone(),
-        audit: audit.clone(),
+        audit: Some(audit.clone()),
         address_field_groups,
         locality_field,
         region_field,
@@ -861,6 +862,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         lat_column,
         lon_column,
         join,
+        ..BatchGeocodeOptions::default()
     })?;
     write_json(serde_json::json!({
         "rows": report.rows,
