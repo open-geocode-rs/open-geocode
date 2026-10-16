@@ -1172,7 +1172,9 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let hits = app.hits();
-    let lines: Vec<Line> = if app.mode == Mode::Batch {
+    let lines: Vec<Line> = if app.mode == Mode::Batch && app.batch_candidate.is_some() {
+        batch_card(app)
+    } else if app.mode == Mode::Batch {
         batch_table(app, results)
     } else if app.query.is_empty() {
         vec![
@@ -1197,6 +1199,14 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(lines), results);
 
+    if app.mode == Mode::Batch && app.batch_candidate.is_some() {
+        footer(
+            frame,
+            app,
+            &[("←→", "choose"), ("enter", "select"), ("esc", "cancel")],
+        );
+        return;
+    }
     if app.mode == Mode::Batch {
         let esc = if app.batch_text.is_empty() {
             "back"
@@ -1273,7 +1283,7 @@ fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
                 DIM,
             )),
             Line::from(span(
-                "  Press enter on a file path to choose its columns, or ctrl+e for a 10,000 address example.",
+                "  Paste a file path to continue with that file, or press ctrl+e for a 10,000 address example.",
                 DIM,
             )),
             Line::raw(""),
@@ -1747,15 +1757,8 @@ fn result_line(
     Line::from(spans)
 }
 
-fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(session) = &app.batch else {
-        return;
-    };
-    let file = &session.file;
-    let inner = area.width as usize;
-    let shown = 3.min(file.total_rows);
-    let sample: Vec<Vec<String>> = (0..shown).map(|index| file.row(index)).collect();
-
+/// `10,000 rows · 4.2 MB · header found · 14 blank rows skipped`.
+fn file_facts(file: &batch::BatchFile) -> String {
     let mut facts = format!(
         "{} rows · {} · {}",
         mock::thousands(file.total_rows),
@@ -1777,6 +1780,37 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
             }
         ));
     }
+    facts
+}
+
+/// The file named in the batch tab, with a choice to continue or drop it.
+fn batch_card(app: &App) -> Vec<Line<'static>> {
+    let Some(file) = &app.batch_candidate else {
+        return Vec::new();
+    };
+    vec![
+        Line::from(vec![plain("   "), bold(file.name.clone())]),
+        Line::from(span(format!("   {}", file_facts(file)), DIM)),
+        Line::raw(""),
+        Line::from(vec![
+            plain("  "),
+            button("Continue", app.batch_choice == 0, true),
+            plain("  "),
+            button("Cancel", app.batch_choice == 1, true),
+        ]),
+    ]
+}
+
+fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(session) = &app.batch else {
+        return;
+    };
+    let file = &session.file;
+    let inner = area.width as usize;
+    let shown = 3.min(file.total_rows);
+    let sample: Vec<Vec<String>> = (0..shown).map(|index| file.row(index)).collect();
+
+    let facts = file_facts(file);
 
     // The columns, each with the role it will play, and the first rows.
     let widths: Vec<usize> = file

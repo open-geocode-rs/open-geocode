@@ -163,6 +163,10 @@ pub struct App {
     /// The file being geocoded, once one is opened.
     pub batch: Option<BatchSession>,
     pub batch_button: usize,
+    /// A file named in the batch tab, waiting to be continued with or dropped.
+    pub batch_candidate: Option<BatchFile>,
+    /// 0 is Continue, 1 is Cancel.
+    pub batch_choice: usize,
 }
 
 impl App {
@@ -204,6 +208,8 @@ impl App {
             batch_note: String::new(),
             batch: None,
             batch_button: 0,
+            batch_candidate: None,
+            batch_choice: 0,
         }
     }
 
@@ -703,6 +709,26 @@ impl App {
     /// Batch mode edits a block of text: a terminal that does not mark a
     /// paste sends it as keys, so Enter adds a line instead of submitting.
     fn batch_key(&mut self, key: KeyEvent) {
+        // A file is waiting: choose between continuing with it and dropping it.
+        if self.batch_candidate.is_some() {
+            match key.code {
+                KeyCode::Left | KeyCode::Right => {
+                    self.batch_choice ^= 1;
+                    return;
+                }
+                KeyCode::Enter if self.batch_choice == 0 => {
+                    if let Some(file) = self.batch_candidate.take() {
+                        self.open_batch_setup(file);
+                    }
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.drop_batch_file();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let rows = self.batch_rows.len();
         match key.code {
@@ -733,17 +759,13 @@ impl App {
                 }
             }
             KeyCode::Char('j') if ctrl => self.push_batch("\n"),
-            KeyCode::Char('e') if ctrl => self.open_batch_setup(BatchFile::example()),
-            KeyCode::Enter => {
-                let typed = self.batch_text.trim().trim_matches('"');
-                let file = (!typed.is_empty() && !typed.contains('\n'))
-                    .then(|| BatchFile::from_path(Path::new(typed)))
-                    .flatten();
-                match file {
-                    Some(file) => self.open_batch_setup(file),
-                    None => self.push_batch("\n"),
-                }
+            KeyCode::Char('e') if ctrl => {
+                self.batch_text = "addresses.csv".to_string();
+                self.batch_rows.clear();
+                self.batch_candidate = Some(BatchFile::example());
+                self.batch_choice = 0;
             }
+            KeyCode::Enter => self.push_batch("\n"),
             KeyCode::Up if rows > 0 => self.hit_cursor = (self.hit_cursor + rows - 1) % rows,
             KeyCode::Down if rows > 0 => self.hit_cursor = (self.hit_cursor + 1) % rows,
             KeyCode::Esc => {
@@ -768,22 +790,31 @@ impl App {
         self.refresh_batch();
     }
 
-    /// Reads the batch text again and looks up every address in it. A single
-    /// line that names a CSV file reads that file instead.
+    /// Forgets the file waiting in the batch tab and clears the box.
+    fn drop_batch_file(&mut self) {
+        self.batch_candidate = None;
+        self.batch_choice = 0;
+        self.batch_text.clear();
+        self.refresh_batch();
+    }
+
+    /// Reads the batch text again. A single line that names a CSV file makes
+    /// that file the candidate to continue with; anything else is read as
+    /// rows and every address in it is looked up.
     fn refresh_batch(&mut self) {
         let typed = self.batch_text.trim().trim_matches('"');
-        let from_file = (!typed.is_empty() && !typed.contains('\n'))
-            .then(|| Path::new(typed))
-            .filter(|path| {
-                path.metadata()
-                    .is_ok_and(|meta| meta.is_file() && meta.len() < 5_000_000)
-            })
-            .and_then(|path| std::fs::read_to_string(path).ok());
-        let (addresses, mut note) =
-            mock::batch_parse(from_file.as_deref().unwrap_or(&self.batch_text));
-        if from_file.is_some() {
-            note.push_str(", from a file");
+        let file = (!typed.is_empty() && !typed.contains('\n'))
+            .then(|| BatchFile::from_path(Path::new(typed)))
+            .flatten();
+        if let Some(file) = file {
+            self.batch_candidate = Some(file);
+            self.batch_choice = 0;
+            self.batch_rows.clear();
+            self.batch_note.clear();
+            return;
         }
+        self.batch_candidate = None;
+        let (addresses, note) = mock::batch_parse(&self.batch_text);
         self.batch_rows = addresses
             .into_iter()
             .map(|input| BatchRow {
@@ -835,7 +866,11 @@ impl App {
                 }
             }
             KeyCode::Enter => self.start_batch_run(),
-            KeyCode::Esc => self.screen = Screen::Query,
+            KeyCode::Esc => {
+                self.batch_candidate = self.batch.take().map(|session| session.file);
+                self.batch_choice = 0;
+                self.screen = Screen::Query;
+            }
             _ => {}
         }
     }

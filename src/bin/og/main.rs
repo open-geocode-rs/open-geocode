@@ -219,6 +219,11 @@ mod preview {
         let mut app = App::new(false);
         press(&mut app, &[KeyCode::Char('g')]);
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(app.batch_candidate.is_some());
+        show(&app, "batch file card");
+        press(&mut app, &[KeyCode::Right]);
+        show(&app, "batch file card, cancel chosen");
+        press(&mut app, &[KeyCode::Left, KeyCode::Enter]);
         assert!(app.screen == Screen::BatchSetup);
         show(&app, "batch setup");
         press(&mut app, &[KeyCode::Right, KeyCode::Right]);
@@ -261,6 +266,7 @@ B,24 sussex dr,Ottawa,ON
         let mut app = App::new(false);
         press(&mut app, &[KeyCode::Char('g')]);
         app.on_paste(path.display().to_string());
+        assert!(app.batch_candidate.is_some());
         press(&mut app, &[KeyCode::Enter]);
         std::fs::remove_file(&path).ok();
         assert!(app.screen == Screen::BatchSetup);
