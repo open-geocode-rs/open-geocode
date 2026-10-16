@@ -13,7 +13,7 @@ use ratatui::{
 
 use crate::{
     app::{self, App, Build, Mode, RegionRow, Screen},
-    mock::{self, Record},
+    mock::{self, Record, Stage},
     regions,
 };
 
@@ -28,7 +28,11 @@ const VIOLET: Color = Color::Rgb(160, 140, 255);
 
 /// Gradient ends of the stage bar and the overall bar.
 const BAR: [(u8, u8, u8); 2] = [(70, 130, 255), (92, 220, 255)];
-const BAR_OVERALL: [(u8, u8, u8); 2] = [(96, 96, 120), (160, 160, 184)];
+/// Full bars of finished stages, muted so the running one stands out.
+const DONE_BAR: Color = Color::Rgb(74, 140, 104);
+/// The shimmer on the running stage's title sweeps from the first colour to
+/// the second.
+const SHIMMER: [(u8, u8, u8); 2] = [(112, 150, 205), (240, 248, 255)];
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -153,19 +157,27 @@ pub fn choices(app: &App) -> Vec<Line<'static>> {
     answers(app, 3)
 }
 
-pub fn stage_done(build: &Build, index: usize) -> Line<'static> {
-    let stage = &build.stages[index];
-    let title = match build.number(index) {
-        Some(number) => format!("{number} {}", stage.title),
-        None => stage.title.clone(),
-    };
-    Line::from(vec![
-        span("  ✓ ", OK),
-        plain(pad(&title, 36)),
-        span(format!("{:>7}", mock::duration(stage.real_secs)), DIM),
-        plain("   "),
-        span(stage.summary.clone(), DIM),
-    ])
+/// Width of the content: the terminal minus its margins, at most 96.
+pub fn content_width(terminal: u16) -> usize {
+    terminal.saturating_sub(2).min(96) as usize
+}
+
+/// The line that opens a build in terminal history.
+pub fn build_header(app: &App) -> Vec<Line<'static>> {
+    vec![
+        Line::raw(""),
+        Line::from(vec![
+            plain(" "),
+            bold(format!("Building {}", app.region.label)),
+        ]),
+        Line::raw(""),
+    ]
+}
+
+/// A finished stage as it goes into terminal history, with a blank line
+/// after it so the stages do not run together.
+pub fn stage_done(build: &Build, index: usize, inner: usize) -> Vec<Line<'static>> {
+    vec![finished_line(&build.stages[index], inner), Line::raw("")]
 }
 
 pub fn cancelled(build: &Build) -> Line<'static> {
@@ -710,143 +722,175 @@ fn lerp(ends: [(u8, u8, u8); 2], t: f64) -> Color {
     )
 }
 
-/// A thin bar that fills left to right; its colour runs along a gradient.
-fn bar(cells: usize, ratio: f64, ends: [(u8, u8, u8); 2]) -> Vec<Span<'static>> {
-    let filled = ratio.clamp(0.0, 1.0) * cells as f64;
-    let full = filled.floor() as usize;
-    let half = full < cells && filled - full as f64 >= 0.5;
-    let mut spans = Vec::with_capacity(cells);
+// A stage line is laid out as Ollama lays out a layer: a marker, the name,
+// the percent, a bar, then size, speed and time in columns of fixed width, so
+// nothing moves as the numbers change.
+const NAME_WIDTH: usize = 24;
+const SIZE_WIDTH: usize = 13;
+const SPEED_WIDTH: usize = 9;
+const TIME_WIDTH: usize = 8;
+/// Everything on a line but the bar.
+const LINE_FIXED: usize = 4 + NAME_WIDTH + 2 + 5 + 2 + 2 + SIZE_WIDTH + SPEED_WIDTH + TIME_WIDTH;
+
+/// Cells of the bar: what the width leaves after the other columns.
+fn bar_cells(inner: usize) -> usize {
+    inner.saturating_sub(LINE_FIXED).clamp(8, 24)
+}
+
+/// A bar between thin caps. The filled part runs along a gradient, or is one
+/// colour when `solid` is given; its last cell is cut in eighths.
+fn bar_spans(cells: usize, ratio: f64, solid: Option<Color>) -> Vec<Span<'static>> {
+    const EIGHTHS: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let exact = ratio.clamp(0.0, 1.0) * cells as f64;
+    let full = exact.floor() as usize;
+    let part = ((exact - full as f64) * 8.0) as usize;
+    let mut spans = vec![span("▕", FAINT)];
     for index in 0..cells {
-        let color = lerp(ends, index as f64 / cells.max(1) as f64);
-        if index < full {
-            spans.push(span("━", color));
-        } else if index == full && half {
-            spans.push(span("╸", color));
+        let color = solid.unwrap_or_else(|| lerp(BAR, index as f64 / cells.max(1) as f64));
+        spans.push(if index < full {
+            span("█", color)
+        } else if index == full && part > 0 {
+            span(EIGHTHS[part - 1], color)
         } else {
-            spans.push(span("━", FAINT));
-        }
+            span("░", FAINT)
+        });
     }
+    spans.push(span("▏", FAINT));
     spans
 }
 
-/// A band that sweeps back and forth, for stages with no total.
-fn sweep(cells: usize, app: &App) -> Vec<Span<'static>> {
-    let band = 10.min(cells);
-    let travel = (cells - band).max(1);
-    let step = (app.started.elapsed().as_millis() / 40) as usize % (travel * 2);
-    let start = if step < travel {
-        step
-    } else {
-        travel * 2 - step
-    };
-    (0..cells)
-        .map(|index| {
-            if (start..start + band).contains(&index) {
-                span("━", lerp(BAR, (index - start) as f64 / band as f64))
-            } else {
-                span("━", FAINT)
-            }
+/// A title whose letters brighten in a band that sweeps along it.
+fn shimmer(text: &str, millis: u128) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let head = ((millis / 70) as usize % (chars.len() + 10)) as f64 - 5.0;
+    chars
+        .iter()
+        .enumerate()
+        .map(|(index, c)| {
+            let near = (1.0 - (index as f64 - head).abs() / 3.5).max(0.0);
+            Span::styled(
+                c.to_string(),
+                Style::new()
+                    .fg(lerp(SHIMMER, near))
+                    .add_modifier(Modifier::BOLD),
+            )
         })
         .collect()
+}
+
+fn finished_line(stage: &Stage, inner: usize) -> Line<'static> {
+    let cells = bar_cells(inner);
+    let mut spans = vec![
+        plain(" "),
+        span("✔", OK),
+        plain("  "),
+        plain(pad(&cut(&stage.title, NAME_WIDTH), NAME_WIDTH)),
+        plain("  "),
+    ];
+    if stage.total.is_some() {
+        spans.push(plain("100% "));
+        spans.extend(bar_spans(cells, 1.0, Some(DONE_BAR)));
+        spans.push(span(
+            format!("  {:>SIZE_WIDTH$}", cut(&stage.summary, SIZE_WIDTH)),
+            DIM,
+        ));
+        spans.push(plain(" ".repeat(SPEED_WIDTH)));
+    } else {
+        // A stage with no total has no bar: its result stands where the bar was.
+        spans.push(plain("     "));
+        spans.push(span(pad(&cut(&stage.summary, cells + 2), cells + 2), DIM));
+        spans.push(plain(" ".repeat(2 + SIZE_WIDTH + SPEED_WIDTH)));
+    }
+    spans.push(span(
+        format!("{:>TIME_WIDTH$}", mock::duration(stage.real_secs)),
+        DIM,
+    ));
+    Line::from(spans)
+}
+
+fn running_line(app: &App, build: &Build, inner: usize) -> Line<'static> {
+    let stage = build.stage();
+    let progress = build.progress();
+    let cells = bar_cells(inner);
+    let name = cut(&stage.title, NAME_WIDTH);
+    let mut spans = vec![plain(" "), span(spinner(app), ACCENT), plain("  ")];
+    spans.extend(shimmer(&name, app.started.elapsed().as_millis()));
+    spans.push(plain(" ".repeat(NAME_WIDTH - width(&name))));
+    spans.push(plain("  "));
+    match stage.total {
+        Some(total) => {
+            let megabytes = stage.unit == "MB";
+            let (done, whole) = if megabytes {
+                (mock::size(total * progress), mock::size(total))
+            } else {
+                (mock::count(total * progress), mock::count(total))
+            };
+            let rate = if megabytes {
+                format!("{:.1} MB/s", total / stage.real_secs)
+            } else {
+                format!("{}/s", mock::count(total / stage.real_secs))
+            };
+            spans.push(plain(format!("{:>3}% ", (progress * 100.0).floor())));
+            spans.extend(bar_spans(cells, progress, None));
+            spans.push(plain(format!(
+                "  {:>SIZE_WIDTH$}",
+                format!("{done}/{whole}")
+            )));
+            spans.push(span(format!("{rate:>SPEED_WIDTH$}"), DIM));
+            spans.push(span(
+                format!(
+                    "{:>TIME_WIDTH$}",
+                    mock::duration((1.0 - progress) * stage.real_secs)
+                ),
+                DIM,
+            ));
+        }
+        None => {
+            // No total, so no percent and no bar: only time passing.
+            spans.push(plain("     "));
+            spans.push(span(pad("working…", cells + 2), DIM));
+            spans.push(plain(" ".repeat(2 + SIZE_WIDTH + SPEED_WIDTH)));
+            spans.push(span(
+                format!(
+                    "{:>TIME_WIDTH$}",
+                    mock::duration(progress * stage.real_secs)
+                ),
+                DIM,
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 fn build(frame: &mut Frame, area: Rect, app: &App) {
     let Some(build) = &app.build else {
         return;
     };
-    let box_rows = if app.show_logs { 17 } else { 12 };
-    let [panel_area, _, _] = Layout::vertical([
-        Constraint::Length(box_rows),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    let stage = build.stage();
-    let progress = build.progress();
-    let inner = panel_area.width.saturating_sub(2) as usize;
-
-    let mut title_line = vec![plain("  "), span(spinner(app), ACCENT), plain(" ")];
-    title_line.push(bold(stage.title.clone()));
-    let mut lines = vec![
-        Line::raw(""),
-        Line::from(title_line),
-        Line::from(vec![plain(format!("    {}", stage.explain[0]))]),
-        Line::from(vec![span(format!("    {}", stage.explain[1]), DIM)]),
-        Line::raw(""),
-    ];
-
-    let mut stage_bar = vec![plain("    ")];
-    match stage.total {
-        Some(total) => {
-            let right = format!(
-                "  {:>3}%   {} / {} {}",
-                (progress * 100.0).floor(),
-                mock::count(total * progress),
-                mock::count(total),
-                stage.unit
-            );
-            let cells = inner.saturating_sub(4 + width(&right) + 2).max(10);
-            stage_bar.extend(bar(cells, progress, BAR));
-            stage_bar.push(plain(right));
-        }
-        None => {
-            let right = "  working".to_string();
-            let cells = inner.saturating_sub(4 + 30).max(10);
-            stage_bar.extend(sweep(cells, app));
-            stage_bar.push(span(right, DIM));
-        }
-    }
-    lines.push(Line::from(stage_bar));
-    lines.push(Line::raw(""));
-
+    let inner = area.width as usize;
     let overall = build.overall();
-    let right = format!(
-        "  {:>3}%   {} left",
-        (overall * 100.0).floor(),
-        mock::about(build.remaining())
-    );
-    let cells = inner.saturating_sub(4 + 9 + width(&right) + 2).max(10);
-    let mut overall_line = vec![span("    overall  ", DIM)];
-    overall_line.extend(bar(cells, overall, BAR_OVERALL));
-    overall_line.push(span(right, DIM));
-    lines.push(Line::from(overall_line));
-
-    let stats = if stage.unit == "MB" {
-        vec![
-            span("    speed ", DIM),
-            plain(format!(
-                "{:.1} MB/s",
-                stage.total.unwrap_or(0.0) / stage.real_secs
-            )),
-            span("    from ", DIM),
-            plain("download.geofabrik.de"),
-        ]
-    } else {
-        let budget = app.memory_gb() as f64;
-        let memory = (1.4 + overall * 4.0).min(budget * 0.85);
-        let spill = (overall * 2.2 - 0.6).max(0.0);
-        let mut stats = vec![
-            span("    memory ", DIM),
-            plain(format!("{memory:.1} / {budget:.1} GB")),
-            span("    spill ", DIM),
-            plain(format!("{spill:.1} GB")),
-        ];
-        if let Some(total) = stage.total {
-            stats.push(span("    rate ", DIM));
-            stats.push(plain(format!(
-                "{} {}/s",
-                mock::count(total / stage.real_secs),
-                stage.unit
-            )));
-        }
-        stats
-    };
-    lines.push(Line::from(stats));
-
+    let budget = app.memory_gb() as f64;
+    let memory = (1.4 + overall * 4.0).min(budget * 0.85);
+    let mut lines = vec![
+        running_line(app, build, inner),
+        Line::raw(""),
+        Line::from(span(
+            format!(
+                "    overall {}% · {} elapsed · {} left · memory {memory:.1} / {budget:.1} GB",
+                (overall * 100.0).floor(),
+                mock::duration(build.elapsed()),
+                mock::about(build.remaining()),
+            ),
+            DIM,
+        )),
+    ];
     if app.show_logs {
+        let stage = build.stage();
+        lines.push(Line::raw(""));
+        lines.push(Line::from(span(format!("    {}", stage.explain[0]), DIM)));
+        lines.push(Line::from(span(format!("    {}", stage.explain[1]), DIM)));
         lines.push(Line::raw(""));
         lines.push(Line::from(span(
-            format!("    log {}", "─".repeat(inner.saturating_sub(12))),
+            format!("    log {}", "─".repeat(inner.saturating_sub(10))),
             FAINT,
         )));
         let end = ((overall * mock::LOGS.len() as f64).ceil() as usize).clamp(1, mock::LOGS.len());
@@ -859,22 +903,16 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
             ]));
         }
     }
-
-    let position = build
-        .number(build.current)
-        .unwrap_or_else(|| "download".to_string());
-    let corner = Line::from(span(
-        format!(" {position} · {} ", mock::duration(build.elapsed())),
-        DIM,
-    ))
-    .right_aligned();
-    let block = panel(&format!("Building {}", app.region.label)).title_top(corner);
-    frame.render_widget(Paragraph::new(lines).block(block), panel_area);
-    let logs = if app.show_logs { "hide logs" } else { "logs" };
+    frame.render_widget(Paragraph::new(lines), area);
+    let details = if app.show_logs {
+        "hide details"
+    } else {
+        "details"
+    };
     footer(
         frame,
         app,
-        &[("l", logs), ("esc", "cancel, keeps downloads")],
+        &[("l", details), ("esc", "cancel, keeps downloads")],
     );
 }
 

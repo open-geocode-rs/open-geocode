@@ -108,6 +108,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
                 }
             }
         }
+        app.width = terminal.size()?.width;
         app.tick();
     }
     if inline {
@@ -175,6 +176,39 @@ mod preview {
         show(&app, "batch pasted");
         app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         show(&app, "batch geojson");
+    }
+
+    fn text(line: &ratatui::text::Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn build_lines() {
+        let mut app = App::new(false);
+        press(&mut app, &[KeyCode::Char('b')]);
+        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        app.screen = Screen::Confirm;
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.screen == Screen::Build);
+        let build = app.build.as_mut().expect("a build is running");
+        build.current = 5;
+        let build = app.build.as_ref().expect("a build is running");
+        println!("=== build history");
+        for line in &app.scrollback {
+            println!("{}", text(line));
+        }
+        for index in 0..5 {
+            for line in ui::stage_done(build, index, 82) {
+                println!("{}", text(&line));
+            }
+        }
+        show(&app, "build running");
+        let build = app.build.as_mut().expect("a build is running");
+        build.current = 8;
+        show(&app, "build no total");
     }
 
     #[test]

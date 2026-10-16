@@ -116,20 +116,6 @@ impl Build {
         let total: f64 = self.stages.iter().map(|stage| stage.real_secs).sum();
         total - self.elapsed()
     }
-
-    /// `3/8` for builder stages; downloads carry no number.
-    pub fn number(&self, index: usize) -> Option<String> {
-        let stage = &self.stages[index];
-        if !stage.numbered {
-            return None;
-        }
-        let total = self.stages.iter().filter(|stage| stage.numbered).count();
-        let position = self.stages[..=index]
-            .iter()
-            .filter(|stage| stage.numbered)
-            .count();
-        Some(format!("{position}/{total}"))
-    }
 }
 
 pub struct App {
@@ -141,6 +127,8 @@ pub struct App {
     pub farewell: Vec<String>,
     pub flash: Option<(String, Instant)>,
     pub started: Instant,
+    /// Terminal width, for lines printed into history.
+    pub width: u16,
     pub home_cursor: usize,
     /// The Packs the home screen lists.
     pub packs: &'static [mock::SamplePack],
@@ -181,6 +169,7 @@ impl App {
             farewell: Vec::new(),
             flash: None,
             started: Instant::now(),
+            width: 96,
             home_cursor: 0,
             packs: if empty { &[] } else { &mock::PACKS },
             active_name: String::new(),
@@ -399,8 +388,11 @@ impl App {
         if build.progress() < 1.0 {
             return;
         }
-        let line = ui::stage_done(build, build.current);
-        self.scrollback.push(line);
+        self.scrollback.extend(ui::stage_done(
+            build,
+            build.current,
+            ui::content_width(self.width),
+        ));
         if build.current + 1 < build.stages.len() {
             build.current += 1;
             build.stage_started = Instant::now();
@@ -583,6 +575,7 @@ impl App {
 
     fn start_build(&mut self) {
         self.scrollback.extend(ui::choices(self));
+        self.scrollback.extend(ui::build_header(self));
         self.build = Some(Build {
             stages: mock::stages(self.region, &self.sources),
             current: 0,

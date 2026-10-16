@@ -37,8 +37,6 @@ pub const RAM_GB: u32 = 16;
 
 pub struct Stage {
     pub title: String,
-    /// Numbered stages are the builder's own; downloads come before them.
-    pub numbered: bool,
     pub explain: [&'static str; 2],
     /// Units of work, or `None` for a stage with no measurable total.
     pub total: Option<f64>,
@@ -51,12 +49,10 @@ pub struct Stage {
 }
 
 pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
-    let file = format!("{}-latest.osm.pbf", region.slug());
     let mut stages = Vec::new();
     if region.local().is_none() {
         stages.push(Stage {
-            title: format!("Download {file}"),
-            numbered: false,
+            title: "Download OpenStreetMap".to_string(),
             explain: [
                 "Fetching the region from Geofabrik.",
                 "The file is checked against its published checksum before use.",
@@ -65,14 +61,13 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             unit: "MB",
             play_secs: 3.0,
             real_secs: 38.0,
-            summary: format!("{}  checksum ok", size(region.size_mb())),
+            summary: size(region.size_mb()),
         });
     }
     for (index, source) in SOURCES.iter().enumerate().skip(1) {
         if sources[index] {
             stages.push(Stage {
                 title: format!("Download {}", source.name),
-                numbered: false,
                 explain: [
                     "Fetching the extra source for this region.",
                     "Its points are merged with OpenStreetMap later in the build.",
@@ -99,7 +94,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "48.2M objects".to_string(),
         ),
         (
-            "Read boundary member ways",
+            "Read boundary ways",
             [
                 "Collecting the outline pieces of countries, provinces and cities.",
                 "These become the areas every result is placed in.",
@@ -108,7 +103,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "ways",
             2.0,
             9.0,
-            "3,418 boundaries".to_string(),
+            "1.9M ways".to_string(),
         ),
         (
             "Join node coordinates",
@@ -156,7 +151,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "records",
             3.5,
             122.0,
-            "7,590,748 records".to_string(),
+            "7.59M records".to_string(),
         ),
         (
             "Finish Pack indexes",
@@ -186,7 +181,6 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
     for (title, explain, total, unit, play_secs, real_secs, summary) in builder {
         stages.push(Stage {
             title: title.to_string(),
-            numbered: true,
             explain,
             total,
             unit,
