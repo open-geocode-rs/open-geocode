@@ -1,6 +1,11 @@
-//! The batch geocoding flow: a CSV is read, each column gets a role, and the
-//! file is geocoded by the engine's batch run, the same `open-geocode
-//! batch-geocode` does, into a new CSV beside it.
+//! The batch geocoding flow: a file of addresses is read, the columns that
+//! make up the address are picked, and the file is geocoded by the engine's
+//! batch run, the same `open-geocode batch-geocode` does, into a new file
+//! beside it.
+//!
+//! A row's address is its picked cells joined in file order into one line,
+//! which the engine's parser reads like any query: there is no telling it
+//! which cell is the street or the postcode.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -16,7 +21,8 @@ use std::{
 
 use anyhow::Result;
 use open_geocode::batch::{
-    BatchGeocodeOptions, BatchObserver, BatchRow, run_batch_geocode, unnamed_columns,
+    BatchGeocodeOptions, BatchObserver, BatchRow, cells, detect_delimiter, header_names,
+    open_delimited, run_batch_geocode, unnamed_columns,
 };
 
 use crate::engine::{Engine, Hit, name_of};
@@ -26,76 +32,71 @@ pub const PREVIEW_ROWS: usize = 3;
 /// Rows the running screen lists, newest first.
 const LATEST_ROWS: usize = 8;
 
-/// What a column holds, as far as the query is concerned.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Address,
-    City,
-    Region,
-    Postcode,
-    Skip,
+/// Words of a header that name part of an address, in the languages
+/// address files come in, and the codes of common registers.
+const ADDRESS_WORDS: &[&str] = &[
+    // the address, the street and the house number
+    "address", "addr", "adresse", "adress", "indirizzo", "direccion", "endereco", "street",
+    "strasse", "straße", "str", "stn", "rue", "via", "calle", "rua", "road", "weg", "gasse",
+    "number", "nummer", "hausnummer", "housenumber", "house", "nr", "no", "num", "numero",
+    "civico", "hnr", "unit", "suite", "apt",
+    // the place
+    "city", "town", "locality", "municipality", "municipal", "gemeinde", "ort", "ortschaft",
+    "commune", "comune", "ville", "ciudad", "cidade", "suburb", "village",
+    // the postcode
+    "postcode", "postal", "zip", "zipcode", "plz", "npa", "cap", "cp", "postleitzahl",
+    // the region and the country
+    "region", "state", "province", "prov", "canton", "kanton", "county", "district",
+    "country", "land", "pays", "paese",
+];
+
+/// Words of a header that name something else, which wins over the above:
+/// identifiers, coordinates, dates and flags.
+const OTHER_WORDS: &[&str] = &[
+    "id", "uuid", "pid", "egid", "egaid", "esid", "edid", "fosnr", "bfs", "lat", "lon", "lng",
+    "latitude", "longitude", "x", "y", "easting", "northing", "date", "modified", "created",
+    "updated", "status", "official", "category", "type", "phone", "email", "url",
+];
+
+/// The words of a header: `ADR_NUMBER` is `adr` and `number`.
+fn words(header: &str) -> Vec<String> {
+    header
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
-impl Role {
-    const ALL: [Role; 5] = [
-        Role::Address,
-        Role::City,
-        Role::Region,
-        Role::Postcode,
-        Role::Skip,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Address => "Address",
-            Self::City => "City",
-            Self::Region => "Region",
-            Self::Postcode => "Postcode",
-            Self::Skip => "Skip",
-        }
+/// Whether a header names part of an address. A municipality's or
+/// commune's name counts; its number does not.
+fn names_address(header: &str) -> bool {
+    let words = words(header);
+    let has = |list: &[&str]| words.iter().any(|word| list.contains(&word.as_str()));
+    if has(OTHER_WORDS) {
+        return false;
     }
-
-    /// The next role, or the one before it.
-    pub fn cycle(self, forward: bool) -> Self {
-        let at = Self::ALL.iter().position(|role| *role == self).unwrap_or(0);
-        let next = if forward {
-            (at + 1) % Self::ALL.len()
-        } else {
-            (at + Self::ALL.len() - 1) % Self::ALL.len()
-        };
-        Self::ALL[next]
-    }
+    let place = words.iter().any(|word| matches!(word.as_str(), "com" | "gem" | "mun"))
+        && words.iter().any(|word| matches!(word.as_str(), "name" | "label"));
+    place || has(ADDRESS_WORDS)
 }
 
-/// The role a header name suggests.
-fn detect(header: &str) -> Role {
-    let header = header.to_lowercase();
-    let has = |words: &[&str]| words.iter().any(|word| header.contains(word));
-    if has(&["addr", "street"]) {
-        Role::Address
-    } else if has(&["city", "town", "locality", "municipal"]) {
-        Role::City
-    } else if has(&["prov", "state", "region"]) {
-        Role::Region
-    } else if has(&["postal", "zip", "postcode"]) {
-        Role::Postcode
-    } else {
-        Role::Skip
-    }
+fn is_number(cell: &str) -> bool {
+    let cell = cell.trim();
+    !cell.is_empty() && cell.parse::<f64>().is_ok()
 }
 
-/// Whether a first row names columns instead of holding an address.
-fn looks_like_header(row: &[String]) -> bool {
-    const WORDS: [&str; 12] = [
-        "address", "addr", "street", "city", "province", "state", "postal", "zip", "name", "id",
-        "lat", "lon",
-    ];
-    row.iter().any(|cell| {
-        let cell = cell.to_lowercase();
-        WORDS
+/// Whether a first row names columns instead of holding data: some column
+/// is a number in the second row but not in the first, or a cell of the
+/// first row names part of an address.
+fn looks_like_header(first: &[String], second: Option<&Vec<String>>) -> bool {
+    let typed = second.is_some_and(|second| {
+        first
             .iter()
-            .any(|word| cell == *word || cell.contains(word))
-    })
+            .zip(second)
+            .any(|(name, value)| !is_number(name) && !name.is_empty() && is_number(value))
+    });
+    typed || first.iter().any(|cell| names_address(cell))
 }
 
 pub struct BatchFile {
@@ -104,54 +105,86 @@ pub struct BatchFile {
     pub bytes: u64,
     pub headers: Vec<String>,
     pub header_found: bool,
-    /// Rows of data, the header row not counted.
-    pub total_rows: u64,
+    /// Rows of data, the header row not counted, as far as the count got.
+    rows: Arc<AtomicU64>,
+    /// Whether the count reached the end of the file.
+    counted: Arc<AtomicBool>,
     /// The first rows of data.
     sample: Vec<Vec<String>>,
 }
 
 impl BatchFile {
-    /// Reads a CSV: its header, its first rows, and how many rows it has.
-    /// None when the path is no readable CSV with at least one row.
+    /// Reads a delimited file's header and first rows, and starts counting
+    /// its rows in the background. None when the path is no file with at
+    /// least one row.
     pub fn from_path(path: &Path) -> Option<Self> {
         let meta = path.metadata().ok()?;
         if !meta.is_file() {
             return None;
         }
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true)
-            .from_path(path)
-            .ok()?;
+        let delimiter = detect_delimiter(path).ok()?;
+        let mut reader = open_delimited(path, delimiter).ok()?;
         let mut first: Vec<Vec<String>> = Vec::new();
-        let mut rows = 0u64;
-        for record in reader.records() {
+        for record in reader.byte_records().take(PREVIEW_ROWS + 1) {
             let record = record.ok()?;
-            if first.len() <= PREVIEW_ROWS {
-                first.push(record.iter().map(|cell| cell.trim().to_string()).collect());
-            }
-            rows += 1;
+            let row = if first.is_empty() {
+                header_names(&record)
+            } else {
+                cells(&record)
+            };
+            first.push(row.iter().map(|cell| cell.trim().to_string()).collect());
         }
         if first.is_empty() {
             return None;
         }
-        let header_found = looks_like_header(&first[0]);
+        let header_found = looks_like_header(&first[0], first.get(1));
         let headers = if header_found {
-            rows -= 1;
             first.remove(0)
         } else {
             unnamed_columns(path).ok()?
         };
         first.truncate(PREVIEW_ROWS);
+        let rows = Arc::new(AtomicU64::new(0));
+        let counted = Arc::new(AtomicBool::new(false));
+        {
+            let (rows, counted, path) = (Arc::clone(&rows), Arc::clone(&counted), path.to_path_buf());
+            let skip = u64::from(header_found);
+            thread::spawn(move || {
+                let Ok(mut reader) = open_delimited(&path, delimiter) else {
+                    return;
+                };
+                let mut record = csv::ByteRecord::new();
+                let mut seen = 0u64;
+                while reader.read_byte_record(&mut record).unwrap_or(false) {
+                    seen += 1;
+                    if seen % 65_536 == 0 {
+                        rows.store(seen.saturating_sub(skip), Ordering::Relaxed);
+                    }
+                }
+                rows.store(seen.saturating_sub(skip), Ordering::Relaxed);
+                counted.store(true, Ordering::Relaxed);
+            });
+        }
         Some(Self {
             path: path.to_path_buf(),
             name: path.file_name()?.to_string_lossy().into_owned(),
             bytes: meta.len(),
-            total_rows: rows,
             headers,
             header_found,
+            rows,
+            counted,
             sample: first,
         })
+    }
+
+    /// Rows of data counted so far.
+    pub fn rows(&self) -> u64 {
+        self.rows.load(Ordering::Relaxed)
+    }
+
+    /// Whether [`Self::rows`] is the whole file.
+    pub fn counted(&self) -> bool {
+        self.counted.load(Ordering::Relaxed)
     }
 
     /// The first rows, each with one cell per header.
@@ -313,7 +346,8 @@ impl Drop for Run {
 
 pub struct BatchSession {
     pub file: BatchFile,
-    pub roles: Vec<Role>,
+    /// Which columns make up the address.
+    pub used: Vec<bool>,
     /// The column the setup cursor is on.
     pub column: usize,
     pub run: Option<Run>,
@@ -322,68 +356,59 @@ pub struct BatchSession {
 
 impl BatchSession {
     pub fn new(file: BatchFile) -> Self {
-        let roles: Vec<Role> = file.headers.iter().map(|header| detect(header)).collect();
-        let column = roles
-            .iter()
-            .position(|role| *role == Role::Address)
-            .unwrap_or(0);
+        let mut used: Vec<bool> = file.headers.iter().map(|header| names_address(header)).collect();
+        // A file whose headers say nothing, such as one without a header
+        // row, starts with every column in the address.
+        if !used.contains(&true) {
+            used.iter_mut().for_each(|on| *on = true);
+        }
+        let column = used.iter().position(|on| *on).unwrap_or(0);
         Self {
             file,
-            roles,
+            used,
             column,
             run: None,
             summary: None,
         }
     }
 
-    fn columns(&self, role: Role) -> Vec<String> {
-        self.roles
+    fn columns(&self) -> Vec<String> {
+        self.used
             .iter()
             .zip(&self.file.headers)
-            .filter(|(own, _)| **own == role)
+            .filter(|(on, _)| **on)
             .map(|(_, header)| header.clone())
             .collect()
     }
 
-    fn cells(&self, row: &[String], role: Role) -> Option<String> {
-        let cells = self
-            .roles
+    /// The address searched for a row: its picked cells in file order,
+    /// joined as the run joins them.
+    pub fn query(&self, row: &[String]) -> String {
+        self.used
             .iter()
             .zip(row)
-            .filter(|(own, _)| **own == role)
+            .filter(|(on, _)| **on)
             .map(|(_, cell)| cell.split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|cell| !cell.is_empty())
-            .collect::<Vec<_>>();
-        (!cells.is_empty()).then(|| cells.join(", "))
-    }
-
-    /// The address searched for a row: its address columns, as the run
-    /// joins them.
-    pub fn query(&self, row: &[String]) -> String {
-        self.cells(row, Role::Address).unwrap_or_default()
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// What the run would answer for a row.
     pub fn lookup(&self, engine: &Engine, row: &[String]) -> Option<Hit> {
-        let address = self.cells(row, Role::Address)?;
-        engine
-            .geocode_address(
-                address,
-                self.cells(row, Role::City),
-                self.cells(row, Role::Region),
-                self.cells(row, Role::Postcode),
-            )
-            .ok()
-            .flatten()
+        let address = self.query(row);
+        if address.is_empty() {
+            return None;
+        }
+        engine.geocode_address(address).ok().flatten()
     }
 
     pub fn has_address(&self) -> bool {
-        self.roles.contains(&Role::Address)
+        self.used.contains(&true)
     }
 
     /// Starts geocoding the whole file.
     pub fn start(&mut self, pack: &Path) {
-        let first = |role: Role| self.columns(role).into_iter().next();
         let output = self.file.output_path();
         let stats = Arc::new(RunStats::default());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -392,10 +417,7 @@ impl BatchSession {
             input: self.file.path.clone(),
             output: output.clone(),
             header_row: self.file.header_found,
-            address_field_groups: vec![self.columns(Role::Address)],
-            locality_field: first(Role::City),
-            region_field: first(Role::Region),
-            postcode_field: first(Role::Postcode),
+            address_field_groups: vec![self.columns()],
             observer: Some(Arc::clone(&stats) as Arc<dyn BatchObserver>),
             cancel: Arc::clone(&cancel),
             ..BatchGeocodeOptions::default()
@@ -433,16 +455,14 @@ impl BatchSession {
             .map(|(name, count)| (name.clone(), *count))
             .collect();
         by_accuracy.sort_by_key(|(name, _)| order.iter().position(|own| own == name));
-        let output_head = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true)
-            .from_path(&run.output)
+        let output_head = detect_delimiter(&run.output)
+            .and_then(|delimiter| open_delimited(&run.output, delimiter))
             .map(|mut reader| {
                 reader
-                    .records()
+                    .byte_records()
                     .take(PREVIEW_ROWS + 1)
                     .filter_map(Result::ok)
-                    .map(|record| record.iter().map(str::to_string).collect())
+                    .map(|record| cells(&record))
                     .collect()
             })
             .unwrap_or_default();
@@ -459,5 +479,43 @@ impl BatchSession {
             output_bytes: fs::metadata(&run.output).map_or(0, |meta| meta.len()),
             output_head,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_address_columns_of_a_register() {
+        let headers = [
+            "ADR_EGAID", "STR_ESID", "BDG_EGID", "ADR_EDID", "STN_LABEL", "ADR_NUMBER",
+            "BDG_CATEGORY", "BDG_NAME", "ZIP_LABEL", "COM_FOSNR", "COM_NAME", "COM_CANTON",
+            "ADR_STATUS", "ADR_OFFICIAL", "ADR_MODIFIED", "ADR_EASTING", "ADR_NORTHING",
+        ];
+        let picked: Vec<&str> = headers
+            .into_iter()
+            .filter(|header| names_address(header))
+            .collect();
+        assert_eq!(
+            picked,
+            ["STN_LABEL", "ADR_NUMBER", "ZIP_LABEL", "COM_NAME", "COM_CANTON"]
+        );
+        for header in ["address", "Street Address", "city", "Postal Code", "id", "lat"] {
+            assert_eq!(
+                names_address(header),
+                !matches!(header, "id" | "lat"),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn tells_a_header_from_data() {
+        let row = |cells: &[&str]| cells.iter().map(|cell| cell.to_string()).collect::<Vec<_>>();
+        let codes = row(&["ADR_EGAID", "BDG_EGID"]);
+        assert!(looks_like_header(&codes, Some(&row(&["102435015", "243056020"]))));
+        let addresses = row(&["100 queen st w", "toronto"]);
+        assert!(!looks_like_header(&addresses, Some(&row(&["24 sussex dr", "ottawa"]))));
     }
 }

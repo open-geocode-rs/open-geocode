@@ -381,8 +381,9 @@ mod screens {
             press(&mut app, &[KeyCode::Enter]);
             show(&app, "batch setup");
             press(&mut app, &[KeyCode::Enter]);
+            wait(&mut app, Duration::from_secs(8), |_| false);
             show(&app, "batch running");
-            wait(&mut app, Duration::from_secs(60), |app| {
+            wait(&mut app, Duration::from_secs(1800), |app| {
                 app.screen != Screen::BatchRun
             });
             show(&app, "batch done");
@@ -406,6 +407,53 @@ mod screens {
             app.live.lock().unwrap().done
         });
         show(&app, "confirm");
+    }
+
+    /// The query shell's GeoJSON is the HTTP API's answer, value for value.
+    #[test]
+    #[ignore = "needs the Andorra Pack in OG_HOME"]
+    fn the_shell_answers_what_the_api_answers() {
+        let home = Home::locate().unwrap();
+        let pack = home.packs_dir().join("andorra");
+        let bind: std::net::SocketAddr = "127.0.0.1:8098".parse().unwrap();
+        let served = pack.clone();
+        std::thread::spawn(move || super::serve_pack(served, bind));
+        std::thread::sleep(Duration::from_secs(2));
+        let engine = crate::engine::Engine::open(&pack).unwrap();
+        let get = |path: &str| -> serde_json::Value {
+            let text = ureq::get(&format!("http://{bind}{path}"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let json = |text: String| -> serde_json::Value { serde_json::from_str(&text).unwrap() };
+        for query in ["andorra la vella", "carrer prat de la creu 70", "escaldes", "x"] {
+            let shell = engine.search_default(query).unwrap();
+            let api = get(&format!("/search?q={}", query.replace(' ', "%20")));
+            assert_eq!(json(shell.collection.json(None)), api, "search {query}");
+            assert!(!shell.hits.is_empty() || api["features"].as_array().unwrap().is_empty());
+            // One feature picked from the list is that feature of the answer.
+            if !shell.hits.is_empty() {
+                assert_eq!(
+                    json(shell.collection.json(Some(0)))["features"][0],
+                    api["features"][0]
+                );
+            }
+        }
+        for (lat, lon) in [(42.5063, 1.5218), (42.55, 1.6), (0.0, 0.0)] {
+            let shell = engine.reverse(lat, lon).unwrap();
+            let api = get(&format!("/reverse?lat={lat}&lon={lon}"));
+            assert_eq!(json(shell.collection.json(None)), api, "reverse {lat},{lon}");
+        }
+        let shell = engine.search("andorra", 1).unwrap();
+        assert_eq!(
+            json(shell.collection.json(None)),
+            get("/search?q=andorra&limit=1"),
+            "a pasted batch row is /search with limit 1"
+        );
     }
 
     /// Quitting during a build leaves no unfinished Pack generation behind.

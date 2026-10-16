@@ -133,20 +133,13 @@ impl Engine {
         self.search(query, DEFAULT_SEARCH_LIMIT)
     }
 
-    /// What a batch run answers for one row: the address, checked against
-    /// the row's city, region and postcode.
-    pub fn geocode_address(
-        &self,
-        address: String,
-        locality: Option<String>,
-        region: Option<String>,
-        postcode: Option<String>,
-    ) -> Result<Option<Hit>> {
+    /// What a batch run answers for one row's address.
+    pub fn geocode_address(&self, address: String) -> Result<Option<Hit>> {
         let Some(found) = self.searcher.geocode_address(AddressGeocodeOptions {
             address,
-            locality,
-            region,
-            postcode,
+            locality: None,
+            region: None,
+            postcode: None,
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
         })?

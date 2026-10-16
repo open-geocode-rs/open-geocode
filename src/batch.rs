@@ -189,23 +189,21 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
     }
     ensure_distinct_paths(&options.input, &options.output, options.audit.as_deref())?;
 
-    let mut reader = ReaderBuilder::new()
-        .flexible(true)
-        .has_headers(options.header_row)
-        .from_path(&options.input)
-        .with_context(|| format!("failed to open {}", options.input.display()))?;
+    let delimiter = detect_delimiter(&options.input)?;
+    let mut reader = open_delimited(&options.input, delimiter)?;
+    let mut records = reader.byte_records();
     let original_headers = if options.header_row {
-        reader
-            .headers()
+        let first = records
+            .next()
+            .transpose()
             .with_context(|| {
                 format!(
                     "failed to read CSV headers from {}",
                     options.input.display()
                 )
             })?
-            .iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
+            .unwrap_or_default();
+        header_names(&first)
     } else {
         unnamed_columns(&options.input)?
     };
@@ -244,17 +242,16 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
         }
     };
 
-    let mut output = create_csv(&options.output, &output_headers)?;
+    let mut output = create_csv(&options.output, &output_headers, delimiter)?;
     let mut audit = options
         .audit
         .as_ref()
-        .map(|path| create_csv(path, &audit_headers))
+        .map(|path| create_csv(path, &audit_headers, delimiter))
         .transpose()?;
     let mut report = BatchGeocodeReport {
         rows: 0,
         resolved: 0,
     };
-    let mut records = reader.records();
     loop {
         if options.cancel.load(Ordering::Relaxed) {
             return Err(BatchCancelled.into());
@@ -263,13 +260,9 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
             .by_ref()
             .take(BATCH_CHUNK_ROWS)
             .map(|record| {
-                Ok(record
-                    .with_context(|| {
-                        format!("failed to read CSV record from {}", options.input.display())
-                    })?
-                    .iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>())
+                Ok(cells(&record.with_context(|| {
+                    format!("failed to read CSV record from {}", options.input.display())
+                })?))
             })
             .collect::<Result<Vec<_>>>()?;
         if chunk.is_empty() {
@@ -301,15 +294,91 @@ pub fn run_batch_geocode(options: BatchGeocodeOptions) -> Result<BatchGeocodeRep
     Ok(report)
 }
 
+/// Field separators a delimited file may use, most common first.
+const DELIMITERS: [u8; 4] = [b',', b';', b'\t', b'|'];
+/// Bytes read from the start of a file to find its separator.
+const SNIFF_BYTES: usize = 64 << 10;
+
+/// The field separator of a delimited text file: of `,` `;` tab and `|`,
+/// the one that splits most of its first lines into the same number of
+/// fields, more than one. A comma when none does.
+pub fn detect_delimiter(path: &Path) -> Result<u8> {
+    use std::io::Read;
+    let mut sample = Vec::with_capacity(SNIFF_BYTES);
+    File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .take(SNIFF_BYTES as u64)
+        .read_to_end(&mut sample)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    // A line cut short by the sample's end would count against every
+    // separator alike; leave it out.
+    if sample.len() == SNIFF_BYTES
+        && let Some(end) = sample.iter().rposition(|byte| *byte == b'\n')
+    {
+        sample.truncate(end + 1);
+    }
+    Ok(delimiter_of(&sample))
+}
+
+/// The field separator of delimited text, as [`detect_delimiter`] finds it.
+pub fn delimiter_of(sample: &[u8]) -> u8 {
+    let mut best = (b',', 0);
+    for delimiter in DELIMITERS {
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for record in ReaderBuilder::new()
+            .flexible(true)
+            .has_headers(false)
+            .delimiter(delimiter)
+            .from_reader(sample)
+            .byte_records()
+            .take(50)
+            .filter_map(Result::ok)
+            .filter(|record| record.len() > 1)
+        {
+            *counts.entry(record.len()).or_default() += 1;
+        }
+        let agreeing = counts.values().copied().max().unwrap_or(0);
+        if agreeing > best.1 {
+            best = (delimiter, agreeing);
+        }
+    }
+    best.0
+}
+
+/// A reader of a delimited file, every row as data, quirks tolerated:
+/// rows of different widths, and bytes that are not UTF-8.
+pub fn open_delimited(path: &Path, delimiter: u8) -> Result<csv::Reader<File>> {
+    ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(false)
+        .delimiter(delimiter)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+}
+
+/// A row's cells as text. Bytes that are not UTF-8, such as a Latin-1
+/// file's accents, become replacement characters instead of failing the row.
+pub fn cells(record: &csv::ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
+/// A header row's names, without the byte order mark some files start with.
+pub fn header_names(record: &csv::ByteRecord) -> Vec<String> {
+    let mut names = cells(record);
+    if let Some(first) = names.first_mut() {
+        *first = first.trim_start_matches('\u{feff}').to_string();
+    }
+    names
+}
+
 /// Names for the columns of a CSV without a header row: `column_1`,
 /// `column_2` and so on, as many as the widest of its first rows has.
 pub fn unnamed_columns(path: &Path) -> Result<Vec<String>> {
-    let width = ReaderBuilder::new()
-        .flexible(true)
-        .has_headers(false)
-        .from_path(path)
-        .with_context(|| format!("failed to open {}", path.display()))?
-        .records()
+    let width = open_delimited(path, detect_delimiter(path)?)?
+        .byte_records()
         .take(BATCH_CHUNK_ROWS)
         .filter_map(Result::ok)
         .map(|record| record.len())
@@ -503,7 +572,7 @@ fn read_csv(path: &Path) -> Result<CsvTable> {
     Ok(CsvTable { headers, rows })
 }
 
-fn create_csv(path: &Path, headers: &[String]) -> Result<PendingCsv> {
+fn create_csv(path: &Path, headers: &[String], delimiter: u8) -> Result<PendingCsv> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -517,7 +586,9 @@ fn create_csv(path: &Path, headers: &[String]) -> Result<PendingCsv> {
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let file = File::create(&temporary)
         .with_context(|| format!("failed to create {}", temporary.display()))?;
-    let mut writer = WriterBuilder::new().from_writer(file);
+    let mut writer = WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_writer(file);
     writer
         .write_record(headers)
         .with_context(|| format!("failed to write headers to {}", path.display()))?;
@@ -953,6 +1024,39 @@ mod tests {
         .unwrap_err();
         assert!(error.downcast_ref::<BatchCancelled>().is_some());
         assert!(!root.join("stopped.csv").exists());
+
+        // A file as offices export it: a byte order mark, semicolons, a
+        // Latin-1 byte, a short row. It is read as it is and written back
+        // with its own separator.
+        let messy = root.join("messy.csv");
+        let mut bytes = b"\xef\xbb\xbfID;STRASSE;ORT\n".to_vec();
+        bytes.extend_from_slice(b"1;20 Queen St;Z\xfcrich\n2;10 King Street\n");
+        std::fs::write(&messy, bytes).expect("input");
+        assert_eq!(detect_delimiter(&messy).expect("delimiter"), b';');
+        let report = run_batch_geocode(BatchGeocodeOptions {
+            pack: Some(root.join("pack")),
+            input: messy,
+            output: root.join("messy-out.csv"),
+            address_field_groups: vec![vec!["strasse".into()]],
+            ..BatchGeocodeOptions::default()
+        })
+        .expect("batch of a messy file");
+        assert_eq!(report.resolved, 2);
+        let output = std::fs::read_to_string(root.join("messy-out.csv")).expect("output");
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "ID;STRASSE;ORT;lat;lon");
+        assert_eq!(lines[1], "1;20 Queen St;Z\u{fffd}rich;43.6000000;-79.4100000");
+        assert_eq!(lines[2], "2;10 King Street;;43.6000000;-79.4000000");
+    }
+
+    #[test]
+    fn finds_the_separator_most_lines_agree_on() {
+        assert_eq!(delimiter_of(b"a,b,c\n1,2,3\n"), b',');
+        assert_eq!(delimiter_of(b"a;b;c\n1;2,5;3\n"), b';');
+        assert_eq!(delimiter_of(b"a\tb\n1\t2\n"), b'\t');
+        assert_eq!(delimiter_of(b"a|b\n1|2\n"), b'|');
+        // One field per line: nothing to choose, so a comma.
+        assert_eq!(delimiter_of(b"100 queen st w\n24 sussex dr\n"), b',');
     }
 
     #[test]

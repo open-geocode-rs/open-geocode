@@ -1123,18 +1123,17 @@ impl App {
             self.screen = Screen::Query;
             return;
         };
-        let columns = session.roles.len().max(1);
+        let columns = session.used.len().max(1);
         match key.code {
             KeyCode::Left => session.column = (session.column + columns - 1) % columns,
             KeyCode::Right | KeyCode::Tab => session.column = (session.column + 1) % columns,
-            KeyCode::Up | KeyCode::Down => {
-                let forward = key.code == KeyCode::Down;
-                if let Some(role) = session.roles.get_mut(session.column) {
-                    *role = role.cycle(forward);
+            KeyCode::Char(' ') | KeyCode::Up | KeyCode::Down => {
+                if let Some(on) = session.used.get_mut(session.column) {
+                    *on ^= true;
                 }
             }
             KeyCode::Enter if !session.has_address() => {
-                self.flash("Give at least one column the Address role.");
+                self.flash("Pick at least one column for the address.");
             }
             KeyCode::Enter => self.start_batch_run(),
             KeyCode::Esc => {
@@ -1268,6 +1267,7 @@ fn parse_pasted(text: &str) -> (Vec<String>, String) {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
+        .delimiter(open_geocode::batch::delimiter_of(text.as_bytes()))
         .from_reader(text.as_bytes());
     let records: Vec<csv::StringRecord> = reader.records().filter_map(Result::ok).collect();
     let column = records.first().and_then(|first| {

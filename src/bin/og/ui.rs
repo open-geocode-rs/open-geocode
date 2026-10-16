@@ -13,7 +13,7 @@ use ratatui::{
 
 use crate::{
     app::{self, App, Mode, RegionRow, Screen},
-    batch::{self, Role},
+    batch,
     engine::{self, Hit, Measure},
     format,
     home::PackInfo,
@@ -1646,19 +1646,21 @@ pub fn batch_header(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-/// How a column's role reads above it; the selected column's is in brackets.
-fn role_span(role: Role, selected: bool, cells: usize) -> Span<'static> {
+/// Whether a column is in the address, as it reads above the column; the
+/// selected column's mark is in brackets.
+fn use_span(used: bool, selected: bool, cells: usize) -> Span<'static> {
+    let mark = if used { "✓ address" } else { "· skip" };
     let label = if selected {
-        format!("[{}]", role.label())
+        format!("[{mark}]")
     } else {
-        role.label().to_string()
+        mark.to_string()
     };
     let text = pad(&label, cells);
-    match (role, selected) {
-        (Role::Skip, true) => Span::styled(text, Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
-        (Role::Skip, false) => span(text, FAINT),
-        (_, true) => Span::styled(text, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        (_, false) => span(text, ACCENT),
+    match (used, selected) {
+        (false, true) => Span::styled(text, Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
+        (false, false) => span(text, FAINT),
+        (true, true) => Span::styled(text, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        (true, false) => span(text, ACCENT),
     }
 }
 
@@ -1746,11 +1748,16 @@ fn result_line(
     Line::from(spans)
 }
 
-/// `10,000 rows · 4.2 MB · header found`.
+/// `10,000 rows · 4.2 MB · header found`, the rows marked as a count so
+/// far until the whole file is counted.
 fn file_facts(file: &batch::BatchFile) -> String {
+    let rows = if file.counted() {
+        format!("{} rows", format::thousands(file.rows()))
+    } else {
+        format!("counting rows… {}", format::thousands(file.rows()))
+    };
     format!(
-        "{} rows · {} · {}",
-        format::thousands(file.total_rows),
+        "{rows} · {} · {}",
         format::bytes(file.bytes),
         if file.header_found {
             "header found"
@@ -1799,8 +1806,7 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
                 .map(|row| width(&row[column]))
                 .max()
                 .unwrap_or(0);
-            let role = width(session.roles[column].label()) + 2;
-            (width(header).max(cells).max(role) + 2).clamp(9, 18)
+            (width(header).max(cells).max(11) + 2).clamp(13, 20)
         })
         .collect();
     let window = visible_columns(&widths, session.column, inner.saturating_sub(5));
@@ -1810,8 +1816,8 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
     let mut rows: Vec<Vec<Span<'static>>> = sample.iter().map(|_| vec![plain("   ")]).collect();
     for column in window {
         let cells = widths[column];
-        roles.push(role_span(
-            session.roles[column],
+        roles.push(use_span(
+            session.used[column],
             column == session.column,
             cells,
         ));
@@ -1888,7 +1894,7 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
         app,
         &[
             ("←→", "column"),
-            ("↑↓", "role"),
+            ("space", "use or skip"),
             ("enter", "start"),
             ("esc", "back"),
         ],
@@ -1912,7 +1918,7 @@ fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
         object: session.file.stem().to_string(),
         explain: ["", ""],
         unit: Unit::Count("rows"),
-        total: Some(session.file.total_rows),
+        total: session.file.counted().then(|| session.file.rows()),
         started: Some(run.started),
         secs: None,
     };
