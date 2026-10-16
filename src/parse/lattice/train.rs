@@ -1284,6 +1284,10 @@ const CATEGORY_SHARE: f64 = 0.03;
 /// number alone after the area they number ("林2"), as libpostal's data
 /// writes them.
 const NUMBERED_AREA_SHARE: f64 = 0.3;
+/// Share of the postcodes of rows written after their country's letters
+/// ("de09496", "D-80331", "d 18211"), as libpostal's generator writes them
+/// (`resources/postal_codes/config.yaml`).
+const POSTCODE_PREFIX_SHARE: f64 = 0.05;
 /// Share of rows with words of a script written without spaces whose
 /// numbers are written in numeral ideographs.
 const NUMERAL_SHARE: f64 = 0.1;
@@ -1452,6 +1456,11 @@ impl<'a> Renderer<'a> {
         }
         if random.chance(0.5) {
             fields.postcode = None;
+        }
+        if let (Some(postcode), Some(country)) = (fields.postcode.as_mut(), country)
+            && random.chance(POSTCODE_PREFIX_SHARE)
+        {
+            *postcode = with_country_prefix(postcode, country, random);
         }
         if random.chance(0.5) && fields.subject != Some(Slot::Region) {
             fields.region = None;
@@ -2004,6 +2013,37 @@ fn address_fields(address: &AddressComponents, fields: &mut Fields) {
     fields.suburb = words(&address.areas.join(" "));
     fields.unit = address.unit.as_deref().and_then(words);
     fields.postcode = address.postcode.as_deref().and_then(words);
+}
+
+/// `postcode` after its country's code or the code's first letter, glued
+/// ("de09496"), joined by a hyphen ("d-80331") or apart ("d 18211").
+fn with_country_prefix(postcode: &Tokens, country: CountryCode, random: &mut Random) -> Tokens {
+    let code = country.as_str().to_ascii_lowercase();
+    let prefix = if random.chance(0.5) {
+        code
+    } else {
+        code[..1].to_string()
+    };
+    let mut written = Tokens::default();
+    let mut words = postcode.words.iter().zip(&postcode.joiners);
+    let Some((first, _)) = words.next() else {
+        return postcode.clone();
+    };
+    match random.below(3) {
+        0 => written.push(format!("{prefix}{first}"), false, None),
+        1 => {
+            written.push(prefix, false, None);
+            written.push(first.clone(), false, Some('-'));
+        }
+        _ => {
+            written.push(prefix, false, None);
+            written.push(first.clone(), false, None);
+        }
+    }
+    for (word, joiner) in words {
+        written.push(word.clone(), false, *joiner);
+    }
+    written
 }
 
 /// The numbered areas of an address ("2丁目", "3 chome") written as their

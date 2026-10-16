@@ -108,6 +108,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
         &["district", "locality", "neighbourhood", "place"],
     ),
     ("glued_phrase", &["unit", "po_box", "level", "admin_type"]),
+    ("dict_dominant", &DICT_FIELDS),
     (
         "grounding",
         &["no_locality", "no_region", "no_country", "no_postcode"],
@@ -258,6 +259,7 @@ enum Block {
     Chain,
     DictLevel,
     GluedPhrase,
+    DictDominant,
     Grounding,
 }
 
@@ -729,6 +731,14 @@ impl FeatureSet {
             super::Glued::AdminType => 3,
         };
         self.push(Block::GluedPhrase, index);
+    }
+
+    /// Of the fields whose names the span is, `field` is the one the most
+    /// records use it in: "sachsen" is a state far more than a village.
+    pub fn dominant_field(&mut self, field: Field) {
+        if let Some(index) = field_index(field) {
+            self.push(Block::DictDominant, index);
+        }
     }
 
     /// The span is one number written in parts: "993.5", "1384 1/2".

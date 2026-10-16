@@ -746,9 +746,12 @@ impl LatticeTagger {
                     set.phrase(kinds);
                 }
                 set.phrase_neighbours(phrases.ending[start], phrases.starting[end]);
+                // A postcode written after its country's letters ("de09496")
+                // is no unit glued to its number.
                 if end - start == 1
                     && !infos[start].unspaced
                     && let Some(field) = self.glued_phrase(&tokens.words[start])
+                    && self.postcode_matches(tokens, &infos, start, end).is_none()
                 {
                     evidence = true;
                     set.glued_phrase(field);
@@ -765,6 +768,8 @@ impl LatticeTagger {
                     evidence = true;
                 }
                 let mut area = false;
+                // The field of names the most records use the span in.
+                let mut dominant: Option<(Field, u64)> = None;
                 for field in Field::NAMES {
                     if suppression.hides(field, start, end) {
                         continue;
@@ -776,6 +781,9 @@ impl LatticeTagger {
                             area = true;
                         }
                         set.dictionary_hit(field, &hit, key.key.chars().count());
+                        if dominant.is_none_or(|(_, count)| hit.entry.count > count) {
+                            dominant = Some((field, hit.entry.count));
+                        }
                         if end - start > 1 {
                             for (unit, cover) in covers[start..end].iter_mut().enumerate() {
                                 if let Some(feature) = features::cover(field, unit == 0) {
@@ -787,6 +795,9 @@ impl LatticeTagger {
                             countries.vote(country, field.country_vote(hit.distance, end - start));
                         }
                     }
+                }
+                if let Some((field, _)) = dominant {
+                    set.dominant_field(field);
                 }
                 if area {
                     let ids = [&key.key, &key.expanded]
@@ -949,9 +960,22 @@ impl LatticeTagger {
         let mut matches = self.postcodes.matches(&words.join(" "));
         if words.len() > 1 {
             matches.extend(self.postcodes.matches(&words.concat()));
-            matches.sort_unstable();
-            matches.dedup();
         }
+        // A postcode written after its country's letters ("D-80331",
+        // "de09496", "CA-M5V 1M9"), as Nominatim reads it and libpostal
+        // writes it: the rest is a postcode of a country whose code starts
+        // with them.
+        if let Some((prefix, rest)) = country_prefix(words) {
+            let prefix = prefix.to_ascii_uppercase();
+            matches.extend(
+                self.postcodes
+                    .matches(&rest)
+                    .into_iter()
+                    .filter(|country| country.as_str().starts_with(&prefix)),
+            );
+        }
+        matches.sort_unstable();
+        matches.dedup();
         (!matches.is_empty()).then_some(matches)
     }
 }
@@ -1195,6 +1219,26 @@ pub(crate) enum Glued {
     Level,
     /// A type of numbered area ("4chome").
     AdminType,
+}
+
+/// The letters of a country a postcode may be written after, one or two
+/// Latin letters as a word of their own ("d 80331") or glued to the digits
+/// ("de09496"), and the rest of the words.
+fn country_prefix(words: &[String]) -> Option<(&str, String)> {
+    let is_prefix = |part: &str| {
+        (1..=2).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphabetic())
+    };
+    match words {
+        [first, rest @ ..] if !rest.is_empty() && is_prefix(first) => {
+            Some((first.as_str(), rest.join(" ")))
+        }
+        [only] => {
+            let split = only.find(|character: char| character.is_ascii_digit())?;
+            let (prefix, rest) = only.split_at(split);
+            is_prefix(prefix).then(|| (prefix, rest.to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Other spellings of a dictionary key looked up besides it: its street
