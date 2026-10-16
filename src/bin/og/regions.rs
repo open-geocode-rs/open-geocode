@@ -5,6 +5,7 @@
 
 use std::sync::OnceLock;
 
+use open_geocode::record::OSM_DATASET;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -65,6 +66,12 @@ impl Region {
     /// regions of one name (`georgia`, `us-georgia`) never share one.
     pub fn slug(&self) -> String {
         self.id.replace('/', "-")
+    }
+
+    /// The dataset a Pack of the region is built from: its extract is
+    /// OpenStreetMap's.
+    pub fn dataset(&self) -> &'static str {
+        OSM_DATASET
     }
 
     pub fn is_world(&self) -> bool {
@@ -143,6 +150,14 @@ impl Tree {
         }
         chain.reverse();
         chain
+    }
+}
+
+/// How a dataset id reads: `osm` is OpenStreetMap.
+pub fn dataset_name(id: &str) -> &str {
+    match id {
+        OSM_DATASET => "OpenStreetMap",
+        other => other,
     }
 }
 

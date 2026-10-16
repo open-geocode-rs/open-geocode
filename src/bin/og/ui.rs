@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 
+use open_geocode::{builder::BuildPlan, record::Layer};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -42,16 +43,6 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 /// Rows of JSON the GeoJSON box shows at once.
 pub const JSON_ROWS: usize = 14;
-
-/// Layers whose records are places: the areas results are placed in.
-const PLACE_LAYERS: [&str; 6] = [
-    "country",
-    "region",
-    "district",
-    "locality",
-    "neighbourhood",
-    "place",
-];
 
 fn span(text: impl Into<Cow<'static, str>>, color: Color) -> Span<'static> {
     Span::styled(text, Style::new().fg(color))
@@ -156,16 +147,25 @@ fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
     if !app.downloads() {
         region.push(span("  on disk", OK));
     }
+    let mut output = vec![plain(app.pack_dir().display().to_string())];
+    if let Some(Ok(plan)) = &app.plan {
+        output.push(span(
+            format!(
+                "  memory budget {}",
+                format::bytes(plan.memory_budget_bytes)
+            ),
+            DIM,
+        ));
+    }
     let lines = vec![
         choice("Region", region),
-        choice("Sources", vec![plain("OpenStreetMap")]),
         choice(
-            "Output",
-            vec![
-                plain(app.pack_dir().display().to_string()),
-                span(format!("  memory {} GB", app.memory_gb), DIM),
-            ],
+            "Sources",
+            vec![plain(
+                regions::dataset_name(app.region.dataset()).to_string(),
+            )],
         ),
+        choice("Output", output),
     ];
     lines.into_iter().take(count).collect()
 }
@@ -205,6 +205,17 @@ pub fn build_header(app: &App) -> Vec<Line<'static>> {
 /// after it so the steps do not run together.
 pub fn step_done(step: &Step, inner: usize) -> Vec<Line<'static>> {
     vec![finished_line(step, inner), Line::raw("")]
+}
+
+/// A build's warning as it goes into terminal history.
+pub fn warning_line(warning: &str, inner: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            plain("    "),
+            span(cut(&format!("! {warning}"), inner.saturating_sub(4)), WARN),
+        ]),
+        Line::raw(""),
+    ]
 }
 
 pub fn done_summary(app: &App) -> Vec<Line<'static>> {
@@ -449,7 +460,18 @@ fn pack_detail(pack: &PackInfo, update: Option<i64>, now: i64) -> Vec<Line<'stat
                 |region| region.label.clone(),
             ),
         ),
-        detail_line("Sources", "OpenStreetMap".to_string()),
+        detail_line(
+            "Sources",
+            if pack.datasets.is_empty() {
+                "unknown".to_string()
+            } else {
+                pack.datasets
+                    .iter()
+                    .map(|id| regions::dataset_name(id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
         detail_line(
             "Data",
             pack.data_at.map_or_else(
@@ -737,41 +759,6 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         download.push(span("  replaces the one on disk  d keep it", DIM));
     }
     let estimate = app.estimate();
-    let free = app.free_disk.map_or_else(
-        || "free space unknown".to_string(),
-        |free| format!("{} free", format::bytes(free)),
-    );
-    let mut disk = match &estimate {
-        Some(estimate) => vec![
-            plain(format::bytes(app.disk_needed())),
-            span(format!("   {free}"), DIM),
-            span(
-                format!(
-                    "   scaled from your {} build",
-                    region_name(&estimate.from.region)
-                ),
-                FAINT,
-            ),
-        ],
-        None if app.downloads() => vec![
-            plain(format!("{} download", format::bytes(app.download_bytes()))),
-            span(format!("   {free}"), DIM),
-            span(
-                "   plus build space, unknown until a build of similar size runs here",
-                FAINT,
-            ),
-        ],
-        None => vec![
-            plain(free),
-            span(
-                "   build space unknown until a build of similar size runs here",
-                FAINT,
-            ),
-        ],
-    };
-    if !app.fits_disk() {
-        disk.push(span("   not enough", ERR));
-    }
     let time = match &estimate {
         Some(estimate) => vec![
             plain(format::about(estimate.secs)),
@@ -795,48 +782,127 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(bold("   Ready to build")),
         Line::raw(""),
         field("Output", vec![plain(app.pack_dir().display().to_string())]),
-        field(
-            "Memory",
-            vec![
-                plain(format!("{} GB", app.memory_gb)),
-                span(
-                    format!(
-                        " for sorting · {} of {} free",
-                        format::bytes(app.memory.available),
-                        format::bytes(app.memory.total)
-                    ),
-                    DIM,
-                ),
-                span("   m change", FAINT),
-            ],
-        ),
-        Line::raw(""),
-        field("Download", download),
-        field("Disk", disk),
-        field("Time", time),
     ]);
+    let shortfalls = app.shortfalls();
+    match &app.plan {
+        Some(Ok(plan)) => lines.extend(plan_lines(plan)),
+        Some(Err(error)) => lines.push(field(
+            "Plan",
+            vec![span(
+                cut(error, area.width.saturating_sub(17) as usize),
+                ERR,
+            )],
+        )),
+        None => {}
+    }
+    lines.extend([field("Download", download), field("Time", time)]);
     if let Some(error) = live_error {
         lines.push(field(
             "",
             vec![span(cut(&format!("server: {error}"), 70), WARN)],
         ));
     }
+    let room = area.width.saturating_sub(19) as usize;
+    if let Some(Ok(plan)) = &app.plan {
+        for warning in &plan.warnings {
+            lines.push(field(
+                "",
+                vec![span(cut(&format!("! {warning}"), room), WARN)],
+            ));
+        }
+    }
+    for shortfall in &shortfalls {
+        lines.push(field(
+            "",
+            vec![span(cut(&format!("✗ {shortfall}"), room), ERR)],
+        ));
+    }
+    if !shortfalls.is_empty() {
+        lines.push(field(
+            "",
+            vec![if app.force {
+                span("forced: builds anyway, and may run out    f undo", WARN)
+            } else {
+                span("f build anyway", FAINT)
+            }],
+        ));
+    }
     lines.extend([
         Line::raw(""),
         Line::from(vec![
             plain("  "),
-            button("Start build", app.confirm_cursor == 0, app.fits_disk()),
+            button("Start build", app.confirm_cursor == 0, app.can_build()),
             plain("  "),
             button("Back", app.confirm_cursor == 1, true),
         ]),
     ]);
     frame.render_widget(Paragraph::new(lines), area);
-    let mut hints = vec![("←→", "choose"), ("m", "memory")];
+    let mut hints = vec![("←→", "choose")];
     if app.on_disk.is_some() {
         hints.push(("d", "download"));
     }
+    if !shortfalls.is_empty() {
+        hints.push(("f", "force"));
+    }
     hints.extend([("enter", "confirm"), ("esc", "back")]);
     footer(frame, app, &hints);
+}
+
+/// What the build plan sizes and needs: the memory budget and threads it
+/// chose from what the machine has, and the memory and disk the input
+/// needs against what is free.
+fn plan_lines(plan: &BuildPlan) -> Vec<Line<'static>> {
+    let found = &plan.resources;
+    let free = |free: Option<u64>| {
+        free.map_or_else(
+            || "free unknown".to_string(),
+            |free| format!("{} free", format::bytes(free)),
+        )
+    };
+    vec![
+        field(
+            "Memory",
+            vec![
+                plain(format!(
+                    "{} budget",
+                    format::bytes(plan.memory_budget_bytes)
+                )),
+                span(
+                    format!(
+                        "{} · {} threads · {} of {} available",
+                        if plan.memory_budget_derived {
+                            ", sized to this machine"
+                        } else {
+                            ""
+                        },
+                        plan.threads,
+                        format::bytes(found.available_memory_bytes),
+                        format::bytes(found.total_memory_bytes)
+                    ),
+                    DIM,
+                ),
+            ],
+        ),
+        field(
+            "Needs",
+            vec![
+                plain(format!(
+                    "about {} memory",
+                    format::bytes(plan.memory_needed_bytes)
+                )),
+                span(
+                    format!(
+                        " · {} scratch, {} · {} Pack, {}",
+                        format::bytes(plan.scratch_disk_needed_bytes),
+                        free(plan.scratch_disk_free_bytes),
+                        format::bytes(plan.output_disk_needed_bytes),
+                        free(plan.output_disk_free_bytes)
+                    ),
+                    DIM,
+                ),
+            ],
+        ),
+    ]
 }
 
 /// A region's name from its id, for lines that name a past build.
@@ -1088,9 +1154,16 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(span(format!("   {}", step.explain[0]), DIM)));
         lines.push(Line::from(span(format!("   {}", step.explain[1]), DIM)));
         lines.push(Line::raw(""));
-        let mut facts = vec![format!("memory budget {} GB", app.memory_gb)];
-        if let Some(resident) = app.resident {
-            facts.push(format!("og holds {}", format::bytes(resident)));
+        let mut facts = Vec::new();
+        if let Some(plan) = progress.plan.lock().expect("plan lock").as_ref() {
+            facts.push(format!(
+                "memory budget {}",
+                format::bytes(plan.memory_budget_bytes)
+            ));
+            facts.push(format!("{} threads", plan.threads));
+        }
+        if let Some(heap) = app.heap {
+            facts.push(format!("og holds {}", format::bytes(heap)));
         }
         if let Some(free) = app.free_disk {
             facts.push(format!("{} disk free", format::bytes(free)));
@@ -1122,10 +1195,19 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
         ]
     };
     let mut stats = vec![plain("   ")];
-    stats.extend(stat("places", pack.layer(&PLACE_LAYERS)));
-    stats.extend(stat("streets", pack.layer(&["street"])));
-    stats.extend(stat("addresses", pack.layer(&["address"])));
-    stats.extend(stat("POIs", pack.layer(&["poi"])));
+    stats.extend(stat(
+        "places",
+        pack.records_in(|layer| layer.place_layer().is_some()),
+    ));
+    stats.extend(stat(
+        "streets",
+        pack.records_in(|layer| layer == Layer::Street),
+    ));
+    stats.extend(stat(
+        "addresses",
+        pack.records_in(|layer| layer == Layer::Address),
+    ));
+    stats.extend(stat("POIs", pack.records_in(|layer| layer == Layer::Poi)));
     let step = |label: &str, command: String| {
         Line::from(vec![
             plain("   "),
@@ -1219,7 +1301,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(area);
 
-    let records = app.engine.as_ref().map_or(0, engine::Engine::records);
+    let records = app.engine.as_ref().map_or(0, |engine| engine.records());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             badge(),
@@ -1321,13 +1403,15 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Batch => None,
         _ => app.answer.as_ref().map(|answer| answer.millis),
     };
-    if let Some(millis) = millis {
-        frame.render_widget(
-            Paragraph::new(
-                Line::from(span(format!("{} ", milliseconds(millis)), DIM)).right_aligned(),
-            ),
-            parsed,
-        );
+    // While the Pack is still answering, a spinner stands where its time
+    // will be.
+    let took = if app.asking() {
+        Some(span(format!("{} ", spinner(app)), ACCENT))
+    } else {
+        millis.map(|millis| span(format!("{} ", milliseconds(millis)), DIM))
+    };
+    if let Some(took) = took {
+        frame.render_widget(Paragraph::new(Line::from(took).right_aligned()), parsed);
     }
 
     let hits = app.hits();
@@ -1852,11 +1936,15 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
     lines.extend(rows.into_iter().map(Line::from));
     lines.push(Line::raw(""));
     lines.push(result_header(inner, "First rows geocoded", "score"));
-    for row in &sample {
-        let hit = app
-            .engine
-            .as_ref()
-            .and_then(|engine| session.lookup(engine, row));
+    let preview = session.previews.get(&session.used);
+    for (index, row) in sample.iter().enumerate() {
+        let Some(hit) = preview.map(|hits| hits.get(index).cloned().flatten()) else {
+            lines.push(Line::from(span(
+                format!("   {}", cut(&session.query(row), inner.saturating_sub(4))),
+                FAINT,
+            )));
+            continue;
+        };
         let last = match &hit {
             Some(hit) => span(format!("{:>LAST_WIDTH$}", measure(hit.measure)), DIM),
             None => span(format!("{:>LAST_WIDTH$}", "–"), DIM),
@@ -1874,8 +1962,12 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
         Some(error) => span(format!("   {}", cut(error, inner.saturating_sub(4))), ERR),
         None => span(
             format!(
-                "   Writes {}.geocoded.csv next to the file, with lat and lon added.",
-                file.stem()
+                "   Writes {} next to the file, with coordinates added.",
+                session
+                    .output
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
             ),
             DIM,
         ),
@@ -1910,8 +2002,7 @@ fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
     };
     let inner = area.width as usize;
     let stats = &run.stats;
-    let done = stats.done.load(std::sync::atomic::Ordering::Relaxed);
-    let matched = stats.matched.load(std::sync::atomic::Ordering::Relaxed);
+    let (done, matched) = stats.counts();
     let step = Step {
         did: "Geocoded",
         doing: "Geocoding",
@@ -1922,8 +2013,13 @@ fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
         started: Some(run.started),
         secs: None,
     };
-    let (p50, p95, p99, _) = stats.latency();
-    let left = format!("   p50 {p50:.1} ms  ·  p95 {p95:.1} ms  ·  p99 {p99:.1} ms");
+    let latency = |q: f64| stats.latencies.quantile(q);
+    let left = format!(
+        "   p50 {:.1} ms  ·  p95 {:.1} ms  ·  p99 {:.1} ms",
+        latency(0.50),
+        latency(0.95),
+        latency(0.99)
+    );
     let share = if done > 0 {
         matched as f64 / done as f64 * 100.0
     } else {
@@ -1931,7 +2027,7 @@ fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
     };
     let right = format!(
         "{share:.1}% matched  ·  {} with no match",
-        format::thousands(done - matched)
+        format::thousands(done.saturating_sub(matched))
     );
     let mut lines = vec![
         running_line(app, &step, done, inner),
@@ -2025,7 +2121,7 @@ fn batch_done(frame: &mut Frame, area: Rect, app: &App) {
     };
     let inner = area.width as usize;
     let rows = summary.rows;
-    let missed = rows - summary.matched;
+    let missed = rows.saturating_sub(summary.matched);
     let percent = |count: u64| count as f64 / rows.max(1) as f64 * 100.0;
 
     let mut accuracy = vec![plain("   ")];

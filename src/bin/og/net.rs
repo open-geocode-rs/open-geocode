@@ -3,23 +3,29 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufReader, Read, Write},
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
 use open_geocode::builder::BuildCancelled;
-use ureq::Agent;
+use ureq::{Agent, http::Response};
 
 use crate::format;
 
 const CHUNK_BYTES: usize = 1 << 20;
+/// How long a download may receive nothing before it is given up as stalled.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a download waiting for data looks at its cancel flag.
+const POLL: Duration = Duration::from_millis(200);
 
 fn agent() -> &'static Agent {
     static AGENT: OnceLock<Agent> = OnceLock::new();
@@ -48,16 +54,17 @@ pub fn head(url: &str) -> Result<Remote> {
         .head(url)
         .call()
         .with_context(|| format!("failed to reach {url}"))?;
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-    };
     Ok(Remote {
-        bytes: header("content-length").and_then(|value| value.parse().ok()),
+        bytes: header(&response, "content-length").and_then(|value| value.parse().ok()),
     })
+}
+
+fn header<B>(response: &Response<B>, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 /// The time an extract's data is from, read from its replication state
@@ -104,9 +111,33 @@ pub fn partial_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Beside a partial file: the ETag, or else the Last-Modified date, of the
+/// response it was written from. A download continues the partial file only
+/// while the server still has that version of the file.
+fn version_path(partial: &Path) -> PathBuf {
+    let mut name = partial.file_name().unwrap_or_default().to_os_string();
+    name.push(".version");
+    partial.with_file_name(name)
+}
+
+/// Moves a complete, checked download into place.
+pub fn complete(partial: &Path, path: &Path) -> Result<()> {
+    fs::rename(partial, path)
+        .with_context(|| format!("failed to move {} into place", path.display()))?;
+    let _ = fs::remove_file(version_path(partial));
+    Ok(())
+}
+
+/// Removes a partial file there is no use continuing from.
+pub fn discard(partial: &Path) {
+    let _ = fs::remove_file(partial);
+    let _ = fs::remove_file(version_path(partial));
+}
+
 /// Downloads `url` to the partial file of `path`, continuing an earlier
-/// download that stopped. `progress` is told the bytes on disk so far and
-/// the whole size, when the server says it.
+/// download that stopped while the server still has the same version of
+/// the file, and starting over when it does not. `progress` is told the
+/// bytes on disk so far and the whole size, when the server says it.
 pub fn download(
     url: &str,
     path: &Path,
@@ -119,49 +150,150 @@ pub fn download(
     }
     let partial = partial_path(path);
     let have = fs::metadata(&partial).map_or(0, |meta| meta.len());
-    let mut request = agent().get(url);
-    if have > 0 {
-        request = request.header("Range", format!("bytes={have}-"));
+    let version = fs::read_to_string(version_path(&partial))
+        .ok()
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty());
+    let resume = version.filter(|_| have > 0).map(|version| (have, version));
+    match fetch(url, &partial, resume.as_ref(), cancel, &mut progress)? {
+        Fetched::Done => Ok(partial),
+        // The partial file is no part of what the server has now.
+        Fetched::Stale => {
+            discard(&partial);
+            match fetch(url, &partial, None, cancel, &mut progress)? {
+                Fetched::Done => Ok(partial),
+                Fetched::Stale => bail!("{url} cannot be downloaded from its start"),
+            }
+        }
     }
-    let mut response = request
+}
+
+enum Fetched {
+    Done,
+    /// The partial file cannot be continued.
+    Stale,
+}
+
+/// One request for `url`: the bytes after `resume`'s when given, else all
+/// of it.
+fn fetch(
+    url: &str,
+    partial: &Path,
+    resume: Option<&(u64, String)>,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<Fetched> {
+    let mut request = agent()
+        .get(url)
+        .config()
+        .http_status_as_error(false)
+        .build();
+    if let Some((have, version)) = resume {
+        // Without the same version the server sends the whole file again.
+        request = request
+            .header("Range", format!("bytes={have}-"))
+            .header("If-Range", version);
+    }
+    let response = request
         .call()
         .with_context(|| format!("failed to download {url}"))?;
-    let resumed = response.status().as_u16() == 206;
-    let length = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let (mut done, total) = if resumed {
-        (have, length.map(|length| length + have))
-    } else {
-        (0, length)
+    let length = header(&response, "content-length").and_then(|value| value.parse::<u64>().ok());
+    // `bytes 100-199/200` for a part, `bytes */200` for a range past the end.
+    let range = header(&response, "content-range").and_then(|value| {
+        let (span, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+        let start = span
+            .split_once('-')
+            .and_then(|(start, _)| start.parse().ok());
+        Some((start, total.parse::<u64>().ok()))
+    });
+    let (start, total) = match (response.status().as_u16(), resume) {
+        (200, _) => (0, length),
+        (206, Some((have, _))) => match range {
+            Some((Some(start), total)) if start == *have => (start, total),
+            _ => return Ok(Fetched::Stale),
+        },
+        // Nothing past the partial file: it is the whole file when it is as
+        // long as the server says, and its checksum then tells for sure.
+        (416, Some((have, _))) => {
+            return match range {
+                Some((_, Some(total))) if total == *have => {
+                    progress(*have, Some(total));
+                    Ok(Fetched::Done)
+                }
+                _ => Ok(Fetched::Stale),
+            };
+        }
+        (status, _) => bail!("{url} answered HTTP {status}"),
     };
+    if start == 0 {
+        let version = header(&response, "etag").or_else(|| header(&response, "last-modified"));
+        match version {
+            Some(version) => fs::write(version_path(partial), version)
+                .with_context(|| format!("failed to write beside {}", partial.display()))?,
+            None => {
+                let _ = fs::remove_file(version_path(partial));
+            }
+        }
+    }
+    let total = total.or(length.map(|length| length + start));
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
-        .append(resumed)
-        .truncate(!resumed)
-        .open(&partial)
+        .append(start > 0)
+        .truncate(start == 0)
+        .open(partial)
         .with_context(|| format!("failed to create {}", partial.display()))?;
+    let mut done = start;
     progress(done, total);
-    let mut body = response.body_mut().as_reader();
-    let mut buffer = vec![0; CHUNK_BYTES];
+    // The body is read on a thread of its own, so a server that stops
+    // sending is noticed, and a cancel is seen, while a read waits.
+    let (sender, chunks) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+    let mut body = response.into_body().into_reader();
+    thread::spawn(move || {
+        loop {
+            let mut chunk = vec![0; CHUNK_BYTES];
+            let read = match body.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            chunk.truncate(read);
+            if sender.send(Ok(chunk)).is_err() {
+                return;
+            }
+        }
+    });
+    let mut heard = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             file.flush()?;
             return Err(BuildCancelled.into());
         }
-        let read = body
-            .read(&mut buffer)
-            .with_context(|| format!("the download of {url} broke off"))?;
-        if read == 0 {
-            break;
+        match chunks.recv_timeout(POLL) {
+            Ok(Ok(chunk)) => {
+                file.write_all(&chunk)
+                    .with_context(|| format!("failed to write {}", partial.display()))?;
+                done += chunk.len() as u64;
+                progress(done, total);
+                heard = Instant::now();
+            }
+            Ok(Err(error)) => {
+                file.flush()?;
+                return Err(error).with_context(|| format!("the download of {url} broke off"));
+            }
+            Err(RecvTimeoutError::Timeout) if heard.elapsed() >= IDLE_TIMEOUT => {
+                file.flush()?;
+                bail!(
+                    "the download of {url} stalled: nothing arrived for {} s",
+                    IDLE_TIMEOUT.as_secs()
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        file.write_all(&buffer[..read])
-            .with_context(|| format!("failed to write {}", partial.display()))?;
-        done += read as u64;
-        progress(done, total);
     }
     file.flush()?;
     if let Some(total) = total
@@ -169,7 +301,7 @@ pub fn download(
     {
         bail!("the download of {url} ended at {done} of {total} bytes");
     }
-    Ok(partial)
+    Ok(Fetched::Done)
 }
 
 /// Checks a file against an MD5 sum. `progress` is told the bytes read.

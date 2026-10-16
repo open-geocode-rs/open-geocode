@@ -107,12 +107,12 @@ impl Engine {
     }
 
     /// What `/search?q=` answers.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Answer> {
+    pub fn search(&self, query: &str) -> Result<Answer> {
         let started = Instant::now();
         let query = query.trim().to_string();
         let hits = self.searcher.search(TextSearchOptions {
             query: query.clone(),
-            limit,
+            limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
         })?;
         let collection = api::forward_collection(&self.pack, query, hits)?;
@@ -129,28 +129,35 @@ impl Engine {
         })
     }
 
-    pub fn search_default(&self, query: &str) -> Result<Answer> {
-        self.search(query, DEFAULT_SEARCH_LIMIT)
-    }
-
-    /// What a batch run answers for one row's address.
-    pub fn geocode_address(&self, address: String) -> Result<Option<Hit>> {
-        let Some(found) = self.searcher.geocode_address(AddressGeocodeOptions {
-            address,
+    /// What a batch run answers for one row's address: its one match, or
+    /// none.
+    pub fn geocode_address(&self, address: &str) -> Result<Answer> {
+        let started = Instant::now();
+        let address = address.trim().to_string();
+        let found = self.searcher.geocode_address(AddressGeocodeOptions {
+            address: address.clone(),
             locality: None,
             region: None,
             postcode: None,
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
-        })?
-        else {
-            return Ok(None);
-        };
-        let feature = api::forward_feature(&mut api::Contexts::new(&self.pack), found.hit)?;
-        Ok(Some(hit(
-            &feature,
-            Measure::Score(feature.properties.rank.score),
-        )))
+        })?;
+        let collection = api::forward_collection(
+            &self.pack,
+            address,
+            found.into_iter().map(|found| found.hit).collect(),
+        )?;
+        let millis = started.elapsed().as_secs_f64() * 1_000.0;
+        let hits = collection
+            .features
+            .iter()
+            .map(|feature| hit(feature, Measure::Score(feature.properties.rank.score)))
+            .collect();
+        Ok(Answer {
+            hits,
+            collection: Collection::Forward(collection),
+            millis,
+        })
     }
 
     /// What `/reverse?lat=&lon=` answers.

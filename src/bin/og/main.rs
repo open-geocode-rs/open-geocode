@@ -6,12 +6,12 @@
 //! screen: finished steps are printed above it and stay in terminal history.
 
 mod app;
+mod ask;
 mod batch;
 mod engine;
 mod format;
 mod home;
 mod job;
-mod machine;
 mod net;
 mod regions;
 mod ui;
@@ -26,7 +26,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use open_geocode::runtime::{ServeOptions, serve};
+use open_geocode::{
+    alloc::CountingAlloc,
+    resources,
+    runtime::{ServeOptions, serve},
+};
 use ratatui::{
     DefaultTerminal, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
@@ -41,7 +45,13 @@ use ratatui::{
 
 use app::App;
 use home::Home;
-use job::{BuildJob, BuildPlan};
+use job::{BuildJob, BuildRequest};
+
+/// mimalloc, counted, as the `open-geocode` binary has it: builds run on
+/// it, and the count lets a build's memory pool see the heap it does not
+/// track.
+#[global_allocator]
+static ALLOCATOR: CountingAlloc<mimalloc::MiMalloc> = CountingAlloc::new(mimalloc::MiMalloc);
 
 #[derive(Parser)]
 #[command(
@@ -62,9 +72,15 @@ enum Command {
         #[arg(long)]
         region: String,
 
-        /// Memory for the build's sort buffers, in GB.
-        #[arg(long, default_value_t = 4)]
-        memory: u64,
+        /// Memory for the build's buffers, in MiB. Sized to what this
+        /// machine can give when not set.
+        #[arg(long)]
+        memory_budget_mb: Option<u64>,
+
+        /// Build even when the pre-flight check finds too little memory or
+        /// disk.
+        #[arg(long)]
+        force: bool,
 
         /// Download the extract again even when one is on disk.
         #[arg(long)]
@@ -84,12 +100,22 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = Home::locate()?;
+    // A build is a long run no user seems to wait on; it should not be
+    // moved to efficiency cores.
+    resources::opt_out_of_power_throttling();
     match cli.command {
         Some(Command::Build {
             region,
-            memory,
+            memory_budget_mb,
+            force,
             download,
-        }) => build(home, &region, memory, download),
+        }) => {
+            let memory_budget_bytes = memory_budget_mb
+                .map(|mb| usize::try_from(mb << 20))
+                .transpose()
+                .context("--memory-budget-mb is larger than this machine can address")?;
+            build(home, &region, memory_budget_bytes, force, download)
+        }
         Some(Command::Serve { pack, bind }) => {
             let dir = home.packs_dir().join(&pack);
             let pack = if dir.is_dir() {
@@ -115,23 +141,49 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
         }))
 }
 
-/// `og build`: the build the interface runs, with one line per step.
-fn build(home: Home, id: &str, memory_gb: u64, download: bool) -> Result<()> {
+/// `og build`: the build the interface runs, with one line per step. Ctrl-C
+/// stops it and removes the unfinished Pack generation; a second one quits
+/// at once.
+fn build(
+    home: Home,
+    id: &str,
+    memory_budget_bytes: Option<usize>,
+    force: bool,
+    download: bool,
+) -> Result<()> {
     let Some(region) = regions::tree().get(id) else {
         bail!("no region {id} in the catalog; ids look like canada/ontario");
     };
     let extract = home.extract_path(region);
-    let plan = BuildPlan {
+    let request = BuildRequest {
         region,
         download: download || !extract.is_file(),
         extract,
         pack: home.pack_dir(region),
-        memory_budget_bytes: memory_gb << 30,
+        memory_budget_bytes,
+        force,
     };
-    let pack = plan.pack.clone();
-    let mut job = BuildJob::start(plan, Arc::new(home));
-    let mut printed = 0;
+    let pack = request.pack.clone();
+    let mut job = BuildJob::start(request, Arc::new(home));
+    let interrupted = job.cancel_flag();
+    // The second handler quits only once the first has set the flag.
+    signal_hook::flag::register_conditional_shutdown(
+        signal_hook::consts::SIGINT,
+        130,
+        Arc::clone(&interrupted),
+    )
+    .context("failed to handle Ctrl-C")?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted)
+        .context("failed to handle Ctrl-C")?;
+    let (mut printed, mut warned) = (0, 0);
     loop {
+        {
+            let warnings = job.progress.warnings.lock().expect("warnings lock");
+            for warning in &warnings[warned..] {
+                eprintln!("warning: {warning}");
+            }
+            warned = warnings.len();
+        }
         {
             let steps = job.progress.steps.lock().expect("steps lock");
             while let Some(step) = steps.get(printed).filter(|step| step.secs.is_some()) {
@@ -145,7 +197,13 @@ fn build(home: Home, id: &str, memory_gb: u64, download: bool) -> Result<()> {
             }
         }
         if let Some(outcome) = job.take() {
-            let built = outcome?;
+            let built = match outcome {
+                Err(error) if job::cancelled(&error) => {
+                    eprintln!("Cancelled; the unfinished Pack was removed.");
+                    std::process::exit(130);
+                }
+                outcome => outcome?,
+            };
             println!(
                 "Pack ready: {} · {} records · {} · built in {}",
                 pack.display(),
@@ -194,7 +252,7 @@ fn interactive(home: Home) -> Result<()> {
     for line in &app.farewell {
         println!("  {line}");
     }
-    if app.job.is_some() || !app.stopping.is_empty() {
+    if app.job.is_some() || !app.stopping_builds.is_empty() || !app.stopping_runs.is_empty() {
         println!("  Stopping, and removing what was not finished…");
     }
     result.and(left)?;
@@ -347,6 +405,13 @@ mod screens {
         }
     }
 
+    /// Ticks the app until the open Pack has answered.
+    fn answered(app: &mut App) {
+        app.tick();
+        wait(app, Duration::from_secs(10), |app| !app.asking());
+        app.tick();
+    }
+
     #[test]
     #[ignore = "needs a Pack in OG_HOME"]
     fn session() {
@@ -357,6 +422,7 @@ mod screens {
 
         press(&mut app, &[KeyCode::Enter]);
         typed(&mut app, "heitastrasse 144 triesenberg");
+        answered(&mut app);
         show(&app, "search");
         press(&mut app, &[KeyCode::Enter]);
         show(&app, "geojson");
@@ -364,6 +430,7 @@ mod screens {
 
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         typed(&mut app, "47.0973, 9.6118");
+        answered(&mut app);
         show(&app, "reverse");
 
         press(&mut app, &[KeyCode::Tab]);
@@ -371,14 +438,17 @@ mod screens {
             "address\nheitastrasse 144 triesenberg\nfuhraweg 6 ruggell\nnirgendweg 999 vaduz\n"
                 .to_string(),
         );
+        answered(&mut app);
         show(&app, "batch pasted");
 
         if let Ok(csv) = std::env::var("OG_SCREENS_CSV") {
             press(&mut app, &[KeyCode::Char('u')]);
             app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
             app.on_paste(csv);
+            app.tick();
             show(&app, "batch file card");
             press(&mut app, &[KeyCode::Enter]);
+            answered(&mut app);
             show(&app, "batch setup");
             press(&mut app, &[KeyCode::Enter]);
             wait(&mut app, Duration::from_secs(8), |_| false);
@@ -430,8 +500,13 @@ mod screens {
             serde_json::from_str(&text).unwrap()
         };
         let json = |text: String| -> serde_json::Value { serde_json::from_str(&text).unwrap() };
-        for query in ["andorra la vella", "carrer prat de la creu 70", "escaldes", "x"] {
-            let shell = engine.search_default(query).unwrap();
+        for query in [
+            "andorra la vella",
+            "carrer prat de la creu 70",
+            "escaldes",
+            "x",
+        ] {
+            let shell = engine.search(query).unwrap();
             let api = get(&format!("/search?q={}", query.replace(' ', "%20")));
             assert_eq!(json(shell.collection.json(None)), api, "search {query}");
             assert!(!shell.hits.is_empty() || api["features"].as_array().unwrap().is_empty());
@@ -446,14 +521,32 @@ mod screens {
         for (lat, lon) in [(42.5063, 1.5218), (42.55, 1.6), (0.0, 0.0)] {
             let shell = engine.reverse(lat, lon).unwrap();
             let api = get(&format!("/reverse?lat={lat}&lon={lon}"));
-            assert_eq!(json(shell.collection.json(None)), api, "reverse {lat},{lon}");
+            assert_eq!(
+                json(shell.collection.json(None)),
+                api,
+                "reverse {lat},{lon}"
+            );
         }
-        let shell = engine.search("andorra", 1).unwrap();
-        assert_eq!(
-            json(shell.collection.json(None)),
-            get("/search?q=andorra&limit=1"),
-            "a pasted batch row is /search with limit 1"
+        // A pasted row is answered as a row of a file is.
+        let dir = std::env::temp_dir().join(format!("og-pasted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let address = "carrer prat de la creu 70, andorra la vella";
+        std::fs::write(dir.join("in.csv"), format!("address\n\"{address}\"\n")).unwrap();
+        open_geocode::batch::run_batch_geocode(open_geocode::batch::BatchGeocodeOptions {
+            pack: Some(pack),
+            input: dir.join("in.csv"),
+            output: dir.join("out.csv"),
+            address_field_groups: vec![vec![open_geocode::batch::Column::At(0)]],
+            ..Default::default()
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(dir.join("out.csv")).unwrap();
+        let hit = engine.geocode_address(address).unwrap().hits.remove(0);
+        assert!(
+            written.contains(&format!("{:.7},{:.7}", hit.lat, hit.lon)),
+            "{written}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Quitting during a build leaves no unfinished Pack generation behind.
@@ -465,12 +558,13 @@ mod screens {
         let pack = home.packs_dir().join("andorra-stopped");
         let mut app = App::new(Home::locate().unwrap());
         app.job = Some(crate::job::BuildJob::start(
-            crate::job::BuildPlan {
+            crate::job::BuildRequest {
                 region,
                 extract: home.extract_path(region),
                 download: false,
                 pack: pack.clone(),
-                memory_budget_bytes: 1 << 30,
+                memory_budget_bytes: None,
+                force: false,
             },
             std::sync::Arc::new(home),
         ));
@@ -535,6 +629,7 @@ mod screens {
         show(&app, "done");
         press(&mut app, &[KeyCode::Enter]);
         typed(&mut app, "andorra la vella");
+        answered(&mut app);
         show(&app, "search the new Pack");
     }
 }

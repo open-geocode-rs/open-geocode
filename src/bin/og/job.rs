@@ -4,28 +4,29 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
 use open_geocode::{
     batch::BatchCancelled,
     builder::{
-        BuildCancelled, BuildObserver, BuildOsmOptions, BuildStage, StageUnit, build_osm_pack,
+        BuildCancelled, BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit,
+        build_planned_osm_pack, plan_osm_build,
     },
 };
 
 use crate::{
     format,
     home::{BuildRecord, Home, PackInfo},
-    machine, net,
-    regions::Region,
+    net,
+    regions::{self, Region},
 };
 
 /// What a step's work is counted in.
@@ -62,6 +63,10 @@ pub struct Progress {
     /// Work done in the running step.
     pub done: AtomicU64,
     pub started: Instant,
+    /// The plan the build runs with, once it is made.
+    pub plan: Mutex<Option<BuildPlan>>,
+    /// What the build warned about, in order.
+    pub warnings: Mutex<Vec<String>>,
 }
 
 impl Progress {
@@ -71,6 +76,8 @@ impl Progress {
             current: AtomicU64::new(0),
             done: AtomicU64::new(0),
             started: Instant::now(),
+            plan: Mutex::new(None),
+            warnings: Mutex::new(Vec::new()),
         })
     }
 
@@ -102,13 +109,18 @@ impl Progress {
     }
 }
 
-pub struct BuildPlan {
+/// A build to run: a region's extract into its Pack.
+pub struct BuildRequest {
     pub region: &'static Region,
     pub extract: PathBuf,
     /// Download the extract first, also when one is on disk.
     pub download: bool,
     pub pack: PathBuf,
-    pub memory_budget_bytes: u64,
+    /// Memory for the build's buffers; derived from what the machine can
+    /// give when not set.
+    pub memory_budget_bytes: Option<usize>,
+    /// Build even when the plan finds too little memory or disk.
+    pub force: bool,
 }
 
 /// A finished build.
@@ -120,24 +132,27 @@ pub struct Built {
 
 pub struct BuildJob {
     pub progress: Arc<Progress>,
+    /// The Pack it writes, and the extract it reads or downloads.
+    pack: PathBuf,
+    extract: PathBuf,
     cancel: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<Built>>>,
 }
 
 impl BuildJob {
-    pub fn start(plan: BuildPlan, home: Arc<Home>) -> Self {
+    pub fn start(request: BuildRequest, home: Arc<Home>) -> Self {
         let mut steps = Vec::new();
-        if plan.download {
+        if request.download {
             steps.push(Step {
                 did: "Downloaded",
                 doing: "Downloading",
-                object: "OpenStreetMap".to_string(),
+                object: regions::dataset_name(request.region.dataset()).to_string(),
                 explain: [
                     "Fetching the region's extract from its publisher.",
                     "A stopped download continues where it left off next time.",
                 ],
                 unit: Unit::Bytes,
-                total: Some(plan.region.osm.bytes),
+                total: Some(request.region.osm.bytes),
                 started: None,
                 secs: None,
             });
@@ -158,13 +173,16 @@ impl BuildJob {
         steps.extend(BuildStage::ALL.into_iter().map(build_step));
         let progress = Progress::new(steps);
         let cancel = Arc::new(AtomicBool::new(false));
+        let (pack, extract) = (request.pack.clone(), request.extract.clone());
         let handle = {
             let progress = Arc::clone(&progress);
             let cancel = Arc::clone(&cancel);
-            thread::spawn(move || run(&plan, &home, &progress, &cancel))
+            thread::spawn(move || run(&request, &home, &progress, &cancel))
         };
         Self {
             progress,
+            pack,
+            extract,
             cancel,
             handle: Some(handle),
         }
@@ -172,6 +190,16 @@ impl BuildJob {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The flag that stops the job, for a signal handler to set.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// Whether the job writes this Pack, or reads or downloads this extract.
+    pub fn touches(&self, pack: &Path, extract: &Path) -> bool {
+        self.pack == pack || self.extract == extract
     }
 
     pub fn is_finished(&self) -> bool {
@@ -312,7 +340,7 @@ fn build_step(stage: BuildStage) -> Step {
     }
 }
 
-/// Hands the builder's stages to the job's steps.
+/// Hands the builder's stages and warnings to the job's progress.
 struct Observer {
     progress: Arc<Progress>,
     /// Steps before the build's own: the download and the checksum.
@@ -331,20 +359,28 @@ impl BuildObserver for Observer {
     fn finished(&self, stage: BuildStage) {
         self.progress.finish(self.offset + stage.number() - 1);
     }
+
+    fn warned(&self, message: &str) {
+        self.progress
+            .warnings
+            .lock()
+            .expect("warnings lock")
+            .push(message.to_string());
+    }
 }
 
 fn run(
-    plan: &BuildPlan,
+    request: &BuildRequest,
     home: &Home,
     progress: &Arc<Progress>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Built> {
     let mut offset = 0;
-    if plan.download {
-        let url = &plan.region.osm.url;
-        progress.start(0, Some(plan.region.osm.bytes));
+    if request.download {
+        let url = &request.region.osm.url;
+        progress.start(0, Some(request.region.osm.bytes));
         let expected = net::published_md5(url)?;
-        let partial = net::download(url, &plan.extract, cancel, |done, total| {
+        let partial = net::download(url, &request.extract, cancel, |done, total| {
             if let Some(total) = total {
                 progress.steps.lock().expect("steps lock")[0].total = Some(total);
             }
@@ -358,16 +394,15 @@ fn run(
         }) {
             // A file that does not match is no use to continue from.
             if !cancel.load(Ordering::Relaxed) {
-                let _ = fs::remove_file(&partial);
+                net::discard(&partial);
             }
             return Err(error);
         }
         progress.finish(1);
-        fs::rename(&partial, &plan.extract)
-            .with_context(|| format!("failed to move {} into place", plan.extract.display()))?;
-        let mut md5 = plan.extract.clone().into_os_string();
+        net::complete(&partial, &request.extract)?;
+        let mut md5 = request.extract.clone().into_os_string();
         md5.push(".md5");
-        let name = plan
+        let name = request
             .extract
             .file_name()
             .unwrap_or_default()
@@ -376,60 +411,44 @@ fn run(
         offset = 2;
     }
 
-    // The most disk the build holds is what was free when it began less the
-    // least that is free while it runs.
-    fs::create_dir_all(&plan.pack)
-        .with_context(|| format!("failed to create {}", plan.pack.display()))?;
-    let free_at_start = machine::free_disk(&plan.pack);
-    let least_free = Arc::new(AtomicU64::new(free_at_start.unwrap_or(u64::MAX)));
-    let watching = Arc::new(AtomicBool::new(true));
-    let watcher = {
-        let (least_free, watching, pack) = (
-            Arc::clone(&least_free),
-            Arc::clone(&watching),
-            plan.pack.clone(),
-        );
-        thread::spawn(move || {
-            while watching.load(Ordering::Relaxed) {
-                if let Some(free) = machine::free_disk(&pack) {
-                    least_free.fetch_min(free, Ordering::Relaxed);
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
-        })
-    };
-    let started = Instant::now();
-    let report = build_osm_pack(BuildOsmOptions {
-        input: plan.extract.clone(),
-        pack: plan.pack.clone(),
-        memory_budget_bytes: Some(
-            usize::try_from(plan.memory_budget_bytes)
-                .context("the memory budget is larger than this machine can address")?,
-        ),
-        input_source: Some(plan.region.id.clone()),
+    let options = BuildOsmOptions {
+        input: request.extract.clone(),
+        pack: request.pack.clone(),
+        memory_budget_bytes: request.memory_budget_bytes,
+        force: request.force,
+        input_source: Some(request.region.id.clone()),
         observer: Arc::new(Observer {
             progress: Arc::clone(progress),
             offset,
         }),
         cancel: Arc::clone(cancel),
         ..BuildOsmOptions::default()
-    });
-    watching.store(false, Ordering::Relaxed);
-    let _ = watcher.join();
-    let report = report?;
+    };
+    let plan = plan_osm_build(&options)?;
+    *progress.plan.lock().expect("plan lock") = Some(plan.clone());
+    // The process's global pool is the batch runs', sized to every CPU the
+    // first time one runs. The build gets a pool of its own, sized by the
+    // plan unless RAYON_NUM_THREADS sets it.
+    let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        0
+    } else {
+        plan.threads
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .context("failed to start the build's worker threads")?;
+    let started = Instant::now();
+    let report = pool.install(|| build_planned_osm_pack(options, plan))?;
     let build_secs = started.elapsed().as_secs_f64();
-    let peak_disk_bytes = free_at_start.map_or(0, |free| {
-        free.saturating_sub(least_free.load(Ordering::Relaxed))
-    });
-    let pack = PackInfo::read(&plan.pack)
-        .with_context(|| format!("the new Pack at {} cannot be read", plan.pack.display()))?;
+    let pack = PackInfo::read(&request.pack)
+        .with_context(|| format!("the new Pack at {} cannot be read", request.pack.display()))?;
     home.record_build(&BuildRecord {
-        region: plan.region.id.clone(),
+        region: request.region.id.clone(),
         input_bytes: report.input_bytes,
         build_secs,
-        peak_disk_bytes,
         pack_bytes: report.output.pack_bytes,
-        memory_budget_bytes: plan.memory_budget_bytes,
+        memory_budget_bytes: report.resources.plan.memory_budget_bytes,
         threads: report.resources.threads,
         finished_at: format::now(),
     })?;

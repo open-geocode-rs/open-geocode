@@ -59,12 +59,14 @@ Regions come from the catalog in `catalog/regions.json`, generated from pinned u
 `og` downloads the region's OpenStreetMap extract, checks it against its published MD5 sum, and builds the Pack on this machine.
 Extracts and Packs live in the og home: `OG_HOME` when set, otherwise the platform's local data directory.
 An extract already at `<home>/pbf/<region id>.osm.pbf` is used without downloading.
-Time and disk estimates appear once a build of a similar size has finished on the same machine; they are scaled from it, never assumed.
+Before a build starts, `og` shows the builder's plan: the memory budget and threads sized to this machine, and the memory and disk the extract needs against what is free.
+A build that does not fit is not started unless forced (`f`, or `og build --force`).
+Time estimates appear once a build of a similar size has finished on the same machine; they are scaled from it, never assumed.
 
 The same work runs without the interface:
 
 ```
-og build --region canada/ontario --memory 6
+og build --region canada/ontario
 og serve canada-ontario
 ```
 

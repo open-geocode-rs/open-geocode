@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use open_geocode::{
     builder::BuilderReport,
     pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackReader},
+    record::Layer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -125,9 +126,12 @@ pub struct PackInfo {
     pub records: u64,
     pub bytes: u64,
     pub built_at: i64,
-    /// When its OpenStreetMap data is from.
+    /// When its data is from.
     pub data_at: Option<i64>,
-    pub layers: Vec<(String, u64)>,
+    /// The datasets its records come from, by id, as its build report
+    /// names them; empty when the report is gone.
+    pub datasets: Vec<String>,
+    pub layers: Vec<(Layer, u64)>,
     /// How long the build took, from its report.
     pub build_secs: Option<f64>,
 }
@@ -160,10 +164,14 @@ impl PackInfo {
             data_at: report
                 .as_ref()
                 .and_then(|report| report.input_replication_timestamp),
+            datasets: report
+                .as_ref()
+                .map(|report| report.datasets.clone())
+                .unwrap_or_default(),
             layers: manifest
                 .layer_counts
                 .iter()
-                .map(|(layer, count)| (layer.clone(), *count))
+                .filter_map(|(layer, count)| Some((Layer::parse(layer)?, *count)))
                 .collect(),
             build_secs: report
                 .as_ref()
@@ -171,10 +179,11 @@ impl PackInfo {
         })
     }
 
-    pub fn layer(&self, names: &[&str]) -> u64 {
+    /// Records in the layers `pick` takes.
+    pub fn records_in(&self, pick: impl Fn(Layer) -> bool) -> u64 {
         self.layers
             .iter()
-            .filter(|(layer, _)| names.contains(&layer.as_str()))
+            .filter(|(layer, _)| pick(*layer))
             .map(|(_, count)| count)
             .sum()
     }
@@ -188,9 +197,6 @@ pub struct BuildRecord {
     pub input_bytes: u64,
     /// The build itself, without the download.
     pub build_secs: f64,
-    /// The most disk the build held at once beyond what was free when it
-    /// started: scratch files, the new Pack and its indexes.
-    pub peak_disk_bytes: u64,
     pub pack_bytes: u64,
     pub memory_budget_bytes: u64,
     pub threads: usize,
@@ -202,11 +208,11 @@ pub struct BuildRecord {
 /// range: a small build is mostly fixed costs, a large one spills to disk.
 const ESTIMATE_RANGE: f64 = 4.0;
 
-/// What a build of `input_bytes` is expected to take on this machine,
-/// scaled from the finished build closest in input size.
+/// How long a build of `input_bytes` is expected to take on this machine,
+/// scaled from the finished build closest in input size. What it needs of
+/// memory and disk is the build plan's to say.
 pub struct Estimate {
     pub secs: f64,
-    pub disk_bytes: u64,
     /// The build it is scaled from.
     pub from: BuildRecord,
 }
@@ -223,7 +229,6 @@ pub fn estimate(history: &[BuildRecord], input_bytes: u64) -> Option<Estimate> {
     let scale = input_bytes as f64 / nearest.input_bytes as f64;
     Some(Estimate {
         secs: nearest.build_secs * scale,
-        disk_bytes: (nearest.peak_disk_bytes as f64 * scale) as u64,
         from: nearest.clone(),
     })
 }

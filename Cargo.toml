@@ -47,10 +47,10 @@ regex = "1.12"
 rstar = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Stops `og build` cleanly on Ctrl-C.
+signal-hook = { version = "0.3", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
 stable_deref_trait = "1.2"
-# Free disk, memory and process size shown by the interactive `og` interface.
-sysinfo = { version = "0.38.4", optional = true }
 tantivy = "0.25.0"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }
@@ -84,7 +84,7 @@ tui = [
     "dep:dirs",
     "dep:md-5",
     "dep:ratatui",
-    "dep:sysinfo",
+    "dep:signal-hook",
     "dep:ureq",
 ]
 
