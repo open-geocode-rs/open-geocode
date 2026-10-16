@@ -32,7 +32,6 @@ pub enum Screen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Search,
-    Autocomplete,
     Reverse,
     /// Many addresses at once, pasted as CSV.
     Batch,
@@ -42,7 +41,6 @@ impl Mode {
     pub fn name(self) -> &'static str {
         match self {
             Self::Search => "search",
-            Self::Autocomplete => "autocomplete",
             Self::Reverse => "reverse",
             Self::Batch => "batch",
         }
@@ -50,8 +48,7 @@ impl Mode {
 
     fn next(self) -> Self {
         match self {
-            Self::Search => Self::Autocomplete,
-            Self::Autocomplete => Self::Reverse,
+            Self::Search => Self::Reverse,
             Self::Reverse => Self::Batch,
             Self::Batch => Self::Search,
         }
@@ -362,7 +359,7 @@ impl App {
 
     pub fn hits(&self) -> Vec<(&'static mock::Record, f64)> {
         match self.mode {
-            Mode::Search | Mode::Autocomplete => mock::search(&self.query),
+            Mode::Search => mock::search(&self.query),
             Mode::Reverse => mock::point(&self.query)
                 .map(|(lat, lon)| mock::reverse(lat, lon))
                 .unwrap_or_default(),

@@ -167,7 +167,7 @@ pub fn build_header(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
         Line::from(vec![
-            plain(" "),
+            plain("  "),
             bold(format!("Building {}", app.region.label)),
         ]),
         Line::raw(""),
@@ -183,7 +183,10 @@ pub fn stage_done(build: &Build, index: usize, inner: usize) -> Vec<Line<'static
 pub fn cancelled(build: &Build) -> Line<'static> {
     Line::from(vec![
         span("  ✗ ", ERR),
-        plain(format!("Build cancelled during {}.", build.stage().title)),
+        plain(format!(
+            "Build cancelled while {}.",
+            build.stage().doing_text().to_lowercase()
+        )),
         span(" Downloaded files are kept.", DIM),
     ])
 }
@@ -722,15 +725,18 @@ fn lerp(ends: [(u8, u8, u8); 2], t: f64) -> Color {
     )
 }
 
-// A stage line is laid out as Ollama lays out a layer: a marker, the name,
-// the percent, a bar, then size, speed and time in columns of fixed width, so
-// nothing moves as the numbers change.
-const NAME_WIDTH: usize = 24;
+// A stage line is laid out as Ollama lays out a layer, with cargo's verb in
+// front: the verb, what it works on, the percent, a bar, then size, speed and
+// time in columns of fixed width, so nothing moves as the numbers change.
+const VERB_WIDTH: usize = 11;
+const NAME_WIDTH: usize = 16;
 const SIZE_WIDTH: usize = 13;
 const SPEED_WIDTH: usize = 9;
 const TIME_WIDTH: usize = 8;
-/// Everything on a line but the bar.
-const LINE_FIXED: usize = 4 + NAME_WIDTH + 2 + 5 + 2 + 2 + SIZE_WIDTH + SPEED_WIDTH + TIME_WIDTH;
+/// Everything on a line but the bar: the gutter, verb, name, percent and the
+/// caps and gap around the bar, then the three right-hand columns.
+const LINE_FIXED: usize =
+    3 + VERB_WIDTH + 1 + NAME_WIDTH + 2 + 5 + 2 + 2 + SIZE_WIDTH + SPEED_WIDTH + TIME_WIDTH;
 
 /// Cells of the bar: what the width leaves after the other columns.
 fn bar_cells(inner: usize) -> usize {
@@ -780,11 +786,16 @@ fn shimmer(text: &str, millis: u128) -> Vec<Span<'static>> {
 
 fn finished_line(stage: &Stage, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
+    // History lines start at the terminal's edge; the live window sits one
+    // column in, so the line carries that margin to stay in line with it.
     let mut spans = vec![
+        plain("    "),
+        Span::styled(
+            pad(stage.did, VERB_WIDTH),
+            Style::new().fg(DONE_BAR).add_modifier(Modifier::BOLD),
+        ),
         plain(" "),
-        span("✔", OK),
-        plain("  "),
-        plain(pad(&cut(&stage.title, NAME_WIDTH), NAME_WIDTH)),
+        plain(pad(&cut(&stage.object, NAME_WIDTH), NAME_WIDTH)),
         plain("  "),
     ];
     if stage.total.is_some() {
@@ -812,10 +823,14 @@ fn running_line(app: &App, build: &Build, inner: usize) -> Line<'static> {
     let stage = build.stage();
     let progress = build.progress();
     let cells = bar_cells(inner);
-    let name = cut(&stage.title, NAME_WIDTH);
-    let mut spans = vec![plain(" "), span(spinner(app), ACCENT), plain("  ")];
-    spans.extend(shimmer(&name, app.started.elapsed().as_millis()));
-    spans.push(plain(" ".repeat(NAME_WIDTH - width(&name))));
+    // The verb and what it works on shimmer as one title.
+    let title = format!(
+        "{} {}",
+        pad(stage.doing, VERB_WIDTH),
+        pad(&cut(&stage.object, NAME_WIDTH), NAME_WIDTH)
+    );
+    let mut spans = vec![plain(" "), span(spinner(app), ACCENT), plain(" ")];
+    spans.extend(shimmer(&title, app.started.elapsed().as_millis()));
     spans.push(plain("  "));
     match stage.total {
         Some(total) => {
@@ -868,29 +883,36 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
     };
     let inner = area.width as usize;
     let overall = build.overall();
-    let budget = app.memory_gb() as f64;
-    let memory = (1.4 + overall * 4.0).min(budget * 0.85);
+    let left = mock::about(build.remaining());
     let mut lines = vec![
         running_line(app, build, inner),
         Line::raw(""),
         Line::from(span(
             format!(
-                "    overall {}% · {} elapsed · {} left · memory {memory:.1} / {budget:.1} GB",
-                (overall * 100.0).floor(),
+                "   Step {} of {}  ·  {} elapsed  ·  about {} left",
+                build.current + 1,
+                build.stages.len(),
                 mock::duration(build.elapsed()),
-                mock::about(build.remaining()),
+                left.trim_start_matches("~ "),
             ),
             DIM,
         )),
     ];
     if app.show_logs {
         let stage = build.stage();
+        let budget = app.memory_gb() as f64;
+        let memory = (1.4 + overall * 4.0).min(budget * 0.85);
         lines.push(Line::raw(""));
-        lines.push(Line::from(span(format!("    {}", stage.explain[0]), DIM)));
-        lines.push(Line::from(span(format!("    {}", stage.explain[1]), DIM)));
+        lines.push(Line::from(span(format!("   {}", stage.explain[0]), DIM)));
+        lines.push(Line::from(span(format!("   {}", stage.explain[1]), DIM)));
         lines.push(Line::raw(""));
         lines.push(Line::from(span(
-            format!("    log {}", "─".repeat(inner.saturating_sub(10))),
+            format!("   memory {memory:.1} / {budget:.1} GB"),
+            DIM,
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(span(
+            format!("   log {}", "─".repeat(inner.saturating_sub(7))),
             FAINT,
         )));
         let end = ((overall * mock::LOGS.len() as f64).ceil() as usize).clamp(1, mock::LOGS.len());
@@ -898,7 +920,7 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
         for (level, text) in &mock::LOGS[start..end] {
             let color = if *level == "warn" { WARN } else { DIM };
             lines.push(Line::from(vec![
-                span(format!("    {level:<5} "), color),
+                span(format!("   {level:<5} "), color),
                 span(text.to_string(), DIM),
             ]));
         }
@@ -1046,7 +1068,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         header,
     );
     let mut tabs = Vec::new();
-    for mode in [Mode::Search, Mode::Autocomplete, Mode::Reverse, Mode::Batch] {
+    for mode in [Mode::Search, Mode::Reverse, Mode::Batch] {
         tabs.push(if mode == app.mode {
             Span::styled(
                 format!(" {} ", mode.name()),
@@ -1059,8 +1081,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(tabs).right_aligned()), header);
 
     let placeholder = match app.mode {
-        Mode::Search => "try: 100 queen st w toronto",
-        Mode::Autocomplete => "type a few letters: cn tow",
+        Mode::Search => "try: 100 queen st w tor",
         Mode::Reverse => "lat, lon   try: 43.6535, -79.3839",
         Mode::Batch => "paste a CSV, one address per row, or type a file path",
     };
@@ -1131,7 +1152,6 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(parsed_line), parsed);
     if !app.query.is_empty() || !app.batch_rows.is_empty() && app.mode == Mode::Batch {
         let millis = match app.mode {
-            Mode::Autocomplete => 1 + app.query.len() % 3,
             Mode::Batch => 2 + app.batch_rows.len() / 40,
             _ => 3 + app.query.len() % 5,
         };
@@ -1151,7 +1171,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
                 DIM,
             )),
             Line::from(span(
-                "  Tab switches between search, autocomplete, reverse and batch.",
+                "  Tab switches between search, reverse and batch.",
                 DIM,
             )),
         ]

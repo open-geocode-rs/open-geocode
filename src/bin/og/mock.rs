@@ -36,7 +36,12 @@ pub const FREE_DISK_GB: f64 = 212.0;
 pub const RAM_GB: u32 = 16;
 
 pub struct Stage {
-    pub title: String,
+    /// What the stage did, for when it is finished: `Scanned`.
+    pub did: &'static str,
+    /// What it is doing, for while it runs: `Scanning`.
+    pub doing: &'static str,
+    /// What it works on: `OSM objects`.
+    pub object: String,
     pub explain: [&'static str; 2],
     /// Units of work, or `None` for a stage with no measurable total.
     pub total: Option<f64>,
@@ -48,11 +53,20 @@ pub struct Stage {
     pub summary: String,
 }
 
+impl Stage {
+    /// `Scanning OSM objects`.
+    pub fn doing_text(&self) -> String {
+        format!("{} {}", self.doing, self.object)
+    }
+}
+
 pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
     let mut stages = Vec::new();
     if region.local().is_none() {
         stages.push(Stage {
-            title: "Download OpenStreetMap".to_string(),
+            did: "Downloaded",
+            doing: "Downloading",
+            object: "OpenStreetMap".to_string(),
             explain: [
                 "Fetching the region from Geofabrik.",
                 "The file is checked against its published checksum before use.",
@@ -67,7 +81,9 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
     for (index, source) in SOURCES.iter().enumerate().skip(1) {
         if sources[index] {
             stages.push(Stage {
-                title: format!("Download {}", source.name),
+                did: "Downloaded",
+                doing: "Downloading",
+                object: source.name.to_string(),
                 explain: [
                     "Fetching the extra source for this region.",
                     "Its points are merged with OpenStreetMap later in the build.",
@@ -82,7 +98,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
     }
     let builder = [
         (
-            "Scan OSM objects",
+            ("Scanned", "Scanning", "OSM objects"),
             [
                 "Reading every node, way and relation once.",
                 "Places, streets, addresses and POIs are kept; the rest is skipped.",
@@ -94,7 +110,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "48.2M objects".to_string(),
         ),
         (
-            "Read boundary ways",
+            ("Read", "Reading", "boundary ways"),
             [
                 "Collecting the outline pieces of countries, provinces and cities.",
                 "These become the areas every result is placed in.",
@@ -106,7 +122,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "1.9M ways".to_string(),
         ),
         (
-            "Join node coordinates",
+            ("Joined", "Joining", "node coordinates"),
             [
                 "Giving every street and building the coordinates of its points.",
                 "Data larger than the memory budget spills to disk; that is normal.",
@@ -118,7 +134,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "67.9M nodes".to_string(),
         ),
         (
-            "Assemble ways",
+            ("Assembled", "Assembling", "ways"),
             [
                 "Turning ways into streets, buildings and address lines.",
                 "House number ranges are laid along their streets here.",
@@ -130,7 +146,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "9.4M ways".to_string(),
         ),
         (
-            "Write context records",
+            ("Wrote", "Writing", "context records"),
             [
                 "Building the admin areas so every result knows its city,",
                 "region and country, even when its own tags leave them out.",
@@ -142,7 +158,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "3,418 areas".to_string(),
         ),
         (
-            "Write records",
+            ("Wrote", "Writing", "records"),
             [
                 "Writing every searchable place into the Pack.",
                 "Duplicates from different sources are folded into one record.",
@@ -154,7 +170,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "7.59M records".to_string(),
         ),
         (
-            "Finish Pack indexes",
+            ("Built", "Building", "Pack indexes"),
             [
                 "Building the text index for search and autocomplete,",
                 "and the spatial index for reverse geocoding.",
@@ -166,7 +182,7 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "text + spatial".to_string(),
         ),
         (
-            "Train address parser",
+            ("Trained", "Training", "address parser"),
             [
                 "Learning this region's street words and postcode shapes,",
                 "so queries are read the way people here write addresses.",
@@ -178,9 +194,11 @@ pub fn stages(region: &Region, sources: &[bool; 3]) -> Vec<Stage> {
             "18,904 street words".to_string(),
         ),
     ];
-    for (title, explain, total, unit, play_secs, real_secs, summary) in builder {
+    for ((did, doing, object), explain, total, unit, play_secs, real_secs, summary) in builder {
         stages.push(Stage {
-            title: title.to_string(),
+            did,
+            doing,
+            object: object.to_string(),
             explain,
             total,
             unit,
