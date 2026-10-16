@@ -2072,20 +2072,8 @@ fn batch_done(frame: &mut Frame, area: Rect, app: &App) {
     ];
     lines.extend(output_table(session, inner));
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        span("   Also written   ", DIM),
-        plain(format!("{stem}.audit.csv")),
-        span(
-            format!(" · {}", mock::size(summary.audit_bytes as f64 / 1e6)),
-            DIM,
-        ),
-    ]));
-    lines.push(Line::raw(""));
     let mut buttons = vec![plain("  ")];
-    for (index, label) in ["Review no matches", "Search in the shell", "Done"]
-        .iter()
-        .enumerate()
-    {
+    for (index, label) in ["Search in the shell", "Done"].iter().enumerate() {
         buttons.push(button(label, index == app.batch_button, true));
         buttons.push(plain("  "));
     }

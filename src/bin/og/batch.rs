@@ -192,7 +192,6 @@ pub struct Summary {
     pub slowest: f64,
     pub seconds: f64,
     pub output_bytes: u64,
-    pub audit_bytes: u64,
 }
 
 pub struct BatchSession {
@@ -409,7 +408,6 @@ impl BatchSession {
             slowest: latencies.last().copied().unwrap_or(0.0),
             seconds: self.seconds(),
             output_bytes: self.file.bytes + rows as u64 * 22,
-            audit_bytes: rows as u64 * 150,
         });
     }
 }

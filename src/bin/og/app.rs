@@ -922,13 +922,12 @@ impl App {
     }
 
     fn batch_done_key(&mut self, key: KeyEvent) {
-        let buttons = 3;
+        let buttons = 2;
         match key.code {
             KeyCode::Left => self.batch_button = (self.batch_button + buttons - 1) % buttons,
             KeyCode::Right | KeyCode::Tab => self.batch_button = (self.batch_button + 1) % buttons,
             KeyCode::Enter => match self.batch_button {
-                0 => self.flash("Reviewing the rows with no match is not wired in this preview."),
-                1 => {
+                0 => {
                     self.erase_flow();
                     self.open_query(Mode::Search);
                 }
