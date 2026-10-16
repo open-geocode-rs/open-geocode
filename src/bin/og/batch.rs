@@ -1,19 +1,30 @@
-//! The batch geocoding flow of the preview: a CSV is read, each column gets a
-//! role, and every row is looked up in the canned records. The 10,000 address
-//! example has its rows made up on demand; a real file is read, but its rows
-//! can only match what the canned records know.
+//! The batch geocoding flow: a CSV is read, each column gets a role, and the
+//! file is geocoded by the engine's batch run, the same `open-geocode
+//! batch-geocode` does, into a new CSV beside it.
 
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Instant,
+};
 
-use crate::mock::{self, Record, Stage};
+use anyhow::Result;
+use open_geocode::batch::{
+    BatchGeocodeOptions, BatchObserver, BatchRow, run_batch_geocode, unnamed_columns,
+};
 
-/// Rows per second the preview pretends the engine manages.
-const RATE: f64 = 2_041.0;
-/// Rows looked up to find the shares of a run, so a large file is not
-/// searched row by row up front.
-const SAMPLE: usize = 2_000;
-/// Longest file the preview reads.
-const MAX_BYTES: u64 = 5_000_000;
+use crate::engine::{Engine, Hit, name_of};
+
+/// Rows of the file shown, and geocoded, before the run starts.
+pub const PREVIEW_ROWS: usize = 3;
+/// Rows the running screen lists, newest first.
+const LATEST_ROWS: usize = 8;
 
 /// What a column holds, as far as the query is concerned.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,90 +99,71 @@ fn looks_like_header(row: &[String]) -> bool {
 }
 
 pub struct BatchFile {
+    pub path: PathBuf,
     pub name: String,
     pub bytes: u64,
     pub headers: Vec<String>,
     pub header_found: bool,
-    pub blank_skipped: usize,
-    pub total_rows: usize,
-    /// The rows of a real file. The example has none: it makes them up.
-    rows: Vec<Vec<String>>,
-    pub example: bool,
+    /// Rows of data, the header row not counted.
+    pub total_rows: u64,
+    /// The first rows of data.
+    sample: Vec<Vec<String>>,
 }
 
 impl BatchFile {
-    /// A made-up file of 10,000 addresses.
-    pub fn example() -> Self {
-        Self {
-            name: "addresses.csv".to_string(),
-            bytes: 4_200_000,
-            headers: ["address", "city", "province", "postal", "id"]
-                .map(str::to_string)
-                .to_vec(),
-            header_found: true,
-            blank_skipped: 14,
-            total_rows: 10_000,
-            rows: Vec::new(),
-            example: true,
-        }
-    }
-
-    /// Reads a CSV. None when the path is not a readable file of a size the
-    /// preview takes.
+    /// Reads a CSV: its header, its first rows, and how many rows it has.
+    /// None when the path is no readable CSV with at least one row.
     pub fn from_path(path: &Path) -> Option<Self> {
         let meta = path.metadata().ok()?;
-        if !meta.is_file() || meta.len() > MAX_BYTES {
+        if !meta.is_file() {
             return None;
         }
-        let text = std::fs::read_to_string(path).ok()?;
-        let blank_lines = text.lines().filter(|line| line.trim().is_empty()).count();
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(false)
             .flexible(true)
-            .from_reader(text.as_bytes());
-        let mut rows: Vec<Vec<String>> = reader
-            .records()
-            .filter_map(Result::ok)
-            .map(|record| record.iter().map(|cell| cell.trim().to_string()).collect())
-            .collect();
-        let before = rows.len();
-        rows.retain(|row| row.iter().any(|cell| !cell.is_empty()));
-        let blank_skipped = blank_lines + (before - rows.len());
-        if rows.is_empty() {
+            .from_path(path)
+            .ok()?;
+        let mut first: Vec<Vec<String>> = Vec::new();
+        let mut rows = 0u64;
+        for record in reader.records() {
+            let record = record.ok()?;
+            if first.len() <= PREVIEW_ROWS {
+                first.push(record.iter().map(|cell| cell.trim().to_string()).collect());
+            }
+            rows += 1;
+        }
+        if first.is_empty() {
             return None;
         }
-        let header_found = looks_like_header(&rows[0]);
+        let header_found = looks_like_header(&first[0]);
         let headers = if header_found {
-            rows.remove(0)
+            rows -= 1;
+            first.remove(0)
         } else {
-            (1..=rows[0].len())
-                .map(|number| format!("Column {number}"))
-                .collect()
+            unnamed_columns(path).ok()?
         };
+        first.truncate(PREVIEW_ROWS);
         Some(Self {
+            path: path.to_path_buf(),
             name: path.file_name()?.to_string_lossy().into_owned(),
             bytes: meta.len(),
-            total_rows: rows.len(),
+            total_rows: rows,
             headers,
             header_found,
-            blank_skipped,
-            rows,
-            example: false,
+            sample: first,
         })
     }
 
-    /// The cells of one row, one per header.
-    pub fn row(&self, index: usize) -> Vec<String> {
-        let mut row = if self.example {
-            let sample = mock::SAMPLE_ROWS[index % mock::SAMPLE_ROWS.len()];
-            let mut row: Vec<String> = sample.iter().map(|cell| cell.to_string()).collect();
-            row.push((index + 1).to_string());
-            row
-        } else {
-            self.rows.get(index).cloned().unwrap_or_default()
-        };
-        row.resize(self.headers.len(), String::new());
-        row
+    /// The first rows, each with one cell per header.
+    pub fn sample(&self) -> Vec<Vec<String>> {
+        self.sample
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row.resize(self.headers.len(), String::new());
+                row
+            })
+            .collect()
     }
 
     /// The file name without its extension.
@@ -180,18 +172,143 @@ impl BatchFile {
             .rsplit_once('.')
             .map_or(&self.name, |(stem, _)| stem)
     }
+
+    /// Where the run writes: `<stem>.geocoded.csv` beside the file, numbered
+    /// when that name is taken, so nothing is written over.
+    fn output_path(&self) -> PathBuf {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let mut path = dir.join(format!("{}.geocoded.csv", self.stem()));
+        let mut number = 2;
+        while path.exists() {
+            path = dir.join(format!("{}.geocoded-{number}.csv", self.stem()));
+            number += 1;
+        }
+        path
+    }
+}
+
+/// One row of the running screen.
+pub struct Latest {
+    pub query: String,
+    pub hit: Option<(String, f64, f64)>,
+    pub millis: f64,
+}
+
+/// What a run has done so far, shared with its thread.
+#[derive(Default)]
+pub struct RunStats {
+    pub done: AtomicU64,
+    pub matched: AtomicU64,
+    pub accuracy: Mutex<BTreeMap<String, u64>>,
+    pub latencies: Mutex<Vec<f32>>,
+    pub latest: Mutex<VecDeque<Latest>>,
+}
+
+impl BatchObserver for RunStats {
+    fn row(&self, row: &BatchRow) {
+        let millis = row.elapsed.as_secs_f64() * 1_000.0;
+        self.done.fetch_add(1, Ordering::Relaxed);
+        if let Some(feature) = row.feature {
+            self.matched.fetch_add(1, Ordering::Relaxed);
+            *self
+                .accuracy
+                .lock()
+                .expect("accuracy lock")
+                .entry(name_of(&feature.properties.accuracy))
+                .or_default() += 1;
+        }
+        self.latencies
+            .lock()
+            .expect("latencies lock")
+            .push(millis as f32);
+        let mut latest = self.latest.lock().expect("latest lock");
+        latest.push_front(Latest {
+            query: row.query.to_string(),
+            hit: row.feature.map(|feature| {
+                (
+                    feature.properties.name.clone(),
+                    feature.lat(),
+                    feature.lon(),
+                )
+            }),
+            millis,
+        });
+        latest.truncate(LATEST_ROWS);
+    }
+}
+
+impl RunStats {
+    /// Median, 95th and 99th percentile and the slowest, in milliseconds.
+    pub fn latency(&self) -> (f64, f64, f64, f64) {
+        let mut latencies = self.latencies.lock().expect("latencies lock").clone();
+        latencies.sort_by(f32::total_cmp);
+        let at = |q: f64| {
+            if latencies.is_empty() {
+                0.0
+            } else {
+                f64::from(latencies[((latencies.len() - 1) as f64 * q).round() as usize])
+            }
+        };
+        (at(0.50), at(0.95), at(0.99), at(1.0))
+    }
 }
 
 /// What a finished run found.
 pub struct Summary {
-    pub matched: usize,
-    pub by_accuracy: Vec<(&'static str, usize)>,
+    pub rows: u64,
+    pub matched: u64,
+    pub by_accuracy: Vec<(String, u64)>,
     pub p50: f64,
     pub p95: f64,
     pub p99: f64,
     pub slowest: f64,
     pub seconds: f64,
+    pub output: PathBuf,
     pub output_bytes: u64,
+    /// The output's first rows, header first.
+    pub output_head: Vec<Vec<String>>,
+}
+
+pub struct Run {
+    pub stats: Arc<RunStats>,
+    pub started: Instant,
+    pub output: PathBuf,
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Result<()>>>,
+}
+
+impl Run {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// The run's outcome, once it is finished.
+    pub fn take(&mut self) -> Option<Result<()>> {
+        if !self.is_finished() {
+            return None;
+        }
+        let handle = self.handle.take()?;
+        Some(
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the run stopped unexpectedly"))),
+        )
+    }
+}
+
+/// A run let go of is stopped, and waited for, so its temporary output
+/// file is removed before og exits.
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 pub struct BatchSession {
@@ -199,9 +316,7 @@ pub struct BatchSession {
     pub roles: Vec<Role>,
     /// The column the setup cursor is on.
     pub column: usize,
-    /// Share of rows that find a match, from a sample of the rows.
-    pub share: f64,
-    accuracy: Vec<(&'static str, f64)>,
+    pub run: Option<Run>,
     pub summary: Option<Summary>,
 }
 
@@ -216,179 +331,93 @@ impl BatchSession {
             file,
             roles,
             column,
-            share: 0.0,
-            accuracy: Vec::new(),
+            run: None,
             summary: None,
         }
     }
 
-    /// The text searched for a row: the columns with a role, in order,
-    /// address first and the region and postcode last, as one line.
-    pub fn query(&self, index: usize) -> String {
-        let row = self.file.row(index);
-        let part = |role: Role| {
-            self.roles
-                .iter()
-                .zip(&row)
-                .filter(|(own, _)| **own == role)
-                .map(|(_, cell)| cell.trim())
-                .filter(|cell| !cell.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let place = [part(Role::Region), part(Role::Postcode)]
-            .into_iter()
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        [part(Role::Address), part(Role::City), place]
-            .into_iter()
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// The best answer for a row.
-    pub fn lookup(&self, index: usize) -> Option<(&'static Record, f64)> {
-        let query = self.query(index);
-        if query.is_empty() {
-            None
-        } else {
-            mock::search(&query).into_iter().next()
-        }
-    }
-
-    /// Rows whose columns give no address at all, estimated from a sample.
-    pub fn without_address(&self) -> usize {
-        let sampled = self.file.total_rows.min(SAMPLE);
-        if sampled == 0 {
-            return 0;
-        }
-        let empty = (0..sampled)
-            .filter(|index| self.query(*index).is_empty())
-            .count();
-        (empty as f64 / sampled as f64 * self.file.total_rows as f64).round() as usize
-    }
-
-    /// How long the run takes at the pretended speed.
-    pub fn seconds(&self) -> f64 {
-        self.file.total_rows as f64 / RATE
-    }
-
-    /// `About 5 seconds for 10,000 rows`.
-    pub fn estimate(&self) -> String {
-        let seconds = self.seconds();
-        let time = if seconds < 1.0 {
-            "Under a second".to_string()
-        } else if seconds < 90.0 {
-            format!("About {:.0} seconds", seconds)
-        } else {
-            format!("About {:.0} minutes", seconds / 60.0)
-        };
-        format!("{time} for {} rows", mock::thousands(self.file.total_rows))
-    }
-
-    /// Looks at a sample of the rows to know how many will match, and how
-    /// accurately, before the run plays.
-    pub fn prepare(&mut self) {
-        let sampled = self.file.total_rows.min(SAMPLE);
-        let mut matched = 0;
-        let mut accuracy: Vec<(&'static str, usize)> = Vec::new();
-        for index in 0..sampled {
-            if let Some((record, _)) = self.lookup(index) {
-                matched += 1;
-                match accuracy
-                    .iter_mut()
-                    .find(|(name, _)| *name == record.accuracy)
-                {
-                    Some((_, count)) => *count += 1,
-                    None => accuracy.push((record.accuracy, 1)),
-                }
-            }
-        }
-        let total = sampled.max(1) as f64;
-        self.share = matched as f64 / total;
-        self.accuracy = accuracy
-            .into_iter()
-            .map(|(name, count)| (name, count as f64 / total))
-            .collect();
-    }
-
-    /// The stages of the run, played like the stages of a build.
-    pub fn stages(&self) -> Vec<Stage> {
-        let rows = self.file.total_rows;
-        let stem = self.file.stem().to_string();
-        let output = self.file.bytes + rows as u64 * 22;
-        let audit = rows as u64 * 150;
-        let count = mock::thousands(rows);
-        vec![
-            Stage {
-                did: "Read",
-                doing: "Reading",
-                object: self.file.name.clone(),
-                explain: [
-                    "Reading the file.",
-                    "Rows without an address are kept and left unmatched.",
-                ],
-                total: Some(rows as f64),
-                unit: "rows",
-                play_secs: 0.8,
-                real_secs: 0.2,
-                summary: format!("{count} rows"),
-            },
-            Stage {
-                did: "Geocoded",
-                doing: "Geocoding",
-                object: stem.clone(),
-                explain: [
-                    "Looking up every row in the Pack.",
-                    "Each row is a search on its own.",
-                ],
-                total: Some(rows as f64),
-                unit: "rows",
-                play_secs: (rows as f64 / 1_000.0).clamp(2.0, 10.0),
-                real_secs: self.seconds(),
-                summary: format!("{count} rows"),
-            },
-            Stage {
-                did: "Wrote",
-                doing: "Writing",
-                object: "geocoded.csv".to_string(),
-                explain: ["Writing your columns with lat and lon added.", ""],
-                total: Some(output as f64 / 1e6),
-                unit: "MB",
-                play_secs: 0.8,
-                real_secs: 0.3,
-                summary: mock::size(output as f64 / 1e6),
-            },
-            Stage {
-                did: "Wrote",
-                doing: "Writing",
-                object: "audit.csv".to_string(),
-                explain: ["Writing one line per row: status, reason and score.", ""],
-                total: Some(audit as f64 / 1e6),
-                unit: "MB",
-                play_secs: 0.8,
-                real_secs: 0.4,
-                summary: mock::size(audit as f64 / 1e6),
-            },
-        ]
-    }
-
-    /// Totals for the done screen.
-    pub fn summarize(&mut self) {
-        let rows = self.file.total_rows;
-        let matched = (rows as f64 * self.share).round() as usize;
-        let mut by_accuracy: Vec<(&'static str, usize)> = self
-            .accuracy
+    fn columns(&self, role: Role) -> Vec<String> {
+        self.roles
             .iter()
-            .map(|(name, share)| (*name, (rows as f64 * share).round() as usize))
-            .collect();
-        // Rounding must not make the parts differ from the whole.
-        let parts: usize = by_accuracy.iter().map(|(_, count)| count).sum();
-        if let Some(largest) = by_accuracy.iter_mut().max_by_key(|(_, count)| *count) {
-            largest.1 = (largest.1 + matched).saturating_sub(parts);
-        }
+            .zip(&self.file.headers)
+            .filter(|(own, _)| **own == role)
+            .map(|(_, header)| header.clone())
+            .collect()
+    }
+
+    fn cells(&self, row: &[String], role: Role) -> Option<String> {
+        let cells = self
+            .roles
+            .iter()
+            .zip(row)
+            .filter(|(own, _)| **own == role)
+            .map(|(_, cell)| cell.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        (!cells.is_empty()).then(|| cells.join(", "))
+    }
+
+    /// The address searched for a row: its address columns, as the run
+    /// joins them.
+    pub fn query(&self, row: &[String]) -> String {
+        self.cells(row, Role::Address).unwrap_or_default()
+    }
+
+    /// What the run would answer for a row.
+    pub fn lookup(&self, engine: &Engine, row: &[String]) -> Option<Hit> {
+        let address = self.cells(row, Role::Address)?;
+        engine
+            .geocode_address(
+                address,
+                self.cells(row, Role::City),
+                self.cells(row, Role::Region),
+                self.cells(row, Role::Postcode),
+            )
+            .ok()
+            .flatten()
+    }
+
+    pub fn has_address(&self) -> bool {
+        self.roles.contains(&Role::Address)
+    }
+
+    /// Starts geocoding the whole file.
+    pub fn start(&mut self, pack: &Path) {
+        let first = |role: Role| self.columns(role).into_iter().next();
+        let output = self.file.output_path();
+        let stats = Arc::new(RunStats::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = BatchGeocodeOptions {
+            pack: Some(pack.to_path_buf()),
+            input: self.file.path.clone(),
+            output: output.clone(),
+            header_row: self.file.header_found,
+            address_field_groups: vec![self.columns(Role::Address)],
+            locality_field: first(Role::City),
+            region_field: first(Role::Region),
+            postcode_field: first(Role::Postcode),
+            observer: Some(Arc::clone(&stats) as Arc<dyn BatchObserver>),
+            cancel: Arc::clone(&cancel),
+            ..BatchGeocodeOptions::default()
+        };
+        let handle = thread::spawn(move || run_batch_geocode(options).map(|_| ()));
+        self.summary = None;
+        self.run = Some(Run {
+            stats,
+            started: Instant::now(),
+            output,
+            cancel,
+            handle: Some(handle),
+        });
+    }
+
+    /// Totals for the done screen, from the finished run and its output.
+    pub fn summarize(&mut self) {
+        let Some(run) = &self.run else {
+            return;
+        };
+        let stats = &run.stats;
+        let (p50, p95, p99, slowest) = stats.latency();
         let order = [
             "rooftop",
             "interpolated",
@@ -396,36 +425,39 @@ impl BatchSession {
             "centroid",
             "approximate",
         ];
+        let mut by_accuracy: Vec<(String, u64)> = stats
+            .accuracy
+            .lock()
+            .expect("accuracy lock")
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect();
         by_accuracy.sort_by_key(|(name, _)| order.iter().position(|own| own == name));
-        let mut latencies: Vec<f64> = (0..rows).map(mock::latency_ms).collect();
-        latencies.sort_by(f64::total_cmp);
+        let output_head = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_path(&run.output)
+            .map(|mut reader| {
+                reader
+                    .records()
+                    .take(PREVIEW_ROWS + 1)
+                    .filter_map(Result::ok)
+                    .map(|record| record.iter().map(str::to_string).collect())
+                    .collect()
+            })
+            .unwrap_or_default();
         self.summary = Some(Summary {
-            matched,
+            rows: stats.done.load(Ordering::Relaxed),
+            matched: stats.matched.load(Ordering::Relaxed),
             by_accuracy,
-            p50: percentile(&latencies, 0.50),
-            p95: percentile(&latencies, 0.95),
-            p99: percentile(&latencies, 0.99),
-            slowest: latencies.last().copied().unwrap_or(0.0),
-            seconds: self.seconds(),
-            output_bytes: self.file.bytes + rows as u64 * 22,
+            p50,
+            p95,
+            p99,
+            slowest,
+            seconds: run.started.elapsed().as_secs_f64(),
+            output: run.output.clone(),
+            output_bytes: fs::metadata(&run.output).map_or(0, |meta| meta.len()),
+            output_head,
         });
     }
-}
-
-fn percentile(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
-}
-
-/// Median, 95th and 99th percentile of the first `done` queries.
-pub fn latency_stats(done: usize) -> (f64, f64, f64) {
-    let mut latencies: Vec<f64> = (0..done).map(mock::latency_ms).collect();
-    latencies.sort_by(f64::total_cmp);
-    (
-        percentile(&latencies, 0.50),
-        percentile(&latencies, 0.95),
-        percentile(&latencies, 0.99),
-    )
 }

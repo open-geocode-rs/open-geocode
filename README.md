@@ -42,6 +42,27 @@ Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machin
    cargo run --release -- serve --pack data/pack
    ```
 
+## The og interface
+
+`og` is the interactive way to do the same: pick a region, build its Pack, search it, and geocode CSV files.
+
+```
+cargo run --release --bin og
+```
+
+Regions come from the catalog in `catalog/regions.json`, generated from pinned upstream snapshots (see `scripts/catalog/README.md`).
+`og` downloads the region's OpenStreetMap extract, checks it against its published MD5 sum, and builds the Pack on this machine.
+Extracts and Packs live in the og home: `OG_HOME` when set, otherwise the platform's local data directory.
+An extract already at `<home>/pbf/<region id>.osm.pbf` is used without downloading.
+Time and disk estimates appear once a build of a similar size has finished on the same machine; they are scaled from it, never assumed.
+
+The same work runs without the interface:
+
+```
+og build --region canada/ontario --memory 6
+og serve canada-ontario
+```
+
 ## Building large extracts and the planet
 
 The builder streams: OSM objects, node references, coordinates, and finished records flow through external sorts, so its large buffers stay within `--memory-budget-mb` whatever the input size.

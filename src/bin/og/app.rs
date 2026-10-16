@@ -1,8 +1,12 @@
-//! Screen state and key handling. Every action ends in canned data from
-//! `mock`; nothing is built, downloaded or searched for real.
+//! Screen state and key handling. Packs are read from the og home, builds
+//! and batch runs are real jobs on their own threads, and the query shell
+//! asks the open Pack.
 
 use std::{
-    path::Path,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -13,7 +17,12 @@ use ratatui::{
 
 use crate::{
     batch::{BatchFile, BatchSession},
-    mock::{self, Stage},
+    engine::{self, Answer, Engine},
+    format,
+    home::{self, BuildRecord, Estimate, Home, PackInfo},
+    job::{self, BuildJob, BuildPlan, Built},
+    machine::{self, ProcessMemory},
+    net,
     regions::{self, Region},
     ui,
 };
@@ -22,7 +31,6 @@ use crate::{
 pub enum Screen {
     Home,
     Region,
-    Sources,
     Confirm,
     Build,
     Done,
@@ -61,14 +69,24 @@ impl Mode {
 }
 
 pub const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
-pub const MEMORY_STEPS_GB: [u32; 5] = [2, 4, 6, 8, 12];
+/// Memory budgets offered for a build, in GB, up to what the machine has
+/// free.
+const MEMORY_STEPS_GB: [u64; 8] = [1, 2, 4, 6, 8, 12, 16, 32];
 /// Rows of the region list, so the box keeps one height while browsing.
 pub const REGION_ROWS: usize = 13;
+/// Where `og serve` and "Serve now" listen.
+pub const SERVE_ADDRESS: &str = "127.0.0.1:8080";
 
 /// One pasted address and the best answer for it.
 pub struct BatchRow {
     pub input: String,
-    pub hit: Option<(&'static mock::Record, f64)>,
+    pub answer: Option<Arc<Answer>>,
+}
+
+impl BatchRow {
+    pub fn hit(&self) -> Option<&engine::Hit> {
+        self.answer.as_ref().and_then(|answer| answer.hits.first())
+    }
 }
 
 /// One row of the region list.
@@ -80,44 +98,21 @@ pub struct RegionRow {
     pub trail: Option<String>,
 }
 
-pub struct Build {
-    pub stages: Vec<Stage>,
-    pub current: usize,
-    pub stage_started: Instant,
+/// What the server says about the chosen region's extract right now.
+#[derive(Default)]
+pub struct Live {
+    pub remote: Option<net::Remote>,
+    /// When the newest extract's data is from.
+    pub data_at: Option<i64>,
+    pub error: Option<String>,
+    pub done: bool,
 }
 
-impl Build {
-    pub fn stage(&self) -> &Stage {
-        &self.stages[self.current]
-    }
-
-    /// The current stage's progress, 0 to 1.
-    pub fn progress(&self) -> f64 {
-        (self.stage_started.elapsed().as_secs_f64() / self.stage().play_secs).min(1.0)
-    }
-
-    pub fn overall(&self) -> f64 {
-        let total: f64 = self.stages.iter().map(|stage| stage.play_secs).sum();
-        let done: f64 = self.stages[..self.current]
-            .iter()
-            .map(|stage| stage.play_secs)
-            .sum();
-        (done + self.progress() * self.stage().play_secs) / total
-    }
-
-    /// Elapsed time as a real build would show it.
-    pub fn elapsed(&self) -> f64 {
-        let done: f64 = self.stages[..self.current]
-            .iter()
-            .map(|stage| stage.real_secs)
-            .sum();
-        done + self.progress() * self.stage().real_secs
-    }
-
-    pub fn remaining(&self) -> f64 {
-        let total: f64 = self.stages.iter().map(|stage| stage.real_secs).sum();
-        total - self.elapsed()
-    }
+/// The extract on disk for the chosen region, and when its data is from.
+pub struct OnDisk {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub data_at: Option<i64>,
 }
 
 pub struct App {
@@ -133,32 +128,54 @@ pub struct App {
     pub erase: Option<usize>,
     /// Plain lines printed after the interface closes.
     pub farewell: Vec<String>,
+    /// A Pack to serve once the interface closes.
+    pub serve: Option<PathBuf>,
     pub flash: Option<(String, Instant)>,
     pub started: Instant,
     /// Terminal width, for lines printed into history.
     pub width: u16,
+    pub home: Arc<Home>,
     pub home_cursor: usize,
     /// The Packs the home screen lists.
-    pub packs: &'static [mock::SamplePack],
+    pub packs: Vec<PackInfo>,
+    /// When the newest data for each Pack's region is from, by Pack
+    /// directory, as the servers answer.
+    pub updates: Arc<Mutex<HashMap<PathBuf, i64>>>,
+    pub history: Vec<BuildRecord>,
+    pub memory: machine::Memory,
     /// The Pack the query shell is using.
+    pub engine: Option<Engine>,
     pub active_name: String,
-    pub active_records: &'static str,
+    pub active_dir: PathBuf,
     pub region_query: String,
     pub region_cursor: usize,
     pub region_scroll: usize,
     /// The regions browsed into, from a continent down. Empty at the top.
     pub region_path: Vec<usize>,
     pub region: &'static Region,
-    pub sources: [bool; 3],
-    pub source_cursor: usize,
-    pub memory_step: usize,
+    /// Download the extract even though one is on disk: an update.
+    pub force_download: bool,
+    pub on_disk: Option<OnDisk>,
+    pub live: Arc<Mutex<Live>>,
+    pub free_disk: Option<u64>,
+    pub memory_gb: u64,
     pub confirm_cursor: usize,
-    pub build: Option<Build>,
-    pub built_secs: f64,
+    pub job: Option<BuildJob>,
+    /// Steps of the running job already printed into history.
+    pub printed: usize,
+    pub built: Option<Built>,
+    pub build_error: Option<String>,
     pub show_logs: bool,
+    pub process: ProcessMemory,
+    /// What og holds in memory, sampled while a job runs.
+    pub resident: Option<u64>,
+    pub sampled: Instant,
     pub done_cursor: usize,
     pub query: String,
     pub mode: Mode,
+    pub answer: Option<Answer>,
+    pub reading: Vec<(String, &'static str)>,
+    pub query_error: Option<String>,
     pub hit_cursor: usize,
     pub json_scroll: usize,
     pub json_all: bool,
@@ -166,6 +183,9 @@ pub struct App {
     pub batch_text: String,
     pub batch_rows: Vec<BatchRow>,
     pub batch_note: String,
+    /// Answers already found for pasted rows, by row text.
+    batch_cache: HashMap<String, Option<Arc<Answer>>>,
+    pub batch_millis: f64,
     /// The file being geocoded, once one is opened.
     pub batch: Option<BatchSession>,
     pub batch_button: usize,
@@ -173,102 +193,168 @@ pub struct App {
     pub batch_candidate: Option<BatchFile>,
     /// 0 is Continue, 1 is Cancel.
     pub batch_choice: usize,
+    pub batch_error: Option<String>,
+    /// Jobs asked to stop that may still be cleaning up. Dropping one waits
+    /// for it, so they are kept until og exits.
+    pub stopping: Vec<Box<dyn Send>>,
 }
 
 impl App {
-    pub fn new(empty: bool) -> Self {
-        Self {
+    pub fn new(home: Home) -> Self {
+        let home = Arc::new(home);
+        let packs = home.packs();
+        let history = home.history();
+        let memory = machine::memory();
+        let region = packs
+            .first()
+            .and_then(|pack| pack.region)
+            .unwrap_or_else(|| regions::tree().root());
+        let app = Self {
             screen: Screen::Home,
             quit: false,
             scrollback: ui::logo(),
             flow_lines: 0,
             erase: None,
             farewell: Vec::new(),
+            serve: None,
             flash: None,
             started: Instant::now(),
             width: 96,
+            home,
             home_cursor: 0,
-            packs: if empty { &[] } else { &mock::PACKS },
+            packs,
+            updates: Arc::new(Mutex::new(HashMap::new())),
+            history,
+            memory_gb: default_memory_gb(&memory),
+            memory,
+            engine: None,
             active_name: String::new(),
-            active_records: "",
+            active_dir: PathBuf::new(),
             region_query: String::new(),
             region_cursor: 0,
             region_scroll: 0,
             region_path: Vec::new(),
-            region: regions::tree()
-                .get("canada/ontario")
-                .unwrap_or_else(|| regions::tree().root()),
-            sources: [true, false, false],
-            source_cursor: 1,
-            memory_step: 2,
+            region,
+            force_download: false,
+            on_disk: None,
+            live: Arc::new(Mutex::new(Live::default())),
+            free_disk: None,
             confirm_cursor: 0,
-            build: None,
-            built_secs: 0.0,
+            job: None,
+            printed: 0,
+            built: None,
+            build_error: None,
             show_logs: false,
+            process: ProcessMemory::new(),
+            resident: None,
+            sampled: Instant::now(),
             done_cursor: 0,
             query: String::new(),
             mode: Mode::Search,
+            answer: None,
+            reading: Vec::new(),
+            query_error: None,
             hit_cursor: 0,
             json_scroll: 0,
             json_all: false,
             batch_text: String::new(),
             batch_rows: Vec::new(),
             batch_note: String::new(),
+            batch_cache: HashMap::new(),
+            batch_millis: 0.0,
             batch: None,
             batch_button: 0,
             batch_candidate: None,
             batch_choice: 0,
+            batch_error: None,
+            stopping: Vec::new(),
+        };
+        app.check_updates();
+        app
+    }
+
+    /// Asks each Pack's publisher, in the background, when its newest data
+    /// is from.
+    fn check_updates(&self) {
+        for pack in &self.packs {
+            let Some(url) = pack.region.and_then(Region::state_url) else {
+                continue;
+            };
+            let (updates, dir) = (Arc::clone(&self.updates), pack.dir.clone());
+            thread::spawn(move || {
+                if let Ok(at) = net::state_timestamp(&url) {
+                    updates.lock().expect("updates lock").insert(dir, at);
+                }
+            });
         }
     }
 
-    pub fn memory_gb(&self) -> u32 {
-        MEMORY_STEPS_GB[self.memory_step]
+    /// When newer data than a Pack's is published, the time it is from.
+    pub fn update_for(&self, pack: &PackInfo) -> Option<i64> {
+        let newest = *self.updates.lock().expect("updates lock").get(&pack.dir)?;
+        (newest > pack.data_at?).then_some(newest)
     }
 
-    pub fn pack_path(&self) -> String {
-        format!("./packs/{}", self.region.slug())
+    /// The memory budgets this machine can offer.
+    pub fn memory_steps(&self) -> Vec<u64> {
+        memory_steps(&self.memory)
     }
 
-    pub fn download_mb(&self) -> f64 {
-        let region = if self.region.local().is_some() {
-            0.0
+    pub fn pack_dir(&self) -> PathBuf {
+        self.home.pack_dir(self.region)
+    }
+
+    /// Whether the build downloads the extract first.
+    pub fn downloads(&self) -> bool {
+        self.force_download || self.on_disk.is_none()
+    }
+
+    /// Bytes to download: the live size when the server gave one.
+    pub fn download_bytes(&self) -> u64 {
+        let live = self.live.lock().expect("live lock");
+        live.remote
+            .and_then(|remote| remote.bytes)
+            .unwrap_or(self.region.osm.bytes)
+    }
+
+    /// The extract the build reads, in bytes.
+    pub fn input_bytes(&self) -> u64 {
+        match (&self.on_disk, self.downloads()) {
+            (Some(extract), false) => extract.bytes,
+            _ => self.download_bytes(),
+        }
+    }
+
+    /// The build of this region scaled from this machine's own builds.
+    pub fn estimate(&self) -> Option<Estimate> {
+        home::estimate(&self.history, self.input_bytes())
+    }
+
+    pub fn estimate_for(&self, region: &Region) -> Option<Estimate> {
+        home::estimate(&self.history, region.osm.bytes)
+    }
+
+    /// Disk the build is known to need: the download, plus what builds on
+    /// this machine have taken.
+    pub fn disk_needed(&self) -> u64 {
+        let download = if self.downloads() {
+            self.download_bytes()
         } else {
-            self.region.size_mb()
+            0
         };
-        let extra: f64 = mock::SOURCES
-            .iter()
-            .zip(self.sources)
-            .filter(|(_, on)| *on)
-            .map(|(source, _)| source.download_mb)
-            .sum();
-        region + extra
-    }
-
-    /// Disk the build needs: the downloads plus scratch and the Pack.
-    pub fn disk_gb(&self) -> f64 {
-        (self.region.size_mb() * 5.5 + self.download_mb()) / 1_000.0
+        download + self.estimate().map_or(0, |estimate| estimate.disk_bytes)
     }
 
     pub fn fits_disk(&self) -> bool {
-        self.disk_gb() <= mock::FREE_DISK_GB
-    }
-
-    pub fn build_secs(&self) -> f64 {
-        let extra =
-            if self.sources[1] { 60.0 } else { 0.0 } + if self.sources[2] { 90.0 } else { 0.0 };
-        self.region.build_secs() + extra
+        self.free_disk.is_none_or(|free| self.disk_needed() <= free)
     }
 
     /// The equivalent non-interactive command for this build.
     pub fn command(&self) -> String {
-        let mut command = format!("og build --region {}", self.region.id);
-        for (source, on) in mock::SOURCES.iter().zip(self.sources).skip(1) {
-            if on {
-                command.push_str(&format!(" --with {}", source.arg));
-            }
-        }
-        command.push_str(&format!(" --memory {}G", self.memory_gb()));
-        command
+        format!(
+            "og build --region {} --memory {}",
+            self.region.id, self.memory_gb
+        )
     }
 
     /// The region whose children the list shows.
@@ -281,7 +367,7 @@ impl App {
 
     /// The rows of the region list. Browsing shows the region itself first,
     /// as the first row, then its children. A search shows every region whose
-    /// name matches, with the regions above it.
+    /// name or alias matches, with the regions above it.
     pub fn region_rows(&self) -> Vec<RegionRow> {
         let tree = regions::tree();
         if self.region_browsing() {
@@ -302,7 +388,16 @@ impl App {
             .searchable()
             .filter_map(|region| {
                 let trail = tree.trail(region);
-                let (positions, score) = find(&self.region_query, &region.name, &trail)?;
+                let (positions, score) =
+                    find(&self.region_query, &region.name, &trail).or_else(|| {
+                        // An alias match ranks below a match of the name.
+                        region
+                            .aliases
+                            .iter()
+                            .filter_map(|alias| find(&self.region_query, alias, &trail))
+                            .map(|(_, score)| (Vec::new(), score - 500_000))
+                            .max_by_key(|(_, score)| *score)
+                    })?;
                 let row = RegionRow {
                     region,
                     positions,
@@ -366,7 +461,7 @@ impl App {
         self.region_reset(cursor);
     }
 
-    /// Takes a region for the build and moves on to its sources. The list
+    /// Takes a region for the build and moves on to confirming it. The list
     /// stays on that region for when the user comes back.
     fn region_select(&mut self, region: &'static Region) {
         self.region = region;
@@ -378,23 +473,48 @@ impl App {
             .position(|row| row.region.index == region.index)
             .unwrap_or(0);
         self.region_reset(cursor);
-        self.screen = Screen::Sources;
+        self.force_download = false;
+        self.open_confirm();
     }
 
-    pub fn hits(&self) -> Vec<(&'static mock::Record, f64)> {
-        match self.mode {
-            Mode::Search => mock::search(&self.query),
-            Mode::Reverse => mock::point(&self.query)
-                .map(|(lat, lon)| mock::reverse(lat, lon))
-                .unwrap_or_default(),
-            Mode::Batch => self.batch_rows.iter().filter_map(|row| row.hit).collect(),
+    /// Opens the confirm step for `self.region`: what is on disk is read
+    /// now, what the server has is asked in the background.
+    fn open_confirm(&mut self) {
+        self.on_disk = self.home.extract(self.region).map(|extract| OnDisk {
+            data_at: open_geocode::builder::replication_timestamp(&extract.path)
+                .ok()
+                .flatten(),
+            path: extract.path,
+            bytes: extract.bytes,
+        });
+        self.free_disk = machine::free_disk(&self.pack_dir());
+        self.memory = machine::memory();
+        let steps = self.memory_steps();
+        if !steps.contains(&self.memory_gb) {
+            self.memory_gb = default_memory_gb(&self.memory);
         }
+        let live = Arc::new(Mutex::new(Live::default()));
+        self.live = Arc::clone(&live);
+        let region = self.region;
+        thread::spawn(move || {
+            let remote = net::head(&region.osm.url);
+            let data_at = region.state_url().map(|url| net::state_timestamp(&url));
+            let mut live = live.lock().expect("live lock");
+            match remote {
+                Ok(remote) => live.remote = Some(remote),
+                Err(error) => live.error = Some(format!("{error:#}")),
+            }
+            live.data_at = data_at.and_then(Result::ok);
+            live.done = true;
+        });
+        self.confirm_cursor = 0;
+        self.screen = Screen::Confirm;
     }
 
     pub fn flash_text(&self) -> Option<&str> {
         self.flash
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(4))
             .map(|(text, _)| text.as_str())
     }
 
@@ -418,37 +538,77 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        let Some(build) = &mut self.build else {
+        if self.job.is_some() && self.sampled.elapsed() >= Duration::from_secs(1) {
+            self.resident = self.process.resident();
+            self.free_disk = machine::free_disk(&self.pack_dir());
+            self.sampled = Instant::now();
+        }
+        self.tick_build();
+        self.tick_batch();
+    }
+
+    fn tick_build(&mut self) {
+        let Some(job) = &self.job else {
             return;
         };
-        if build.progress() < 1.0 {
-            return;
+        // Steps that finished since the last tick go into history, in order.
+        let mut lines = Vec::new();
+        {
+            let steps = job.progress.steps.lock().expect("steps lock");
+            while let Some(step) = steps.get(self.printed).filter(|step| step.secs.is_some()) {
+                lines.extend(ui::step_done(step, ui::content_width(self.width)));
+                self.printed += 1;
+            }
         }
-        // The fields are used one by one: the build is borrowed from `self`.
-        let lines = ui::stage_done(build, build.current, ui::content_width(self.width));
-        self.flow_lines += lines.len();
-        self.scrollback.extend(lines);
-        if build.current + 1 < build.stages.len() {
-            build.current += 1;
-            build.stage_started = Instant::now();
-        } else {
-            self.built_secs = build.elapsed();
-            self.build = None;
-            if let Some(session) = &mut self.batch
-                && self.screen == Screen::BatchRun
-            {
+        self.push_flow(lines);
+        let Some(outcome) = self.job.as_mut().and_then(BuildJob::take) else {
+            return;
+        };
+        self.job = None;
+        match outcome {
+            Ok(built) => {
+                self.history = self.home.history();
+                self.packs = self.home.packs();
+                self.check_updates();
+                self.built = Some(built);
+                self.done_cursor = 0;
+                self.screen = Screen::Done;
+            }
+            Err(error) if job::cancelled(&error) => {}
+            Err(error) => self.build_error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn tick_batch(&mut self) {
+        let Some(session) = &mut self.batch else {
+            return;
+        };
+        let Some(run) = &mut session.run else {
+            return;
+        };
+        let Some(outcome) = run.take() else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
                 session.summarize();
+                session.run = None;
                 self.batch_button = 0;
                 self.screen = Screen::BatchDone;
-            } else {
-                self.screen = Screen::Done;
-                self.done_cursor = 0;
+            }
+            Err(error) if job::cancelled(&error) => session.run = None,
+            Err(error) => {
+                session.run = None;
+                self.batch_error = Some(format!("{error:#}"));
             }
         }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if let Some(job) = &self.job {
+                job.cancel();
+            }
             self.farewell.push("Cancelled.".to_string());
             self.quit = true;
             return;
@@ -456,7 +616,6 @@ impl App {
         match self.screen {
             Screen::Home => self.home_key(key),
             Screen::Region => self.region_key(key),
-            Screen::Sources => self.sources_key(key),
             Screen::Confirm => self.confirm_key(key),
             Screen::Build => self.build_key(key),
             Screen::Done => self.done_key(key),
@@ -482,33 +641,63 @@ impl App {
             KeyCode::Char('b') => self.screen = Screen::Region,
             KeyCode::Enter if on_build => self.screen = Screen::Region,
             KeyCode::Enter => {
-                let pack = &self.packs[self.home_cursor];
-                self.active_name = pack.name.to_string();
-                self.active_records = pack.records;
-                self.open_query(Mode::Search);
+                let dir = self.packs[self.home_cursor].dir.clone();
+                if self.activate(&dir) {
+                    self.open_query(Mode::Search);
+                }
             }
             KeyCode::Char('v') if !on_build => {
-                self.flash("Serving is not wired in this preview.");
+                self.serve = Some(self.packs[self.home_cursor].dir.clone());
+                self.quit = true;
             }
             KeyCode::Char('g') if !on_build => {
-                let pack = &self.packs[self.home_cursor];
-                self.active_name = pack.name.to_string();
-                self.active_records = pack.records;
-                self.open_query(Mode::Batch);
-            }
-            KeyCode::Char('m') if !on_build => {
-                self.flash("More is not wired in this preview.");
+                let dir = self.packs[self.home_cursor].dir.clone();
+                if self.activate(&dir) {
+                    self.open_query(Mode::Batch);
+                }
             }
             KeyCode::Char('u') if !on_build => {
                 let pack = &self.packs[self.home_cursor];
-                if pack.update.is_some() {
-                    self.flash("Updating is not wired in this preview.");
-                } else {
-                    self.flash(format!("{} is up to date.", pack.name));
+                match (pack.region, self.update_for(pack)) {
+                    (Some(region), Some(_)) => {
+                        self.region = region;
+                        self.region_path = regions::tree().ancestors(region);
+                        self.force_download = true;
+                        self.open_confirm();
+                    }
+                    _ => {
+                        let name = pack.name.clone();
+                        self.flash(format!("{name} has the newest data its publisher has."));
+                    }
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// Opens a Pack for the query shell. False, with the reason shown, when
+    /// it cannot be opened.
+    fn activate(&mut self, dir: &Path) -> bool {
+        if self.engine.is_some() && self.active_dir == dir {
+            return true;
+        }
+        match Engine::open(dir) {
+            Ok(engine) => {
+                self.active_name = self
+                    .packs
+                    .iter()
+                    .find(|pack| pack.dir == dir)
+                    .map_or_else(|| dir.display().to_string(), |pack| pack.name.clone());
+                self.active_dir = dir.to_path_buf();
+                self.engine = Some(engine);
+                self.batch_cache.clear();
+                true
+            }
+            Err(error) => {
+                self.flash(format!("{error:#}"));
+                false
+            }
         }
     }
 
@@ -578,43 +767,30 @@ impl App {
         }
     }
 
-    fn sources_key(&mut self, key: KeyEvent) {
-        let rows = mock::SOURCES.len();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.source_cursor = (self.source_cursor + rows - 1) % rows;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.source_cursor = (self.source_cursor + 1) % rows;
-            }
-            KeyCode::Char(' ') => {
-                if self.source_cursor == 0 {
-                    self.flash("OpenStreetMap is the base of every Pack.");
-                } else {
-                    self.sources[self.source_cursor] ^= true;
-                }
-            }
-            KeyCode::Enter => {
-                self.confirm_cursor = 0;
-                self.screen = Screen::Confirm;
-            }
-            KeyCode::Esc => self.screen = Screen::Region,
-            _ => {}
-        }
-    }
-
     fn confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => self.confirm_cursor ^= 1,
-            KeyCode::Char('m') => self.memory_step = (self.memory_step + 1) % MEMORY_STEPS_GB.len(),
-            KeyCode::Enter if self.confirm_cursor == 1 => self.screen = Screen::Sources,
+            KeyCode::Char('m') => {
+                let steps = self.memory_steps();
+                let at = steps
+                    .iter()
+                    .position(|gb| *gb == self.memory_gb)
+                    .unwrap_or(0);
+                self.memory_gb = steps[(at + 1) % steps.len()];
+            }
+            KeyCode::Char('d') if self.on_disk.is_some() => {
+                self.force_download ^= true;
+                self.free_disk = machine::free_disk(&self.pack_dir());
+            }
+            KeyCode::Enter if self.confirm_cursor == 1 => self.screen = Screen::Region,
             KeyCode::Enter if !self.fits_disk() => self.flash(format!(
-                "Not enough free disk: {} needs about {:.0} GB. Pick a smaller region.",
+                "Not enough free disk: {} needs {}, {} is free.",
                 self.region.name,
-                self.disk_gb()
+                format::bytes(self.disk_needed()),
+                format::bytes(self.free_disk.unwrap_or(0))
             )),
             KeyCode::Enter => self.start_build(),
-            KeyCode::Esc => self.screen = Screen::Sources,
+            KeyCode::Esc => self.screen = Screen::Region,
             _ => {}
         }
     }
@@ -623,11 +799,20 @@ impl App {
         let mut lines = ui::choices(self);
         lines.extend(ui::build_header(self));
         self.push_flow(lines);
-        self.build = Some(Build {
-            stages: mock::stages(self.region, &self.sources),
-            current: 0,
-            stage_started: Instant::now(),
-        });
+        self.built = None;
+        self.build_error = None;
+        self.printed = 0;
+        self.resident = self.process.resident();
+        self.job = Some(BuildJob::start(
+            BuildPlan {
+                region: self.region,
+                extract: self.home.extract_path(self.region),
+                download: self.downloads(),
+                pack: self.pack_dir(),
+                memory_budget_bytes: self.memory_gb << 30,
+            },
+            Arc::clone(&self.home),
+        ));
         self.show_logs = false;
         self.screen = Screen::Build;
     }
@@ -636,9 +821,13 @@ impl App {
         match key.code {
             KeyCode::Char('l') => self.show_logs ^= true,
             KeyCode::Esc => {
-                self.build = None;
+                if let Some(job) = self.job.take() {
+                    job.cancel();
+                    self.stopping.push(Box::new(job));
+                }
+                self.build_error = None;
                 self.erase_flow();
-                self.screen = Screen::Confirm;
+                self.open_confirm();
             }
             _ => {}
         }
@@ -654,12 +843,21 @@ impl App {
             }
             KeyCode::Enter => match self.done_cursor {
                 0 => {
+                    let dir = self.pack_dir();
                     self.erase_flow();
-                    self.active_name = self.region.name.clone();
-                    self.active_records = mock::PACK.records;
-                    self.open_query(Mode::Search);
+                    // The Pack may have been rebuilt where an older one was open.
+                    if self.active_dir == dir {
+                        self.engine = None;
+                    }
+                    if self.activate(&dir) {
+                        self.open_query(Mode::Search);
+                    }
                 }
-                1 => self.flash("Serving is not wired in this preview."),
+                1 => {
+                    self.scrollback.extend(ui::done_summary(self));
+                    self.serve = Some(self.pack_dir());
+                    self.quit = true;
+                }
                 _ => {
                     self.scrollback.extend(ui::done_summary(self));
                     self.quit = true;
@@ -675,9 +873,45 @@ impl App {
 
     fn open_query(&mut self, mode: Mode) {
         self.query.clear();
+        self.answer = None;
+        self.reading.clear();
+        self.query_error = None;
         self.mode = mode;
         self.hit_cursor = 0;
         self.screen = Screen::Query;
+    }
+
+    /// Asks the Pack again after the query changed.
+    fn refresh_query(&mut self) {
+        self.hit_cursor = 0;
+        self.answer = None;
+        self.reading.clear();
+        self.query_error = None;
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        if self.query.trim().is_empty() {
+            return;
+        }
+        let answer = match self.mode {
+            Mode::Search => {
+                self.reading = engine.read(&self.query).parts;
+                Some(engine.search_default(&self.query))
+            }
+            Mode::Reverse => engine::point(&self.query).map(|(lat, lon)| engine.reverse(lat, lon)),
+            Mode::Batch => None,
+        };
+        match answer {
+            Some(Ok(answer)) => self.answer = Some(answer),
+            Some(Err(error)) => self.query_error = Some(format!("{error:#}")),
+            None => {}
+        }
+    }
+
+    pub fn hits(&self) -> &[engine::Hit] {
+        self.answer
+            .as_ref()
+            .map_or(&[], |answer| answer.hits.as_slice())
     }
 
     fn query_key(&mut self, key: KeyEvent) {
@@ -695,11 +929,11 @@ impl App {
                     Mode::Reverse
                 };
                 self.query.clear();
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             KeyCode::Tab => {
                 self.mode = self.mode.next();
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             KeyCode::Up if hits > 0 => self.hit_cursor = (self.hit_cursor + hits - 1) % hits,
             KeyCode::Down if hits > 0 => self.hit_cursor = (self.hit_cursor + 1) % hits,
@@ -713,16 +947,16 @@ impl App {
                     self.screen = Screen::Home;
                 } else {
                     self.query.clear();
-                    self.hit_cursor = 0;
+                    self.refresh_query();
                 }
             }
             KeyCode::Backspace => {
                 self.query.pop();
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             _ => {}
         }
@@ -756,12 +990,12 @@ impl App {
         match key.code {
             KeyCode::Tab => {
                 self.mode = self.mode.next();
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             KeyCode::Char('r') if ctrl => {
                 self.mode = Mode::Reverse;
                 self.query.clear();
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             KeyCode::Char('u') if ctrl => {
                 self.batch_text.clear();
@@ -771,7 +1005,7 @@ impl App {
                 if self
                     .batch_rows
                     .get(self.hit_cursor)
-                    .is_some_and(|row| row.hit.is_some())
+                    .is_some_and(|row| row.hit().is_some())
                 {
                     self.json_scroll = 0;
                     self.json_all = false;
@@ -781,12 +1015,6 @@ impl App {
                 }
             }
             KeyCode::Char('j') if ctrl => self.push_batch("\n"),
-            KeyCode::Char('e') if ctrl => {
-                self.batch_text = "addresses.csv".to_string();
-                self.batch_rows.clear();
-                self.batch_candidate = Some(BatchFile::example());
-                self.batch_choice = 0;
-            }
             KeyCode::Enter => self.push_batch("\n"),
             KeyCode::Up if rows > 0 => self.hit_cursor = (self.hit_cursor + rows - 1) % rows,
             KeyCode::Down if rows > 0 => self.hit_cursor = (self.hit_cursor + 1) % rows,
@@ -822,7 +1050,8 @@ impl App {
 
     /// Reads the batch text again. A single line that names a CSV file makes
     /// that file the candidate to continue with; anything else is read as
-    /// rows and every address in it is looked up.
+    /// rows and every address in it is looked up. Rows already looked up are
+    /// not asked again.
     fn refresh_batch(&mut self) {
         let typed = self.batch_text.trim().trim_matches('"');
         let file = (!typed.is_empty() && !typed.contains('\n'))
@@ -836,14 +1065,30 @@ impl App {
             return;
         }
         self.batch_candidate = None;
-        let (addresses, note) = mock::batch_parse(&self.batch_text);
-        self.batch_rows = addresses
-            .into_iter()
-            .map(|input| BatchRow {
-                hit: mock::search(&input).into_iter().next(),
-                input,
-            })
-            .collect();
+        let (addresses, note) = parse_pasted(&self.batch_text);
+        let mut rows = Vec::with_capacity(addresses.len());
+        for input in addresses {
+            let answer = match self.batch_cache.get(&input) {
+                Some(answer) => answer.clone(),
+                None => {
+                    let answer = self
+                        .engine
+                        .as_ref()
+                        .and_then(|engine| engine.search(&input, 1).ok())
+                        .map(Arc::new);
+                    self.batch_cache.insert(input.clone(), answer.clone());
+                    answer
+                }
+            };
+            rows.push(BatchRow { input, answer });
+        }
+        // What the engine took for every row, also those answered before.
+        self.batch_millis = rows
+            .iter()
+            .filter_map(|row| row.answer.as_ref())
+            .map(|answer| answer.millis)
+            .sum();
+        self.batch_rows = rows;
         self.batch_note = note;
         self.hit_cursor = self.hit_cursor.min(self.batch_rows.len().saturating_sub(1));
     }
@@ -856,7 +1101,7 @@ impl App {
             Screen::Query => {
                 self.query
                     .push_str(text.lines().next().unwrap_or("").trim());
-                self.hit_cursor = 0;
+                self.refresh_query();
             }
             Screen::Region => {
                 self.region_query
@@ -869,6 +1114,7 @@ impl App {
 
     fn open_batch_setup(&mut self, file: BatchFile) {
         self.batch = Some(BatchSession::new(file));
+        self.batch_error = None;
         self.screen = Screen::BatchSetup;
     }
 
@@ -887,6 +1133,9 @@ impl App {
                     *role = role.cycle(forward);
                 }
             }
+            KeyCode::Enter if !session.has_address() => {
+                self.flash("Give at least one column the Address role.");
+            }
             KeyCode::Enter => self.start_batch_run(),
             KeyCode::Esc => {
                 self.batch_candidate = self.batch.take().map(|session| session.file);
@@ -901,13 +1150,8 @@ impl App {
         let Some(session) = &mut self.batch else {
             return;
         };
-        session.prepare();
-        let stages = session.stages();
-        self.build = Some(Build {
-            stages,
-            current: 0,
-            stage_started: Instant::now(),
-        });
+        self.batch_error = None;
+        session.start(&self.active_dir);
         let lines = ui::batch_header(self);
         self.push_flow(lines);
         self.screen = Screen::BatchRun;
@@ -915,7 +1159,13 @@ impl App {
 
     fn batch_run_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
-            self.build = None;
+            if let Some(session) = &mut self.batch
+                && let Some(run) = session.run.take()
+            {
+                run.cancel();
+                self.stopping.push(Box::new(run));
+            }
+            self.batch_error = None;
             self.erase_flow();
             self.screen = Screen::BatchSetup;
         }
@@ -944,6 +1194,23 @@ impl App {
         }
     }
 
+    /// The JSON the GeoJSON screen shows.
+    pub fn json_text(&self) -> String {
+        if self.mode == Mode::Batch {
+            return self
+                .batch_rows
+                .get(self.hit_cursor)
+                .and_then(|row| row.answer.as_ref())
+                .map(|answer| answer.collection.json(None))
+                .unwrap_or_default();
+        }
+        let only = (!self.json_all).then_some(self.hit_cursor);
+        self.answer
+            .as_ref()
+            .map(|answer| answer.collection.json(only))
+            .unwrap_or_default()
+    }
+
     fn json_key(&mut self, key: KeyEvent) {
         let last = ui::json_lines(self).len().saturating_sub(ui::JSON_ROWS);
         match key.code {
@@ -957,15 +1224,78 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => {
                 self.json_scroll = (self.json_scroll + 10).min(last);
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if self.mode != Mode::Batch => {
                 self.json_all ^= true;
                 self.json_scroll = 0;
             }
-            KeyCode::Char('y') => self.flash("Copy is not wired in this preview."),
+            KeyCode::Char('y') => {
+                let text = self.json_text();
+                let lines = text.lines().count();
+                match arboard::Clipboard::new().and_then(|mut board| board.set_text(text)) {
+                    Ok(()) => self.flash(format!("Copied {lines} lines of GeoJSON.")),
+                    Err(error) => self.flash(format!("Could not copy: {error}")),
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Query,
             _ => {}
         }
     }
+}
+
+fn memory_steps(memory: &machine::Memory) -> Vec<u64> {
+    let available_gb = memory.available >> 30;
+    let steps: Vec<u64> = MEMORY_STEPS_GB
+        .into_iter()
+        .filter(|gb| *gb <= available_gb.max(1))
+        .collect();
+    if steps.is_empty() { vec![1] } else { steps }
+}
+
+/// Half the memory free now, at the step below it.
+fn default_memory_gb(memory: &machine::Memory) -> u64 {
+    let half = (memory.available >> 30) / 2;
+    memory_steps(memory)
+        .into_iter()
+        .filter(|gb| *gb <= half.max(1))
+        .max()
+        .unwrap_or(1)
+}
+
+/// Reads pasted CSV into one address per row. A header with a column named
+/// like an address picks that column; without one every row is an address.
+/// Returns the addresses and a short note on how they were read.
+fn parse_pasted(text: &str) -> (Vec<String>, String) {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(text.as_bytes());
+    let records: Vec<csv::StringRecord> = reader.records().filter_map(Result::ok).collect();
+    let column = records.first().and_then(|first| {
+        first.iter().position(|field| {
+            matches!(
+                field.trim().to_lowercase().as_str(),
+                "address" | "addr" | "full_address" | "query" | "q"
+            )
+        })
+    });
+    let (rows, note) = match column {
+        Some(_) => (&records[1..], "address column"),
+        None => (&records[..], "one address per row"),
+    };
+    let addresses = rows
+        .iter()
+        .map(|record| match column {
+            Some(index) => record.get(index).unwrap_or("").trim().to_string(),
+            None => record
+                .iter()
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+        .filter(|address| !address.is_empty())
+        .collect();
+    (addresses, note.to_string())
 }
 
 /// Matches a search against a region: every word of the query must occur in

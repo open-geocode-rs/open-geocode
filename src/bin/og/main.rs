@@ -1,21 +1,32 @@
-//! A look-only preview of the interactive `og` interface. Regions, build
-//! stages and query results are canned (`mock`), so the screens can be judged
-//! before they are wired to the builder and the searcher.
+//! `og`: the interactive interface to open-geocode, and the commands it
+//! names for scripts. Run alone it opens the interface; `og build` and
+//! `og serve` do the same work without it.
 //!
 //! The interface draws in an inline viewport below the prompt, not the full
 //! screen: finished steps are printed above it and stay in terminal history.
 
 mod app;
 mod batch;
-mod mock;
+mod engine;
+mod format;
+mod home;
+mod job;
+mod machine;
+mod net;
 mod regions;
 mod ui;
 
 use std::{
     io::{self, IsTerminal},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use open_geocode::runtime::{ServeOptions, serve};
 use ratatui::{
     DefaultTerminal, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
@@ -29,8 +40,126 @@ use ratatui::{
 };
 
 use app::App;
+use home::Home;
+use job::{BuildJob, BuildPlan};
 
-fn main() -> io::Result<()> {
+#[derive(Parser)]
+#[command(
+    name = "og",
+    version,
+    about = "Build and search geocoding Packs from open data"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Download a region's OpenStreetMap extract and build a Pack from it.
+    Build {
+        /// The region's catalog id, for example `canada/ontario`.
+        #[arg(long)]
+        region: String,
+
+        /// Memory for the build's sort buffers, in GB.
+        #[arg(long, default_value_t = 4)]
+        memory: u64,
+
+        /// Download the extract again even when one is on disk.
+        #[arg(long)]
+        download: bool,
+    },
+    /// Serve a Pack's HTTP API.
+    Serve {
+        /// A Pack in the og home, by name (`canada-ontario`), or a path.
+        pack: String,
+
+        /// Address and port to listen on.
+        #[arg(long, default_value = app::SERVE_ADDRESS)]
+        bind: SocketAddr,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let home = Home::locate()?;
+    match cli.command {
+        Some(Command::Build {
+            region,
+            memory,
+            download,
+        }) => build(home, &region, memory, download),
+        Some(Command::Serve { pack, bind }) => {
+            let dir = home.packs_dir().join(&pack);
+            let pack = if dir.is_dir() {
+                dir
+            } else {
+                PathBuf::from(pack)
+            };
+            serve_pack(pack, bind)
+        }
+        None => interactive(home),
+    }
+}
+
+fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve(ServeOptions {
+            pack,
+            demo: None,
+            bind,
+            basemap: None,
+        }))
+}
+
+/// `og build`: the build the interface runs, with one line per step.
+fn build(home: Home, id: &str, memory_gb: u64, download: bool) -> Result<()> {
+    let Some(region) = regions::tree().get(id) else {
+        bail!("no region {id} in the catalog; ids look like canada/ontario");
+    };
+    let extract = home.extract_path(region);
+    let plan = BuildPlan {
+        region,
+        download: download || !extract.is_file(),
+        extract,
+        pack: home.pack_dir(region),
+        memory_budget_bytes: memory_gb << 30,
+    };
+    let pack = plan.pack.clone();
+    let mut job = BuildJob::start(plan, Arc::new(home));
+    let mut printed = 0;
+    loop {
+        {
+            let steps = job.progress.steps.lock().expect("steps lock");
+            while let Some(step) = steps.get(printed).filter(|step| step.secs.is_some()) {
+                eprintln!(
+                    "{:<10} {:<18} {:>8}",
+                    step.did,
+                    step.object,
+                    format::duration(step.secs.unwrap_or_default())
+                );
+                printed += 1;
+            }
+        }
+        if let Some(outcome) = job.take() {
+            let built = outcome?;
+            println!(
+                "Pack ready: {} · {} records · {} · built in {}",
+                pack.display(),
+                format::thousands(built.pack.records),
+                format::bytes(built.pack.bytes),
+                format::duration(built.build_secs)
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn interactive(home: Home) -> Result<()> {
     if !io::stdout().is_terminal() {
         eprintln!("og opens an interactive interface and needs a terminal.");
         eprintln!("Run `og --help` for the commands that work in scripts.");
@@ -45,9 +174,7 @@ fn main() -> io::Result<()> {
     } else {
         Viewport::Fullscreen
     };
-    // `og --empty` previews the screens for a machine with no Packs.
-    let empty = std::env::args().any(|arg| arg == "--empty");
-    let mut app = App::new(empty);
+    let mut app = App::new(home);
     let mut terminal = ratatui::init_with_options(TerminalOptions { viewport });
     // A terminal that supports it marks pasted text, so a pasted CSV arrives
     // in one piece. The others send it as keys.
@@ -67,7 +194,17 @@ fn main() -> io::Result<()> {
     for line in &app.farewell {
         println!("  {line}");
     }
-    result.and(left)
+    if app.job.is_some() || !app.stopping.is_empty() {
+        println!("  Stopping, and removing what was not finished…");
+    }
+    result.and(left)?;
+    if let Some(pack) = app.serve.take() {
+        let bind = app::SERVE_ADDRESS.parse().context("the serve address")?;
+        // The interface and its Pack are closed before the server opens it.
+        drop(app);
+        return serve_pack(pack, bind);
+    }
+    Ok(())
 }
 
 /// Gives the terminal back. The window is erased from its first row down, so
@@ -159,15 +296,21 @@ fn print_scrollback(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     })
 }
 
+/// Draws each screen of a session against the og home in `OG_HOME`, as a
+/// person would step through it, and prints them. Run with
+/// `cargo test --bin og screens -- --ignored --nocapture`, after a Pack is
+/// built there; `OG_SCREENS_CSV` names a CSV for the batch flow.
 #[cfg(test)]
-mod preview {
+mod screens {
+    use std::time::{Duration, Instant};
+
     use ratatui::{
         Terminal,
         backend::TestBackend,
         crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     };
 
-    use super::{App, ui};
+    use super::{App, Home, ui};
     use crate::app::Screen;
 
     fn press(app: &mut App, keys: &[KeyCode]) {
@@ -183,7 +326,7 @@ mod preview {
     }
 
     fn show(app: &App, name: &str) {
-        let mut terminal = Terminal::new(TestBackend::new(84, ui::HEIGHT)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, ui::HEIGHT)).unwrap();
         terminal.draw(|frame| ui::draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
         println!("=== {name}");
@@ -195,191 +338,155 @@ mod preview {
         }
     }
 
+    /// Ticks the app until `done` holds, at most `limit`.
+    fn wait(app: &mut App, limit: Duration, done: impl Fn(&App) -> bool) {
+        let started = Instant::now();
+        while !done(app) && started.elapsed() < limit {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[test]
-    fn batch_mode() {
-        let mut app = App::new(false);
-        press(&mut app, &[KeyCode::Char('g')]);
-        show(&app, "batch empty");
+    #[ignore = "needs a Pack in OG_HOME"]
+    fn session() {
+        let mut app = App::new(Home::locate().unwrap());
+        // Let the update checks answer.
+        std::thread::sleep(Duration::from_secs(3));
+        show(&app, "home");
+
+        press(&mut app, &[KeyCode::Enter]);
+        typed(&mut app, "heitastrasse 144 triesenberg");
+        show(&app, "search");
+        press(&mut app, &[KeyCode::Enter]);
+        show(&app, "geojson");
+        press(&mut app, &[KeyCode::Esc]);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        typed(&mut app, "47.0973, 9.6118");
+        show(&app, "reverse");
+
+        press(&mut app, &[KeyCode::Tab]);
         app.on_paste(
-            "address,id\n100 queen st w toronto,1\n24 sussex dr ottawa,2\n1 yonge st toronto,3\nnowhere road,4\n"
+            "address\nheitastrasse 144 triesenberg\nfuhraweg 6 ruggell\nnirgendweg 999 vaduz\n"
                 .to_string(),
         );
         show(&app, "batch pasted");
-        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        show(&app, "batch geojson");
-    }
 
-    fn text(line: &ratatui::text::Line) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
+        if let Ok(csv) = std::env::var("OG_SCREENS_CSV") {
+            press(&mut app, &[KeyCode::Char('u')]);
+            app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            app.on_paste(csv);
+            show(&app, "batch file card");
+            press(&mut app, &[KeyCode::Enter]);
+            show(&app, "batch setup");
+            press(&mut app, &[KeyCode::Enter]);
+            show(&app, "batch running");
+            wait(&mut app, Duration::from_secs(60), |app| {
+                app.screen != Screen::BatchRun
+            });
+            show(&app, "batch done");
+            for line in &app.scrollback {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                println!("history | {text}");
+            }
+            press(&mut app, &[KeyCode::Esc]);
+        }
 
-    #[test]
-    fn build_lines() {
-        let mut app = App::new(false);
         press(&mut app, &[KeyCode::Char('b')]);
-        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
-        app.screen = Screen::Confirm;
+        show(&app, "regions");
+        typed(&mut app, "ontario");
+        show(&app, "region search");
         press(&mut app, &[KeyCode::Enter]);
-        assert!(app.screen == Screen::Build);
-        let build = app.build.as_mut().expect("a build is running");
-        build.current = 5;
-        let build = app.build.as_ref().expect("a build is running");
-        println!("=== build history");
-        for line in &app.scrollback {
-            println!("{}", text(line));
-        }
-        for index in 0..5 {
-            for line in ui::stage_done(build, index, 82) {
-                println!("{}", text(&line));
-            }
-        }
-        show(&app, "build running");
-        let build = app.build.as_mut().expect("a build is running");
-        build.current = 8;
-        show(&app, "build no total");
+        wait(&mut app, Duration::from_secs(15), |app| {
+            app.live.lock().unwrap().done
+        });
+        show(&app, "confirm");
     }
 
+    /// Quitting during a build leaves no unfinished Pack generation behind.
     #[test]
-    fn batch_flow() {
-        use std::time::{Duration, Instant};
-
-        let mut app = App::new(false);
-        press(&mut app, &[KeyCode::Char('g')]);
-        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert!(app.batch_candidate.is_some());
-        show(&app, "batch file card");
-        press(&mut app, &[KeyCode::Right]);
-        show(&app, "batch file card, cancel chosen");
-        press(&mut app, &[KeyCode::Left, KeyCode::Enter]);
-        assert!(app.screen == Screen::BatchSetup);
-        show(&app, "batch setup");
-        press(&mut app, &[KeyCode::Right, KeyCode::Right]);
-        press(&mut app, &[KeyCode::Down]);
-        show(&app, "batch setup, region role changed");
-        press(&mut app, &[KeyCode::Up]);
-        press(&mut app, &[KeyCode::Enter]);
-        assert!(app.screen == Screen::BatchRun);
-        if let Some(build) = app.build.as_mut() {
-            build.current = 1;
-            build.stage_started = Instant::now() - Duration::from_secs(4);
-        }
-        show(&app, "batch running");
-        for _ in 0..4 {
-            if let Some(build) = app.build.as_mut() {
-                build.stage_started = Instant::now() - Duration::from_secs(60);
-            }
-            app.tick();
-        }
-        assert!(app.screen == Screen::BatchDone);
-        println!("=== batch history");
-        for line in &app.scrollback {
-            println!("{}", text(line));
-        }
-        show(&app, "batch done");
+    #[ignore = "needs the Andorra extract in OG_HOME"]
+    fn quitting_mid_build_cleans_up() {
+        let home = Home::locate().unwrap();
+        let region = crate::regions::tree().get("andorra").unwrap();
+        let pack = home.packs_dir().join("andorra-stopped");
+        let mut app = App::new(Home::locate().unwrap());
+        app.job = Some(crate::job::BuildJob::start(
+            crate::job::BuildPlan {
+                region,
+                extract: home.extract_path(region),
+                download: false,
+                pack: pack.clone(),
+                memory_budget_bytes: 1 << 30,
+            },
+            std::sync::Arc::new(home),
+        ));
+        std::thread::sleep(Duration::from_millis(300));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+        drop(app);
+        let left = std::fs::read_dir(pack.join("generations"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            left,
+            0,
+            "an unfinished generation was left in {}",
+            pack.display()
+        );
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
+    /// Builds the region named by `OG_SCREENS_REGION` through the interface:
+    /// confirm, the running build at each step, history, and the done screen.
     #[test]
-    fn batch_file_path() {
-        let path = std::env::temp_dir().join("og-preview-batch.csv");
-        std::fs::write(
-            &path,
-            "Name,Street Address,Town,State
-A,100 queen st w,Toronto,ON
-
-B,24 sussex dr,Ottawa,ON
-",
-        )
-        .expect("the temp file is written");
-        let mut app = App::new(false);
-        press(&mut app, &[KeyCode::Char('g')]);
-        app.on_paste(path.display().to_string());
-        assert!(app.batch_candidate.is_some());
-        press(&mut app, &[KeyCode::Enter]);
-        std::fs::remove_file(&path).ok();
-        assert!(app.screen == Screen::BatchSetup);
-        let session = app.batch.as_ref().expect("a file is open");
-        assert_eq!(session.file.total_rows, 2);
-        assert!(session.file.header_found);
-        assert_eq!(session.query(0), "100 queen st w, Toronto, ON");
-        show(&app, "batch setup from a file");
-    }
-
-    #[test]
-    fn leaving_a_flow_erases_its_history() {
-        use std::time::{Duration, Instant};
-
-        let mut app = App::new(false);
+    #[ignore = "downloads and builds a region"]
+    fn build_flow() {
+        let region = std::env::var("OG_SCREENS_REGION").unwrap_or_else(|_| "andorra".into());
+        let mut app = App::new(Home::locate().unwrap());
         press(&mut app, &[KeyCode::Char('b')]);
-        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
-        app.screen = Screen::Confirm;
+        typed(&mut app, &region);
         press(&mut app, &[KeyCode::Enter]);
-        assert!(app.screen == Screen::Build);
-        assert!(app.flow_lines > 0);
-        for _ in 0..12 {
-            if let Some(build) = app.build.as_mut() {
-                build.stage_started = Instant::now() - Duration::from_secs(60);
-            }
-            app.tick();
-        }
-        assert!(app.screen == Screen::Done);
-        let printed = app.flow_lines;
-        assert!(printed > 6, "the stages are in history");
-        press(&mut app, &[KeyCode::Enter]);
-        assert_eq!(app.erase, Some(printed));
-        assert_eq!(app.flow_lines, 0);
-    }
-
-    #[test]
-    fn home_without_packs() {
-        let app = App::new(true);
-        show(&app, "home without packs");
-    }
-
-    #[test]
-    fn every_screen_fits() {
-        let mut app = App::new(false);
-        show(&app, "home");
-        press(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
-        show(&app, "home build row");
-        press(&mut app, &[KeyCode::Enter]);
-        show(&app, "region");
-        press(&mut app, &[KeyCode::Down; 7]);
-        press(&mut app, &[KeyCode::Enter]);
-        show(&app, "region north america");
-        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
-        show(&app, "region canada");
-        press(&mut app, &[KeyCode::PageDown]);
-        show(&app, "region canada scrolled");
-        press(&mut app, &[KeyCode::Left, KeyCode::Left]);
-        typed(&mut app, "onta");
-        show(&app, "region onta");
-        press(&mut app, &[KeyCode::Enter, KeyCode::Char(' ')]);
-        show(&app, "sources");
-        press(&mut app, &[KeyCode::Enter]);
+        wait(&mut app, Duration::from_secs(15), |app| {
+            app.live.lock().unwrap().done
+        });
         show(&app, "confirm");
         press(&mut app, &[KeyCode::Enter]);
-        assert!(app.screen == Screen::Build);
-        show(&app, "build");
-        if let Some(build) = &mut app.build {
-            build.current = 3;
+        let mut seen = usize::MAX;
+        while app.screen == Screen::Build && app.build_error.is_none() {
+            let step = app.job.as_ref().map(|job| job.progress.current());
+            if let Some(step) = step
+                && step != seen
+            {
+                // Let the step get going before drawing it.
+                std::thread::sleep(Duration::from_millis(700));
+                app.tick();
+                app.show_logs = step % 3 == 0;
+                show(&app, &format!("build step {step}"));
+                seen = step;
+            }
+            app.tick();
+            std::thread::sleep(Duration::from_millis(50));
         }
-        app.show_logs = true;
-        show(&app, "build join with logs");
-        app.build = None;
-        app.screen = Screen::Done;
-        app.built_secs = 588.0;
+        if app.build_error.is_some() {
+            show(&app, "build failed");
+        }
+        for line in &app.scrollback {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            println!("history | {text}");
+        }
         show(&app, "done");
         press(&mut app, &[KeyCode::Enter]);
-        typed(&mut app, "100 queen st w toronto");
-        show(&app, "query");
-        press(&mut app, &[KeyCode::Enter]);
-        show(&app, "json");
-        press(&mut app, &[KeyCode::Esc]);
-        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        typed(&mut app, "43.6535, -79.3839");
-        show(&app, "reverse");
+        typed(&mut app, "andorra la vella");
+        show(&app, "search the new Pack");
     }
 }

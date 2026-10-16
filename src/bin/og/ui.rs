@@ -12,9 +12,12 @@ use ratatui::{
 };
 
 use crate::{
-    app::{self, App, Build, Mode, RegionRow, Screen},
-    batch::{self, BatchSession, Role},
-    mock::{self, Record, Stage},
+    app::{self, App, Mode, RegionRow, Screen},
+    batch::{self, Role},
+    engine::{self, Hit, Measure},
+    format,
+    home::PackInfo,
+    job::{Step, Unit},
     regions,
 };
 
@@ -39,6 +42,16 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 /// Rows of JSON the GeoJSON box shows at once.
 pub const JSON_ROWS: usize = 14;
+
+/// Layers whose records are places: the areas results are placed in.
+const PLACE_LAYERS: [&str; 6] = [
+    "country",
+    "region",
+    "district",
+    "locality",
+    "neighbourhood",
+    "place",
+];
 
 fn span(text: impl Into<Cow<'static, str>>, color: Color) -> Span<'static> {
     Span::styled(text, Style::new().fg(color))
@@ -76,6 +89,16 @@ fn pad(text: &str, cells: usize) -> String {
     format!("{text}{}", " ".repeat(cells.saturating_sub(width(text))))
 }
 
+/// Cuts text to a number of cells, ending it with an ellipsis.
+fn cut(text: &str, cells: usize) -> String {
+    if width(text) > cells {
+        let keep: String = text.chars().take(cells.saturating_sub(1)).collect();
+        format!("{keep}…")
+    } else {
+        text.to_string()
+    }
+}
+
 fn spinner(app: &App) -> &'static str {
     SPINNER[(app.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]
 }
@@ -97,7 +120,7 @@ pub fn logo() -> Vec<Line<'static>> {
             Span::styled("█ ▀█", g),
             plain("   "),
             bold("open-geocode"),
-            span(" 0.1.0", DIM),
+            span(concat!(" ", env!("CARGO_PKG_VERSION")), DIM),
         ]),
         Line::from(vec![
             plain("  "),
@@ -128,25 +151,19 @@ fn choice(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
 fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
     let mut region = vec![
         plain(app.region.label.clone()),
-        span(format!("  {}", mock::size(app.region.size_mb())), DIM),
+        span(format!("  {}", format::bytes(app.input_bytes())), DIM),
     ];
-    if app.region.local().is_some() {
+    if !app.downloads() {
         region.push(span("  on disk", OK));
     }
-    let sources: Vec<&str> = mock::SOURCES
-        .iter()
-        .zip(app.sources)
-        .filter(|(_, on)| *on)
-        .map(|(source, _)| source.name)
-        .collect();
     let lines = vec![
         choice("Region", region),
-        choice("Sources", vec![plain(sources.join(" + "))]),
+        choice("Sources", vec![plain("OpenStreetMap")]),
         choice(
             "Output",
             vec![
-                plain(app.pack_path()),
-                span(format!("  memory {} GB", app.memory_gb()), DIM),
+                plain(app.pack_dir().display().to_string()),
+                span(format!("  memory {} GB", app.memory_gb), DIM),
             ],
         ),
     ];
@@ -184,13 +201,16 @@ pub fn build_header(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-/// A finished stage as it goes into terminal history, with a blank line
-/// after it so the stages do not run together.
-pub fn stage_done(build: &Build, index: usize, inner: usize) -> Vec<Line<'static>> {
-    vec![finished_line(&build.stages[index], inner), Line::raw("")]
+/// A finished step as it goes into terminal history, with a blank line
+/// after it so the steps do not run together.
+pub fn step_done(step: &Step, inner: usize) -> Vec<Line<'static>> {
+    vec![finished_line(step, inner), Line::raw("")]
 }
 
 pub fn done_summary(app: &App) -> Vec<Line<'static>> {
+    let Some(built) = &app.built else {
+        return Vec::new();
+    };
     vec![
         Line::raw(""),
         Line::from(vec![
@@ -199,12 +219,16 @@ pub fn done_summary(app: &App) -> Vec<Line<'static>> {
             span(
                 format!(
                     "  {} · {} · built in {}",
-                    app.pack_path(),
-                    mock::PACK.size,
-                    mock::duration(app.built_secs)
+                    built.pack.dir.display(),
+                    format::bytes(built.pack.bytes),
+                    format::duration(built.build_secs)
                 ),
                 DIM,
             ),
+        ]),
+        Line::from(vec![
+            span("    Serve it        ", DIM),
+            span(format!("og serve {}", app.region.slug()), ACCENT),
         ]),
         Line::from(vec![
             span("    Build it again  ", DIM),
@@ -231,7 +255,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Home => home(frame, area, app),
         Screen::Region => region(frame, area, app),
-        Screen::Sources => sources(frame, area, app),
         Screen::Confirm => confirm(frame, area, app),
         Screen::Build => build(frame, area, app),
         Screen::Done => done(frame, area, app),
@@ -287,6 +310,10 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
                 "   A Pack is the data file og searches, built from open data.",
                 DIM,
             )),
+            Line::from(span(
+                format!("   Packs are kept in {}", app.home.packs_dir().display()),
+                DIM,
+            )),
             Line::raw(""),
             Line::from(vec![span(" ❯ ", ACCENT), bold("Build a Pack")]),
         ];
@@ -297,7 +324,7 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
     let name_width = app
         .packs
         .iter()
-        .map(|pack| width(pack.name))
+        .map(|pack| width(&pack.name))
         .max()
         .unwrap_or(0)
         .clamp(10, 20);
@@ -308,9 +335,16 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(area);
 
+    let now = format::now();
     let mut list = vec![Line::from(bold("   Your Packs")), Line::raw("")];
     for (index, pack) in app.packs.iter().enumerate() {
-        list.push(pack_row(pack, index == app.home_cursor, name_width));
+        list.push(pack_row(
+            pack,
+            index == app.home_cursor,
+            name_width,
+            app.update_for(pack).is_some(),
+            now,
+        ));
     }
     list.push(Line::raw(""));
     list.push(Line::from(vec![
@@ -332,12 +366,14 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
         vec![
             Line::from(bold("Build a Pack")),
             Line::raw(""),
-            Line::from(plain("Pick a region and extra sources.")),
-            Line::from(plain("og downloads the open data and")),
-            Line::from(plain("builds the Pack on this machine.")),
+            Line::from(plain("Pick a region of the world.")),
+            Line::from(plain("og downloads its OpenStreetMap")),
+            Line::from(plain("data and builds the Pack on this")),
+            Line::from(plain("machine.")),
         ]
     } else {
-        pack_detail(&app.packs[app.home_cursor])
+        let pack = &app.packs[app.home_cursor];
+        pack_detail(pack, app.update_for(pack), now)
     };
     frame.render_widget(Paragraph::new(detail), right);
 
@@ -350,7 +386,7 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
             ("v", "serve"),
             ("g", "batch geocode"),
         ];
-        if app.packs[app.home_cursor].update.is_some() {
+        if app.update_for(&app.packs[app.home_cursor]).is_some() {
             hints.push(("u", "update"));
         }
         hints.push(("b", "build"));
@@ -360,13 +396,14 @@ fn home(frame: &mut Frame, area: Rect, app: &App) {
     footer(frame, app, &hints);
 }
 
-fn pack_row(pack: &mock::SamplePack, selected: bool, name_width: usize) -> Line<'static> {
-    let shown = if width(pack.name) > name_width {
-        let keep: String = pack.name.chars().take(name_width - 1).collect();
-        format!("{keep}…")
-    } else {
-        pack.name.to_string()
-    };
+fn pack_row(
+    pack: &PackInfo,
+    selected: bool,
+    name_width: usize,
+    update: bool,
+    now: i64,
+) -> Line<'static> {
+    let shown = cut(&pack.name, name_width);
     let name = if selected {
         bold(pad(&shown, name_width))
     } else {
@@ -379,9 +416,9 @@ fn pack_row(pack: &mock::SamplePack, selected: bool, name_width: usize) -> Line<
             plain("   ")
         },
         name,
-        span(format!("{:>8}", pack.size), DIM),
-        span(format!("  {:>7}", pack.built_ago), DIM),
-        if pack.update.is_some() {
+        span(format!("{:>8}", format::bytes(pack.bytes)), DIM),
+        span(format!("  {:>7}", format::ago(pack.built_at, now)), DIM),
+        if update {
             span("  ↑", ACCENT)
         } else {
             plain("   ")
@@ -393,20 +430,44 @@ fn detail_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![span(pad(label, 10), DIM), plain(value)])
 }
 
-fn pack_detail(pack: &mock::SamplePack) -> Vec<Line<'static>> {
+fn pack_detail(pack: &PackInfo, update: Option<i64>, now: i64) -> Vec<Line<'static>> {
+    let mut built = format!(
+        "{} · {}",
+        format::ago(pack.built_at, now),
+        format::date(pack.built_at)
+    );
+    if let Some(secs) = pack.build_secs {
+        built.push_str(&format!(" · in {}", format::duration(secs)));
+    }
     let mut lines = vec![
-        Line::from(bold(pack.name)),
+        Line::from(bold(pack.name.clone())),
         Line::raw(""),
-        detail_line("Region", pack.region.to_string()),
-        detail_line("Sources", pack.sources.to_string()),
-        detail_line("Records", pack.records.to_string()),
-        detail_line("Built", format!("{} · {}", pack.built_long, pack.built_on)),
-        detail_line("Path", pack.path.to_string()),
+        detail_line(
+            "Region",
+            pack.region.map_or_else(
+                || "not from the catalog".to_string(),
+                |region| region.label.clone(),
+            ),
+        ),
+        detail_line("Sources", "OpenStreetMap".to_string()),
+        detail_line(
+            "Data",
+            pack.data_at.map_or_else(
+                || "date unknown".to_string(),
+                |at| format!("from {}", format::date(at)),
+            ),
+        ),
+        detail_line("Records", format::thousands(pack.records)),
+        detail_line("Built", built),
+        detail_line("Path", pack.dir.display().to_string()),
         Line::raw(""),
     ];
-    if let Some(date) = pack.update {
+    if let Some(at) = update {
         lines.push(Line::from(span("↑ Update available", ACCENT)));
-        lines.push(Line::from(span(format!("  Newer data from {date}"), DIM)));
+        lines.push(Line::from(span(
+            format!("  Newer data from {}", format::date(at)),
+            DIM,
+        )));
     }
     lines
 }
@@ -476,6 +537,7 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     while room > 0 && next < rows.len() {
         let all = browsing && next == 0;
         lines.push(region_row(
+            app,
             &rows[next],
             next == app.region_cursor,
             all,
@@ -529,9 +591,16 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     footer(frame, app, hints);
 }
 
-/// One line of the region list: the name, what is around it, and what the
-/// build would cost.
-fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<'static> {
+/// One line of the region list: the name, what is around it, the size of
+/// its extract, and how long its build takes when this machine has built
+/// before.
+fn region_row(
+    app: &App,
+    row: &RegionRow,
+    selected: bool,
+    all: bool,
+    inner: usize,
+) -> Line<'static> {
     let region = row.region;
     let base = if selected {
         Style::new().add_modifier(Modifier::BOLD)
@@ -557,17 +626,17 @@ fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<
         };
         spans.push(Span::styled(c.to_string(), style));
     }
-    let right = format!(
-        "{:>8}  {:>9} ",
-        mock::size(region.size_mb()),
-        mock::about(region.build_secs())
-    );
+    let time = app
+        .estimate_for(region)
+        .map(|estimate| format::about(estimate.secs))
+        .unwrap_or_default();
+    let right = format!("{:>8}  {:>9} ", format::bytes(region.osm.bytes), time);
     let opens = if all || region.children.is_empty() {
         String::new()
     } else {
         format!("  {} {} ›", region.children.len(), region.unit())
     };
-    let disk = if region.local().is_some() {
+    let disk = if app.home.extract(region).is_some() {
         "  ● on disk"
     } else {
         ""
@@ -593,57 +662,6 @@ fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<
     Line::from(spans)
 }
 
-fn sources(frame: &mut Frame, area: Rect, app: &App) {
-    let inner = area.width.saturating_sub(2) as usize;
-    let mut lines = answers(app, 1);
-    lines.push(Line::raw(""));
-    lines.push(Line::from(bold("   Sources")));
-    lines.push(Line::raw(""));
-    lines.extend(mock::SOURCES.iter().enumerate().map(|(index, source)| {
-        let selected = index == app.source_cursor;
-        let on = app.sources[index];
-        let mark = match (index, on) {
-            (0, _) => span("[✓] ", DIM),
-            (_, true) => span("[✓] ", ACCENT),
-            (_, false) => span("[ ] ", DIM),
-        };
-        let name = if selected {
-            bold(pad(source.name, 18))
-        } else {
-            plain(pad(source.name, 18))
-        };
-        let right = if index == 0 {
-            "required ".to_string()
-        } else {
-            format!("+{} ", mock::size(source.download_mb))
-        };
-        let used = 3 + 4 + 18 + width(source.detail);
-        Line::from(vec![
-            if selected {
-                span(" ❯ ", ACCENT)
-            } else {
-                plain("   ")
-            },
-            mark,
-            name,
-            span(source.detail, DIM),
-            plain(" ".repeat(inner.saturating_sub(used + width(&right)))),
-            span(right, FAINT),
-        ])
-    }));
-    frame.render_widget(Paragraph::new(lines), area);
-    footer(
-        frame,
-        app,
-        &[
-            ("↑↓", "move"),
-            ("space", "toggle"),
-            ("enter", "continue"),
-            ("esc", "back"),
-        ],
-    );
-}
-
 fn field(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![plain("   "), span(pad(label, 13), DIM)];
     spans.extend(value);
@@ -667,42 +685,143 @@ fn button(label: &str, selected: bool, enabled: bool) -> Span<'static> {
 }
 
 fn confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let download = match (app.download_mb(), app.region.local()) {
-        (0.0, Some(path)) => vec![plain("nothing"), span(format!("  using {path}"), DIM)],
-        (mb, _) => vec![
-            plain(mock::size(mb)),
-            span("  from download.geofabrik.de", DIM),
+    let (newest, live_done, live_error) = {
+        let live = app.live.lock().expect("live lock");
+        (live.data_at, live.done, live.error.clone())
+    };
+    let host = app
+        .region
+        .osm
+        .url
+        .split('/')
+        .nth(2)
+        .unwrap_or_default()
+        .to_string();
+    let mut download = match (&app.on_disk, app.downloads()) {
+        (Some(extract), false) => {
+            let mut value = vec![
+                plain("nothing"),
+                span(format!("  using {}", extract.path.display()), DIM),
+            ];
+            if let Some(at) = extract.data_at {
+                value.push(span(format!("  data from {}", format::date(at)), DIM));
+            }
+            value
+        }
+        _ => {
+            let mut value = vec![
+                plain(format::bytes(app.download_bytes())),
+                span(format!("  from {host}"), DIM),
+            ];
+            match (newest, live_done) {
+                (Some(at), _) => {
+                    value.push(span(format!("  data from {}", format::date(at)), DIM));
+                }
+                (None, false) => value.push(span("  checking…", FAINT)),
+                (None, true) => {}
+            }
+            value
+        }
+    };
+    // An extract on disk with newer data published: say so, and how to take it.
+    if let (Some(extract), Some(at)) = (&app.on_disk, newest)
+        && !app.downloads()
+        && extract.data_at.is_some_and(|own| at > own)
+    {
+        download.push(span(
+            format!("  newer: {}  d download it", format::date(at)),
+            ACCENT,
+        ));
+    }
+    if app.downloads() && app.on_disk.is_some() {
+        download.push(span("  replaces the one on disk  d keep it", DIM));
+    }
+    let estimate = app.estimate();
+    let free = app.free_disk.map_or_else(
+        || "free space unknown".to_string(),
+        |free| format!("{} free", format::bytes(free)),
+    );
+    let mut disk = match &estimate {
+        Some(estimate) => vec![
+            plain(format::bytes(app.disk_needed())),
+            span(format!("   {free}"), DIM),
+            span(
+                format!(
+                    "   scaled from your {} build",
+                    region_name(&estimate.from.region)
+                ),
+                FAINT,
+            ),
+        ],
+        None if app.downloads() => vec![
+            plain(format!("{} download", format::bytes(app.download_bytes()))),
+            span(format!("   {free}"), DIM),
+            span(
+                "   plus build space, unknown until a build of similar size runs here",
+                FAINT,
+            ),
+        ],
+        None => vec![
+            plain(free),
+            span(
+                "   build space unknown until a build of similar size runs here",
+                FAINT,
+            ),
         ],
     };
-    let mut disk = vec![
-        plain(format!("~ {:.1} GB", app.disk_gb())),
-        span(format!("   {:.0} GB free", mock::FREE_DISK_GB), DIM),
-    ];
     if !app.fits_disk() {
         disk.push(span("   not enough", ERR));
     }
+    let time = match &estimate {
+        Some(estimate) => vec![
+            plain(format::about(estimate.secs)),
+            span(
+                format!(
+                    "   your {} build took {}",
+                    region_name(&estimate.from.region),
+                    format::duration(estimate.from.build_secs)
+                ),
+                FAINT,
+            ),
+        ],
+        None => vec![span(
+            "no estimate: no build of a similar size has finished on this machine",
+            DIM,
+        )],
+    };
     let mut lines = answers(app, 2);
     lines.extend([
         Line::raw(""),
         Line::from(bold("   Ready to build")),
         Line::raw(""),
-        field("Output", vec![plain(app.pack_path())]),
+        field("Output", vec![plain(app.pack_dir().display().to_string())]),
         field(
             "Memory",
             vec![
-                plain(format!("{} GB", app.memory_gb())),
-                span(format!(" of {} GB RAM", mock::RAM_GB), DIM),
-                span("      m change", FAINT),
+                plain(format!("{} GB", app.memory_gb)),
+                span(
+                    format!(
+                        " for sorting · {} of {} free",
+                        format::bytes(app.memory.available),
+                        format::bytes(app.memory.total)
+                    ),
+                    DIM,
+                ),
+                span("   m change", FAINT),
             ],
-        ),
-        field(
-            "Scratch",
-            vec![span(format!("{}/.scratch", app.pack_path()), DIM)],
         ),
         Line::raw(""),
         field("Download", download),
-        field("Disk needed", disk),
-        field("Time", vec![plain(mock::about(app.build_secs()))]),
+        field("Disk", disk),
+        field("Time", time),
+    ]);
+    if let Some(error) = live_error {
+        lines.push(field(
+            "",
+            vec![span(cut(&format!("server: {error}"), 70), WARN)],
+        ));
+    }
+    lines.extend([
         Line::raw(""),
         Line::from(vec![
             plain("  "),
@@ -712,16 +831,19 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         ]),
     ]);
     frame.render_widget(Paragraph::new(lines), area);
-    footer(
-        frame,
-        app,
-        &[
-            ("←→", "choose"),
-            ("m", "memory"),
-            ("enter", "confirm"),
-            ("esc", "back"),
-        ],
-    );
+    let mut hints = vec![("←→", "choose"), ("m", "memory")];
+    if app.on_disk.is_some() {
+        hints.push(("d", "download"));
+    }
+    hints.extend([("enter", "confirm"), ("esc", "back")]);
+    footer(frame, app, &hints);
+}
+
+/// A region's name from its id, for lines that name a past build.
+fn region_name(id: &str) -> String {
+    regions::tree()
+        .get(id)
+        .map_or_else(|| id.to_string(), |region| region.name.clone())
 }
 
 fn lerp(ends: [(u8, u8, u8); 2], t: f64) -> Color {
@@ -738,8 +860,8 @@ fn lerp(ends: [(u8, u8, u8); 2], t: f64) -> Color {
 // time in columns of fixed width, so nothing moves as the numbers change.
 const VERB_WIDTH: usize = 11;
 const NAME_WIDTH: usize = 16;
-const SIZE_WIDTH: usize = 13;
-const SPEED_WIDTH: usize = 9;
+const SIZE_WIDTH: usize = 15;
+const SPEED_WIDTH: usize = 11;
 const TIME_WIDTH: usize = 8;
 /// Everything on a line but the bar: the gutter, verb, name, percent and the
 /// caps and gap around the bar, then the three right-hand columns.
@@ -792,92 +914,110 @@ fn shimmer(text: &str, millis: u128) -> Vec<Span<'static>> {
         .collect()
 }
 
-fn finished_line(stage: &Stage, inner: usize) -> Line<'static> {
+/// An amount of a step's work: `752 MB`, `48.2M ways`.
+fn amount(unit: Unit, value: u64) -> String {
+    match unit {
+        Unit::Bytes => format::bytes(value),
+        Unit::Count(_) => format::count(value),
+        Unit::None => String::new(),
+    }
+}
+
+fn finished_line(step: &Step, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
     // History lines start at the terminal's edge; the live window sits one
     // column in, so the line carries that margin to stay in line with it.
     let mut spans = vec![
         plain("    "),
         Span::styled(
-            pad(stage.did, VERB_WIDTH),
+            pad(step.did, VERB_WIDTH),
             Style::new().fg(DONE_BAR).add_modifier(Modifier::BOLD),
         ),
         plain(" "),
-        plain(pad(&cut(&stage.object, NAME_WIDTH), NAME_WIDTH)),
+        plain(pad(&cut(&step.object, NAME_WIDTH), NAME_WIDTH)),
         plain("  "),
     ];
-    if stage.total.is_some() {
-        spans.push(plain("100% "));
-        spans.extend(bar_spans(cells, 1.0, Some(DONE_BAR)));
-        spans.push(span(
-            format!("  {:>SIZE_WIDTH$}", cut(&stage.summary, SIZE_WIDTH)),
-            DIM,
-        ));
-        spans.push(plain(" ".repeat(SPEED_WIDTH)));
-    } else {
-        // A stage with no total has no bar: its result stands where the bar was.
-        spans.push(plain("     "));
-        spans.push(span(pad(&cut(&stage.summary, cells + 2), cells + 2), DIM));
-        spans.push(plain(" ".repeat(2 + SIZE_WIDTH + SPEED_WIDTH)));
+    match (step.unit, step.total) {
+        (Unit::None, _) | (_, None) => {
+            // A step with no measure has no bar: only its time is known.
+            spans.push(plain(
+                " ".repeat(5 + cells + 2 + 2 + SIZE_WIDTH + SPEED_WIDTH),
+            ));
+        }
+        (unit, Some(total)) => {
+            let summary = match unit {
+                Unit::Count(name) => format!("{} {name}", amount(unit, total)),
+                _ => amount(unit, total),
+            };
+            spans.push(plain("100% "));
+            spans.extend(bar_spans(cells, 1.0, Some(DONE_BAR)));
+            spans.push(span(
+                format!("  {:>SIZE_WIDTH$}", cut(&summary, SIZE_WIDTH)),
+                DIM,
+            ));
+            spans.push(plain(" ".repeat(SPEED_WIDTH)));
+        }
     }
     spans.push(span(
-        format!("{:>TIME_WIDTH$}", mock::duration(stage.real_secs)),
+        format!(
+            "{:>TIME_WIDTH$}",
+            format::duration(step.secs.unwrap_or_default())
+        ),
         DIM,
     ));
     Line::from(spans)
 }
 
-fn running_line(app: &App, build: &Build, inner: usize) -> Line<'static> {
-    let stage = build.stage();
-    let progress = build.progress();
+/// The running step: what it does, how far it is, and the rate it goes at,
+/// all measured.
+fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
+    let elapsed = step.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
     // The verb and what it works on shimmer as one title.
     let title = format!(
         "{} {}",
-        pad(stage.doing, VERB_WIDTH),
-        pad(&cut(&stage.object, NAME_WIDTH), NAME_WIDTH)
+        pad(step.doing, VERB_WIDTH),
+        pad(&cut(&step.object, NAME_WIDTH), NAME_WIDTH)
     );
     let mut spans = vec![plain(" "), span(spinner(app), ACCENT), plain(" ")];
     spans.extend(shimmer(&title, app.started.elapsed().as_millis()));
     spans.push(plain("  "));
-    match stage.total {
-        Some(total) => {
-            let megabytes = stage.unit == "MB";
-            let (done, whole) = if megabytes {
-                (mock::size(total * progress), mock::size(total))
+    match (step.unit, step.total) {
+        (unit, Some(total)) if unit != Unit::None && total > 0 => {
+            let ratio = (done as f64 / total as f64).min(1.0);
+            let rate = done as f64 / elapsed.max(0.001);
+            let speed = if elapsed < 1.0 || done == 0 {
+                String::new()
             } else {
-                (mock::count(total * progress), mock::count(total))
+                match unit {
+                    Unit::Bytes => format!("{}/s", format::bytes(rate as u64)),
+                    _ => format!("{}/s", format::count(rate as u64)),
+                }
             };
-            let rate = if megabytes {
-                format!("{:.1} MB/s", total / stage.real_secs)
+            let left = if elapsed < 1.0 || done == 0 {
+                String::new()
             } else {
-                format!("{}/s", mock::count(total / stage.real_secs))
+                format::duration(total.saturating_sub(done) as f64 / rate)
             };
-            spans.push(plain(format!("{:>3}% ", (progress * 100.0).floor())));
-            spans.extend(bar_spans(cells, progress, None));
+            spans.push(plain(format!("{:>3}% ", (ratio * 100.0).floor())));
+            spans.extend(bar_spans(cells, ratio, None));
             spans.push(plain(format!(
                 "  {:>SIZE_WIDTH$}",
-                format!("{done}/{whole}")
+                cut(
+                    &format!("{}/{}", amount(unit, done), amount(unit, total)),
+                    SIZE_WIDTH
+                )
             )));
-            spans.push(span(format!("{rate:>SPEED_WIDTH$}"), DIM));
-            spans.push(span(
-                format!(
-                    "{:>TIME_WIDTH$}",
-                    mock::duration((1.0 - progress) * stage.real_secs)
-                ),
-                DIM,
-            ));
+            spans.push(span(format!("{speed:>SPEED_WIDTH$}"), DIM));
+            spans.push(span(format!("{left:>TIME_WIDTH$}"), DIM));
         }
-        None => {
-            // No total, so no percent and no bar: only time passing.
+        _ => {
+            // No measure, so no percent and no bar: only time passing.
             spans.push(plain("     "));
             spans.push(span(pad("working…", cells + 2), DIM));
             spans.push(plain(" ".repeat(2 + SIZE_WIDTH + SPEED_WIDTH)));
             spans.push(span(
-                format!(
-                    "{:>TIME_WIDTH$}",
-                    mock::duration(progress * stage.real_secs)
-                ),
+                format!("{:>TIME_WIDTH$}", format::duration(elapsed)),
                 DIM,
             ));
         }
@@ -886,52 +1026,76 @@ fn running_line(app: &App, build: &Build, inner: usize) -> Line<'static> {
 }
 
 fn build(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(build) = &app.build else {
+    let inner = area.width as usize;
+    if let Some(error) = &app.build_error {
+        let mut lines = vec![
+            Line::from(vec![plain("   "), strong("Build failed", ERR)]),
+            Line::raw(""),
+        ];
+        let room = inner.saturating_sub(6).max(20);
+        for part in error.split(": ") {
+            for chunk in part.chars().collect::<Vec<_>>().chunks(room) {
+                lines.push(Line::from(span(
+                    format!("   {}", chunk.iter().collect::<String>()),
+                    DIM,
+                )));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+        footer(frame, app, &[("esc", "back")]);
+        return;
+    }
+    let Some(job) = &app.job else {
         return;
     };
-    let inner = area.width as usize;
-    let overall = build.overall();
-    let left = mock::about(build.remaining());
+    let progress = &job.progress;
+    let current = progress.current();
+    let done = progress.done();
+    let steps = progress.steps.lock().expect("steps lock");
+    let Some(step) = steps.get(current) else {
+        return;
+    };
+    let mut status = format!(
+        "   Step {} of {}  ·  {} elapsed",
+        current + 1,
+        steps.len(),
+        format::duration(progress.started.elapsed().as_secs_f64()),
+    );
+    // What is left, from this machine's own builds, once the build runs.
+    let build_started = steps
+        .iter()
+        .rev()
+        .take(open_geocode::builder::BuildStage::ALL.len())
+        .filter_map(|step| step.started)
+        .min();
+    if let (Some(estimate), Some(started)) = (app.estimate(), build_started) {
+        let left = estimate.secs - started.elapsed().as_secs_f64();
+        if left > 0.0 {
+            status.push_str(&format!(
+                "  ·  {} left by your {} build",
+                format::about(left),
+                region_name(&estimate.from.region)
+            ));
+        }
+    }
     let mut lines = vec![
-        running_line(app, build, inner),
+        running_line(app, step, done, inner),
         Line::raw(""),
-        Line::from(span(
-            format!(
-                "   Step {} of {}  ·  {} elapsed  ·  about {} left",
-                build.current + 1,
-                build.stages.len(),
-                mock::duration(build.elapsed()),
-                left.trim_start_matches("~ "),
-            ),
-            DIM,
-        )),
+        Line::from(span(status, DIM)),
     ];
     if app.show_logs {
-        let stage = build.stage();
-        let budget = app.memory_gb() as f64;
-        let memory = (1.4 + overall * 4.0).min(budget * 0.85);
         lines.push(Line::raw(""));
-        lines.push(Line::from(span(format!("   {}", stage.explain[0]), DIM)));
-        lines.push(Line::from(span(format!("   {}", stage.explain[1]), DIM)));
+        lines.push(Line::from(span(format!("   {}", step.explain[0]), DIM)));
+        lines.push(Line::from(span(format!("   {}", step.explain[1]), DIM)));
         lines.push(Line::raw(""));
-        lines.push(Line::from(span(
-            format!("   memory {memory:.1} / {budget:.1} GB"),
-            DIM,
-        )));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(span(
-            format!("   log {}", "─".repeat(inner.saturating_sub(7))),
-            FAINT,
-        )));
-        let end = ((overall * mock::LOGS.len() as f64).ceil() as usize).clamp(1, mock::LOGS.len());
-        let start = end.saturating_sub(3);
-        for (level, text) in &mock::LOGS[start..end] {
-            let color = if *level == "warn" { WARN } else { DIM };
-            lines.push(Line::from(vec![
-                span(format!("   {level:<5} "), color),
-                span(text.to_string(), DIM),
-            ]));
+        let mut facts = vec![format!("memory budget {} GB", app.memory_gb)];
+        if let Some(resident) = app.resident {
+            facts.push(format!("og holds {}", format::bytes(resident)));
         }
+        if let Some(free) = app.free_disk {
+            facts.push(format!("{} disk free", format::bytes(free)));
+        }
+        lines.push(Line::from(span(format!("   {}", facts.join("  ·  ")), DIM)));
     }
     frame.render_widget(Paragraph::new(lines), area);
     let details = if app.show_logs {
@@ -947,14 +1111,21 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn done(frame: &mut Frame, area: Rect, app: &App) {
-    let stat = |label: &str, value: &str| {
-        vec![bold(value.to_string()), span(format!(" {label}    "), DIM)]
+    let Some(built) = &app.built else {
+        return;
+    };
+    let pack = &built.pack;
+    let stat = |label: &str, value: u64| {
+        vec![
+            bold(format::thousands(value)),
+            span(format!(" {label}    "), DIM),
+        ]
     };
     let mut stats = vec![plain("   ")];
-    stats.extend(stat("places", mock::PACK.places));
-    stats.extend(stat("streets", mock::PACK.streets));
-    stats.extend(stat("addresses", mock::PACK.addresses));
-    stats.extend(stat("POIs", mock::PACK.pois));
+    stats.extend(stat("places", pack.layer(&PLACE_LAYERS)));
+    stats.extend(stat("streets", pack.layer(&["street"])));
+    stats.extend(stat("addresses", pack.layer(&["address"])));
+    stats.extend(stat("POIs", pack.layer(&["poi"])));
     let step = |label: &str, command: String| {
         Line::from(vec![
             plain("   "),
@@ -964,12 +1135,6 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
     };
     let more =
         |text: String, color: Color| Line::from(vec![plain(" ".repeat(20)), span(text, color)]);
-    // The command is long: break it after the region, as a shell would.
-    let command = app.command();
-    let (head, rest) = command
-        .match_indices(" --")
-        .nth(1)
-        .map_or((command.as_str(), ""), |(at, _)| command.split_at(at));
     let mut buttons = vec![plain("  ")];
     for (index, label) in app::DONE_ITEMS.iter().enumerate() {
         buttons.push(button(label, index == app.done_cursor, true));
@@ -982,27 +1147,26 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
             bold("Pack ready"),
             span(
                 format!(
-                    "   {} · {} · built in {}",
-                    app.pack_path(),
-                    mock::PACK.size,
-                    mock::duration(app.built_secs)
+                    "   {} · {} records · built in {}",
+                    format::bytes(pack.bytes),
+                    format::thousands(pack.records),
+                    format::duration(built.build_secs)
                 ),
                 DIM,
             ),
         ]),
+        Line::from(span(format!("   {}", pack.dir.display()), FAINT)),
         Line::raw(""),
         Line::from(stats),
         Line::raw(""),
         Line::from(bold("   Next")),
         Line::raw(""),
-        step("Search it", format!("og query {}", app.pack_path())),
-        step(
-            "Serve the API",
-            format!("og serve --pack {}", app.pack_path()),
+        step("Serve the API", format!("og serve {}", app.region.slug())),
+        more(
+            format!("then GET http://{}/search?q=…", app::SERVE_ADDRESS),
+            DIM,
         ),
-        more("then GET http://127.0.0.1:8080/search?q=…".to_string(), DIM),
-        step("Build it again", format!("{head} \\")),
-        more(rest.trim_start().to_string(), ACCENT),
+        step("Build it again", app.command()),
         Line::raw(""),
         Line::from(buttons),
     ];
@@ -1026,7 +1190,7 @@ fn badge() -> Span<'static> {
 
 fn layer_color(layer: &str) -> Color {
     match layer {
-        "address" => VIOLET,
+        "address" | "interpolation" => VIOLET,
         "poi" => PINK,
         "street" => ACCENT,
         _ => OK,
@@ -1035,10 +1199,9 @@ fn layer_color(layer: &str) -> Color {
 
 fn label_color(label: &str) -> Color {
     match label {
-        "house_number" => WARN,
+        "house_number" | "unit" => WARN,
         "street" => ACCENT,
-        "locality" => OK,
-        "region" => OK,
+        "locality" | "region" | "country" => OK,
         "postcode" => PINK,
         _ => VIOLET,
     }
@@ -1056,11 +1219,16 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(area);
 
+    let records = app.engine.as_ref().map_or(0, engine::Engine::records);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             badge(),
             span(
-                format!("  {} · {} records", app.active_name, app.active_records),
+                format!(
+                    "  {} · {} records",
+                    app.active_name,
+                    format::thousands(records)
+                ),
                 DIM,
             ),
         ])),
@@ -1080,8 +1248,8 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(tabs).right_aligned()), header);
 
     let placeholder = match app.mode {
-        Mode::Search => "try: 100 queen st w tor",
-        Mode::Reverse => "lat, lon   try: 43.6535, -79.3839",
+        Mode::Search => "an address, a street, a place or a POI",
+        Mode::Reverse => "lat, lon",
         Mode::Batch => "paste a CSV, one address per row, or type a file path",
     };
     let typed = if app.mode == Mode::Batch {
@@ -1104,7 +1272,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
             let matched = app
                 .batch_rows
                 .iter()
-                .filter(|row| row.hit.is_some())
+                .filter(|row| row.hit().is_some())
                 .count();
             Line::from(vec![
                 span("  ", DIM),
@@ -1120,7 +1288,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
                 ),
             ])
         }
-        Mode::Reverse => match mock::point(&app.query) {
+        Mode::Reverse => match engine::point(&app.query) {
             Some((lat, lon)) => Line::from(vec![
                 span("  point   ", DIM),
                 span("lat ", DIM),
@@ -1131,17 +1299,16 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
             None if app.query.is_empty() => Line::raw(""),
             None => Line::from(span("  waiting for lat, lon", WARN)),
         },
-        _ => {
-            let parts = mock::parse(&app.query);
+        Mode::Search => {
             let mut spans = vec![span("  parsed  ", DIM)];
-            for (index, (text, label)) in parts.iter().enumerate() {
+            for (index, (text, label)) in app.reading.iter().enumerate() {
                 if index > 0 {
                     spans.push(span("  ·  ", FAINT));
                 }
                 spans.push(bold(text.clone()));
                 spans.push(span(format!(" {label}"), label_color(label)));
             }
-            if parts.is_empty() {
+            if app.reading.is_empty() {
                 Line::raw("")
             } else {
                 Line::from(spans)
@@ -1149,13 +1316,16 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
     frame.render_widget(Paragraph::new(parsed_line), parsed);
-    if !app.query.is_empty() || !app.batch_rows.is_empty() && app.mode == Mode::Batch {
-        let millis = match app.mode {
-            Mode::Batch => 2 + app.batch_rows.len() / 40,
-            _ => 3 + app.query.len() % 5,
-        };
+    let millis = match app.mode {
+        Mode::Batch if !app.batch_rows.is_empty() => Some(app.batch_millis),
+        Mode::Batch => None,
+        _ => app.answer.as_ref().map(|answer| answer.millis),
+    };
+    if let Some(millis) = millis {
         frame.render_widget(
-            Paragraph::new(Line::from(span(format!("{millis} ms "), DIM)).right_aligned()),
+            Paragraph::new(
+                Line::from(span(format!("{} ", milliseconds(millis)), DIM)).right_aligned(),
+            ),
             parsed,
         );
     }
@@ -1165,6 +1335,8 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         batch_card(app)
     } else if app.mode == Mode::Batch {
         batch_table(app, results)
+    } else if let Some(error) = &app.query_error {
+        vec![Line::from(span(format!("  {error}"), ERR))]
     } else if app.query.is_empty() {
         vec![
             Line::from(span(
@@ -1181,9 +1353,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         hits.iter()
             .enumerate()
-            .map(|(index, (record, value))| {
-                hit_row(record, *value, app.mode, index == app.hit_cursor)
-            })
+            .map(|(index, hit)| hit_row(hit, index == app.hit_cursor))
             .collect()
     };
     frame.render_widget(Paragraph::new(lines), results);
@@ -1208,7 +1378,6 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
             &[
                 ("↑↓", "pick"),
                 ("ctrl+g", "GeoJSON"),
-                ("ctrl+e", "example"),
                 ("ctrl+u", "clear"),
                 ("tab", "mode"),
                 ("esc", esc),
@@ -1234,6 +1403,15 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// `0.8 ms`, `12 ms`.
+fn milliseconds(millis: f64) -> String {
+    if millis < 10.0 {
+        format!("{millis:.1} ms")
+    } else {
+        format!("{millis:.0} ms")
+    }
+}
+
 /// What the batch box shows: the text typed, or how much was pasted.
 fn batch_input(app: &App) -> String {
     if app.batch_text.contains('\n') {
@@ -1245,16 +1423,6 @@ fn batch_input(app: &App) -> String {
         format!("{lines} lines pasted")
     } else {
         app.batch_text.clone()
-    }
-}
-
-/// Cuts text to a number of cells, ending it with an ellipsis.
-fn cut(text: &str, cells: usize) -> String {
-    if width(text) > cells {
-        let keep: String = text.chars().take(cells.saturating_sub(1)).collect();
-        format!("{keep}…")
-    } else {
-        text.to_string()
     }
 }
 
@@ -1272,23 +1440,19 @@ fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
                 DIM,
             )),
             Line::from(span(
-                "  Paste a file path to continue with that file, or press ctrl+e for a 10,000 address example.",
+                "  A file path opens that file, to geocode all of it into a new CSV.",
                 DIM,
             )),
-            Line::raw(""),
-            Line::from(span("  address", FAINT)),
-            Line::from(span("  100 queen st w toronto", FAINT)),
-            Line::from(span("  24 sussex dr ottawa", FAINT)),
         ];
     }
     let inner = area.width as usize;
     let address_width = 26.min(inner / 3);
-    let match_width = inner.saturating_sub(3 + 4 + address_width + 2 + 2 + 2 + 5 + 1);
+    let match_width = inner.saturating_sub(3 + 4 + address_width + 2 + 2 + 2 + 6 + 1);
     let capacity = (area.height as usize).saturating_sub(1).max(1);
     let start = (app.hit_cursor + 1).saturating_sub(capacity);
     let mut lines = vec![Line::from(span(
         format!(
-            "   {:>3}  {}  {}  {:>5}",
+            "   {:>3}  {}  {}  {:>6}",
             "#",
             pad("Address", address_width),
             pad("Match", match_width + 2),
@@ -1313,11 +1477,11 @@ fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
             },
             plain("  "),
         ];
-        match row.hit {
-            Some((record, value)) => {
+        match row.hit() {
+            Some(hit) => {
                 spans.push(span("✓ ", OK));
-                spans.push(plain(pad(&cut(record.label, match_width), match_width)));
-                spans.push(span(format!("  {value:>5.2}"), DIM));
+                spans.push(plain(pad(&cut(&hit.label, match_width), match_width)));
+                spans.push(span(format!("  {}", measure(hit.measure)), DIM));
             }
             None => spans.push(span("– no match", DIM)),
         }
@@ -1326,243 +1490,84 @@ fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
     lines
 }
 
-fn hit_row(record: &Record, value: f64, mode: Mode, selected: bool) -> Line<'static> {
-    let measure = match mode {
-        Mode::Reverse if value >= 1_000.0 => span(format!("{:>5.1} km", value / 1_000.0), DIM),
-        Mode::Reverse => span(format!("{:>6.0} m", value), DIM),
-        _ => {
-            let color = if value >= 0.8 {
-                OK
-            } else if value >= 0.55 {
-                WARN
-            } else {
-                DIM
-            };
-            span(format!("{value:.2}"), color)
+/// Search's score or reverse's distance, six cells wide.
+fn measure(measure: Measure) -> String {
+    match measure {
+        Measure::Score(score) => format!("{score:>6.1}"),
+        Measure::Distance(Some(metres)) if metres >= 1_000.0 => {
+            format!("{:>4.1}km", metres / 1_000.0)
         }
-    };
+        Measure::Distance(Some(metres)) => format!("{:>5.0}m", metres),
+        Measure::Distance(None) => format!("{:>6}", "area"),
+    }
+}
+
+fn hit_row(hit: &Hit, selected: bool) -> Line<'static> {
     Line::from(vec![
         if selected {
             span(" ❯ ", ACCENT)
         } else {
             plain("   ")
         },
-        measure,
+        span(measure(hit.measure), DIM),
         plain("  "),
-        span(pad(record.layer, 9), layer_color(record.layer)),
+        span(pad(&hit.layer, 13), layer_color(&hit.layer)),
         if selected {
-            bold(record.label)
+            bold(hit.label.clone())
         } else {
-            plain(record.label)
+            plain(hit.label.clone())
         },
     ])
 }
 
-/// A JSON value with its keys in contract order.
-enum Json {
-    Str(String),
-    Num(String),
-    Obj(Vec<(&'static str, Json)>),
-    Arr(Vec<Json>),
-}
-
-fn string(text: &str) -> Json {
-    Json::Str(text.to_string())
-}
-
-fn area(id: &str, name: &str) -> Json {
-    Json::Obj(vec![("id", string(id)), ("name", string(name))])
-}
-
-fn feature(record: &Record, value: f64, mode: Mode, row: usize) -> Json {
-    let mut address = Vec::new();
-    if let Some(number) = record.housenumber {
-        address.push(("housenumber", string(number)));
-    }
-    if let Some(street) = record.street {
-        address.push(("street", string(street)));
-    }
-    if let Some(postcode) = record.postcode {
-        address.push(("postcode", string(postcode)));
-    }
-    let (kind, id) = record.id.rsplit_once(':').unwrap_or(("node", "0"));
-    let kind = kind.rsplit(':').next().unwrap_or(kind);
-    let mut properties = vec![
-        ("id", string(record.id)),
-        (
-            "record_id",
-            Json::Num((4_812_330 + row * 7_919).to_string()),
-        ),
-        ("layer", string(record.layer)),
-        ("accuracy", string(record.accuracy)),
-        ("name", string(record.name)),
-        ("label", string(record.label)),
-    ];
-    if let Some(category) = record.category {
-        properties.push(("category", string(category)));
-    }
-    if !address.is_empty() {
-        properties.push(("address", Json::Obj(address)));
-    }
-    let mut context = Vec::new();
-    if record.layer != "locality" {
-        context.push(("locality", area("osm:relation:324211", record.locality)));
-    }
-    context.push(("region", area("osm:relation:68841", "Ontario")));
-    context.push(("country", area("osm:relation:1428125", "Canada")));
-    properties.push(("context", Json::Obj(context)));
-    properties.push((
-        "source",
-        Json::Obj(vec![
-            ("dataset", string("osm")),
-            ("object_type", string(kind)),
-            ("object_id", Json::Num(id.to_string())),
-        ]),
-    ));
-    match mode {
-        Mode::Reverse => properties.push(("distance_m", Json::Num(format!("{value:.1}")))),
-        _ => properties.push(("score", Json::Num(format!("{value:.2}")))),
-    }
-    Json::Obj(vec![
-        ("type", string("Feature")),
-        (
-            "geometry",
-            Json::Obj(vec![
-                ("type", string("Point")),
-                (
-                    "coordinates",
-                    Json::Arr(vec![
-                        Json::Num(format!("{:.7}", record.lon)),
-                        Json::Num(format!("{:.7}", record.lat)),
-                    ]),
-                ),
-            ]),
-        ),
-        ("properties", Json::Obj(properties)),
-    ])
-}
-
-/// The answer as the API would return it, one styled line per JSON line.
+/// The answer as the API returns it, one styled line per JSON line.
 pub fn json_lines(app: &App) -> Vec<Line<'static>> {
-    let hits = app.hits();
-    let picked: Vec<(usize, (&Record, f64))> = if app.mode == Mode::Batch {
-        app.batch_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(row, batch)| batch.hit.map(|hit| (row, hit)))
-            .filter(|(row, _)| app.json_all || *row == app.hit_cursor)
-            .collect()
-    } else if app.json_all {
-        hits.iter().copied().enumerate().collect()
-    } else {
-        hits.iter()
-            .copied()
-            .enumerate()
-            .skip(app.hit_cursor)
-            .take(1)
-            .collect()
-    };
-    let geocoding = match (app.mode, mock::point(&app.query)) {
-        (Mode::Reverse, Some((lat, lon))) => vec![
-            ("version", string("1")),
-            (
-                "point",
-                Json::Obj(vec![
-                    ("lon", Json::Num(format!("{lon}"))),
-                    ("lat", Json::Num(format!("{lat}"))),
-                ]),
-            ),
-        ],
-        (Mode::Batch, _) => vec![
-            ("version", string("1")),
-            (
-                "query",
-                string(&format!("batch of {} rows", app.batch_rows.len())),
-            ),
-        ],
-        _ => vec![
-            ("version", string("1")),
-            ("query", string(app.query.trim())),
-        ],
-    };
-    let mut geocoding = geocoding;
-    geocoding.push(("attribution", string("© OpenStreetMap contributors, ODbL")));
-    let collection = Json::Obj(vec![
-        ("type", string("FeatureCollection")),
-        ("geocoding", Json::Obj(geocoding)),
-        (
-            "features",
-            Json::Arr(
-                picked
-                    .into_iter()
-                    .map(|(row, (record, value))| feature(record, value, app.mode, row))
-                    .collect(),
-            ),
-        ),
-    ]);
-    let mut lines = Vec::new();
-    emit(&collection, 0, None, false, &mut lines);
-    lines
+    app.json_text().lines().map(json_line).collect()
 }
 
-fn emit(value: &Json, indent: usize, key: Option<&str>, comma: bool, out: &mut Vec<Line<'static>>) {
-    let mut head = vec![plain(" ".repeat(indent + 1))];
-    if let Some(key) = key {
-        head.push(span(format!("\"{key}\""), ACCENT));
-        head.push(span(": ", FAINT));
-    }
-    let tail = || span(if comma { "," } else { "" }, FAINT);
-    match value {
-        Json::Str(text) => {
-            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-            head.push(span(format!("\"{escaped}\""), OK));
-            head.push(tail());
-            out.push(Line::from(head));
-        }
-        Json::Num(number) => {
-            head.push(span(number.clone(), WARN));
-            head.push(tail());
-            out.push(Line::from(head));
-        }
-        Json::Arr(items) if items.iter().all(|item| matches!(item, Json::Num(_))) => {
-            head.push(span("[", FAINT));
-            for (index, item) in items.iter().enumerate() {
-                if let Json::Num(number) = item {
-                    if index > 0 {
-                        head.push(span(", ", FAINT));
+/// Colours one line of pretty JSON: keys, strings, numbers and punctuation.
+fn json_line(line: &str) -> Line<'static> {
+    let indent = line.len() - line.trim_start().len();
+    let mut spans = vec![plain(" ".repeat(indent + 1))];
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        if let Some(body) = rest.strip_prefix('"') {
+            // A string runs to the next quote that is not escaped.
+            let mut end = 0;
+            let mut escaped = false;
+            for (at, c) in body.char_indices() {
+                match c {
+                    '\\' if !escaped => escaped = true,
+                    '"' if !escaped => {
+                        end = at;
+                        break;
                     }
-                    head.push(span(number.clone(), WARN));
+                    _ => escaped = false,
                 }
             }
-            head.push(span("]", FAINT));
-            head.push(tail());
-            out.push(Line::from(head));
-        }
-        Json::Arr(items) => {
-            head.push(span("[", FAINT));
-            out.push(Line::from(head));
-            for (index, item) in items.iter().enumerate() {
-                emit(item, indent + 2, None, index + 1 < items.len(), out);
+            let text = format!("\"{}\"", &body[..end]);
+            rest = &body[end + 1..];
+            if let Some(after) = rest.strip_prefix(": ") {
+                spans.push(span(text, ACCENT));
+                spans.push(span(": ", FAINT));
+                rest = after;
+            } else {
+                spans.push(span(text, OK));
             }
-            out.push(Line::from(vec![
-                plain(" ".repeat(indent + 1)),
-                span("]", FAINT),
-                tail(),
-            ]));
-        }
-        Json::Obj(fields) => {
-            head.push(span("{", FAINT));
-            out.push(Line::from(head));
-            for (index, (name, item)) in fields.iter().enumerate() {
-                emit(item, indent + 2, Some(name), index + 1 < fields.len(), out);
+        } else {
+            let end = rest
+                .find([',', ']', '}', '[', '{', '"'])
+                .unwrap_or(rest.len());
+            if end == 0 {
+                spans.push(span(rest[..1].to_string(), FAINT));
+                rest = &rest[1..];
+            } else {
+                spans.push(span(rest[..end].trim().to_string(), WARN));
+                rest = &rest[end..];
             }
-            out.push(Line::from(vec![
-                plain(" ".repeat(indent + 1)),
-                span("}", FAINT),
-                tail(),
-            ]));
         }
     }
+    Line::from(spans)
 }
 
 fn json(frame: &mut Frame, area: Rect, app: &App) {
@@ -1572,24 +1577,26 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    let hits = app.hits();
     let batch = app.mode == Mode::Batch;
-    let what = if app.json_all {
-        format!("  all {} results", hits.len())
-    } else if batch {
-        format!("  row {} of {}", app.hit_cursor + 1, app.batch_rows.len())
+    let hits = app.hits();
+    let (what, label) = if batch {
+        let row = app.batch_rows.get(app.hit_cursor);
+        (
+            format!("  row {} of {}", app.hit_cursor + 1, app.batch_rows.len()),
+            row.and_then(|row| row.hit())
+                .map(|hit| format!(" · {}", hit.label))
+                .unwrap_or_default(),
+        )
+    } else if app.json_all {
+        (format!("  all {} results", hits.len()), String::new())
     } else {
-        format!("  result {} of {}", app.hit_cursor + 1, hits.len())
+        (
+            format!("  result {} of {}", app.hit_cursor + 1, hits.len()),
+            hits.get(app.hit_cursor)
+                .map(|hit| format!(" · {}", hit.label))
+                .unwrap_or_default(),
+        )
     };
-    let shown = if batch {
-        app.batch_rows.get(app.hit_cursor).and_then(|row| row.hit)
-    } else {
-        hits.get(app.hit_cursor).copied()
-    };
-    let label = shown
-        .filter(|_| !app.json_all)
-        .map(|(record, _)| format!(" · {}", record.label))
-        .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(Line::from(vec![badge(), plain(what), span(label, DIM)])),
         header,
@@ -1606,16 +1613,19 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
     let shown: Vec<Line> = lines.into_iter().skip(scroll).take(JSON_ROWS).collect();
     let block = panel("GeoJSON").title_bottom(Line::from(corner).right_aligned());
     frame.render_widget(Paragraph::new(shown).block(block), panel_area);
-    let all = if app.json_all {
-        "one result"
-    } else {
-        "all results"
-    };
-    footer(
-        frame,
-        app,
-        &[("↑↓", "scroll"), ("a", all), ("y", "copy"), ("esc", "back")],
-    );
+    let mut hints = vec![("↑↓", "scroll")];
+    if !batch {
+        hints.push((
+            "a",
+            if app.json_all {
+                "one result"
+            } else {
+                "all results"
+            },
+        ));
+    }
+    hints.extend([("y", "copy"), ("esc", "back")]);
+    footer(frame, app, &hints);
 }
 
 /// The line that opens a batch run in terminal history.
@@ -1677,7 +1687,7 @@ fn visible_columns(widths: &[usize], selected: usize, avail: usize) -> std::ops:
 const MATCH_WIDTH: usize = 20;
 const LAT_WIDTH: usize = 9;
 const LON_WIDTH: usize = 10;
-const LAST_WIDTH: usize = 7;
+const LAST_WIDTH: usize = 8;
 
 fn query_width(inner: usize) -> usize {
     inner
@@ -1701,7 +1711,7 @@ fn result_header(inner: usize, title: &str, last: &str) -> Line<'static> {
 fn result_line(
     inner: usize,
     query: &str,
-    hit: Option<(&Record, f64)>,
+    hit: Option<(&str, f64, f64)>,
     last: Span<'static>,
 ) -> Line<'static> {
     let query_cells = query_width(inner);
@@ -1720,10 +1730,10 @@ fn result_line(
         plain("  "),
     ];
     match hit {
-        Some((record, _)) => {
-            spans.push(plain(pad(&cut(record.name, MATCH_WIDTH), MATCH_WIDTH)));
-            spans.push(plain(format!("  {:>LAT_WIDTH$.5}", record.lat)));
-            spans.push(plain(format!("  {:>LON_WIDTH$.5}", record.lon)));
+        Some((name, lat, lon)) => {
+            spans.push(plain(pad(&cut(name, MATCH_WIDTH), MATCH_WIDTH)));
+            spans.push(plain(format!("  {lat:>LAT_WIDTH$.5}")));
+            spans.push(plain(format!("  {lon:>LON_WIDTH$.5}")));
         }
         None => {
             spans.push(span(pad("no match", MATCH_WIDTH), DIM));
@@ -1736,30 +1746,18 @@ fn result_line(
     Line::from(spans)
 }
 
-/// `10,000 rows · 4.2 MB · header found · 14 blank rows skipped`.
+/// `10,000 rows · 4.2 MB · header found`.
 fn file_facts(file: &batch::BatchFile) -> String {
-    let mut facts = format!(
+    format!(
         "{} rows · {} · {}",
-        mock::thousands(file.total_rows),
-        mock::size(file.bytes as f64 / 1e6),
+        format::thousands(file.total_rows),
+        format::bytes(file.bytes),
         if file.header_found {
             "header found"
         } else {
             "no header row"
         },
-    );
-    if file.blank_skipped > 0 {
-        facts.push_str(&format!(
-            " · {} blank {} skipped",
-            file.blank_skipped,
-            if file.blank_skipped == 1 {
-                "row"
-            } else {
-                "rows"
-            }
-        ));
-    }
-    facts
+    )
 }
 
 /// The file named in the batch tab, with a choice to continue or drop it.
@@ -1786,8 +1784,7 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
     };
     let file = &session.file;
     let inner = area.width as usize;
-    let shown = 3.min(file.total_rows);
-    let sample: Vec<Vec<String>> = (0..shown).map(|index| file.row(index)).collect();
+    let sample = file.sample();
 
     let facts = file_facts(file);
 
@@ -1849,24 +1846,35 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
     lines.extend(rows.into_iter().map(Line::from));
     lines.push(Line::raw(""));
     lines.push(result_header(inner, "First rows geocoded", "score"));
-    for index in 0..shown {
-        let hit = session.lookup(index);
-        let score = match hit {
-            Some((_, score)) => span(format!("{score:>LAST_WIDTH$.2}"), DIM),
+    for row in &sample {
+        let hit = app
+            .engine
+            .as_ref()
+            .and_then(|engine| session.lookup(engine, row));
+        let last = match &hit {
+            Some(hit) => span(format!("{:>LAST_WIDTH$}", measure(hit.measure)), DIM),
             None => span(format!("{:>LAST_WIDTH$}", "–"), DIM),
         };
-        lines.push(result_line(inner, &session.query(index), hit, score));
-    }
-    let mut note = session.estimate();
-    let missing = session.without_address();
-    if missing > 0 {
-        note.push_str(&format!(
-            "  ·  {} rows have no address and will be skipped",
-            mock::thousands(missing)
+        lines.push(result_line(
+            inner,
+            &session.query(row),
+            hit.as_ref()
+                .map(|hit| (hit.name.as_str(), hit.lat, hit.lon)),
+            last,
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::from(span(format!("   {note}"), DIM)));
+    let note = match &app.batch_error {
+        Some(error) => span(format!("   {}", cut(error, inner.saturating_sub(4))), ERR),
+        None => span(
+            format!(
+                "   Writes {}.geocoded.csv next to the file, with lat and lon added.",
+                file.stem()
+            ),
+            DIM,
+        ),
+    };
+    lines.push(Line::from(note));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         plain("   "),
@@ -1887,18 +1895,28 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The newest queries of a run, a few at a time: the engine does thousands a
-/// second, so the list shows a sample that changes about seven times a second.
-fn latest_queries(
-    session: &BatchSession,
-    build: &Build,
-    done: usize,
-    inner: usize,
-) -> Vec<Line<'static>> {
-    let stage = build.stage();
-    let total = session.file.total_rows;
-    let (p50, p95, p99) = batch::latency_stats(done);
-    let matched = (done as f64 * session.share).round() as usize;
+fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(session) = &app.batch else {
+        return;
+    };
+    let Some(run) = &session.run else {
+        return;
+    };
+    let inner = area.width as usize;
+    let stats = &run.stats;
+    let done = stats.done.load(std::sync::atomic::Ordering::Relaxed);
+    let matched = stats.matched.load(std::sync::atomic::Ordering::Relaxed);
+    let step = Step {
+        did: "Geocoded",
+        doing: "Geocoding",
+        object: session.file.stem().to_string(),
+        explain: ["", ""],
+        unit: Unit::Count("rows"),
+        total: Some(session.file.total_rows),
+        started: Some(run.started),
+        secs: None,
+    };
+    let (p50, p95, p99, _) = stats.latency();
     let left = format!("   p50 {p50:.1} ms  ·  p95 {p95:.1} ms  ·  p99 {p99:.1} ms");
     let share = if done > 0 {
         matched as f64 / done as f64 * 100.0
@@ -1907,9 +1925,11 @@ fn latest_queries(
     };
     let right = format!(
         "{share:.1}% matched  ·  {} with no match",
-        mock::thousands(done - matched)
+        format::thousands(done - matched)
     );
     let mut lines = vec![
+        running_line(app, &step, done, inner),
+        Line::raw(""),
         Line::from(vec![
             span(pad(&left, inner.saturating_sub(width(&right))), DIM),
             span(right, DIM),
@@ -1917,96 +1937,75 @@ fn latest_queries(
         Line::raw(""),
         result_header(inner, "Latest", "time"),
     ];
-    let per_tick = (total as f64 / (stage.play_secs * 1000.0 / 150.0)).max(1.0) as usize;
-    let tick = (build.stage_started.elapsed().as_millis() / 150) as usize;
-    let anchor = (tick * per_tick).min(done);
-    for back in 0..8 {
-        if anchor < back + 1 {
-            break;
-        }
-        let index = anchor - 1 - back;
-        let took = mock::latency_ms(index);
-        let color = if took > 3.0 { ACCENT } else { DIM };
+    for latest in stats.latest.lock().expect("latest lock").iter() {
+        let color = if latest.millis > 3.0 { ACCENT } else { DIM };
         lines.push(result_line(
             inner,
-            &session.query(index),
-            session.lookup(index),
-            span(format!("{:>LAST_WIDTH$}", format!("{took:.1} ms")), color),
+            &latest.query,
+            latest
+                .hit
+                .as_ref()
+                .map(|(name, lat, lon)| (name.as_str(), *lat, *lon)),
+            span(
+                format!("{:>LAST_WIDTH$}", milliseconds(latest.millis)),
+                color,
+            ),
         ));
-    }
-    lines
-}
-
-fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
-    let (Some(build), Some(session)) = (&app.build, &app.batch) else {
-        return;
-    };
-    let inner = area.width as usize;
-    let mut lines = vec![running_line(app, build, inner), Line::raw("")];
-    if build.stage().doing == "Geocoding" {
-        let done = (session.file.total_rows as f64 * build.progress()) as usize;
-        lines.extend(latest_queries(session, build, done, inner));
     }
     frame.render_widget(Paragraph::new(lines), area);
     footer(frame, app, &[("esc", "cancel")]);
 }
 
-/// The first rows of the output file: the file's own columns, then lat and
-/// lon, which the run adds.
-fn output_table(session: &BatchSession, inner: usize) -> Vec<Line<'static>> {
-    let file = &session.file;
-    let shown = 3.min(file.total_rows);
-    let sample: Vec<Vec<String>> = (0..shown).map(|index| file.row(index)).collect();
-    let widths: Vec<usize> = file
-        .headers
+/// The first rows of the output file as it was written.
+fn output_table(head: &[Vec<String>], inner: usize) -> Vec<Line<'static>> {
+    let Some((header, rows)) = head.split_first() else {
+        return Vec::new();
+    };
+    let widths: Vec<usize> = header
         .iter()
         .enumerate()
-        .map(|(column, header)| {
-            let cells = sample
+        .map(|(column, name)| {
+            let cells = rows
                 .iter()
-                .map(|row| width(&row[column]))
+                .map(|row| row.get(column).map_or(0, |cell| width(cell)))
                 .max()
                 .unwrap_or(0);
-            (width(header).max(cells) + 2).clamp(6, 18)
+            (width(name).max(cells) + 2).clamp(6, 18)
         })
         .collect();
-    let avail = inner.saturating_sub(3 + LAT_WIDTH + 1 + 2 + LON_WIDTH + 1 + 2);
-    let mut used = 0;
-    let mut count = 0;
-    for cells in &widths {
-        if used + cells > avail && count > 0 {
+    // The lat and lon the run added are the last two columns: keep them in
+    // view and drop columns before them that do not fit.
+    let tail = widths.len().saturating_sub(2);
+    let mut avail = inner.saturating_sub(3 + widths[tail..].iter().sum::<usize>());
+    let mut shown = Vec::new();
+    for (column, cells) in widths.iter().enumerate().take(tail) {
+        if *cells > avail {
             break;
         }
-        used += cells;
-        count += 1;
+        avail -= cells;
+        shown.push(column);
     }
-    let coordinate = Style::new().fg(ACCENT);
-    let mut header = vec![plain("   ")];
-    for (cells, name) in widths.iter().zip(&file.headers).take(count) {
-        header.push(span(pad(&cut(name, cells - 2), *cells), DIM));
-    }
-    header.push(Span::styled(
-        format!("{:>w$}", "lat", w = LAT_WIDTH + 1),
-        coordinate,
-    ));
-    header.push(Span::styled(
-        format!("  {:>w$}", "lon", w = LON_WIDTH + 1),
-        coordinate,
-    ));
-    let mut lines = vec![Line::from(header)];
-    for (index, row) in sample.iter().enumerate() {
+    shown.extend(tail..widths.len());
+    let line = |row: &[String], style: fn(String) -> Span<'static>, coordinate: Style| {
         let mut spans = vec![plain("   ")];
-        for (cells, cell) in widths.iter().zip(row).take(count) {
-            spans.push(plain(pad(&cut(cell, cells - 2), *cells)));
+        for &column in &shown {
+            let cell = row.get(column).map_or("", String::as_str);
+            let text = pad(&cut(cell, widths[column] - 2), widths[column]);
+            spans.push(if column >= tail {
+                Span::styled(text, coordinate)
+            } else {
+                style(text)
+            });
         }
-        match session.lookup(index) {
-            Some((record, _)) => {
-                spans.push(plain(format!("{:>w$.5}", record.lat, w = LAT_WIDTH + 1)));
-                spans.push(plain(format!("  {:>w$.5}", record.lon, w = LON_WIDTH + 1)));
-            }
-            None => spans.push(plain("")),
-        }
-        lines.push(Line::from(spans));
+        Line::from(spans)
+    };
+    let mut lines = vec![line(
+        header,
+        |text| span(text, DIM),
+        Style::new().fg(ACCENT),
+    )];
+    for row in rows {
+        lines.push(line(row, plain, Style::new()));
     }
     lines
 }
@@ -2019,41 +2018,48 @@ fn batch_done(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let inner = area.width as usize;
-    let rows = session.file.total_rows;
+    let rows = summary.rows;
     let missed = rows - summary.matched;
-    let percent = |count: usize| count as f64 / rows.max(1) as f64 * 100.0;
-    let stem = session.file.stem().to_string();
+    let percent = |count: u64| count as f64 / rows.max(1) as f64 * 100.0;
 
     let mut accuracy = vec![plain("   ")];
     for (name, count) in &summary.by_accuracy {
         accuracy.push(span(format!("{name} "), DIM));
-        accuracy.push(bold(mock::thousands(*count)));
+        accuracy.push(bold(format::thousands(*count)));
         accuracy.push(plain("    "));
     }
-    let output = format!("{stem}.geocoded.csv");
+    let output = summary
+        .output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let size = format!(
         "{} rows · {}",
-        mock::thousands(rows),
-        mock::size(summary.output_bytes as f64 / 1e6)
+        format::thousands(rows),
+        format::bytes(summary.output_bytes)
     );
     let mut lines = vec![
         Line::raw(""),
         Line::from(vec![
             plain("   "),
-            bold(mock::thousands(summary.matched)),
+            bold(format::thousands(summary.matched)),
             span(
                 format!(" matched  ·  {:.1}%", percent(summary.matched)),
                 DIM,
             ),
             plain("          "),
-            bold(mock::thousands(missed)),
+            bold(format::thousands(missed)),
             span(format!(" with no match  ·  {:.1}%", percent(missed)), DIM),
         ]),
         Line::from(accuracy),
         Line::from(span(
             format!(
-                "   p50 {:.1} ms  ·  p95 {:.1} ms  ·  p99 {:.1} ms  ·  slowest {:.1} ms  ·  {:.1}s in all",
-                summary.p50, summary.p95, summary.p99, summary.slowest, summary.seconds
+                "   p50 {:.1} ms  ·  p95 {:.1} ms  ·  p99 {:.1} ms  ·  slowest {:.1} ms  ·  {} in all",
+                summary.p50,
+                summary.p95,
+                summary.p99,
+                summary.slowest,
+                format::duration(summary.seconds)
             ),
             DIM,
         )),
@@ -2070,7 +2076,7 @@ fn batch_done(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
     ];
-    lines.extend(output_table(session, inner));
+    lines.extend(output_table(&summary.output_head, inner));
     lines.push(Line::raw(""));
     let mut buttons = vec![plain("  ")];
     for (index, label) in ["Search in the shell", "Done"].iter().enumerate() {
@@ -2084,4 +2090,29 @@ fn batch_done(frame: &mut Frame, area: Rect, app: &App) {
         app,
         &[("←→", "choose"), ("enter", "select"), ("q", "home")],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn colours_json_without_losing_text() {
+        for line in [
+            r#"  "label": "100 Queen Street West, Toronto","#,
+            r#"  "coordinates": ["#,
+            r#"    -79.3839347,"#,
+            r#"  "escaped": "a \"quoted\" word","#,
+            r#"}"#,
+        ] {
+            assert_eq!(text(&json_line(line)).trim(), line.trim(), "{line}");
+        }
+    }
 }

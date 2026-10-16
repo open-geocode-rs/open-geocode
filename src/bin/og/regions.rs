@@ -1,17 +1,11 @@
 //! The region tree the build picker browses: the planet, continents,
-//! countries and sub-regions, each with the size of its download. It is read
-//! from `regions.json`, built from Geofabrik's index.
+//! countries and sub-regions. It is the catalog `catalog/regions.json`, which
+//! `scripts/catalog/catalog.py` generates from pinned upstream snapshots, so
+//! every size and date here is upstream's own.
 
 use std::sync::OnceLock;
 
 use serde::Deserialize;
-
-/// Seconds of build time per MB of download, from an Ontario build on the
-/// development machine. A placeholder until builds record their own rate.
-const SECS_PER_MB: f64 = 0.085;
-
-/// Extracts the preview pretends are already on disk.
-const ON_DISK: [&str; 5] = ["canada", "france", "germany", "japan", "russia"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,13 +19,31 @@ pub enum Kind {
 }
 
 #[derive(Deserialize)]
+struct Catalog {
+    schema: u32,
+    regions: Vec<Entry>,
+}
+
+#[derive(Deserialize)]
 struct Entry {
     id: String,
     name: String,
     kind: Kind,
     parent: Option<String>,
-    bytes: u64,
+    #[serde(default)]
+    aliases: Vec<String>,
+    osm: Osm,
 }
+
+/// The region's OpenStreetMap extract, as the catalog snapshot saw it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Osm {
+    pub url: String,
+    pub bytes: u64,
+}
+
+/// The catalog schema this build reads.
+const SCHEMA: u32 = 1;
 
 pub struct Region {
     pub index: usize,
@@ -43,33 +55,30 @@ pub struct Region {
     pub parent: Option<usize>,
     /// Browsable regions directly below this one, by name.
     pub children: Vec<usize>,
-    pub bytes: u64,
+    /// Other names the region is known by, for search.
+    pub aliases: Vec<String>,
+    pub osm: Osm,
 }
 
 impl Region {
-    pub fn size_mb(&self) -> f64 {
-        self.bytes as f64 / 1e6
-    }
-
-    /// The Pack directory name: the last part of the id.
-    pub fn slug(&self) -> &str {
-        self.id.rsplit('/').next().unwrap_or(&self.id)
+    /// The Pack directory name: the id with its parts joined by `-`, so two
+    /// regions of one name (`georgia`, `us-georgia`) never share one.
+    pub fn slug(&self) -> String {
+        self.id.replace('/', "-")
     }
 
     pub fn is_world(&self) -> bool {
         self.kind == Kind::World
     }
 
-    /// Build time estimated from the download size.
-    pub fn build_secs(&self) -> f64 {
-        self.size_mb() * SECS_PER_MB
-    }
-
-    /// The extract's path if it is already on disk, so no download is needed.
-    pub fn local(&self) -> Option<String> {
-        ON_DISK
-            .contains(&self.id.as_str())
-            .then(|| format!("data/pbf/{}.osm.pbf", self.id))
+    /// The Geofabrik replication state of the extract, which names the time
+    /// its data is from. The planet is published elsewhere and has none.
+    pub fn state_url(&self) -> Option<String> {
+        self.osm
+            .url
+            .strip_suffix("-latest.osm.pbf")
+            .filter(|_| self.osm.url.starts_with("https://download.geofabrik.de/"))
+            .map(|base| format!("{base}-updates/state.txt"))
     }
 
     /// What the regions below are called.
@@ -84,11 +93,12 @@ impl Region {
 
 pub struct Tree {
     regions: Vec<Region>,
+    root: usize,
 }
 
 impl Tree {
     pub fn root(&self) -> &Region {
-        &self.regions[0]
+        &self.regions[self.root]
     }
 
     pub fn get(&self, id: &str) -> Option<&Region> {
@@ -138,12 +148,18 @@ impl Tree {
 
 pub fn tree() -> &'static Tree {
     static TREE: OnceLock<Tree> = OnceLock::new();
-    TREE.get_or_init(load)
+    TREE.get_or_init(|| load(include_str!("../../../catalog/regions.json")))
 }
 
-fn load() -> Tree {
-    let entries: Vec<Entry> = serde_json::from_str(include_str!("regions.json"))
-        .expect("regions.json is a list of regions");
+fn load(text: &str) -> Tree {
+    let catalog: Catalog =
+        serde_json::from_str(text).expect("catalog/regions.json is a region catalog");
+    assert_eq!(
+        catalog.schema, SCHEMA,
+        "catalog/regions.json has schema {}, this build reads {SCHEMA}",
+        catalog.schema
+    );
+    let entries = catalog.regions;
     let index_of = |id: &str| entries.iter().position(|entry| entry.id == id);
     let mut regions: Vec<Region> = entries
         .iter()
@@ -156,9 +172,14 @@ fn load() -> Tree {
             kind: entry.kind,
             parent: entry.parent.as_deref().and_then(index_of),
             children: Vec::new(),
-            bytes: entry.bytes,
+            aliases: entry.aliases.clone(),
+            osm: entry.osm.clone(),
         })
         .collect();
+    let root = regions
+        .iter()
+        .position(Region::is_world)
+        .expect("the catalog has the planet");
     for index in 0..regions.len() {
         if regions[index].kind == Kind::Group {
             continue;
@@ -189,5 +210,26 @@ fn load() -> Tree {
         parts.reverse();
         regions[index].label = parts.join(" / ");
     }
-    Tree { regions }
+    Tree { regions, root }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn the_catalog_is_one_tree_with_distinct_pack_names() {
+        let tree = tree();
+        assert!(tree.root().is_world());
+        let mut slugs = HashSet::new();
+        for region in &tree.regions {
+            assert!(slugs.insert(region.slug()), "{} twice", region.slug());
+            if !region.is_world() {
+                assert!(region.parent.is_some(), "{} has no parent", region.id);
+            }
+            assert!(region.osm.bytes > 0, "{} has no size", region.id);
+        }
+    }
 }
