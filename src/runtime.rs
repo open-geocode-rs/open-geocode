@@ -35,9 +35,11 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub pack: PathBuf,
-    pub demo: PathBuf,
+    /// Static demo files to serve; without them only the API is served.
+    pub demo: Option<PathBuf>,
     pub bind: SocketAddr,
-    pub basemap: PathBuf,
+    /// The basemap PMTiles archive the demo shows, when there is one.
+    pub basemap: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -91,7 +93,7 @@ struct ReverseParams {
 pub async fn serve(options: ServeOptions) -> Result<()> {
     let state = AppState::open(&options.pack)
         .with_context(|| format!("failed to open Pack {}", options.pack.display()))?;
-    let app = build_router(state, &options.demo, &options.basemap);
+    let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
     let listener = TcpListener::bind(options.bind)
         .await
@@ -113,7 +115,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 /// Cloudflare R2, not the Runtime (Decisions 6/35a, amended 2026-06-03).
 ///
 /// Split out from [`serve`] so it can be exercised without binding a socket.
-pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Router {
+pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option<&Path>) -> Router {
     // Read-only API and health routes: GET only (Decision 27). axum would
     // otherwise route HEAD to the GET handler automatically, so `get_only`
     // registers an explicit HEAD responder that returns 405. Other methods fall
@@ -135,14 +137,16 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     // Decisions 6/7/8, amended 2026-06-03); R2's free egress makes PMTiles
     // abuse protection a non-issue. The bare binary hands back the file with
     // native range support and no policy.
-    if basemap.exists() {
-        app = app.route_service("/basemap.pmtiles", ServeFile::new(basemap));
-        println!("Serving basemap {}", basemap.display());
-    } else {
-        eprintln!(
+    match basemap {
+        Some(basemap) if basemap.exists() => {
+            app = app.route_service("/basemap.pmtiles", ServeFile::new(basemap));
+            println!("Serving basemap {}", basemap.display());
+        }
+        Some(basemap) => eprintln!(
             "basemap {} not found; serving demo without a basemap",
             basemap.display()
-        );
+        ),
+        None => {}
     }
 
     // ServeDir keeps local-dev static serving (Decision 10) but its built-in 404
@@ -152,13 +156,18 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     // request-id layer is outermost so it also wraps both fallbacks, which puts
     // the id in every Problem and logs every 500 in one place.
     let error_log = state.error_log.clone();
-    app.method_not_allowed_fallback(method::method_not_allowed)
-        .fallback_service(ServeDir::new(demo).not_found_service(method::not_found.into_service()))
-        .layer(middleware::from_fn_with_state(
-            error_log,
-            request_id::propagate,
-        ))
-        .with_state(state)
+    let app = app.method_not_allowed_fallback(method::method_not_allowed);
+    let app = match demo {
+        Some(demo) => app.fallback_service(
+            ServeDir::new(demo).not_found_service(method::not_found.into_service()),
+        ),
+        None => app.fallback(method::not_found),
+    };
+    app.layer(middleware::from_fn_with_state(
+        error_log,
+        request_id::propagate,
+    ))
+    .with_state(state)
 }
 
 /// A GET-only route that also rejects HEAD with 405, defeating axum's default
@@ -370,7 +379,7 @@ mod router_tests {
         let demo = temp_path("health-demo");
         let no_basemap = temp_path("health-no-basemap");
 
-        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
         assert_eq!(
             send(router.clone(), request("GET", "/healthz"))
                 .await
@@ -382,7 +391,7 @@ mod router_tests {
             StatusCode::OK
         );
 
-        let not_ready = build_router(state_for(&pack, false), &demo, &no_basemap);
+        let not_ready = build_router(state_for(&pack, false), Some(&demo), Some(&no_basemap));
         assert_eq!(
             send(not_ready, request("GET", "/readyz")).await.status,
             StatusCode::SERVICE_UNAVAILABLE
@@ -397,7 +406,7 @@ mod router_tests {
         write_pack(&pack);
         let demo = temp_path("search-demo");
         let no_basemap = temp_path("search-no-basemap");
-        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // Empty query -> 400 invalid_query, Problem Details.
         let reply = send(router.clone(), request("GET", "/search?q=")).await;
@@ -438,7 +447,7 @@ mod router_tests {
         write_pack(&pack);
         let demo = temp_path("reverse-demo");
         let no_basemap = temp_path("reverse-no-basemap");
-        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         let reply = send(router.clone(), request("GET", "/reverse?lon=999&lat=0")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -460,7 +469,7 @@ mod router_tests {
         write_pack(&pack);
         let demo = temp_path("methods-demo");
         let no_basemap = temp_path("methods-no-basemap");
-        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // POST to a GET-only route -> 405 with Allow: GET.
         let reply = send(router.clone(), request("POST", "/search")).await;
@@ -511,7 +520,7 @@ mod router_tests {
         let basemap = temp_path("basemap.pmtiles");
         std::fs::write(&basemap, vec![0u8; 600_000]).expect("write basemap");
 
-        let router = build_router(state_for(&pack, true), &demo, &basemap);
+        let router = build_router(state_for(&pack, true), Some(&demo), Some(&basemap));
 
         // A bounded range is honored as a 206 with exactly the requested bytes.
         let mut req = request("GET", "/basemap.pmtiles");
@@ -633,7 +642,7 @@ mod router_tests {
         let log = ErrorLog::capture();
         let mut state = state_for(&pack, true);
         state.error_log = log.clone();
-        let router = build_router(state, &demo, &no_basemap);
+        let router = build_router(state, Some(&demo), Some(&no_basemap));
 
         for (method, uri, status) in [
             ("GET", "/search?q=", StatusCode::BAD_REQUEST),

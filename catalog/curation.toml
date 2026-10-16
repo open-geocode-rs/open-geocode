@@ -1,0 +1,472 @@
+# Hand decisions applied on top of the pinned upstream snapshots.
+# catalog/catalog.py reads this file; regions.json is generated from it.
+#
+# Keys are our region ids (the Geofabrik download path without the continent
+# and without -latest.osm.pbf), so `canada/ontario`, `germany`, `russia`.
+# Every table carries a `why`. Decisions are grouped by reason, so one `why`
+# covers a group of regions decided for the same reason.
+#
+# Sections:
+#   continents     Top-level Geofabrik extracts that are continents.
+#   planet         Name of the planet entry, which is not in Geofabrik's index.
+#   parent         Where a region sits in the tree, when upstream is wrong or silent.
+#   kind           world, continent, country, subregion or group, when depth is wrong.
+#   iso            ISO 3166 codes. The first is shown; the rest are the same
+#                  territory under another code, used to match OpenAddresses.
+#   covers         Country codes of an extract that covers several countries whole.
+#                  Used to match OpenAddresses; no single code is shown.
+#   names          English display name first, then aliases for search.
+#   accept_names   Upstream names flagged by the generator that are fine as they are.
+
+[continents]
+why = "Geofabrik's top-level extracts with no parent. Russia is also top level upstream but is a country, see parent.transcontinental."
+ids = ["africa", "antarctica", "asia", "australia-oceania", "central-america", "europe", "north-america", "south-america"]
+
+[planet]
+why = "The planet file comes from planet.openstreetmap.org, not from Geofabrik's index."
+name = "World"
+aliases = ["Planet", "Earth"]
+
+# --- Tree --------------------------------------------------------------
+
+[parent.transcontinental]
+why = "Geofabrik puts Russia at the top level with no parent because it spans Europe and Asia. A tree needs one parent; most of its people and its capital are in Europe."
+
+[parent.transcontinental.set]
+russia = "europe"
+
+[parent.islands]
+why = "Island regions Geofabrik lists as their own continent-level extract. They are parts of a country (Azores: Portugal, Canary Islands: Spain), so they browse under it. The id keeps the Geofabrik path."
+
+[parent.islands.set]
+azores = "portugal"
+canary-islands = "spain"
+
+[kind.groups]
+why = "Extracts that overlap other extracts, which already cover every part of them. Kept for direct use; the CLI hides groups from browsing and search."
+
+[kind.groups.set]
+alps = "group"
+britain-and-ireland = "group"
+dach = "group"
+great-britain = "group"
+sea = "group"
+south-africa-and-lesotho = "group"
+us-midwest = "group"
+us-northeast = "group"
+us-pacific = "group"
+us-south = "group"
+us-west = "group"
+
+[kind.multi-country]
+why = "Extracts that hold several countries but are the only extract for at least one of them, so they must stay browsable as countries. Their countries are in covers.multi-country."
+
+[kind.multi-country.set]
+gcc-states = "country"
+guernsey-jersey = "country"
+haiti-and-domrep = "country"
+israel-and-palestine = "country"
+malaysia-singapore-brunei = "country"
+senegal-and-gambia = "country"
+american-oceania = "country"
+
+# --- ISO codes ---------------------------------------------------------
+
+[covers.multi-country]
+why = "Countries each extract covers in full, checked against Geofabrik's polygons with a point in each capital. Upstream lists five GCC codes but the polygon also covers Saudi Arabia (Riyadh), so SA is added. American Oceania covers American Samoa, Guam and the Northern Mariana Islands; it covers only some US Minor Outlying Islands, so UM is left out."
+
+[covers.multi-country.set]
+american-oceania = ["AS", "GU", "MP"]
+gcc-states = ["SA", "AE", "BH", "KW", "OM", "QA"]
+guernsey-jersey = ["GG", "JE"]
+haiti-and-domrep = ["HT", "DO"]
+israel-and-palestine = ["IL", "PS"]
+malaysia-singapore-brunei = ["MY", "SG", "BN"]
+senegal-and-gambia = ["SN", "GM"]
+
+[iso.wrong-upstream]
+why = "Geofabrik tags several Oceania extracts with another country's code (VU for Vanuatu, MH for the Marshall Islands). These are the territories' own codes. Clipperton has no ISO 3166-1 code, only FR-CP."
+
+[iso.wrong-upstream.set]
+ile-de-clipperton = ["FR-CP"]
+pitcairn-islands = ["PN"]
+polynesie-francaise = ["PF", "FR-PF"]
+tokelau = ["TK"]
+wallis-et-futuna = ["WF", "FR-WF"]
+
+[iso.two-codes-upstream]
+why = "Upstream gives both an ISO 3166-1 and an ISO 3166-2 code for one territory. Show the one that fits the tree (3166-2 under a country, 3166-1 at country level); keep the other for matching. OpenAddresses uses vi/ and nc/ sources for these. Taiwan: OpenAddresses and the catalog use TW."
+
+[iso.two-codes-upstream.set]
+new-caledonia = ["NC", "FR-NC"]
+taiwan = ["TW"]
+"us/puerto-rico" = ["US-PR", "PR"]
+"us/us-virgin-islands" = ["US-VI", "VI"]
+
+[iso.french-overseas]
+why = "French overseas departments under france with no code upstream (Guyane has FR-GF upstream). ISO 3166-2:FR and OpenAddresses (fr/971 to fr/976) use the department number; the ISO 3166-1 code is the same territory."
+
+[iso.french-overseas.set]
+"france/guadeloupe" = ["FR-971", "GP"]
+"france/guyane" = ["FR-973", "GF", "FR-GF"]
+"france/martinique" = ["FR-972", "MQ"]
+"france/reunion" = ["FR-974", "RE"]
+"france/mayotte" = ["FR-976", "YT"]
+
+[iso.missing-upstream]
+why = "Single territories with no code upstream that have an ISO 3166 code of their own."
+
+[iso.missing-upstream.set]
+azores = ["PT-20"]
+canary-islands = ["ES-CN"]
+comores = ["KM"]
+isle-of-man = ["IM"]
+"russia/kaliningrad" = ["RU-KGD"]
+"united-kingdom/bermuda" = ["BM"]
+"united-kingdom/falklands" = ["FK"]
+"norway/svalbard-janmayen" = ["SJ"]
+"australia/christmas-island" = ["CX"]
+"australia/cocos-islands" = ["CC"]
+"australia/heard-mcdonald" = ["HM"]
+"australia/norfolk-island" = ["NF"]
+"china/hong-kong" = ["CN-HK", "HK"]
+"china/macau" = ["CN-MO", "MO"]
+
+[iso.kosovo]
+why = "Upstream gives only RS-KM. Kosovo has no ISO 3166-1 code; XK is the code in common use, and OpenAddresses files Kosovo under xk/. RS-KM is dropped: the Serbia extract does not cover Kosovo, so Serbian country-wide data should not count as partly inside it."
+
+[iso.kosovo.set]
+kosovo = ["XK"]
+
+[iso.first-level-subdivisions]
+why = "Subregions that are exactly one ISO 3166-2 subdivision, with no code upstream. Extracts that also hold a neighbour (Brandenburg with Berlin, Lower Saxony with Bremen, New South Wales with the ACT, Central Bohemia with Prague, Hebei with Beijing and Tianjin, Guangdong with Hong Kong and Macau) keep only their own code."
+
+[iso.first-level-subdivisions.set]
+"australia/act" = ["AU-ACT"]
+"australia/new-south-wales" = ["AU-NSW"]
+"australia/northern-territory" = ["AU-NT"]
+"australia/queensland" = ["AU-QLD"]
+"australia/south-australia" = ["AU-SA"]
+"australia/tasmania" = ["AU-TAS"]
+"australia/victoria" = ["AU-VIC"]
+"australia/western-australia" = ["AU-WA"]
+"china/anhui" = ["CN-AH"]
+"china/beijing" = ["CN-BJ"]
+"china/chongqing" = ["CN-CQ"]
+"china/fujian" = ["CN-FJ"]
+"china/gansu" = ["CN-GS"]
+"china/guangdong" = ["CN-GD"]
+"china/guangxi" = ["CN-GX"]
+"china/guizhou" = ["CN-GZ"]
+"china/hainan" = ["CN-HI"]
+"china/hebei" = ["CN-HE"]
+"china/heilongjiang" = ["CN-HL"]
+"china/henan" = ["CN-HA"]
+"china/hubei" = ["CN-HB"]
+"china/hunan" = ["CN-HN"]
+"china/inner-mongolia" = ["CN-NM"]
+"china/jiangsu" = ["CN-JS"]
+"china/jiangxi" = ["CN-JX"]
+"china/jilin" = ["CN-JL"]
+"china/liaoning" = ["CN-LN"]
+"china/ningxia" = ["CN-NX"]
+"china/qinghai" = ["CN-QH"]
+"china/shaanxi" = ["CN-SN"]
+"china/shandong" = ["CN-SD"]
+"china/shanghai" = ["CN-SH"]
+"china/shanxi" = ["CN-SX"]
+"china/sichuan" = ["CN-SC"]
+"china/tianjin" = ["CN-TJ"]
+"china/tibet" = ["CN-XZ"]
+"china/xinjiang" = ["CN-XJ"]
+"china/yunnan" = ["CN-YN"]
+"china/zhejiang" = ["CN-ZJ"]
+"czech-republic/jihocesky" = ["CZ-31"]
+"czech-republic/jihomoravsky" = ["CZ-64"]
+"czech-republic/karlovarsky" = ["CZ-41"]
+"czech-republic/kralovehradecky" = ["CZ-52"]
+"czech-republic/liberecky" = ["CZ-51"]
+"czech-republic/moravskoslezky" = ["CZ-80"]
+"czech-republic/olomoucky" = ["CZ-71"]
+"czech-republic/pardubicky" = ["CZ-53"]
+"czech-republic/plzensky" = ["CZ-32"]
+"czech-republic/praha" = ["CZ-10"]
+"czech-republic/stredocesky" = ["CZ-20"]
+"czech-republic/ustecky" = ["CZ-42"]
+"czech-republic/vysocina" = ["CZ-63"]
+"czech-republic/zlinsky" = ["CZ-72"]
+"germany/baden-wuerttemberg" = ["DE-BW"]
+"germany/bayern" = ["DE-BY"]
+"germany/berlin" = ["DE-BE"]
+"germany/brandenburg" = ["DE-BB"]
+"germany/bremen" = ["DE-HB"]
+"germany/hamburg" = ["DE-HH"]
+"germany/hessen" = ["DE-HE"]
+"germany/mecklenburg-vorpommern" = ["DE-MV"]
+"germany/niedersachsen" = ["DE-NI"]
+"germany/nordrhein-westfalen" = ["DE-NW"]
+"germany/rheinland-pfalz" = ["DE-RP"]
+"germany/saarland" = ["DE-SL"]
+"germany/sachsen" = ["DE-SN"]
+"germany/sachsen-anhalt" = ["DE-ST"]
+"germany/schleswig-holstein" = ["DE-SH"]
+"germany/thueringen" = ["DE-TH"]
+"netherlands/drenthe" = ["NL-DR"]
+"netherlands/flevoland" = ["NL-FL"]
+"netherlands/friesland" = ["NL-FR"]
+"netherlands/gelderland" = ["NL-GE"]
+"netherlands/groningen" = ["NL-GR"]
+"netherlands/limburg" = ["NL-LI"]
+"netherlands/noord-brabant" = ["NL-NB"]
+"netherlands/noord-holland" = ["NL-NH"]
+"netherlands/overijssel" = ["NL-OV"]
+"netherlands/utrecht" = ["NL-UT"]
+"netherlands/zeeland" = ["NL-ZE"]
+"netherlands/zuid-holland" = ["NL-ZH"]
+"poland/dolnoslaskie" = ["PL-02"]
+"poland/kujawsko-pomorskie" = ["PL-04"]
+"poland/lubelskie" = ["PL-06"]
+"poland/lubuskie" = ["PL-08"]
+"poland/lodzkie" = ["PL-10"]
+"poland/malopolskie" = ["PL-12"]
+"poland/mazowieckie" = ["PL-14"]
+"poland/opolskie" = ["PL-16"]
+"poland/podkarpackie" = ["PL-18"]
+"poland/podlaskie" = ["PL-20"]
+"poland/pomorskie" = ["PL-22"]
+"poland/slaskie" = ["PL-24"]
+"poland/swietokrzyskie" = ["PL-26"]
+"poland/warminsko-mazurskie" = ["PL-28"]
+"poland/wielkopolskie" = ["PL-30"]
+"poland/zachodniopomorskie" = ["PL-32"]
+"spain/andalucia" = ["ES-AN"]
+"spain/aragon" = ["ES-AR"]
+"spain/asturias" = ["ES-AS"]
+"spain/cantabria" = ["ES-CB"]
+"spain/castilla-la-mancha" = ["ES-CM"]
+"spain/castilla-y-leon" = ["ES-CL"]
+"spain/cataluna" = ["ES-CT"]
+"spain/ceuta" = ["ES-CE"]
+"spain/extremadura" = ["ES-EX"]
+"spain/galicia" = ["ES-GA"]
+"spain/islas-baleares" = ["ES-IB"]
+"spain/la-rioja" = ["ES-RI"]
+"spain/madrid" = ["ES-MD"]
+"spain/melilla" = ["ES-ML"]
+"spain/murcia" = ["ES-MC"]
+"spain/navarra" = ["ES-NC"]
+"spain/pais-vasco" = ["ES-PV"]
+"spain/valencia" = ["ES-VC"]
+"united-kingdom/england" = ["GB-ENG"]
+"united-kingdom/scotland" = ["GB-SCT"]
+"united-kingdom/wales" = ["GB-WLS"]
+
+# --- Names -------------------------------------------------------------
+
+[names.ids-as-names]
+why = "Geofabrik gives most US states their id as the name (us/alabama)."
+
+[names.ids-as-names.set]
+"us/alabama" = ["Alabama"]
+"us/alaska" = ["Alaska"]
+"us/arizona" = ["Arizona"]
+"us/arkansas" = ["Arkansas"]
+"us/california" = ["California"]
+"us/colorado" = ["Colorado"]
+"us/connecticut" = ["Connecticut"]
+"us/delaware" = ["Delaware"]
+"us/district-of-columbia" = ["District of Columbia", "Washington, D.C."]
+"us/florida" = ["Florida"]
+"us/hawaii" = ["Hawaii"]
+"us/idaho" = ["Idaho"]
+"us/illinois" = ["Illinois"]
+"us/indiana" = ["Indiana"]
+"us/iowa" = ["Iowa"]
+"us/kansas" = ["Kansas"]
+"us/kentucky" = ["Kentucky"]
+"us/louisiana" = ["Louisiana"]
+"us/maine" = ["Maine"]
+"us/maryland" = ["Maryland"]
+"us/massachusetts" = ["Massachusetts"]
+"us/michigan" = ["Michigan"]
+"us/minnesota" = ["Minnesota"]
+"us/mississippi" = ["Mississippi"]
+"us/missouri" = ["Missouri"]
+"us/montana" = ["Montana"]
+"us/nebraska" = ["Nebraska"]
+"us/nevada" = ["Nevada"]
+"us/new-hampshire" = ["New Hampshire"]
+"us/new-jersey" = ["New Jersey"]
+"us/new-mexico" = ["New Mexico"]
+"us/new-york" = ["New York"]
+"us/north-carolina" = ["North Carolina"]
+"us/north-dakota" = ["North Dakota"]
+"us/ohio" = ["Ohio"]
+"us/oklahoma" = ["Oklahoma"]
+"us/oregon" = ["Oregon"]
+"us/pennsylvania" = ["Pennsylvania"]
+"us/puerto-rico" = ["Puerto Rico"]
+"us/rhode-island" = ["Rhode Island"]
+"us/south-carolina" = ["South Carolina"]
+"us/south-dakota" = ["South Dakota"]
+"us/tennessee" = ["Tennessee"]
+"us/texas" = ["Texas"]
+"us/us-virgin-islands" = ["United States Virgin Islands", "US Virgin Islands"]
+"us/utah" = ["Utah"]
+"us/vermont" = ["Vermont"]
+"us/virginia" = ["Virginia"]
+"us/washington" = ["Washington"]
+"us/west-virginia" = ["West Virginia"]
+"us/wisconsin" = ["Wisconsin"]
+"us/wyoming" = ["Wyoming"]
+
+[names.markup]
+why = "Upstream names with HTML markup and the English name in brackets (Poland, Norway). Show the English name; keep the local one for search."
+
+[names.markup.set]
+"norway/nord-norge" = ["Northern Norway", "Nord-Norge"]
+"norway/ostlandet" = ["Eastern Norway", "Østlandet", "Ostlandet"]
+"norway/sorlandet" = ["Southern Norway", "Sørlandet", "Sorlandet"]
+"norway/trondelag" = ["Central Norway", "Trøndelag", "Trondelag"]
+"norway/vestlandet" = ["Western Norway", "Vestlandet"]
+"poland/dolnoslaskie" = ["Lower Silesian Voivodeship", "Dolnośląskie", "Dolnoslaskie"]
+"poland/kujawsko-pomorskie" = ["Kuyavian-Pomeranian Voivodeship", "Kujawsko-pomorskie"]
+"poland/lodzkie" = ["Łódź Voivodeship", "Lodz Voivodeship", "Łódzkie", "Lodzkie"]
+"poland/lubelskie" = ["Lublin Voivodeship", "Lubelskie"]
+"poland/lubuskie" = ["Lubusz Voivodeship", "Lubuskie"]
+"poland/malopolskie" = ["Lesser Poland Voivodeship", "Małopolskie", "Malopolskie"]
+"poland/mazowieckie" = ["Masovian Voivodeship", "Mazowieckie"]
+"poland/opolskie" = ["Opole Voivodeship", "Opolskie"]
+"poland/podkarpackie" = ["Subcarpathian Voivodeship", "Podkarpackie"]
+"poland/podlaskie" = ["Podlaskie Voivodeship", "Podlaskie"]
+"poland/pomorskie" = ["Pomeranian Voivodeship", "Pomorskie"]
+"poland/slaskie" = ["Silesian Voivodeship", "Śląskie", "Slaskie"]
+"poland/swietokrzyskie" = ["Świętokrzyskie Voivodeship", "Swietokrzyskie Voivodeship", "Świętokrzyskie"]
+"poland/warminsko-mazurskie" = ["Warmian-Masurian Voivodeship", "Warmińsko-mazurskie", "Warminsko-mazurskie"]
+"poland/wielkopolskie" = ["Greater Poland Voivodeship", "Wielkopolskie"]
+"poland/zachodniopomorskie" = ["West Pomeranian Voivodeship", "Zachodniopomorskie"]
+
+[names.local-language]
+why = "Upstream uses the local name. Show the English name; keep the local one and its ASCII spelling for search."
+
+[names.local-language.set]
+"czech-republic/jihocesky" = ["South Bohemian Region", "Jihočeský kraj", "Jihocesky"]
+"czech-republic/jihomoravsky" = ["South Moravian Region", "Jihomoravský kraj", "Jihomoravsky"]
+"czech-republic/karlovarsky" = ["Karlovy Vary Region", "Karlovarský kraj", "Karlovarsky"]
+"czech-republic/kralovehradecky" = ["Hradec Králové Region", "Hradec Kralove Region", "Královéhradecký kraj"]
+"czech-republic/liberecky" = ["Liberec Region", "Liberecký kraj", "Liberecky"]
+"czech-republic/moravskoslezky" = ["Moravian-Silesian Region", "Moravskoslezský kraj", "Moravskoslezsky"]
+"czech-republic/olomoucky" = ["Olomouc Region", "Olomoucký kraj", "Olomoucky"]
+"czech-republic/pardubicky" = ["Pardubice Region", "Pardubický kraj", "Pardubicky"]
+"czech-republic/plzensky" = ["Plzeň Region", "Pilsen Region", "Plzeňský kraj", "Plzensky"]
+"czech-republic/praha" = ["Prague", "Praha"]
+"czech-republic/stredocesky" = ["Central Bohemian Region (with Prague)", "Středočeský kraj", "Stredocesky"]
+"czech-republic/ustecky" = ["Ústí nad Labem Region", "Usti nad Labem Region", "Ústecký kraj", "Ustecky"]
+"czech-republic/vysocina" = ["Vysočina Region", "Vysocina Region", "Kraj Vysočina"]
+"czech-republic/zlinsky" = ["Zlín Region", "Zlin Region", "Zlínský kraj", "Zlinsky"]
+"france/basse-normandie" = ["Lower Normandy", "Basse-Normandie"]
+"france/bourgogne" = ["Burgundy", "Bourgogne"]
+"france/bretagne" = ["Brittany", "Bretagne"]
+"france/champagne-ardenne" = ["Champagne-Ardenne", "Champagne Ardenne"]
+"france/corse" = ["Corsica", "Corse"]
+"france/franche-comte" = ["Franche-Comté", "Franche-Comte", "Franche Comte"]
+"france/guyane" = ["French Guiana", "Guyane"]
+"france/haute-normandie" = ["Upper Normandy", "Haute-Normandie"]
+"france/midi-pyrenees" = ["Midi-Pyrénées", "Midi-Pyrenees"]
+"france/picardie" = ["Picardy", "Picardie"]
+"france/provence-alpes-cote-d-azur" = ["Provence-Alpes-Côte d'Azur", "Provence-Alpes-Cote d'Azur", "Provence Alpes-Cote-d'Azur"]
+"france/reunion" = ["Réunion", "Reunion"]
+"france/rhone-alpes" = ["Rhône-Alpes", "Rhone-Alpes"]
+"germany/baden-wuerttemberg" = ["Baden-Württemberg", "Baden-Wuerttemberg", "Baden-Wurttemberg"]
+"germany/baden-wuerttemberg/freiburg-regbez" = ["Freiburg Region", "Regierungsbezirk Freiburg"]
+"germany/baden-wuerttemberg/karlsruhe-regbez" = ["Karlsruhe Region", "Regierungsbezirk Karlsruhe"]
+"germany/baden-wuerttemberg/stuttgart-regbez" = ["Stuttgart Region", "Regierungsbezirk Stuttgart"]
+"germany/baden-wuerttemberg/tuebingen-regbez" = ["Tübingen Region", "Tuebingen Region", "Regierungsbezirk Tübingen"]
+"germany/bayern" = ["Bavaria", "Bayern"]
+"germany/bayern/mittelfranken" = ["Middle Franconia", "Mittelfranken"]
+"germany/bayern/niederbayern" = ["Lower Bavaria", "Niederbayern"]
+"germany/bayern/oberbayern" = ["Upper Bavaria", "Oberbayern"]
+"germany/bayern/oberfranken" = ["Upper Franconia", "Oberfranken"]
+"germany/bayern/oberpfalz" = ["Upper Palatinate", "Oberpfalz"]
+"germany/bayern/schwaben" = ["Swabia", "Schwaben"]
+"germany/bayern/unterfranken" = ["Lower Franconia", "Unterfranken"]
+"germany/brandenburg" = ["Brandenburg (with Berlin)", "Brandenburg"]
+"germany/hessen" = ["Hesse", "Hessen"]
+"germany/mecklenburg-vorpommern" = ["Mecklenburg-Western Pomerania", "Mecklenburg-Vorpommern"]
+"germany/niedersachsen" = ["Lower Saxony (with Bremen)", "Lower Saxony", "Niedersachsen"]
+"germany/nordrhein-westfalen" = ["North Rhine-Westphalia", "Nordrhein-Westfalen"]
+"germany/nordrhein-westfalen/arnsberg-regbez" = ["Arnsberg Region", "Regierungsbezirk Arnsberg"]
+"germany/nordrhein-westfalen/detmold-regbez" = ["Detmold Region", "Regierungsbezirk Detmold"]
+"germany/nordrhein-westfalen/duesseldorf-regbez" = ["Düsseldorf Region", "Duesseldorf Region", "Dusseldorf Region", "Regierungsbezirk Düsseldorf"]
+"germany/nordrhein-westfalen/koeln-regbez" = ["Cologne Region", "Köln", "Koeln", "Regierungsbezirk Köln"]
+"germany/nordrhein-westfalen/muenster-regbez" = ["Münster Region", "Muenster Region", "Munster Region", "Regierungsbezirk Münster"]
+"germany/rheinland-pfalz" = ["Rhineland-Palatinate", "Rheinland-Pfalz"]
+"germany/sachsen" = ["Saxony", "Sachsen"]
+"germany/sachsen-anhalt" = ["Saxony-Anhalt", "Sachsen-Anhalt"]
+"germany/thueringen" = ["Thuringia", "Thüringen", "Thueringen"]
+"italy/centro" = ["Central Italy", "Centro"]
+"italy/isole" = ["Insular Italy", "Isole"]
+"italy/nord-est" = ["Northeast Italy", "Nord-Est"]
+"italy/nord-ovest" = ["Northwest Italy", "Nord-Ovest"]
+"italy/sud" = ["Southern Italy", "Sud"]
+"brazil/centro-oeste" = ["Central-West Region", "Centro-Oeste"]
+"brazil/nordeste" = ["Northeast Region", "Nordeste"]
+"brazil/norte" = ["North Region", "Norte"]
+"brazil/sudeste" = ["Southeast Region", "Sudeste"]
+"brazil/sul" = ["South Region", "Sul"]
+"japan/chubu" = ["Chubu", "Chūbu"]
+"japan/chugoku" = ["Chugoku", "Chūgoku"]
+"japan/hokkaido" = ["Hokkaido", "Hokkaidō"]
+"japan/kansai" = ["Kansai", "Kinki"]
+"japan/kanto" = ["Kanto", "Kantō"]
+"japan/kyushu" = ["Kyushu", "Kyūshū"]
+"japan/tohoku" = ["Tohoku", "Tōhoku"]
+"netherlands/noord-brabant" = ["North Brabant", "Noord-Brabant"]
+"netherlands/noord-holland" = ["North Holland", "Noord-Holland"]
+"netherlands/zuid-holland" = ["South Holland", "Zuid-Holland"]
+"spain/andalucia" = ["Andalusia", "Andalucía", "Andalucia"]
+"spain/aragon" = ["Aragon", "Aragón"]
+"spain/castilla-y-leon" = ["Castile and León", "Castile and Leon", "Castilla y León", "Castilla y Leon"]
+"spain/cataluna" = ["Catalonia", "Cataluña", "Cataluna", "Catalunya"]
+"spain/islas-baleares" = ["Balearic Islands", "Islas Baleares", "Illes Balears"]
+"spain/navarra" = ["Navarre", "Navarra"]
+"spain/pais-vasco" = ["Basque Country", "País Vasco", "Pais Vasco", "Euskadi"]
+"spain/valencia" = ["Valencian Community", "Valencia", "Comunitat Valenciana"]
+comores = ["Comoros", "Comores"]
+ile-de-clipperton = ["Clipperton Island", "Île de Clipperton", "Ile de Clipperton"]
+polynesie-francaise = ["French Polynesia", "Polynésie française", "Polynesie francaise"]
+wallis-et-futuna = ["Wallis and Futuna", "Wallis et Futuna"]
+
+[names.country-names]
+why = "Upstream uses an older, informal or descriptive name. Show the common English short name; keep the upstream name for search."
+
+[names.country-names.set]
+bosnia-herzegovina = ["Bosnia and Herzegovina", "Bosnia-Herzegovina"]
+congo-brazzaville = ["Republic of the Congo", "Congo-Brazzaville", "Congo (Republic/Brazzaville)"]
+congo-democratic-republic = ["Democratic Republic of the Congo", "DR Congo", "Congo-Kinshasa", "Congo (Democratic Republic/Kinshasa)"]
+macedonia = ["North Macedonia", "Macedonia"]
+myanmar = ["Myanmar", "Burma", "Myanmar (a.k.a. Burma)"]
+russia = ["Russia", "Russian Federation"]
+swaziland = ["Eswatini", "Swaziland"]
+us = ["United States", "United States of America", "USA"]
+"russia/south-fed-district" = ["Southern Federal District", "South Federal District"]
+"indonesia/nusa-tenggara" = ["Nusa Tenggara", "Nusa-Tenggara"]
+
+[names.search-aliases]
+why = "The upstream name is fine but search should also find the other common name, or the countries inside a multi-country extract."
+
+[names.search-aliases.set]
+cape-verde = ["Cape Verde", "Cabo Verde"]
+czech-republic = ["Czech Republic", "Czechia"]
+east-timor = ["East Timor", "Timor-Leste"]
+ivory-coast = ["Ivory Coast", "Côte d'Ivoire", "Cote d'Ivoire"]
+turkey = ["Turkey", "Türkiye", "Turkiye"]
+dach = ["Germany, Austria, Switzerland", "DACH"]
+gcc-states = ["GCC States", "Gulf Cooperation Council", "Saudi Arabia", "United Arab Emirates", "Bahrain", "Kuwait", "Oman", "Qatar"]
+guernsey-jersey = ["Guernsey and Jersey", "Guernsey", "Jersey"]
+haiti-and-domrep = ["Haiti and Dominican Republic", "Haiti", "Dominican Republic"]
+israel-and-palestine = ["Israel and Palestine", "Israel", "Palestine"]
+malaysia-singapore-brunei = ["Malaysia, Singapore, and Brunei", "Malaysia", "Singapore", "Brunei"]
+senegal-and-gambia = ["Senegal and Gambia", "Senegal", "Gambia"]
+american-oceania = ["American Oceania", "American Samoa", "Guam", "Northern Mariana Islands"]
+ireland-and-northern-ireland = ["Ireland and Northern Ireland", "Ireland", "Northern Ireland"]

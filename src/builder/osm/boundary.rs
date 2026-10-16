@@ -488,14 +488,19 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
 
 /// Build boundary polygons from resolved boundary ways and relations.
 /// `member_lines` holds the resolved vertices of every relation member way,
-/// `None` when a member could not be fully resolved.
+/// `None` when a member could not be fully resolved. `check` is asked every
+/// [`CHECK_EVERY`] boundaries whether to go on, and its error is returned.
 pub(crate) fn build_boundaries(
     ways: &[BoundaryWay],
     relations: &[BoundaryRelationStub],
     member_lines: &HashMap<i64, Option<&[Vertex]>>,
-) -> BoundarySet {
+    check: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<BoundarySet> {
     let mut candidates = Vec::new();
-    for way in ways {
+    for (index, way) in ways.iter().enumerate() {
+        if index % CHECK_EVERY == 0 {
+            check()?;
+        }
         if let Some(boundary) = boundary_from_way(way) {
             candidates.push(BoundaryCandidate {
                 source_object_type: OsmObjectType::Way,
@@ -504,7 +509,10 @@ pub(crate) fn build_boundaries(
             });
         }
     }
-    for stub in relations {
+    for (index, stub) in relations.iter().enumerate() {
+        if index % CHECK_EVERY == 0 {
+            check()?;
+        }
         if let Some(boundary) = boundary_from_relation(stub, member_lines) {
             candidates.push(BoundaryCandidate {
                 source_object_type: OsmObjectType::Relation,
@@ -515,14 +523,18 @@ pub(crate) fn build_boundaries(
     }
     // Layers come from how the boundaries nest, which is only knowable once
     // every candidate is in hand.
+    check()?;
     let unmatched_admin_ids = assign_layers_by_containment(&mut candidates);
     let derived_countries = derived_country_records(&candidates);
-    BoundarySet {
+    Ok(BoundarySet {
         candidates,
         derived_countries,
         unmatched_admin_ids,
-    }
+    })
 }
+
+/// Boundaries assembled between two checks of whether the build goes on.
+const CHECK_EVERY: usize = 256;
 
 /// Region boundaries whose ISO 3166-2 code names a country that has no
 /// country boundary in the input get a derived country record.
@@ -1532,7 +1544,7 @@ mod tests {
             square(2, "3", "関東地方", None, 4.0),
             square(3, "4", "千葉県", None, 1.0),
         ];
-        let set = build_boundaries(&ways, &[], &HashMap::new());
+        let set = build_boundaries(&ways, &[], &HashMap::new(), || Ok(())).expect("boundaries");
         let groups = set.region_groups(&[100, 101, 102]);
         assert_eq!(groups, HashMap::from([(102, vec![101])]));
     }
@@ -1593,7 +1605,7 @@ mod tests {
             .iter()
             .map(|(way_id, line): (&i64, &Option<Vec<Vertex>>)| (*way_id, line.as_deref()))
             .collect();
-        let set = build_boundaries(&[], &relations, &member_lines);
+        let set = build_boundaries(&[], &relations, &member_lines, || Ok(())).expect("boundaries");
         assert_eq!(
             set.len(),
             1,

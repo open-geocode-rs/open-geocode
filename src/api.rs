@@ -165,7 +165,9 @@ pub struct Reverse {
 /// | `street` | a point on a street or range line (`representative_point`, reverse `street`) |
 /// | `centroid` | the centre of a drawn way or relation (`centroid`) |
 /// | `approximate` | a node or derived point standing for something larger: a place node, a postcode |
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// Accuracies order from the most precise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Accuracy {
     Rooftop,

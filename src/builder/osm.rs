@@ -42,10 +42,11 @@ mod test_pbf;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -56,7 +57,7 @@ use crate::{
     alloc,
     builder::{
         plan::{BuildPlan, plan_build},
-        progress::{item_progress_bar, stage_progress},
+        progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
     },
     extsort::{ExternalSorter, SortStats, Spool},
@@ -68,7 +69,7 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{Record, RejectedRecord},
+    record::{OSM_DATASET, Record, RejectedRecord},
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
@@ -78,6 +79,7 @@ use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_co
 use emit::{FeatureOutput, emit_features};
 use emitted::Emitted;
 use nodes::join_nodes;
+pub use pbf::replication_timestamp;
 use pbf::{for_each_block, input_bytes};
 use postcode::PostcodeAccumulator;
 use scan::scan_block;
@@ -86,7 +88,7 @@ use spill::{NodeRequest, PendingRecord, ResolvedRef, WayFeature, WayKind};
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct BuildOsmOptions {
     pub input: PathBuf,
     pub pack: PathBuf,
@@ -98,6 +100,44 @@ pub struct BuildOsmOptions {
     pub scratch_dir: Option<PathBuf>,
     /// Build even when the pre-flight check finds too little memory or disk.
     pub force: bool,
+    /// What the input is, for example a region id, kept in the build report.
+    pub input_source: Option<String>,
+    /// Told about each stage as it starts, advances and finishes, and about
+    /// the plan's warnings.
+    pub observer: Arc<dyn BuildObserver>,
+    /// Set to stop the build: it then fails with
+    /// [`crate::builder::BuildCancelled`] and publishes nothing.
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl Default for BuildOsmOptions {
+    fn default() -> Self {
+        Self {
+            input: PathBuf::new(),
+            pack: PathBuf::new(),
+            memory_budget_bytes: None,
+            scratch_dir: None,
+            force: false,
+            input_source: None,
+            observer: Arc::new(TerminalObserver::new()),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl fmt::Debug for BuildOsmOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BuildOsmOptions")
+            .field("input", &self.input)
+            .field("pack", &self.pack)
+            .field("memory_budget_bytes", &self.memory_budget_bytes)
+            .field("scratch_dir", &self.scratch_dir)
+            .field("force", &self.force)
+            .field("input_source", &self.input_source)
+            .field("cancel", &self.cancel)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Plan a build of `options` on this machine: probe it, size the budget and
@@ -126,8 +166,8 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
 /// one pool serves every stage.
 pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
     let started = Instant::now();
-    for warning in &plan.warnings {
-        eprintln!("warning: {warning}");
+    for warning in plan.shortfalls.iter().chain(&plan.warnings) {
+        options.observer.warned(warning);
     }
     let budget = usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX);
     // The sorters and the parser's lattice cache split what the others leave
@@ -147,6 +187,8 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         },
     )?;
     let scratch = Arc::clone(writer.scratch());
+    scratch.cancel_on(Arc::clone(&options.cancel));
+    let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel));
     let input_bytes = input_bytes(&options.input)?;
     // Spill files stay in the page cache while they fit in a quarter of what
     // the build leaves free: the rest keeps the Pack and the input it
@@ -161,8 +203,11 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         report: BuilderReport {
             schema_version: BUILD_REPORT_SCHEMA_VERSION,
             input: options.input.display().to_string(),
+            input_source: options.input_source.clone(),
+            input_replication_timestamp: replication_timestamp(&options.input)?,
             pack: options.pack.display().to_string(),
             input_bytes,
+            datasets: vec![OSM_DATASET.to_string()],
             ..BuilderReport::default()
         },
         audit: Audit::create(writer.generation())?,
@@ -192,7 +237,8 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let mut way_blobs = Vec::new();
     for_each_block(
         &options.input,
-        "1/8 scan OSM objects",
+        &progress,
+        BuildStage::Scan,
         None,
         |offset, block| Ok((offset, scan_block(&block))),
         |(offset, output)| {
@@ -237,10 +283,14 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         .filter(|way_id| !boundary_feature_ids.contains(way_id))
         .collect::<HashSet<_>>();
     let mut members: HashMap<i64, (u64, usize)> = HashMap::new();
-    if !member_ids.is_empty() {
+    if member_ids.is_empty() {
+        progress.start(BuildStage::BoundaryMembers, Some(0))?;
+        progress.finish(BuildStage::BoundaryMembers);
+    } else {
         for_each_block(
             &options.input,
-            "2/8 read boundary member ways",
+            &progress,
+            BuildStage::BoundaryMembers,
             Some(&way_blobs),
             |_, block| Ok(member_ways(&block, &member_ids)),
             |found| {
@@ -269,6 +319,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         &node_blobs,
         requests.finish()?,
         &mut resolved,
+        &progress,
     )?;
     build.report.geometry_resolution.resolved_node_refs = join.resolved;
     build.report.phases.node_join_ms = phase.elapsed().as_millis();
@@ -277,21 +328,23 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let phase = Instant::now();
     let resolved_stats = resolved.stats();
     let mut boundary_ways = Vec::new();
-    let progress = item_progress_bar(features.written(), "4/8 assemble ways");
+    progress.start(BuildStage::AssembleWays, Some(features.written()))?;
     let mut member_vertices = emit_features(
         features.into_reader()?,
         resolved.finish()?,
         |output: FeatureOutput| {
-            progress.inc(1);
+            progress.advance(1);
+            progress.check()?;
             boundary_ways.extend(output.boundary_ways);
             build.absorb(output.emitted)
         },
     )?;
-    progress.finish_with_message("4/8 assemble ways complete");
+    progress.finish(BuildStage::AssembleWays);
     build.report.phases.feature_emission_ms = phase.elapsed().as_millis();
 
     // Admin boundaries, their place records and postcode centroids.
     let phase = Instant::now();
+    progress.start(BuildStage::Boundaries, None)?;
     let member_vertices: HashMap<i64, Option<Vec<Vertex>>> = members
         .into_iter()
         .map(|(way_id, (owner, count))| {
@@ -313,7 +366,9 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     for (way_id, line) in &member_vertices {
         member_lines.insert(*way_id, line.as_deref());
     }
-    let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines);
+    let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines, || {
+        progress.check()
+    })?;
     build
         .report
         .unmatched_admin_level_ids
@@ -336,6 +391,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         }
         build.push(Record::Postcode(record), None)?;
     }
+    progress.finish(BuildStage::Boundaries);
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
 
     // Context records first: once their ids are known, the boundary index can
@@ -379,7 +435,8 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         ordered.into_reader()?,
         context_count,
         &index,
-        "5/8 write context records",
+        &progress,
+        BuildStage::ContextRecords,
     )?;
     report.phases.context_record_write_ms = phase.elapsed().as_millis();
 
@@ -390,7 +447,8 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         records.finish()?,
         record_stats.items,
         &index,
-        "6/8 write records",
+        &progress,
+        BuildStage::Records,
     )?;
     drop(index);
     report.phases.record_write_ms = phase.elapsed().as_millis();
@@ -398,16 +456,16 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let phase = Instant::now();
     report.scratch.spilled_bytes = scratch.spilled_bytes();
     report.scratch.peak_tracked_bytes = memory.peak() as u64;
-    let progress = stage_progress("7/8 finish Pack indexes");
+    progress.start(BuildStage::Indexes, None)?;
     let (mut sealed, mut stats) = writer.seal()?;
-    progress.finish_with_message("7/8 finish Pack indexes complete");
+    progress.finish(BuildStage::Indexes);
     report.phases.pack_seal_ms = phase.elapsed().as_millis();
 
     // The parser learns from the sealed Pack's dictionaries and the records
     // drawn while they were written, and its weights join the Pack before it
     // is published.
     let phase = Instant::now();
-    let progress = stage_progress("8/8 train address parser");
+    progress.start(BuildStage::Parser, None)?;
     // By now the build has used memory and page cache a fresh process would
     // have: sample again what is left.
     let resources = Resources::probe();
@@ -423,7 +481,8 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
     }
     drop(scratch);
-    progress.finish_with_message("8/8 train address parser complete");
+    progress.finish(BuildStage::Parser);
+    progress.check()?;
     report.parser_training = training;
     report.phases.parser_training_ms = phase.elapsed().as_millis();
 
@@ -551,9 +610,10 @@ fn write_ordered(
     records: impl Iterator<Item = Result<PendingRecord>> + Send,
     total: u64,
     index: &BoundaryIndex,
-    message: &'static str,
+    progress: &Progress,
+    stage: BuildStage,
 ) -> Result<()> {
-    let progress = item_progress_bar(total, message);
+    progress.start(stage, Some(total))?;
     let mut preparer = writer.preparer();
     // One thread reads and prepares the next batch while this one appends the
     // batch before: the store, the text index and the spatial pairs take
@@ -598,11 +658,12 @@ fn write_ordered(
             }
             let len = prepared.len() as u64;
             writer.commit(prepared)?;
-            progress.inc(len);
+            progress.advance(len);
+            progress.check()?;
         }
         Ok(())
     })?;
-    progress.finish_with_message(format!("{message} complete"));
+    progress.finish(stage);
     Ok(())
 }
 
@@ -647,6 +708,7 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use crate::{
+        builder::progress::StageUnit,
         pack::{PackReader, RecordPointPrecision},
         record::Record,
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
@@ -1439,6 +1501,108 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("osmium sort"), "{error:#}");
+        assert!(!dir.join("pack").join("CURRENT").exists());
+    }
+
+    /// Records what an observer is told, in order.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<(BuildStage, &'static str, Option<u64>)>>);
+
+    impl BuildObserver for Recorder {
+        fn started(&self, stage: BuildStage, total: Option<u64>) {
+            self.0
+                .lock()
+                .expect("events")
+                .push((stage, "started", total));
+        }
+
+        fn advanced(&self, units: u64) {
+            let mut events = self.0.lock().expect("events");
+            let stage = events.last().expect("a stage is running").0;
+            events.push((stage, "advanced", Some(units)));
+        }
+
+        fn finished(&self, stage: BuildStage) {
+            self.0
+                .lock()
+                .expect("events")
+                .push((stage, "finished", None));
+        }
+
+        fn warned(&self, _: &str) {}
+    }
+
+    #[test]
+    fn tells_the_observer_every_stage_in_order_with_its_work() {
+        let dir = temp_dir("observed");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let recorder = Arc::new(Recorder::default());
+        let report = build_osm_pack(BuildOsmOptions {
+            input: input.clone(),
+            pack: dir.join("pack"),
+            input_source: Some("town".into()),
+            observer: Arc::clone(&recorder) as Arc<dyn BuildObserver>,
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        assert_eq!(report.input_source.as_deref(), Some("town"));
+        assert!(report.resources.threads > 0);
+        assert_eq!(report.datasets, [OSM_DATASET]);
+
+        let events = recorder.0.lock().expect("events");
+        let order: Vec<BuildStage> = events
+            .iter()
+            .filter(|(_, event, _)| *event == "started")
+            .map(|(stage, _, _)| *stage)
+            .collect();
+        assert_eq!(order, BuildStage::ALL);
+        for stage in BuildStage::ALL {
+            let total = events
+                .iter()
+                .find(|(own, event, _)| *own == stage && *event == "started")
+                .and_then(|(_, _, total)| *total);
+            let done: u64 = events
+                .iter()
+                .filter(|(own, event, _)| *own == stage && *event == "advanced")
+                .filter_map(|(_, _, units)| *units)
+                .sum();
+            match stage.unit() {
+                StageUnit::None => assert_eq!(total, None, "{stage:?}"),
+                _ => assert_eq!(total, Some(done), "{stage:?} counts all its work"),
+            }
+            assert!(
+                events.contains(&(stage, "finished", None)),
+                "{stage:?} finishes"
+            );
+        }
+        assert_eq!(
+            events
+                .iter()
+                .find(|(stage, event, _)| *stage == BuildStage::Scan && *event == "started")
+                .and_then(|(_, _, total)| *total),
+            Some(fs::metadata(&input).expect("input").len()),
+            "the scan is measured in bytes of the input"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_build_publishes_nothing() {
+        let dir = temp_dir("cancelled");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let error = build_osm_pack(BuildOsmOptions {
+            input,
+            pack: dir.join("pack"),
+            cancel: Arc::new(AtomicBool::new(true)),
+            ..BuildOsmOptions::default()
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::builder::BuildCancelled>()
+                .is_some()
+        );
         assert!(!dir.join("pack").join("CURRENT").exists());
     }
 }

@@ -15,6 +15,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check region catalog
+        run: python3 -I catalog/catalog.py check
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -26,5 +29,8 @@ jobs:
       - name: Check lints
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check lints with the og interface
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-features

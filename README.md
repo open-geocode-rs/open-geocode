@@ -47,6 +47,29 @@ Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machin
    cargo run --release -- serve --pack data/pack
    ```
 
+## The og interface
+
+`og` is the interactive way to do the same: pick a region, build its Pack, search it, and geocode CSV files.
+
+```
+cargo run --release --features tui --bin og
+```
+
+Regions come from the catalog in `catalog/regions.json`, generated from pinned upstream snapshots (see `catalog/README.md`).
+`og` downloads the region's OpenStreetMap extract, checks it against its published MD5 sum, and builds the Pack on this machine.
+Extracts and Packs live in the og home: `OG_HOME` when set, otherwise the platform's local data directory.
+An extract already at `<home>/pbf/<region id>.osm.pbf` is used without downloading.
+Before a build starts, `og` shows the builder's plan: the memory budget and threads sized to this machine, and the memory and disk the extract needs against what is free.
+A build that does not fit is not started unless forced (`f`, or `og build --force`).
+Time estimates appear once a build of a similar size has finished on the same machine; they are scaled from it, never assumed.
+
+The same work runs without the interface:
+
+```
+og build --region canada/ontario
+og serve canada-ontario
+```
+
 ## What's next
 
 I'm actively working on turning open-geocode into a free batch geocoder for the whole planet: drop in a spreadsheet of addresses, get it back with coordinates.

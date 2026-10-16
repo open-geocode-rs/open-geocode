@@ -6,11 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use indicatif::ProgressBar;
 use osmpbf::{Blob, BlobDecode, BlobReader, ByteOffset, PrimitiveBlock};
 use rayon::prelude::*;
 
-use crate::builder::progress::{byte_progress_bar, item_progress_bar};
+use crate::builder::progress::{BuildStage, Progress};
 
 const READ_BUFFER_BYTES: usize = 4 << 20;
 /// Blobs decoded per parallel batch, per worker thread.
@@ -21,10 +20,12 @@ const BLOBS_PER_THREAD: usize = 4;
 /// offsets are read, which lets later passes skip blocks they do not need.
 ///
 /// Memory stays bounded: one batch of blobs is decoded at a time while the
-/// next is read.
+/// next is read. The stage is measured in bytes when the whole file is read
+/// and in blocks when only `offsets` are.
 pub(crate) fn for_each_block<T, M, S>(
     input: &Path,
-    message: &'static str,
+    progress: &Progress,
+    stage: BuildStage,
     offsets: Option<&[u64]>,
     map: M,
     mut sink: S,
@@ -35,10 +36,11 @@ where
     S: FnMut(T) -> Result<()>,
 {
     let batch_size = rayon::current_num_threads() * BLOBS_PER_THREAD;
-    let progress = match offsets {
-        Some(offsets) => item_progress_bar(offsets.len() as u64, message),
-        None => byte_progress_bar(input_bytes(input)?, message),
+    let total = match offsets {
+        Some(offsets) => offsets.len() as u64,
+        None => input_bytes(input)?,
     };
+    progress.start(stage, Some(total))?;
     let file = File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
     let reader = BufReader::with_capacity(
         READ_BUFFER_BYTES,
@@ -59,7 +61,7 @@ where
                 match offsets {
                     Some(offsets) => {
                         let offset = *offsets.get(index)?;
-                        progress_for_reader.inc(1);
+                        progress_for_reader.advance(1);
                         Some(blobs.blob_from_offset(ByteOffset(offset)))
                     }
                     None => blobs.next(),
@@ -94,6 +96,7 @@ where
 
         // Dropping the receiver on an early return stops the reader thread.
         for batch in receiver {
+            progress.check()?;
             let outputs = batch?
                 .par_iter()
                 .map(|blob| {
@@ -114,8 +117,27 @@ where
         }
         Ok(())
     })?;
-    progress.finish_with_message(format!("{message} complete"));
+    progress.finish(stage);
     Ok(())
+}
+
+/// When the extract's data was taken from OpenStreetMap, as its header
+/// states it, in seconds since the Unix epoch. `None` when the header does
+/// not say; Geofabrik and planet extracts do.
+pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
+    let file = File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
+    let mut blobs = BlobReader::new(BufReader::new(file));
+    let Some(blob) = blobs.next() else {
+        return Ok(None);
+    };
+    let blob = blob.with_context(|| format!("failed to read {}", input.display()))?;
+    match blob
+        .decode()
+        .with_context(|| format!("failed to read the header of {}", input.display()))?
+    {
+        BlobDecode::OsmHeader(header) => Ok(header.osmosis_replication_timestamp()),
+        BlobDecode::OsmData(_) | BlobDecode::Unknown(_) => Ok(None),
+    }
 }
 
 pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
@@ -126,14 +148,14 @@ pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
 
 struct ProgressReader<R> {
     inner: R,
-    progress: Option<ProgressBar>,
+    progress: Option<Progress>,
 }
 
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let bytes_read = self.inner.read(buffer)?;
         if let Some(progress) = &self.progress {
-            progress.inc(bytes_read as u64);
+            progress.advance(bytes_read as u64);
         }
         Ok(bytes_read)
     }

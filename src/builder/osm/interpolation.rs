@@ -235,13 +235,13 @@ fn validate_range(
         Some(NumberParity::Odd) if start % 2 != 1 || end % 2 != 1 => {
             return Err(CandidateIssue::InterpolationInvalidParity);
         }
-        Some(NumberParity::Even) if start % 2 != 0 || end % 2 != 0 => {
+        Some(NumberParity::Even) if !start.is_multiple_of(2) || !end.is_multiple_of(2) => {
             return Err(CandidateIssue::InterpolationInvalidParity);
         }
         _ => {}
     }
 
-    if (end - start) % rule.step != 0 {
+    if !(end - start).is_multiple_of(rule.step) {
         return Err(CandidateIssue::InterpolationInvalidNumberRange);
     }
 

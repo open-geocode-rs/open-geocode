@@ -12,7 +12,9 @@ use serde_json::Value;
 use open_geocode::{
     alloc::CountingAlloc,
     api,
-    batch::{BatchGeocodeOptions, CoordinateJoinOptions, parse_field_groups, run_batch_geocode},
+    batch::{
+        BatchGeocodeOptions, Column, CoordinateJoinOptions, parse_field_groups, run_batch_geocode,
+    },
     bench::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
@@ -465,6 +467,7 @@ async fn main() -> Result<()> {
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
                 force,
+                ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;
             // One pool serves every stage of the build, sized by the plan
@@ -603,9 +606,9 @@ async fn main() -> Result<()> {
         } => {
             serve(ServeOptions {
                 pack,
-                demo,
+                demo: Some(demo),
                 bind,
-                basemap,
+                basemap: Some(basemap),
             })
             .await
         }
@@ -896,16 +899,17 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         pack,
         input,
         output: output.clone(),
-        audit: audit.clone(),
+        audit: Some(audit.clone()),
         address_field_groups,
-        locality_field,
-        region_field,
-        postcode_field,
+        locality_field: locality_field.map(Column::Named),
+        region_field: region_field.map(Column::Named),
+        postcode_field: postcode_field.map(Column::Named),
         layer,
         limit,
         lat_column,
         lon_column,
         join,
+        ..BatchGeocodeOptions::default()
     })?;
     write_json(serde_json::json!({
         "rows": report.rows,

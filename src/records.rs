@@ -381,7 +381,7 @@ impl RecordsWriter {
         if self.strings.segment_full(self.record_count) {
             self.strings.start_segment(self.record_count);
         }
-        if self.record_count % BLOCK_RECORDS == 0 {
+        if self.record_count.is_multiple_of(BLOCK_RECORDS) {
             self.flush_block()?;
             self.block_base = point;
         }

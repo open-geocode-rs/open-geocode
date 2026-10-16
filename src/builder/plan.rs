@@ -53,7 +53,11 @@ pub struct BuildPlan {
     pub scratch_disk_free_bytes: Option<u64>,
     pub output_disk_needed_bytes: u64,
     pub output_disk_free_bytes: Option<u64>,
+    /// Needs within 10% of what is free.
     pub warnings: Vec<String>,
+    /// Needs past what is free, each with how to fix it. A plan has any only
+    /// when forced.
+    pub shortfalls: Vec<String>,
     /// Whether the build was told to run despite a shortfall.
     pub forced: bool,
 }
@@ -168,7 +172,7 @@ pub fn plan_build(
             shortfalls.join("\n  ")
         );
     }
-    plan.warnings.extend(shortfalls);
+    plan.shortfalls = shortfalls;
     Ok(plan)
 }
 
@@ -186,7 +190,7 @@ mod tests {
         assert!(message.contains("disk"), "{message}");
         let plan = plan_build(u64::MAX / 8, &scratch, &scratch, None, true).expect("forced");
         assert!(plan.forced);
-        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        assert_eq!(plan.shortfalls.len(), 2, "{:?}", plan.shortfalls);
     }
 
     #[test]

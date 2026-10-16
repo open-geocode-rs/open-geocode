@@ -12,7 +12,10 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use osmpbf::{Element, PrimitiveBlock};
 
-use crate::extsort::{ExternalSorter, Sorted};
+use crate::{
+    builder::progress::{BuildStage, Progress},
+    extsort::{ExternalSorter, Sorted},
+};
 
 use super::{
     address::{collect_addr_tags_from_map, collect_clean_tags},
@@ -70,6 +73,7 @@ pub(crate) fn join_nodes(
     node_blobs: &[u64],
     requests: Sorted<NodeRequest>,
     resolved: &mut ExternalSorter<ResolvedRef>,
+    progress: &Progress,
 ) -> Result<JoinStats> {
     let mut join = Join {
         requests,
@@ -80,7 +84,8 @@ pub(crate) fn join_nodes(
     join.advance()?;
     for_each_block(
         input,
-        "3/8 join node coordinates",
+        progress,
+        BuildStage::NodeJoin,
         Some(node_blobs),
         |_, block| Ok(decode_nodes(&block)),
         |block| join.block(block, resolved),

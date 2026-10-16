@@ -76,8 +76,8 @@ async fn responses_match_the_committed_examples() {
     let ids = write_pack(&pack);
     let router = build_router(
         AppState::open(&pack).expect("open pack"),
-        &pack.join("demo"),
-        &pack.join("basemap.pmtiles"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
     );
 
     let address = get(&router, "/search?q=10%20King%20Street").await;

@@ -341,10 +341,15 @@ impl PackWriter {
         let string_count = records.string_count();
         let context_tuple_count = contexts.tuple_count();
 
+        // Each section can take minutes on a large input: a build asked to
+        // stop does so between them.
         records.finish(&mut pack)?;
+        scratch.check_cancelled()?;
         contexts.finish(&mut pack)?;
         let text_commit = text.finish(&mut pack)?;
+        scratch.check_cancelled()?;
         let spatial_commit = spatial.finish(&mut pack)?;
+        scratch.check_cancelled()?;
         dictionaries.finish(&mut pack, &context_names)?;
         drop(context_names);
 
