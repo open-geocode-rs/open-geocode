@@ -227,6 +227,60 @@ pub struct PackStats {
     pub size: &'static str,
 }
 
+/// A Pack the preview pretends is on disk. The numbers are invented.
+pub struct SamplePack {
+    pub name: &'static str,
+    pub region: &'static str,
+    pub sources: &'static str,
+    pub records: &'static str,
+    pub size: &'static str,
+    pub built_ago: &'static str,
+    pub built_long: &'static str,
+    pub built_on: &'static str,
+    pub path: &'static str,
+    /// The date of newer data than the Pack was built from.
+    pub update: Option<&'static str>,
+}
+
+pub const PACKS: [SamplePack; 3] = [
+    SamplePack {
+        name: "Ontario",
+        region: "Canada / Ontario",
+        sources: "OpenStreetMap, OpenAddresses",
+        records: "7,590,748",
+        size: "1.3 GB",
+        built_ago: "2d ago",
+        built_long: "2 days ago",
+        built_on: "2026-10-14",
+        path: "./packs/ontario",
+        update: Some("2026-10-16"),
+    },
+    SamplePack {
+        name: "Canada",
+        region: "Canada",
+        sources: "OpenStreetMap",
+        records: "31,402,118",
+        size: "9.8 GB",
+        built_ago: "4d ago",
+        built_long: "4 days ago",
+        built_on: "2026-10-12",
+        path: "./packs/canada",
+        update: None,
+    },
+    SamplePack {
+        name: "Germany",
+        region: "Germany",
+        sources: "OpenStreetMap",
+        records: "58,119,730",
+        size: "4.9 GB",
+        built_ago: "12d ago",
+        built_long: "12 days ago",
+        built_on: "2026-10-04",
+        path: "./packs/germany",
+        update: None,
+    },
+];
+
 pub const PACK: PackStats = PackStats {
     places: "61,203",
     streets: "412,880",

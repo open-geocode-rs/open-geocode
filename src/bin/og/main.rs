@@ -41,7 +41,9 @@ fn main() -> io::Result<()> {
     } else {
         Viewport::Fullscreen
     };
-    let mut app = App::new();
+    // `og --empty` previews the screens for a machine with no Packs.
+    let empty = std::env::args().any(|arg| arg == "--empty");
+    let mut app = App::new(empty);
     let mut terminal = ratatui::init_with_options(TerminalOptions { viewport });
     let result = run(&mut terminal, &mut app, inline);
     let cleared = terminal.clear();
@@ -130,9 +132,17 @@ mod preview {
     }
 
     #[test]
+    fn home_without_packs() {
+        let app = App::new(true);
+        show(&app, "home without packs");
+    }
+
+    #[test]
     fn every_screen_fits() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         show(&app, "home");
+        press(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        show(&app, "home build row");
         press(&mut app, &[KeyCode::Enter]);
         show(&app, "region");
         press(&mut app, &[KeyCode::Down; 7]);

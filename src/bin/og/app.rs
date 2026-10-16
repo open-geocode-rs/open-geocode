@@ -51,13 +51,6 @@ impl Mode {
     }
 }
 
-pub const HOME_ITEMS: [(&str, &str); 4] = [
-    ("Build a Pack", "download a region and index it"),
-    ("Query a Pack", "try searches and see the GeoJSON"),
-    ("Serve a Pack", "start the HTTP API"),
-    ("Docs", "open the guide in your browser"),
-];
-
 pub const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
 pub const MEMORY_STEPS_GB: [u32; 5] = [2, 4, 6, 8, 12];
 /// Rows of the region list, so the box keeps one height while browsing.
@@ -136,6 +129,11 @@ pub struct App {
     pub flash: Option<(String, Instant)>,
     pub started: Instant,
     pub home_cursor: usize,
+    /// The Packs the home screen lists.
+    pub packs: &'static [mock::SamplePack],
+    /// The Pack the query shell is using.
+    pub active_name: String,
+    pub active_records: &'static str,
     pub region_query: String,
     pub region_cursor: usize,
     pub region_scroll: usize,
@@ -158,7 +156,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(empty: bool) -> Self {
         Self {
             screen: Screen::Home,
             quit: false,
@@ -167,6 +165,9 @@ impl App {
             flash: None,
             started: Instant::now(),
             home_cursor: 0,
+            packs: if empty { &[] } else { &mock::PACKS },
+            active_name: String::new(),
+            active_records: "",
             region_query: String::new(),
             region_cursor: 0,
             region_scroll: 0,
@@ -409,19 +410,41 @@ impl App {
     }
 
     fn home_key(&mut self, key: KeyEvent) {
+        // The last row builds a new Pack; the rows above it are the Packs.
+        let rows = self.packs.len() + 1;
+        let on_build = self.home_cursor == self.packs.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.home_cursor = (self.home_cursor + HOME_ITEMS.len() - 1) % HOME_ITEMS.len();
+                self.home_cursor = (self.home_cursor + rows - 1) % rows;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.home_cursor = (self.home_cursor + 1) % HOME_ITEMS.len();
+                self.home_cursor = (self.home_cursor + 1) % rows;
             }
-            KeyCode::Enter => match self.home_cursor {
-                0 => self.screen = Screen::Region,
-                1 => self.open_query(),
-                2 => self.flash("Serving is not wired in this preview."),
-                _ => self.flash("Docs are not wired in this preview."),
-            },
+            KeyCode::Char('b') => self.screen = Screen::Region,
+            KeyCode::Enter if on_build => self.screen = Screen::Region,
+            KeyCode::Enter => {
+                let pack = &self.packs[self.home_cursor];
+                self.active_name = pack.name.to_string();
+                self.active_records = pack.records;
+                self.open_query();
+            }
+            KeyCode::Char('v') if !on_build => {
+                self.flash("Serving is not wired in this preview.");
+            }
+            KeyCode::Char('g') if !on_build => {
+                self.flash("Geocoding a file is not wired in this preview.");
+            }
+            KeyCode::Char('m') if !on_build => {
+                self.flash("More is not wired in this preview.");
+            }
+            KeyCode::Char('u') if !on_build => {
+                let pack = &self.packs[self.home_cursor];
+                if pack.update.is_some() {
+                    self.flash("Updating is not wired in this preview.");
+                } else {
+                    self.flash(format!("{} is up to date.", pack.name));
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -569,6 +592,8 @@ impl App {
             KeyCode::Enter => match self.done_cursor {
                 0 => {
                     self.scrollback.extend(ui::done_summary(self));
+                    self.active_name = self.region.name.clone();
+                    self.active_records = mock::PACK.records;
                     self.open_query();
                 }
                 1 => self.flash("Serving is not wired in this preview."),

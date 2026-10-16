@@ -207,11 +207,11 @@ pub const HEIGHT: u16 = 20;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
-    // The last row belongs to the key hints.
+    // The last two rows belong to the rule and the key hints.
     let area = Rect {
         x: full.x + 1,
         width: full.width.saturating_sub(2).min(96),
-        height: full.height.saturating_sub(1),
+        height: full.height.saturating_sub(2),
         ..full
     };
     match app.screen {
@@ -242,57 +242,171 @@ fn footer(frame: &mut Frame, app: &App, hints: &[(&str, &str)]) {
         }
     };
     let full = frame.area();
-    let area = Rect {
+    let hints = Rect {
         x: full.x + 1,
         y: full.y + full.height.saturating_sub(1),
         width: full.width.saturating_sub(2).min(96),
         height: 1.min(full.height),
     };
-    frame.render_widget(Paragraph::new(line), area);
+    let rule = Rect {
+        y: hints.y.saturating_sub(1),
+        ..hints
+    };
+    frame.render_widget(
+        Paragraph::new(span("─".repeat(hints.width as usize), FAINT)),
+        rule,
+    );
+    frame.render_widget(Paragraph::new(line), hints);
 }
 
 fn home(frame: &mut Frame, area: Rect, app: &App) {
-    let [_, menu, packs, _, _] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(6),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+    let on_build = app.home_cursor == app.packs.len();
+    if app.packs.is_empty() {
+        let lines = vec![
+            Line::from(bold("   Your Packs")),
+            Line::raw(""),
+            Line::from(plain("   No Packs yet.")),
+            Line::from(span(
+                "   A Pack is the data file og searches, built from open data.",
+                DIM,
+            )),
+            Line::raw(""),
+            Line::from(vec![span(" ❯ ", ACCENT), bold("Build a Pack")]),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
+        footer(frame, app, &[("enter", "build a Pack"), ("q", "quit")]);
+        return;
+    }
+    let name_width = app
+        .packs
+        .iter()
+        .map(|pack| width(pack.name))
+        .max()
+        .unwrap_or(0)
+        .clamp(10, 20);
+    let [left, _, right] = Layout::horizontal([
+        Constraint::Length(name_width as u16 + 23),
+        Constraint::Length(4),
+        Constraint::Min(0),
     ])
     .areas(area);
-    let lines: Vec<Line> = app::HOME_ITEMS
-        .iter()
-        .enumerate()
-        .map(|(index, (label, detail))| {
-            if index == app.home_cursor {
-                Line::from(vec![
-                    span(" ❯ ", ACCENT),
-                    strong(pad(label, 18), ACCENT),
-                    span(detail.to_string(), DIM),
-                ])
-            } else {
-                Line::from(vec![
-                    plain("   "),
-                    plain(pad(label, 18)),
-                    span(detail.to_string(), DIM),
-                ])
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines).block(panel("What next?")), menu);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            span("  Packs found  ", DIM),
-            plain("./packs/ontario"),
-            span("  1.3 GB · built 2 days ago", DIM),
-        ])),
-        packs,
-    );
-    footer(
-        frame,
-        app,
-        &[("↑↓", "move"), ("enter", "select"), ("q", "quit")],
-    );
+
+    let mut list = vec![Line::from(bold("   Your Packs")), Line::raw("")];
+    for (index, pack) in app.packs.iter().enumerate() {
+        list.push(pack_row(pack, index == app.home_cursor, name_width));
+    }
+    list.push(Line::raw(""));
+    list.push(Line::from(vec![
+        if on_build {
+            span(" ❯ ", ACCENT)
+        } else {
+            plain("   ")
+        },
+        span("+ ", ACCENT),
+        if on_build {
+            bold("Build a Pack")
+        } else {
+            plain("Build a Pack")
+        },
+    ]));
+    frame.render_widget(Paragraph::new(list), left);
+
+    let detail = if on_build {
+        vec![
+            Line::from(bold("Build a Pack")),
+            Line::raw(""),
+            Line::from(plain("Pick a region and extra sources.")),
+            Line::from(plain("og downloads the open data and")),
+            Line::from(plain("builds the Pack on this machine.")),
+            Line::raw(""),
+            action_line("enter", "Start"),
+        ]
+    } else {
+        pack_detail(&app.packs[app.home_cursor])
+    };
+    frame.render_widget(Paragraph::new(detail), right);
+
+    let hints: Vec<(&str, &str)> = if on_build {
+        vec![("↑↓", "move"), ("enter", "build a Pack"), ("q", "quit")]
+    } else {
+        let mut hints = vec![
+            ("↑↓", "move"),
+            ("enter", "search"),
+            ("v", "serve"),
+            ("g", "geocode a file"),
+        ];
+        if app.packs[app.home_cursor].update.is_some() {
+            hints.push(("u", "update"));
+        }
+        hints.push(("b", "build"));
+        hints.push(("q", "quit"));
+        hints
+    };
+    footer(frame, app, &hints);
+}
+
+fn pack_row(pack: &mock::SamplePack, selected: bool, name_width: usize) -> Line<'static> {
+    let shown = if width(pack.name) > name_width {
+        let keep: String = pack.name.chars().take(name_width - 1).collect();
+        format!("{keep}…")
+    } else {
+        pack.name.to_string()
+    };
+    let name = if selected {
+        bold(pad(&shown, name_width))
+    } else {
+        plain(pad(&shown, name_width))
+    };
+    Line::from(vec![
+        if selected {
+            span(" ❯ ", ACCENT)
+        } else {
+            plain("   ")
+        },
+        name,
+        span(format!("{:>8}", pack.size), DIM),
+        span(format!("  {:>7}", pack.built_ago), DIM),
+        if pack.update.is_some() {
+            span("  ↑", ACCENT)
+        } else {
+            plain("   ")
+        },
+    ])
+}
+
+fn detail_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![span(pad(label, 10), DIM), plain(value)])
+}
+
+/// A key and what it does: `v        Serve the API`.
+fn action_line(key: &str, label: &str) -> Line<'static> {
+    Line::from(vec![bold(pad(key, 8)), plain(label.to_string())])
+}
+
+fn pack_detail(pack: &mock::SamplePack) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(bold(pack.name)),
+        Line::raw(""),
+        detail_line("Region", pack.region.to_string()),
+        detail_line("Sources", pack.sources.to_string()),
+        detail_line("Records", pack.records.to_string()),
+        detail_line("Built", format!("{} · {}", pack.built_long, pack.built_on)),
+        detail_line("Path", pack.path.to_string()),
+        Line::raw(""),
+    ];
+    if let Some(date) = pack.update {
+        lines.push(Line::from(span("↑ Update available", ACCENT)));
+        lines.push(Line::from(span(format!("  Newer data from {date}"), DIM)));
+        lines.push(Line::raw(""));
+    }
+    lines.push(action_line("enter", "Search"));
+    lines.push(action_line("v", "Serve the API"));
+    lines.push(action_line("g", "Geocode a file"));
+    if pack.update.is_some() {
+        lines.push(action_line("u", "Update"));
+    }
+    lines.push(action_line("m", "More"));
+    lines
 }
 
 fn input_line(text: &str, placeholder: &str) -> Line<'static> {
@@ -902,7 +1016,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(vec![
             badge(),
             span(
-                format!("  {} · {} records", app.region.slug(), mock::PACK.records),
+                format!("  {} · {} records", app.active_name, app.active_records),
                 DIM,
             ),
         ])),
