@@ -329,7 +329,7 @@ impl BatchFile {
                 let mut seen = 0u64;
                 while reader.read_byte_record(&mut record).unwrap_or(false) {
                     seen += 1;
-                    if seen % 65_536 == 0 {
+                    if seen.is_multiple_of(65_536) {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
