@@ -248,6 +248,11 @@ impl PackWriter {
         self.dictionaries.set_country_codes(codes);
     }
 
+    /// The groups of regions each region lies in, by the region's id.
+    pub fn set_region_groups(&mut self, groups: HashMap<RecordId, Vec<RecordId>>) {
+        self.dictionaries.set_region_groups(groups);
+    }
+
     /// Postcode centroids, so the records written after this that state no
     /// postcode are ranked by the nearest one.
     pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {

@@ -334,6 +334,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     }
     writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
     writer.set_country_codes(boundaries.country_codes(&boundary_ids, &country_ids));
+    writer.set_region_groups(boundaries.region_groups(&boundary_ids));
     writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
     let context_count = ordered.written();

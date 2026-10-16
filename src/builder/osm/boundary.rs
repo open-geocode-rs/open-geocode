@@ -258,6 +258,51 @@ impl BoundarySet {
         boundaries.chain(derived).collect()
     }
 
+    /// The groups of regions each admin region lies in, by record id: the
+    /// larger admin regions of another name covering its representative
+    /// point ("関東地方" of "千葉県"). A record keeps the smaller region as
+    /// its own, yet queries name either.
+    pub(crate) fn region_groups(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, Vec<RecordId>> {
+        let regions = self
+            .candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter(|(candidate, _)| {
+                candidate.boundary.layer == PlaceLayer::Region
+                    && candidate.boundary.admin_level.is_some()
+            })
+            .map(|(candidate, record_id)| {
+                (
+                    &candidate.boundary,
+                    candidate.boundary.geometry.unsigned_area(),
+                    *record_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        regions
+            .par_iter()
+            .filter_map(|(region, area, record_id)| {
+                let point = Point::new(
+                    region.representative_point[0],
+                    region.representative_point[1],
+                );
+                let groups = regions
+                    .iter()
+                    .filter(|(group, group_area, _)| {
+                        group_area > area
+                            && !same_text(&group.name, &region.name)
+                            && group.geometry.contains(&point)
+                    })
+                    .map(|(_, _, group_id)| *group_id)
+                    .collect::<Vec<_>>();
+                (!groups.is_empty()).then_some((*record_id, groups))
+            })
+            .collect()
+    }
+
     /// Index the boundaries under their final record ids. Edge indexes of
     /// large areas are built in parallel.
     pub(crate) fn into_index(
@@ -1455,6 +1500,41 @@ mod tests {
 
         assert_eq!(assignment.admin_context.country_record_id, Some(7));
         assert_eq!(assignment.admin_context.region_record_id, Some(20));
+    }
+
+    #[test]
+    fn a_region_lies_in_the_larger_regions_covering_it() {
+        let square = |object_id, level: &str, name: &str, iso: Option<&str>, size: f64| {
+            let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+            let base = object_id * 10;
+            let mut tags = BTreeMap::from([
+                ("boundary".to_string(), "administrative".to_string()),
+                ("admin_level".to_string(), level.to_string()),
+                ("name".to_string(), name.to_string()),
+            ]);
+            if let Some(iso) = iso {
+                tags.insert("ISO3166-1:alpha2".to_string(), iso.to_string());
+            }
+            BoundaryWay {
+                object_id,
+                tags,
+                vertices: vec![
+                    vertex(base, 140.0, 35.0),
+                    vertex(base + 1, 140.0 + size, 35.0),
+                    vertex(base + 2, 140.0 + size, 35.0 + size),
+                    vertex(base + 3, 140.0, 35.0 + size),
+                    vertex(base, 140.0, 35.0),
+                ],
+            }
+        };
+        let ways = [
+            square(1, "2", "日本", Some("JP"), 8.0),
+            square(2, "3", "関東地方", None, 4.0),
+            square(3, "4", "千葉県", None, 1.0),
+        ];
+        let set = build_boundaries(&ways, &[], &HashMap::new());
+        let groups = set.region_groups(&[100, 101, 102]);
+        assert_eq!(groups, HashMap::from([(102, vec![101])]));
     }
 
     #[test]

@@ -1302,6 +1302,13 @@ const CHAIN_SHARE: f64 = 0.5;
 /// without the word of its type, when the dictionaries hold it so ("愛知" of
 /// "愛知県", see [`admin_aliases`]).
 const ADMIN_ALIAS_SHARE: f64 = 0.3;
+/// Share of the rows in a region that lies in a group of regions
+/// ("千葉県" in "関東地方") that name the group, as libpostal's data does
+/// ("北九州市, 九州地方, 日本").
+const REGION_GROUP_SHARE: f64 = 0.3;
+/// Share of the rows naming a group of regions that write the region
+/// before it ("東京都関東地方"), not the group alone.
+const REGION_AND_GROUP_SHARE: f64 = 0.2;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
@@ -1878,6 +1885,18 @@ impl<'a> Renderer<'a> {
             }
             locality => locality,
         };
+        if let Some(group) = self.region_group(tuple.region_record_id, random)? {
+            region = Some(match region {
+                Some(region) if random.chance(REGION_AND_GROUP_SHARE) => {
+                    if group.chars().next().is_some_and(is_unspaced) {
+                        format!("{region}{group}")
+                    } else {
+                        format!("{region} {group}")
+                    }
+                }
+                _ => group,
+            });
+        }
         let countries = self.names(tuple.country_record_id)?;
         let country_code = countries
             .first()
@@ -1894,6 +1913,24 @@ impl<'a> Renderer<'a> {
             country,
             country_code,
         })
+    }
+
+    /// In [`REGION_GROUP_SHARE`] of draws, a name of a group of regions the
+    /// region `id` lies in.
+    fn region_group(
+        &mut self,
+        id: Option<RecordId>,
+        random: &mut Random,
+    ) -> Result<Option<String>> {
+        let Some(id) = id.and_then(|id| u32::try_from(id).ok()) else {
+            return Ok(None);
+        };
+        let groups = self.tagger.dictionaries().region_groups(id);
+        if groups.is_empty() || !random.chance(REGION_GROUP_SHARE) {
+            return Ok(None);
+        }
+        let group = groups[random.below(groups.len() as u64) as usize];
+        self.admin_name(Some(RecordId::from(group)), Field::Region, random)
     }
 
     /// One name of an area, as [`pick_name`] picks it.

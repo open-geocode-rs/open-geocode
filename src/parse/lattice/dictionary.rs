@@ -57,6 +57,10 @@ pub const AREA_IDS_SECTION: &str = "parse/area_ids";
 /// Every pair of areas one record lies in, sorted little-endian `u64`s of
 /// the smaller id above the larger.
 pub const NESTING_SECTION: &str = "parse/nesting";
+/// Each region with the groups of regions it lies in ("千葉県" in
+/// "関東地方"), sorted little-endian `u64`s of the region's id above the
+/// group's.
+pub const REGION_GROUPS_SECTION: &str = "parse/region_groups";
 /// A name of more areas than this ("2丁目", "中央区") says too little of
 /// where it is: its areas are not listed.
 const MAX_AREAS_PER_NAME: usize = 64;
@@ -286,6 +290,7 @@ pub struct Dictionaries {
     areas: Map<Bytes>,
     area_ids: Bytes,
     nesting: Bytes,
+    region_groups: Bytes,
     /// Records per country, from the country dictionary, to prefer the
     /// countries the Pack covers when only a postcode pattern names one.
     countries: HashMap<CountryCode, u64>,
@@ -299,6 +304,7 @@ impl fmt::Debug for Dictionaries {
         }
         debug.field(AREAS_SECTION, &self.areas.len());
         debug.field(NESTING_SECTION, &(self.nesting.len() / 8));
+        debug.field(REGION_GROUPS_SECTION, &(self.region_groups.len() / 8));
         debug.finish()
     }
 }
@@ -333,6 +339,9 @@ impl Dictionaries {
                 Map::new(areas).with_context(|| format!("invalid Pack section {AREAS_SECTION}"))?;
             dictionaries.area_ids = area_ids;
             dictionaries.nesting = nesting;
+        }
+        if let Some(region_groups) = section(REGION_GROUPS_SECTION)? {
+            dictionaries.region_groups = region_groups;
         }
         Ok(dictionaries)
     }
@@ -374,6 +383,7 @@ impl Dictionaries {
             areas: empty_values(),
             area_ids: Bytes::empty(),
             nesting: Bytes::empty(),
+            region_groups: Bytes::empty(),
             countries,
         }
     }
@@ -474,6 +484,33 @@ impl Dictionaries {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The groups of regions the region `region` lies in ("関東地方" of
+    /// "千葉県").
+    pub fn region_groups(&self, region: u32) -> Vec<u32> {
+        let pair_at = |index: usize| {
+            u64::from_le_bytes(
+                self.region_groups[index * 8..index * 8 + 8]
+                    .try_into()
+                    .expect("eight bytes"),
+            )
+        };
+        let pairs = self.region_groups.len() / 8;
+        let (mut low, mut high) = (0, pairs);
+        while low < high {
+            let middle = (low + high) / 2;
+            if ((pair_at(middle) >> 32) as u32) < region {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        (low..pairs)
+            .map(pair_at)
+            .take_while(|pair| (pair >> 32) as u32 == region)
+            .map(|pair| pair as u32)
+            .collect()
     }
 
     /// Whether places of the areas `left` and of the areas `right` can be
@@ -779,6 +816,8 @@ pub struct DictionaryBuilder {
     place_names: Vec<(String, u32, u8)>,
     /// The country code of each country record admin contexts point at.
     country_codes: HashMap<RecordId, CountryCode>,
+    /// The groups of regions each region lies in, by the region's id.
+    region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
 impl DictionaryBuilder {
@@ -786,6 +825,12 @@ impl DictionaryBuilder {
     /// in the country its admin context places it in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
         self.country_codes = codes;
+    }
+
+    /// The groups of regions each region lies in ("関東地方" of "千葉県"):
+    /// a record keeps only its region, yet lies in the region's groups too.
+    pub fn set_region_groups(&mut self, groups: HashMap<RecordId, Vec<RecordId>>) {
+        self.region_groups = groups;
     }
 
     /// Note that the place `place` lies in the areas of its own context, and
@@ -827,7 +872,14 @@ impl DictionaryBuilder {
             return;
         };
         self.contexts.insert(tuple);
-        for (field, level, area) in [
+        let groups = tuple
+            .region_record_id
+            .and_then(|region| self.region_groups.get(&region))
+            .into_iter()
+            .flatten()
+            .map(|group| (Field::Region, level::REGION, Some(*group)))
+            .collect::<Vec<_>>();
+        for (field, level, area) in groups.into_iter().chain([
             (Field::Country, level::COUNTRY, tuple.country_record_id),
             (Field::Region, level::REGION, tuple.region_record_id),
             (Field::Locality, level::DISTRICT, tuple.district_record_id),
@@ -838,7 +890,7 @@ impl DictionaryBuilder {
                 tuple.neighbourhood_record_id,
             ),
             (Field::Locality, level::PLACE, tuple.place_record_id),
-        ] {
+        ]) {
             if let Some(area) = area {
                 self.areas
                     .entry(area)
@@ -873,6 +925,7 @@ impl DictionaryBuilder {
             area_pairs,
             place_names,
             country_codes,
+            region_groups,
         } = self;
         // The ids of the areas each area name names, and the levels of the
         // areas each name names.
@@ -1073,9 +1126,17 @@ impl DictionaryBuilder {
             .into_iter()
             .filter(|pair| !shares_name((pair >> 32) as u32, *pair as u32))
             .collect::<Vec<_>>();
+        // A record lies in the groups of its region as well.
         for context in &contexts {
+            let groups = context
+                .region_record_id
+                .and_then(|region| region_groups.get(&region))
+                .into_iter()
+                .flatten()
+                .copied();
             let ids = context
                 .parent_record_ids()
+                .chain(groups)
                 .filter_map(|id| u32::try_from(id).ok())
                 .collect::<Vec<_>>();
             for (index, left) in ids.iter().enumerate() {
@@ -1085,6 +1146,21 @@ impl DictionaryBuilder {
             }
         }
         pack.add(NESTING_SECTION, DICTIONARY_VERSION, &nesting_section(pairs))?;
+        let mut groups = region_groups
+            .iter()
+            .flat_map(|(region, groups)| groups.iter().map(move |group| (*region, *group)))
+            .filter_map(|(region, group)| {
+                let region = u64::from(u32::try_from(region).ok()?);
+                Some((region << 32) | u64::from(u32::try_from(group).ok()?))
+            })
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups.dedup();
+        let groups = groups
+            .iter()
+            .flat_map(|pair| pair.to_le_bytes())
+            .collect::<Vec<_>>();
+        pack.add(REGION_GROUPS_SECTION, DICTIONARY_VERSION, &groups)?;
         Ok(())
     }
 }
