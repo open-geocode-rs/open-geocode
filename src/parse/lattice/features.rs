@@ -13,16 +13,23 @@
 //! no dictionary holds. The word of a span is its one token, or the units of
 //! a script written without spaces glued into one key ("みなとみらい").
 //!
+//! The words themselves are hashed too, each word of a span into
+//! [`WORD_BUCKETS`] buckets, so the model learns the words the Pack it is
+//! trained on writes its streets, venues and places with ("strasse",
+//! "bäckerei", "sebun"). The model stays one per Pack: the words are the
+//! Pack's own, learned when it is built.
+//!
 //! ```text
 //! ids 0 .. NAMED                      the named blocks of BLOCKS, in order
 //! NAMED + (side * 3 + n - 2) * 1024   bucket 0 of the affix block of side
 //!   + bucket                          (0 prefix, 1 suffix) and n (2..=4)
+//! WORDS + bucket                      a word of the span
 //! ```
 
 use super::{
     CountryCode, MAX_SPAN_TOKENS, Tokens,
     decode::Span,
-    dictionary::{Dictionaries, Field, Match},
+    dictionary::{Dictionaries, Field, Match, level},
 };
 
 /// The feature blocks, in id order, with the names of their features.
@@ -97,6 +104,12 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ("phrase_after", &PHRASE_KINDS),
     ("chain", &["2", "3", "4+", "with_region"]),
     (
+        "dict_level",
+        &["district", "locality", "neighbourhood", "place"],
+    ),
+    ("glued_phrase", &["unit", "po_box", "level", "admin_type"]),
+    ("dict_dominant", &DICT_FIELDS),
+    (
         "grounding",
         &["no_locality", "no_region", "no_country", "no_postcode"],
     ),
@@ -104,13 +117,15 @@ const BLOCKS: &[(&str, &[&str])] = &[
 
 /// The kinds of vocabulary phrase, in the order of
 /// [`Field::PHRASES`](super::dictionary::Field::PHRASES).
-const PHRASE_KINDS: [&str; 6] = [
+const PHRASE_KINDS: [&str; 8] = [
     "unit",
     "po_box",
     "level",
     "building",
     "street_type",
     "directional",
+    "near",
+    "category",
 ];
 
 const DICT_COVER: [&str; 10] = [
@@ -242,6 +257,9 @@ enum Block {
     PhraseBefore,
     PhraseAfter,
     Chain,
+    DictLevel,
+    GluedPhrase,
+    DictDominant,
     Grounding,
 }
 
@@ -262,8 +280,12 @@ const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
 /// Buckets of each affix block: one per side and length.
 pub(super) const AFFIX_BUCKETS: usize = 1_024;
 const AFFIX_BLOCKS: usize = 2 * AFFIX_SIZES.len();
+/// The first id of the word block.
+const WORDS: usize = NAMED + AFFIX_BLOCKS * AFFIX_BUCKETS;
+/// Buckets of the word block.
+pub(super) const WORD_BUCKETS: usize = 1 << 15;
 /// Feature ids, without labels.
-pub(super) const COUNT: usize = NAMED + AFFIX_BLOCKS * AFFIX_BUCKETS;
+pub(super) const COUNT: usize = WORDS + WORD_BUCKETS;
 
 /// The feature of a one-unit span that lies inside a longer name of `field`
 /// the dictionaries know, at its first unit or after it. A run of
@@ -337,6 +359,13 @@ fn id(block: Block, index: usize) -> u32 {
 
 /// `block:feature`, for weight dumps and the schema fingerprint.
 pub(super) fn name(id: u32) -> String {
+    if let Some(bucket) = (id as usize).checked_sub(WORDS) {
+        return if bucket < WORD_BUCKETS {
+            format!("word:{bucket}")
+        } else {
+            format!("unknown:{id}")
+        };
+    }
     if let Some(affix) = (id as usize).checked_sub(NAMED) {
         let (block, bucket) = (affix / AFFIX_BUCKETS, affix % AFFIX_BUCKETS);
         if block < AFFIX_BLOCKS {
@@ -511,6 +540,10 @@ impl FeatureSet {
         };
         let len = tokens.len();
         set.push(Block::Bias, 0);
+        for word in &tokens.words[start..end] {
+            let bucket = xxhash_rust::xxh3::xxh3_64(word.as_bytes()) % WORD_BUCKETS as u64;
+            set.features.push((WORDS + bucket as usize) as u32);
+        }
         set.push(Block::SpanTokens, set.length_bucket());
         let position = [
             start == 0,
@@ -608,6 +641,23 @@ impl FeatureSet {
             self.country_features
                 .push((country, id(Block::DictInCountry, field_index)));
         }
+        // Which admin level a locality name names: a district and a city
+        // are both in the locality dictionary, and only this tells them apart.
+        if field == Field::Locality {
+            for (index, bit) in [
+                level::DISTRICT,
+                level::LOCALITY,
+                level::NEIGHBOURHOOD,
+                level::PLACE,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if hit.entry.levels & bit != 0 {
+                    self.push(Block::DictLevel, index);
+                }
+            }
+        }
     }
 
     /// The prefixes and suffixes of `word`, the span as one word, each of
@@ -669,6 +719,26 @@ impl FeatureSet {
     /// The units the span covers.
     pub fn range(&self) -> (usize, usize) {
         (self.start, self.end)
+    }
+
+    /// The span is one token that glues a number to a unit, PO box or level
+    /// phrase or an admin type word ("4og", "apt4", "4chome").
+    pub fn glued_phrase(&mut self, glued: super::Glued) {
+        let index = match glued {
+            super::Glued::Unit => 0,
+            super::Glued::PoBox => 1,
+            super::Glued::Level => 2,
+            super::Glued::AdminType => 3,
+        };
+        self.push(Block::GluedPhrase, index);
+    }
+
+    /// Of the fields whose names the span is, `field` is the one the most
+    /// records use it in: "sachsen" is a state far more than a village.
+    pub fn dominant_field(&mut self, field: Field) {
+        if let Some(index) = field_index(field) {
+            self.push(Block::DictDominant, index);
+        }
     }
 
     /// The span is one number written in parts: "993.5", "1384 1/2".
@@ -737,7 +807,9 @@ mod tests {
         assert_eq!(name(NAMED as u32 - 1), "grounding:no_postcode");
         assert_eq!(name(NAMED as u32 - 4), "grounding:no_locality");
         assert_eq!(name(NAMED as u32), "affix:prefix2:0");
-        assert_eq!(name(COUNT as u32 - 1), "affix:suffix4:1023");
+        assert_eq!(name(WORDS as u32 - 1), "affix:suffix4:1023");
+        assert_eq!(name(WORDS as u32), "word:0");
+        assert_eq!(name(COUNT as u32 - 1), "word:32767");
         assert_eq!(
             by_name("dict_distance:street:1"),
             id(Block::DictDistance, 7)

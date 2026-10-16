@@ -17,18 +17,21 @@ use crate::{
 };
 
 use super::{
+    admin_levels::{self, admin_levels},
     containment::AreaShape,
     place::place_layer,
     tags::{OsmTags, alternate_names, name_tags},
 };
 
 /// Tags a boundary keeps after the scan besides its names.
-const BOUNDARY_TAG_KEYS: [&str; 6] = [
+const BOUNDARY_TAG_KEYS: [&str; 8] = [
     "ISO3166-1:alpha2",
+    "ISO3166-1:alpha3",
     "ISO3166-2",
     "admin_level",
     "boundary",
     "country_code",
+    "designation",
     "place",
 ];
 
@@ -117,6 +120,9 @@ struct BuiltBoundary {
     alt_names: Vec<String>,
     /// The layer its `place` tag names, if any (`place=city` is a locality).
     place_layer: Option<PlaceLayer>,
+    /// Its `designation` tag (`unitary_authority`), which libpostal's table
+    /// reads in some countries.
+    designation: Option<String>,
     inferred_country_code: Option<String>,
     geometry: MultiPolygon<f64>,
     representative_point: [f64; 2],
@@ -140,9 +146,18 @@ pub(crate) enum ContextOrigin {
 pub(crate) struct BoundarySet {
     candidates: Vec<BoundaryCandidate>,
     derived_countries: Vec<(String, PlaceRecord)>,
+    /// The ways and relations libpostal's admin table names for the
+    /// countries of the input that the input does not have.
+    unmatched_admin_ids: Vec<String>,
 }
 
 impl BoundarySet {
+    /// The objects libpostal's admin table names that the input lacks: a
+    /// rule for an id OSM no longer has applies to nothing.
+    pub(crate) fn unmatched_admin_ids(&self) -> &[String] {
+        &self.unmatched_admin_ids
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.candidates.len()
     }
@@ -241,6 +256,51 @@ impl BoundarySet {
             .iter()
             .filter_map(|(code, record_id)| Some((*record_id, CountryCode::parse(code)?)));
         boundaries.chain(derived).collect()
+    }
+
+    /// The groups of regions each admin region lies in, by record id: the
+    /// larger admin regions of another name covering its representative
+    /// point ("関東地方" of "千葉県"). A record keeps the smaller region as
+    /// its own, yet queries name either.
+    pub(crate) fn region_groups(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, Vec<RecordId>> {
+        let regions = self
+            .candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter(|(candidate, _)| {
+                candidate.boundary.layer == PlaceLayer::Region
+                    && candidate.boundary.admin_level.is_some()
+            })
+            .map(|(candidate, record_id)| {
+                (
+                    &candidate.boundary,
+                    candidate.boundary.geometry.unsigned_area(),
+                    *record_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        regions
+            .par_iter()
+            .filter_map(|(region, area, record_id)| {
+                let point = Point::new(
+                    region.representative_point[0],
+                    region.representative_point[1],
+                );
+                let groups = regions
+                    .iter()
+                    .filter(|(group, group_area, _)| {
+                        group_area > area
+                            && !same_text(&group.name, &region.name)
+                            && group.geometry.contains(&point)
+                    })
+                    .map(|(_, _, group_id)| *group_id)
+                    .collect::<Vec<_>>();
+                (!groups.is_empty()).then_some((*record_id, groups))
+            })
+            .collect()
     }
 
     /// Index the boundaries under their final record ids. Edge indexes of
@@ -455,11 +515,12 @@ pub(crate) fn build_boundaries(
     }
     // Layers come from how the boundaries nest, which is only knowable once
     // every candidate is in hand.
-    assign_layers_by_containment(&mut candidates);
+    let unmatched_admin_ids = assign_layers_by_containment(&mut candidates);
     let derived_countries = derived_country_records(&candidates);
     BoundarySet {
         candidates,
         derived_countries,
+        unmatched_admin_ids,
     }
 }
 
@@ -513,6 +574,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
         name,
         alt_names,
         place_layer,
+        designation,
     } = area_parts(&way.tags)?;
     let inferred_country_code = country_code_from_tags(&way.tags, layer);
     let closed = ends(&way.vertices).is_some_and(|(first, last)| first == last);
@@ -532,6 +594,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
         name,
         alt_names,
         place_layer,
+        designation,
         inferred_country_code,
         geometry,
         representative_point,
@@ -549,6 +612,7 @@ fn boundary_from_relation(
         name,
         alt_names,
         place_layer,
+        designation,
     } = area_parts(&stub.tags)?;
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
@@ -579,6 +643,7 @@ fn boundary_from_relation(
         name,
         alt_names,
         place_layer,
+        designation,
         inferred_country_code,
         geometry,
         representative_point,
@@ -692,6 +757,7 @@ struct AreaParts {
     name: String,
     alt_names: Vec<String>,
     place_layer: Option<PlaceLayer>,
+    designation: Option<String>,
 }
 
 /// An admin boundary, or else a named place of a layer the Pack has drawn as
@@ -708,16 +774,36 @@ fn admin_boundary_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
     let admin_level = tags.cleaned("admin_level")?.parse::<u8>().ok()?;
     let layer = admin_level_layer(admin_level)?;
     let name = tags.cleaned("name")?;
+    let mut alt_names = alternate_names(tags, &name);
+    // The codes a country or a region is written as: "DEU", and "NW" of
+    // "DE-NW" or "ON" of "CA-ON".
+    let codes = [
+        tags.cleaned("ISO3166-1:alpha3")
+            .filter(|_| admin_level <= COUNTRY_ADMIN_LEVEL),
+        tags.cleaned("ISO3166-2").and_then(|code| {
+            let (_, subdivision) = code.split_once('-')?;
+            subdivision
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+                .then(|| subdivision.to_string())
+        }),
+    ];
+    for code in codes.into_iter().flatten() {
+        if code != name && !alt_names.contains(&code) {
+            alt_names.push(code);
+        }
+    }
     Some(AreaParts {
         layer,
         admin_level: Some(admin_level),
         place_type: None,
-        alt_names: alternate_names(tags, &name),
+        alt_names,
         name,
         place_layer: tags
             .cleaned("place")
             .and_then(|place| place_layer(&place))
             .filter(|layer| *layer != PlaceLayer::Place),
+        designation: tags.cleaned("designation"),
     })
 }
 
@@ -732,6 +818,7 @@ fn place_area_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
         alt_names: alternate_names(tags, &name),
         name,
         place_layer: None,
+        designation: None,
     })
 }
 
@@ -833,12 +920,32 @@ const PLACE_TAG_AGREEMENT: f64 = 0.8;
 /// either side of a border, and per country rather than per individual chain so
 /// that one sparsely mapped region cannot classify differently to its
 /// neighbours, the usual way a relative-depth scheme goes wrong.
-fn assign_layers_by_containment(candidates: &mut [BoundaryCandidate]) {
+fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<String> {
     let countries = country_of_each_boundary(candidates);
+    let (verdicts, unmatched) = table_layers(candidates, &countries);
+    // A boundary the table says is no area of the Pack (a group of regions)
+    // goes, and the rest are ranked without it.
+    let keep = verdicts
+        .iter()
+        .map(|verdict| !matches!(verdict, Some(None)))
+        .collect::<Vec<_>>();
+    let mut kept = keep.iter();
+    candidates.retain(|_| *kept.next().expect("one verdict per candidate"));
+    let countries = countries
+        .into_iter()
+        .zip(&keep)
+        .filter_map(|(country, keep)| keep.then_some(country))
+        .collect::<Vec<_>>();
+    let mut verdicts = verdicts
+        .into_iter()
+        .filter(|verdict| !matches!(verdict, Some(None)))
+        .map(Option::flatten)
+        .collect::<Vec<_>>();
+    fill_locality_from_suburbs(candidates, &countries, &mut verdicts);
     let tagged = tagged_level_layers(candidates, &countries);
 
-    // Layers each country already fills with a tagged or conventional level,
-    // and the off-convention levels waiting for a slot.
+    // Layers each country already fills with a listed, tagged or
+    // conventional level, and the off-convention levels waiting for a slot.
     let mut filled: BTreeMap<Option<String>, BTreeSet<PlaceLayer>> = BTreeMap::new();
     let mut unconventional: BTreeMap<Option<String>, BTreeSet<u8>> = BTreeMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -847,9 +954,8 @@ fn assign_layers_by_containment(candidates: &mut [BoundaryCandidate]) {
         let Some(level) = candidate.boundary.admin_level else {
             continue;
         };
-        match tagged
-            .get(&(country.clone(), level))
-            .copied()
+        match verdicts[index]
+            .or_else(|| tagged.get(&(country.clone(), level)).copied())
             .or_else(|| conventional_admin_layer(level))
         {
             Some(layer) => {
@@ -894,12 +1000,113 @@ fn assign_layers_by_containment(candidates: &mut [BoundaryCandidate]) {
             continue;
         };
         let key = (countries[index].clone(), level);
-        if let Some(layer) = tagged.get(&key).or_else(|| promoted.get(&key)) {
-            candidate.boundary.layer = *layer;
+        if let Some(layer) = verdicts[index]
+            .or_else(|| tagged.get(&key).copied())
+            .or_else(|| promoted.get(&key).copied())
+        {
+            candidate.boundary.layer = layer;
         } else if let Some(layer) = conventional_admin_layer(key.1) {
             candidate.boundary.layer = layer;
         }
     }
+    unmatched
+}
+
+/// The locality layer is the place an address names. Where libpostal's
+/// table gives a country's boundaries no city but names suburbs (Australia's
+/// postal localities are suburbs at level 9, and libpostal's generator lets
+/// them stand in for cities), the outermost level of them takes it.
+fn fill_locality_from_suburbs(
+    candidates: &[BoundaryCandidate],
+    countries: &[Option<String>],
+    verdicts: &mut [Option<PlaceLayer>],
+) {
+    let mut has_locality = BTreeSet::new();
+    let mut suburb_levels = BTreeMap::<Option<String>, u8>::new();
+    for ((candidate, country), verdict) in candidates.iter().zip(countries).zip(verdicts.iter()) {
+        // A level the table is silent on keeps its conventional layer.
+        let layer = verdict.or_else(|| {
+            candidate
+                .boundary
+                .admin_level
+                .and_then(conventional_admin_layer)
+        });
+        match (layer, candidate.boundary.admin_level) {
+            (Some(PlaceLayer::Locality), _) => {
+                has_locality.insert(country.clone());
+            }
+            (Some(PlaceLayer::Neighbourhood), Some(level)) if verdict.is_some() => {
+                let outermost = suburb_levels.entry(country.clone()).or_insert(level);
+                *outermost = (*outermost).min(level);
+            }
+            _ => {}
+        }
+    }
+    for ((candidate, country), verdict) in candidates.iter().zip(countries).zip(verdicts.iter_mut())
+    {
+        if !has_locality.contains(country)
+            && *verdict == Some(PlaceLayer::Neighbourhood)
+            && candidate.boundary.admin_level == suburb_levels.get(country).copied()
+        {
+            *verdict = Some(PlaceLayer::Locality);
+        }
+    }
+}
+
+/// What libpostal's admin table says of each boundary (see
+/// [`admin_levels`]): a layer, `Some(None)` for no area of the Pack, `None`
+/// when it says nothing. Also the objects the table names for the input's
+/// countries that the input lacks.
+fn table_layers(
+    candidates: &[BoundaryCandidate],
+    countries: &[Option<String>],
+) -> (Vec<Option<Option<PlaceLayer>>>, Vec<String>) {
+    let table = admin_levels();
+    let present = countries
+        .iter()
+        .flatten()
+        .map(|code| code.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let by_object = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            (
+                (candidate.source_object_type, candidate.source_object_id),
+                index,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let verdicts = candidates
+        .iter()
+        .zip(countries)
+        .map(|(candidate, country)| {
+            let country = country.as_ref().map(|code| code.to_ascii_lowercase());
+            let boundary = admin_levels::Boundary {
+                object: (candidate.source_object_type, candidate.source_object_id),
+                country: country.as_deref(),
+                admin_level: candidate.boundary.admin_level,
+                designation: candidate.boundary.designation.as_deref(),
+            };
+            let [lon, lat] = candidate.boundary.representative_point;
+            table.verdict(boundary, |object| {
+                by_object.get(&object).is_some_and(|index| {
+                    candidates[*index]
+                        .boundary
+                        .geometry
+                        .contains(&Point::new(lon, lat))
+                })
+            })
+        })
+        .collect();
+    let mut unmatched = table
+        .listed_areas(&present)
+        .filter(|object| !by_object.contains_key(object))
+        .map(admin_levels::object_key)
+        .collect::<Vec<_>>();
+    unmatched.sort_unstable();
+    unmatched.dedup();
+    (verdicts, unmatched)
 }
 
 /// The layer the `place` tags of each country's levels agree on, where they
@@ -1264,6 +1471,7 @@ mod tests {
                     name: format!("level {level}"),
                     alt_names: Vec::new(),
                     place_layer,
+                    designation: None,
                     inferred_country_code: (level <= 2).then(|| "AU".to_string()),
                     representative_point: representative_point(&geometry).expect("point"),
                     geometry,
@@ -1292,6 +1500,41 @@ mod tests {
 
         assert_eq!(assignment.admin_context.country_record_id, Some(7));
         assert_eq!(assignment.admin_context.region_record_id, Some(20));
+    }
+
+    #[test]
+    fn a_region_lies_in_the_larger_regions_covering_it() {
+        let square = |object_id, level: &str, name: &str, iso: Option<&str>, size: f64| {
+            let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+            let base = object_id * 10;
+            let mut tags = BTreeMap::from([
+                ("boundary".to_string(), "administrative".to_string()),
+                ("admin_level".to_string(), level.to_string()),
+                ("name".to_string(), name.to_string()),
+            ]);
+            if let Some(iso) = iso {
+                tags.insert("ISO3166-1:alpha2".to_string(), iso.to_string());
+            }
+            BoundaryWay {
+                object_id,
+                tags,
+                vertices: vec![
+                    vertex(base, 140.0, 35.0),
+                    vertex(base + 1, 140.0 + size, 35.0),
+                    vertex(base + 2, 140.0 + size, 35.0 + size),
+                    vertex(base + 3, 140.0, 35.0 + size),
+                    vertex(base, 140.0, 35.0),
+                ],
+            }
+        };
+        let ways = [
+            square(1, "2", "日本", Some("JP"), 8.0),
+            square(2, "3", "関東地方", None, 4.0),
+            square(3, "4", "千葉県", None, 1.0),
+        ];
+        let set = build_boundaries(&ways, &[], &HashMap::new());
+        let groups = set.region_groups(&[100, 101, 102]);
+        assert_eq!(groups, HashMap::from([(102, vec![101])]));
     }
 
     #[test]

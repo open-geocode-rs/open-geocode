@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{post_office}.txt (MIT)
+# libpostal resources/dictionaries/*/{post_office}.txt (MIT, see NOTICE)
 # bg
 пощенска кутия|пк|п.к|п к
 poshtenska kutiya|pk|p.k|p k

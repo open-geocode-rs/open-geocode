@@ -1,3 +1,4 @@
+pub mod alloc;
 pub mod api;
 pub mod batch;
 pub mod bench;
@@ -15,6 +16,7 @@ pub mod pack;
 pub mod parse;
 pub mod record;
 pub mod records;
+pub mod resources;
 pub mod reverse;
 pub mod runtime;
 pub mod search;

@@ -1,3 +1,4 @@
+# OpenCage address-formatting conf/countries/worldwide.yaml (MIT, see NOTICE)
 AD	{{{attention}}}\n{{{house}}}\n{{{house_number}}} {{{road}}}\n{{{place}}}\n{{{postcode}}} {{#first}} {{{town}}} || {{{village}}} || {{{hamlet}}} || {{{city}}} || {{{municipality}}} || {{{state}}} {{/first}}\n{{{country}}}
 AE	{{{attention}}}\n{{{house}}}\n{{{house_number}}} {{{road}}}\n{{#first}} {{{suburb}}} || {{{city_district}}} || {{{neighbourhood}}} {{/first}}\n{{#first}} {{{city}}} || {{{town}}} || {{{village}}} || {{{hamlet}}} {{/first}}\n{{#first}} {{{state_district}}} || {{{state}}} {{/first}}\n{{{country}}}
 AF	{{{attention}}}\n{{{house}}}\n{{{road}}} {{{house_number}}}\n{{#first}} {{{suburb}}} || {{{city_district}}} || {{{neighbourhood}}} {{/first}}\n{{#first}} {{{city}}} || {{{town}}} || {{{village}}} || {{{hamlet}}} || {{{state}}} {{/first}}\n{{{country}}}

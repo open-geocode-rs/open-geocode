@@ -12,6 +12,15 @@ kanton
 landkreis
 kreis
 regierungsbezirk
+stadt
+amt
+markt
+samtgemeinde
+verbandsgemeinde
+verwaltungsgemeinschaft
+vgem
+verwaltungsverband
+gvv
 # en
 state
 province

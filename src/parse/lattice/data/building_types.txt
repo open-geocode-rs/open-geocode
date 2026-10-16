@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{building_types}.txt (MIT)
+# libpostal resources/dictionaries/*/{building_types}.txt (MIT, see NOTICE)
 # az
 mənzil|menzil
 # be

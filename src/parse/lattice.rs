@@ -20,6 +20,7 @@
 //! Pack, the postcode patterns and address templates are vendored data, and
 //! the weights are learned from the Pack's own records (see [`train`]).
 
+mod abbreviations;
 mod decode;
 pub mod dictionary;
 mod features;
@@ -27,7 +28,7 @@ pub mod postcode;
 pub mod train;
 pub mod weights;
 
-use std::{collections::HashMap, fmt, path::Path, sync::OnceLock};
+use std::{collections::HashMap, fmt, path::Path, rc::Rc, sync::OnceLock};
 
 use anyhow::Result;
 use levenshtein_automata::{DFA, LevenshteinAutomatonBuilder};
@@ -247,7 +248,7 @@ fn fold_width(word: &str) -> String {
 
 /// `character<TAB>value` rows of the ideographs that are numerals, from the
 /// Unihan kPrimaryNumeric property (Unicode License V3, see
-/// `data/LICENSE-unicode.txt`), vendored by `scripts/parse_lattice_words.py`.
+/// `NOTICE`), vendored.
 pub(super) const NUMERALS: &str = include_str!("lattice/data/numerals.tsv");
 
 /// The value of a numeral character that Unicode does not class as a
@@ -550,8 +551,16 @@ pub struct LatticeTagger {
     dictionaries: Dictionaries,
     postcodes: &'static PostcodeTable,
     weights: Weights,
-    one_edit: LevenshteinAutomatonBuilder,
-    two_edits: LevenshteinAutomatonBuilder,
+}
+
+/// The builder of the automata of names within `edits` edits (one or two),
+/// transpositions counted as one: built once per process and shared, as
+/// Tantivy shares its builders, since the two-edit one takes milliseconds
+/// and megabytes to build.
+fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuilder {
+    static BUILDERS: [OnceLock<LevenshteinAutomatonBuilder>; 2] =
+        [OnceLock::new(), OnceLock::new()];
+    BUILDERS[usize::from(edits - 1)].get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true))
 }
 
 impl fmt::Debug for LatticeTagger {
@@ -583,8 +592,6 @@ impl LatticeTagger {
             dictionaries,
             postcodes: PostcodeTable::global(),
             weights,
-            one_edit: LevenshteinAutomatonBuilder::new(1, true),
-            two_edits: LevenshteinAutomatonBuilder::new(2, true),
         }
     }
 
@@ -726,7 +733,7 @@ impl LatticeTagger {
         let mut covers = vec![0u16; tokens.len()];
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
         let runs = units.runs();
-        let phrases = Phrases::new(self, &units, longest);
+        let mut phrases = Phrases::new(self, &units, longest);
         // Exact area names, `(start, end, is a region)`, and the glued
         // spans without other evidence, which may be chains of them.
         let mut areas = Vec::new();
@@ -745,7 +752,17 @@ impl LatticeTagger {
                     set.phrase(kinds);
                 }
                 set.phrase_neighbours(phrases.ending[start], phrases.starting[end]);
-                let mut key = SpanKey::new(units.key(start, end), &infos[start..end]);
+                // A postcode written after its country's letters ("de09496")
+                // is no unit glued to its number.
+                if end - start == 1
+                    && !infos[start].unspaced
+                    && let Some(field) = self.glued_phrase(&tokens.words[start])
+                    && self.postcode_matches(tokens, &infos, start, end).is_none()
+                {
+                    evidence = true;
+                    set.glued_phrase(field);
+                }
+                let mut key = SpanKey::new(phrases.take_key(start, end), &infos[start..end]);
                 // A word's affixes: of a token, or of glued units as one.
                 let glued = end - start > 1 && units.unspaced(start, end);
                 if (end - start == 1 && !infos[start].unspaced) || glued {
@@ -757,6 +774,8 @@ impl LatticeTagger {
                     evidence = true;
                 }
                 let mut area = false;
+                // The field of names the most records use the span in.
+                let mut dominant: Option<(Field, u64)> = None;
                 for field in Field::NAMES {
                     if suppression.hides(field, start, end) {
                         continue;
@@ -768,6 +787,9 @@ impl LatticeTagger {
                             area = true;
                         }
                         set.dictionary_hit(field, &hit, key.key.chars().count());
+                        if dominant.is_none_or(|(_, count)| hit.entry.count > count) {
+                            dominant = Some((field, hit.entry.count));
+                        }
                         if end - start > 1 {
                             for (unit, cover) in covers[start..end].iter_mut().enumerate() {
                                 if let Some(feature) = features::cover(field, unit == 0) {
@@ -779,6 +801,9 @@ impl LatticeTagger {
                             countries.vote(country, field.country_vote(hit.distance, end - start));
                         }
                     }
+                }
+                if let Some((field, _)) = dominant {
+                    set.dominant_field(field);
                 }
                 if area {
                     let ids = [&key.key, &key.expanded]
@@ -856,29 +881,69 @@ impl LatticeTagger {
         lattice
     }
 
+    /// The vocabulary a token glues to its number: "4og" is a floor, "apt4"
+    /// a unit, "4chome" a numbered area. The token is one run of digits and
+    /// one of letters, either way round, and the letters a unit, PO box or
+    /// level phrase or an admin type word.
+    fn glued_phrase(&self, word: &str) -> Option<Glued> {
+        let split = word
+            .char_indices()
+            .skip(1)
+            .find(|(index, character)| {
+                let previous = word[..*index].chars().next_back().expect("a character");
+                previous.is_numeric() != character.is_numeric()
+            })
+            .map(|(index, _)| index)?;
+        let (head, tail) = word.split_at(split);
+        let numeric = |part: &str| part.chars().all(char::is_numeric);
+        let letters = |part: &str| part.chars().all(char::is_alphabetic);
+        let phrase = match (numeric(head), numeric(tail)) {
+            (true, false) if letters(tail) => tail,
+            (false, true) if letters(head) => head,
+            _ => return None,
+        };
+        [
+            (Field::Level, Glued::Level),
+            (Field::Unit, Glued::Unit),
+            (Field::PoBox, Glued::PoBox),
+        ]
+        .into_iter()
+        .find(|(field, _)| self.dictionaries.contains(*field, phrase))
+        .map(|(_, glued)| glued)
+        .or_else(|| dictionary::is_admin_type(phrase).then_some(Glued::AdminType))
+    }
+
     /// The best hit of `key` in `field`: exact, as written or with its
     /// abbreviations expanded the way the text index expands them, else the
     /// nearest name the key's fuzzy automaton accepts.
     fn lookup(&self, field: Field, key: &mut SpanKey) -> Option<Match> {
-        let exact = [Some(&key.key), Some(&key.expanded), key.masked.as_ref()]
-            .into_iter()
-            .flatten()
-            .filter_map(|key| self.dictionaries.get(field, key))
-            .max_by_key(|entry| entry.count);
+        // The span as written first: another spelling of it (the name
+        // without its type word, an abbreviation in full) is only read when
+        // the span itself names nothing, so "verwaltungsgemeinschaft
+        // stockach" is the district it names, not the city "stockach".
+        let best = |keys: &mut dyn Iterator<Item = &String>| {
+            keys.filter_map(|key| self.dictionaries.get(field, key))
+                .max_by_key(|entry| entry.count)
+        };
+        let exact = best(
+            &mut [Some(&key.key), Some(&key.expanded), key.masked.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .or_else(|| best(&mut key.spellings.iter()));
         if let Some(entry) = exact {
             return Some(Match { entry, distance: 0 });
         }
-        let first = key.expanded.chars().next().map_or(0, char::len_utf8);
-        let prefix = key.expanded[..first].to_string();
-        if field == Field::Poi {
-            if key.tokens < 2 && key.chars < MIN_FUZZY_POI_CHARS {
-                return None;
-            }
-            let dfa = key.poi_dfa(self)?;
-            return self.dictionaries.fuzzy(field, dfa, &prefix);
+        if field == Field::Poi && key.tokens < 2 && key.chars < MIN_FUZZY_POI_CHARS {
+            return None;
         }
-        let dfa = key.dfa(self)?;
-        self.dictionaries.fuzzy(field, dfa, &prefix)
+        let dfa = if field == Field::Poi {
+            key.poi_dfa()?
+        } else {
+            key.dfa()?
+        };
+        let first = key.expanded.chars().next().map_or(0, char::len_utf8);
+        self.dictionaries.fuzzy(field, &dfa, &key.expanded[..first])
     }
 
     /// The countries whose postcode pattern `start..end` matches, written
@@ -900,9 +965,22 @@ impl LatticeTagger {
         let mut matches = self.postcodes.matches(&words.join(" "));
         if words.len() > 1 {
             matches.extend(self.postcodes.matches(&words.concat()));
-            matches.sort_unstable();
-            matches.dedup();
         }
+        // A postcode written after its country's letters ("D-80331",
+        // "de09496", "CA-M5V 1M9"), as Nominatim reads it and libpostal
+        // writes it: the rest is a postcode of a country whose code starts
+        // with them.
+        if let Some((prefix, rest)) = country_prefix(words) {
+            let prefix = prefix.to_ascii_uppercase();
+            matches.extend(
+                self.postcodes
+                    .matches(&rest)
+                    .into_iter()
+                    .filter(|country| country.as_str().starts_with(&prefix)),
+            );
+        }
+        matches.sort_unstable();
+        matches.dedup();
         (!matches.is_empty()).then_some(matches)
     }
 }
@@ -985,10 +1063,15 @@ impl Chains {
 
 /// The vocabulary phrases of a query's units (see [`Field::PHRASES`]): the
 /// kinds of phrase each span is, one bit per field, and the kinds of the
-/// phrases that end before and start at each unit.
+/// phrases that end before and start at each unit. The dictionary key of
+/// every span is made here once, and taken by the lattice after.
 struct Phrases {
     /// `(start, end, kinds)` of every span that is a phrase.
     spans: Vec<(usize, usize, u8)>,
+    /// The key of every span looked up, in the order they are looked up.
+    keys: Vec<String>,
+    /// The index in `keys` of the first span starting at each unit.
+    first_key: Vec<usize>,
     /// `ending[unit]`: the kinds of the phrases that end right before `unit`.
     ending: Vec<u8>,
     /// `starting[unit]`: the kinds of the phrases that start at `unit`; one
@@ -1001,10 +1084,13 @@ impl Phrases {
         let len = units.len();
         let mut phrases = Self {
             spans: Vec::new(),
+            keys: Vec::with_capacity(len * MAX_SPAN_TOKENS),
+            first_key: Vec::with_capacity(len),
             ending: vec![0; len + 1],
             starting: vec![0; len + 1],
         };
         for start in 0..len {
+            phrases.first_key.push(phrases.keys.len());
             for end in start + 1..=(start + longest).min(len) {
                 if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
                     break;
@@ -1020,9 +1106,15 @@ impl Phrases {
                     phrases.ending[end] |= kinds;
                     phrases.starting[start] |= kinds;
                 }
+                phrases.keys.push(key);
             }
         }
         phrases
+    }
+
+    /// The key of `start..end`, a span this looked up; once.
+    fn take_key(&mut self, start: usize, end: usize) -> String {
+        std::mem::take(&mut self.keys[self.first_key[start] + (end - start - 1)])
     }
 
     fn kinds(&self, start: usize, end: usize) -> u8 {
@@ -1042,6 +1134,9 @@ struct SpanKey {
     /// The key with its numerals masked ([`mask_numerals`]), which names
     /// the numbered areas of a kind the Pack holds many of.
     masked: Option<String>,
+    /// The key with its street types and directions in their other forms,
+    /// in every language ([`abbreviations::Abbreviations::spellings`]).
+    spellings: Vec<String>,
     /// Whether the span may be a typo of a name: it is at least
     /// [`MIN_FUZZY_CHARS`] long, has no digit, not every word of it is a
     /// known word, and it is not of a script written without spaces. A house
@@ -1052,9 +1147,11 @@ struct SpanKey {
     /// Tokens and characters of the expanded key.
     tokens: usize,
     chars: usize,
-    dfa: Option<DFA>,
-    /// The automaton of the names within one edit, for the POI names.
-    poi_dfa: Option<DFA>,
+    /// The automaton of the names within one or two edits, and that of the
+    /// names within one for the POI names: one automaton when both allow
+    /// one edit.
+    dfa: Option<Rc<DFA>>,
+    poi_dfa: Option<Rc<DFA>>,
 }
 
 impl SpanKey {
@@ -1067,6 +1164,7 @@ impl SpanKey {
         Self {
             tokens: expanded.split(' ').count(),
             masked: mask_numerals(&key),
+            spellings: spellings(&key),
             key,
             expanded,
             fuzzy,
@@ -1076,37 +1174,47 @@ impl SpanKey {
         }
     }
 
+    /// Edits the automaton of the names allows: two for keys of
+    /// [`TWO_EDIT_CHARS`] to [`MAX_TWO_EDIT_CHARS`] characters, else one.
+    fn edits(&self) -> u8 {
+        if (TWO_EDIT_CHARS..=MAX_TWO_EDIT_CHARS).contains(&self.chars) {
+            2
+        } else {
+            1
+        }
+    }
+
     /// The automaton of the names within one edit of the expanded key, for
     /// the POI names: they are many, and two edits of a span reach many
     /// venues. `None` when the span is no typo.
-    fn poi_dfa(&mut self, tagger: &LatticeTagger) -> Option<&DFA> {
+    fn poi_dfa(&mut self) -> Option<Rc<DFA>> {
         if !self.fuzzy {
             return None;
         }
         if self.poi_dfa.is_none() {
-            self.poi_dfa = Some(tagger.one_edit.build_dfa(&self.expanded));
+            self.poi_dfa = Some(match &self.dfa {
+                Some(dfa) if self.edits() == 1 => Rc::clone(dfa),
+                _ => Rc::new(automaton_builder(1).build_dfa(&self.expanded)),
+            });
         }
-        self.poi_dfa.as_ref()
+        self.poi_dfa.clone()
     }
 
-    /// The automaton of the names within one edit of the expanded key, or
-    /// two for keys of [`TWO_EDIT_CHARS`] to [`MAX_TWO_EDIT_CHARS`]; `None` when the span is no typo. Names are only
+    /// The automaton of the names within [`Self::edits`] edits of the
+    /// expanded key; `None` when the span is no typo. Names are only
     /// matched when they start with the key's first character, which typing
     /// errors seldom change (see [`Dictionaries::fuzzy`]).
-    fn dfa(&mut self, tagger: &LatticeTagger) -> Option<&DFA> {
+    fn dfa(&mut self) -> Option<Rc<DFA>> {
         if !self.fuzzy {
             return None;
         }
         if self.dfa.is_none() {
-            let chars = self.expanded.chars().count();
-            let builder = if (TWO_EDIT_CHARS..=MAX_TWO_EDIT_CHARS).contains(&chars) {
-                &tagger.two_edits
-            } else {
-                &tagger.one_edit
-            };
-            self.dfa = Some(builder.build_dfa(&self.expanded));
+            self.dfa = Some(match &self.poi_dfa {
+                Some(dfa) if self.edits() == 1 => Rc::clone(dfa),
+                _ => Rc::new(automaton_builder(self.edits()).build_dfa(&self.expanded)),
+            });
         }
-        self.dfa.as_ref()
+        self.dfa.clone()
     }
 }
 
@@ -1131,6 +1239,51 @@ fn is_glued_numeral(units: &Units, infos: &[TokenInfo], start: usize, end: usize
         && infos[start..end]
             .iter()
             .all(|info| info.shape == features::Shape::Digits)
+}
+
+/// What a number is glued to in one token (see
+/// [`LatticeTagger::glued_phrase`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Glued {
+    Unit,
+    PoBox,
+    Level,
+    /// A type of numbered area ("4chome").
+    AdminType,
+}
+
+/// The letters of a country a postcode may be written after, one or two
+/// Latin letters as a word of their own ("d 80331") or glued to the digits
+/// ("de09496"), and the rest of the words.
+fn country_prefix(words: &[String]) -> Option<(&str, String)> {
+    let is_prefix = |part: &str| {
+        (1..=2).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphabetic())
+    };
+    match words {
+        [first, rest @ ..] if !rest.is_empty() && is_prefix(first) => {
+            Some((first.as_str(), rest.join(" ")))
+        }
+        [only] => {
+            let split = only.find(|character: char| character.is_ascii_digit())?;
+            let (prefix, rest) = only.split_at(split);
+            is_prefix(prefix).then(|| (prefix, rest.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Other spellings of a dictionary key looked up besides it: its street
+/// types and directions in their other forms, and the key without the admin
+/// type word it is written with ("nordrhein westfalen" of "bundesland
+/// nordrhein westfalen", "nagoya" of "nagoyashi").
+fn spellings(key: &str) -> Vec<String> {
+    let mut spellings = abbreviations::abbreviations().spellings(key);
+    for alias in dictionary::admin_aliases(key) {
+        if !spellings.contains(&alias) {
+            spellings.push(alias);
+        }
+    }
+    spellings
 }
 
 /// A dictionary key with street-type and direction abbreviations expanded,

@@ -1,0 +1,88 @@
+# libpostal resources/boundaries/names/languages/<lang>.yaml (MIT, see NOTICE)
+# de
+stadtteil ~
+stadtbezirk ~
+gemeinde ~
+landkreis ~
+kreis ~
+grenze ~
+freistaat ~
+regierungsbezirk ~
+gemeindefreies gebiet ~
+# en
+city of ~
+city and borough of ~
+city and county of ~
+township of ~
+town of ~
+regional municipality of ~
+district municipality of ~
+rural city of ~
+municipality of ~
+borough of ~
+london borough of ~
+royal borough of ~
+shire of ~
+parish of ~
+free state of ~
+autonomous city of ~
+territorial waters of ~
+county of ~
+county ~
+~ township
+~ municipality
+~ local municipality
+~ metropolitan municipality
+~ district municipality
+~ regional municipality
+~ cp
+~ civil parish
+~ community development council
+~ cdc
+~ council
+~ borough council
+~ city council
+~ regional council
+-township
+-municipality
+-cdc
+-council
+# es
+colonia ~
+municipio nuestra senora de ~
+~ colonia
+-colonia
+# fr
+commune de ~
+~ (eaux territoriales)
+# ja
+ōaza ~
+ō-aza ~
+oaza ~
+aza ~
+koaza ~
+~ ken
+~ to
+~ dō
+~ do
+~ fu
+~ gun
+~ shi
+~ machi
+~ chō
+~ cho
+~ mura
+~ ku
+~ aza
+~ oaza
+~ koaza
+-ken
+-gun
+-shi
+-machi
+-chō
+-cho
+-mura
+-aza
+-oaza
+-koaza

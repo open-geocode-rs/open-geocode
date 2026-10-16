@@ -1,0 +1,35 @@
+# libpostal resources/dictionaries/*/{unit_types_standalone}.txt (MIT, see NOTICE)
+# en
+front|frnt
+garage|grge
+lobby|lby|lbby
+lower left|lower l|lwr l
+lower right|lower r|lwr r
+maisonette|msnt
+penthouse|pths|ph|pent house
+rear
+rear lower|rear lwr
+side|sd
+top floor left|tfl|t f l|t.f.l|t / f / l
+top floor right|tfr|t f r|t.f.r|t / f / r
+top left|tl|t l|t.l|t / l
+top right|tr|t r|t.r|t / r
+upper left|upper l|upr left|uppr left|upr l|uppr l
+upper right|upper r|upr right|uppr right|upr r|uppr r
+# es
+ático|át|atico|at|atco
+ático de lujo|át de lujo|atico de lujo|at de lujo|ático lujo|át lujo|atico lujo|at lujo|atco lujo
+cobertizo|cbtizfrente|fren
+sobreático|sobreatico
+trasera|trs|tras
+# id
+belakang bawah|belakang bwh|blkg bwh
+belakang|blkg
+depan|dpn
+garasi|grsi
+kanan bawah|kanan bwh|knan bwh
+kiri bawah|kiri bwh|kri bwh
+lobi|lbi|lbbi
+sisi|ssi
+# pt
+sobre loja|slj

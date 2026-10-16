@@ -402,8 +402,10 @@ fn run(
     let report = build_osm_pack(BuildOsmOptions {
         input: plan.extract.clone(),
         pack: plan.pack.clone(),
-        memory_budget_bytes: usize::try_from(plan.memory_budget_bytes)
-            .context("the memory budget is larger than this machine can address")?,
+        memory_budget_bytes: Some(
+            usize::try_from(plan.memory_budget_bytes)
+                .context("the memory budget is larger than this machine can address")?,
+        ),
         input_source: Some(plan.region.id.clone()),
         observer: Arc::new(Observer {
             progress: Arc::clone(progress),
@@ -428,7 +430,7 @@ fn run(
         peak_disk_bytes,
         pack_bytes: report.output.pack_bytes,
         memory_budget_bytes: plan.memory_budget_bytes,
-        threads: report.threads,
+        threads: report.resources.threads,
         finished_at: format::now(),
     })?;
     Ok(Built { pack, build_secs })

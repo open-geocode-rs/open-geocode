@@ -789,6 +789,7 @@ mod tests {
         let entry = Entry {
             count: 1,
             country: None,
+            levels: 0,
         };
         let dictionaries = Dictionaries::from_entries([
             (Field::Locality, "浜松市", entry),

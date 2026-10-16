@@ -1,0 +1,79 @@
+# libpostal resources/dictionaries/*/{entrances}.txt (MIT, see NOTICE)
+# bg
+вход|вх
+vkhod|vkh
+# bs
+ulaz
+# ca
+entrada|entr|entd
+# cs
+vchod
+# da
+indgang
+# de
+eingang
+# el
+είσοδος|εισοδος
+eísodos|eisodos
+# en
+entrance|entr|ent
+# es
+entrada|entr|entd
+portal|prtl
+pórtico|prtco|portico
+# et
+sissepääs|sissepaas
+# eu
+sarrera
+# fi
+sisäänkäynti|sisaankaynti
+# fr
+entrée|entr|ent
+couloir
+# he
+כניסה
+knisa
+# hr
+ulaz
+# id
+masuk|msk
+gerbang masuk|grbg msk
+pintu masuk|pntu msk|pntu msuk
+# is
+inngangur
+# it
+ingresso
+# lt
+įėjimas|iejimas
+# lv
+ieeja
+# nb
+inngang|inng
+# nl
+ingang
+# pl
+wejście|wejscie
+# pt
+entrada|entr|entd
+# ro
+intrare|intrarea
+# ru
+вход
+vkhod
+подъезд
+pod'ezd
+# sk
+vchod
+# sl
+vhod
+# sr
+улаз
+ulaz
+# sv
+entré|entre
+ingång|ingaang|ingang
+# tr
+giriş|giris
+# uk
+вхід
+vkhid

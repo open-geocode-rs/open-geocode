@@ -2,8 +2,8 @@
 //!
 //! The patterns are the `zip` field of Google's libaddressinput country data
 //! (<https://github.com/google/libaddressinput>, `testdata/countryinfo.txt`,
-//! Apache License 2.0, see `data/LICENSE-libaddressinput.txt`), vendored as
-//! `data/postcodes.tsv` by `scripts/parse_lattice_data.py`. They are data,
+//! Apache License 2.0, see `NOTICE`), vendored as
+//! `data/postcodes.tsv`. They are data,
 //! compiled into the binary; nothing here is written per country.
 
 use std::sync::OnceLock;

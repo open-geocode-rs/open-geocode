@@ -1,4 +1,4 @@
-# libpostal resources/dictionaries/*/{directionals}.txt (MIT)
+# libpostal resources/dictionaries/*/{directionals}.txt (MIT, see NOTICE)
 # af
 noord|n
 noordoos|noord oos|no|n.o.|n.o|n o

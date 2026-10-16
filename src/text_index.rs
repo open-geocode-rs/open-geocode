@@ -177,8 +177,9 @@ impl TextIndexWriter {
             if !memory.try_grow(self.memory_bytes) {
                 memory.force_grow(self.memory_bytes);
             }
-            let threads = std::thread::available_parallelism()
-                .map_or(1, usize::from)
+            // As many as the build's worker pool, which is sized to the
+            // CPUs and memory the process can use.
+            let threads = rayon::current_num_threads()
                 .min(MAX_INDEX_THREADS)
                 .min(self.memory_bytes / INDEX_THREAD_MEMORY_BYTES)
                 .max(1);

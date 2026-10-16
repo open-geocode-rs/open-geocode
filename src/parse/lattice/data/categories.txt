@@ -1,0 +1,15122 @@
+# libpostal resources/categories/<lang>.tsv (MIT, see NOTICE)
+# af
+lughawe
+lughawes
+kunssentrum
+kunssentrums
+otm
+otms
+ouditorium
+ouditoriums
+bank
+banks
+kroeg
+kroegs
+fietsparkering
+fietsparkerings
+fietsverhuring
+fietsverhurings
+bordeel
+bordeels
+wisselkantoor
+wisselkantoors
+bushalte
+bushaltes
+kafee
+kafees
+motorverhuring
+motorverhurings
+karwas
+karwass
+casino
+casinos
+bioskoop
+bioskoops
+kliniek
+klinieks
+klub
+klubs
+kollege
+kolleges
+gemeenskap-sentrum
+gemeenskap-sentrums
+hof
+hofs
+krematorium
+krematoriums
+tandarts
+tandartss
+dokters
+dokterss
+studentehuis
+studentehuiss
+drinkwater
+drinkwaters
+bestuurskool
+bestuurskools
+ambassade
+ambassades
+noodtelefoon
+noodtelefoons
+wegneemetes
+wegneemetess
+veerterminaal
+veerterminaals
+brandkraan
+brandkraans
+brandweerstasie
+brandweerstasies
+fontein
+fonteins
+brandstof
+brandstofs
+begraafplaas
+begraafplaass
+saal
+saals
+gesondheidsentrum
+gesondheidsentrums
+hospitaal
+hospitaals
+hotel
+hotels
+jagtoring
+jagtorings
+roomys
+roomyss
+kleuterskool
+kleuterskools
+biblioteek
+biblioteeks
+mark
+marks
+markplein
+markpleins
+nagklub
+nagklubs
+verpleeghuis
+verpleeghuiss
+kantoor
+kantoors
+park
+parks
+parkade
+parkades
+apteek
+apteeks
+plek van aanbidding
+plek van aanbiddings
+polisie
+polisies
+posbus
+posbuss
+poskantoor
+poskantoors
+tronk
+tronks
+openbare gebou
+openbare gebous
+openbare mark
+openbare marks
+ontvangsarea
+ontvangsareas
+restaurant
+restaurants
+ouetehuis
+ouetehuiss
+sauna
+saunas
+skool
+skools
+skuiling
+skuilings
+winkel
+winkels
+inkopies
+inkopiess
+sosiale klub
+sosiale klubs
+studio
+studios
+supermark
+supermarks
+taxi
+taxis
+openbare telefoon
+openbare telefoons
+teater
+teaters
+toilette
+toilettes
+stadsaal
+stadsaals
+universiteit
+universiteits
+veearts
+veeartss
+asblik
+asbliks
+wifi-toegang
+wifi-toegangs
+jeugsentrum
+jeugsentrums
+administratiewe grens
+administratiewe grenss
+woonstelblok
+woonstelbloks
+boublok
+boubloks
+bunker
+bunkers
+kapel
+kapels
+kerk
+kerks
+kommersiële-gebou
+kommersiële-gebous
+ingang
+ingangs
+fakulteit-gebou
+fakulteit-gebous
+plaasgebou
+plaasgebous
+woonstelle
+woonstelles
+garage
+garages
+hospitaal-gebou
+hospitaal-gebous
+huis
+huiss
+industriële gebou
+industriële gebous
+kantoorgebou
+kantoorgebous
+residensiële gebou
+residensiële gebous
+kleinhandel-gebou
+kleinhandel-gebous
+skoolgebou
+skoolgebous
+stadion
+stadions
+terras
+terrass
+toring
+torings
+spoorwegstasie
+spoorwegstasies
+universiteitsgebou
+universiteitsgebous
+gebou
+gebous
+ruiterpad
+ruiterpads
+snelweg in aanbou
+snelweg in aanbous
+fietspad
+fietspads
+afstandsmerker
+afstandsmerkers
+noodtoeganspunt
+noodtoeganspunts
+voetpad
+voetpads
+hek
+heks
+snelweg
+snelwegs
+snelwegknooppunt
+snelwegknooppunts
+pad
+pads
+platform
+platforms
+primêre pad
+primêre pads
+renbaan
+renbaans
+woonerf
+woonerfs
+sekondêre pad
+sekondêre pads
+dienspad
+dienspads
+snelweg dienste
+snelweg dienstes
+trappe
+trappes
+tersiêre pad
+tersiêre pads
+spoor
+spoors
+wandelpad
+wandelpads
+trokpad
+trokpads
+ongeklassifiseerde pad
+ongeklassifiseerde pads
+grondpad
+grondpads
+argeologiese vindplaas
+argeologiese vindplaass
+slagveld
+slagvelds
+kasteel
+kasteels
+ikoon
+ikoons
+landgoed
+landgoeds
+herdenkingsmonument
+herdenkingsmonuments
+myn
+myns
+monument
+monuments
+museum
+museums
+ruïnes
+ruïness
+kruis langs die pad
+kruis langs die pads
+altaar langs die pad
+altaar langs die pads
+wrak
+wraks
+kommersiële gebied
+kommersiële gebieds
+konstruksie
+konstruksies
+plaas
+plaass
+plaasgrond
+plaasgronds
+plaaswerf
+plaaswerfs
+woud
+wouds
+gras
+grass
+industriële gebied
+industriële gebieds
+stortingsterrein
+stortingsterreins
+militêre gebied
+militêre gebieds
+berg
+bergs
+natuurreservaat
+natuurreservaats
+plein
+pleins
+steengroewe
+steengroewes
+reservoir
+reservoirs
+woongebied
+woongebieds
+kleinhandel
+kleinhandels
+wingerd
+wingerds
+vleiland
+vleilands
+bos
+boss
+strandoort
+strandoorts
+visvangarea
+visvangareas
+tuin
+tuins
+gholfbaan
+gholfbaans
+ysbaan
+ysbaans
+marina
+marinas
+minigolf
+minigolfs
+sportveld
+sportvelds
+speelgrond
+speelgronds
+sport-sentrum
+sport-sentrums
+swembad
+swembads
+atletiekbaan
+atletiekbaans
+waterspeelpark
+waterspeelparks
+baai
+baais
+strand
+strands
+kaap
+kaaps
+grotingang
+grotingangs
+kanaal
+kanaals
+kloof
+kloofs
+kuslyn
+kuslyns
+krater
+kraters
+besienswaardigheid
+besienswaardigheids
+geiser
+geisers
+gletser
+gletsers
+heide
+heides
+heuwel
+heuwels
+eiland
+eilands
+land
+lands
+moeras
+moerass
+modder
+modders
+piek
+pieks
+punt
+punts
+rif
+rifs
+bergkam
+bergkams
+rivier
+riviers
+rotse
+rotses
+puin
+puins
+struikgewas
+struikgewass
+sandbank
+sandbanks
+bron
+brons
+seestraat
+seestraats
+boom
+booms
+vallei
+valleis
+vulkaan
+vulkaans
+water
+waters
+stad
+stads
+distrik
+distriks
+huise
+huises
+eilandjie
+eilandjies
+munisipaliteit
+munisipaliteits
+poskode
+poskodes
+streek
+streeks
+see
+sees
+staat
+staats
+deelgebied
+deelgebieds
+voorstad
+voorstads
+dorp
+dorps
+geïnkorporeerde ruimte
+geïnkorporeerde ruimtes
+spoor in aanbou
+spoor in aanbous
+ongebruikte spoorwegstasie
+ongebruikte spoorwegstasies
+kabelspoorweg
+kabelspoorwegs
+treinhalte
+treinhaltes
+historiese spoorwegstasie
+historiese spoorwegstasies
+spoorwegkruising
+spoorwegkruisings
+gelykvloerse kruising
+gelykvloerse kruisings
+monorail
+monorails
+smalspoor
+smalspoors
+spoorweg-platform
+spoorweg-platforms
+historiese spoor
+historiese spoors
+metrostasie
+metrostasies
+metroingang
+metroingangs
+spoogwegpunte
+spoogwegpuntes
+tramhalte
+tramhaltes
+kledingwinkel
+kledingwinkels
+kunswinkel
+kunswinkels
+bakkery
+bakkerys
+skoonheidssalon
+skoonheidssalons
+fietswinkel
+fietswinkels
+boekwinkel
+boekwinkels
+slagter
+slagters
+motorwinkel
+motorwinkels
+motorhandelaar
+motorhandelaars
+motoronderdele
+motoronderdeles
+motorherstel
+motorherstels
+mat-/tapytwinkel
+mat-/tapytwinkels
+liefdadigheidswinkel
+liefdadigheidswinkels
+klerewinkel
+klerewinkels
+rekenaarwinkel
+rekenaarwinkels
+gemakswinkel
+gemakswinkels
+fotokopie-winkel
+fotokopie-winkels
+kosmetiesewinkel
+kosmetiesewinkels
+afslagwinkel
+afslagwinkels
+doen-dit-self-winkel
+doen-dit-self-winkels
+droogskoonmaker
+droogskoonmakers
+elektronikawinkel
+elektronikawinkels
+plaaswinkel
+plaaswinkels
+modewinkel
+modewinkels
+viswinkel
+viswinkels
+bloemiste
+bloemistes
+koswinkel
+koswinkels
+begrafnisondernemer
+begrafnisondernemers
+meubels
+meubelss
+galery
+galerys
+kwekery/tuinsentrum
+kwekery/tuinsentrums
+algemene winkel
+algemene winkels
+geskenkwinkel
+geskenkwinkels
+kruideniersware-winkel
+kruideniersware-winkels
+haarkapper
+haarkappers
+hardwarewinkel
+hardwarewinkels
+hi-fi
+hi-fis
+versekering
+versekerings
+juwelierswinkel
+juwelierswinkels
+kioskwinkel
+kioskwinkels
+wassery
+wasserys
+selfoonwinkel
+selfoonwinkels
+motorfietswinkel
+motorfietswinkels
+musiekwinkel
+musiekwinkels
+nuusagent
+nuusagents
+oogkundige
+oogkundiges
+organiese koswinkel
+organiese koswinkels
+buitelug-winkel
+buitelug-winkels
+dierewinkel
+dierewinkels
+fotowinkel
+fotowinkels
+skoenwinkel
+skoenwinkels
+winkelsentrum
+winkelsentrums
+sportwinkel
+sportwinkels
+skryfbehoeftes-winkel
+skryfbehoeftes-winkels
+speelgoedwinkel
+speelgoedwinkels
+reisburo
+reisburos
+video-winkel
+video-winkels
+berghut
+berghuts
+kunswerk
+kunswerks
+attraksie
+attraksies
+bed en ontbyt
+bed en ontbyts
+hut
+huts
+kampterrein
+kampterreins
+karavaanpark
+karavaanparks
+chalet
+chalets
+gastehuis
+gastehuiss
+inligting
+inligtings
+leer om
+leer oms
+motel
+motels
+piekniekplek
+piekniekpleks
+pretpark
+pretparks
+uitkykpunt
+uitkykpunts
+dieretuin
+dieretuins
+skeepswerf
+skeepswerfs
+waterverbinding
+waterverbindings
+dam
+dams
+sloot
+sloots
+dokke
+dokkes
+afvoerkanaal
+afvoerkanaals
+sluis
+sluiss
+sluisdeur
+sluisdeurs
+minerale bron
+minerale brons
+stroomversnelling
+stroomversnellings
+rivierbedding
+rivierbeddings
+stroom
+strooms
+waterpunt
+waterpunts
+waterval
+watervals
+# ar
+مطار
+مطارs
+مركز فني/ثقافي
+مركز فني/ثقافيs
+صراف آلي
+صراف آليs
+قاعة محاضرات
+قاعة محاضراتs
+مصرف
+مصرفs
+حانة
+حانةs
+مقعد
+مقعدs
+موقف دراجات
+موقف دراجاتs
+تأجير دراجة
+تأجير دراجةs
+بيت دعارة
+بيت دعارةs
+مكتب صرافة
+مكتب صرافةs
+محطة حافلات
+محطة حافلاتs
+مقهى
+مقهىs
+تأجير سيارات
+تأجير سياراتs
+مشاركة سيارات
+مشاركة سياراتs
+غسيل سيارات
+غسيل سياراتs
+نادي قمار
+نادي قمارs
+سينما
+سينماs
+عيادة
+عيادةs
+نادي
+ناديs
+كلّية
+كلّيةs
+مركز اجتماع
+مركز اجتماعs
+محكمة
+محكمةs
+محرقة جثث
+محرقة جثثs
+طبيب أسنان
+طبيب أسنانs
+أطباء
+أطباءs
+عنبر نوم
+عنبر نومs
+مياه عذبة
+مياه عذبةs
+مدرسة تعليم قيادة
+مدرسة تعليم قيادةs
+سفارة
+سفارةs
+هاتف طوارئ
+هاتف طوارئs
+وجبات سريعة
+وجبات سريعةs
+مرسى عبّارة
+مرسى عبّارةs
+مواد مكافحة حرائق
+مواد مكافحة حرائقs
+فوج إطفاء
+فوج إطفاءs
+نافورة
+نافورةs
+وقود
+وقودs
+مقبرة
+مقبرةs
+مركز للرشاقة/الرياضة
+مركز للرشاقة/الرياضةs
+قاعة
+قاعةs
+مركز صحي
+مركز صحيs
+مستشفى
+مستشفىs
+فندق
+فندقs
+مربط للصيد
+مربط للصيدs
+مثلجات
+مثلجاتs
+حضانة أطفال
+حضانة أطفالs
+مكتبة
+مكتبةs
+سوق
+سوقs
+للإنقاذ في الجبل
+للإنقاذ في الجبلs
+نادي ليلي
+نادي ليليs
+رعاية تمريضية
+رعاية تمريضيةs
+دار رعاية مسنين/معاقين
+دار رعاية مسنين/معاقينs
+مكتب
+مكتبs
+منتزه
+منتزهs
+موقف سيارات
+موقف سياراتs
+صيدلية
+صيدليةs
+معبد
+معبدs
+شرطة
+شرطةs
+صندوق بريد
+صندوق بريدs
+مكتب بريد
+مكتب بريدs
+روضة أطفال
+روضة أطفالs
+سجن
+سجنs
+مبنى عام
+مبنى عامs
+سوق عمومي
+سوق عموميs
+منطقة استقبال
+منطقة استقبالs
+نقطة إعادة تصنيع
+نقطة إعادة تصنيعs
+مطعم
+مطعمs
+بيت مسنين
+بيت مسنينs
+حمّام بخاري حار
+حمّام بخاري حارs
+مدرسة
+مدرسةs
+ملجأ
+ملجأs
+متجر/دكان/حانوت
+متجر/دكان/حانوتs
+التسوق
+التسوقs
+نادي اجتماعي
+نادي اجتماعيs
+ستوديو
+ستوديوs
+سوبرماركت
+سوبرماركتs
+سيارة أجرة
+سيارة أجرةs
+هاتف عمومي
+هاتف عموميs
+مسرح
+مسرحs
+مراحيض
+مراحيضs
+مبنى بلدية
+مبنى بلديةs
+جامعة
+جامعةs
+آلة بيع
+آلة بيعs
+جراحة بيطرية
+جراحة بيطريةs
+مبنى/دار القرية
+مبنى/دار القريةs
+سلة نفايات
+سلة نفاياتs
+نقطة اتصال لاسلكية واي فاي
+نقطة اتصال لاسلكية واي فايs
+مركز نشاطات للشباب
+مركز نشاطات للشبابs
+حدود إدارية
+حدود إداريةs
+مجموعة شقق
+مجموعة شققs
+مجمع مباني
+مجمع مبانيs
+ملجأ محصن
+ملجأ محصنs
+معبد/مصلى
+معبد/مصلىs
+كنيسة
+كنيسةs
+دار/قاعة البلدية
+دار/قاعة البلديةs
+مبنى تجاري
+مبنى تجاريs
+مدخل مبنى
+مدخل مبنىs
+مبنى كلية
+مبنى كليةs
+مبنى مزرعة
+مبنى مزرعةs
+شقق
+شققs
+مرآب
+مرآبs
+مبنى مستشفى
+مبنى مستشفىs
+منزل
+منزلs
+مبنى صناعي
+مبنى صناعيs
+مبنى مكتب
+مبنى مكتبs
+مبنى سكني
+مبنى سكنيs
+مبنى بيع بالمفرق
+مبنى بيع بالمفرقs
+مبنى مدرسة
+مبنى مدرسةs
+متجر
+متجرs
+مدرج ألعاب رياضية
+مدرج ألعاب رياضيةs
+مخزن
+مخزنs
+صف منازل
+صف منازلs
+برج
+برجs
+محطة قطار
+محطة قطارs
+مبنى جامعة
+مبنى جامعةs
+مبنى
+مبنىs
+مسلك خيول
+مسلك خيولs
+مسار خاص للحافلات
+مسار خاص للحافلاتs
+موقف حافلات
+موقف حافلاتs
+طريق فرعي
+طريق فرعيs
+طريق سريع قيد الإنشاء
+طريق سريع قيد الإنشاءs
+مسار دراجات
+مسار دراجاتs
+إشارة مسافة
+إشارة مسافةs
+نقطة دخول طوارئ
+نقطة دخول طوارئs
+ممر للمشاة
+ممر للمشاةs
+مخاضة
+مخاضةs
+بوّابة
+بوّابةs
+شارع سكني
+شارع سكنيs
+طريق غير هام
+طريق غير هامs
+طريق سريع
+طريق سريعs
+تقاطع طرقات سريعة
+تقاطع طرقات سريعةs
+مسار
+مسارs
+طريق للمشاة
+طريق للمشاةs
+منصة
+منصةs
+طريق أولي
+طريق أوليs
+حلبة سباق
+حلبة سباقs
+طريق سكني
+طريق سكنيs
+طريق
+طريقs
+طريق ثانوي
+طريق ثانويs
+طريق خدمة
+طريق خدمةs
+خدمات الطرق السريعة
+خدمات الطرق السريعةs
+درج
+درجs
+مرقى لعبور جدار
+مرقى لعبور جدارs
+درب
+دربs
+طريق رئيسي
+طريق رئيسيs
+طريق غير مصنّف
+طريق غير مصنّفs
+طريق غير معبد
+طريق غير معبدs
+موقع أثري
+موقع أثريs
+ساحة معركة
+ساحة معركةs
+حجر/صخرة تعليم حدود
+حجر/صخرة تعليم حدودs
+قلعة
+قلعةs
+أيقونة
+أيقونةs
+عزبة
+عزبةs
+نصب تذكاري
+نصب تذكاريs
+منجم
+منجمs
+ضريح
+ضريحs
+متحف
+متحفs
+أطلال
+أطلالs
+صليب تذكاري
+صليب تذكاريs
+مزار جانب طريق
+مزار جانب طريقs
+حطام
+حطامs
+حصص سكنية
+حصص سكنيةs
+حوض
+حوضs
+أرض مخلفات
+أرض مخلفاتs
+منطقة تجارية
+منطقة تجاريةs
+محمية طبيعية
+محمية طبيعيةs
+ورشة بناء
+ورشة بناءs
+مزرعة
+مزرعةs
+أرض زراعية
+أرض زراعيةs
+فناء مزرعة
+فناء مزرعةs
+غابة
+غابةs
+عشب
+عشبs
+حقول خضراء
+حقول خضراءs
+منطقة صناعية
+منطقة صناعيةs
+مكب نفايات
+مكب نفاياتs
+مرج
+مرجs
+منطقة عسكرية
+منطقة عسكريةs
+جبل
+جبلs
+منطقة تزحلق
+منطقة تزحلقs
+ساحة
+ساحةs
+كسّارة
+كسّارةs
+سكة حديدية
+سكة حديديةs
+ميدان ألعاب
+ميدان ألعابs
+خزان
+خزانs
+منطقة سكنية
+منطقة سكنيةs
+بيع بالمفرق
+بيع بالمفرقs
+أرض خضراء
+أرض خضراءs
+كرم عنب
+كرم عنبs
+أرض رطبة
+أرض رطبةs
+حرج
+حرجs
+شاطئ منتجع
+شاطئ منتجعs
+أرض مشاع
+أرض مشاعs
+منطقة صيد سمك
+منطقة صيد سمكs
+حديقة
+حديقةs
+ملعب غولف
+ملعب غولفs
+حلبة تزلج على الجليد
+حلبة تزلج على الجليدs
+مارينا
+ماريناs
+جولف مصغر
+جولف مصغرs
+ملعب رياضي
+ملعب رياضيs
+ملعب
+ملعبs
+مزلقة
+مزلقةs
+مركز رياضي
+مركز رياضيs
+بركة سباحة
+بركة سباحةs
+مضمار سباق
+مضمار سباقs
+منتزه ألعاب مائية
+منتزه ألعاب مائيةs
+خليج
+خليجs
+شاطئ
+شاطئs
+رأس (أرض داخلة في البحر(
+رأس (أرض داخلة في البحر(s
+مدخل كهف
+مدخل كهفs
+قناة
+قناةs
+جرف
+جرفs
+خط ساحلي
+خط ساحليs
+فوهة بركان
+فوهة بركانs
+ميزة
+ميزةs
+منحدر
+منحدرs
+مضيق بحري
+مضيق بحريs
+نافورة ماء حار
+نافورة ماء حارs
+نهر/بحر جليدي
+نهر/بحر جليديs
+أرض بور
+أرض بورs
+تلة
+تلةs
+جزيرة
+جزيرةs
+أرض
+أرضs
+سبخة
+سبخةs
+أرض جرداء
+أرض جرداءs
+وحل
+وحلs
+ذروة
+ذروةs
+نقطة
+نقطةs
+سلسلة صخور قرب سطح الماء
+سلسلة صخور قرب سطح الماءs
+أرض مرتفعة
+أرض مرتفعةs
+نهر
+نهرs
+صخرة
+صخرةs
+أرض حصاة
+أرض حصاةs
+أشجار منخفضة
+أشجار منخفضةs
+مياه ضحلة
+مياه ضحلةs
+نبع
+نبعs
+مضيق جبلي
+مضيق جبليs
+شجرة
+شجرةs
+وادي
+واديs
+بركان
+بركانs
+ماء
+ماءs
+أراضي رطبة
+أراضي رطبةs
+مدينة
+مدينةs
+دولة
+دولةs
+مقاطعة
+مقاطعةs
+كفر
+كفرs
+منازل
+منازلs
+جزيرة صغيرة
+جزيرة صغيرةs
+محلة
+محلةs
+بلدية
+بلديةs
+الرمز البريدي
+الرمز البريديs
+منطقة
+منطقةs
+بحر
+بحرs
+ولاية
+ولايةs
+التقسيم الفرعي
+التقسيم الفرعيs
+ضاحية
+ضاحيةs
+بلدة
+بلدةs
+مساحة غير منظمة
+مساحة غير منظمةs
+قرية
+قريةs
+سكة حديد مهجورة
+سكة حديد مهجورةs
+سكة حديدية تحت الإنشاء
+سكة حديدية تحت الإنشاءs
+محطة سكة حديد مهجورة
+محطة سكة حديد مهجورةs
+سكة حديدية معلقة
+سكة حديدية معلقةs
+موقف قطار
+موقف قطارs
+محطة سكة حديد تاريخية
+محطة سكة حديد تاريخيةs
+تقاطع سكك حديدية
+تقاطع سكك حديديةs
+قطار خفيف
+قطار خفيفs
+قطار ذات سكة حديد واحدة
+قطار ذات سكة حديد واحدةs
+سكة حديد ضيقة
+سكة حديد ضيقةs
+رصيف محطة قطار
+رصيف محطة قطارs
+سكة حديدية تراثية
+سكة حديدية تراثيةs
+خط تفرع سكة حديدية
+خط تفرع سكة حديديةs
+محطة مترو الأنفاق
+محطة مترو الأنفاقs
+مدخل مترو
+مدخل متروs
+مبدل السكة الحديدية
+مبدل السكة الحديديةs
+سكة ترام
+سكة ترامs
+موقف ترام
+موقف ترامs
+فناء سكة حديد
+فناء سكة حديدs
+متجر كحول للبيع الخارجي
+متجر كحول للبيع الخارجيs
+متجر ملابس
+متجر ملابسs
+متجر فن
+متجر فنs
+مخبز
+مخبزs
+صالون تجميل
+صالون تجميلs
+متجر مشروبات
+متجر مشروباتs
+متجر دراجات
+متجر دراجاتs
+متجر كتب
+متجر كتبs
+جزار
+جزارs
+متجر سيارات
+متجر سياراتs
+تاجر سيارات
+تاجر سياراتs
+قطع غيار سيارات
+قطع غيار سياراتs
+مرآب سيارات
+مرآب سياراتs
+معرض سجاد
+معرض سجادs
+متجر جمعية خيرية
+متجر جمعية خيريةs
+صيدلي
+صيدليs
+متجر ألبسة
+متجر ألبسةs
+متجر كمبيوتر
+متجر كمبيوترs
+متجر الحلويات
+متجر الحلوياتs
+متجر للأغراض اليومية
+متجر للأغراض اليوميةs
+محل تصوير مستندات
+محل تصوير مستنداتs
+بائع مستحضرات تجميل
+بائع مستحضرات تجميلs
+متجر متعدد الأقسام
+متجر متعدد الأقسامs
+محل رخصة
+محل رخصةs
+براعة منزلية
+براعة منزليةs
+تنظيف جاف
+تنظيف جافs
+متجر إلكترونيات
+متجر إلكترونياتs
+وكيل عقاري
+وكيل عقاريs
+متجر منتوجات زراعية
+متجر منتوجات زراعيةs
+متجر أزياء
+متجر أزياءs
+متجر أسماك
+متجر أسماكs
+بائع زهور
+بائع زهورs
+دكان مأكولات
+دكان مأكولاتs
+وكلاء ترتيبات جنازة
+وكلاء ترتيبات جنازةs
+أثاث
+أثاثs
+معرض
+معرضs
+متجر للسلع الزراعية
+متجر للسلع الزراعيةs
+متجر عام
+متجر عامs
+متجر هدايا
+متجر هداياs
+محل خضروات
+محل خضرواتs
+بقالة
+بقالةs
+مزين/مصفف شعر
+مزين/مصفف شعرs
+متجر عتاد
+متجر عتادs
+متجر هاي فاي
+متجر هاي فايs
+بوليصات تأمين
+بوليصات تأمينs
+متجر مجوهرات
+متجر مجوهراتs
+كشك
+كشكs
+مصبغة
+مصبغةs
+مركز تسوق
+مركز تسوقs
+متجر هواتف محمولة
+متجر هواتف محمولةs
+متجر دراجات نارية
+متجر دراجات ناريةs
+متجر موسيقى
+متجر موسيقىs
+وكالة أنباء
+وكالة أنباءs
+نظاراتي
+نظاراتيs
+متجر أغذية عضوية
+متجر أغذية عضويةs
+متجر للنشاطات الخارجية
+متجر للنشاطات الخارجيةs
+متجر حيوانات أليفة
+متجر حيوانات أليفةs
+متجر صور
+متجر صورs
+صالون
+صالونs
+متجر أحذية
+متجر أحذيةs
+مركز التسوق
+مركز التسوقs
+متجر رياضة
+متجر رياضةs
+محل قرطاسية
+محل قرطاسيةs
+متجر ألعاب
+متجر ألعابs
+وكالة سفر
+وكالة سفرs
+متجر فيديو
+متجر فيديوs
+متجر نبيذ للبيع الخارجي
+متجر نبيذ للبيع الخارجيs
+كوخ جبلي
+كوخ جبليs
+عمل فني
+عمل فنيs
+معلم سياحي
+معلم سياحيs
+سرير وفطار
+سرير وفطارs
+حُجرة أو مقصورة
+حُجرة أو مقصورةs
+موقع تخييم
+موقع تخييمs
+موقع قافلة
+موقع قافلةs
+شاليه
+شاليهs
+بيت ضيافة
+بيت ضيافةs
+سكن شباب
+سكن شبابs
+معلومات
+معلوماتs
+كوخ منحدر
+كوخ منحدرs
+نُزل
+نُزلs
+موقع بيك نيك
+موقع بيك نيكs
+حديقة ملاهي
+حديقة ملاهيs
+موقع كاشف
+موقع كاشفs
+حديقة حيوانات
+حديقة حيواناتs
+حوض سفن
+حوض سفنs
+قناة مائية
+قناة مائيةs
+سدّ
+سدّs
+قناة مهجورة
+قناة مهجورةs
+خندق
+خندقs
+مرسى
+مرسىs
+مسرب
+مسربs
+قفل
+قفلs
+هويس
+هويسs
+نبع مياه معدنية
+نبع مياه معدنيةs
+منحدرات نهرية
+منحدرات نهريةs
+ضفة نهر
+ضفة نهرs
+جدول
+جدولs
+نقطة ماء شفة
+نقطة ماء شفةs
+شلال
+شلالs
+هدار (سدّ منخفض)
+هدار (سدّ منخفض)s
+# br
+aerborzh
+aerborzhioù
+kreizenn arz
+kreizennoù arz
+bilhedaouer
+bilhedaouerioù
+selaouva
+selaouvaoù
+ti-bank
+ti-banks
+tavarn
+tavarns
+skaoñ
+skaoñs
+parklec'h evit ar beloioù
+parklec'h evit ar beloioùs
+feurmiñ beloioù
+feurmiñ beloioùs
+bordel
+bordels
+burev eskemm
+burev eskemms
+arsav bus
+arsav buss
+kafedi
+kafedis
+feurmiñ kirri
+feurmiñ kirris
+leur genweturañ
+leur genweturañs
+gwalc'hiñ kirri
+gwalc'hiñ kirris
+kazino
+kazinos
+sinema
+sinemas
+klinikenn
+klinikenns
+klub
+klubs
+skol-veur pe skol-uhel
+skol-veur pe skol-uhels
+sal liezimplij
+sal liezimplijs
+lez-varn
+lez-varns
+krematoriom
+krematorioms
+dentour
+dentours
+mezeien
+mezeiens
+kouskva
+kouskvas
+dour mat da evañ
+dour mat da evañs
+skol bleinañ
+skol bleinañs
+kannati
+kannatis
+pellgomzer evit an trummadoù
+pellgomzer evit an trummadoùs
+fast food
+fast foods
+porzh karrlistri
+porzh karrlistris
+dour evit an tan
+dour evit an tans
+kazarn pomperien
+kazarn pomperiens
+feunteun
+feunteuns
+trelosk
+trelosks
+bered
+bereds
+fitness/jiminas
+fitness/jiminass
+sal
+sals
+kreizenn yec'hed
+kreizenn yec'heds
+ospital
+ospitals
+leti
+letis
+stand tennañ
+stand tennañs
+dienn skorn
+dienn skorns
+liorzh ar vugale
+liorzh ar vugales
+levraoueg
+levraouegs
+marc'had
+marc'hads
+marc'hallac'h
+marc'hallac'hs
+sikourioù er menezioù
+sikourioù er menezioùs
+klub-noz
+klub-nozs
+diwallerezh
+diwallerezhs
+ti yec'hed
+ti yec'heds
+burev
+burevs
+park
+parks
+parklec'h
+parklec'hs
+apotikerezh
+apotikerezhs
+lec'h azeuliñ
+lec'h azeuliñs
+polis
+poliss
+boest-lizheroù
+boest-lizheroùs
+ti-post
+ti-posts
+rakskol
+rakskols
+toull-bac'h
+toull-bac'hs
+savadur foran
+savadur forans
+marc'had foran
+marc'had forans
+tachenn degemer
+tachenn degemers
+lec'h adaozañ
+lec'h adaozañs
+preti
+pretis
+ti-retredidi
+ti-retredidis
+saona
+saonas
+skol
+skols
+gwasked
+gwaskeds
+stal
+stals
+prenadennoù
+prenadennoùs
+klub sokial
+klub sokials
+studio
+studios
+gourmarc'had
+gourmarc'hads
+taksi
+taksis
+pellgomzer foran
+pellgomzer forans
+c'hoariva
+c'hoarivas
+privezioù
+privezioùs
+ti-kêr
+ti-kêrs
+skol-veur
+skol-veurs
+ingaler emgefre
+ingaler emgefres
+surjianerezh evit al loened
+surjianerezh evit al loeneds
+sal ar gumun
+sal ar gumuns
+pod-lastez
+pod-lastezs
+moned wifi
+moned wifis
+kreizenn evit ar re yaouank
+kreizenn evit ar re yaouanks
+bevennoù melestradurel
+bevennoù melestradurels
+kendi
+kendis
+bunker
+bunkers
+chapel
+chapels
+iliz
+ilizs
+savadur gant burevioù
+savadur gant burevioùs
+dont-tre ar savadur
+dont-tre ar savadurs
+savadur kevrenn
+savadur kevrenns
+savadur feurm
+savadur feurms
+ranndioù
+ranndioùs
+karrdi
+karrdis
+savadur ospital
+savadur ospitals
+ti
+tis
+savadurioù greantel
+savadurioù greantels
+savadur burevioù
+savadur burevioùs
+savadur annez
+savadur annezs
+savadur skol
+savadur skols
+stad
+stads
+savenn
+savenns
+tour
+tours
+porzh-houarn
+porzh-houarns
+savadur skol-veur
+savadur skol-veurs
+savadur
+savadurs
+hent evit ar varc'hegerien
+hent evit ar varc'hegeriens
+hent kirri boutin hentet
+hent kirri boutin hentets
+hent eil renk
+hent eil renks
+gourhent o vezañ savet
+gourhent o vezañ savets
+roudenn divrodegoù
+roudenn divrodegoùs
+bonn kilometroù
+bonn kilometroùs
+poent moned trummadoù
+poent moned trummadoùs
+gwenodenn evit an droadeien
+gwenodenn evit an droadeiens
+roudour
+roudours
+dor
+dors
+straed annez
+straed annezs
+hent dister
+hent disters
+gourhent
+gourhents
+liammadur gourhent
+liammadur gourhents
+hentoù gourhentet
+hentoù gourhentets
+gwenodenn
+gwenodenns
+hent evit an droadeien
+hent evit an droadeiens
+leurenn
+leurenns
+hent kentañ renk
+hent kentañ renks
+hent kentañ
+hent kentañs
+redva
+redvas
+takad annezet
+takad annezets
+hent
+hents
+hent a-eil
+hent a-eils
+hent ar servijoù
+hent ar servijoùs
+servijoù gourhent
+servijoù gourhents
+diri
+diris
+skalier
+skaliers
+hent trede renk
+hent trede renks
+roudenn
+roudenns
+hent-tizh
+hent-tizhs
+hent bihan
+hent bihans
+hent nann-gwisket
+hent nann-gwiskets
+lec'hienn henoniel
+lec'hienn henoniels
+takad emgann
+takad emganns
+bonn harzoù
+bonn harzoùs
+kastell
+kastells
+arlun
+arluns
+maner
+maners
+kounlec'h
+kounlec'hs
+mengleuz
+mengleuzs
+monumant
+monumants
+mirdi
+mirdis
+dismantroù
+dismantroùs
+kroaz
+kroazs
+ti-pediñ
+ti-pediñs
+peñse
+peñses
+liorzhoù familh
+liorzhoù familhs
+poull
+poulls
+tachenn rezet
+tachenn rezets
+takad kenwerzh
+takad kenwerzhs
+tachenn gwarezet
+tachenn gwarezets
+atant
+atants
+tachennoù labour-douar
+tachennoù labour-douars
+mereuri
+mereuris
+koadeg
+koadegs
+geot
+geots
+tachenn da sevel tiez
+tachenn da sevel tiezs
+takad greantel
+takad greantels
+diskarg
+diskargs
+prad
+prads
+takad milourel
+takad milourels
+menez
+menezs
+gwarezva natur
+gwarezva naturs
+plasenn
+plasenns
+hent-houarn
+hent-houarns
+tachenn c'hoari
+tachenn c'hoaris
+mirlenn
+mirlenns
+takad annez
+takad annezs
+tachenn foran gant geot
+tachenn foran gant geots
+gwinieg
+gwiniegs
+takad gleborek
+takad gleboreks
+koad
+koads
+kêr-gouronkañ
+kêr-gouronkañs
+tachenn kumun
+tachenn kumuns
+takad pesketa
+takad pesketas
+liorzh
+liorzhs
+tachenn golf
+tachenn golfs
+poull-ruzikat
+poull-ruzikats
+porzh-bageal
+porzh-bageals
+golfig
+golfigs
+tachenn sport
+tachenn sports
+kal
+kals
+kreizenn sport
+kreizenn sports
+poull-neuial
+poull-neuials
+roudenn redek
+roudenn redeks
+kreizenn dour
+kreizenn dours
+bae
+baes
+traezhenn
+traezhenns
+kab
+kabs
+treuzoù mougev
+treuzoù mougevs
+kanol
+kanols
+tornaod
+tornaods
+arvor
+arvors
+toull-diskarg
+toull-diskargs
+elfenn
+elfenns
+fell
+fells
+fjord
+fjords
+geiser
+geisers
+skorneg
+skornegs
+brug
+brugs
+torgenn
+torgenns
+enez
+enezs
+douar
+douars
+geun
+geuns
+lanneier
+lanneiers
+fank
+fanks
+pikern
+pikerns
+poent
+poents
+karreg
+karregs
+kribenn
+kribenns
+stêr
+stêrs
+roc'h
+roc'hs
+disac'hadur
+disac'hadurs
+strouezh
+strouezhs
+klosenn
+klosenns
+lamm-dour
+lamm-dours
+strizh-mor
+strizh-mors
+gwezenn
+gwezenns
+traoñienn
+traoñienns
+menez-tan
+menez-tans
+dour
+dours
+takadoù gleborek
+takadoù gleboreks
+meurgêr
+meurgêrs
+bro
+bros
+kontelezh
+kontelezhs
+pennkêr
+pennkêrs
+tiez
+tiezs
+enezennig
+enezennigs
+lec'hiadenn
+lec'hiadenns
+lanneg
+lannegs
+kumun
+kumuns
+kod post
+kod posts
+rannvro
+rannvros
+mor
+mors
+eilrannad
+eilrannads
+karter
+karters
+kêr
+kêrs
+takad diaoz
+takad diaozs
+kêriadenn
+kêriadenns
+hent-houarn dilezet
+hent-houarn dilezets
+hent-houarn war sevel
+hent-houarn war sevels
+hent-houarn dizimplijet
+hent-houarn dizimplijets
+porzh-houarn dizimplijet
+porzh-houarn dizimplijets
+hent-houarn fundren
+hent-houarn fundrens
+chom a-sav an tren
+chom a-sav an trens
+lec'h chom a-sav istorel an tren
+lec'h chom a-sav istorel an trens
+kej hent-houarn
+kej hent-houarns
+treuzenn hent-houarn
+treuzenn hent-houarns
+hent-houarn bihan
+hent-houarn bihans
+monorail
+monorails
+hent-houarn strizh
+hent-houarn strizhs
+pondalez hent-houarn
+pondalez hent-houarns
+hent-houarn miret
+hent-houarn mirets
+hent-houarn kevreañ
+hent-houarn kevreañs
+arsav metro
+arsav metros
+dont-tre ar metro
+dont-tre ar metros
+hentoù-houarn heñchañ
+hentoù-houarn heñchañs
+tramgarr
+tramgarrs
+lec'h chom a-sav an tram
+lec'h chom a-sav an trams
+hent rummañ
+hent rummañs
+gwezher alkool
+gwezher alkools
+stal dilhad
+stal dilhads
+stal arz
+stal arzs
+baraerezh
+baraerezhs
+stal produioù kened
+stal produioù keneds
+stal evajoù
+stal evajoùs
+stal marc'hoù-houarn
+stal marc'hoù-houarns
+levrdi
+levrdis
+kiger
+kigers
+stal kirri
+stal kirris
+gwerzher kirri
+gwerzher kirris
+pezhioù evit ar c'hirri
+pezhioù evit ar c'hirris
+dresañ kirri
+dresañ kirris
+stal pallennoù
+stal pallennoùs
+stal madobererezh
+stal madobererezhs
+stal produioù yec'hederezh
+stal produioù yec'hederezhs
+stal urzhiataerioù
+stal urzhiataerioùs
+koñfizerezh
+koñfizerezhs
+ispiserezh
+ispiserezhs
+stal luc'heilañ
+stal luc'heilañs
+stal gwezeladoù
+stal gwezeladoùs
+gour stalioù
+gour stalioùs
+stal discount
+stal discounts
+stal bitellat
+stal bitellats
+netadur sec'h
+netadur sec'hs
+stal traoù eletronek
+stal traoù eletroneks
+kourater tiez
+kourater tiezs
+stal evit al labour-douar
+stal evit al labour-douars
+stal giz
+stal gizs
+peskerezh
+peskerezhs
+bokedour
+bokedours
+stal voued
+stal voueds
+kañvlidoù
+kañvlidoùs
+stal arrebeuri
+stal arrebeuris
+palier
+paliers
+stal liorzhañ
+stal liorzhañs
+stal hollek
+stal holleks
+stal profoù
+stal profoùs
+gwerzher frouezh ha legumaj
+gwerzher frouezh ha legumajs
+perukenner
+perukenners
+stal urzhiataerezh
+stal urzhiataerezhs
+stal hi-fi
+stal hi-fis
+asurañs
+asurañss
+bravigerezh
+bravigerezhs
+kiosk
+kiosks
+kanndi
+kanndis
+palier kenwerzh
+palier kenwerzhs
+stal pellgomzerioù hezoug
+stal pellgomzerioù hezougs
+stal marc'hoù-tan
+stal marc'hoù-tans
+stal sonerezh
+stal sonerezhs
+gwerzher kazetennoù
+gwerzher kazetennoùs
+luneder
+luneders
+stal boued bio
+stal boued bios
+stal obererezhioù en diavaez
+stal obererezhioù en diavaezs
+stal loened
+stal loeneds
+stal luc'hskeudenniñ
+stal luc'hskeudenniñs
+saloñs
+saloñss
+stal voteier
+stal voteiers
+kreizenn-genwerzh
+kreizenn-genwerzhs
+stal sport
+stal sports
+paperaerezh
+paperaerezhs
+stal c'hoarielloù
+stal c'hoarielloùs
+ajañs-veaj
+ajañs-veajs
+stal videoioù
+stal videoioùs
+kavour gwin
+kavour gwins
+ti repu
+ti repus
+oberenn arz
+oberenn arzs
+tra zedennus
+tra zedennuss
+bod ha boued
+bod ha boueds
+kabanenn
+kabanenns
+tachenn gampiñ
+tachenn gampiñs
+tachenn karavanennoù
+tachenn karavanennoùs
+ti-menez
+ti-menezs
+ti ostizien
+ti ostiziens
+herberc'h
+herberc'hs
+titouroù
+titouroùs
+stand
+stands
+motel
+motels
+lec'hienn biknikañ
+lec'hienn biknikañs
+park tematek
+park temateks
+gwelva
+gwelvas
+zoo
+zoos
+chanter bigi
+chanter bigis
+kevreadur dourredennoù
+kevreadur dourredennoùs
+chaoser
+chaosers
+kanol dilezet
+kanol dilezets
+foz
+fozs
+dok
+doks
+dizourer
+dizourers
+skluz
+skluzs
+dor skluz
+dor skluzs
+mammenn dour melar
+mammenn dour melars
+fes
+fess
+taranoù
+taranoùs
+strad ar stêr
+strad ar stêrs
+gwazh-dour
+gwazh-dours
+oued
+oueds
+lec'h dour
+lec'h dours
+stankell
+stankells
+# ca
+aeroport
+aeroports
+caixer automàtic
+caixers automàtics
+auditori
+auditoris
+banc
+bancs
+bar
+bars
+lloguer de bicicletes
+lloguers de bicicletes
+prostíbul
+prostíbuls
+oficina de canvi
+oficines de canvi
+estació d'autobusos
+estacions d'autobusos
+cafè
+cafès
+lloguer de cotxes
+lloguers de cotxes
+casino
+casinos
+cinema
+cinemes
+clínica
+clíniques
+club
+clubs
+jutjat
+jutjats
+crematori
+crematoris
+dentista
+dentistes
+metge
+metges
+aigua potable
+aigües potables
+autoescola
+autoescoles
+ambaixada
+ambaixades
+telèfon d'emergència
+telèfons d'emergència
+parc de bombers
+parcs de bombers
+font
+fonts
+gasolinera
+gasolineres
+cementiri
+cementiris
+centre de salut
+centres de salut
+hospital
+hospitals
+hotel
+hotels
+gelat
+gelats
+jardí d'infància
+jardins d'infància
+biblioteca
+biblioteques
+mercat
+mercats
+club nocturn
+clubs nocturns
+parc
+parcs
+pàrquing
+pàrquings
+farmàcia
+farmàcies
+lloc de culte
+llocs de culte
+policia
+policies
+bústia
+bústies
+oficina de correus
+oficines de correus
+pre-escola
+pre-escoles
+presó
+presons
+pub
+pubs
+edifici públic
+edificis públics
+punt de reciclatge
+punts de reciclatge
+restaurant
+restaurants
+sauna
+saunes
+escola
+escoles
+refugi
+refugis
+botiga
+botigues
+club social
+club socials
+supermercat
+supermercats
+taxi
+taxis
+telèfon públic
+telèfon públics
+teatre
+teatres
+banys
+banyss
+ajuntament
+ajuntaments
+universitat
+universitats
+accés a internet wifi
+accés a internet wifis
+centre juvenil
+centre juvenils
+bloc d'apartaments
+bloc d'apartamentss
+capella
+capellas
+església
+esglésias
+edifici comercial
+edifici comercials
+edifici facultatiu
+edifici facultatius
+pisos
+pisoss
+garatge
+garatges
+edifici hospitalari
+edifici hospitalaris
+casa
+casas
+edifici industrial
+edifici industrials
+edifici públics
+edifici escolar
+edifici escolars
+estadi
+estadis
+magatzem
+magatzems
+torre
+torres
+estació de tren
+estació de trens
+edifici universitari
+edifici universitaris
+edifici
+edificis
+parada d'autobús
+parada d'autobúss
+ruta per a bicicletes
+ruta per a bicicletess
+accés d'emergència
+accés d'emergèncias
+sendera
+senderas
+porta
+portas
+camí
+camís
+carretera principal
+carretera principals
+residencial
+residencials
+carretera
+carreteras
+carretera secundària
+carretera secundàrias
+graons
+graonss
+escala per a travessar reixats
+escala per a travessar reixatss
+carretera terciària
+carretera terciàrias
+carretera sense classificar
+carretera sense classificars
+lloc arqueològic
+lloc arqueològics
+camp de batalla
+camp de batallas
+castell
+castells
+icona
+iconas
+memorial
+memorials
+mina
+minas
+monument
+monuments
+museu
+museus
+ruïnes
+ruïness
+zona comercial
+zona comercials
+construcció
+construcciós
+granja
+granjas
+bosc
+boscs
+zona industrial
+zona industrials
+muntanya
+muntanyas
+plaça
+plaças
+pedrera
+pedreras
+àrea residencial
+àrea residencials
+aiguamoll
+aiguamolls
+fusta
+fustas
+àrea de pesca
+àrea de pescas
+jardí
+jardís
+camp de golf
+camp de golfs
+pista de patinatge sobre gel
+pista de patinatge sobre gels
+port esportiu
+port esportius
+minigolf
+minigolfs
+reserva natural
+reserva naturals
+centre esportiu
+centre esportius
+piscina
+piscinas
+parc aquàtic
+parc aquàtics
+badia
+badias
+platja
+platjas
+cap
+caps
+entrada a cova
+entrada a covas
+canal
+canals
+cingle
+cingles
+litoral
+litorals
+cràter
+cràters
+forest
+forests
+fiord
+fiords
+guèiser
+guèisers
+glacera
+glaceras
+bruguerar
+bruguerars
+pujol
+pujols
+illa
+illas
+amarratge
+amarratges
+llot
+llots
+pic
+pics
+punt
+punts
+escull
+esculls
+cresta
+crestas
+riu
+rius
+roca
+rocas
+pedregar
+pedregars
+deu
+deus
+estret
+estrets
+arbre
+arbres
+vall
+valls
+volcà
+volcàs
+aigua
+aiguas
+aiguamollss
+ciutat
+ciutats
+país
+paíss
+comtat
+comtats
+aldea
+aldeas
+cases
+casess
+illot
+illots
+localitat
+localitats
+amarrador
+amarradors
+municipi
+municipis
+codi postal
+codi postals
+regió
+regiós
+mar
+mars
+estat o província
+estat o províncias
+subdivisió
+subdivisiós
+suburbi
+suburbis
+poble
+pobles
+pas a nivell
+pas a nivells
+monorail
+monorails
+estació de metro
+estació de metros
+tramvia
+tramvias
+parada de tramvia
+parada de tramvias
+fleca
+flecas
+tenda de bicicletes
+tenda de bicicletess
+llibreria
+llibrerias
+carnisseria
+carnisserias
+reparació d'automòbils
+reparació d'automòbilss
+farmàcias
+peixateria
+peixaterias
+floristeria
+floristerias
+perruqueria o barberia
+perruqueria o barberias
+joieria
+joierias
+bugaderia
+bugaderias
+centre comercial
+centre comercials
+sabateria
+sabaterias
+agència de viatges
+agència de viatgess
+cabanya alpina
+cabanya alpinas
+il·lustració
+il·lustraciós
+atracció
+atracciós
+llist i esmorzar (b&amp;b)
+llist i esmorzar (b&amp;b)s
+cabanya
+cabanyas
+campament
+campaments
+càmping per a caravanes
+càmping per a caravaness
+xalet
+xalets
+alberg
+albergs
+hostal
+hostals
+informació
+informaciós
+nau
+naus
+motel
+motels
+àrea de pícnic
+àrea de pícnics
+parc temàtic
+parc temàtics
+mirador
+miradors
+zoològic
+zoològics
+séquia
+séquias
+amarradorss
+ràpids
+ràpidss
+torrent
+torrents
+punt d'aigua
+punt d'aiguas
+cascada
+cascadas
+# cs
+kino
+kina
+parkoviště
+pošta
+pošty
+toalety
+železniční stanice
+autobusová zastávka
+autobusové zastávky
+brána
+brány
+ulice
+silnice ii. třídy
+schodiště
+schody
+muzeum
+muzea
+hřbitov
+hřbitovy
+staveniště
+vinice
+zahrada
+zahrady
+golfové hřiště
+kluziště
+minigolf
+minigolfy
+přírodní rezervace
+park
+parky
+hřiště
+stadion
+stadiony
+bazén
+bazény
+pláž
+pláže
+ledovec
+ledovce
+kopec
+kopce
+ostrov
+ostrovy
+strom
+stromy
+údolí
+letiště
+velkoměsto
+velkoměsta
+stát
+státy
+farma
+farmy
+osada
+osady
+dům
+domy
+budova
+budovy
+ostrůvek
+ostrůvky
+oblast
+oblasti
+obecní úřad
+obecní úřady
+psč
+kraj
+kraje
+moře
+městská část
+městské části
+město
+města
+vesnice
+železniční zastávka
+železnční zastávky
+stanice metra
+kadeřnictví
+vysokohorská chata
+vysokohorské chaty
+turistická atrakce
+turistické atrakce
+tábořiště, kemp
+tábořiště, kempy
+autokemping
+autokempingy
+velká chata
+velké chaty
+penzion
+penziony
+hostel
+hostely
+hotel
+hotels
+turistické informace
+přístřešek
+přístřešky
+motel
+motely
+zábavní park
+zábavní parky
+místo s dobrým výhledem
+místo s dobrými výhledy
+zoo
+# de
+flughafen
+flughäfen
+kulturzentrum
+kulturzentren
+geldautomat
+geldautomaten
+hörsaal
+hörsäle
+bank
+banken
+bar
+bars
+bänke
+fahrradstellplatz
+fahrradstellplätze
+fahrradverleih
+fahrradverleihe
+bordell
+bordelle
+wechselstube
+wechselstuben
+busbahnhof
+busbahnhöfe
+café
+cafés
+cafe
+cafes
+autovermietung
+autovermietungen
+carsharing
+carsharings
+autowaschanlage
+autowaschanlagen
+casino
+casinos
+kino
+kinos
+krankenhaus
+krankenhäuser
+verein
+vereine
+hochschule
+hochschulen
+gemeinschaftszentrum
+gemeinschaftszentren
+gericht
+gerichte
+krematorium
+krematorien
+zahnarzt
+zahnärzte
+arzt
+ärzte
+dojo
+dojos
+dojang
+kampfsport
+kampfkunst
+studentenwohnheim
+studentenwohnheime
+trinkwasser
+fahrschule
+fahrschulen
+botschaft
+botschaften
+notrufsäule
+notrufsäulen
+schnellimbiss
+schnellimbisse
+imbiss
+imbisse
+fähranlegestelle
+fähranlegestellen
+hydrant
+hydranten
+feuerwehr
+feuerwehren
+springbrunnen
+tankstelle
+tankstellen
+friedhof
+friedhöfe
+turnhalle
+turnhallen
+halle
+hallen
+gesundheitszentrum
+gesundheitszentren
+hotel
+hotels
+hochstand
+hochstände
+eisdiele
+eisdielen
+kindergarten
+kindergärten
+bücherei
+büchereien
+markt
+märkte
+marktplatz
+marktplätze
+bergrettung
+nachtklub
+nachtklubs
+kinderkrippe
+kinderkrippen
+pflegeheim
+pflegeheime
+büro
+büros
+park
+parks
+parkplatz
+parkplätze
+apotheke
+apotheken
+andachtsstätte
+andachtsstätten
+polizei
+briefkasten
+briefkästen
+postamt
+postämter
+vorschule
+vorschulen
+gefängnis
+gefängnisse
+kneipe
+kneipen
+öffentliches gebäude
+öffentliche gebäude
+öffentlicher markt
+öffentliche märkte
+empfangsbereich
+empfangsbereiche
+recyclingeinrichtung
+recyclingeinrichtungen
+restaurant
+restaurants
+gaststätte
+gaststätten
+gasthaus
+gasthäuser
+altersheim
+altersheime
+sauna
+saunen
+schule
+schulen
+schutzhütte
+schutzhütten
+geschäft
+geschäfte
+einkaufszentrum
+einkaufszentren
+geselligkeitsverein
+geselligkeitsvereine
+studio
+studios
+supermarkt
+supermärkte
+swingerclub
+swingerclubs
+taxistand
+taxistände
+telefonzelle
+telefonzellen
+theater
+wc
+wcs
+toilette
+toiletten
+rathaus
+rathäuser
+universität
+universitäten
+automat
+automaten
+tierarzt
+tierärzte
+gemeindezentrum
+gemeindezentren
+mülleimer
+wlan-access-point
+wlan-access-points
+jugendzentrum
+jugendzentren
+verwaltungsgrenze
+verwaltungsgrenzen
+wohnblock
+wohnblöcke
+gebäudeblock
+gebäudeblöcke
+bunker
+kapelle
+kapellen
+kirche
+kirchen
+gewerbegebäude
+eingang
+eingänge
+ausbildungsgebäude
+bauernhof
+bauernhöfe
+wohnung
+wohnungen
+garage
+garagen
+spital
+spitäler
+haus
+häuser
+industriegebäude
+bürogebäude
+wohngebäude
+einzelhandelsgebäude
+schulgebäude
+stadion
+stadien
+warenhäuser
+terrasse
+terrassen
+turm
+türme
+bahnhof
+bahnhöfe
+universitätsgebäude
+gebäude
+reitweg
+reitwege
+busspur
+busspuren
+bushaltestelle
+bushaltestellen
+umgehungsstraße
+umgehungstraßen
+straße im bau
+straßen im bau
+radweg
+radwege
+kilometerstein
+kilometersteine
+notrufpunkt
+notrufpunkte
+fußweg
+fußwege
+furt
+furten
+tor
+tore
+spielstraße
+spielstraßen
+nebenstraße
+nebenstraßen
+autobahn
+autobahnen
+autobahnkreuz
+autobahnkreuze
+autobahnauffahrt
+autobahnauffahrten
+pfad
+pfade
+trampelpfad
+trampelpfade
+fußgängerzone
+fußgängerzonen
+plattform
+plattformen
+primärstraße
+primärstraßen
+primärauffahrt
+primärauffahrten
+rennweg
+rennwege
+wohnstraße
+wohnstraßen
+straße
+straßen
+landstraße
+landstraßen
+anliegerstraße
+anliegerstraßen
+autobahnraststätte
+autobahnraststätten
+treppe
+treppen
+zaunübertritt
+zaunübertritts
+tertiärstraße
+tertiärstraßen
+feldweg
+feldwege
+waldweg
+waldwege
+fernverkehrsstraße
+fernverkehrsstraßen
+fernstraßenauffahrt
+fernstraßenauffahrten
+nichtasphaltierte straße
+nichtasphaltierte straßen
+ausgrabungsstätte
+ausgrabungsstätten
+kampfgebiet
+kampfgebiete
+grenzstein
+grenzsteine
+historisches gebäude
+historische gebäude
+schloss
+schlösser
+burg
+burgen
+historisches haus
+historisches häuser
+symbol
+symbole
+gut
+gute
+gedenkstätte
+gedenkstätten
+historisches bergwerk
+historische bergwerke
+monument
+monumente
+museum
+museen
+ruine
+ruinen
+wegkreuz
+wegkreuze
+schrein
+schreine
+schiffswrack
+schiffswracks
+kleingartenanlage
+kleingartenanlagen
+becken
+brachfläche
+brachflächen
+gewerbegebiet
+gewerbegebiete
+naturschutzgebiet
+naturschutzgebiete
+baustelle
+baustellen
+ackerland
+acker
+äcker
+hof
+höfe
+wald
+wälder
+rasenfläche
+rasenflächen
+unbebaute fläche
+unbebaute flächen
+industriegebiet
+industriegebiete
+müllhalde
+müllhalden
+wiese
+wiesen
+militärgebiet
+militärgebiete
+bergwerk
+bergwerke
+berg
+berge
+piste
+pisten
+großer platz
+große plätze
+steinbruch
+steinbrüche
+eisenbahn
+eisenbahnen
+naherholungsgebiet
+naherholungsgebiete
+reservoir
+reservoire
+siedlung
+siedlungen
+wohngebiet
+wohngebiete
+einzelhandel
+grünanlage
+grünanlagen
+weingut
+weingüter
+feuchtgebiet
+feuchtgebiete
+freibad
+freibäder
+gemeindeland
+fischereigrund
+fischereigründe
+garten
+gärten
+golfplatz
+golfplätze
+eislaufplatz
+eislaufplätze
+yachthafen
+yachthäfen
+minigolf
+minigolfplätze
+sportplatz
+sportplätze
+spielfeld
+spielfelder
+spielplatz
+spielplätze
+slipanlage
+slipanlagen
+sportzentrum
+sportzentren
+schwimmbecken
+rennstrecke
+rennstrecken
+wasserpark
+wasserparks
+pass
+pässe
+gebirgspass
+gebirgspässe
+bucht
+buchten
+strand
+strände
+kap
+kaps
+höhleneingang
+höhleneingänge
+kanal
+kanäle
+klippe
+klippen
+küstenlinie
+küstenlinien
+krater
+merkmal
+merkmale
+kahler berg
+kahle berge
+fjord
+fjorde
+geysir
+geysire
+gletscher
+heide
+erhebung
+hügel
+insel
+inseln
+land
+länder
+marschland
+marschlandgebiete
+moor
+moors
+schlamm
+schlamme
+gipfel
+punkt
+punkte
+riff
+riffs
+grat
+grate
+fluss
+flüsse
+stein
+steine
+geröll
+geröllhalden
+busch
+büsche
+untiefe
+untiefen
+quelle
+quellen
+baum
+bäume
+tal
+täler
+vulkan
+vulkane
+wasser
+stadt
+städte
+bezirk
+bezirke
+gehöft
+gehöfte
+weiler
+inselchen
+ortschaft
+ortschaften
+moore
+gemeinde
+gemeinden
+postleitzahl
+postleitzahlen
+region
+regionen
+meer
+meere
+bundesland
+bundesländer
+untergruppe
+untergruppen
+stadtteil
+stadtteile
+gemeindefreies gebiet
+gemeindefreie gebiete
+dorf
+dörfer
+aufgelassene bahnstrecke
+aufgelassene bahnstrecken
+eisenbahn im bau
+eisenbahnen im bau
+unbenutzte bahnstrecke
+unbenutzte bahnstrecken
+unbenutzer bahnhof
+unbenutze bahnhöfe
+seilbahn
+seilbahnen
+haltepunkt
+haltepunkte
+historischer bahnhof
+historische bahnhöfe
+bahnknotenpunkt
+bahnknotenpunkte
+eisenbahnkreuzung
+eisenbahnkreuzungs
+straßenbahn
+straßenbahns
+einschienenbahn
+einschienenbahns
+schmalspurbahn
+schmalspurbahns
+bahnsteig
+bahnsteigs
+bewahrte bahnstrecke
+bewahrte bahnstrecken
+bahnstrecke
+u-bahn-station
+u-bahn-stationen
+u-bahn-zugang
+u-bahn-zugänge
+weiche
+weichens
+straßenbahn-haltestelle
+straßenbahn-haltestellen
+rangierbahnhof
+rangierbahnhöfe
+spirituosenladen
+spirituosenläden
+bekleidungsgeschäft
+bekleidungsgeschäfte
+kunstladen
+kunstläden
+galerie
+galerien
+bäckerei
+bäckereien
+parfümerie
+parfümerien
+getränkemarkt
+getränkemärkte
+fahrradgeschäft
+fahrradgeschäfte
+buchgeschäft
+buchgeschäfte
+buchladen
+buchläden
+fleischerei
+fleischereien
+metzgerei
+metzgereien
+autohaus
+autohäuser
+autoteilehändler
+autoteilehändlers
+autowerkstatt
+autowerkstatts
+teppichgeschäft
+teppichgeschäfte
+wohltätigkeitsladen
+wohltätigkeitsladens
+drogerie
+drogerien
+computergeschäft
+computergeschäfte
+süßwarengeschäft
+süßwarengeschäfte
+tante-emma-laden
+tante-emma-läden
+copyshop
+copyshops
+kosmetikgeschäft
+kosmetikgeschäfte
+diskontladen
+diskontläden
+baumarkt
+baumärkte
+textilreinigung
+textilreinigungen
+elektronikgeschäft
+elektronikgeschäfte
+imobilienhändler
+imobilienmakler
+hofladen
+hofläden
+modegeschäft
+modegeschäfte
+angelladen
+angelläden
+blumenladen
+blumenläden
+lebensmittelladen
+lebensmittelläden
+bestattungsunternehmen
+möbelgeschäft
+möbelgeschäfte
+gärtnerei
+gärtnereien
+gemischtwarenladen
+gemischtwarenladens
+geschenkeladen
+geschenkeläden
+obst- und gemüsehandlung
+obst- und gemüsehändler
+frisör
+frisöre
+eisenwarenhandlung
+eisenwarenhändler
+unterhaltungselektronikladen
+unterhaltungselektronikläden
+versicherungsbüro
+versicherungsbüros
+juwelier
+juweliere
+kiosk
+kioske
+waschsalon
+waschsalons
+handygeschäft
+handygeschäfte
+motorradgeschäft
+motorradgeschäfte
+musikladen
+musikläden
+zeitschriftenladen
+zeitschriftenläden
+optiker
+bioladen
+bioläden
+outdoorladen
+outdoorläden
+tierhandlung
+tierhandlungen
+fotoladen
+fotoläden
+salon
+salons
+schuhgeschäft
+schuhgeschäfte
+schuhladen
+schuhläden
+sportgeschäft
+sportgeschäfte
+schreibwarenladen
+schreibwarenläden
+spielwarengeschäft
+spielwarengeschäfte
+spielwarenladen
+spielwarenläden
+reisebüro
+reisebüros
+videothek
+videotheken
+weingeschäft
+weingeschäfte
+berghütte
+berghütten
+kunstwerk
+kunstwerke
+attraktion
+attraktionen
+unterkunft
+unterkünfte
+hütte
+hütten
+campingplatz
+campingplätze
+wohnwagen-stellplatz
+wohnwagen-stellplätze
+almhütte
+almhütten
+pension
+pensionen
+jugendherberge
+jugendherbergen
+touristen-information
+touristen-informations
+anbau
+anbaus
+motel
+motels
+piknikplatz
+piknikplätze
+vergnügungspark
+vergnügungsparks
+aussichtspunkt
+aussichtspunkte
+zoo
+zoos
+werft
+werften
+wasserstraßenverbindung
+wasserstraßenverbindungen
+staudamm
+staudämme
+aufgelassener kanal
+aufgelassener kanals
+wassergraben
+wassergrabens
+dock
+docks
+entwässerungsgraben
+entwässerungsgräben
+schleuse
+schleusen
+schleusentor
+schleusentore
+mineralquelle
+mineralquellen
+anlegeplatz
+anlegeplätze
+stromschnellen
+flussufer
+bach
+bäche
+trockental
+trockentäler
+wasserpunkt
+wasserpunkte
+wasserfall
+wasserfälle
+wehr
+wehre
+windmühle
+windmühlen
+standesamt
+standesämter
+# de_at
+wirtshaus
+wirtshäuser
+# en
+airport
+airports
+animal boarding facility
+animal boarding facilities
+animal shelter
+animal shelters
+arts centre
+arts centres
+arts center
+arts centers
+atm
+atms
+cash
+cash machine
+cash machines
+auditorium
+auditoriums
+bank
+banks
+bar
+bars
+bench
+benches
+cycle parking
+cycle parkings
+cycle rental
+cycle rentals
+bicycle parking
+bicycle parkings
+bicycle rental
+bicycle rentals
+brothel
+brothels
+bureau de change
+bureau de changes
+bureaus de change
+bus station
+bus stations
+cafe
+cafes
+car rental
+car rentals
+car share
+car sharing
+car sharings
+car wash
+car washes
+casino
+casinos
+cinema
+cinemas
+clinic
+clinics
+club
+clubs
+college
+colleges
+community centre
+community centres
+community center
+community centers
+courthouse
+courthouses
+crematorium
+crematoriums
+dentist
+dentists
+doctor
+doctors
+martial arts
+dojo
+dojos
+dojang
+dormitory
+dormitorys
+dormitories
+drinking water
+water
+driving school
+driving schools
+embassy
+embassys
+embassies
+emergency phone
+emergency phones
+fast food
+food
+ferry terminal
+ferry terminals
+fire hydrant
+fire hydrants
+fire station
+fire stations
+fountain
+fountains
+fuel
+fuels
+fuel station
+fuel stations
+gas
+gas station
+gas stations
+petrol
+petrol station
+petrol stations
+grave yard
+grave yards
+fitness centre
+fitness centres
+fitness center
+fitness centers
+gym
+gyms
+hall
+halls
+health centre
+health centres
+health center
+health centers
+hospital
+hospitals
+hotel
+hotels
+hunting stand
+hunting stands
+ice cream
+kindergarten
+kindergartens
+library
+librarys
+libraries
+market
+markets
+marketplace
+marketplaces
+mountain rescue
+mountain rescues
+night club
+night clubs
+nursery
+nurserys
+nurseries
+nursing home
+nursing homes
+office
+offices
+park
+parks
+parking
+pharmacy
+pharmacys
+pharmacies
+church
+churches
+place of worship
+place of worships
+places of worship
+police
+post box
+post boxes
+post office
+post offices
+pre-school
+pre-schools
+prison
+prisons
+pub
+pubs
+public building
+public buildings
+public market
+public markets
+reception area
+reception areas
+recycling point
+recycling points
+restaurant
+restaurants
+retirement home
+retirement homes
+sauna
+saunas
+school
+schools
+shelter
+shelters
+shop
+shops
+shopping
+social club
+social clubs
+studio
+studios
+supermarket
+supermarkets
+swinger club
+swinger clubs
+taxi
+taxis
+taxi rank
+taxi ranks
+telephone
+telephones
+public telephone
+public telephones
+phone booth
+phone booths
+theatre
+theatres
+toilet
+toilets
+town hall
+town halls
+university
+universitys
+universities
+vending machine
+vending machines
+veterinary surgery
+veterinary surgeries
+village hall
+village halls
+waste basket
+waste baskets
+rubbish bin
+rubbish bins
+bin
+bins
+wifi access
+wifi
+wifi point
+wifi points
+youth centre
+youth centres
+youth center
+youth centers
+apartment block
+apartment blocks
+building block
+building blocks
+bunker
+bunkers
+chapel
+chapels
+churchs
+city hall
+city halls
+commercial building
+commercial buildings
+building entrance
+building entrances
+faculty building
+faculty buildings
+farm building
+farm buildings
+flats
+garage
+garages
+hospital building
+hospital buildings
+house
+houses
+industrial building
+industrial buildings
+office building
+office buildings
+residential building
+residential buildings
+retail building
+retail buildings
+school building
+school buildings
+stadium
+stadiums
+store
+stores
+terrace
+terraces
+tower
+towers
+railway station
+railway stations
+station
+stations
+university building
+university buildings
+building
+buildings
+bridleway
+bridleways
+guided bus lane
+guided bus lanes
+bus stop
+bus stops
+byway
+byways
+highway under construction
+highways under construction
+cycle path
+cycle paths
+distance marker
+distance markers
+emergency access point
+emergency access points
+footpath
+footpaths
+ford
+fords
+gate
+gates
+living street
+living streets
+minor road
+minor roads
+motorway
+motorways
+motorway junction
+motorway junctions
+motorway road
+motorway roads
+path
+paths
+pedestrian way
+pedestrian ways
+platform
+platforms
+primary road
+primary roads
+raceway
+raceways
+residential
+residentials
+residential road
+residential roads
+rest area
+rest stop
+road
+roads
+secondary road
+secondary roads
+service road
+service roads
+service area
+motorway services
+steps
+stile
+stiles
+tertiary road
+tertiary roads
+track
+tracks
+trail
+trails
+trunk road
+trunk roads
+unclassified road
+unclassified roads
+unsurfaced road
+unsurfaced roads
+archaeological site
+archaeological sites
+battlefield
+battlefields
+boundary stone
+boundary stones
+castle
+castles
+icon
+icons
+manor
+manors
+memorial
+memorials
+mine
+mines
+monument
+monuments
+museum
+museums
+ruin
+ruins
+wayside cross
+wayside crosses
+wayside shrine
+wayside shrines
+wreck
+wrecks
+allotment
+allotments
+basin
+basins
+brownfield land
+brownfield lands
+cemetery
+cemeterys
+cemeteries
+commercial area
+commercial areas
+conservation
+conservations
+construction
+constructions
+farm
+farms
+farmland
+farmlands
+farmyard
+farmyards
+forest
+forests
+grass
+grasses
+greenfield land
+greenfield lands
+industrial area
+industrial areas
+landfill
+landfills
+meadow
+meadows
+military area
+military areas
+mountain
+mountains
+nature reserve
+nature reserves
+piste
+pistes
+plaza
+plazas
+quarry
+quarrys
+quarries
+railway
+railways
+recreation ground
+recreation grounds
+reservoir
+reservoirs
+residential area
+residential areas
+retail
+retails
+village green
+village greens
+vineyard
+vineyards
+wetland
+wetlands
+wood
+woods
+beach resort
+beach resorts
+common land
+common lands
+fishing area
+fishing areas
+garden
+gardens
+golf course
+golf courses
+hackerspace
+hackerspaces
+ice rink
+ice rinks
+marina
+marinas
+miniature golf
+miniature golfs
+sports pitch
+sports pitches
+playground
+playgrounds
+slipway
+slipways
+sports centre
+sports centres
+sports centers
+swimming pool
+swimming pools
+running track
+running tracks
+water park
+water parks
+bay
+bays
+beach
+beachs
+beaches
+cape
+capes
+cave entrance
+cave entrances
+channel
+channels
+cliff
+cliffs
+coastline
+coastlines
+crater
+craters
+feature
+features
+fell
+fells
+fjord
+fjords
+geyser
+geysers
+glacier
+glaciers
+heath
+heaths
+hill
+hills
+island
+islands
+land
+lands
+marsh
+marshs
+marshes
+moor
+moors
+mud
+muds
+peak
+peaks
+point
+points
+reef
+reefs
+ridge
+ridges
+river
+rivers
+rock
+rocks
+scree
+screes
+scrub
+scrubs
+shoal
+shoals
+spring
+springs
+strait
+straits
+tree
+trees
+valley
+valleys
+volcano
+volcanos
+waters
+city
+citys
+cities
+country
+countrys
+countries
+county
+countys
+counties
+hamlet
+hamlets
+islet
+islets
+locality
+localitys
+localities
+municipality
+municipalitys
+municipalities
+postcode
+postcodes
+region
+regions
+sea
+seas
+state
+states
+subdivision
+subdivisions
+suburb
+suburbs
+town
+towns
+unincorporated area
+unincorporated areas
+village
+villages
+abandoned railway
+abandoned railways
+railway under construction
+railway under constructions
+disused railway
+disused railways
+disused railway station
+disused railway stations
+funicular railway
+funicular railways
+train stop
+train stops
+historic railway station
+historic railway stations
+railway junction
+railway junctions
+level crossing
+level crossings
+light rail
+light rails
+monorail
+monorails
+narrow gauge railway
+narrow gauge railways
+railway platform
+railway platforms
+preserved railway
+preserved railways
+railway spur
+railway spurs
+subway station
+subway stations
+subway entrance
+subway entrances
+railway points
+tramway
+tramways
+tram stop
+tram stops
+railway yard
+railway yards
+off license
+off licenses
+apparel shop
+apparel shops
+art shop
+art shops
+bakery
+bakerys
+bakeries
+beauty shop
+beauty shops
+beverages shop
+beverages shops
+bicycle shop
+bicycle shops
+book shop
+book shops
+butcher
+butchers
+car shop
+car shops
+car dealer
+car dealers
+car parts
+carpet shop
+carpet shops
+car repair
+car repairs
+charity shop
+charity shops
+chemist
+chemists
+clothes shop
+clothes shops
+computer shop
+computer shops
+confectionery shop
+confectionery shops
+convenience store
+convenience stores
+copy shop
+copy shops
+cosmetics shop
+cosmetics shops
+department store
+department stores
+discount items shop
+discount items shops
+do-it-yourself
+do-it-yourselfs
+do-it-yourselves
+drugstore
+drugstores
+dry cleaning
+dry cleanings
+electronics shop
+electronics shops
+estate agent
+estate agents
+farm shop
+farm shops
+fashion shop
+fashion shops
+fish shop
+fish shops
+florist
+florists
+food shop
+food shops
+funeral director
+funeral directors
+furniture
+furnitures
+gallery
+gallerys
+galleries
+garden centre
+garden centres
+garden center
+garden centers
+general store
+general stores
+gift shop
+gift shops
+greengrocer
+greengrocers
+grocery shop
+grocery shops
+hairdresser
+hairdressers
+hardware store
+hardware stores
+hi-fi
+hi-fis
+insurance
+insurances
+jewelry shop
+jewelry shops
+kiosk shop
+kiosk shops
+laundry
+laundrys
+laundries
+mall
+malls
+mobile phone shop
+mobile phone shops
+motorcycle shop
+motorcycle shops
+music shop
+music shops
+newsagent
+newsagents
+optician
+opticians
+organic food shop
+organic food shops
+outdoor shop
+outdoor shops
+pet shop
+pet shops
+photo shop
+photo shops
+salon
+salons
+shoe shop
+shoe shops
+shopping centre
+shopping centres
+shopping center
+shopping centers
+sports shop
+sports shops
+stationery shop
+stationery shops
+toy shop
+toy shops
+travel agency
+travel agencys
+travel agencies
+video shop
+video shops
+alpine hut
+alpine huts
+artwork
+artworks
+attraction
+attractions
+bed and breakfast
+bed and breakfasts
+cabin
+cabins
+camp site
+camp sites
+caravan site
+caravan sites
+chalet
+chalets
+guest house
+guest houses
+hostel
+hostels
+information
+informations
+lean to
+lean tos
+motel
+motels
+picnic site
+picnic sites
+theme park
+theme parks
+viewpoint
+viewpoints
+zoo
+zoos
+boatyard
+boatyards
+boat ramp
+boat ramps
+canal
+canals
+waterway connector
+waterway connectors
+dam
+dams
+derelict canal
+derelict canals
+ditch
+ditchs
+ditches
+dock
+docks
+drain
+drains
+lock
+locks
+lock gate
+lock gates
+mineral spring
+mineral springs
+mooring
+moorings
+rapids
+riverbank
+riverbanks
+stream
+streams
+wadi
+wadis
+waterfall
+waterfalls
+water point
+water points
+weir
+weirs
+windmill
+windmills
+# es
+aeropuerto
+aeropuertos
+centro de arte
+centros de arte
+cajero automático
+cajeros automáticos
+auditorio
+auditorios
+banco
+bancos
+bar
+bares
+aparcamiento de bibicletas
+aparcamientos de bibicletas
+alquiler de bicicletas
+alquileres de bicicletas
+burdel
+burdeles
+casa de cambio
+casa de cambios
+estación de autobuses
+estaciones de autobuses
+cafetería
+cafeterías
+alquiler de vehículos
+alquileres de vehículos
+vehículo compartido
+vehículos compartidos
+autolavado
+autolavados
+casino
+casinos
+cine
+cines
+clínica
+clínicas
+club
+clubes
+clubs
+universidad o instituto
+universidades o institutos
+centro comunitario
+centros comunitarios
+juzgado
+juzgados
+crematorio
+crematorios
+dentista
+dentistas
+consultorio médico
+consultorios médicos
+centro médico
+centros médicos
+residencia de estudiantes
+residencias de estudiantes
+colegio mayor
+colegios mayores
+autoescuela
+autoescuelas
+embajada
+embajadas
+teléfono de emergencia
+teléfonos de emergencia
+comida rápida
+comidas rápidas
+terminal de ferry
+terminales de ferry
+hidrante
+hidrantes
+parque de bomberos
+parques de bomberos
+fuente
+fuentes
+gasolinera
+gasolineras
+cementerio
+cementerios
+gimnasio
+gimnasios
+salón de acto
+salones de actos
+centro de salud
+centros de salud
+hospital
+hospitales
+hotel
+hoteles
+apostadero de caza
+apostaderos de caza
+heladería
+heladerías
+jardín de infancia
+jardines de infancia
+biblioteca
+bibliotecas
+mercado
+mercados
+rescate de montaña
+rescates de montaña
+discoteca
+discotecas
+enfermería
+enfermerías
+residencia de la tercera edad
+residencias de la tercera edad
+oficina
+oficinas
+parque
+parques
+aparcamiento
+aparcamientos
+farmacia
+farmacias
+templo
+templos
+policía
+policías
+buzón de correos
+buzones de correos
+oficina de correos
+oficinas de correos
+parvulario
+parvularios
+prisión
+prisiones
+pub
+pubs
+edificio público
+edificios públicos
+mercado público
+mercados públicos
+área de recepción
+áreas de recepción
+punto de reciclaje
+puntos de reciclaje
+restaurante
+restaurantes
+residencia de jubilados
+residencias de jubilados
+sauna
+saunas
+escuela
+escuelas
+colegio
+colegios
+refugio
+refugios
+tienda
+tiendas
+compras
+club social
+clubes sociales
+estudio
+estudios
+supermercado
+supermercados
+taxi
+taxis
+teléfono público
+teléfonos públicos
+teatro
+teatros
+aseos
+baño
+baños
+ayuntamiento
+ayuntamientos
+universidad
+universidades
+máquina expendedora
+máquinas expendedoras
+clínica veterinaria
+clínicas veterinarias
+salón municipal
+salones municipales
+papelera
+papeleras
+acceso a internet inalámbrico
+accesos a internet inalámbrico
+centro juvenil
+centros juveniles
+límite administrativo
+límites administrativos
+bloque de apartamentos
+bloques de apartamentos
+bloque de edificios
+bloques de edificios
+búnker
+búnkeres
+capilla
+capillas
+iglesia
+iglesias
+edificio comercial
+edificios comerciales
+entrada a edificio
+entradas a edificios
+edificio de facultad
+edificios de facultad
+granja
+granjas
+apartamento
+apartamentos
+garaje
+garajes
+mansión
+mansiones
+edificio hospitalario
+edificios hospitalarios
+casa
+casas
+edificio industrial
+edificios industriales
+edificio de oficinas
+edificios de oficinas
+edificio residencial
+edificios residenciales
+edificio escolar
+edificios escolares
+estadio
+estadios
+almacén
+almacenes
+terraza
+terrazas
+torre
+torres
+estación de tren
+estaciones de tren
+edificio universitario
+edificios universitarios
+edificio
+edificios
+camino prioritario para peatones y caballos
+caminos prioritarios para peatones y caballos
+canal guiado de autobuses
+canales guiados de autobuses
+parada de autobuses
+paradas de autobuses
+camino
+caminos
+vía en construcción
+vías en construcción
+ruta para bicicletas
+rutas para bicicletas
+carril bici
+carriles bici
+hito kilométrico
+hitos kilométricos
+acceso de emergencia
+accesos de emergencia
+sendero
+senderos
+vado
+vados
+puerta
+puertas
+calle residencial
+calles residenciales
+carretera secundaria
+carreteras secundarias
+autovía
+autovías
+cruce de autovías
+cruces de autovías
+enlace de autovía
+enlaces de autovía
+vía peatonal
+vías peatonales
+plataforma
+plataformas
+carretera primaria
+carreteras primarias
+enlace de carretera principal
+enlaces de carretera principal
+pista de carreras
+pistas de carreras
+calle
+calles
+carretera
+carreteras
+enlace de carretera secundaria
+enlaces de carretera secundaria
+vía de servicio
+vías de servicio
+escalera
+escaleras
+escalera para atravesar verjas
+escaleras para atravesar verjas
+carretera local
+carreteras locales
+pista
+pistas
+carretera principal
+carreteras principales
+enlace a carretera principal
+enlaces a carretera principal
+carretera sin clasificación
+carreteras sin clasificación
+vía no pavimentada
+vías no pavimentadas
+yacimiento arqueológico
+yacimientos arqueológicos
+campo de batalla
+campos de batalla
+mojón
+mojones
+edificio histórico
+edificios históricos
+castillo
+castillos
+icono
+iconos
+casa señorial
+casas señoriales
+monumento conmemorativo
+monumentos conmemorativos
+mina
+minas
+monumento
+monumentos
+museo
+museos
+ruinas
+cruz de término
+cruces de término
+sepulcro
+sepulcros
+calvario
+calvarios
+altar de carretera
+altares de carretera
+pecio
+pecios
+naufragio
+naufragios
+huerto
+huertos
+cuenca
+cuencas
+terreno baldío
+terrenos baldíos
+baldío
+baldíos
+área de oficinas
+áreas de oficinas
+área de reserva
+áreas de reserva
+construcción
+construcciones
+finca
+fincas
+tierra de labranza
+tierras de labranza
+corral
+corrales
+bosque
+bosques
+césped
+céspedes
+pasto
+pastos
+terreno urbanizable
+terrenos urbanizables
+zona industrial
+zonas industriales
+relleno
+rellenos
+vertedero
+vertederos
+basurero
+basureros
+pradera
+praderas
+zona militar
+zonas militares
+montaña
+montañas
+reserva natural
+reservas naturales
+pista de esquí
+pistas de esquí
+plaza
+plazas
+cantera
+canteras
+carrilera
+carrileras
+vía de ferrocarril
+vías de ferrocarril
+área recreacional
+áreas recreacionales
+embalse
+embalses
+área residencial
+áreas residenciales
+zona comercial
+zonas comerciales
+parque municipal
+parques municipales
+viñedo
+viñedos
+pantano
+pantanos
+humedal
+humedales
+balneario
+balnearios
+complejo en la playa
+complejos en la playa
+terreno común
+terrenos comunes
+área de pesca
+áreas de pesca
+pesca deportiva
+pescas deportivas
+jardín
+jardínes
+campo de golf
+campos de golf
+pista de patinaje sobre hielo
+pistas de patinaje sobre hielo
+puerto deportivo
+puertos deportivos
+golfito
+golfitos
+minigolf
+minigolfs
+cancha
+canchas
+cancha deportiva
+canchas deportivas
+parque infantil
+parques infantiles
+área de juegos
+áreas de juegos
+área recreativa
+áreas recreativas
+grada
+gradas
+polideportivo
+polideportivos
+centro deportivo
+centros deportivos
+piscina
+piscinas
+parque acuático
+parques acuáticos
+bahía
+bahías
+playa
+playas
+cabo
+cabos
+entrada a cueva
+entradas a cuevas
+canal
+canales
+acantilado
+acantilados
+costa
+costas
+cráter
+cráteres
+característica
+características
+monte
+montes
+fiordo
+fiordos
+géiser
+géiseres
+glaciar
+glaciares
+brezal
+brezales
+colina
+colinas
+isla
+islas
+tierra
+tierras
+marisma
+marismas
+páramo
+páramos
+lodo
+lodos
+cumbre
+cumbres
+pico
+picos
+punto
+puntos
+arrecife
+arrecifes
+cuchilla
+cuchillas
+cresta
+crestas
+río
+ríos
+piedra
+piedras
+roca
+rocas
+pedregal
+pedregales
+matorral
+matorrales
+banco de arena
+bancos de arena
+nacimiento
+nacimientos
+manantial
+manantiales
+estrecho
+estrechos
+árbol
+árboles
+valle
+valles
+volcán
+volcanes
+agua
+aguas
+lago
+lagos
+laguna
+lagunas
+ciudad
+ciudades
+país
+países
+condado
+condados
+aldea
+aldeas
+vereda
+veredas
+casass
+islote
+islotes
+paraje
+parajes
+municipio
+municipios
+código postal
+códigos postales
+región
+regiones
+mar
+mares
+estado
+estados
+provincia
+provincias
+departamento
+departamentos
+subdivisión
+subdivisiones
+suburbio
+suburbios
+comuna
+comunas
+localidad
+localidades
+pueblo
+pueblos
+parroquia
+parroquias
+área no incorporada
+áreas no incorporadas
+villa
+villas
+corregimiento
+corregimientos
+carrilera abandonada
+carrileras abandonadas
+vía de tren abandonada
+vías de tren abandonadas
+vía ferroviaria en construcción
+vías ferroviaria en construcción
+vía ferroviaria en desuso
+vías ferroviaria en desuso
+estación de tren en desuso
+estaciones de tren en desuso
+vía de funicular
+vías de funicular
+apeadero
+apeaderos
+estación de tren histórica
+estaciónes de tren históricas
+encrucijada de vías ferroviarias
+encrucijada de vías ferroviariass
+paso a nivel
+pasos a nivel
+metro ligero
+metros ligeros
+monorail
+monorailes
+ferrocarril de vía estrecha
+ferrocarriles de vía estrecha
+andén de tren
+andenes de tren
+vía ferroviaria preservada
+vías ferroviarias preservadas
+ramal ferroviario
+ramales ferroviarios
+estación de trenes
+estación de metro
+estaciones de metro
+boca de metro
+bocas de metro
+aguja de ferrocarril
+agujas de ferrocarril
+ruta de tranvía
+rutas de tranvías
+parada de tranvía
+paradas de tranvía
+estación de clasificación
+estaciones de clasificación
+licorería
+licorerías
+tienda de ropa
+tiendas de ropa
+tienda de artículos de arte
+tienda de artículos de artes
+panadería
+panaderías
+tienda de productos de belleza
+tienda de productos de bellezas
+tienda de bebidas
+tienda de bebidass
+tienda de bicicletas
+tienda de bicicletass
+librería
+librerías
+carnicería
+carnicerías
+concesionario
+concesionarios
+concesionario de automóviles
+concesionarios de automóviles
+repuestos automotrices
+taller mecánico
+talleres mecánicos
+tienda de alfombras
+tienda de alfombrass
+tienda benéfica
+tiendas benéficas
+droguería
+droguerías
+tienda de informática
+tiendas de informática
+dulcería
+dulcerías
+pequeño supermercado
+pequeños supermercados
+copistería
+copisterías
+tienda de cosmética
+tienda de cosméticas
+grandes almacenes
+tienda de descuento
+tienda de descuentos
+tienda de bricolaje
+tiendas de bricolaje
+parafarmacia
+parafarmacias
+tintorería
+tintorerías
+tienda de electrónica
+tiendas de electrónica
+inmobiliaria
+inmobiliarias
+tienda de productos agrícolas
+tiendas de productos agrícolas
+tienda de moda
+tiendas de moda
+tienda de artículos de pesca
+tiendas de artículos de pesca
+floristería
+floristerías
+tienda de alimentación
+tiendas de alimentación
+funeraria
+funerarias
+tienda de muebles
+tiendas de muebles
+galería
+galerías
+vivero
+viveros
+tienda de artículos generales
+tienda de artículos generaless
+tienda de regalos
+tiendas de regalos
+frutería
+fruterías
+peluquería
+peluquerías
+ferretería
+ferreterías
+hi-fi
+hi-fis
+aseguradora
+aseguradoras
+joyería
+joyerías
+kiosko
+kioskos
+lavandería
+lavanderías
+centro comercial
+centros comerciales
+tienda de telefonía
+tiendas de telefonía
+tienda de motocicletas
+tiendas de motocicletas
+tienda de música
+tiendas de música
+kiosko de prensa
+kioskos de prensa
+óptica
+ópticas
+tienda de alimentos orgánicos
+tiendas de alimentos orgánicos
+tienda de deportes de aventura
+tiendas de deportes de aventura
+tienda de mascotas
+tiendas de mascotas
+tienda fotográfica
+tiendas fotográficas
+salón de belleza
+salónes de belleza
+zapatería
+zapaterías
+tienda de artículos deportivos
+tiendas de artículos deportivos
+papelería
+papelerías
+juguetería
+jugueterías
+agencia de viajes
+agencias de viajes
+bazar
+bazares
+videotienda
+videotiendas
+cabaña alpina
+cabaña alpinas
+obra de arte
+obras de arte
+atracción
+atracciónes
+cama y desayuno (b&amp;b)
+cama y desayuno (b&amp;b)s
+cabaña
+cabañas
+campamento
+campamentos
+camping para caravanas
+campings para caravanas
+chalet
+chalets
+albergue
+albergues
+hostal
+hostales
+información
+informacións
+nave
+naves
+motel
+moteles
+área de picnic
+áreas de picnic
+parque temático
+parques temáticos
+mirador
+miradores
+zoológico
+zoológicos
+astillero
+astilleros
+esclusa
+esclusas
+presa
+presas
+canal abandonado
+canales abandonados
+acequia
+acequias
+muelle
+muelles
+desagüe
+desagües
+compuerta de esclusa
+compuertas de esclusa
+fuente mineral
+fuente minerals
+amarradero
+amarraderos
+rápidos
+ribera
+riberas
+arroyo
+arroyos
+rambla
+ramblas
+punto de agua
+punto de aguas
+cascada
+cascadas
+represa
+represas
+# et
+lennujaam
+pangaautomaat
+pangaautomaadid
+auditoorium
+auditooriumid
+pank
+pangad
+pink
+pingid
+jalgrattaparkla
+jalgrattaparklad
+jalgrattarent
+jalgrattarendid
+rahavahetus
+rahavahetused
+bussijaam
+bussijaamad
+kohvik
+kohvikud
+autorent
+autorendid
+autopesu
+autopesud
+kasiino
+kasiinod
+kino
+kinod
+kliinik
+kliinikud
+klubi
+klubid
+kohtuhoone
+kohtuhooned
+krematoorium
+krematooriumid
+hambaarst
+hambaarstid
+joogivesi
+joogiveed
+autokool
+autokoolid
+saatkond
+saatkonnad
+kiirtoit
+kiirtoidud
+kütus
+kütused
+surnuaed
+surnuaiad
+haigla
+haiglad
+hotell
+hotellid
+jäätis
+jäätised
+lasteaed
+lasteaiad
+raamatukogu
+raamatukogud
+turg
+turgud
+ööklubi
+ööklubid
+apteek
+apteegid
+politsei
+politseid
+postkast
+postkastid
+postkontor
+postkontorid
+vangla
+vanglad
+vastuvõtt
+vastuvõtud
+restoran
+restoranid
+vanadekodu
+vanadekodud
+saun
+saunad
+kool
+koolid
+kauplus
+kauplused
+supermarket
+supermarketid
+takso
+taksod
+teater
+teatrid
+wc
+wcd
+ülikool
+ülikoolid
+prügikast
+prügikastid
+wifi
+wifid
+noortekeskus
+noortekeskused
+kabel
+kabelid
+kirik
+kirikud
+koolihoone
+koolihooned
+staadion
+staadionid
+torn
+tornid
+raudteejaam
+raudteejaamad
+ülikoolihoone
+ülikoolihooned
+hoone
+hooned
+bussipeatus
+bussipeatused
+jalgrattatee
+jalgrattateed
+jalgrada
+jalgrajad
+jalakäijatele
+jalakäijarajad
+kindlus
+kindlused
+ikoon
+ikoonid
+mõis
+mõisad
+muuseum
+muuseumid
+varemed
+mets
+metsad
+mägi
+mäed
+raudtee
+raudteed
+soo
+sood
+aed
+aiad
+golfiväljak
+golfiväljakud
+uisuväli
+uisuväljad
+minigolf
+minigolfid
+park
+pargid
+mänguväljak
+mänguväljakud
+spordikeskus
+spordikeskused
+saadion
+saadionid
+ujula
+ujulad
+veepark
+veepargid
+rand
+rannad
+koopa sissepääs
+koopa sissepääsud
+rannajoon
+rannajooned
+kraater
+kraatrid
+fjord
+fjordid
+geiser
+geiserid
+saar
+saared
+muda
+mudad
+mäetipp
+mäetipud
+jõgi
+jõed
+allikas
+allikad
+puu
+puud
+vulkaan
+vulkaanid
+vesi
+veed
+linn
+linnad
+riik
+riigid
+maakond
+maakonnad
+maja
+majad
+saareke
+saarekesed
+vald
+vallad
+sihtnumber
+sihtnumbrid
+osariik
+osariigid
+küla
+külad
+trammitee
+trammiteed
+trammipeatus
+trammipeatused
+raamatupood
+raamatupoed
+autoparandus
+autoparandused
+vaibakauplus
+vaibakauplused
+riidepood
+riidepoed
+arvutikauplus
+arvutikauplused
+kosmeetikapood
+kosmeetikapoed
+keemiline puhastus
+keemilised puhastused
+kalapood
+kalapoed
+toidupood
+toidupoed
+mööbel
+mööblipoed
+galerii
+galeriid
+juuksur
+juuksurid
+kindlustus
+kindlustused
+juveelipood
+juveelipoed
+kiosk
+kioskid
+mobiiltelefonide pood
+mobiiltelefonide poed
+muusikapood
+muusikapoed
+lemmikloomapood
+lemmikloomapoed
+kingapood
+kingapoed
+spordipood
+spordipoed
+mänguasjapood
+mänguasjapoed
+reisiagentuur
+reisiagentuurid
+turismiatraktsioon
+turismiatraktsioonid
+laagriplats
+laagriplatsid
+külalistemaja
+külalistemajad
+informatsioon
+informatsioonid
+motell
+motellid
+piknikuplats
+piknikuplatsid
+teemapark
+teemapargid
+loomaaed
+loomaaiad
+# eu
+aireportu
+aireportus
+arte zentroa
+arte zentroas
+entzunareto
+entzunaretos
+banku
+bankus
+taberna
+tabernas
+txirrindu alokairua
+txirrindu alokairuas
+putetxe
+putetxes
+diru-truke bulegoa
+diru-truke bulegoas
+autobus-geltoki
+autobus-geltokis
+kafetegi
+kafetegis
+ibilgailu-alokairu
+ibilgailu-alokairus
+auto garbiketa
+auto garbiketas
+kasino
+kasinos
+zinema
+zinemas
+klinika
+klinikas
+diskoteka
+diskotekas
+komunitate zentroa
+komunitate zentroas
+epaitegia
+epaitegias
+errauste labe
+errauste labes
+dentista
+dentistas
+medikuak
+medikuaks
+edateko ur
+edateko urs
+autoeskola
+autoeskolas
+enbaxada
+enbaxadas
+larrialdi telefonoa
+larrialdi telefonoas
+janari azkarra
+janari azkarras
+ferry terminal
+ferry terminals
+suhiltzaileak
+suhiltzaileaks
+iturri
+iturris
+hilerri
+hilerris
+osasun zentroa / gimnasioa
+osasun zentroa / gimnasioas
+osasun zentroa
+osasun zentroas
+ospitalea
+ospitaleas
+hotel
+hotels
+izozkiak
+izozkiaks
+haurtzaindegi
+haurtzaindegis
+liburutegia
+liburutegias
+merkatu
+merkatus
+merkatua
+merkatuas
+mendiko erreskatea
+mendiko erreskateas
+gau-klub
+gau-klubs
+bulego
+bulegos
+parke
+parkes
+aparkaleku
+aparkalekus
+farmazia
+farmazias
+otoitzerako lekua
+otoitzerako lekuas
+polizia
+polizias
+postontzia
+postontzias
+postetxe
+postetxes
+eskolaurre
+eskolaurres
+espetxe
+espetxes
+eraikin publiko
+eraikin publikos
+herri azoka
+herri azokas
+birziklatze gune
+birziklatze gunes
+jatetxe
+jatetxes
+sauna
+saunas
+ikastetxe
+ikastetxes
+denda
+dendas
+erosketak
+erosketaks
+estudio
+estudios
+supermerkatu
+supermerkatus
+taxi
+taxis
+telefono publiko
+telefono publikos
+antzokia
+antzokias
+komunak
+komunaks
+udaletxe
+udaletxes
+unibertsitate
+unibertsitates
+salmenta automatiko
+salmenta automatikos
+wifi sarbidea
+wifi sarbideas
+gaztelekua
+gaztelekuas
+muga administratiboa
+muga administratiboas
+bunker
+bunkers
+kapera
+kaperas
+eliza
+elizas
+udaletxea
+udaletxeas
+garajea
+garajeas
+ospitale erakina
+ospitale erakinas
+hotela
+hotelas
+etxe
+etxes
+eraikin industriala
+eraikin industrialas
+eskola eraikina
+eskola eraikinas
+estadio
+estadios
+dorre
+dorres
+tren geltokia
+tren geltokias
+unibertsitate eraikina
+unibertsitate eraikinas
+eraikina
+eraikinas
+autobus-geraleku
+autobus-geralekus
+eraikitze-lanetan dagoen autopista
+eraikitze-lanetan dagoen autopistas
+larrialdi sarbide gunea
+larrialdi sarbide guneas
+oinezkoen bide
+oinezkoen bides
+ate
+ates
+autobide
+autobides
+autobidea
+autobideas
+nasa
+nasas
+lehen mailako errepide
+lehen mailako errepides
+errepide nagusi
+errepide nagusis
+bizileku
+bizilekus
+errepide
+errepides
+bigarren mailako errepide
+bigarren mailako errepides
+zerbitzu errepidea
+zerbitzu errepideas
+autobide zerbitzuak
+autobide zerbitzuaks
+eskailera-mailak
+eskailera-mailaks
+hirugarren mailako errepide
+hirugarren mailako errepides
+pista
+pistas
+aztarnategi arkeologiko
+aztarnategi arkeologikos
+gaztelu
+gaztelus
+etxea
+etxeas
+memoriala
+memorialas
+meategi
+meategis
+monumentu
+monumentus
+museo
+museos
+merkataritza eremua
+merkataritza eremuas
+baso
+basos
+larre
+larres
+eremu militarra
+eremu militarras
+mendi
+mendis
+natura-erreserba
+natura-erreserbas
+enparantza
+enparantzas
+harrobi
+harrobis
+trenbide
+trenbides
+urtegi
+urtegis
+hondartza konplexu
+hondartza konplexus
+lur komunak
+lur komunaks
+arrantza lekua
+arrantza lekuas
+lorategi
+lorategis
+golf-zelai
+golf-zelais
+izotz-pista
+izotz-pistas
+kirol-portu
+kirol-portus
+minigolfa
+minigolfas
+natura erreserba
+natura erreserbas
+parkea
+parkeas
+kirolgunea
+kirolguneas
+jolastoki
+jolastokis
+kiroldegi
+kiroldegis
+igerilekua
+igerilekuas
+badia
+badias
+hondartza
+hondartzas
+lurmutur
+lurmuturs
+kobazulo sarrera
+kobazulo sarreras
+kanal
+kanals
+itsasertz
+itsasertzs
+crater
+craters
+fiordo
+fiordos
+geiser
+geisers
+glaziar
+glaziars
+muinoa
+muinoas
+irla
+irlas
+lohi
+lohis
+gailur
+gailurs
+puntu
+puntus
+arrezife
+arrezifes
+ibai
+ibais
+arroka
+arrokas
+harritza
+harritzas
+hondar-banku
+hondar-bankus
+zuhaitza
+zuhaitzas
+haran
+harans
+sumendi
+sumendis
+ura
+uras
+hiria
+hirias
+herrialdea
+herrialdeas
+konderria
+konderrias
+baserria
+baserrias
+herrixka
+herrixkas
+etxeak
+etxeaks
+uhartea
+uharteas
+lokalitate
+lokalitates
+udalerri
+udalerris
+posta-kode
+posta-kodes
+eskualde
+eskualdes
+itsasoa
+itsasoas
+estatua
+estatuas
+subdibisio
+subdibisios
+aldiri
+aldiris
+herria
+herrias
+elkartu gabeko gunea
+elkartu gabeko guneas
+eraikitze-lanetan dagoen trenbidea
+eraikitze-lanetan dagoen trenbideas
+tren geralekua
+tren geralekuas
+tren geltoki historikoa
+tren geltoki historikoas
+tren arina
+tren arinas
+monoraila
+monorailas
+trenbide plataforma
+trenbide plataformas
+metro geltoki
+metro geltokis
+metro sarbidea
+metro sarbideas
+tranbia
+tranbias
+tranbia geltoki
+tranbia geltokis
+arte-denda
+arte-dendas
+okindegi
+okindegis
+liburudenda
+liburudendas
+harategi
+harategis
+arropa denda
+arropa dendas
+ordenagailu-denda
+ordenagailu-dendas
+gozotegi
+gozotegis
+elektronika-denda
+elektronika-dendas
+higiezinen agente
+higiezinen agentes
+arrantza-denda
+arrantza-dendas
+loradenda
+loradendas
+janari-denda
+janari-dendas
+altzari
+altzaris
+galeria
+galerias
+opari-denda
+opari-dendas
+barazki-saltzaile
+barazki-saltzailes
+janaridenda
+janaridendas
+ile-apaindegi
+ile-apaindegis
+hi-fi
+hi-fis
+aseguruak
+aseguruaks
+bitxi-denda
+bitxi-dendas
+kiosko
+kioskos
+garbitegi
+garbitegis
+merkataritza-gunea
+merkataritza-guneas
+mugikor-denda
+mugikor-dendas
+musika-denda
+musika-dendas
+kioskoa
+kioskoas
+optika
+optikas
+animalia-denda
+animalia-dendas
+argazki-denda
+argazki-dendas
+zapatadenda
+zapatadendas
+merkatal gunea
+merkatal guneas
+kirol denda
+kirol dendas
+jostailu denda
+jostailu dendas
+bidaia-agentzia
+bidaia-agentzias
+aterpe alpinoa
+aterpe alpinoas
+atrakzio
+atrakzios
+ohe eta gosari (b&amp;b)
+ohe eta gosari (b&amp;b)s
+kanpin
+kanpins
+txalet
+txalets
+aterpe
+aterpes
+ostatu
+ostatus
+informazioa
+informazioas
+motel
+motels
+museoa
+museoas
+piknik-gune
+piknik-gunes
+parke tematiko
+parke tematikos
+behatoki
+behatokis
+zoologiko
+zoologikos
+urtegia
+urtegias
+lubakia
+lubakias
+isurbidea
+isurbideas
+ur-lasterrak
+ur-lasterraks
+ur-jauzi
+ur-jauzis
+uharka
+uharkas
+# fa
+فرودگاه
+فرودگاهs
+عابر بانک
+عابر بانکs
+بانک
+بانکs
+نیمکت
+نیمکتs
+فاحشه خانه
+فاحشه خانهs
+کافه
+کافهs
+سینما
+سینماs
+درمانگاه
+درمانگاهs
+دادگاه
+دادگاهs
+دندانپزشک
+دندانپزشکs
+خوابگاه دانشجویی
+خوابگاه دانشجوییs
+سفارت
+سفارتs
+آتش نشانی
+آتش نشانیs
+پمپ بنزین
+پمپ بنزینs
+بیمارستان
+بیمارستانs
+هتل
+هتلs
+کودکستان
+کودکستانs
+کتابخانه
+کتابخانهs
+بازار
+بازارs
+دفتر
+دفترs
+پارک
+پارکs
+پارکینگ
+پارکینگs
+داروخانه
+داروخانهs
+پلیس
+پلیسs
+صندوق پست
+صندوق پستs
+اداره پست
+اداره پستs
+زندان
+زندانs
+میخانه
+میخانهs
+بازیافت
+بازیافتs
+رستوران
+رستورانs
+مدرسه
+مدرسهs
+سوپرمارکت
+سوپرمارکتs
+تاکسی
+تاکسیs
+تئاتر
+تئاترs
+شهر داری
+شهر داریs
+دانشگاه
+دانشگاهs
+سطل اشغال
+سطل اشغالs
+گاراژ
+گاراژs
+خانه
+خانهs
+ورزشگاه
+ورزشگاهs
+برج
+برجs
+ایستگاه اتوبوس
+ایستگاه اتوبوسs
+اتوبان
+اتوبانs
+مسیر
+مسیرs
+جاده
+جادهs
+پله
+پلهs
+بزرگراه
+بزرگراهs
+قلعه
+قلعهs
+موزه
+موزهs
+زمین کشاورزی
+زمین کشاورزیs
+جنگل
+جنگلs
+کوه
+کوهs
+ریل
+ریلs
+باغ
+باغs
+ساحل
+ساحلs
+کانال
+کانالs
+تپه
+تپهs
+جزیره
+جزیرهs
+نقطه
+نقطهs
+رود خانه
+رود خانهs
+صخره
+صخرهs
+درخت
+درختs
+دره
+درهs
+کوه آتشفشان
+کوه آتشفشانs
+اب
+ابs
+شهر بزرگ
+شهر بزرگs
+کشور
+کشورs
+مزرعه
+مزرعهs
+دریا
+دریاs
+محله
+محلهs
+شهر
+شهرs
+دهکده
+دهکدهs
+نانوایی
+نانواییs
+قصاب
+قصابs
+کیوسک
+کیوسکs
+متل
+متلs
+باغ وحش
+باغ وحشs
+رودخانه
+رودخانهs
+ابشار
+ابشارs
+# fi
+lentokenttä
+lentokentät
+lentokenttiä
+taidekeskus
+taidekeskukset
+taidekeskuksia
+pankkiautomaatti
+pankkiautomaatit
+auditorio
+auditoriot
+pankki
+pankit
+penkki
+penkit
+pyöräparkki
+pyöräparkit
+pyörävuokraamo
+pyörävuokraamot
+bordelli
+bordellit
+rahanvaihto
+rahanvaihtajat
+linja-autoasema
+linja-autoasemat
+kahvila
+kahvilat
+autovuokraamo
+autovuokraamot
+autopesu
+autopesut
+kasino
+kasinot
+elokuvateatteri
+elokuvateatterit
+klinikka
+klinikat
+oikeustalo
+oikeustalot
+krematorio
+krematoriot
+hammaslääkäri
+hammaslääkärit
+lääkäri
+lääkäreitä
+juomavesi
+juomavettä
+lähetystö
+lähetystöt
+hätäpuhelin
+hätäpuhelimet
+pikaruoka
+pikaruokaa
+lauttaterminaali
+lauttaterminaalit
+paloposti
+palopostit
+paloasema
+paloasemat
+lähde
+lähteet
+bensa-asema
+bensa-asemat
+hautausmaa
+hautausmaat
+liikuntakeskus / kuntosali
+liikuntakeskukset / kuntosalit
+terveyskeskus
+terveyskeskukset
+sairaala
+sairaalat
+hotelli
+hotellit
+metsästyslava
+metsästyslavat
+jäätelö
+jäätelöä
+päiväkoti
+päiväkodit
+kirjasto
+kirjastot
+tori
+torit
+yökerho
+yökerhot
+toimisto
+toimistot
+puisto
+puistot
+parkkipaikka
+parkkipaikkat
+apteekki
+apteekit
+poliisi
+poliisit
+poliisiasema
+poliisiasemat
+kirjelaatikko
+postilaatikko
+kirjelaatikot
+postilaatikot
+postitoimisto
+postitoimistot
+esikoulu
+esikoulut
+vankila
+vankilat
+pubi
+pubit
+pubeja
+julkinen rakennus
+julkiset rakennukset
+vastaanottoalue
+vastaanottoalueet
+kierrätyspaikka
+kierrätyspaikat
+ravintola
+ravintolat
+ravintoloita
+vanhainkoti
+vanhainkodit
+sauna
+saunat
+koulu
+koulut
+kauppa
+kaupat
+studio
+studiot
+supermarketti
+supermarketit
+taksi
+taksit
+puhelinkoppi
+puhelinkopit
+teatteri
+teatterit
+wc
+wct
+vessa
+vessat
+kaupungintalo
+kaupungintalot
+yliopisto
+yliopistot
+myyntiautomaatti
+myyntiautomaatit
+eläinlääkäri
+eläinlääkärit
+roskakori
+roskakorit
+langaton lähiverkko
+langattomat lähiverkot
+nuorisokeskus
+nuorisokeskukset
+hallinnollinen raja
+hallinnolliset rajat
+talo
+talot
+bunkkeri
+bunkkerit
+kirkko
+kirkot
+kerrostalo
+kerrostalot
+autotalli
+autotallit
+sairaalarakennus
+sairaalarakennukset
+toimistorakennus
+toimistorakennukset
+asuinrakennus
+asuinrakennukset
+koulurakennus
+koulurakennukset
+stadion
+stadionit
+rivitalo
+rivitalot
+torni
+tornit
+rautatieasema
+rautatieasemat
+yliopistorakennus
+yliopistorakennukset
+rakennus
+rakennukset
+bussipysäkki
+bussipysäkkit
+sivutie
+sivuties
+rakenteilla oleva tie
+rakenteilla olevat tiet
+pyörätie
+pyörätiet
+etäisyysmerkki
+etäisyysmerkit
+polku
+jalkakäytävä
+kävelytie
+polut
+jalkakäytävät
+kävelytiet
+portti
+portit
+asuinkatu
+asuinkadut
+moottoritie
+moottoritiet
+liittymä
+moottoritien liittymä
+liittymät
+moottoritien liittymät
+kävelykatu
+kävelykadut
+kantatie
+kantatiet
+kilparata
+kilparadat
+tie
+tiet
+seututie
+seututiet
+portaat
+portaita
+yhdystie
+yhdystiet
+metsätie
+metsätiet
+valtatie
+valtatiet
+päällystämätön tie
+päällystämättämät tiet
+taistelukenttä
+taistelukentät
+linna
+linnat
+kaivos
+kaivokset
+muistomerkki
+muistomerkit
+museo
+museot
+rauniot
+raunioita
+hylky
+hylyt
+kaupallinen alue
+kaupalliset alueet
+rakennustyömaa
+rakennustyömaat
+metsä
+metsät
+nurmikko
+nurmikot
+teollisuusalue
+teollisuusalueet
+kaatopaikka
+kaatopaikat
+niitty
+niityt
+sotilasalue
+sotilasalueet
+vuori
+vuoret
+avolouhos
+avolouhokset
+rautatie
+rautatiet
+asuinalue
+asuinalueet
+kosteikko
+kosteikot
+kalastusalue
+kalastusalueet
+puutarha
+puutarhat
+golf-kenttä
+golf-kentät
+luistelurata
+luisteluradat
+huvivenesatama
+huvivenesatamat
+minigolf
+minigolfit
+urheilukenttä
+urheilukentät
+leikkikenttä
+leikkikentät
+vesillelaskuramppi
+vesillelaskurampit
+urheilukeskus
+urheilukeskukset
+stadioni
+uima-allas
+uima-altaat
+juoksurata
+juoksuradat
+vesipuisto
+vesipuistot
+lahti
+lahdet
+hiekkaranta
+hiekkarannat
+luolan sisäänkäynti
+luolan sisäänkäynnit
+kanava
+kanavat
+jyrkänne
+jyrkänteet
+rantaviiva
+rantaviivat
+kraatteri
+kraatterit
+tunturi
+tunturit
+vuono
+vuonot
+geysir
+geysirit
+jäätikkö
+jäätiköt
+mäki
+mäet
+saari
+saaret
+maa
+maata
+muta
+mutaa
+huippu
+huiput
+riutta
+riutat
+joki
+joet
+kivi
+kivet
+kiviä
+puu
+puut
+laakso
+laaksot
+tulivuori
+tulivuoret
+vesi
+vettä
+järvi
+järvet
+järviä
+kaupunki
+kaupungit
+maat
+piirikunta
+piirikunnat
+maatila
+maatilat
+pieni kylä
+pienet kylät
+taloja
+paikkakunta
+paikkakunnat
+kunta
+kunnat
+postinumero
+postinumerot
+alue
+alueet
+meri
+meret
+osavaltio
+osavaltiot
+lähiö
+lähiöt
+kylä
+kylät
+hylätty rautatie
+hylätyt rautatiet
+rakenteilla oleva rautatie
+rakenteilla olevat rautatiet
+käytöstä poistunut rautatieasema
+käytöstä poistuneet rautatieasemat
+tasoristeys
+tasoristeykset
+yksikiskoinen raide
+yksikiskoiset raiteet
+asemalaituri
+asemalaiturit
+metro
+metrot
+metron sisäänkäynti
+metron sisäänkäynnit
+ratapiha
+ratapihat
+taidekauppa
+taidekaupat
+leipomo
+leipomot
+polkupyöräkauppa
+polkupyöräkaupat
+kirjakauppa
+kirjakaupat
+lihakauppa
+lihakaupat
+autokauppa
+autokaupat
+auton osia
+autokorjaamo
+autokorjaamot
+mattokauppa
+mattokaupat
+vaatekauppa
+vaatekaupat
+tietokonekauppa
+tietokonekaupat
+lähikauppa
+lähikaupat
+tavaratalo
+tavaratalot
+kuivapesula
+kuivapesulat
+elektroniikkakauppa
+elektroniikkakaupat
+muotikauppa
+muotikaupat
+kalakauppa
+kalakaupat
+kukkakauppa
+kukkakaupat
+ruokakauppa
+ruokakaupat
+hautausurakoitsija
+hautausurakoitsijat
+huonekaluliike
+huonekaluliikkeet
+huonekalumyymälä
+huonekalumyymälät
+lahjakauppa
+lahjakaupat
+kampaamo
+kampaamot
+kultaseppä
+kultasepät
+korukauppa
+korukaupat
+kioski
+kioskit
+pesula
+pesulat
+ostoskeskus
+ostoskeskukset
+matkapuhelinkauppa
+matkapuhelinkaupat
+moottoripyöräkauppa
+moottoripyöräkaupat
+musiikkikauppa
+musiikkikaupat
+lehtikioski
+lehtikioskit
+optikko
+optikot
+eläinkauppa
+eläinkaupat
+kauneussalonki
+kauneussalongit
+kenkäkauppa
+kenkäkaupat
+urheilukauppa
+urheilukaupat
+lelukauppa
+lelukaupat
+matkatoimisto
+matkatoimistot
+videokauppa
+videokaupat
+alppimaja
+alppimajat
+taideteos
+taideteokset
+aamiaismajoitus
+aamiaismajoitukset
+mökki
+mökit
+leirintäalue
+leirintäalueet
+hostelli
+hostellit
+infopiste
+infopisteet
+motelli
+motellit
+piknik-paikka
+piknik-paikat
+huvipuisto
+huvipuistot
+teemapuisto
+teemapuistot
+näköalapaikka
+näköalapaikat
+eläintarha
+eläintarhat
+kanaali
+kanaalit
+pato
+padot
+oja
+ojat
+telakka
+märkätelakka
+telakat
+märkätelakat
+sulku
+sulut
+koski
+kosket
+puro
+purot
+pohjapato
+pohjapadot
+# fr
+aéroport
+aéroports
+centre artistique
+centres artistiques
+distributeur automatique de billets
+distributeurs automatiques de billets
+auditorium
+auditoriums
+banque
+banques
+bar
+bars
+banc
+bancs
+parking à vélos
+parkings à vélos
+location de vélos
+locations de vélos
+bordel
+bordels
+bureau de change
+bureaux de change
+arrêt de bus
+arrêts de bus
+café
+cafés
+location de voitures
+locations de voitures
+covoiturage
+covoiturages
+lavage de voitures
+lavages de voitures
+défibrillateur
+défibrillateurs
+dae
+laverie
+laveries
+casino
+casinos
+cinéma
+cinémas
+clinique
+cliniques
+club
+clubs
+établissement d'enseignement supérieur
+établissements d'enseignement supérieur
+salle polyvalente
+salles polyvalentes
+palais de justice
+crématorium
+crématoriums
+dentiste
+dentistes
+docteur
+docteurs
+dortoir
+dortoirs
+eau potable
+eaux potables
+école de conduite
+écoles de conduite
+ambassade
+ambassades
+téléphone d'urgence
+téléphones d'urgence
+restauration rapide
+restaurations rapides
+terminal de ferry
+terminaux de ferry
+bouche d'incendie
+bouches d'incendie
+caserne de pompiers
+casernes de pompiers
+fontaine
+fontaines
+carburant
+carburants
+cimetière
+cimetières
+fitness
+salle de gymnastique
+salles de gymnastique
+salle
+salles
+centre de santé
+centres de santé
+hôpital
+hôpitaux
+hôtel
+hôtels
+stand de tir
+stands de tir
+crème glacée
+crèmes glacées
+jardin d'enfants
+jardins d'enfants
+bibliothèque
+bibliothèques
+marché
+marchés
+place de marché
+places de marché
+secours en montagne
+boîte de nuit
+boîtes de nuit
+nurserie
+nurseries
+maison de santé
+maisons de santé
+bureau
+bureaux
+parc
+parcs
+parking
+parkings
+pharmacie
+pharmacies
+lieu de culte
+lieux de culte
+police
+polices
+boîtes aux lettres
+bureau de poste
+bureaux de poste
+préscolaire
+préscolaires
+prison
+prisons
+bâtiment public
+bâtimentss publics
+marché public
+marchés publics
+zone de réception
+zones de réceptions
+bulle à verre
+bulles à verre
+bulle
+bulles
+point de recyclage
+points de recyclage
+restaurant
+restaurants
+maison de retraite
+maisons de retraite
+sauna
+saunas
+école
+écoles
+refuge
+refuges
+magasin
+magasins
+commerce
+commerces
+club social
+clubs sociaux
+studio
+studios
+supermarché
+supermarchés
+taxi
+taxis
+téléphone public
+téléphones publics
+théâtre
+théâtres
+toilettes
+hôtel de ville
+hôtels de ville
+université
+universités
+distributeur automatique
+distributeurs automatiques
+vétérinaire
+vétérinaires
+salle communale
+salles communales
+corbeille
+corbeilles
+accès wifi
+centre pour la jeunesse
+centres pour la jeunesse
+limite administrative
+limites administratives
+immeuble
+immeubles
+bunker
+bunkers
+chapelle
+chapelles
+église
+églises
+bâtiment de bureaux
+bâtiments de bureaux
+entrée de bâtiment
+entrées de bâtiment
+bâtiment de faculté
+bâtiments de faculté
+bâtiment de ferme
+bâtiments de fermes
+appartements
+garage
+garages
+bâtiment hospitalier
+bâtiments hospitaliers
+maison
+maisons
+bâtiment industriel
+bâtiments industriels
+bâtiments publics
+bâtiment résidentiel
+bâtiments résidentiels
+bâtiment d'école
+bâtiments d'école
+stade
+stades
+terrasse
+terrasses
+tour
+tours
+gare ferroviaire
+gares ferroviaires
+bâtiment d'université
+bâtiments d'universités
+bâtiment
+bâtiments
+chemin pour cavaliers
+chemins pour cavaliers
+voie de bus guidée
+voies de bus guidées
+route secondaire
+routes secondaires
+route en construction
+routes en construction
+piste cyclable
+pistes cyclables
+borne kilométrique
+bornes kilométriques
+point d'accès d'urgence
+points d'accès d'urgence
+chemin piéton
+chemins piétons
+gué
+gués
+porte
+portes
+rue résidentielle
+rues résidentielles
+route mineure
+routes mineures
+autoroute
+autoroutes
+jonction d'autoroutes
+jonctions d'autoroutes
+bretelle autoroutière
+bretelles autoroutières
+chemin
+chemins
+plateforme
+plateformes
+route principale
+routes principales
+circuit
+circuits
+rue résidentiel
+route
+routes
+voie de service
+voies de services
+aire de service
+aires de service
+escalier
+escaliers
+échalier
+échaliers
+route tertiaire
+routes tertiaires
+piste
+pistes
+voie express
+voies express
+bretelle de voie express
+bretelles de voie express
+route non revêtue
+routes non revêtues
+site archéologique
+sites archéologiques
+champ de bataille
+champs de bataille
+borne frontière
+bornes frontières
+château
+châteaux
+icône
+icônes
+manoir
+manoirs
+mémorial
+mémorials
+mine
+mines
+monument
+monuments
+musée
+musées
+ruines
+croix de chemin
+calvaire
+calvaires
+oratoire
+oratoires
+épave
+épaves
+jardins familiaux
+bassin
+bassins
+terrain rasé
+terrains rasés
+zone tertiaire
+zones tertiaires
+zone protégée
+zones protégées
+zone en construction
+zones en construction
+zone agricole
+zones agricoles
+terrains agricoles
+bâtiments de ferme
+forêt
+forêts
+zone herborée
+zones herborées
+zone de construction future
+zones de construction future
+zone industrielle
+zones industrielles
+décharge
+décharges
+prairie
+prairies
+zone militaire
+zones militaires
+montagne
+montagnes
+réserve naturelle
+réserves naturelles
+plaza
+plazas
+carrière
+carrières
+voie ferrée
+voies ferrées
+aire de jeux
+aires de jeux
+réservoir
+réservoirs
+zone résidentielle
+zones résidentielles
+zone commerciale
+zones commerciales
+zone publique herborée
+zones publiques herborées
+vignoble
+vignobles
+zone humide
+zones humides
+bois
+station balnéaire
+stations balnéaires
+terrains communaux
+zone de pêche
+zones de pêche
+jardin
+jardins
+terrain de golf
+terrains de golf
+patinoire
+patinoires
+port de plaisance
+ports de plaisance
+golf miniature
+golfs miniatures
+terrain de sport
+terrains de sport
+terrain de jeux
+terrains de jeux
+cale de lancement
+cales de lancement
+centre sportif
+centres sportifs
+piscine
+piscines
+parc aquatique
+parcs aquatiques
+baie
+baies
+plage
+plages
+cap
+caps
+entrée de grotte
+entrées de grotte
+canal
+canaux
+falaise
+falaises
+littoral
+littorals
+cratère
+cratères
+élément
+éléments
+fell
+fells
+fjord
+fjords
+geyser
+geysers
+glacier
+glaciers
+bruyère
+bruyères
+colline
+collines
+île
+îles
+terre
+terres
+marécage
+marécages
+maure
+maures
+boue
+boues
+pic
+pics
+pointe
+pointes
+récif
+récifs
+crête
+crêtes
+rivière
+rivières
+roche
+roches
+éboulis
+broussailles
+haut-fond
+haut-fonds
+cascade
+cascades
+détroit
+détroits
+arbre
+arbres
+vallée
+vallées
+volcan
+volcans
+eau
+eaux
+ville
+villes
+pays
+comté
+comtés
+ferme
+fermes
+hameau
+hameaux
+îlot
+îlots
+localité
+localités
+municipalité
+municipalités
+code postal
+codes postaux
+région
+régions
+mer
+mers
+état
+états
+subdivision
+subdivisions
+quartier
+quartiers
+lieu non organisé
+lieux non organisés
+village
+villages
+voie ferrée abandonnée
+voies ferrées abandonnées
+voie ferrée en construction
+voies ferrées en construction
+voie ferrée désaffectée
+voies ferrées désaffectées
+gare désaffectée
+gares désaffectées
+voie de funiculaire
+voies de funiculaire
+arrêt de train
+arrêts de train
+arrêt de train historique
+arrêts de train historiques
+jonction ferroviaire
+jonctions ferroviaires
+passage à niveau
+passages à niveau
+petite voie ferrée
+petites voies ferrées
+monorail
+monorails
+chemin de fer à voie étroite
+chemins de fer à voie étroite
+plateforme ferroviaire
+plateformes ferroviaires
+voie ferrée conservée
+voies ferrées conservées
+voie de connexion
+voies de connexion
+station de métro
+stations de métro
+bouche de métro
+bouches de métro
+aiguillage
+aiguillages
+tramway
+tramways
+arrêt de tram
+arrêts de tram
+voie de triage
+voies de triages
+magasin officiel d'alcool
+magasins officiels d'alcool
+magasin d'habillement
+magasins d'habillement
+boutique d'art
+boutiques d'art
+boulangerie
+boulangeries
+magasin de produits de beauté
+magasins de produits de beauté
+magasin de boissons
+magasins de boissonss
+magasin de vélos
+magasins de vélos
+librairie
+librairies
+boucher
+bouchers
+boucherie
+boucheries
+magasin de voitures
+magasins de voitures
+vendeur de voitures
+vendeurs de voitures
+pièces d'automobile
+réparation de voitures
+réparations de voitures
+magasin de tapis
+magasins de tapis
+magasin de bienfaisance
+magasins de bienfaisance
+magasin de produits d'hygiène
+magasins de produits d'hygiènes
+magasin de vêtements
+magasins de vêtements
+magasin informatique
+magasins informatiques
+confiserie
+confiseries
+épicerie
+épiceries
+magasin de photocopies
+magasins de photocopies
+magasin de cosmétiques
+magasins de cosmétiques
+grand magasin
+grands magasins
+magasin discount
+magasins discounts
+magasin de bricolage
+magasins de bricolage
+nettoyage à sec
+nettoyages à sec
+magasin d'électronique
+magasins d'électronique
+agent immobilier
+agents immobilier
+magasin de produits agricoles
+magasins de produits agricoles
+magasin de mode
+magasins de mode
+poissonnerie
+poissonneries
+fleuriste
+fleuristes
+magasin d'alimentation
+magasins d'alimentation
+pompes funèbres
+magasin d'ameublement
+galerie
+galeries
+jardinerie
+jardineries
+magasin généraliste
+magasins généralistes
+boutique de cadeaux
+boutiques de cadeaux
+marchand de fruits et légumes
+marchands de fruits et légumes
+coiffeur
+coiffeurs
+quincaillerie
+quincailleries
+magasin hi-fi
+magasins hi-fi
+assurance
+assurances
+bijouterie
+bijouteries
+kiosque
+kiosques
+blanchisserie
+blanchisseries
+galerie marchande
+galeries marchandes
+magasin de téléphones mobiles
+magasins de téléphones mobiles
+magasin de moto
+magasins de moto
+magasin de musique
+magasins de musique
+marchand de journaux
+marchands de journaux
+opticien
+opticiens
+magasin bio
+magasins bio
+magasin d'activités de plein air
+magasins d'activités de plein air
+magasin d'animaux
+magasins d'animaux
+magasin de photographie
+magasins de photographie
+salon
+salons
+magasin de chaussures
+magasins de chaussures
+centre commercial
+centres commerciaux
+magasin de sport
+magasins de sport
+papeterie
+papeteries
+magasin de jouets
+magasins de jouets
+agence de voyage
+agences de voyage
+magasin de vidéos
+magasins de vidéos
+caviste
+cavistes
+œuvre d’art
+œuvres d’art
+attraction
+attractions
+gîte
+gîtes
+hutte
+huttes
+camping
+campings
+site de caravane
+sites de caravane
+chalet
+chalets
+maison d'hôte
+maisons d'hôte
+auberge
+auberges
+informations
+stand
+stands
+motel
+motels
+site de pique-nique
+sites de pique-nique
+parc à thème
+parcs à thème
+point de vue
+points de vue
+zoo
+zoos
+chantier naval
+chantiers navals
+connexion hydrographique
+connexions hydrographiques
+digue
+digues
+canal de délaissement
+canaux de délaissement
+fossé
+fossés
+dock
+docks
+drain
+drains
+écluse
+écluses
+porte d'écluse
+portes d'écluses
+source d'eau minérale
+sources d'eau minérale
+mouillage
+mouillages
+rapides
+lit de rivière
+lits de rivière
+ruisseau
+ruisseaux
+oued
+oueds
+point d'eau
+points d'eau
+chute d'eau
+chutes d'eau
+barrage
+barrages
+charcuterie
+charcuteries
+station service
+stations services
+mairie
+mairies
+garage automobile
+garages automobiles
+teinturerie
+teintureries
+pressing
+pressings
+auto-école
+auto-écoles
+primeur
+primeurs
+médecin
+médecins
+office de tourisme
+offices de tourisme
+# gl
+aeroporto
+aeroportos
+centro artístico
+centro artísticos
+caixeiro automático
+caixeiro automáticos
+auditorio
+auditorios
+banco
+bancos
+bar
+bars
+aparcadoiro de bicicletas
+aparcadoiro de bicicletass
+aluguer de bicicletas
+aluguer de bicicletass
+prostíbulo
+prostíbulos
+estación de autobuses
+estación de autobusess
+cafetaría
+cafetarías
+aluguer de automóbiles
+aluguer de automóbiless
+casino
+casinos
+cine
+cines
+clínica
+clínicas
+club
+clubs
+instituto
+institutos
+centro comunitario
+centro comunitarios
+xulgado
+xulgados
+crematorio
+crematorios
+dentista
+dentistas
+residencia universitaria
+residencia universitarias
+auga potable
+auga potables
+escola de condución
+escola de conducións
+teléfono de emerxencia
+teléfono de emerxencias
+comida rápida
+comida rápidas
+parque de bombeiros
+parque de bombeiross
+fonte
+fontes
+combustible
+combustibles
+cemiterio
+cemiterios
+ximnasio
+ximnasios
+centro de saúde
+centro de saúdes
+hospital
+hospitals
+hotel
+hotels
+xeadaría
+xeadarías
+xardín de infancia
+xardín de infancias
+biblioteca
+bibliotecas
+mercado
+mercados
+praza de mercado
+praza de mercados
+club nocturno
+club nocturnos
+oficina
+oficinas
+parque
+parques
+aparcadoiro
+aparcadoiros
+farmacia
+farmacias
+lugar de culto
+lugar de cultos
+policía
+policías
+caixa de correos
+caixa de correoss
+oficina de correos
+oficina de correoss
+preescolar
+preescolars
+prisión
+prisións
+pub
+pubs
+edificio público
+edificio públicos
+mercado público
+mercado públicos
+punto de reciclaxe
+punto de reciclaxes
+restaurante
+restaurantes
+residencia de xubilados
+residencia de xubiladoss
+sauna
+saunas
+escola
+escolas
+abeiro
+abeiros
+tenda
+tendas
+comercio
+comercios
+club social
+club socials
+estudio
+estudios
+supermercado
+supermercados
+teléfono público
+teléfono públicos
+teatro
+teatros
+aseos
+aseoss
+concello
+concellos
+universidade
+universidades
+máquina expendedora
+máquina expendedoras
+clínica veterinaria
+clínica veterinarias
+acceso wifi
+acceso wifis
+casa da xuventude
+casa da xuventudes
+pista de cabalos
+pista de cabaloss
+parada de autobús
+parada de autobúss
+camiño secundario
+camiño secundarios
+autoestrada en construción
+autoestrada en construcións
+pista de bicicletas
+pista de bicicletass
+indicador quilométrico
+indicador quilométricos
+punto de acceso de emerxencia
+punto de acceso de emerxencias
+carreiro
+carreiros
+vao
+vaos
+porta
+portas
+rúa residencial
+rúa residencials
+estrada lateral
+estrada laterals
+autoestrada
+autoestradas
+cruce de autovías
+cruce de autovíass
+enlace de autoestrada
+enlace de autoestradas
+camiño
+camiños
+camiño peonil
+camiño peonils
+plataforma
+plataformas
+estrada primaria
+estrada primarias
+estrada principal
+estrada principals
+circuíto
+circuítos
+residencial
+residencials
+estrada
+estradas
+estrada secundaria
+estrada secundarias
+estrada de servizo
+estrada de servizos
+área de servizo
+área de servizos
+chanzos
+chanzoss
+escada
+escadas
+estrada terciaria
+estrada terciarias
+pista
+pistas
+estrada nacional
+estrada nacionals
+estrada sen clasificar
+estrada sen clasificars
+estrada non pavimentada
+estrada non pavimentadas
+balneario
+balnearios
+terreo común
+terreo comúns
+área de pesca
+área de pescas
+xardín
+xardíns
+campo de golf
+campo de golfs
+pista de patinaxe sobre xeo
+pista de patinaxe sobre xeos
+porto deportivo
+porto deportivos
+minigolf
+minigolfs
+reserva natural
+reserva naturals
+cancha deportiva
+cancha deportivas
+patio de recreo
+patio de recreos
+área recreativa
+área recreativas
+varadoiro
+varadoiros
+centro deportivo
+centro deportivos
+estadio
+estadios
+piscina
+piscinas
+pista de carreiras
+pista de carreirass
+parque acuático
+parque acuáticos
+baía
+baías
+praia
+praias
+cabo
+cabos
+entrada de cova
+entrada de covas
+canal
+canals
+cantil
+cantils
+litoral
+litorals
+cráter
+cráters
+elemento
+elementos
+brañal
+brañals
+fiorde
+fiordes
+géiser
+géisers
+glaciar
+glaciars
+outeiro
+outeiros
+illa
+illas
+terra
+terras
+marisma
+marismas
+páramo
+páramos
+lama
+lamas
+pico
+picos
+punto
+puntos
+arrecife
+arrecifes
+crista
+cristas
+río
+ríos
+rocha
+rochas
+pedregal
+pedregals
+matogueira
+matogueiras
+cardume
+cardumes
+primavera
+primaveras
+estreito
+estreitos
+árbore
+árbores
+val
+vals
+volcán
+volcáns
+auga
+augas
+pantano
+pantanos
+bosque
+bosques
+cidade
+cidades
+país
+paíss
+condado
+condados
+granxa
+granxas
+aldea
+aldeas
+casa
+casas
+casass
+illote
+illotes
+localidade
+localidades
+municipio
+municipios
+código postal
+código postals
+rexión
+rexións
+mar
+mars
+estado/provincia
+estado/provincias
+subdivisión
+subdivisións
+barrio
+barrios
+área non incorporada
+área non incorporadas
+vila
+vilas
+tenda de roupa
+tenda de roupas
+tenda de arte
+tenda de artes
+panadaría
+panadarías
+tenda de bicicletas
+tenda de bicicletass
+libraría
+librarías
+carnizaría
+carnizarías
+taller mecánico
+taller mecánicos
+tenda de alfombras
+tenda de alfombrass
+tenda benéfica
+tenda benéficas
+tenda informática
+tenda informáticas
+gran almacén
+gran almacéns
+tenda de bricolaxe
+tenda de bricolaxes
+axencia inmobiliaria
+axencia inmobiliarias
+tenda de moda
+tenda de modas
+peixaría
+peixarías
+floraría
+florarías
+tenda de alimentación
+tenda de alimentacións
+galería
+galerías
+tenda de ultramarinos
+tenda de ultramarinoss
+perrucaría
+perrucarías
+ferraxaría
+ferraxarías
+hi-fi
+hi-fis
+xoiaría
+xoiarías
+centro comercial
+centro comercials
+tenda de telefonía móbil
+tenda de telefonía móbils
+tenda de motocicletas
+tenda de motocicletass
+tenda de música
+tenda de músicas
+oftalmólogo
+oftalmólogos
+tenda de alimentos orgánicos
+tenda de alimentos orgánicoss
+tenda de deportes ao aire libre
+tenda de deportes ao aire libres
+tenda de fotografía
+tenda de fotografías
+zapataría
+zapatarías
+tenda de deportes
+tenda de deportess
+papelaría
+papelarías
+xoguetaría
+xoguetarías
+axencia de viaxes
+axencia de viaxess
+cabana alpina
+cabana alpinas
+obra de arte
+obra de artes
+atracción
+atraccións
+cama e almorzo
+cama e almorzos
+cabana
+cabanas
+campamento
+campamentos
+sitio de caravanas
+sitio de caravanass
+chalé
+chalés
+albergue
+albergues
+hostal
+hostals
+información
+informacións
+caseta
+casetas
+motel
+motels
+museo
+museos
+sitio de pícnic
+sitio de pícnics
+parque temático
+parque temáticos
+miradoiro
+miradoiros
+zoolóxico
+zoolóxicos
+# hr
+zračna luka
+zračna lukas
+umjetnički centar
+umjetnički centars
+bankomat
+bankomats
+auditorij
+auditorijs
+banka
+bankas
+bar
+bars
+klupa
+klupas
+biciklistički parking
+biciklistički parkings
+rent a bicikl
+rent a bicikls
+bordel
+bordels
+mjenjačnica
+mjenjačnicas
+autobusni kolodvor
+autobusni kolodvors
+caffe bar
+caffe bars
+rent-a-car
+rent-a-cars
+carsharing
+carsharings
+autopraonica
+autopraonicas
+casino
+casinos
+kino
+kinos
+klinika
+klinikas
+klub
+klubs
+fakultet
+fakultets
+društveni centar
+društveni centars
+sud
+suds
+krematorij
+krematorijs
+zubar
+zubars
+doktor
+doktors
+studentski dom
+studentski doms
+pitka voda
+pitka vodas
+autoškola
+autoškolas
+veleposlanstvo
+veleposlanstvos
+telefon (s.o.s)
+telefon (s.o.s)s
+fast food
+fast foods
+trajektni terminal
+trajektni terminals
+hidrant
+hidrants
+vatrogasna postaja
+vatrogasna postajas
+fontana
+fontanas
+benzinska
+benzinskas
+groblje
+grobljes
+fitness centar
+fitness centars
+hala
+halas
+zdravstveni centar
+zdravstveni centars
+bolnica
+bolnicas
+hotel
+hotels
+čeka
+čekas
+slastičarna
+slastičarnas
+dječji vrtić
+dječji vrtićs
+knjižnica
+knjižnicas
+tržnica
+tržnicas
+gss - gorska služba spašavanja
+gss - gorska služba spašavanjas
+'noćni klub'
+'noćni klub's
+čuvanje djece
+čuvanje djeces
+starački dom
+starački doms
+kancelarija
+kancelarijas
+park
+parks
+parking
+parkings
+ljekarna
+ljekarnas
+crkva
+crkvas
+policija
+policijas
+poštanski sandučić
+poštanski sandučićs
+pošta
+poštas
+predškolska ustanova
+predškolska ustanovas
+zatvor
+zatvors
+pub
+pubs
+ustanova
+ustanovas
+javna tržnica
+javna tržnicas
+recepcija
+recepcijas
+reciklažna točka
+reciklažna točkas
+restoran
+restorans
+dom za starije osobe
+dom za starije osobes
+sauna
+saunas
+škola
+školas
+sklonište
+skloništes
+trgovina
+trgovinas
+trgovački centar
+trgovački centars
+društveni klub
+društveni klubs
+studio
+studios
+supermarket
+supermarkets
+taxi
+taxis
+telefonska govornica
+telefonska govornicas
+kazalište
+kazalištes
+wc
+wcs
+gradsko poglavarstvo
+gradsko poglavarstvos
+sveučilište
+sveučilištes
+automat
+automats
+veterinar
+veterinars
+seoski dom
+seoski doms
+kanta za otpatke
+kanta za otpatkes
+wifi pristupna točka
+wifi pristupna točkas
+centar za mladež
+centar za mladežs
+administrativna granica
+administrativna granicas
+stambeni blok
+stambeni bloks
+blok zgrada
+blok zgradas
+bunker
+bunkers
+kapelica
+kapelicas
+gradska vjećnica
+gradska vjećnicas
+poslovna zgrada
+poslovna zgradas
+ulaz
+ulazs
+zgrada fakulteta
+zgrada fakultetas
+farma (zgrada)
+farma (zgrada)s
+stanovi
+stanovis
+garaža
+garažas
+dvorana
+dvoranas
+kuća
+kućas
+industrijska zgrada
+industrijska zgradas
+uredska zgrada
+uredska zgradas
+javna zgrada
+javna zgradas
+stambena zgrada
+stambena zgradas
+maloprodajna zgrada
+maloprodajna zgradas
+školska zgrada
+školska zgradas
+stadion
+stadions
+terasa
+terasas
+toranj
+toranjs
+željeznički kolodvor
+željeznički kolodvors
+zgrada sveučilišta
+zgrada sveučilištas
+zgrada
+zgradas
+konjička staza
+konjička stazas
+autobusna traka
+autobusna trakas
+autobusno stajalište
+autobusno stajalištes
+prečica
+prečicas
+autocesta u izgradnji
+autocesta u izgradnjis
+biciklistička staza
+biciklistička stazas
+oznaka km
+oznaka kms
+s.o.s. točka
+s.o.s. točkas
+pješačka staza
+pješačka stazas
+ford
+fords
+kapija
+kapijas
+ulica smirenog prometa
+ulica smirenog prometas
+drugorazredna cesta
+drugorazredna cestas
+autocesta
+autocestas
+čvor (autoputa)
+čvor (autoputa)s
+autocesta (pristupna cesta)
+autocesta (pristupna cesta)s
+staza
+stazas
+pješački put
+pješački puts
+platforma
+platformas
+državna cesta
+državna cestas
+trkalište
+trkalištes
+ulica
+ulicas
+cesta
+cestas
+županijska cesta
+županijska cestas
+servisna cesta
+servisna cestas
+autocesta - usluge
+autocesta - usluges
+stepenice
+stepenices
+prijelaz preko ograde
+prijelaz preko ogrades
+lokalna cesta
+lokalna cestas
+makadam
+makadams
+cesta rezervirana za motorna vozila
+cesta rezervirana za motorna vozilas
+cesta rezrevirana za mot. voz. - prilazna cesta
+cesta rezrevirana za mot. voz. - prilazna cestas
+nerazvrstana cesta
+nerazvrstana cestas
+neasfaltirana cesta
+neasfaltirana cestas
+arheološko nalazište
+arheološko nalazištes
+bojno polje
+bojno poljes
+granični kamen
+granični kamens
+dvorac
+dvoracs
+ikona
+ikonas
+zamak
+zamaks
+spomen dom
+spomen doms
+rudnik
+rudniks
+spomenik
+spomeniks
+muzej
+muzejs
+ruševine
+ruševines
+krajputaš
+krajputašs
+usputno svetište
+usputno svetištes
+olupina
+olupinas
+vrtovi
+vrtovis
+bazen
+bazens
+zemljište za prenamjenu
+zemljište za prenamjenus
+poslovno područje
+poslovno područjes
+zaštićeno područje
+zaštićeno područjes
+gradilište
+gradilištes
+farma
+farmas
+polje
+poljes
+šuma
+šumas
+trava
+travas
+greenfield zemljište
+greenfield zemljištes
+industrijsko područje
+industrijsko područjes
+deponija
+deponijas
+livada
+livadas
+vojno područje
+vojno područjes
+planina
+planinas
+rezervat prirode
+rezervat prirodes
+pista
+pistas
+plaza
+plazas
+kamenolom
+kamenoloms
+željeznica
+željeznicas
+rekreacijsko područje
+rekreacijsko područjes
+rezervoar
+rezervoars
+stambeno područje
+stambeno područjes
+seoski travnjak
+seoski travnjaks
+vinograd
+vinograds
+močvara
+močvaras
+plaža
+plažas
+općinsko zemljište
+općinsko zemljištes
+ribičko područje
+ribičko područjes
+vrt
+vrts
+golf igralište
+golf igralištes
+klizalište
+klizalištes
+marina
+marinas
+minigolf
+minigolfs
+sportski teren
+sportski terens
+igralište
+igralištes
+rekreacijski teren
+rekreacijski terens
+navoz
+navozs
+sportski centar
+sportski centars
+staza za trčanje
+staza za trčanjes
+vodeni park
+vodeni parks
+zaljev
+zaljevs
+rt
+rts
+pećina (ulaz)
+pećina (ulaz)s
+kanal
+kanals
+litica
+liticas
+obala
+obalas
+krater
+kraters
+obilježje
+obilježjes
+brdo
+brdos
+fjord
+fjords
+gejzir
+gejzirs
+glečer
+glečers
+ravnica
+ravnicas
+otok
+otoks
+zemlja
+zemljas
+blato
+blatos
+vrh
+vrhs
+točka
+točkas
+greben
+grebens
+rijeka
+rijekas
+stijena
+stijenas
+šljunak
+šljunaks
+guštara
+guštaras
+sprud
+spruds
+izvor
+izvors
+tjesnac
+tjesnacs
+drvo
+drvos
+dolina
+dolinas
+vulkan
+vulkans
+voda
+vodas
+grad
+grads
+država
+državas
+županija/grofovija
+županija/grofovijas
+zaseok
+zaseoks
+kuće
+kućes
+otočić
+otočićs
+lokalitet
+lokalitets
+općina
+općinas
+poštanski broj
+poštanski brojs
+područje
+područjes
+more
+mores
+pokrajina / država (usa)
+pokrajina / država (usa)s
+podgrupa
+podgrupas
+predgrađe
+predgrađes
+slobodna zemlja
+slobodna zemljas
+selo
+selos
+napuštena pruga
+napuštena prugas
+pruga u izgradnji
+pruga u izgradnjis
+željeznička stanica (nije u upotrebi)
+željeznička stanica (nije u upotrebi)s
+uspinjača
+uspinjačas
+željeznička stanica
+željeznička stanicas
+povijesna željeznička stanica
+povijesna željeznička stanicas
+željeznički čvor
+željeznički čvors
+pružni prijelaz
+pružni prijelazs
+laka željeznica
+laka željeznicas
+jednotračna pruga
+jednotračna prugas
+uskotračna pruga
+uskotračna prugas
+željeznička platforma
+željeznička platformas
+sačuvana pruga
+sačuvana prugas
+pruga
+prugas
+podzemna - stanica
+podzemna - stanicas
+podzemna - ulaz
+podzemna - ulazs
+skretnica
+skretnicas
+tramvaj
+tramvajs
+tramvajska stanica
+tramvajska stanicas
+ranžirni kolodvor
+ranžirni kolodvors
+trgovina pićem
+trgovina pićems
+trgovina odjećom
+trgovina odjećoms
+atelje
+ateljes
+pekara
+pekaras
+parfumerija
+parfumerijas
+trgovina biciklima
+trgovina biciklimas
+knjižara
+knjižaras
+mesnica
+mesnicas
+autokuća
+autokućas
+autodijelovi
+autodijelovis
+autoservis
+autoserviss
+trgovina tepisima
+trgovina tepisimas
+dobrotvorna trgovina
+dobrotvorna trgovinas
+butik
+butiks
+computer shop
+computer shops
+delikatesa
+delikatesas
+minimarket
+minimarkets
+kopiraona
+kopiraonas
+robna kuća
+robna kućas
+diskont
+diskonts
+uradi sam
+uradi sams
+drogerija
+drogerijas
+kemijska čistionica
+kemijska čistionicas
+trgovina elektronikom
+trgovina elektronikoms
+agencija za nekretnine
+agencija za nekretnines
+poljo-apoteka
+poljo-apotekas
+modna trgovina
+modna trgovinas
+ribarnica
+ribarnicas
+cvjećarnica
+cvjećarnicas
+trgovina prehranom
+trgovina prehranoms
+pogrebno poduzeće
+pogrebno poduzećes
+namještaj
+namještajs
+galerija
+galerijas
+vrtni centar
+vrtni centars
+trgovina mješovitom robom
+trgovina mješovitom roboms
+poklon trgovina
+poklon trgovinas
+voćarna
+voćarnas
+frizer
+frizers
+željezar
+željezars
+hi-fi
+hi-fis
+osiguranje
+osiguranjes
+zlatarna
+zlatarnas
+kiosk
+kiosks
+praonica rublja
+praonica rubljas
+trgovina mobitelima
+trgovina mobitelimas
+moto shop
+moto shops
+trgovina glazbom
+trgovina glazboms
+novinar
+novinars
+optičar
+optičars
+trgovina zdrave hrane
+trgovina zdrave hranes
+trgovina za slobodno vrijeme
+trgovina za slobodno vrijemes
+trgovina za kućne ljubimce
+trgovina za kućne ljubimces
+fotograf
+fotografs
+salon
+salons
+trgovina obućom
+trgovina obućoms
+trgovina sportskom opremom
+trgovina sportskom opremoms
+papirnica
+papirnicas
+trgovina igračkama
+trgovina igračkamas
+putnička agencija
+putnička agencijas
+videoteka
+videotekas
+vinoteka
+vinotekas
+alpska kuća
+alpska kućas
+umjetničko djelo
+umjetničko djelos
+atrakcija
+atrakcijas
+'noćenje i doručak'
+'noćenje i doručak's
+koliba
+kolibas
+kamp
+kamps
+kamp-kućice (mjesto)
+kamp-kućice (mjesto)s
+planinska kuća
+planinska kućas
+apartman
+apartmans
+hostel
+hostels
+informacije
+informacijes
+lean to
+lean tos
+motel
+motels
+piknik-mjesto
+piknik-mjestos
+tematski park
+tematski parks
+vidikovac
+vidikovacs
+zoo
+zoos
+brodogradilište
+brodogradilištes
+spoj vodnih puteva
+spoj vodnih putevas
+brana
+branas
+zanemaren kanal
+zanemaren kanals
+jarak
+jaraks
+dok
+doks
+odvod
+odvods
+ustava
+ustavas
+mineralni izvor
+mineralni izvors
+sidrište
+sidrištes
+brzaci
+brzacis
+riječna obala
+riječna obalas
+potok
+potoks
+suho korito rijeke
+suho korito rijekes
+točka vodotoka
+točka vodotokas
+vodopad
+vodopads
+# hu
+repülőtér
+repülőterek
+művészeti központ
+művészeti központok
+bankautomata
+bankautomaták
+auditórium
+auditóriumok
+bank
+bankok
+bár
+bárok
+pad
+padok
+kerékpártároló
+kerékpártárolók
+kerékpárkölcsönző
+kerékpárkölcsönzők
+bordélyház
+bordélyházak
+pénzváltó
+pénzváltók
+autóbusz-állomás
+autóbusz-állomások
+kávézó
+kávézók
+autókölcsönző
+autókölcsönzők
+autómegosztó
+autómegosztók
+autómosó
+autómosók
+kaszinó
+kaszinók
+mozi
+mozik
+klinika
+klinikasák
+klub
+klubok
+fõiskola
+főiskolák
+művelődési központ
+művelődési központok
+bíróság
+bíróságok
+krematórium
+krematóriumok
+fogorvos
+fogorvosok
+orvosi rendelő
+orvosi rendelők
+kollégium
+kollégiumok
+ivóvíz
+ivóvizek
+autósiskola
+autósiskolák
+nagykövetség
+nagykövetségek
+segélyhívó
+segélyhívók
+gyorsétterem
+gyorséttermek
+kompkikötő
+kompkikötők
+tűzcsap
+tűzcsapok
+tűzoltóság
+tűzoltóságok
+szökőkút
+szökőkutak
+benzinkút
+benzinkutak
+kis temető
+kis temetők
+fitness- / tornaterem
+fitness- / tornatermek
+csarnok
+csarnokok
+egészségügyi központ
+egészségügyi központok
+kórház
+kórházak
+szálloda
+szállodák
+magasles
+magaslesek
+jégkrém
+jégkrémek
+óvoda
+óvodák
+könyvtár
+könyvtárak
+piac
+piacok
+vásártér
+vásárterek
+hegyimentő
+hegyimentők
+éjszakai bár
+éjszakai bárok
+idősek otthona
+idősek otthonai
+iroda
+irodák
+park
+parkok
+parkoló
+parkolók
+gyógyszertár
+gyógyszertárak
+vallási hely
+vallási helyek
+rendőrség
+rendőrségek
+postaláda
+postaládák
+posta
+posták
+börtön
+börtönök
+kocsma
+kocsmák
+középület
+középületek
+recepció
+recepciók
+szelektív hulladékgyűjtő
+szelektív hulladékgyűjtők
+étterem
+étteremek
+nyugdíjasotthon
+nyugdíjasotthonok
+szauna
+szaunák
+iskola
+iskolák
+esőház
+esőházak
+bolt
+boltok
+vásárlás
+társasági klub
+társasági klubok
+stúdió
+stúdiók
+szupermarket
+szupermarketek
+taxi
+taxik
+nyilvános telefon
+nyilvános telefonok
+színház
+színházak
+wc
+wc-k
+városháza
+városházák
+egyetem
+egyetemek
+árusító automata
+árusító automaták
+állatorvosi rendelő
+állatorvosi rendelők
+községháza
+községházak
+szemétgyűjtő kosár
+szemétgyűjtő kosarak
+wifi hozzáférés
+wifi hozzáférések
+ifjúsági központ
+ifjúsági központok
+közigazgatási határ
+közigazgatási határok
+társasház
+társasházak
+háztömb
+háztömbök
+bunker
+bunkerek
+kápolna
+kápolnas
+templom
+temploms
+városházas
+kereskedelmi épület
+kereskedelmi épülets
+kollégiums
+épületbejárat
+épületbejárats
+egyetemi épület
+egyetemi épülets
+tanyaépület
+tanyaépülets
+lakások
+lakásoks
+garázs
+garázss
+csarnoks
+kórházépület
+kórházépülets
+szállodas
+ház
+házs
+ipari épület
+ipari épülets
+irodaház
+irodaházs
+középülets
+lakóház
+lakóházs
+iskolaépület
+iskolaépülets
+bolts
+stadion
+stadions
+áruház
+áruházs
+sorház
+sorházs
+torony
+toronys
+vasútállomás
+vasútállomáss
+épület
+épülets
+lovaglóút
+lovaglóúts
+buszsín
+buszsíns
+buszmegálló
+buszmegállós
+kiépítetlen ösvény
+kiépítetlen ösvénys
+építés alatt álló közút
+építés alatt álló közúts
+kerékpárút
+kerékpárúts
+távolságjelölő
+távolságjelölős
+vészhelyzeti hozzáférési pont
+vészhelyzeti hozzáférési ponts
+gyalogút
+gyalogúts
+gázló
+gázlós
+kapu
+kapus
+pihenőút
+pihenőúts
+alárendelt út
+alárendelt úts
+autópálya
+autópályas
+autópálya-csomópont
+autópálya-csomóponts
+ösvény
+ösvénys
+sétálóutca
+sétálóutcas
+peron
+perons
+főút
+főúts
+versenypálya
+versenypályas
+lakóövezeti út
+lakóövezeti úts
+út
+úts
+összekötő út
+összekötő úts
+szervizút
+szervizúts
+autópálya-pihenőhely
+autópálya-pihenőhelys
+lépcső
+lépcsős
+lépcsős átjáró
+lépcsős átjárós
+bekötőút
+bekötőúts
+földút
+földúts
+túraút
+túraúts
+autóút
+autóúts
+egyéb út
+egyéb úts
+burkolatlan út
+burkolatlan úts
+régészeti lelőhely
+régészeti lelőhelys
+csatamező
+csatamezős
+határkő
+határkős
+vár
+várs
+ikon
+ikons
+majorság
+majorságs
+emlékmű
+emlékműs
+bánya
+bányas
+műemlék
+műemléks
+múzeum
+múzeums
+rom
+roms
+útszéli kereszt
+útszéli kereszts
+útszéli kegyhely
+útszéli kegyhelys
+hajóroncs
+hajóroncss
+kert
+kerts
+medence
+medences
+barnamező
+barnamezős
+temető
+temetős
+irodaterület
+irodaterülets
+védelmi terület
+védelmi területs
+építési terület
+építési területs
+tanya
+tanyas
+mezőgazdasági terület
+mezőgazdasági területs
+tanya épületei
+tanya épületeis
+erdő
+erdős
+füves terület
+füves területs
+zöldmező
+zöldmezős
+ipari terület
+ipari területs
+hulladéklerakó
+hulladéklerakós
+rét
+réts
+katonai terület
+katonai területs
+hegy
+hegys
+természetvédelmi terület
+természetvédelmi területs
+parks
+sípálya
+sípályas
+tér
+térs
+kőfejtő
+kőfejtős
+vasúti terület
+vasúti területs
+szabadidőpark
+szabadidőparks
+víztározó
+víztározós
+lakóövezet
+lakóövezets
+kereskedelmi terület
+kereskedelmi területs
+közös mező
+közös mezős
+szőlős
+szőlőss
+láp
+láps
+tengerparti üdülőhely
+tengerparti üdülőhelys
+közös terület
+közös területs
+horgászterület
+horgászterülets
+golfpálya
+golfpályas
+műjégpálya
+műjégpályas
+kishajókikötő
+kishajókikötős
+minigolfpálya
+minigolfpályas
+labdarúgópálya
+labdarúgópályas
+játszótér
+játszótérs
+sólya
+sólyas
+sportközpont
+sportközponts
+uszoda
+uszodas
+futópálya
+futópályas
+vízipark
+víziparks
+öböl
+öböls
+part
+parts
+partfok
+partfoks
+barlangbejárat
+barlangbejárats
+csatorna
+csatornas
+szikla
+sziklas
+tengerpart
+tengerparts
+kráter
+kráters
+tereptárgy
+tereptárgys
+kopár
+kopárs
+fjord
+fjords
+gejzír
+gejzírs
+gleccser
+gleccsers
+puszta
+pusztas
+domb
+dombs
+sziget
+szigets
+szárazföld
+szárazfölds
+mocsár
+mocsárs
+iszap
+iszaps
+hegycsúcs
+hegycsúcss
+pont
+ponts
+zátony
+zátonys
+hegygerinc
+hegygerincs
+folyó
+folyós
+sziklatörmelék
+sziklatörmeléks
+cserjés
+cserjéss
+forrás
+forráss
+tengerszoros
+tengerszoross
+fa
+fas
+völgy
+völgys
+vulkán
+vulkáns
+tó
+tós
+nagyváros
+nagyváross
+ország
+országs
+megye
+megyes
+község
+községs
+házak
+házaks
+kis sziget
+kis szigets
+hely
+helys
+település
+településs
+irányítószám
+irányítószáms
+régió
+régiós
+tenger
+tengers
+állam
+állams
+településrész
+településrészs
+városrész
+városrészs
+város
+váross
+jogi személyiséggel nem rendelkező terület
+jogi személyiséggel nem rendelkező területs
+nagyközség
+nagyközségs
+felhagyott vasút
+felhagyott vasúts
+építés alatt álló vasút
+építés alatt álló vasúts
+használaton kívüli vasút
+használaton kívüli vasúts
+használaton kívüli vasútállomás
+használaton kívüli vasútállomáss
+siklóvasút
+siklóvasúts
+vasúti megállóhely
+vasúti megállóhelys
+történelmi vasútállomás
+történelmi vasútállomáss
+vasúti csomópont
+vasúti csomóponts
+vasúti átjáró
+vasúti átjárós
+hév
+hévs
+egysínű vasút
+egysínű vasúts
+keskeny nyomközű vasút
+keskeny nyomközű vasúts
+vasúti peron
+vasúti perons
+megőrzött vasút
+megőrzött vasúts
+vasúti szárnyvonal
+vasúti szárnyvonals
+metróállomás
+metróállomáss
+metrókijárat
+metrókijárats
+vasúti váltó
+vasúti váltós
+villamos
+villamoss
+villamosmegálló
+villamosmegállós
+rendező-pályaudvar
+rendező-pályaudvars
+alkoholos italbolt
+alkoholos italbolts
+ruházati bolt
+ruházati bolts
+művészeti bolt
+művészeti bolts
+pékség
+pékségs
+szépészeti bolt
+szépészeti bolts
+italbolt
+italbolts
+kerékpárbolt
+kerékpárbolts
+könyvesbolt
+könyvesbolts
+hentesbolt
+hentesbolts
+autókereskedés
+autókereskedéss
+autóalkatrészbolt
+autóalkatrészbolts
+autószerviz
+autószervizs
+szőnyegbolt
+szőnyegbolts
+adománybolt
+adománybolts
+vegyipari bolt
+vegyipari bolts
+számítástechnikai bolt
+számítástechnikai bolts
+cukrászda
+cukrászdas
+kisbolt
+kisbolts
+fénymásoló bolt
+fénymásoló bolts
+kozmetikai bolt
+kozmetikai bolts
+diszkontárubolt
+diszkontárubolts
+barkácsbolt
+barkácsbolts
+illatszerbolt
+illatszerbolts
+ruhatisztító
+ruhatisztítós
+elektronikai bolt
+elektronikai bolts
+ingatlankereskedés
+ingatlankereskedéss
+kertészbolt
+kertészbolts
+divatbolt
+divatbolts
+halbolt
+halbolts
+virágárus
+virágáruss
+élelmiszerbolt
+élelmiszerbolts
+temetkezési vállalkozó
+temetkezési vállalkozós
+bútorbolt
+bútorbolts
+galéria
+galérias
+cserepes virágbolt
+cserepes virágbolts
+vegyeskereskedés
+vegyeskereskedéss
+ajándékbolt
+ajándékbolts
+zöldséges
+zöldségess
+fűszerbolt
+fűszerbolts
+fodrászat
+fodrászats
+szerelési bolt
+szerelési bolts
+hi-fi bolt
+hi-fi bolts
+biztosító
+biztosítós
+ékszerbolt
+ékszerbolts
+trafik
+trafiks
+mosoda
+mosodas
+üzletház
+üzletházs
+piacs
+mobiltelefonbolt
+mobiltelefonbolts
+motorbolt
+motorbolts
+zenebolt
+zenebolts
+újságárus
+újságáruss
+látszerész
+látszerészs
+bioélelmiszerbolt
+bioélelmiszerbolts
+túrabolt
+túrabolts
+állatkereskedés
+állatkereskedéss
+fotóbolt
+fotóbolts
+szalon
+szalons
+cipőbolt
+cipőbolts
+bevásárlóközpont
+bevásárlóközponts
+sportbolt
+sportbolts
+írószerbolt
+írószerbolts
+szupermarkets
+játékbolt
+játékbolts
+utazási iroda
+utazási irodas
+videókölcsönző
+videókölcsönzős
+borárusító italbolt
+borárusító italbolts
+alpesi kunyhó
+alpesi kunyhós
+műalkotás
+műalkotáss
+látnivaló
+látnivalós
+vendégház
+vendégházs
+kunyhó
+kunyhós
+kemping
+kempings
+lakókocsitábor
+lakókocsitábors
+nyaralóház
+nyaralóházs
+turistaszálló
+turistaszállós
+információ
+információs
+motel
+motels
+piknikezőhely
+piknikezőhelys
+vidámpark
+vidámparks
+kilátó
+kilátós
+állatkert
+állatkerts
+hajóhangár
+hajóhangárs
+vízi csatlakozó
+vízi csatlakozós
+gát
+gáts
+felhagyott csatorna
+felhagyott csatornas
+árok
+ároks
+kikötõ
+kikötõs
+zsilip
+zsilips
+ásványos patak
+ásványos pataks
+kikötő
+kikötős
+zuhatag
+zuhatags
+folyópart
+folyóparts
+patak
+pataks
+vádi
+vádis
+vízi fordítópont
+vízi fordítóponts
+vízesés
+vízeséss
+bukógát
+bukógáts
+# is
+flugvöllur
+flugvellir
+hraðbanki
+hraðbankar
+bar
+barir
+reiðhjólaleiga
+reiðhjólaleigur
+hóruhús
+kaffihús
+bílaleiga
+bílaleigur
+bílaþvottastöð
+bílaþvottastöðvar
+kvikmyndarhús
+tannlæknir
+tannlæknar
+sendiráð
+skyndibitastaður
+skyndibitastaðir
+brunahani
+brunahanar
+spítali
+spítalar
+hótel
+bókasafn
+bókasöfn
+póstkassi
+póstkassar
+pósthús
+fangelsi
+pöbb
+pöbbar
+veitingastaður
+veitingastaðir
+gufubað
+gufuböð
+verslun
+verslanir
+leikhús
+kapella
+kapellur
+kirkja
+kirkjur
+vað
+vöð
+íbúðargata
+íbúðargötur
+kastali
+kastalar
+hersvæði
+íþróttamiðstöð
+íþróttamiðstöðvar
+sundlaug
+sundlaugar
+vatnsleikjagarður
+vatnsleikjagarðar
+flói
+flóar
+strönd
+strendur
+hellisop
+gígur
+gígar
+fell
+fjörður
+firðir
+goshver
+goshverir
+jökull
+jöklar
+hæð
+hæðir
+eyja
+eyjur
+tindur
+tindar
+rif
+á
+ár
+tré
+dalur
+dalir
+eldfjall
+eldfjöll
+vatn
+vötn
+borg
+borgir
+land
+lönd
+bóndabýli
+hús
+smáeyja
+smáeyjur
+póstnúmer
+svæði
+haf
+höf
+hverfi
+bær
+bæir
+þorp
+bakarí
+hjólabúð
+hjólabúðir
+bókabúð
+bókabúðir
+slátrari
+slátrarar
+bílabúð
+bílabúðir
+teppabúð
+teppabúðir
+fatabúð
+fatabúðir
+tölvubúð
+tölvubúðir
+raftækjaverslun
+raftækjaverslanir
+fiskbúð
+fiskbúðir
+blómabúð
+blómabúðir
+matvöruverslun
+matvöruverslanir
+húsgagnaverslun
+gjafabúð
+gjafabúðir
+verkfærabúð
+verkfærabúðir
+hljómtækjabúð
+hljómtækjabúðir
+söluturn
+söluturnar
+farsímaverslun
+farsímaverslanir
+útivistarbúð
+útivistarbúðir
+gæludýrabúð
+gæludýrabúðir
+leikfangaverslun
+leikfangaverslanir
+ferðaskrifstofa
+ferðaskrifstofur
+myndbandaleiga
+myndbandaleigur
+listaverk
+safn
+söfn
+dýragarður
+dýragarðar
+vatnsaflsvirkjun
+vatnsaflsvirkjanir
+lækur
+lækir
+foss
+fossar
+# it
+aeroporto
+aeroporti
+pensione per animali
+pensioni per animali
+rifugio per animali
+bancomat
+banca
+banche
+bar
+panchina
+panchine
+parcheggio per biciclette
+parcheggi per biciclette
+stazione del bikesharing
+stazioni del bikesharing
+bordello
+bordelli
+cambiavalute
+cambia valute
+caffè
+autonoleggio
+autonoleggi
+stazione del carsharing
+stazioni del carsharing
+autolavaggio
+autolavaggi
+casinò
+stazione di ricarica elettrica
+stazioni di ricarica elettrica
+stazione di ricarica
+stazioni di ricarica
+colonnina di ricarica
+colonnine di ricarica
+cinema
+scuola superiore
+scuole superiori
+tribunale
+tribunali
+crematorio
+crematori
+dentista
+dentisti
+dormitorio
+dormitori
+acqua
+acqua potabile
+fontanelle
+fontanella
+scuola guida
+scuole guida
+ambasciata
+ambasciate
+colonnina sos
+colonnine sos
+fast food
+terminal traghetto
+terminal traghetti
+pompa antincendio
+pompe antincendio
+vigili del fuoco
+pompieri
+stazione di rifornimento
+stazioni di rifornimento
+cimitero
+cimiteri
+ospedale
+ospedali
+hotel
+albergo
+alberghi
+postazione di caccia
+postazioni di caccia
+gelateria
+gelaterie
+asilo infantile
+asili infantili
+biblioteca
+biblioteche
+soccorso alpino
+soccorsi alpini
+asilo nido
+asili nido
+parcheggio
+parcheggi
+farmacia
+farmacie
+luogo di culto
+luoghi di culto
+forze dell'ordine
+polizia
+carabinieri
+cassetta postale
+cassette postali
+cassetta delle lettere
+cassette delle lettere
+ufficio postale
+uffici postali
+prigione
+prigioni
+pub
+edificio pubblico
+edifici pubblici
+ristorante
+ristoranti
+sauna
+saune
+scuola
+scuole
+pensilina/ricovero
+pensiline/ricoveri
+supermercato
+supermercati
+taxi
+telefono pubblico
+telefoni pubblici
+teatro
+teatri
+gabinetto pubblico
+gabinetti pubblici
+municipio
+municipi
+università
+distributore automatico
+distributori automatici
+veterinario
+veterinari
+punto di accesso wifi
+punti di accesso wifi
+chiesa
+chiese
+percorso per equitazione
+percorsi per equitazione
+autobus guidato
+autobus guidati
+fermata autobus
+fermate autobus
+byway (uk)
+strada in costruzione
+strade in costruzione
+percorso ciclabile
+percorsi ciclabili
+percorso pedonale
+percorsi pedonali
+guado
+guadi
+cancello
+cancelli
+autostrada/tangenziale
+autostrade/tangenziali
+svincolo
+svincoli
+strada primaria
+strade primarie
+strada residenziale
+strade residenziali
+strada secondaria
+strade secondarie
+strada di servizio
+strade di servizio
+stazione di servizio
+stazioni di servizio
+scala
+scale
+scaletta
+scalette
+strada terziaria
+strade terziarie
+percorso escursionistico
+percorsi escursionistici
+strada non classificata
+strade non classificate
+sito archeologico
+siti archeologici
+edificio
+edifici
+castello
+castelli
+miniera
+miniere
+monumento
+monumenti
+museo
+musei
+rovine
+torre
+torri
+prato
+prati
+zona industriale
+zone industriali
+area residenziale
+aree residenziali
+area comune (uk)
+aree comuni (uk)
+area cani
+aree cani
+riserva di pesca
+riserve di pesca
+giardino
+giardini
+campo da golf
+campi da golf
+pista di ghiaccio
+piste di ghiaccio
+porto turistico
+porti turistici
+minigolf
+riserva naturale
+riserve naturali
+parco
+parchi
+campo sportivo
+campi sportivi
+parco giochi
+parchi giochi
+area di svago
+aree di svago
+rampa di alaggio
+rampe di alaggio
+centro sportivo
+centri sportivi
+stadio
+stadi
+piscina
+piscine
+pista da corsa
+piste da corsa
+parco acquatico
+parchi acquatici
+baia
+baie
+spiaggia
+spiagge
+capo
+capi
+entrata di grotta/caverna
+entrate di grotte/caverne
+canale
+canali
+rupe
+rupi
+linea di costa
+linee di costa
+cratere
+crateri
+caratteristica
+caratteristiche
+prato alpino
+prati alpini
+fiordo
+fiordi
+geyser
+ghiacciaio
+ghiacciai
+brughiera
+brughiere
+collina
+colline
+isola
+isole
+palude alluvionale
+paludi alluvionali
+zona fangosa (sabbie mobili)
+zone fangose (sabbie mobili)
+picco montuoso
+picchi montuosi
+scogliera
+scogliere
+cresta montuosa
+creste montuose
+fiume
+fiumi
+roccia
+rocce
+ghiaione
+ghiaioni
+boscaglia
+boscaglie
+secca
+secche
+sorgente
+sorgenti
+albero
+alberi
+valle
+valli
+vulcano
+vulcani
+zona umida
+zone umide
+bosco
+boschi
+città
+nazione
+nazioni
+contea
+contee
+area agricola
+aree agricole
+borgo
+borghi
+casa
+case
+gruppo di case
+gruppi di case
+isoletta
+isolette
+località
+comune
+comuni
+cap
+provincia
+province
+mare
+mari
+regione
+regioni
+suddivisione
+suddivisioni
+quartiere
+quartieri
+paese
+paesi
+frazione
+frazioni
+panetteria
+panetterie
+negozio di biciclette
+negozi di biciclette
+libreria
+librerie
+macellaio
+macellai
+concessionaria
+concessionarie
+lavasecco
+lavasecchi
+agenzia immobiliare
+agenzie immobiliari
+fioraio
+fiorai
+alimentari
+fruttivendolo
+fruttivendoli
+assicurazioni
+gioielleria
+gioiellerie
+lavanderia
+lavanderie
+edicola
+ottico
+ottici
+agenzia di viaggi
+agenzie di viaggi
+agenzia viaggi
+agenzie viaggi
+agenzia viaggio
+agenzie viaggio
+rifugio alpino
+rifugi alpini
+opera d'arte
+opere d'arte
+attrazione turistica
+attrazioni turistiche
+bed and breakfast
+campeggio
+campeggi
+area caravan e camper
+aree caravan e camper
+casetta (chalet)
+casette (chalet)
+guest house
+ostello
+ostelli
+informazioni
+motel
+area picnic
+aree picnic
+parco divertimenti
+parchi divertimenti
+punto panoramico
+punti panoramici
+zoo
+benzinaio
+benzinai
+# ja
+空港
+銀行
+レンタカー
+洗車
+賭場
+大学
+歯科医
+大使館
+ホテル
+幼稚園
+図書館
+パブ（立ち吞み屋）
+サウナ
+学校
+店舗
+タクシー乗り場
+wifiアクセスポイント
+バス停
+階段
+市
+テーマパーク
+谷
+動物園
+# mk
+аеродром
+аеродромs
+дом на уметности
+дом на уметностиs
+банкомат
+банкоматs
+аудиториум
+аудиториумs
+банка
+банкаs
+бар
+барs
+клупа
+клупаs
+велосипедско паркирање
+велосипедско паркирањеs
+изнајмување велосипеди
+изнајмување велосипедиs
+бордел
+борделs
+менувачница
+менувачницаs
+автобуска станица
+автобуска станицаs
+кафуле
+кафулеs
+рент-а-кар
+рент-а-карs
+изнајмување автомобил
+изнајмување автомобилs
+автоперална
+автопералнаs
+казино
+казиноs
+кино
+киноs
+клиника
+клиникаs
+клуб
+клубs
+колеџ
+колеџs
+центар на заедница
+центар на заедницаs
+суд
+судs
+крематориум
+крематориумs
+забар
+забарs
+доктори
+докториs
+студентски дом
+студентски домs
+питка вода
+питка водаs
+автошкола
+автошколаs
+амбасада
+амбасадаs
+итен телефон
+итен телефонs
+брза храна
+брза хранаs
+ферибот-терминал
+ферибот-терминалs
+противпожарен хидрант
+противпожарен хидрантs
+пожарна
+пожарнаs
+фонтана
+фонтанаs
+гориво
+горивоs
+гробишта
+гробиштаs
+теретана / фитнес
+теретана / фитнесs
+соборна сала
+соборна салаs
+здравствен центар
+здравствен центарs
+болница
+болницаs
+хотел
+хотелs
+ловечка кула
+ловечка кулаs
+сладолед
+сладоледs
+градинка
+градинкаs
+библиотека
+библиотекаs
+пазар
+пазарs
+планинарско спасување
+планинарско спасувањеs
+ноќен клуб
+ноќен клубs
+јасли
+јаслиs
+старечки дом
+старечки домs
+канцеларија
+канцеларијаs
+парк
+паркs
+паркинг
+паркингs
+аптека
+аптекаs
+верски објект
+верски објектs
+полиција
+полицијаs
+поштенско сандаче
+поштенско сандачеs
+пошта
+поштаs
+претшколска установа
+претшколска установаs
+затвор
+затворs
+пивница
+пивницаs
+јавен објект
+јавен објектs
+градски пазар
+градски пазарs
+рецепција
+рецепцијаs
+рециклирање
+рециклирањеs
+ресторан
+ресторанs
+сауна
+саунаs
+училиште
+училиштеs
+засолниште
+засолништеs
+дуќан
+дуќанs
+дуќани
+дуќаниs
+друштвен клуб
+друштвен клубs
+студио
+студиоs
+супермаркет
+супермаркетs
+такси
+таксиs
+телефонска говорница
+телефонска говорницаs
+театар
+театарs
+тоалет
+тоалетs
+градски дом
+градски домs
+универзитет
+универзитетs
+вендинг-машина
+вендинг-машинаs
+ветеринарна клиника
+ветеринарна клиникаs
+месна заедница
+месна заедницаs
+корпа за отпадоци
+корпа за отпадоциs
+безжичен интернет
+безжичен интернетs
+младински центар
+младински центарs
+административна граница
+административна границаs
+станбен блок
+станбен блокs
+блок згради
+блок зградиs
+бункер
+бункерs
+капела
+капелаs
+црква
+цркваs
+комерцијална зграда
+комерцијална зградаs
+влез во зграда
+влез во зградаs
+факултетски објект
+факултетски објектs
+земјоделски објект
+земјоделски објектs
+станови
+становиs
+гаража
+гаражаs
+сала
+салаs
+болничка зграда
+болничка зградаs
+куќа
+куќаs
+индустриски објект
+индустриски објектs
+деловна зграда
+деловна зградаs
+станбена зграда
+станбена зградаs
+продажен објект
+продажен објектs
+школско здание
+школско зданиеs
+стадион
+стадионs
+продавница
+продавницаs
+тераса
+терасаs
+кула
+кулаs
+железничка станица
+железничка станицаs
+универзитетска зграда
+универзитетска зградаs
+зграда
+зградаs
+коњски пат
+коњски патs
+автобуски шини
+автобуски шиниs
+автобуска постојка
+автобуска постојкаs
+спореден пат
+спореден патs
+автопат во изградба
+автопат во изградбаs
+велосипедска патека
+велосипедска патекаs
+бележник на растојание
+бележник на растојаниеs
+прва помош
+прва помошs
+тротоар
+тротоарs
+брод
+бродs
+порта
+портаs
+маалска улица
+маалска улицаs
+помал спореден пат
+помал спореден патs
+автопат
+автопатs
+клучка
+клучкаs
+приклучен пат
+приклучен патs
+патека
+патекаs
+пешачка патека
+пешачка патекаs
+платформа
+платформаs
+главен пат
+главен патs
+тркачка патека
+тркачка патекаs
+станбен
+станбенs
+пат
+патs
+помошен пат
+помошен патs
+крајпатен сервис
+крајпатен сервисs
+скалила
+скалилаs
+тарабен премин
+тарабен преминs
+третостепен пат
+третостепен патs
+полски пат
+полски патs
+магистрала
+магистралаs
+некласификуван пат
+некласификуван патs
+неасфалтиран пат
+неасфалтиран патs
+археолошки локалитет
+археолошки локалитетs
+бојно поле
+бојно полеs
+граничен камен
+граничен каменs
+замок
+замокs
+икона
+иконаs
+велепоседнички дом
+велепоседнички домs
+споменик
+споменикs
+рудник
+рудникs
+музеј
+музејs
+рушевини
+рушевиниs
+крајпатен крст
+крајпатен крстs
+параклис
+параклисs
+бродолом
+бродоломs
+парцели
+парцелиs
+басен
+басенs
+угар
+угарs
+комерцијално подрачје
+комерцијално подрачјеs
+заштитено земјиште
+заштитено земјиштеs
+градилиште
+градилиштеs
+фарма
+фармаs
+обработливо земјиште
+обработливо земјиштеs
+земјоделски двор
+земјоделски дворs
+шума
+шумаs
+трева
+треваs
+неискористено земјиште
+неискористено земјиштеs
+индустриско подрачје
+индустриско подрачјеs
+депонија
+депонијаs
+ливада
+ливадаs
+воено подрачје
+воено подрачјеs
+планина
+планинаs
+природен резерват
+природен резерватs
+писта
+пистаs
+плоштадче
+плоштадчеs
+каменолом
+каменоломs
+железница
+железницаs
+рекреативен терен
+рекреативен теренs
+резервоар
+резервоарs
+станбено подрачје
+станбено подрачјеs
+селско зеленило
+селско зеленилоs
+лозници
+лознициs
+мочуриште
+мочуриштеs
+крајбрежно одморалиште
+крајбрежно одморалиштеs
+општествена земја
+општествена земјаs
+рибарење
+рибарењеs
+градина
+градинаs
+голф-терен
+голф-теренs
+лизгалиште
+лизгалиштеs
+марина
+маринаs
+миниголф
+миниголфs
+спортски терен
+спортски теренs
+детско игралиште
+детско игралиштеs
+разонодно место
+разонодно местоs
+испуст
+испустs
+спортски центар
+спортски центарs
+базен
+базенs
+спортска патека
+спортска патекаs
+аквапарк
+аквапаркs
+залив
+заливs
+плажа
+плажаs
+‘рт
+‘ртs
+влез во пештера
+влез во пештераs
+канал
+каналs
+гребен
+гребенs
+крајбрежје
+крајбрежјеs
+кратер
+кратерs
+елемент
+елементs
+фел
+фелs
+фјорд
+фјордs
+гејзер
+гејзерs
+глечер
+глечерs
+голет
+голетs
+рид
+ридs
+остров
+островs
+земја
+земјаs
+бара
+бараs
+пустара
+пустараs
+кал
+калs
+врв
+врвs
+точка
+точкаs
+срт
+сртs
+река
+рекаs
+карпа
+карпаs
+сип
+сипs
+честак
+честакs
+плитко место
+плитко местоs
+извор
+изворs
+проток
+протокs
+дрво
+дрвоs
+долина
+долинаs
+вулкан
+вулканs
+вода
+водаs
+град
+градs
+грофовија
+грофовијаs
+селце
+селцеs
+куќи
+куќиs
+островче
+островчеs
+месност
+месностs
+општина
+општинаs
+поштенски број
+поштенски бројs
+регион
+регионs
+море
+мореs
+покраина
+покраинаs
+админ. подрачје
+админ. подрачјеs
+населба
+населбаs
+нездружено подрачје
+нездружено подрачјеs
+село
+селоs
+напуштена железничка линија
+напуштена железничка линијаs
+железничка линија во изградба
+железничка линија во изградбаs
+напуштена железничка станица
+напуштена железничка станицаs
+жичена железница
+жичена железницаs
+железничка постојка
+железничка постојкаs
+историска железничка станица
+историска железничка станицаs
+железнички јазол
+железнички јазолs
+надвозник
+надвозникs
+лека железница
+лека железницаs
+едношинска линија
+едношинска линијаs
+теснолинејка
+теснолинејкаs
+железнички перон
+железнички перонs
+зачувана железничка линија
+зачувана железничка линијаs
+железнички огранок
+железнички огранокs
+метро станица
+метро станицаs
+влез во метро
+влез во метроs
+железнички пунктови
+железнички пунктовиs
+трамвајска линија
+трамвајска линијаs
+трамвајска постојка
+трамвајска постојкаs
+железничко депо
+железничко депоs
+алкохол на црно
+алкохол на црноs
+облека
+облекаs
+уметнички дуќан
+уметнички дуќанs
+пекара
+пекараs
+козметика
+козметикаs
+пијалоци
+пијалоциs
+продавница за велосипеди
+продавница за велосипедиs
+книжарница
+книжарницаs
+месарница
+месарницаs
+автосалон
+автосалонs
+автоделови
+автоделовиs
+автосервис
+автосервисs
+дуќан за теписи
+дуќан за теписиs
+добротворна продавница
+добротворна продавницаs
+дуќан за облека
+дуќан за облекаs
+компјутерска продавница
+компјутерска продавницаs
+слаткарница
+слаткарницаs
+бакалница
+бакалницаs
+фотокопир
+фотокопирs
+стоковна куќа
+стоковна куќаs
+распродажен дуќан
+распродажен дуќанs
+направи-сам
+направи-самs
+хемиско чистење
+хемиско чистењеs
+електронска опрема
+електронска опремаs
+недвижности
+недвижностиs
+земјоделски дуќан
+земјоделски дуќанs
+бутик
+бутикs
+рибарница
+рибарницаs
+цвеќара
+цвеќараs
+продавница за храна
+продавница за хранаs
+погребална служба
+погребална службаs
+мебел
+мебелs
+галерија
+галеријаs
+градинарски центар
+градинарски центарs
+колонијал
+колонијалs
+дуќан за подароци
+дуќан за подароциs
+пиљара
+пиљараs
+фризер
+фризерs
+алат и опрема
+алат и опремаs
+аудиосистеми
+аудиосистемиs
+осигурително
+осигурителноs
+јувелир
+јувелирs
+трафика
+трафикаs
+пералница
+пералницаs
+трговски центар
+трговски центарs
+мобилни телефони
+мобилни телефониs
+моторцикли
+моторциклиs
+музички дуќан
+музички дуќанs
+весникара
+весникараs
+оптичар
+оптичарs
+здрава храна
+здрава хранаs
+дуќан на отворено
+дуќан на отвореноs
+домашни миленици
+домашни миленициs
+фотографски дуќан
+фотографски дуќанs
+салон
+салонs
+обувки
+обувкиs
+спортски дуќан
+спортски дуќанs
+прибор и репроматеријали
+прибор и репроматеријалиs
+продавница за играчки
+продавница за играчкиs
+туристичка агенција
+туристичка агенцијаs
+видеотека
+видеотекаs
+алкохолни пијалоци
+алкохолни пијалоциs
+планинска куќарка
+планинска куќаркаs
+уметничко дело
+уметничко делоs
+атракција
+атракцијаs
+полупансион
+полупансионs
+колиба
+колибаs
+камп
+кампs
+автокамп
+автокампs
+брвнара
+брвнараs
+пансион
+пансионs
+хостел
+хостелs
+информации
+информацииs
+прилепена стреа
+прилепена стреаs
+мотел
+мотелs
+излетничко место
+излетничко местоs
+забавен парк
+забавен паркs
+видиковец
+видиковецs
+зоолошка
+зоолошкаs
+чамцоградилиште
+чамцоградилиштеs
+слив
+сливs
+брана
+бранаs
+запуштен канал
+запуштен каналs
+канач
+каначs
+док
+докs
+одвод
+одводs
+каналска брана
+каналска бранаs
+каналска капија
+каналска капијаs
+минерален извор
+минерален изворs
+сидриште
+сидриштеs
+брзак
+брзакs
+кеј
+кејs
+поток
+потокs
+вади
+вадиs
+пристап до вода
+пристап до водаs
+водопад
+водопадs
+јаз
+јазs
+# nl
+luchthaven
+luchthavens
+kunstcollectief
+kunstcollectieven
+geldautomaat
+geldautomaten
+auditorium
+auditoriums
+bank
+banken
+bar
+bars
+bankje
+bankjes
+fietsenstalling
+fietsenstallingen
+fietsverhuur
+fietsverhuren
+bordeel
+bordelen
+wisselkantoor
+wisselkantoren
+busstation
+busstations
+café
+cafés
+autoverhuur
+autoverhuren
+autodelen
+carpooling
+carwash
+carwashes
+autowasstraat
+autowasstraten
+casino
+casinos
+casino's
+bioscoop
+bioscopen
+cinema
+cinemas
+kliniek
+klinieken
+club
+clubs
+hogeschool
+hogescholen
+gemeenschapscentrum
+gemeenschapscentrums
+gemeenschapscentra
+rechtbank
+rechtbanken
+crematorium
+crematoriums
+crematoria
+tandarts
+tandartsen
+dokter
+dokters
+studentenhuis
+studentenhuizen
+drinkwater
+rijschool
+rijscholen
+ambassade
+ambassades
+noodtelefoon
+noodtelefoons
+fast food
+fast foods
+veerterminal
+veerterminals
+brandkraan
+brandkranen
+brandweer
+fontein
+fonteinen
+brandstof
+benzine pomp
+benzine pompen
+begraafplaats
+begraafplaatsen
+fitnesscentrum
+fitnesscentrums
+fitnesscentra
+hal
+hallen
+gezondheidscentrum
+gezondheidscentrums
+gezondheidscentra
+ziekenhuis
+ziekenhuizen
+hotel
+hotels
+jachttoren
+jachttorens
+ijs
+kleuterschool
+kleuterscholen
+bibliotheek
+bibliotheken
+markt
+markten
+marktplein
+marktpleinen
+reddingsdienst
+reddingsdiensten
+nachtclub
+nachtclubs
+discotheek
+discotheeken
+disco's
+verpleeghuis
+verpleeghuizen
+rvt
+rvt's
+rusthuis
+rusthuizen
+kantoor
+kantoren
+park
+parken
+parkeren
+parking
+parkings
+apotheek
+apotheken
+gebedsplaats
+gebedsplaatsen
+politie
+brievenbus
+brievenbussen
+postkantoor
+postkantoren
+peuterspeelzaal
+peuterspeelzalen
+gevangenis
+gevangenissen
+café's
+openbaar gebouw
+openbare gebouwen
+openbare markt
+openbare markten
+receptie
+recepties
+recyclingpunt
+recyclingpunten
+recyclage
+restaurant
+restaurants
+bejaardentehuis
+bejaardentehuizen
+sauna
+sauna's
+school
+scholen
+beschutting
+beschuttingen
+winkel
+winkels
+winkelen
+eenkamerappartement
+eenkamerappartementen
+studio
+studio's
+supermarkt
+supermarkten
+taxi
+taxi's
+openbare telefoon
+openbare telefoons
+theater
+theaters
+toilet
+toiletten
+gemeentehuis
+gemeentehuizen
+universiteit
+universiteiten
+automaat
+automaten
+dierenarts
+dierenartsen
+vuilbak
+vuilbakken
+wifi-toegang
+wifi
+jeugdcentrum
+jeugdcentrums
+jeugdcentra
+administratieve grens
+administratieve grenzen
+appartement
+appartementen
+bunker
+bunkers
+kapel
+kapellen
+kerk
+kerken
+commercieel gebouw
+commerciële gebouwen
+ingang
+ingangen
+faculteitsgebouw
+faculteitsgebouwen
+boerderij
+boerderijen
+flat
+flats
+garage
+garages
+huis
+huizen
+industrieel gebouw
+industriële gebouwen
+kantoorgebouw
+kantoorgebouwen
+winkelpand
+winkelpanden
+schoolgebouw
+schoolgebouwen
+stadion
+stadions
+toren
+torens
+spoorwegstation
+spoorwegstations
+universiteitsgebouw
+universiteitsgebouwen
+gebouw
+gebouwen
+ruiterpad
+ruiterpaden
+busbaan
+busbanen
+bushalte
+bushaltes
+onverharde weg
+onverharde wegs
+snelweg in aanbouw
+snelwegen in aanbouw
+fietspad
+fietspaden
+afstandsmarkering
+afstandsmarkeringen
+noodafslag
+noodafslagen
+voetpad
+voetpaden
+voorde
+voordes
+slagboom
+slagbomen
+woonerf
+woonerven
+lokale weg
+lokale wegen
+autosnelweg
+autosnelwegen
+afrit
+afritten
+pad
+paden
+voetgangerszone
+voetgangerszones
+perron
+perrons
+primaire weg
+primaire wegen
+racecircuit
+racecircuits
+straat
+straten
+weg
+wegen
+secundaire weg
+secundaire wegen
+serviceweg
+servicewegen
+trap
+trappen
+overstap
+overstappen
+tertiaire weg
+tertiaire wegen
+slag
+slagen
+autoweg
+autowegen
+landweg
+landwegen
+onverharde wegen
+archeologische site
+archeologische sites
+slagveld
+slagvelden
+grenspaal
+grenspalen
+historisch gebouw
+historische gebouwen
+kasteel
+kastelen
+icoon
+iconen
+landgoed
+monument
+monumenten
+mijn
+mijnen
+monoment
+monomenten
+groot monoment
+grote monomenten
+museum
+museums
+musea
+ruïne
+ruïnes
+kruis
+kruisen
+altaar
+altaars
+wrak
+wrakken
+volkstuinen
+volkstuinenen
+waterbekken
+waterbekkens
+braakliggend terrein
+braakliggende terreinen
+commercieel gebied
+commerciële gebieden
+natuurbehoud
+in aanbouw
+landbouwgrond
+landbouwgronden
+boerenerf
+boerenerven
+bos
+bossen
+grasland
+graslanden
+bouwgrond
+industrieel gebied
+industriële gebieden
+stortplaats
+stortplaatsen
+weide
+weides
+miltair gebied
+miltaire gebieden
+berg
+bergen
+natuurreservaat
+natuurreservaten
+piste
+pistes
+plein
+pleinen
+steengroeve
+steengroeves
+spoor
+spooren
+recreatiegebied
+recreatiegebieden
+reservoir
+reservoirs
+woonwijk
+woonwijken
+stadsgroen
+wijngaard
+wijngaarden
+moeras
+moerassen
+houtland
+badplaats
+badplaatsen
+meent
+meents
+visvijver
+visvijvers
+tuin
+tuinen
+golfbaan
+golfbanen
+ijsbaan
+ijsbanen
+ijspiste
+ijspistes
+jachthaven
+jachthavens
+minigolf
+sportveld
+sportvelden
+speelplaats
+speelplaatsen
+scheepshelling
+scheepshellingen
+sportcentrum
+sportcentrums
+sportcentra
+stadia
+zwembad
+zwembaden
+atletiekbaan
+atletiekbanen
+waterspeelpark
+waterspeelparken
+waterpark
+waterparken
+baai
+baaien
+strand
+stranden
+kaap
+kapen
+grotingang
+grotingangen
+kanaal
+kanalen
+klif
+kliffen
+kustlijn
+kustlijnen
+krater
+kraters
+bezienswaardigheid
+bezienswaardigheden
+fjell
+fjord
+fjorden
+geiser
+geisers
+gletsjer
+gletsjers
+heide
+heuvel
+heuvels
+eiland
+eilanden
+land
+landen
+veen
+venen
+modder
+spits
+spitsen
+rif
+riffen
+bergkam
+bergkammen
+rivier
+rivieren
+rots
+rotsen
+puin
+struikgewas
+struikgewassen
+zandbank
+zandbanken
+bron
+bronnen
+zeeëngte
+zeeëngtes
+boom
+bomen
+vallei
+valleien
+vulkaan
+vulkanen
+water
+stad
+stads
+district
+districts
+boerderijs
+gehucht
+gehuchts
+huiss
+huizens
+eilands
+eilandje
+eilandjes
+plaats
+plaatss
+veens
+gemeente
+gemeentes
+postcode
+postcodes
+regio
+regios
+zee
+zees
+staat
+staats
+deelgebied
+deelgebieds
+buitenwijk
+buitenwijks
+gemeentevrij gebied
+gemeentevrij gebieds
+dorp
+dorps
+vervallen spoorweg
+vervallen spoorwegs
+spoor in aanbouw
+spoor in aanbouws
+ongebruikte spoorweg
+ongebruikte spoorwegs
+ongebruikt spoorwegstation
+ongebruikt spoorwegstations
+kabelspoorweg
+kabelspoorwegs
+treinhalte
+treinhaltes
+historisch spoorwegstation
+historisch spoorwegstations
+spoorwegkruising
+spoorwegkruisings
+gelijkvloerse kruising
+gelijkvloerse kruisings
+lightrail
+lightrails
+monorail
+monorails
+smalspoor
+smalspoors
+spoorwegplatform
+spoorwegplatforms
+historisch spoor
+historisch spoors
+parallelspoorweg
+parallelspoorwegs
+metrostation
+metrostations
+metroingang
+metroingangs
+spoogwegpunten
+spoogwegpuntens
+tramrails
+tramrailss
+tramhalte
+tramhaltes
+rangeerterrein
+rangeerterreins
+slijterij
+slijterijs
+kledingwinkel
+kledingwinkels
+kunstwinkel
+kunstwinkels
+bakkerij
+bakkerijs
+schoonheidssalon
+schoonheidssalons
+frisdrankverkooppunt
+frisdrankverkooppunts
+fietsenwinkel
+fietsenwinkels
+boekenwinkel
+boekenwinkels
+slagerij
+slagerijs
+automaterialenwinkel
+automaterialenwinkels
+autodealer
+autodealers
+autoonderdelen
+autoonderdelens
+autogarage
+autogarages
+tapijtzaak
+tapijtzaaks
+liefdadigheidswinkel
+liefdadigheidswinkels
+apotheeks
+computerwinkel
+computerwinkels
+snoepverkooppunt
+snoepverkooppunts
+gemakswinkel
+gemakswinkels
+copyshop
+copyshops
+cosmeticawinkel
+cosmeticawinkels
+warenhuis
+warenhuiss
+discountwinkel
+discountwinkels
+doe-het-zelf-winkel
+doe-het-zelf-winkels
+drogisterij
+drogisterijs
+stomerij
+stomerijs
+elektronicawinkel
+elektronicawinkels
+makelaar
+makelaars
+boerenwinkel
+boerenwinkels
+viswinkel
+viswinkels
+bloemist
+bloemists
+etenswarenwinkel
+etenswarenwinkels
+uitvaartcentrum
+uitvaartcentrums
+meubelzaak
+meubelzaaks
+galerie
+galeries
+tuincentrum
+tuincentrums
+algemene winkel
+algemene winkels
+cadeauwinkel
+cadeauwinkels
+groenteboer
+groenteboers
+kruidenierswinkel
+kruidenierswinkels
+kapper
+kappers
+gereedschappenwinkel
+gereedschappenwinkels
+hi-fi
+hi-fis
+verzekeringen
+verzekeringens
+juwelier
+juweliers
+kioskwinkel
+kioskwinkels
+wasserij
+wasserijs
+overdekt winkelcentrum
+overdekt winkelcentrums
+markts
+mobiele telefoons
+mobiele telefoonss
+motorfietsenwinkel
+motorfietsenwinkels
+muziekwinkel
+muziekwinkels
+straatkiosk
+straatkiosks
+opticien
+opticiens
+organische winkel
+organische winkels
+buitensportwinkel
+buitensportwinkels
+dierenwinkel
+dierenwinkels
+fotowinkel
+fotowinkels
+schoenenzaak
+schoenenzaaks
+winkelcentrum
+winkelcentrums
+sportwinkel
+sportwinkels
+kantoorartikelenwinkel
+kantoorartikelenwinkels
+supermarkts
+speelgoedwinkel
+speelgoedwinkels
+reisbureau
+reisbureaus
+videotheek
+videotheeks
+berghut
+berghuts
+kunst
+kunsts
+attractie
+attracties
+pension
+pensions
+hut
+huts
+kampeerterrein
+kampeerterreins
+caravankampeerterrein
+caravankampeerterreins
+vakantiehuisje
+vakantiehuisjes
+gastenverblijf
+gastenverblijfs
+jeugdherberg
+jeugdherbergs
+informatie
+informaties
+open schutplaats
+open schutplaatss
+motel
+motels
+picknickplaats
+picknickplaatss
+pretpark
+pretparks
+valleis
+bijzonder uitzicht
+bijzonder uitzichts
+dierentuin
+dierentuins
+scheepswerf
+scheepswerfs
+kanaals
+waterverbinding
+waterverbindings
+dam
+dams
+onbeheerd kanaal
+onbeheerd kanaals
+sloot
+sloots
+dock
+docks
+afvoerkanaal
+afvoerkanaals
+schutsluis
+schutsluiss
+sluisdeur
+sluisdeurs
+brons
+aanlegplaats
+aanlegplaatss
+stroomversnelling
+stroomversnellings
+riviers
+rivierbedding
+rivierbeddings
+stroom
+strooms
+beek
+beeks
+waterpunt
+waterpunts
+waterval
+watervals
+stuwdam
+stuwdams
+# no
+flyplass
+flyplasser
+kunstsenter
+kunstsentre
+minibank
+minibanker
+# pl
+lotnisko
+lotniska
+bankomat
+bankomaty
+bank
+banki
+bar
+bary
+parking rowerowy
+parkingi rowerowe
+wypożyczalnia rowerów
+wypożyczalnie rowerów
+burdel
+burdele
+kantor
+kantory
+dworzec autobusowy
+dworce autobusowe
+kawiarnia
+kawiarnie
+wypożyczalnia samochodów
+wypożyczalnie samochodów
+myjnia samochodowa
+myjnie samochodowe
+kasyno
+kasyna
+kino
+kina
+przychodnia
+przychodnie
+klub
+klubs
+uczelnia
+uczelnias
+sąd
+sąds
+krematorium
+krematoriums
+gabinet dentystyczny
+gabinet dentystycznys
+bursa
+bursas
+źródło wody pitnej
+źródło wody pitnejs
+nauka jazdy
+nauka jazdys
+ambasada
+ambasadas
+telefon alarmowy
+telefon alarmowys
+fast food
+fast foods
+terminal promowy
+terminal promowys
+hydrant
+hydrants
+remiza strażacka
+remiza strażackas
+fontanna
+fontannas
+stacja benzynowa
+stacja benzynowas
+centrum fitness / sala gimnastyczna
+centrum fitness / sala gimnastycznas
+szpital
+szpitale
+hotel
+hotele
+lodziarnia
+lodziarnias
+przedszkole
+przedszkola
+biblioteka
+bibliotekas
+targowisko
+targowiska
+klub nocny
+klub nocnys
+żłobek
+żłobeks
+dom opieki
+dom opiekis
+biuro
+biuros
+park
+parks
+parking
+parkings
+apteka
+aptekas
+miejsce kultu
+miejsce kultus
+posterunek policji
+posterunek policjis
+skrzynka pocztowa
+skrzynka pocztowas
+poczta
+pocztas
+więzienie
+więzienies
+pub
+pubs
+miejsce recyklingu
+miejsce recyklingus
+restauracja
+restauracje
+dom starców
+dom starcóws
+sauna
+saunas
+szkoła
+szkołas
+schron
+schrons
+supermarket
+supermarkety
+postój taksówek
+postój taksóweks
+budka telefoniczna
+budka telefonicznas
+teatr
+teatrs
+toaleta publiczna
+toaleta publicznas
+urząd miejski
+urząd miejskis
+uniwersytet
+uniwersytets
+weterynarz
+weterynarze
+urząd gminy
+urząd gminys
+wifi
+blok mieszkalny
+blok mieszkalnys
+budynek bloku
+budynek blokus
+bunkier
+bunkiers
+kaplica
+kaplicas
+kościół
+kościoły
+ratusz
+ratusze
+budynek handlowy
+budynki handlowe
+wejście do budynku
+wejście do budynkus
+budynek prawny
+budynek prawnys
+budynek gospodarczy
+budynek gospodarczys
+mieszkania
+mieszkanias
+garaż
+garaże
+hala
+halas
+budynek szpitala
+budynek szpitalas
+hotels
+dom
+doms
+budynek przemysłowy
+budynek przemysłowys
+budynek biurowy
+budynek biurowys
+budynek publiczny
+budynek publicznys
+budynek mieszkalny
+budynek mieszkalnys
+budynek detaliczny
+budynek detalicznys
+budynek szkoły
+budynek szkołys
+stadion
+stadions
+wieża
+wieżas
+stacja kolejowa
+stacja kolejowas
+budynek uniwersytetu
+budynek uniwersytetus
+przystanek autobusowy
+przystanek autobusowys
+droga w budowie
+drogi w budowie
+droga rowerowa
+drogi rowerowe
+bród
+bróds
+strefa zamieszkania
+strefa zamieszkanias
+autostrada
+autostrady
+skrzyżowanie autostrad
+skrzyżowanie autostrads
+ścieżka
+ścieżki
+deptak
+deptaki
+droga krajowa
+droga krajowas
+tor wyścigowy
+tor wyścigowys
+droga wojewódzka
+droga wojewódzkas
+droga powiatowa
+droga powiatowas
+droga ekspresowa
+droga ekspresowas
+droga ekspresowa - dojazd
+droga ekspresowa - dojazds
+kamień graniczny
+kamienie graniczne
+zamek
+zameki
+dwór
+dwory
+pomnik
+pomniki
+kopalnia
+kopalnias
+muzeum
+muzeums
+ruiny
+ruinys
+wrak
+wraks
+ogródki działkowe
+cmentarz
+cmentarzs
+teren budowy
+tereny budów
+farma
+farmas
+podwórze gospodarskie
+podwórze gospodarskies
+las
+lass
+tereny niezagospodarowane
+tereny niezagospodarowanes
+teren przemysłowy
+teren przemysłowys
+wysypisko śmieci
+wysypisko śmiecis
+łąka
+łąkas
+teren wojskowy
+teren wojskowys
+rezerwat przyrody
+rezerwat przyrodys
+parki
+kamieniołom
+kamieniołomy
+winnica
+winnice
+tereny podmokłe
+łowisko
+łowiska
+ogród
+ogróds
+pole golfowe
+pole golfowes
+lodowisko
+lodowiskos
+marina
+marinas
+boisko sportowe
+boisko sportowes
+plac zabaw
+plac zabaws
+pochylnia
+pochylnias
+basen
+basens
+bieżnia
+bieżnias
+park wodny
+park wodnys
+zatoka
+zatokas
+plaża
+plażas
+przylądek
+przylądeks
+wejście do jaskini
+wejście do jaskinis
+urwisko
+urwiskos
+krater
+kraters
+hale górskie
+hale górskies
+fiord
+fiords
+gejzer
+gejzers
+lodowiec
+lodowiecs
+wrzosowisko
+wrzosowiskos
+wyspa
+wyspas
+bagno
+bagnos
+torfowisko
+torfowiskos
+szczyt
+szczyts
+rafa
+rafas
+grzbiet
+grzbiets
+rzeka
+rzekas
+skała
+skałas
+zsypisko
+zsypiskos
+mielizna
+mieliznas
+źródło
+źródłos
+cieśnina
+cieśninas
+drzewo
+drzewos
+dolina
+dolinas
+wulkan
+wulkans
+puszcza
+puszczas
+miasto
+miastos
+kraj
+krajs
+powiat
+powiats
+osada
+osadas
+zabudowanie
+zabudowanies
+wysepka
+wysepkas
+rejon
+rejons
+gmina
+gminas
+kod pocztowy
+kod pocztowys
+morze
+morzes
+stan
+stans
+dzielnica
+dzielnicas
+osiedle
+osiedles
+miasteczko
+miasteczkos
+obszar bez osobowości prawnej
+obszar bez osobowości prawnejs
+wieś
+wieśs
+dawna linia kolejowa
+dawna linia kolejowas
+budowana linia kolejowa
+budowana linia kolejowas
+nieczynna trasa kolejowa
+nieczynna trasa kolejowas
+nieużywana stacja kolejowa
+nieużywana stacja kolejowas
+kolejka linowa
+kolejka linowas
+przystanek kolejowy
+przystanek kolejowys
+historyczna stacja kolejowa
+historyczna stacja kolejowas
+węzeł kolejowy
+węzeł kolejowys
+przejazd kolejowy
+przejazd kolejowys
+lekka kolej
+lekka kolejs
+kolej jednoszynowa
+kolej jednoszynowas
+kolej wąskotorowa
+kolej wąskotorowas
+peron
+perons
+kolej zabytkowa
+kolej zabytkowas
+bocznica kolejowa
+bocznica kolejowas
+stacja metra
+stacja metras
+wejście na stację metra
+wejście na stację metras
+zwrotnica
+zwrotnicas
+linia tramwajowa
+linia tramwajowas
+przystanek tramwajowy
+przystanek tramwajowys
+jard kolejowy
+jard kolejowys
+sklep monopolowy
+sklep monopolowys
+sklep odzieżowy
+sklep odzieżowys
+sklep z dziełami sztuki
+sklep z dziełami sztukis
+piekarnia
+piekarnias
+salon kosmetyczny
+salon kosmetycznys
+sklep z napojami
+sklep z napojamis
+sklep rowerowy
+sklep rowerowys
+księgarnia
+księgarnias
+rzeźnik
+rzeźniks
+sklep samochodowy
+sklep samochodowys
+salon samochodowy
+salon samochodowys
+sklep z częściami samochodowymi
+sklep z częściami samochodowymis
+naprawa samochodów
+naprawa samochodóws
+sklep z dywanami
+sklep z dywanamis
+sklep miłosny
+sklep miłosnys
+drogeria
+drogerias
+sklep komputerowy
+sklep komputerowys
+cukiernia
+cukiernias
+spożywczy
+spożywcze
+ksero
+ksera
+sklep kosmetyczny
+sklep kosmetycznys
+dom towarowy
+dom towarowys
+sklep z produktami po obniżce
+sklep z produktami po obniżces
+sklep budowlany
+sklep budowlanys
+pralnia chemiczna
+pralnia chemicznas
+sklep elektroniczny
+sklep elektronicznys
+biuro nieruchomości
+biuro nieruchomościs
+sklep gospodarski
+sklep gospodarskis
+sklep modelarski
+sklep modelarskis
+sklep rybny
+sklep rybnys
+kwiaciarnia
+kwiaciarnie
+zakład pogrzebowy
+zakłady pogrzebowe
+sklep meblowy
+sklep meblowys
+galeria
+galerias
+centrum ogrodnicze
+centrum ogrodniczes
+sklep ogólny
+sklep ogólnys
+sklep z pamiątkami
+sklep z pamiątkamis
+warzywniak
+warzywniaki
+fryzjer
+fryzjerzy
+sklep ze sprzętem
+sklepy ze sprzętem
+hi-fi
+hi-fis
+ubezpieczenie
+ubezpieczenia
+sklep z biżuterią
+sklep z biżuteriąs
+kiosk
+kiosks
+pralnia
+pralnias
+centrum handlowe
+centrum handlowes
+sklep z telefonami komórkowymi
+sklep z telefonami komórkowymis
+sklep z motocyklami
+sklep z motocyklamis
+sklep muzyczny
+sklep muzycznys
+optyk
+optyks
+sklep z produktami organicznymi
+sklep z produktami organicznymis
+sklep na wolnym powietrzu
+sklep na wolnym powietrzus
+sklep ze zwierzątkami
+sklep ze zwierzątkamis
+sklep fotograficzny
+sklep fotograficznys
+salon
+salons
+sklep obuwniczy
+sklep obuwniczys
+sklep sportowy
+sklep sportowys
+sklep papierniczy
+sklep papierniczys
+supermarkets
+sklep zabawkowy
+sklep zabawkowys
+biuro podróży
+biuro podróżys
+sklep filmowy
+sklep filmowys
+winiarnia
+winiarnias
+chata alpejska
+chata alpejskas
+sztuka
+sztukas
+atrakcja turystyczna
+atrakcja turystycznas
+łóżko i śniadanie
+łóżko i śniadanies
+kabina
+kabinas
+miejsce na kamping
+miejsce na kampings
+miejsce na przyczepę campingową
+miejsce na przyczepę campingowąs
+schronisko
+schroniskos
+pensjonat
+pensjonats
+hostel
+hostels
+informacja turystyczna
+informacja turystycznas
+nachylenie
+nachylenies
+motel
+motels
+miejsce na piknik
+miejsce na pikniks
+park tematyczny
+park tematycznys
+punkt widokowy
+punkt widokowys
+zoo
+stocznia
+stocznias
+kanał
+kanałs
+złącze dróg wodnych
+złącze dróg wodnychs
+tama
+tamas
+opuszczony kanał
+opuszczony kanałs
+rów
+róws
+basen portowy
+basen portowys
+rów odpływowy
+rów odpływowys
+zastawka
+zastawkas
+śluza
+śluzas
+źródło mineralne
+źródło mineralnes
+kotwicowisko
+kotwicowiskos
+katarakty
+kataraktys
+brzeg rzeki
+brzeg rzekis
+strumień
+strumieńs
+starorzecze
+starorzeczes
+punkt wodny
+punkt wodnys
+wodospad
+wodospads
+jaz
+jazs
+# ps
+بانک
+بانکs
+کلينيک
+کلينيکs
+پوهنځی
+پوهنځیs
+سفارت
+سفارتs
+روغتون
+روغتونs
+هوټل
+هوټلs
+پارک
+پارکs
+درملتون
+درملتونs
+پوليس
+پوليسs
+ښوونځی
+ښوونځیs
+هټۍ
+هټۍs
+نندارتون
+نندارتونs
+لوبغالی
+لوبغالیs
+برج
+برجs
+تمځای
+تمځایs
+واټ
+واټs
+ماڼۍ
+ماڼۍs
+کليسا
+کليساs
+کور
+کورs
+موزيم
+موزيمs
+هديره
+هديرهs
+ځنګل
+ځنګلs
+غونډۍ
+غونډۍs
+ټاپو
+ټاپوs
+څوکه
+څوکهs
+ونه
+ونهs
+دره
+درهs
+اوبه
+اوبهs
+هوايي ډګر
+هوايي ډګرs
+ښار
+ښارs
+هېواد
+هېوادs
+فارم
+فارمs
+کورونه
+کورونهs
+سيمه
+سيمهs
+ښارګوټی
+ښارګوټیs
+کلی
+کلیs
+بټيارۍ
+بټيارۍs
+ګالېري
+ګالېريs
+مېلمستون
+مېلمستونs
+ليليه
+ليليهs
+مالومات
+مالوماتs
+مېله ځای
+مېله ځایs
+ژوبڼ
+ژوبڼs
+# pt
+aeroporto
+aeroportos
+caixa eletrônico
+caixas eletrônicos
+caixa multibanco
+caixas multibanco
+caixa de multibanco
+caixas de multibanco
+multibanco
+multibancos
+multicaixa
+multicaixas
+agência bancária
+agências bancárias
+banco
+bancos
+bar
+bares
+câmbio
+câmbios
+cambista
+cambistas
+estação de autocarros
+estações de autocarros
+estação de camionagem
+estações de camionagem
+estação de ônibus
+estações de ônibus
+estação rodoviária
+estações rodoviárias
+rodoviária
+rodoviárias
+terminal rodoviário
+terminais rodoviários
+escola
+escolas
+câmara municipal
+câmaras municipais
+município
+municípios
+universidade
+universidades
+paragem de autocarro
+paragem de autocarros
+paragens de autocarro
+paragens de autocarros
+parada de ônibus
+paradas de ônibus
+ponto de ônibus
+pontos de ônibus
+ponto de parada
+pontos de parada
+estrada
+estradas
+castelo
+castelos
+ruína
+ruínas
+praia
+praias
+ilha
+ilhas
+ilhéu
+ilhéus
+rio
+rios
+código postal
+códigos postais
+funicular
+funiculares
+passagem de nível
+passagens de nível
+estação
+estações
+estação de comboio
+estações de comboio
+estação de comboios
+estações de comboios
+estação ferroviária
+estações ferroviárias
+estação de metro
+estações de metro
+estação de metrô
+estações de metrô
+estação de metropolitano
+estações de metropolitano
+estação de trem
+estações de trem
+estação de trens
+estações de trens
+museu
+museus
+# ru
+аэропорт
+аэропорты
+дом искусств
+дома искусств
+банкомат
+банкоматы
+аудитория
+аудитории
+банк
+банки
+бар
+бары
+скамья
+скамьи
+велопарковка
+велопарковки
+прокат велосипедов
+бордель
+бордели
+обмен валют
+автобусная станция
+автобусные станции
+кафе
+аренда автомобилей
+прокат автомобилей
+автомойка
+автомойки
+казино
+кинотеатр
+кинотеатры
+поликлиника
+поликлиники
+клуб
+клубы
+колледж
+колледжи
+общественный центр
+общественные центры
+помещение суда
+помещения судов
+крематорий
+крематории
+стоматология
+стоматологии
+врач
+врачи
+общежитие
+общежития
+питьевая вода
+автошкола
+автошколы
+посольство
+посольства
+телефон экстренных служб
+телефоны экстренных служб
+палатка с едой
+палатки с едой
+паромная станция
+паромные станции
+пожарный гидрант
+пожарные гидранты
+пожарная охрана
+фонтан
+фонтаны
+заправка
+заправки
+место захоронения
+места захоронения
+тренажерный зал
+тренажерные залы
+холл
+холлы
+оздоровительный центр
+оздоровительные центры
+госпиталь
+госпитали
+гостиница
+гостиницы
+охотничья вышка
+охотничьи вышки
+мороженное
+детский сад
+детские сады
+библиотека
+библиотеки
+магазин
+магазины
+рыночная площадь
+рыночные площади
+горная спасательная служба
+горные спасательные службы
+ночной клуб
+ночные клубы
+пансионат
+пансионаты
+дом престарелых
+дома престарелых
+офис
+офисы
+парк
+парки
+стоянка
+стоянки
+аптека
+аптеки
+место поклонения
+места поклонений
+полиция
+почтовый ящик
+почтовые ящики
+почтовое отделение
+почтовые отделения
+дошкольное учреждение
+дошкольные учреждения
+тюрьма
+тюрьмы
+паб
+пабы
+общественное здание
+общественные здания
+городской рынок
+городские рынки
+приёмная
+приёмные
+место утилизации
+места утилизации
+ресторан
+рестораны
+сауна
+сауны
+школа
+школы
+укрытие
+укрытия
+торговый центр
+торговые центры
+сообщество
+сообщества
+студия
+студии
+супермаркет
+супермаркеты
+такси
+телефон
+телефоны
+театр
+театры
+туалет
+туалеты
+городская администрация
+университет
+университеты
+торговый автомат
+торговые автоматы
+ветеринарная клиника
+ветеринарные клиники
+усадьба
+усадьбы
+мусорный бак
+мусорные баки
+вай-фай
+молодёжный центр
+молодёжные центры
+административная граница
+административные границы
+многоквартирный дом
+многоквартирные дома
+ряд зданий
+ряды зданий
+бункер
+бункеры
+церковь
+церкви
+мэрия
+мэрии
+офисное здание
+офисные здания
+вход в здание
+входы в здание
+факультетское здание
+факультетские здания
+ферма
+фермы
+квартиры
+гараж
+гаражи
+здание больницы
+здания больницы
+дом
+дома
+промышленное здание
+промышленные здания
+жилой дом
+жилые дома
+здание на продажу
+здания на продажу
+стадион
+стадионы
+ряд жилых домов
+ряды жилых домов
+башня
+башни
+трамвайная остановка
+трамвайные остановки
+здание
+здания
+конный путь
+конные пути
+автобусная полоса-рельс
+автобусные полосы-рельсы
+автобусная остановка
+автобусные остановки
+закоулок
+закоулки
+ремонт дороги
+ремонт дорог
+велодорожка
+велодорожки
+километровый столб
+километровые столбы
+пункт первой помощи
+пункты первой помощи
+тротуар
+тротуары
+брод
+броды
+ворота
+жилая улица
+жилые улицы
+второстепенная дорога
+второстепенные дороги
+автомагистраль
+автомагистрали
+перекрёсток
+перекрёстки
+развязка на автомагистрали
+развязки на автомагистрали
+тропа
+тропы
+дорога для пешеходов
+дороги для пешеходов
+платформа
+платформы
+главная дорога
+главные дороги
+гоночная трасса
+гоночные трассы
+улица
+улицы
+дорога
+дороги
+примыкающая дорога
+примыкающие дороги
+подъездная дорога
+подъездные дороги
+придорожный сервис
+ступеньки
+турникет
+турникеты
+дорога третьего класса
+дороги третьего класса
+грунтовка
+грунтовки
+трасса
+трассы
+развязка
+развязки
+дорога без покрытия
+дороги без покрытия
+раскопки
+поле боя
+поля боёв
+пограничный камень
+пограничные камни
+крепость
+крепости
+икона
+иконы
+поместье
+поместья
+памятник
+памятники
+рудник
+рудники
+монумент
+монументы
+музей
+музеи
+развалины
+придорожный крест
+придорожные кресты
+придорожная святыня
+придорожные святыни
+остов судна
+остовы судов
+сады-огороды
+бассейн
+бассейны
+заброшенная зона
+заброшенные зоны
+кладбище
+кладбища
+офисная территория
+офисные территории
+законсервированная зона
+законсервированные зоны
+стройка
+стройки
+сельхозугодья
+сельхоздвор
+сельхоздворы
+дикий лес
+дикие леса
+трава
+травы
+неосвоенная территория
+неосвоенные территории
+промзона
+промзоны
+свалка
+свалки
+луг
+луга
+военная зона
+военные зоны
+шахта
+шахты
+гора
+горы
+заповедник
+заповедники
+лыжня
+лыжни
+открытая площадка
+открытые площадки
+карьер
+карьеры
+железная дорога
+железные дороги
+зона отдыха
+зоны отдыха
+водохранилище
+водохранилища
+жилой район
+жилые районы
+торговая территория
+торговые территории
+деревенское поле
+деревенские поля
+виноградник
+виноградники
+заболоченность
+заболоченности
+обслуживаемый лес
+обслуживаемые леса
+пляж с насаждениями
+пляжи с насаждениями
+общественная земля
+общественные земли
+рыбалка
+сад
+сады
+поле для гольфа
+поля для гольфа
+каток
+катки
+пристань для яхт
+пристани для яхт
+минигольф
+минигольфы
+спортивный газон
+спортивные газоны
+детская игровая площадка
+детские игровые площадки
+эллинг
+эллинги
+спортивный центр
+спортивные центры
+спортивная дорожка
+спортивные дорожки
+аквапарк
+аквапарки
+залив
+заливы
+пляж
+пляжи
+мыс
+мысы
+вход в пещеру
+входы в пещеру
+канал
+каналы
+обрыв
+обрывы
+береговая линия
+береговые линии
+кратер
+кратеры
+природный объект
+природные объекты
+холм
+холмы
+фьорд
+фьорды
+гейзер
+гейзеры
+ледник
+ледники
+пустошь
+пустоши
+остров
+острова
+земля
+земли
+болото
+болота
+торфяник
+торфяники
+грязь
+грязи
+вершина горы
+вершины гор
+полуостров
+полуострова
+риф
+рифы
+хребет
+хребты
+река
+реки
+скала
+скалы
+осыпь камней
+осыпи камней
+кустарник
+кустарники
+мелководье
+мелководья
+родник
+родники
+пролив
+проливы
+дерево
+деревья
+долина
+долины
+вулкан
+вулканы
+водоём
+водоёмы
+заболоченная территория
+заболоченные территории
+заболоченные земли
+естественный лес
+естественные леса
+город
+города
+страна
+страны
+уезд
+уезды
+посёлок
+посёлки
+островок
+островки
+населённый пункт
+населённые пункты
+муниципалитет
+муниципалитеты
+индекс
+индексы
+регион
+регионы
+море
+моря
+область/штат
+области/штаты
+участок
+участки
+пригород
+пригороды
+загородная зона
+загородные зоны
+деревня
+деревни
+разобранные железнодорожные пути
+ремонт ж.д. путей
+заброшенная ж.д. ветка
+заброшенные ж.д. ветки
+заброшенная ж.д. станция
+заброшенная ж.д. станцияs
+фуникулер
+фуникулеры
+станция ж.д.
+станции ж.д.
+историческая ж.д. станция
+исторические ж.д. станции
+узел ж.д.
+узлы ж.д.
+железнодорожный переезд
+железнодорожные переезды
+легкорельсовый ж.д. транспорт
+монорельс
+узкоколейка
+железнодорожная платформа
+железнодорожные платформы
+историческая ж.д.
+исторические ж.д.
+ответвление ж.д. пути
+ответвления ж.д. путей
+железнодорожная станция
+железнодорожные станции
+станция метро
+станции метро
+вход в метро
+входы в метро
+железнодорожная стрелка
+железнодорожные стрелки
+трамвай
+трамваи
+депо
+винный магазин
+винные магазины
+магазин одежды
+магазины одежды
+художественный салон
+художественные салоны
+булочная
+булочные
+салон красоты
+салоны красоты
+магазин напитков
+магазины напитков
+веломагазин
+веломагазины
+книжный магазин
+книжные магазины
+мясная лавка
+мясные лавки
+автомагазин
+автомагазины
+автосалон
+автосалоны
+автозапчасти
+автомастерская
+автомастерские
+ковры
+секонд-хэнд
+секонд-хэнды
+магазин бытовой химии
+магазины бытовой химии
+компьютерный магазин
+компьютерные магазины
+кондитерская
+кондитерские
+ларёк
+ларьки
+услуги копирования
+косметика
+универсам
+универсамы
+магазин распродаж
+магазины распродаж
+сделай-сам
+химчистка
+химчистки
+магазин электротоваров
+магазины электротоваров
+риелтор
+риелторы
+фермерский магазин
+фермерские магазины
+магазин модной одежды
+магазины модной одежды
+рыбный магазин
+рыбные магазины
+цветочный магазин
+цветочные магазины
+продуктовый магазин
+продуктовые магазины
+похоронное бюро
+похоронные бюро
+мебельный магазин
+мебельные магазины
+галерея
+галереи
+садоводческий магазин
+садоводческие магазины
+магазин подарков
+магазины подарков
+овощной магазин
+овощные магазины
+бакалейный магазин
+бакалейные магазины
+парикмахерская
+парикмахерские
+хозяйственный магазин
+хозяйственные магазины
+магазин аудио/видео аппаратуры
+магазины аудио/видео аппаратуры
+страховая компания
+страховые компании
+ювелирный магазин
+ювелирные магазины
+киоск
+киоски
+прачечная
+прачечные
+молл
+моллы
+рынок
+рынки
+магазин мобильных телефонов
+магазины мобильных телефонов
+магазин по продаже мотоциклов
+магазины по продаже мотоциклов
+музыкальный магазин
+музыкальные магазины
+газетный киоск
+газетные киоски
+магазин оптики
+магазины оптики
+магазин экологических продуктов
+магазины экологических продуктов
+место уличной торговли
+места уличной торговли
+зоомагазин
+зоомагазины
+фотомагазин
+фотомагазины
+салон
+салоны
+обувной магазин
+обувные магазины
+спортивный магазин
+спортивные магазины
+магазин канцелярских товаров
+магазины канцелярских товаров
+магазин игрушек
+магазины игрушек
+туристической агентство
+туристические агентства
+магазин видеозаписей
+магазины видеозаписей
+горный приют
+горные приюты
+произведения искусства
+достопримечательность
+достопримечательности
+полупансион
+полупансионы
+кабинка
+кабинки
+лагерь
+лагеря
+караван-сарай
+караван-сараи
+шале
+домик для гостей
+домики для гостей
+хостел
+хостелы
+информация
+навес
+навесы
+мотель
+мотели
+место для пикника
+места для пикников
+аттракционы
+смотровая площадка
+смотровые площадки
+зоопарк
+зоопарки
+верфь
+верфи
+слияние рек
+слияния рек
+дамба
+дамбы
+пересохший канал
+пересохшие каналы
+водоотлив
+водоотливы
+док
+доки
+сточная канава
+сточные канавы
+шлюз
+шлюзы
+минеральный родник
+минеральные родники
+место швартовки
+места швартовки
+речной порог
+речные пороги
+берег реки
+берега реки
+ручей
+ручьи
+высохшее русло
+высохшие русла
+пункт водоснабжения
+пункты водоснабжения
+водопад
+водопады
+плотина
+плотины
+# sk
+letisko
+letiskos
+kultúrne stredisko
+kultúrne strediskos
+bankomat
+bankomats
+banka
+bankas
+bar
+bars
+lavička
+lavičkas
+parkovisko bicyklov
+parkovisko bicyklovs
+požičovňa bicyklov
+požičovňa bicyklovs
+nevestinec
+nevestinecs
+zmenáreň
+zmenáreňs
+autobusová stanica
+autobusová stanicas
+kaviareň
+kaviareňs
+požičovňa áut
+požičovňa áuts
+autopožičovňa
+autopožičovňas
+autoumývareň
+autoumývareňs
+kasíno
+kasínos
+kino
+kinos
+poliklinika
+poliklinikas
+klub
+klubs
+vysoká škola
+vysoká školas
+súd
+súds
+krematórium
+krematóriums
+zubár
+zubárs
+študentský domov
+študentský domovs
+pitná voda
+pitná vodas
+autoškola
+autoškolas
+veľvyslanectvo
+veľvyslanectvos
+núdzový telefón
+núdzový telefóns
+rýchle občerstvenie
+rýchle občerstvenies
+terminál trajektu
+terminál trajektus
+požiarny hydrant
+požiarny hydrants
+požiarna stanica
+požiarna stanicas
+fontána
+fontánas
+benzínová pumpa
+benzínová pumpas
+cintorín
+cintoríns
+fitnes centrum / telocvičňa
+fitnes centrum / telocvičňas
+zdravotné stredisko
+zdravotné strediskos
+nemocnica
+nemocnicas
+hotel
+hotels
+poľovnícky posed
+poľovnícky poseds
+zmrzlina
+zmrzlinas
+materská škola
+materská školas
+knižnica
+knižnicas
+obchod
+obchods
+tržnica
+tržnicas
+horská služba
+horská službas
+'nočný klub'
+'nočný klub's
+jasle
+jasles
+sanatórium
+sanatóriums
+úrad
+úrads
+park
+parks
+parkovisko
+parkoviskos
+lekáreň
+lekáreňs
+kostol
+kostols
+polícia
+polícias
+poštová schránka
+poštová schránkas
+pošta
+poštas
+škôlka
+škôlkas
+väzenie
+väzenies
+krčma
+krčmas
+verejná budova
+verejná budovas
+recyklačké miesto
+recyklačké miestos
+reštaurácia
+reštaurácias
+domov dôchodcov
+domov dôchodcovs
+sauna
+saunas
+škola
+školas
+altánok
+altánoks
+spoločenský klub
+spoločenský klubs
+ateliér
+ateliérs
+supermarket
+supermarkets
+taxi
+taxis
+verejný telefón
+verejný telefóns
+divadlo
+divadlos
+wc
+wcs
+radnica
+radnicas
+univerzita
+univerzitas
+predajný automat
+predajný automats
+veterinárna ordinácia
+veterinárna ordinácias
+odpadkový kôš
+odpadkový kôšs
+prístup wi-fi
+prístup wi-fis
+mládežnícke centrum
+mládežnícke centrums
+administratívne hranice
+administratívne hranices
+bytový dom
+bytový doms
+bunker
+bunkers
+kaplnka
+kaplnkas
+kostol,cirkev
+kostol,cirkevs
+radnica,magistrát
+radnica,magistráts
+komerčné budovy
+komerčné budovys
+budovy fakulty
+budovy fakultys
+hospodárska budova
+hospodárska budovas
+byty
+bytys
+garáž
+garážs
+sála
+sálas
+nemocničné budovy
+nemocničné budovys
+dom
+doms
+priemyselné budovy
+priemyselné budovys
+administratívna budova
+administratívna budovas
+obytné budovy
+obytné budovys
+maloobchodné budovy
+maloobchodné budovys
+štadión
+štadións
+radová zástavba
+radová zástavbas
+veža
+vežas
+železničná stanica
+železničná stanicas
+univerzitné budovy
+univerzitné budovys
+budova
+budovas
+cesta pre kone
+cesta pre kones
+bus so sprievodcom
+bus so sprievodcoms
+zastávka autobusu
+zastávka autobusus
+byway (súkromná cesta)
+byway (súkromná cesta)s
+cesta vo výstavbe
+cesta vo výstavbes
+cyklistický chodník
+cyklistický chodníks
+distance marker (kilometrovník)
+distance marker (kilometrovník)s
+stanica prvej pomoci
+stanica prvej pomocis
+chodník
+chodníks
+brod
+brods
+brána
+bránas
+obytná zóna
+obytná zónas
+vedľajšia cesta
+vedľajšia cestas
+diaľnica
+diaľnicas
+motorway junction (diaľničná križovatka)
+motorway junction (diaľničná križovatka)s
+cesta
+cestas
+chodník pre chodcov
+chodník pre chodcovs
+nástupište
+nástupištes
+cesta i. triedy
+cesta i. triedys
+residential(obytný)
+residential(obytný)s
+cesta ii. triedy
+cesta ii. triedys
+service road (prístupová komunikácia)
+service road (prístupová komunikácia)s
+schody
+schodys
+schodíky cez ohradu
+schodíky cez ohradus
+cesta iii. triedy
+cesta iii. triedys
+nespevnené cesty
+nespevnené cestys
+cesta pre motorové vozidlá
+cesta pre motorové vozidlás
+neklasifikovaná cesta
+neklasifikovaná cestas
+nespevnená cesta
+nespevnená cestas
+archeologické nálezisko
+archeologické náleziskos
+bojisko
+bojiskos
+hraničný kameň
+hraničný kameňs
+hrad
+hrads
+šľachtické sídlo
+šľachtické sídlos
+pomník
+pomníks
+baňa
+baňas
+pamätník
+pamätníks
+múzeum
+múzeums
+ruina
+ruinas
+božie muky
+božie mukys
+malá kaplnka pri ceste
+malá kaplnka pri cestes
+zrúcanina
+zrúcaninas
+záhradkárske osady
+záhradkárske osadys
+basin (vodná nádrž)
+basin (vodná nádrž)s
+obchodná štvrť
+obchodná štvrťs
+stavba
+stavbas
+farma
+farmas
+dvor
+dvors
+les
+less
+tráva
+trávas
+priemyslová oblasť
+priemyslová oblasťs
+skládka odpadu
+skládka odpadus
+lúka
+lúkas
+vojenský priestor
+vojenský priestors
+hora
+horas
+prírodná rezervácia
+prírodná rezervácias
+zjazdovka
+zjazdovkas
+námestie
+námesties
+lom
+loms
+železnica
+železnicas
+residential area (obytná oblasť)
+residential area (obytná oblasť)s
+retail (obchodná zóna)
+retail (obchodná zóna)s
+verejná zeleň
+verejná zeleňs
+vinica
+vinicas
+mokrina
+mokrinas
+drevo
+drevos
+verejné priestranstvo
+verejné priestranstvos
+rybolov (športový)
+rybolov (športový)s
+záhrada
+záhradas
+golfové ihrisko
+golfové ihriskos
+umelé klzisko
+umelé klziskos
+prístav pre jachty
+prístav pre jachtys
+mini golf
+mini golfs
+športové ihrisko
+športové ihriskos
+detské ihrisko
+detské ihriskos
+rekreačná oblasť
+rekreačná oblasťs
+lodný sklz
+lodný sklzs
+športové stredisko
+športové strediskos
+plaváreň
+plaváreňs
+bežecká dráha
+bežecká dráhas
+aquapark
+aquaparks
+zátoka, záliv
+zátoka, zálivs
+pláž
+plážs
+mys
+myss
+vstup do jaskyne
+vstup do jaskynes
+kanál
+kanáls
+útes, kamenná stena
+útes, kamenná stenas
+pobrežie
+pobrežies
+kráter
+kráters
+vlastnosť
+vlastnosťs
+horská pastvina
+horská pastvinas
+fjord
+fjords
+gejzír
+gejzírs
+ľadovec
+ľadovecs
+vresovisko
+vresoviskos
+kopec
+kopecs
+ostrov
+ostrovs
+bažina
+bažinas
+močiar
+močiars
+bahno
+bahnos
+vrchol
+vrchols
+bod
+bods
+bradlo, skalisko
+bradlo, skaliskos
+hrebeň
+hrebeňs
+rieka
+riekas
+skala
+skalas
+sutina
+sutinas
+rúbanisko
+rúbaniskos
+plytčina
+plytčinas
+prameň
+prameňs
+úžina
+úžinas
+strom
+stroms
+dolina
+dolinas
+sopka
+sopkas
+voda
+vodas
+mesto nad 100 tis.
+mesto nad 100 tis.s
+štát
+štáts
+okres
+okress
+osada do 200
+osada do 200s
+budovy
+budovys
+ostrovček
+ostrovčeks
+oblasť
+oblasťs
+obecný úrad
+obecný úrads
+psč
+psčs
+región
+regións
+more
+mores
+pododdelenie
+pododdelenies
+mestský obvod
+mestský obvods
+mesto 10 tis.-100 tis.
+mesto 10 tis.-100 tis.s
+nezaradená oblasť
+nezaradená oblasťs
+obec 200-10 tis.
+obec 200-10 tis.s
+opustená železnica
+opustená železnicas
+železnica vo výstavbe
+železnica vo výstavbes
+nepoužívaná železnica
+nepoužívaná železnicas
+nepoužívaná železničná stanica
+nepoužívaná železničná stanicas
+lanová dráha
+lanová dráhas
+zastávka vlaku
+zastávka vlakus
+zastávka historickej železnice
+zastávka historickej železnices
+železničný uzol
+železničný uzols
+železničný prejazd
+železničný prejazds
+ľahká železnica
+ľahká železnicas
+jednokoľajka
+jednokoľajkas
+úzkokoľajná železnica
+úzkokoľajná železnicas
+železničné nástupište
+železničné nástupištes
+historická železnica
+historická železnicas
+železničná vlečka
+železničná vlečkas
+stanica metra
+stanica metras
+vchod do metra
+vchod do metras
+železničná výhybka
+železničná výhybkas
+električka
+električkas
+zastávka električky
+zastávka električkys
+železničné depo
+železničné depos
+mimo povolenia
+mimo povolenias
+odevy
+odevys
+obchod s umením
+obchod s umeníms
+pekáreň
+pekáreňs
+salón krásy
+salón krásys
+občerstvenie
+občerstvenies
+obchod s bicylkami
+obchod s bicylkamis
+kníhkupectvo
+kníhkupectvos
+mäsiarstvo
+mäsiarstvos
+obchod s autami
+obchod s autamis
+mototechna
+mototechnas
+autoservis
+autoserviss
+obchod s kobercami
+obchod s kobercamis
+charitatívny obchod
+charitatívny obchods
+obchod s konfekciou
+obchod s konfekcious
+obchod s počítačmi
+obchod s počítačmis
+cukráreň
+cukráreňs
+obchodný dom
+obchodný doms
+urob si sám
+urob si sáms
+chemická čistiareň
+chemická čistiareňs
+elektro
+elektros
+realitná kancelária
+realitná kancelárias
+poľnonákup
+poľnonákups
+obchod s rybami
+obchod s rybamis
+kvetinárstvo
+kvetinárstvos
+obchod s potravinami
+obchod s potravinamis
+pohrebníctvo
+pohrebníctvos
+nábytok
+nábytoks
+galéria
+galérias
+záhradnícke centrum
+záhradnícke centrums
+zmiešaný tovar
+zmiešaný tovars
+suveníry
+suvenírys
+obchod so zeleninou
+obchod so zeleninous
+potraviny
+potravinys
+kaderníctvo,holičstvo
+kaderníctvo,holičstvos
+železiarstvo
+železiarstvos
+hi-fi
+hi-fis
+poisťovňa
+poisťovňas
+zlatníctvo
+zlatníctvos
+novinový stánok
+novinový stánoks
+práčovňa
+práčovňas
+pešia zóna
+pešia zónas
+obchod s mobilnými telefónmi
+obchod s mobilnými telefónmis
+motocyklový obchod
+motocyklový obchods
+hudobniny
+hudobninys
+očná optika
+očná optikas
+obchod so zdravou výživou
+obchod so zdravou výživous
+turistický obchod
+turistický obchods
+chovprodukt
+chovprodukts
+fotokino
+fotokinos
+salón
+salóns
+obuva
+obuvas
+nákupné stredisko
+nákupné strediskos
+športový obchod
+športový obchods
+papierníctvo
+papierníctvos
+hračkárstvo
+hračkárstvos
+cestovná kancelária
+cestovná kancelárias
+vysokohorská chata
+vysokohorská chatas
+umelecké dielo
+umelecké dielos
+atrakcia
+atrakcias
+nocľah a raňajky
+nocľah a raňajkys
+malá chata
+malá chatas
+kemping
+kempings
+autokemping
+autokempings
+veľká chata
+veľká chatas
+penzión
+penzións
+ubytovňa, internát
+ubytovňa, internáts
+informácie
+informácies
+prístrešok
+prístrešoks
+motel
+motels
+výletné miesto
+výletné miestos
+zábavný park
+zábavný parks
+údolie
+údolies
+rozhľadňa, výhliadka
+rozhľadňa, výhliadkas
+zoo
+zoos
+lodenica
+lodenicas
+priehrada,hrádza
+priehrada,hrádzas
+opustený kanál
+opustený kanáls
+priekopa
+priekopas
+dok
+doks
+odvodňovací kanál
+odvodňovací kanáls
+plavebná komora
+plavebná komoras
+brána plavebnej komory
+brána plavebnej komorys
+minerálny prameň
+minerálny prameňs
+kotvisko
+kotviskos
+breh rieky
+breh riekys
+potok
+potoks
+občasné riečisko(vádí)
+občasné riečisko(vádí)s
+vodný bod
+vodný bods
+vodopád
+vodopáds
+splav
+splavs
+# sv
+flygplats
+flygplatser
+bankomat
+bankomater
+bank
+banker
+bar
+barer
+bänk
+bänkar
+cykelparkering
+cykelparkeringar
+cykeluthyrning
+cykeluthyrningar
+bordell
+bordeller
+växlingskontor
+busstation
+busstationer
+biluthyrning
+biluthyrningar
+bilpool
+bilpooler
+biltvätt
+biltvättar
+biograf
+biografer
+krematorium
+krematorier
+tandläkare
+läkare
+dricksvatten
+körskola
+körskolor
+ambassad
+ambassader
+nödtelefon
+nödtelefoner
+snabbmat
+färjeterminal
+färjeterminaler
+brandpost
+brandposter
+brandstation
+brandstationer
+fontän
+fontäner
+bränsle
+bränslen
+begravningsplats
+begravningsplatser
+sjukhus
+hotell
+glass
+dagis
+bibliotek
+torghandel
+torghandlar
+marknad
+marknader
+nattklubb
+nattklubbar
+kontor
+parkeringsplats
+parkeringsplatser
+apotek
+plats för tillbedjan
+platser för tillbedjan
+polis
+poliser
+postkontor
+förskola
+förskolor
+fängelse
+fängelser
+pub
+pubar
+offentlig byggnad
+offentliga byggnader
+återvinningsstation
+återvinningsstationer
+restaurang
+restauranger
+äldreboende
+äldreboenden
+bastu
+bastur
+skola
+skolor
+affär
+affärer
+taxi
+taxis
+teater
+teatrar
+toalett
+toaletter
+varumaskin
+varumaskiner
+veterinär
+veterinärer
+papperskorg
+papperskorgar
+ungdomscenter
+kapell
+kyrka
+kyrkor
+garage
+sjukhusbyggnad
+sjukhusbyggnader
+hus
+kontorsbyggnad
+kontorsbyggnader
+skolbyggnad
+skolbyggnader
+terass
+terasser
+järnvägsstation
+järnvägsstationer
+busshållplats
+busshållplatser
+väg under konstruktion
+vägar under konstruktion
+cykelspår
+gångväg
+gångvägar
+grind
+grindar
+motorväg
+motorvägar
+perrong
+perronger
+väg
+vägar
+trappa
+trappor
+vandringsled
+vandringsleder
+oasfalterad väg
+oasfalterade vägar
+arkeologisk plats
+arkeologiska platser
+slagfält
+gränssten
+gränsstenar
+byggnad
+byggnader
+slott
+ikon
+ikoner
+gruva
+gruvor
+monument
+museum
+museer
+ruin
+ruiner
+torn
+vrak
+kolonilott
+kolonilotter
+bondgård
+bondgårdar
+skog
+skogar
+industriområde
+industriområden
+militärområde
+militärområden
+park
+parker
+bostadsområde
+bostadsområden
+vingård
+vingårdar
+fiskevatten
+trädgård
+trädgårdar
+golfbana
+golfbanor
+isrink
+isrinkar
+marina
+marinor
+minigolf
+naturreservat
+lekplats
+lekplatser
+sporthall
+sporthallar
+stadium
+stadiums
+vattenpark
+vattenparker
+bukt
+bukter
+strand
+stränder
+udde
+uddar
+grottmynning
+grottmynningar
+kanal
+kanaler
+klippa
+klippor
+kustlinje
+kustlinjer
+krater
+kratrar
+fjord
+fjordar
+gejser
+gejsrar
+glaciär
+glaciärer
+kulle
+kullar
+ö
+öar
+träsk
+hed
+hedar
+lera
+leror
+topp
+toppar
+rev
+flod
+floder
+taluskon
+taluskoner
+sandbank
+sandbankar
+källa
+källor
+träd
+dal
+dalar
+vulkan
+vulkaner
+vatten
+våtmark
+våtmarker
+stad
+städer
+land
+länder
+län
+by
+byar
+holme
+holmar
+kommun
+kommuner
+postnummer
+region
+regioner
+hav
+förort
+förorter
+ort
+orter
+mindre ort
+mindre orter
+nedlagd järnvägsstation
+nedlagda järnvägsstationer
+bergbana
+bergbanor
+spårvagn
+spårvagnar
+smalspårsjärnväg
+smalspårsjärnvägar
+tågperrong
+tågperronger
+tågstation
+tågstationer
+tunnelbaneingång
+tunnelbaneingångar
+bageri
+bagerier
+cykelaffär
+cykelaffärer
+bokhandel
+bokhandlar
+slaktare
+bilförsäljare
+bildelar
+bilverkstad
+bilverkstäder
+datorbutik
+datorbutiker
+närköp
+kemtvätt
+kemtvättar
+blommor
+mataffär
+mataffärer
+begravningsbyrå
+begravningsbyråer
+galleri
+galleris
+frisör
+frisörer
+försäkring
+försäkringar
+guldsmed
+guldsmeder
+kiosk
+kiosker
+köpcentrum
+optiker
+djuraffär
+djuraffärer
+fotoaffär
+fotoaffärer
+salong
+salonger
+skoaffär
+skoaffärer
+leksaksaffär
+leksaksaffärer
+resebyrå
+resebyråer
+fjällbod
+fjällbodar
+konstverk
+attraktion
+attraktioner
+bad and breakfast
+bad and breakfasts
+stuga
+stugor
+campingplats
+campingplatser
+husvagnsuppställningsplats
+husvagnsuppställningsplatser
+vandrarhem
+turistinformation
+turistinformationer
+motell
+picknickplats
+picknickplatser
+nöjespark
+nöjesparker
+utsiktspunkt
+utsiktspunkter
+djurpark
+djurparker
+sluss
+slussar
+slussport
+slussportar
+vattenfall
+# uk
+аеропорт
+аеропортs
+мистецький центр
+мистецький центрs
+банкомат
+банкоматs
+конференц-зала
+конференц-залаs
+банк
+банкs
+бар
+барs
+лавка
+лавкаs
+місце стоянки для велосипедів
+місце стоянки для велосипедівs
+прокат велосипедів
+прокат велосипедівs
+бордель
+бордельs
+обмін валют
+обмін валютs
+автовокзал
+автовокзалs
+кафе
+кафеs
+прокат автомобілів
+прокат автомобілівs
+прокат авто
+прокат автоs
+автомийка
+автомийкаs
+казино
+казиноs
+кинотеатр
+кинотеатрs
+клініка
+клінікаs
+клуб
+клубs
+коледж
+коледжs
+громадський центр
+громадський центрs
+суд
+судs
+крематорій
+крематорійs
+стоматологія
+стоматологіяs
+лікарі
+лікаріs
+гуртожиток
+гуртожитокs
+питна вода
+питна водаs
+автошкола
+автошколаs
+амбасада
+амбасадаs
+телефон для екстрених викликів
+телефон для екстрених викликівs
+забігайлівка
+забігайлівкаs
+поромна станція
+поромна станціяs
+пожежний гідрант
+пожежний гідрантs
+пожежна станція
+пожежна станціяs
+фонтан
+фонтанs
+пальне
+пальнеs
+цвинтар
+цвинтарs
+тренажерний зал
+тренажерний залs
+зала
+залаs
+центр здоров'я
+центр здоров'яs
+лікарня
+лікарняs
+готель
+готельs
+мисливська вежа
+мисливська вежаs
+морозиво
+морозивоs
+дитячий садок
+дитячий садокs
+бібліотека
+бібліотекаs
+ринок
+ринокs
+гірські рятувальники
+гірські рятувальникиs
+нічний клуб
+нічний клубs
+дитсадок
+дитсадокs
+будинок престарілих
+будинок престарілихs
+офіс
+офісs
+парк
+паркs
+автостоянка
+автостоянкаs
+аптека
+аптекаs
+культова споруда
+культова спорудаs
+міліція (поліція)
+міліція (поліція)s
+поштова скриня
+поштова скриняs
+пошта
+поштаs
+дошкільний заклад
+дошкільний закладs
+в'язниця
+в'язницяs
+паб
+пабs
+громадський заклад
+громадський закладs
+базар
+базарs
+зона прийому
+зона прийомуs
+місце переробки відходів
+місце переробки відходівs
+ресторан
+ресторанs
+будинки для людей похилого віку
+будинки для людей похилого вікуs
+сауна
+саунаs
+школа
+школаs
+укриття
+укриттяs
+магазин
+магазинs
+шопінг
+шопінгs
+клуб за інтересами
+клуб за інтересамиs
+студія
+студіяs
+супермаркет
+супермаркетs
+таксі
+таксіs
+телефон
+телефонs
+театр
+театрs
+туалет
+туалетs
+міськвиконком
+міськвиконкомs
+університет
+університетs
+торговий автомат
+торговий автоматs
+ветлікарня
+ветлікарняs
+сільрада
+сільрадаs
+контейнер для сміття
+контейнер для сміттяs
+wifi-зона
+wifi-зонаs
+молодіжний центр
+молодіжний центрs
+адміністративний кордон
+адміністративний кордонs
+житловий масив
+житловий масивs
+квартал
+кварталs
+бункер
+бункерs
+каплиця
+каплицяs
+храм
+храмs
+мерія
+меріяs
+комерційна нерухомість
+комерційна нерухомістьs
+вхід у будівлю
+вхід у будівлюs
+факультет
+факультетs
+ферма
+фермаs
+оселі
+оселіs
+гараж
+гаражs
+будинок
+будинокs
+промислова споруда
+промислова спорудаs
+офісний будинок
+офісний будинокs
+суспільна будівля
+суспільна будівляs
+житловий будинок
+житловий будинокs
+центр роздрібної торгівлі
+центр роздрібної торгівліs
+стадіон
+стадіонs
+склад
+складs
+тераса
+терасаs
+башта
+баштаs
+залізнична станція
+залізнична станціяs
+будівля
+будівляs
+дорога для їзди верхи
+дорога для їзди верхиs
+автобусна зупинка
+автобусна зупинкаs
+боковий шлях
+боковий шляхs
+будівництво автомагітсралі
+будівництво автомагітсраліs
+велосипедна доріжка
+велосипедна доріжкаs
+верстовий камінь
+верстовий каміньs
+пункт швидкої допомоги
+пункт швидкої допомогиs
+пішохідна доріжка
+пішохідна доріжкаs
+броди
+бродиs
+ворота
+воротаs
+житлова зона
+житлова зонаs
+другорядна дорога
+другорядна дорогаs
+автомагістраль
+автомагістральs
+в'їзд на автомагістраль
+в'їзд на автомагістральs
+з’єднання з автомагістраллю
+з’єднання з автомагістраллюs
+алея
+алеяs
+пішохідна дорога
+пішохідна дорогаs
+платформа
+платформаs
+головна дорога
+головна дорогаs
+з’єднання з головною дорогою
+з’єднання з головною дорогоюs
+гоночна траса
+гоночна трасаs
+жила вулиця
+жила вулицяs
+дорога
+дорогаs
+з’єднання з другорядною дорогою
+з’єднання з другорядною дорогоюs
+службова дорога
+службова дорогаs
+придорожній сервіс
+придорожній сервісs
+стежка
+стежкаs
+турнікет
+турнікетs
+третьорядна дорога
+третьорядна дорогаs
+неасфальтований шлях.
+неасфальтований шлях.s
+шосе
+шосеs
+з’їзд з/на шосе
+з’їзд з/на шосеs
+дорога без класифікації
+дорога без класифікаціїs
+дорога без покриття
+дорога без покриттяs
+археологічні дослідження
+археологічні дослідженняs
+поле битви
+поле битвиs
+прикордонний камінь
+прикордонний каміньs
+за́мок
+за́мокs
+дім
+дімs
+маєток
+маєтокs
+меморіал
+меморіалs
+копальня
+копальняs
+пам’ятник
+пам’ятникs
+музей
+музейs
+руїни
+руїниs
+придорожній хрест
+придорожній хрестs
+придорожній храм
+придорожній храмs
+місце катастрофи
+місце катастрофиs
+сади-городи
+сади-городиs
+резервуар
+резервуарs
+очищена територія під забудову
+очищена територія під забудовуs
+кладовище
+кладовищеs
+торгівельно-офісна територія
+торгівельно-офісна територіяs
+заповідник
+заповідникs
+будівництво
+будівництвоs
+фермерське подвір'я
+фермерське подвір'яs
+ліс
+лісs
+трава
+траваs
+знесення під забудову
+знесення під забудовуs
+промзона
+промзонаs
+звалище
+звалищеs
+луг
+лугs
+військова зона
+військова зонаs
+гори
+гориs
+лижня
+лижняs
+ринкова площа
+ринкова площаs
+кар’єр
+кар’єрs
+залізниця
+залізницяs
+база відпочинку
+база відпочинкуs
+водосховище
+водосховищеs
+житловий квартал
+житловий кварталs
+роздрібна торгівля
+роздрібна торгівляs
+сільська галявина
+сільська галявинаs
+виноградник
+виноградникs
+болота
+болотаs
+гай
+гайs
+пляжний курорт
+пляжний курортs
+громадська земля
+громадська земляs
+район риболовлі
+район риболовліs
+сад
+садs
+поле для гольфу
+поле для гольфуs
+ковзанка
+ковзанкаs
+гавань для екскурсійних суден
+гавань для екскурсійних суденs
+міні-гольф
+міні-гольфs
+спортмайданчик
+спортмайданчикs
+дитячий майданчик
+дитячий майданчикs
+сліп (спуск на воду)
+сліп (спуск на воду)s
+спортивний центр
+спортивний центрs
+басейн
+басейнs
+бігова доріжка
+бігова доріжкаs
+аквапарку
+аквапаркуs
+затока
+затокаs
+пляж
+пляжs
+мис
+мисs
+входу в печеру
+входу в печеруs
+канал
+каналs
+скеля
+скеляs
+узбережжя
+узбережжяs
+кратер
+кратерs
+елемент
+елементs
+вирубка
+вирубкаs
+фіорд
+фіордs
+гейзер
+гейзерs
+льодовик
+льодовикs
+степ
+степs
+пагорб
+пагорбs
+острів
+острівs
+земля
+земляs
+болото
+болотоs
+торф
+торфs
+грязюка
+грязюкаs
+пік
+пікs
+точка
+точкаs
+риф
+рифs
+гірський хребет
+гірський хребетs
+ріка
+рікаs
+щебінь
+щебіньs
+чагарник
+чагарникs
+мілина
+мілинаs
+джерело
+джерелоs
+перешийок
+перешийокs
+дерево
+деревоs
+долина
+долинаs
+вулкан
+вулканs
+вода
+водаs
+водно-болотні угіддя
+водно-болотні угіддяs
+місто
+містоs
+країна
+країнаs
+район
+районs
+хутір
+хутірs
+дома
+домаs
+острівець
+острівецьs
+населений пункт
+населений пунктs
+мур
+мурs
+муніципалітет
+муніципалітетs
+індекс
+індексs
+море
+мореs
+область/штат
+область/штатs
+підрозділ
+підрозділs
+передмістя
+передмістяs
+неприєднанні території
+неприєднанні територіїs
+село
+селоs
+кинуті колії
+кинуті коліїs
+будівництво колії
+будівництво коліїs
+покинута колія
+покинута коліяs
+покинута залізнична станція
+покинута залізнична станціяs
+фунікулер
+фунікулерs
+зупинка поїзда
+зупинка поїздаs
+історична залізнична станція
+історична залізнична станціяs
+переїзд
+переїздs
+залізничний переїзд
+залізничний переїздs
+швидкісний трамвай
+швидкісний трамвайs
+монорейка
+монорейкаs
+вузькоколійка
+вузькоколійкаs
+залізнична платформа
+залізнична платформаs
+законсервовані колії
+законсервовані коліїs
+залізнична гілка
+залізнична гілкаs
+станція метро
+станція метроs
+вхід в метро
+вхід в метроs
+стрілка
+стрілкаs
+трамвайні колії
+трамвайні коліїs
+трамвайна зупинка
+трамвайна зупинкаs
+депо
+депоs
+спритні напої
+спритні напоїs
+одяг
+одягs
+художній салон
+художній салонs
+хліб
+хлібs
+салон краси
+салон красиs
+напої
+напоїs
+веломагазин
+веломагазинs
+книгарня
+книгарняs
+м’ясо
+м’ясоs
+автомагазин
+автомагазинs
+автосалон
+автосалонs
+автозапчастини
+автозапчастиниs
+авто майстерня
+авто майстерняs
+килими
+килимиs
+соціальний магазин
+соціальний магазинs
+хімтовари
+хімтовариs
+комп’ютерна крамниця
+комп’ютерна крамницяs
+кондитерська
+кондитерськаs
+мінімаркет
+мінімаркетs
+послуги копіювання
+послуги копіюванняs
+магазин косметики
+магазин косметикиs
+універмаг
+універмагs
+уцінені товари
+уцінені товариs
+зроби сам
+зроби самs
+хімчистка
+хімчисткаs
+магазин електроніки
+магазин електронікиs
+агентство нерухомості
+агентство нерухомостіs
+сільпо
+сільпоs
+модний одяг
+модний одягs
+риба
+рибаs
+квіти
+квітиs
+продовольчі товари
+продовольчі товариs
+ритуальні послуги
+ритуальні послугиs
+меблі
+мебліs
+галерея
+галереяs
+сад та город
+сад та городs
+універсам
+універсамs
+подарунки
+подарункиs
+овочі, фрукти
+овочі, фруктиs
+бакалія
+бакаліяs
+перукар
+перукарs
+хозтовари
+хозтовариs
+аудіо-техніка
+аудіо-технікаs
+страхування
+страхуванняs
+ювелірний магазин
+ювелірний магазинs
+кіоск
+кіоскs
+пральня
+пральняs
+торгівельно-розважальний центр
+торгівельно-розважальний центрs
+мобільні телефони
+мобільні телефониs
+мотоцикли
+мотоциклиs
+музика
+музикаs
+газетний кіоск
+газетний кіоскs
+оптика
+оптикаs
+продовольчий магазин
+продовольчий магазинs
+виносна торгівля
+виносна торгівляs
+зоомагазин
+зоомагазинs
+фотомагазин
+фотомагазинs
+салон
+салонs
+взуття
+взуттяs
+торговий центр
+торговий центрs
+спортивні товари
+спортивні товариs
+канцтовари
+канцтовариs
+іграшки
+іграшкиs
+туристична агенція
+туристична агенціяs
+відео
+відеоs
+вино
+виноs
+гірський притулок
+гірський притулокs
+образотворче мистецтво
+образотворче мистецтвоs
+цікаві місця
+цікаві місцяs
+ліжко та сніданок
+ліжко та сніданокs
+кабіна
+кабінаs
+турбаза
+турбазаs
+майданчик для трейлерів
+майданчик для трейлерівs
+шале
+шалеs
+гостьовий будинок
+гостьовий будинокs
+хостел
+хостелs
+інформація
+інформаціяs
+навіс
+навісs
+мотель
+мотельs
+місце для пікніків
+місце для пікніківs
+тематичний парк
+тематичний паркs
+оглядовий майданчик
+оглядовий майданчикs
+зоопарк
+зоопаркs
+верф
+верфs
+з’єднання водних шляхів
+з’єднання водних шляхівs
+дамба
+дамбаs
+покинутий канал
+покинутий каналs
+рів
+рівs
+док
+докs
+дренажний канал
+дренажний каналs
+шлюз
+шлюзs
+шлюзові ворота
+шлюзові воротаs
+мінеральне джерело
+мінеральне джерелоs
+якірна стоянка
+якірна стоянкаs
+пороги
+порогиs
+берег ріки
+берег рікиs
+струмок
+струмокs
+пересохле русло
+пересохле руслоs
+пункт водопостачання
+пункт водопостачанняs
+водоспад
+водоспадs
+ставок
+ставокs
+# vi
+sân bay
+các sân bay
+phi trường
+các phi trường
+trung tâm nghệ thuật
+các trung tâm nghệ thuật
+máy rút tiền tự động
+các máy rút tiền tự động
+ngân hàng
+các ngân hàng
+quán rượu
+các quán rượu
+ghế
+các ghế
+chỗ đậu xe đạp
+các chỗ đậu xe đạp
+chỗ mướn xe đạp
+các chỗ mướn xe đạp
+các trạm xe buýt
+các trạm xe bus
+quán cà phê
+các quán cà phê
+chỗ mướn xe
+các chỗ mướn xe
+chia sẻ xe cộ
+các chia sẻ xe cộ
+tiệm rửa xe
+các tiệm rửa xe
+sòng bạc
+các sòng bạc
+rạp phim
+các rạp phim
+câu lạc bộ
+các câu lạc bộ
+trường cao đẳng
+các trường cao đẳng
+trung tâm cộng đồng
+các trung tâm cộng đồng
+tòa
+các tòa
+nha sĩ
+các nha sĩ
+bác sĩ
+các bác sĩ
+ký túc xá
+các ký túc xá
+vòi nước uống
+các vòi nước uống
+trường lái xe
+các trường lái xe
+tòa đại sứ
+các tòa đại sứ
+điện thoại khẩn cấp
+các điện thoại khẩn cấp
+nhà hàng ăn nhanh
+các nhà hàng ăn nhanh
+trạm phà
+các trạm phà
+vòi nước máy
+các vòi nước máy
+trạm cứu hỏa
+các trạm cứu hỏa
+vòi nước
+các vòi nước
+cây xăng
+các cây xăng
+nghĩa địa
+các nghĩa địa
+nhà thể dục
+các nhà thể dục
+trung tâm y tế
+các trung tâm y tế
+bệnh viện
+các bệnh viện
+khách sạn
+các khách sạn
+tiệm kem
+các tiệm kem
+tiểu học
+các tiểu học
+thư viện
+các thư viện
+chợ
+các chợ
+chợ phiên
+các chợ phiên
+nhà trẻ
+các nhà trẻ
+văn phòng
+các văn phòng
+công viên
+các công viên
+chỗ đậu xe
+các chỗ đậu xe
+nhà thuốc
+các nhà thuốc
+nơi thờ phụng
+các nơi thờ phụng
+cảnh sát
+các cảnh sát
+hòm thư
+các hòm thư
+bưu điện
+các bưu điện
+trường mầm non
+các trường mầm non
+nhà tù
+các nhà tù
+nhà hàng
+các nhà hàng
+nhà tắm hơi
+các nhà tắm hơi
+trường học
+các trường học
+tiệm
+các tiệm
+siêu thị
+các siêu thị
+taxi
+các taxi
+điện thoại công cộng
+các điện thoại công cộng
+nhà hát
+các nhà hát
+vệ sinh
+các vệ sinh
+thị sảnh
+các thị sảnh
+trường đại học
+các trường đại học
+máy bán hàng
+các máy bán hàng
+thùng rác
+các thùng rác
+điểm truy cập không dây
+các điểm truy cập không dây
+trung tâm thanh niên
+các trung tâm thanh niên
+biên giới hành chính
+các biên giới hành chính
+boong ke
+các boong ke
+nhà thờ
+các nhà thờ
+trụ sở thành phố
+các trụ sở thành phố
+tòa nhà thương mại
+các tòa nhà thương mại
+cửa vào
+các cửa vào
+ga ra
+các ga ra
+tòa nhà bệnh viện
+các tòa nhà bệnh viện
+nhà ở
+các nhà ở
+tòa nhà công nghiệp
+các tòa nhà công nghiệp
+tòa nhà văn phòng
+các tòa nhà văn phòng
+nhà trường
+các nhà trường
+sân vận động
+các sân vận động
+tháp
+các tháp
+nhà ga
+các nhà ga
+tòa nhà đại học
+các tòa nhà đại học
+tòa nhà
+các tòa nhà
+đường cưỡi ngựa
+các đường cưỡi ngựa
+chỗ đậu xe buýt
+các chỗ đậu xe buýt
+đường đang xây
+các đường đang xây
+đường xe đạp
+các đường xe đạp
+cây số
+các cây số
+đường bộ
+các đường bộ
+cổng
+các cổng
+đường hàng xóm
+các đường hàng xóm
+đường nhỏ
+các đường nhỏ
+đường cao tốc
+các đường cao tốc
+ngã tư đường cao tốc
+các ngã tư đường cao tốc
+lối
+các lối
+đường bộ lớn
+các đường bộ lớn
+đường chính
+các đường chính
+đường đua
+các đường đua
+đường nhà ở
+các đường nhà ở
+đường
+các đường
+đường lớn
+các đường lớn
+đường phụ
+các đường phụ
+dịch vụ dọc đường cao tốc
+các dịch vụ dọc đường cao tốc
+cầu thang
+các cầu thang
+đường mòn
+các đường mòn
+xa lộ
+các xa lộ
+đường không phân loại
+các đường không phân loại
+đường không lát
+các đường không lát
+khu vực khảo cổ
+các khu vực khảo cổ
+chiến trường
+các chiến trường
+mốc biên giới
+các mốc biên giới
+lâu đài
+các lâu đài
+thánh tượng
+các thánh tượng
+trang viên
+các trang viên
+đài tưởng niệm
+các đài tưởng niệm
+mỏ
+các mỏ
+đài kỷ niệm
+các đài kỷ niệm
+bảo tàng
+các bảo tàng
+tàn tích
+các tàn tích
+thánh giá dọc đường
+các thánh giá dọc đường
+đền thánh dọc đường
+các đền thánh dọc đường
+khu vườn gia đình
+các khu vườn gia đình
+lưu vực
+các lưu vực
+khu vực thương mại
+các khu vực thương mại
+bảo tồn
+các bảo tồn
+công trường xây dựng
+các công trường xây dựng
+trại
+các trại
+sân trại
+các sân trại
+rừng trồng cây
+các rừng trồng cây
+cỏ
+các cỏ
+khu vực công nghiệp
+các khu vực công nghiệp
+nơi đổ rác
+các nơi đổ rác
+đồng cỏ
+các đồng cỏ
+khu vực quân sự
+các khu vực quân sự
+núi
+các núi
+khu bảo tồn thiên niên
+các khu bảo tồn thiên niên
+đường trượt tuyết
+các đường trượt tuyết
+quảng trường
+các quảng trường
+mỏ đá
+các mỏ đá
+đường sắt
+các đường sắt
+sân chơi
+các sân chơi
+bể nước
+các bể nước
+khu vực nhà ở
+các khu vực nhà ở
+khu vực buôn bán
+các khu vực buôn bán
+vườn nho
+các vườn nho
+đầm lầy
+các đầm lầy
+rừng
+các rừng
+hồ đánh cá
+các hồ đánh cá
+vườn
+các vườn
+sân golf
+các sân golf
+sân băng
+các sân băng
+bãi thể thao
+các bãi thể thao
+sân giải trí
+các sân giải trí
+trung tâm thể thao
+các trung tâm thể thao
+hồ bơi
+các hồ bơi
+công viên nước
+các công viên nước
+vịnh
+các vịnh
+bãi biển
+các bãi biển
+mũi đất
+các mũi đất
+cửa vào hang
+các cửa vào hang
+eo biển
+các eo biển
+vách đá
+các vách đá
+bờ biển
+các bờ biển
+mạch nước phun
+các mạch nước phun
+sông băng
+các sông băng
+bãi hoang
+các bãi hoang
+đồi
+các đồi
+đảo
+các đảo
+đất
+các đất
+truông
+các truông
+đỉnh
+các đỉnh
+rạn san hô
+các rạn san hô
+sông
+các sông
+đá
+các đá
+suối
+các suối
+cây
+các cây
+thung lũng
+các thung lũng
+núi lửa
+các núi lửa
+nước
+các nước
+thành phố
+các thành phố
+quốc gia
+các quốc gia
+quận hạt
+các quận hạt
+dãy nhà
+các dãy nhà
+địa phương
+các địa phương
+mã bưu điện
+các mã bưu điện
+miền
+các miền
+biển
+các biển
+tỉnh bang
+các tỉnh bang
+hàng xóm
+các hàng xóm
+ngoại ô
+các ngoại ô
+thị xã/trấn
+các thị xã/trấn
+khu chưa hợp nhất
+các khu chưa hợp nhất
+làng
+các làng
+đường sắt đang xây
+các đường sắt đang xây
+nhà ga đóng cửa
+các nhà ga đóng cửa
+đường sắt leo núi
+các đường sắt leo núi
+nhà ga lịch sử
+các nhà ga lịch sử
+ga đầu mối
+các ga đầu mối
+đường một ray
+các đường một ray
+trạm xe điện ngầm
+các trạm xe điện ngầm
+cửa vào nhà ga xe điện ngầm
+các cửa vào nhà ga xe điện ngầm
+đường xe điện
+các đường xe điện
+tiệm bánh
+các tiệm bánh
+tiệm xe đạp
+các tiệm xe đạp
+tiệm sách
+các tiệm sách
+tiệm xe hơi
+các tiệm xe hơi
+cửa hàng xe hơi
+các cửa hàng xe hơi
+tiệm sửa xe
+các tiệm sửa xe
+tiệm thảm
+các tiệm thảm
+tiệm quần áo
+các tiệm quần áo
+tiệm máy tính
+các tiệm máy tính
+tiệm kẹo
+các tiệm kẹo
+tiệm tập hóa
+các tiệm tập hóa
+tiệm mỹ phẩm
+các tiệm mỹ phẩm
+tiệm thời trang
+các tiệm thời trang
+tiệm cá
+các tiệm cá
+tiệm hoa
+các tiệm hoa
+tiệm thực phẩm
+các tiệm thực phẩm
+tiệm tạp phẩm
+các tiệm tạp phẩm
+tiệm làm tóc
+các tiệm làm tóc
+bảo hiểm
+các bảo hiểm
+tiệm kim hoàn
+các tiệm kim hoàn
+tiệm giặt quần áo
+các tiệm giặt quần áo
+trung tâm mua sắm
+các trung tâm mua sắm
+tiệm điện thoại di động
+các tiệm điện thoại di động
+cửa hàng xe mô tô
+các cửa hàng xe mô tô
+tiệm nhạc
+các tiệm nhạc
+tiệm báo
+các tiệm báo
+tiệm kính mắt
+các tiệm kính mắt
+tiệm thực phẩm hữu cơ
+các tiệm thực phẩm hữu cơ
+tiệm rửa hình
+các tiệm rửa hình
+tiệm giày
+các tiệm giày
+tiệm thể thao
+các tiệm thể thao
+tiệm đồ chơi
+các tiệm đồ chơi
+văn phòng du lịch
+các văn phòng du lịch
+tiệm phim
+các tiệm phim
+túp lều trên núi
+các túp lều trên núi
+tác phẩm nghệ thuật
+các tác phẩm nghệ thuật
+nơi du lịch
+các nơi du lịch
+nhà trọ
+các nhà trọ
+túp lều
+các túp lều
+nơi cắm trại
+các nơi cắm trại
+nhà ván
+các nhà ván
+thông tin
+các thông tin
+nhà chái
+các nhà chái
+khách sạn dọc đường
+các khách sạn dọc đường
+bàn ăn ngoài trời
+các bàn ăn ngoài trời
+công viên giải trí
+các công viên giải trí
+thắng cảnh
+các thắng cảnh
+vườn thú
+các vườn thú
+kênh
+các kênh
+đập
+các đập
+thác ghềnh
+các thác ghềnh
+bờ sông
+các bờ sông
+dòng suối
+các dòng suối
+thác
+các thác

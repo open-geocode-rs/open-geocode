@@ -33,6 +33,11 @@ levenshtein_automata = "0.2"
 # Checks a downloaded extract against the MD5 sum Geofabrik publishes.
 md-5 = "0.11.0"
 memmap2 = "0.9"
+# The global allocator: the Windows process heap serializes many-threaded
+# builds on its lock, and mimalloc's per-thread heaps do not. Version 2, the
+# long-deployed line: the crate's default, version 3, crashed a Germany build
+# with a null read in its arena bitmap (`mi_bitmap_try_find_and_claim`).
+mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 osmpbf = "0.3"
 # The interactive `og` interface, drawn inline below the prompt.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
@@ -56,6 +61,21 @@ unicode-script = "0.5.7"
 ureq = "3.4.2"
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+# The resource probe: usable CPUs, memory and disk, and memory-map hints.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # Used only by the in-crate router tests to drive the Router via `oneshot`.
