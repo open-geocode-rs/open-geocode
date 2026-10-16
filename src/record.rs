@@ -281,7 +281,7 @@ impl InterpolationRange {
     /// number on an odd range).
     pub fn fraction_of(&self, number: u32) -> Option<f64> {
         if !(self.start..=self.end).contains(&number)
-            || (self.step > 0 && (number - self.start) % self.step != 0)
+            || (self.step > 0 && !(number - self.start).is_multiple_of(self.step))
         {
             return None;
         }

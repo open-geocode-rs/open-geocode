@@ -236,7 +236,7 @@ fn write_cell_index(
                      points: &mut Vec<u64>,
                      segments: &mut Vec<u64>|
      -> Result<()> {
-        if cell_count % CELLS_PER_BLOCK == 0 {
+        if cell_count.is_multiple_of(CELLS_PER_BLOCK) {
             blocks.push((cell, data_len));
             previous_cell = cell;
         }
