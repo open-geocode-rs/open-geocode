@@ -1,5 +1,5 @@
 # Hand decisions applied on top of the pinned upstream snapshots.
-# scripts/catalog/catalog.py reads this file; regions.json is generated from it.
+# catalog/catalog.py reads this file; regions.json is generated from it.
 #
 # Keys are our region ids (the Geofabrik download path without the continent
 # and without -latest.osm.pbf), so `canada/ontario`, `germany`, `russia`.

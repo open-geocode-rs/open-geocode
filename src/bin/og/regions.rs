@@ -1,6 +1,6 @@
 //! The region tree the build picker browses: the planet, continents,
 //! countries and sub-regions. It is the catalog `catalog/regions.json`, which
-//! `scripts/catalog/catalog.py` generates from pinned upstream snapshots, so
+//! `catalog/catalog.py` generates from pinned upstream snapshots, so
 //! every size and date here is upstream's own.
 
 use std::sync::OnceLock;

@@ -55,7 +55,7 @@ Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machin
 cargo run --release --features tui --bin og
 ```
 
-Regions come from the catalog in `catalog/regions.json`, generated from pinned upstream snapshots (see `scripts/catalog/README.md`).
+Regions come from the catalog in `catalog/regions.json`, generated from pinned upstream snapshots (see `catalog/README.md`).
 `og` downloads the region's OpenStreetMap extract, checks it against its published MD5 sum, and builds the Pack on this machine.
 Extracts and Packs live in the og home: `OG_HOME` when set, otherwise the platform's local data directory.
 An extract already at `<home>/pbf/<region id>.osm.pbf` is used without downloading.

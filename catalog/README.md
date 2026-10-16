@@ -13,16 +13,16 @@ It is generated, never edited by hand.
 | `catalog/upstream/overture.json` | Overture places and addresses counted inside each Geofabrik polygon. |
 | `catalog/curation.toml` | Hand decisions, grouped by reason, each group with a `why`. |
 | `catalog/regions.json` | The output. |
-| `scripts/catalog/catalog.py` | The generator. |
+| `catalog/catalog.py` | The generator. |
 
 ## Commands
 
 Run Python isolated (`-I`) from the repository root.
 
 ```sh
-python -I scripts/catalog/catalog.py generate
-python -I scripts/catalog/catalog.py check
-python -I scripts/catalog/catalog.py update geofabrik|openaddresses|overture|all
+python -I catalog/catalog.py generate
+python -I catalog/catalog.py check
+python -I catalog/catalog.py update geofabrik|openaddresses|overture|all
 ```
 
 `generate` reads only the snapshots and `curation.toml`, so it works offline and two runs give byte-identical output.

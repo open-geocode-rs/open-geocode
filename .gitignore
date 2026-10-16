@@ -34,7 +34,5 @@ data/
 # Python bytecode
 __pycache__/
 
-# Local scripts: fixture generators, baselines and vendoring helpers. The
-# region catalog's generator is not one: CI runs it.
-/scripts/*
-!/scripts/catalog/
+# Local scripts: fixture generators, baselines and vendoring helpers.
+/scripts/

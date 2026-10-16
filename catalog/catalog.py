@@ -7,18 +7,18 @@ sha256 in catalog/sources.lock.json. `generate` is offline: it reads only the
 snapshots and catalog/curation.toml, so two runs give byte-identical output.
 `check` regenerates in memory and fails if anything drifted.
 
-    python -I scripts/catalog/catalog.py update geofabrik|openaddresses|overture|all
-    python -I scripts/catalog/catalog.py generate
-    python -I scripts/catalog/catalog.py check
+    python -I catalog/catalog.py update geofabrik|openaddresses|overture|all
+    python -I catalog/catalog.py generate
+    python -I catalog/catalog.py check
 
 `generate` and `check` need only the standard library. `update overture`
-needs the packages in scripts/catalog/requirements.txt.
+needs the packages in catalog/requirements.txt.
 """
 import argparse, datetime, email.utils, hashlib, json, os, sys, time, tomllib
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CATALOG = os.path.join(ROOT, "catalog")
 UPSTREAM = os.path.join(CATALOG, "upstream")
 LOCK = os.path.join(CATALOG, "sources.lock.json")
