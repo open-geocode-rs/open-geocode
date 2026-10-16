@@ -2,6 +2,11 @@
 
 Fast, lightweight, self-hosted geocoding in pure Rust.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/open-geocode-rs/open-geocode/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/open-geocode-rs/open-geocode/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/open-geocode.svg?style=flat-square)](https://crates.io/crates/open-geocode)
+[![docs.rs](https://img.shields.io/docsrs/open-geocode?style=flat-square)](https://docs.rs/open-geocode)
+[![license](https://img.shields.io/crates/l/open-geocode.svg?style=flat-square)](LICENSE)
+
 `open-geocode` is a minimal Rust-native geocoding engine: address and named
 place search, Tantivy-backed autocomplete, and reverse geocoding from coordinates to
 address-first location context. It turns OpenStreetMap PBF extracts into a
@@ -42,38 +47,11 @@ Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machin
    cargo run --release -- serve --pack data/pack
    ```
 
-## Building large extracts and the planet
+## What's next
 
-The builder streams: OSM objects, node references, coordinates, and finished records flow through external sorts, so its large buffers stay within `--memory-budget-mb` whatever the input size.
-A region fits in the budget and never touches disk; a country or the planet spills sorted runs to scratch files and merges them, through the same code.
+I'm actively working on turning open-geocode into a free batch geocoder for the whole planet: drop in a spreadsheet of addresses, get it back with coordinates.
 
-```
-cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-budget-mb 16384 --scratch-dir /mnt/fast-ssd/og-scratch
-```
-
-- Before it starts, the build probes what the process can use: CPUs (the affinity mask, a cgroup quota or a Windows Job object's CPU cap) and memory (available memory, the Windows commit limit, a cgroup, Job object or rlimit limit).
-  It then checks the input against the memory and disk it needs and stops, naming each shortfall and its fix, unless `--force` is given.
-  The build report records the probe, the sizes chosen and the check (`resources`).
-- `--memory-budget-mb` (minimum 64) sets the one shared pool for the build's large buffers: sort buffers (counted by capacity), the string table of the current segment, merge read buffers, the text indexing buffers and the parser's training lattices.
-  Without it the pool is half of the available memory less what the build holds outside the pool, between 256 MiB and 1 GiB.
-  A larger pool spills less but builds slower: sorting, hashing and indexing in buffers far larger than the CPU caches costs more than the spill saves.
-  The text index takes half of the pool while records are written, and the sorters split the rest fairly, so a sorter running alone may use all of it.
-  A buffer that would overflow its share spills to disk, and so does one that would push the heap past 85% of the memory that was available.
-  The build report records the tracked peak (`scratch.peak_tracked_bytes`) and the heap's (`scratch.peak_heap_bytes`).
-- The build runs one pool of worker threads, one per usable CPU unless the memory beside the budget cannot hold 64 MiB for each; `RAYON_NUM_THREADS` overrides it.
-- The string table cannot spill, so it starts a new segment once it uses an eighth of the pool (or after 1,048,576 records); with a small budget, common strings such as country names are then stored a few more times.
-- A few reservations are needed to make progress and are taken even when the pool is full, so the tracked peak can pass a very small budget:
-  merge read buffers (64 KiB to 1 MiB per run file being merged, sized from the sorter's share) and the text index's minimum of 16 MiB.
-- The process also uses memory outside the pool: the PBF blocks being decoded (a few hundred MB on a many-core machine), the admin boundary polygons, the postcode centroids, and the operating system's cache of mapped files.
-- `--scratch-dir` puts temporary files on a different disk; it defaults to the Pack directory.
-  Each sorted run is deleted as soon as it has been merged, and the whole scratch directory is removed when the build ends.
-  Ontario writes about 1 GB of scratch in total for a 0.94 GB input.
-- The input must be sorted by type and id, which Geofabrik and planet.openstreetmap.org files are.
-  Run `osmium sort` on anything else; the builder stops with an error on unsorted nodes.
-- Admin boundary polygons and postcode centroids grow with the number of boundaries and postcodes, not with the number of addresses.
-- `verify-pack --pack <file>` checks a copied or downloaded Pack against its per-section checksums; every build runs the same check before it publishes.
-
-The build report (`audit/build-report.json`) records the time of each phase, how much each sorter spilled, and the size of every Pack section.
+Think Adobe's file converter, but for addresses, and for the whole planet.
 
 ## Rebuilding packs safely
 
