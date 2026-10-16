@@ -6,6 +6,7 @@
 //! screen: finished steps are printed above it and stay in terminal history.
 
 mod app;
+mod batch;
 mod mock;
 mod regions;
 mod ui;
@@ -209,6 +210,65 @@ mod preview {
         let build = app.build.as_mut().expect("a build is running");
         build.current = 8;
         show(&app, "build no total");
+    }
+
+    #[test]
+    fn batch_flow() {
+        use std::time::{Duration, Instant};
+
+        let mut app = App::new(false);
+        press(&mut app, &[KeyCode::Char('g')]);
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(app.screen == Screen::BatchSetup);
+        show(&app, "batch setup");
+        press(&mut app, &[KeyCode::Right, KeyCode::Right]);
+        press(&mut app, &[KeyCode::Down]);
+        show(&app, "batch setup, region role changed");
+        press(&mut app, &[KeyCode::Up]);
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.screen == Screen::BatchRun);
+        if let Some(build) = app.build.as_mut() {
+            build.current = 1;
+            build.stage_started = Instant::now() - Duration::from_secs(4);
+        }
+        show(&app, "batch running");
+        for _ in 0..4 {
+            if let Some(build) = app.build.as_mut() {
+                build.stage_started = Instant::now() - Duration::from_secs(60);
+            }
+            app.tick();
+        }
+        assert!(app.screen == Screen::BatchDone);
+        println!("=== batch history");
+        for line in &app.scrollback {
+            println!("{}", text(line));
+        }
+        show(&app, "batch done");
+    }
+
+    #[test]
+    fn batch_file_path() {
+        let path = std::env::temp_dir().join("og-preview-batch.csv");
+        std::fs::write(
+            &path,
+            "Name,Street Address,Town,State
+A,100 queen st w,Toronto,ON
+
+B,24 sussex dr,Ottawa,ON
+",
+        )
+        .expect("the temp file is written");
+        let mut app = App::new(false);
+        press(&mut app, &[KeyCode::Char('g')]);
+        app.on_paste(path.display().to_string());
+        press(&mut app, &[KeyCode::Enter]);
+        std::fs::remove_file(&path).ok();
+        assert!(app.screen == Screen::BatchSetup);
+        let session = app.batch.as_ref().expect("a file is open");
+        assert_eq!(session.file.total_rows, 2);
+        assert!(session.file.header_found);
+        assert_eq!(session.query(0), "100 queen st w, Toronto, ON");
+        show(&app, "batch setup from a file");
     }
 
     #[test]

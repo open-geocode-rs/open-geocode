@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use crate::{
+    batch::{BatchFile, BatchSession},
     mock::{self, Stage},
     regions::{self, Region},
     ui,
@@ -27,6 +28,10 @@ pub enum Screen {
     Done,
     Query,
     Json,
+    /// Choosing the columns of a file to geocode.
+    BatchSetup,
+    BatchRun,
+    BatchDone,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -155,6 +160,9 @@ pub struct App {
     pub batch_text: String,
     pub batch_rows: Vec<BatchRow>,
     pub batch_note: String,
+    /// The file being geocoded, once one is opened.
+    pub batch: Option<BatchSession>,
+    pub batch_button: usize,
 }
 
 impl App {
@@ -194,6 +202,8 @@ impl App {
             batch_text: String::new(),
             batch_rows: Vec::new(),
             batch_note: String::new(),
+            batch: None,
+            batch_button: 0,
         }
     }
 
@@ -396,8 +406,16 @@ impl App {
         } else {
             self.built_secs = build.elapsed();
             self.build = None;
-            self.screen = Screen::Done;
-            self.done_cursor = 0;
+            if let Some(session) = &mut self.batch
+                && self.screen == Screen::BatchRun
+            {
+                session.summarize();
+                self.batch_button = 0;
+                self.screen = Screen::BatchDone;
+            } else {
+                self.screen = Screen::Done;
+                self.done_cursor = 0;
+            }
         }
     }
 
@@ -416,6 +434,9 @@ impl App {
             Screen::Done => self.done_key(key),
             Screen::Query => self.query_key(key),
             Screen::Json => self.json_key(key),
+            Screen::BatchSetup => self.batch_setup_key(key),
+            Screen::BatchRun => self.batch_run_key(key),
+            Screen::BatchDone => self.batch_done_key(key),
         }
     }
 
@@ -712,7 +733,17 @@ impl App {
                 }
             }
             KeyCode::Char('j') if ctrl => self.push_batch("\n"),
-            KeyCode::Enter => self.push_batch("\n"),
+            KeyCode::Char('e') if ctrl => self.open_batch_setup(BatchFile::example()),
+            KeyCode::Enter => {
+                let typed = self.batch_text.trim().trim_matches('"');
+                let file = (!typed.is_empty() && !typed.contains('\n'))
+                    .then(|| BatchFile::from_path(Path::new(typed)))
+                    .flatten();
+                match file {
+                    Some(file) => self.open_batch_setup(file),
+                    None => self.push_batch("\n"),
+                }
+            }
             KeyCode::Up if rows > 0 => self.hit_cursor = (self.hit_cursor + rows - 1) % rows,
             KeyCode::Down if rows > 0 => self.hit_cursor = (self.hit_cursor + 1) % rows,
             KeyCode::Esc => {
@@ -779,6 +810,71 @@ impl App {
                     .push_str(text.lines().next().unwrap_or("").trim());
                 self.region_reset(0);
             }
+            _ => {}
+        }
+    }
+
+    fn open_batch_setup(&mut self, file: BatchFile) {
+        self.batch = Some(BatchSession::new(file));
+        self.screen = Screen::BatchSetup;
+    }
+
+    fn batch_setup_key(&mut self, key: KeyEvent) {
+        let Some(session) = &mut self.batch else {
+            self.screen = Screen::Query;
+            return;
+        };
+        let columns = session.roles.len().max(1);
+        match key.code {
+            KeyCode::Left => session.column = (session.column + columns - 1) % columns,
+            KeyCode::Right | KeyCode::Tab => session.column = (session.column + 1) % columns,
+            KeyCode::Up | KeyCode::Down => {
+                let forward = key.code == KeyCode::Down;
+                if let Some(role) = session.roles.get_mut(session.column) {
+                    *role = role.cycle(forward);
+                }
+            }
+            KeyCode::Enter => self.start_batch_run(),
+            KeyCode::Esc => self.screen = Screen::Query,
+            _ => {}
+        }
+    }
+
+    fn start_batch_run(&mut self) {
+        let Some(session) = &mut self.batch else {
+            return;
+        };
+        session.prepare();
+        let stages = session.stages();
+        self.build = Some(Build {
+            stages,
+            current: 0,
+            stage_started: Instant::now(),
+        });
+        self.scrollback.extend(ui::batch_header(self));
+        self.screen = Screen::BatchRun;
+    }
+
+    fn batch_run_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            if let Some(build) = self.build.take() {
+                self.scrollback.push(ui::batch_cancelled(&build));
+            }
+            self.screen = Screen::BatchSetup;
+        }
+    }
+
+    fn batch_done_key(&mut self, key: KeyEvent) {
+        let buttons = 3;
+        match key.code {
+            KeyCode::Left => self.batch_button = (self.batch_button + buttons - 1) % buttons,
+            KeyCode::Right | KeyCode::Tab => self.batch_button = (self.batch_button + 1) % buttons,
+            KeyCode::Enter => match self.batch_button {
+                0 => self.flash("Reviewing the rows with no match is not wired in this preview."),
+                1 => self.open_query(Mode::Search),
+                _ => self.screen = Screen::Home,
+            },
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Home,
             _ => {}
         }
     }

@@ -13,6 +13,7 @@ use ratatui::{
 
 use crate::{
     app::{self, App, Build, Mode, RegionRow, Screen},
+    batch::{self, BatchSession, Role},
     mock::{self, Record, Stage},
     regions,
 };
@@ -247,6 +248,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Done => done(frame, area, app),
         Screen::Query => query(frame, area, app),
         Screen::Json => json(frame, area, app),
+        Screen::BatchSetup => batch_setup(frame, area, app),
+        Screen::BatchRun => batch_run(frame, area, app),
+        Screen::BatchDone => batch_done(frame, area, app),
     }
 }
 
@@ -1205,6 +1209,7 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
             &[
                 ("↑↓", "pick"),
                 ("ctrl+g", "GeoJSON"),
+                ("ctrl+e", "example"),
                 ("ctrl+u", "clear"),
                 ("tab", "mode"),
                 ("esc", esc),
@@ -1265,6 +1270,10 @@ fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
             )),
             Line::from(span(
                 "  A column named address is used; without one, each row is one address.",
+                DIM,
+            )),
+            Line::from(span(
+                "  Press enter on a file path to choose its columns, or ctrl+e for a 10,000 address example.",
                 DIM,
             )),
             Line::raw(""),
@@ -1607,5 +1616,471 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
         frame,
         app,
         &[("↑↓", "scroll"), ("a", all), ("y", "copy"), ("esc", "back")],
+    );
+}
+
+/// The line that opens a batch run in terminal history.
+pub fn batch_header(app: &App) -> Vec<Line<'static>> {
+    let name = app
+        .batch
+        .as_ref()
+        .map(|session| session.file.name.clone())
+        .unwrap_or_default();
+    vec![
+        Line::raw(""),
+        Line::from(vec![
+            plain("    "),
+            bold("Batch geocode"),
+            span(format!("  ·  {name}"), DIM),
+        ]),
+        Line::raw(""),
+    ]
+}
+
+pub fn batch_cancelled(build: &Build) -> Line<'static> {
+    Line::from(vec![
+        plain("    "),
+        plain(format!(
+            "Cancelled while {}.",
+            build.stage().doing_text().to_lowercase()
+        )),
+    ])
+}
+
+/// How a column's role reads above it; the selected column's is in brackets.
+fn role_span(role: Role, selected: bool, cells: usize) -> Span<'static> {
+    let label = if selected {
+        format!("[{}]", role.label())
+    } else {
+        role.label().to_string()
+    };
+    let text = pad(&label, cells);
+    match (role, selected) {
+        (Role::Skip, true) => Span::styled(text, Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
+        (Role::Skip, false) => span(text, FAINT),
+        (_, true) => Span::styled(text, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        (_, false) => span(text, ACCENT),
+    }
+}
+
+/// Which columns of a table fit in `avail` cells, keeping `selected` in view.
+fn visible_columns(widths: &[usize], selected: usize, avail: usize) -> std::ops::Range<usize> {
+    let mut start = 0;
+    loop {
+        let mut end = start;
+        let mut used = 0;
+        while end < widths.len() && used + widths[end] <= avail {
+            used += widths[end];
+            end += 1;
+        }
+        if end == start {
+            end = (start + 1).min(widths.len());
+        }
+        if selected < end || end >= widths.len() || start + 1 >= widths.len() {
+            return start..end;
+        }
+        start += 1;
+    }
+}
+
+// The result columns of the batch screens: the query, what it matched, the
+// coordinates, and one more figure (a score, or the time the query took).
+const MATCH_WIDTH: usize = 20;
+const LAT_WIDTH: usize = 9;
+const LON_WIDTH: usize = 10;
+const LAST_WIDTH: usize = 7;
+
+fn query_width(inner: usize) -> usize {
+    inner
+        .saturating_sub(3 + 2 + MATCH_WIDTH + 2 + LAT_WIDTH + 2 + LON_WIDTH + 2 + LAST_WIDTH)
+        .clamp(14, 30)
+}
+
+fn result_header(inner: usize, title: &str, last: &str) -> Line<'static> {
+    Line::from(span(
+        format!(
+            "   {}  {}  {:>LAT_WIDTH$}  {:>LON_WIDTH$}  {last:>LAST_WIDTH$}",
+            pad(title, query_width(inner)),
+            " ".repeat(MATCH_WIDTH),
+            "lat",
+            "lon",
+        ),
+        DIM,
+    ))
+}
+
+fn result_line(
+    inner: usize,
+    query: &str,
+    hit: Option<(&Record, f64)>,
+    last: Span<'static>,
+) -> Line<'static> {
+    let query_cells = query_width(inner);
+    let shown = if query.is_empty() {
+        "(no address)"
+    } else {
+        query
+    };
+    let mut spans = vec![
+        plain("   "),
+        if query.is_empty() {
+            span(pad(&cut(shown, query_cells), query_cells), FAINT)
+        } else {
+            plain(pad(&cut(shown, query_cells), query_cells))
+        },
+        plain("  "),
+    ];
+    match hit {
+        Some((record, _)) => {
+            spans.push(plain(pad(&cut(record.name, MATCH_WIDTH), MATCH_WIDTH)));
+            spans.push(plain(format!("  {:>LAT_WIDTH$.5}", record.lat)));
+            spans.push(plain(format!("  {:>LON_WIDTH$.5}", record.lon)));
+        }
+        None => {
+            spans.push(span(pad("no match", MATCH_WIDTH), DIM));
+            spans.push(span(format!("  {:>LAT_WIDTH$}", "–"), DIM));
+            spans.push(span(format!("  {:>LON_WIDTH$}", "–"), DIM));
+        }
+    }
+    spans.push(plain("  "));
+    spans.push(last);
+    Line::from(spans)
+}
+
+fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(session) = &app.batch else {
+        return;
+    };
+    let file = &session.file;
+    let inner = area.width as usize;
+    let shown = 3.min(file.total_rows);
+    let sample: Vec<Vec<String>> = (0..shown).map(|index| file.row(index)).collect();
+
+    let mut facts = format!(
+        "{} rows · {} · {}",
+        mock::thousands(file.total_rows),
+        mock::size(file.bytes as f64 / 1e6),
+        if file.header_found {
+            "header found"
+        } else {
+            "no header row"
+        },
+    );
+    if file.blank_skipped > 0 {
+        facts.push_str(&format!(
+            " · {} blank {} skipped",
+            file.blank_skipped,
+            if file.blank_skipped == 1 {
+                "row"
+            } else {
+                "rows"
+            }
+        ));
+    }
+
+    // The columns, each with the role it will play, and the first rows.
+    let widths: Vec<usize> = file
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(column, header)| {
+            let cells = sample
+                .iter()
+                .map(|row| width(&row[column]))
+                .max()
+                .unwrap_or(0);
+            let role = width(session.roles[column].label()) + 2;
+            (width(header).max(cells).max(role) + 2).clamp(9, 18)
+        })
+        .collect();
+    let window = visible_columns(&widths, session.column, inner.saturating_sub(5));
+    let more = window.end < widths.len();
+    let mut roles = vec![plain("   ")];
+    let mut headers = vec![plain("   ")];
+    let mut rows: Vec<Vec<Span<'static>>> = sample.iter().map(|_| vec![plain("   ")]).collect();
+    for column in window {
+        let cells = widths[column];
+        roles.push(role_span(
+            session.roles[column],
+            column == session.column,
+            cells,
+        ));
+        headers.push(span(
+            pad(&cut(&file.headers[column], cells - 2), cells),
+            DIM,
+        ));
+        for (row, line) in sample.iter().zip(rows.iter_mut()) {
+            line.push(plain(pad(&cut(&row[column], cells - 2), cells)));
+        }
+    }
+    if more {
+        roles.push(span("…", FAINT));
+    }
+
+    let mut lines = vec![
+        Line::from(vec![
+            plain("   "),
+            bold("Batch geocode"),
+            span(format!("  ·  {}", app.active_name), DIM),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            plain("   "),
+            bold(file.name.clone()),
+            span(format!("    {facts}"), DIM),
+        ]),
+        Line::raw(""),
+        Line::from(roles),
+        Line::from(headers),
+    ];
+    lines.extend(rows.into_iter().map(Line::from));
+    lines.push(Line::raw(""));
+    lines.push(result_header(inner, "First rows geocoded", "score"));
+    for index in 0..shown {
+        let hit = session.lookup(index);
+        let score = match hit {
+            Some((_, score)) => span(format!("{score:>LAST_WIDTH$.2}"), DIM),
+            None => span(format!("{:>LAST_WIDTH$}", "–"), DIM),
+        };
+        lines.push(result_line(inner, &session.query(index), hit, score));
+    }
+    let mut note = session.estimate();
+    let missing = session.without_address();
+    if missing > 0 {
+        note.push_str(&format!(
+            "  ·  {} rows have no address and will be skipped",
+            mock::thousands(missing)
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(span(format!("   {note}"), DIM)));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        plain("   "),
+        button("Start", true, true),
+        plain("  "),
+        button("Back", false, true),
+    ]));
+    frame.render_widget(Paragraph::new(lines), area);
+    footer(
+        frame,
+        app,
+        &[
+            ("←→", "column"),
+            ("↑↓", "role"),
+            ("enter", "start"),
+            ("esc", "back"),
+        ],
+    );
+}
+
+/// The newest queries of a run, a few at a time: the engine does thousands a
+/// second, so the list shows a sample that changes about seven times a second.
+fn latest_queries(
+    session: &BatchSession,
+    build: &Build,
+    done: usize,
+    inner: usize,
+) -> Vec<Line<'static>> {
+    let stage = build.stage();
+    let total = session.file.total_rows;
+    let (p50, p95, p99) = batch::latency_stats(done);
+    let matched = (done as f64 * session.share).round() as usize;
+    let left = format!("   p50 {p50:.1} ms  ·  p95 {p95:.1} ms  ·  p99 {p99:.1} ms");
+    let share = if done > 0 {
+        matched as f64 / done as f64 * 100.0
+    } else {
+        0.0
+    };
+    let right = format!(
+        "{share:.1}% matched  ·  {} with no match",
+        mock::thousands(done - matched)
+    );
+    let mut lines = vec![
+        Line::from(vec![
+            span(pad(&left, inner.saturating_sub(width(&right))), DIM),
+            span(right, DIM),
+        ]),
+        Line::raw(""),
+        result_header(inner, "Latest", "time"),
+    ];
+    let per_tick = (total as f64 / (stage.play_secs * 1000.0 / 150.0)).max(1.0) as usize;
+    let tick = (build.stage_started.elapsed().as_millis() / 150) as usize;
+    let anchor = (tick * per_tick).min(done);
+    for back in 0..8 {
+        if anchor < back + 1 {
+            break;
+        }
+        let index = anchor - 1 - back;
+        let took = mock::latency_ms(index);
+        let color = if took > 3.0 { ACCENT } else { DIM };
+        lines.push(result_line(
+            inner,
+            &session.query(index),
+            session.lookup(index),
+            span(format!("{:>LAST_WIDTH$}", format!("{took:.1} ms")), color),
+        ));
+    }
+    lines
+}
+
+fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
+    let (Some(build), Some(session)) = (&app.build, &app.batch) else {
+        return;
+    };
+    let inner = area.width as usize;
+    let mut lines = vec![running_line(app, build, inner), Line::raw("")];
+    if build.stage().doing == "Geocoding" {
+        let done = (session.file.total_rows as f64 * build.progress()) as usize;
+        lines.extend(latest_queries(session, build, done, inner));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+    footer(frame, app, &[("esc", "cancel")]);
+}
+
+/// The first rows of the output file: the file's own columns, then lat and
+/// lon, which the run adds.
+fn output_table(session: &BatchSession, inner: usize) -> Vec<Line<'static>> {
+    let file = &session.file;
+    let shown = 3.min(file.total_rows);
+    let sample: Vec<Vec<String>> = (0..shown).map(|index| file.row(index)).collect();
+    let widths: Vec<usize> = file
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(column, header)| {
+            let cells = sample
+                .iter()
+                .map(|row| width(&row[column]))
+                .max()
+                .unwrap_or(0);
+            (width(header).max(cells) + 2).clamp(6, 18)
+        })
+        .collect();
+    let avail = inner.saturating_sub(3 + LAT_WIDTH + 1 + 2 + LON_WIDTH + 1 + 2);
+    let mut used = 0;
+    let mut count = 0;
+    for cells in &widths {
+        if used + cells > avail && count > 0 {
+            break;
+        }
+        used += cells;
+        count += 1;
+    }
+    let coordinate = Style::new().fg(ACCENT);
+    let mut header = vec![plain("   ")];
+    for (cells, name) in widths.iter().zip(&file.headers).take(count) {
+        header.push(span(pad(&cut(name, cells - 2), *cells), DIM));
+    }
+    header.push(Span::styled(
+        format!("{:>w$}", "lat", w = LAT_WIDTH + 1),
+        coordinate,
+    ));
+    header.push(Span::styled(
+        format!("  {:>w$}", "lon", w = LON_WIDTH + 1),
+        coordinate,
+    ));
+    let mut lines = vec![Line::from(header)];
+    for (index, row) in sample.iter().enumerate() {
+        let mut spans = vec![plain("   ")];
+        for (cells, cell) in widths.iter().zip(row).take(count) {
+            spans.push(plain(pad(&cut(cell, cells - 2), *cells)));
+        }
+        match session.lookup(index) {
+            Some((record, _)) => {
+                spans.push(plain(format!("{:>w$.5}", record.lat, w = LAT_WIDTH + 1)));
+                spans.push(plain(format!("  {:>w$.5}", record.lon, w = LON_WIDTH + 1)));
+            }
+            None => spans.push(plain("")),
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn batch_done(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(session) = &app.batch else {
+        return;
+    };
+    let Some(summary) = &session.summary else {
+        return;
+    };
+    let inner = area.width as usize;
+    let rows = session.file.total_rows;
+    let missed = rows - summary.matched;
+    let percent = |count: usize| count as f64 / rows.max(1) as f64 * 100.0;
+    let stem = session.file.stem().to_string();
+
+    let mut accuracy = vec![plain("   ")];
+    for (name, count) in &summary.by_accuracy {
+        accuracy.push(span(format!("{name} "), DIM));
+        accuracy.push(bold(mock::thousands(*count)));
+        accuracy.push(plain("    "));
+    }
+    let output = format!("{stem}.geocoded.csv");
+    let size = format!(
+        "{} rows · {}",
+        mock::thousands(rows),
+        mock::size(summary.output_bytes as f64 / 1e6)
+    );
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            plain("   "),
+            bold(mock::thousands(summary.matched)),
+            span(
+                format!(" matched  ·  {:.1}%", percent(summary.matched)),
+                DIM,
+            ),
+            plain("          "),
+            bold(mock::thousands(missed)),
+            span(format!(" with no match  ·  {:.1}%", percent(missed)), DIM),
+        ]),
+        Line::from(accuracy),
+        Line::from(span(
+            format!(
+                "   p50 {:.1} ms  ·  p95 {:.1} ms  ·  p99 {:.1} ms  ·  slowest {:.1} ms  ·  {:.1}s in all",
+                summary.p50, summary.p95, summary.p99, summary.slowest, summary.seconds
+            ),
+            DIM,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            plain("   "),
+            bold(output.clone()),
+            span(
+                format!(
+                    "{}{size}",
+                    " ".repeat(inner.saturating_sub(3 + width(&output) + width(&size)))
+                ),
+                DIM,
+            ),
+        ]),
+    ];
+    lines.extend(output_table(session, inner));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        span("   Also written   ", DIM),
+        plain(format!("{stem}.audit.csv")),
+        span(
+            format!(" · {}", mock::size(summary.audit_bytes as f64 / 1e6)),
+            DIM,
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    let mut buttons = vec![plain("  ")];
+    for (index, label) in ["Review no matches", "Search in the shell", "Done"]
+        .iter()
+        .enumerate()
+    {
+        buttons.push(button(label, index == app.batch_button, true));
+        buttons.push(plain("  "));
+    }
+    lines.push(Line::from(buttons));
+    frame.render_widget(Paragraph::new(lines), area);
+    footer(
+        frame,
+        app,
+        &[("←→", "choose"), ("enter", "select"), ("q", "home")],
     );
 }

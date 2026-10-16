@@ -727,8 +727,12 @@ fn metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 pub fn size(mb: f64) -> String {
-    if mb < 1.0 {
+    if mb < 0.001 {
+        "<1 KB".to_string()
+    } else if mb < 1.0 {
         format!("{:.0} KB", mb * 1_000.0)
+    } else if mb < 10.0 {
+        format!("{mb:.1} MB")
     } else if mb >= 1_000.0 {
         format!("{:.1} GB", mb / 1_000.0)
     } else {
@@ -799,4 +803,54 @@ pub fn batch_parse(text: &str) -> (Vec<String>, String) {
         .filter(|address| !address.is_empty())
         .collect();
     (addresses, note.to_string())
+}
+
+/// Rows of the 10,000 address example, repeated: address, city, region and
+/// postcode.
+pub const SAMPLE_ROWS: [[&str; 4]; 13] = [
+    ["100 queen st w", "Toronto", "ON", "M5H 2N2"],
+    ["24 sussex dr", "Ottawa", "ON", "K1M 1M4"],
+    ["1 yonge st", "Toronto", "ON", "M5E 1E5"],
+    ["nowhere rd", "Kingston", "ON", "K7L 1A1"],
+    ["290 bremner blvd", "Toronto", "ON", ""],
+    ["65 front st w", "Toronto", "ON", ""],
+    ["queen st w", "Brampton", "ON", ""],
+    ["bay st", "Toronto", "ON", ""],
+    ["yonge st", "Toronto", "ON", ""],
+    ["king st w", "Toronto", "ON", ""],
+    ["parliament hill", "Ottawa", "ON", ""],
+    ["qeens university", "Kingston", "ON", ""],
+    ["123 fake ave", "Toronto", "ON", ""],
+];
+
+/// How long a query takes in milliseconds, made up but always the same for
+/// the same row: most under a millisecond, a few much slower.
+pub fn latency_ms(index: usize) -> f64 {
+    let mut x = (index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 32;
+    let u = (x % 100_000) as f64 / 100_000.0;
+    if u < 0.90 {
+        0.45 + 0.55 * (u / 0.90)
+    } else if u < 0.99 {
+        1.0 + 1.5 * ((u - 0.90) / 0.09)
+    } else if u < 0.999 {
+        2.5 + 3.0 * ((u - 0.99) / 0.009)
+    } else {
+        5.5 + 33.0 * ((u - 0.999) / 0.001)
+    }
+}
+
+/// `10,000`.
+pub fn thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
