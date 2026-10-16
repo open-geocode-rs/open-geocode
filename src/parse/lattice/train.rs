@@ -37,7 +37,7 @@ use super::{
     CountryCode, FIELD_BREAKS, LatticeTagger, NUMERALS, Suppression, Tokens,
     abbreviations::abbreviations,
     decode::{self, END, LABELS, Lattice, Path as LabelPath, START, STATES},
-    dictionary::{Dictionaries, Field, admin_aliases},
+    dictionary::{Dictionaries, Field, admin_aliases, level},
     dictionary_key, is_unspaced,
     weights::Weights,
 };
@@ -837,7 +837,9 @@ impl Slot {
             Self::HouseNumber => Label::HouseNumber,
             Self::Street => Label::Street,
             Self::Suburb | Self::Locality | Self::Island => Label::Locality,
-            Self::District => Label::District,
+            // A district is written on the region side, as libpostal labels
+            // its state_district.
+            Self::District => Label::Region,
             Self::Region => Label::Region,
             Self::Postcode => Label::Postcode,
             Self::Country => Label::Country,
@@ -985,7 +987,7 @@ fn writes_slot(nodes: &[Node], slot: Slot) -> bool {
 fn insert_area(groups: &mut Vec<Group>, label: Label, words: &Tokens) {
     let at = groups
         .iter()
-        .rposition(|group| matches!(group.label, Label::Locality | Label::District))
+        .rposition(|group| group.label == Label::Locality)
         .map(|index| index + 1)
         .or_else(|| {
             groups.iter().position(|group| {
@@ -1109,11 +1111,16 @@ impl<'a> Renderer<'a> {
                         fields.country = name;
                         fields.subject = Some(Slot::Country);
                     }
-                    PlaceLayer::Region => {
+                    // A region that is a city as well (Berlin) is written as
+                    // the locality it is in queries.
+                    PlaceLayer::Region if !self.names_a_locality(name.as_ref()) => {
                         fields.region = name;
                         fields.subject = Some(Slot::Region);
                     }
-                    PlaceLayer::District => {
+                    // A district that is also the place addresses name (a city
+                    // drawn only as a district) is written as a locality, any
+                    // other on the region side.
+                    PlaceLayer::District if !self.names_a_locality(name.as_ref()) => {
                         fields.district = name;
                         fields.subject = Some(Slot::District);
                         fields.region = context.region.as_deref().and_then(words);
@@ -1261,7 +1268,7 @@ impl<'a> Renderer<'a> {
         if let Some(district) = &fields.district
             && !writes_slot(template, Slot::District)
         {
-            insert_area(&mut groups, Label::District, district);
+            insert_area(&mut groups, Label::Region, district);
         }
         // Many places write the largest area first and the house number
         // last ("100-0005 東京都千代田区丸の内2-7-2"), whatever order the
@@ -1360,6 +1367,14 @@ impl<'a> Renderer<'a> {
             .and_then(words)
     }
 
+    /// Whether the dictionaries know `name` as the place an address names:
+    /// a locality name addresses state or a city is drawn as.
+    fn names_a_locality(&self, name: Option<&Tokens>) -> bool {
+        name.and_then(|name| dictionary_key(&name.words.join(" ")))
+            .and_then(|key| self.tagger.dictionaries().get(Field::Locality, &key))
+            .is_some_and(|entry| entry.levels & level::LOCALITY != 0)
+    }
+
     /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
     /// records on one.
     fn island(&self, context: &Areas, random: &mut Random) -> Option<Tokens> {
@@ -1378,11 +1393,7 @@ impl<'a> Renderer<'a> {
             .position(|group| {
                 matches!(
                     group.label,
-                    Label::Locality
-                        | Label::District
-                        | Label::Region
-                        | Label::Postcode
-                        | Label::Country
+                    Label::Locality | Label::Region | Label::Postcode | Label::Country
                 )
             })
             .unwrap_or(groups.len());
@@ -1513,8 +1524,35 @@ impl<'a> Renderer<'a> {
             return Ok(Areas::default());
         };
         let tuple = context.admin_context;
-        let locality = self.admin_name(tuple.locality_record_id, Field::Locality, random)?;
-        let district = self.admin_name(tuple.district_record_id, Field::Locality, random)?;
+        // An area with no locality below it is the locality an address
+        // names (a city drawn only as a district, a kreisfreie Stadt); a
+        // district between the record's locality and its region is written
+        // on the region side.
+        let (locality, district) = match tuple.locality_record_id {
+            Some(locality) => (
+                self.admin_name(Some(locality), Field::Locality, random)?,
+                self.admin_name(tuple.district_record_id, Field::Locality, random)?,
+            ),
+            None => (
+                self.admin_name(tuple.district_record_id, Field::Locality, random)?,
+                None,
+            ),
+        };
+        // A district goes on the region side only when its name names no
+        // locality: "Gütersloh" is a city as well as its Kreis, and a query
+        // naming it means the city, as libpostal's data labels such names.
+        let district = district.filter(|district| !self.names_a_locality(words(district).as_ref()));
+        let mut region = self.admin_name(tuple.region_record_id, Field::Region, random)?;
+        // A city that is a region of its own (Berlin, Hamburg) is the
+        // locality of the records in it that lie in no other.
+        let locality = match locality {
+            None if district.is_none()
+                && self.names_a_locality(region.as_deref().and_then(words).as_ref()) =>
+            {
+                region.take()
+            }
+            locality => locality,
+        };
         let countries = self.names(tuple.country_record_id)?;
         let country_code = countries
             .first()
@@ -1527,7 +1565,7 @@ impl<'a> Renderer<'a> {
             district,
             island: self.name(tuple.place_record_id, random)?,
             suburb: self.name(tuple.neighbourhood_record_id, random)?,
-            region: self.admin_name(tuple.region_record_id, Field::Region, random)?,
+            region,
             country,
             country_code,
         })

@@ -652,19 +652,14 @@ impl LatticeTagger {
     }
 
     /// Whether `path` reads its query as one address can be written: each
-    /// of the country, the region, the district and the postcode is one field at most, a
+    /// of the country, the region and the postcode is one field at most, a
     /// house number has a number, and the places it names that the Pack
     /// knows are each named once and lie one in another (a ward in its city,
     /// the city in its region), so no admin level is named twice.
     /// The model scores parts of a labelling; this holds of the whole.
     fn is_one_address(&self, lattice: &Lattice, path: &decode::Path) -> bool {
         let labels = path.labels(lattice);
-        for label in [
-            Label::Country,
-            Label::Region,
-            Label::District,
-            Label::Postcode,
-        ] {
+        for label in [Label::Country, Label::Region, Label::Postcode] {
             let fields = labels
                 .iter()
                 .enumerate()
@@ -693,7 +688,7 @@ impl LatticeTagger {
             .filter(|segment| {
                 matches!(
                     segment.label,
-                    Label::Locality | Label::District | Label::Region | Label::Country
+                    Label::Locality | Label::Region | Label::Country
                 )
             })
             .filter_map(|segment| {

@@ -7,9 +7,6 @@ pub enum Label {
     Unit,
     Street,
     Locality,
-    /// An area between the locality and the region: a county, a district,
-    /// a Kreis, a département.
-    District,
     Region,
     Postcode,
     Country,
@@ -17,12 +14,11 @@ pub enum Label {
 }
 
 impl Label {
-    pub const ALL: [Label; 9] = [
+    pub const ALL: [Label; 8] = [
         Label::HouseNumber,
         Label::Unit,
         Label::Street,
         Label::Locality,
-        Label::District,
         Label::Region,
         Label::Postcode,
         Label::Country,
@@ -36,7 +32,6 @@ impl Label {
             Label::Unit => "unit",
             Label::Street => "street",
             Label::Locality => "locality",
-            Label::District => "district",
             Label::Region => "region",
             Label::Postcode => "postcode",
             Label::Country => "country",

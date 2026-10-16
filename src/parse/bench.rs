@@ -285,12 +285,8 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                             .iter()
                             .zip(&row.tokens)
                             .all(|(left, right)| left.token == right.token);
-                    let predicted = aligned.then(|| {
-                        tagged
-                            .iter()
-                            .map(|tagged| mapping::scored(tagged.label))
-                            .collect::<Vec<_>>()
-                    });
+                    let predicted = aligned
+                        .then(|| tagged.iter().map(|tagged| tagged.label).collect::<Vec<_>>());
                     add_row(name, line, &row.labels(), predicted.as_deref());
                     if index == 0 && options.show_misses > 0 {
                         let miss = miss(file, variant, line + 1, row, predicted.as_deref());
