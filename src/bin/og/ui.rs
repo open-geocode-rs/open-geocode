@@ -118,7 +118,7 @@ pub fn logo() -> Vec<Line<'static>> {
 }
 
 fn choice(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
-    let mut spans = vec![span("  ✓ ", OK), span(pad(label, 11), DIM)];
+    let mut spans = vec![plain("   "), span(pad(label, 10), DIM)];
     spans.extend(value);
     Line::from(spans)
 }
@@ -154,7 +154,16 @@ fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
 
 /// What a started build leaves in terminal history.
 pub fn choices(app: &App) -> Vec<Line<'static>> {
+    // History lines start at the terminal's edge; the live window is one
+    // column in.
     answers(app, 3)
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![plain(" ")];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Width of the content: the terminal minus its margins, at most 96.
@@ -167,7 +176,7 @@ pub fn build_header(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
         Line::from(vec![
-            plain("  "),
+            plain("    "),
             bold(format!("Building {}", app.region.label)),
         ]),
         Line::raw(""),
@@ -195,12 +204,12 @@ pub fn done_summary(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
         Line::from(vec![
-            span("  ● ", OK),
+            plain("    "),
             bold("Pack ready"),
-            plain(format!("  {}", app.pack_path())),
             span(
                 format!(
-                    "  {}  built in {}",
+                    "  {} · {} · built in {}",
+                    app.pack_path(),
                     mock::PACK.size,
                     mock::duration(app.built_secs)
                 ),
@@ -208,7 +217,7 @@ pub fn done_summary(app: &App) -> Vec<Line<'static>> {
             ),
         ]),
         Line::from(vec![
-            span("    rebuild with  ", DIM),
+            span("    Build it again  ", DIM),
             span(app.command(), ACCENT),
         ]),
         Line::raw(""),
@@ -423,16 +432,49 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     let rows = app.region_rows();
     let browsing = app.region_browsing();
     let inner = area.width.saturating_sub(2) as usize;
+
+    // The title is the way down the tree: the levels above dim, this one bold.
+    let mut names = vec!["Region".to_string()];
+    if browsing {
+        names.extend(
+            app.region_path
+                .iter()
+                .map(|index| tree.at(*index).name.clone()),
+        );
+    } else {
+        names.push("search".to_string());
+    }
+    let mut title = vec![plain("   ")];
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            title.push(span(" › ", FAINT));
+        }
+        title.push(if index + 1 == names.len() {
+            bold(name.clone())
+        } else {
+            span(name.clone(), DIM)
+        });
+    }
+    let mut search = vec![
+        plain("   "),
+        plain(app.region_query.clone()),
+        span("▌", ACCENT),
+    ];
+    if app.region_query.is_empty() {
+        search.push(span(
+            format!(" type to search {} regions", tree.searchable().count()),
+            FAINT,
+        ));
+    }
     let mut lines = vec![
-        input_line(
-            &app.region_query,
-            &format!("type to search {} regions", tree.searchable().count()),
-        ),
+        Line::from(title),
+        Line::raw(""),
+        Line::from(search),
         Line::raw(""),
     ];
     if rows.is_empty() {
         lines.push(Line::from(span(
-            format!("  No region matches \"{}\".", app.region_query.trim()),
+            format!("   No region matches \"{}\".", app.region_query.trim()),
             DIM,
         )));
     }
@@ -450,40 +492,33 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
         // A line under the region itself sets it apart from the regions below.
         if all && rows.len() > 1 && room > 0 {
             lines.push(Line::from(span(
-                format!("  {}", "─".repeat(inner.saturating_sub(4))),
+                format!("   {}", "─".repeat(inner.saturating_sub(6))),
                 FAINT,
             )));
             room -= 1;
         }
         next += 1;
     }
-
-    let mut trail = vec!["Region".to_string()];
-    if browsing {
-        trail.extend(
-            app.region_path
-                .iter()
-                .map(|index| tree.at(*index).name.clone()),
-        );
-    } else {
-        trail.push("search".to_string());
+    while lines.len() < 4 + app::REGION_ROWS {
+        lines.push(Line::raw(""));
     }
+    // Under the list: how many rows are out of sight, and where the cursor is.
     let more = rows.len().saturating_sub(next);
-    let mut block = panel(&trail.join(" › "));
-    if more > 0 {
-        block =
-            block.title_bottom(Line::from(span(format!(" ↓ {more} more "), DIM)).left_aligned());
-    }
-    if !rows.is_empty() {
-        block = block.title_bottom(
-            Line::from(span(
-                format!(" {} of {} ", app.region_cursor + 1, rows.len()),
-                DIM,
-            ))
-            .right_aligned(),
-        );
-    }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let left = if more > 0 {
+        format!("   ↓ {more} more")
+    } else {
+        String::new()
+    };
+    let right = if rows.is_empty() {
+        String::new()
+    } else {
+        format!("{} of {}", app.region_cursor + 1, rows.len())
+    };
+    lines.push(Line::from(vec![
+        span(pad(&left, inner.saturating_sub(width(&right))), DIM),
+        span(right, DIM),
+    ]));
+    frame.render_widget(Paragraph::new(lines), area);
     let hints: &[(&str, &str)] = if browsing {
         &[
             ("↑↓", "move"),
@@ -566,52 +601,44 @@ fn region_row(row: &RegionRow, selected: bool, all: bool, inner: usize) -> Line<
 }
 
 fn sources(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, list, _, _] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(5),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    frame.render_widget(Paragraph::new(answers(app, 1)), done);
-    let inner = list.width.saturating_sub(2) as usize;
-    let lines: Vec<Line> = mock::SOURCES
-        .iter()
-        .enumerate()
-        .map(|(index, source)| {
-            let selected = index == app.source_cursor;
-            let on = app.sources[index];
-            let mark = match (index, on) {
-                (0, _) => span("[✓] ", DIM),
-                (_, true) => span("[✓] ", ACCENT),
-                (_, false) => span("[ ] ", DIM),
-            };
-            let name = if selected {
-                bold(pad(source.name, 18))
+    let inner = area.width.saturating_sub(2) as usize;
+    let mut lines = answers(app, 1);
+    lines.push(Line::raw(""));
+    lines.push(Line::from(bold("   Sources")));
+    lines.push(Line::raw(""));
+    lines.extend(mock::SOURCES.iter().enumerate().map(|(index, source)| {
+        let selected = index == app.source_cursor;
+        let on = app.sources[index];
+        let mark = match (index, on) {
+            (0, _) => span("[✓] ", DIM),
+            (_, true) => span("[✓] ", ACCENT),
+            (_, false) => span("[ ] ", DIM),
+        };
+        let name = if selected {
+            bold(pad(source.name, 18))
+        } else {
+            plain(pad(source.name, 18))
+        };
+        let right = if index == 0 {
+            "required ".to_string()
+        } else {
+            format!("+{} ", mock::size(source.download_mb))
+        };
+        let used = 3 + 4 + 18 + width(source.detail);
+        Line::from(vec![
+            if selected {
+                span(" ❯ ", ACCENT)
             } else {
-                plain(pad(source.name, 18))
-            };
-            let right = if index == 0 {
-                "required ".to_string()
-            } else {
-                format!("+{} ", mock::size(source.download_mb))
-            };
-            let used = 3 + 4 + 18 + width(source.detail);
-            Line::from(vec![
-                if selected {
-                    span(" ❯ ", ACCENT)
-                } else {
-                    plain("   ")
-                },
-                mark,
-                name,
-                span(source.detail, DIM),
-                plain(" ".repeat(inner.saturating_sub(used + width(&right)))),
-                span(right, FAINT),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines).block(panel("Sources")), list);
+                plain("   ")
+            },
+            mark,
+            name,
+            span(source.detail, DIM),
+            plain(" ".repeat(inner.saturating_sub(used + width(&right)))),
+            span(right, FAINT),
+        ])
+    }));
+    frame.render_widget(Paragraph::new(lines), area);
     footer(
         frame,
         app,
@@ -625,7 +652,7 @@ fn sources(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn field(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
-    let mut spans = vec![span(format!("  {}", pad(label, 14)), DIM)];
+    let mut spans = vec![plain("   "), span(pad(label, 13), DIM)];
     spans.extend(value);
     Line::from(spans)
 }
@@ -647,14 +674,6 @@ fn button(label: &str, selected: bool, enabled: bool) -> Span<'static> {
 }
 
 fn confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let [done, panel_area, _, _] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(11),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    frame.render_widget(Paragraph::new(answers(app, 2)), done);
     let download = match (app.download_mb(), app.region.local()) {
         (0.0, Some(path)) => vec![plain("nothing"), span(format!("  using {path}"), DIM)],
         (mb, _) => vec![
@@ -662,12 +681,18 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
             span("  from download.geofabrik.de", DIM),
         ],
     };
-    let disk_mark = if app.fits_disk() {
-        span("  ✓", OK)
-    } else {
-        span("  ✗ not enough", ERR)
-    };
-    let lines = vec![
+    let mut disk = vec![
+        plain(format!("~ {:.1} GB", app.disk_gb())),
+        span(format!("   {:.0} GB free", mock::FREE_DISK_GB), DIM),
+    ];
+    if !app.fits_disk() {
+        disk.push(span("   not enough", ERR));
+    }
+    let mut lines = answers(app, 2);
+    lines.extend([
+        Line::raw(""),
+        Line::from(bold("   Ready to build")),
+        Line::raw(""),
         field("Output", vec![plain(app.pack_path())]),
         field(
             "Memory",
@@ -683,14 +708,7 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Line::raw(""),
         field("Download", download),
-        field(
-            "Disk needed",
-            vec![
-                plain(format!("~ {:.1} GB", app.disk_gb())),
-                span(format!("   free {:.0} GB", mock::FREE_DISK_GB), DIM),
-                disk_mark,
-            ],
-        ),
+        field("Disk needed", disk),
         field("Time", vec![plain(mock::about(app.build_secs()))]),
         Line::raw(""),
         Line::from(vec![
@@ -699,11 +717,8 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
             plain("  "),
             button("Back", app.confirm_cursor == 1, true),
         ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(panel("Ready to build")),
-        panel_area,
-    );
+    ]);
+    frame.render_widget(Paragraph::new(lines), area);
     footer(
         frame,
         app,
@@ -939,26 +954,23 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn done(frame: &mut Frame, area: Rect, app: &App) {
-    let [body, _, _] = Layout::vertical([
-        Constraint::Length(13),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    let stat =
-        |label: &str, value: &str| vec![bold(value.to_string()), span(format!(" {label}   "), DIM)];
-    let mut stats = vec![plain("    ")];
+    let stat = |label: &str, value: &str| {
+        vec![bold(value.to_string()), span(format!(" {label}    "), DIM)]
+    };
+    let mut stats = vec![plain("   ")];
     stats.extend(stat("places", mock::PACK.places));
     stats.extend(stat("streets", mock::PACK.streets));
     stats.extend(stat("addresses", mock::PACK.addresses));
     stats.extend(stat("POIs", mock::PACK.pois));
-    let step = |number: &str, label: &str, command: String| {
+    let step = |label: &str, command: String| {
         Line::from(vec![
-            span(format!("    {number}  "), DIM),
-            plain(pad(label, 18)),
+            plain("   "),
+            plain(pad(label, 17)),
             span(command, ACCENT),
         ])
     };
+    let more =
+        |text: String, color: Color| Line::from(vec![plain(" ".repeat(20)), span(text, color)]);
     // The command is long: break it after the region, as a shell would.
     let command = app.command();
     let (head, rest) = command
@@ -973,12 +985,12 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::raw(""),
         Line::from(vec![
-            span("  ● ", OK),
+            plain("   "),
             bold("Pack ready"),
-            plain(format!("   {}", app.pack_path())),
             span(
                 format!(
-                    "   {}   built in {}",
+                    "   {} · {} · built in {}",
+                    app.pack_path(),
                     mock::PACK.size,
                     mock::duration(app.built_secs)
                 ),
@@ -988,26 +1000,20 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(stats),
         Line::raw(""),
-        Line::from(bold("  Next steps")),
-        step("1", "Try it now", format!("og query {}", app.pack_path())),
+        Line::from(bold("   Next")),
+        Line::raw(""),
+        step("Search it", format!("og query {}", app.pack_path())),
         step(
-            "2",
             "Serve the API",
             format!("og serve --pack {}", app.pack_path()),
         ),
-        Line::from(vec![
-            plain(format!("       {}", " ".repeat(18))),
-            span("then GET http://127.0.0.1:8080/search?q=…", DIM),
-        ]),
-        step("3", "Same build again", format!("{head} \\")),
-        Line::from(vec![
-            plain(format!("       {}", " ".repeat(18))),
-            span(format!("  {}", rest.trim_start()), ACCENT),
-        ]),
+        more("then GET http://127.0.0.1:8080/search?q=…".to_string(), DIM),
+        step("Build it again", format!("{head} \\")),
+        more(rest.trim_start().to_string(), ACCENT),
         Line::raw(""),
         Line::from(buttons),
     ];
-    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(Paragraph::new(lines), area);
     footer(
         frame,
         app,
