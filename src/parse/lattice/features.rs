@@ -116,7 +116,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
 
 /// The kinds of vocabulary phrase, in the order of
 /// [`Field::PHRASES`](super::dictionary::Field::PHRASES).
-const PHRASE_KINDS: [&str; 7] = [
+const PHRASE_KINDS: [&str; 8] = [
     "unit",
     "po_box",
     "level",
@@ -124,6 +124,7 @@ const PHRASE_KINDS: [&str; 7] = [
     "street_type",
     "directional",
     "near",
+    "category",
 ];
 
 const DICT_COVER: [&str; 10] = [

@@ -102,7 +102,25 @@ impl Abbreviations {
             }
             spellings = next;
         }
+        // A street type written apart from a name it glues onto in its
+        // language ("lechwehr strasse" of "lechwehrstraße").
+        if let [head @ .., stem, form] = &words[..]
+            && self.glued.iter().any(|(glued, _)| glued == form)
+        {
+            for other in
+                std::iter::once(*form).chain(self.glued_forms(form).iter().map(String::as_str))
+            {
+                let mut glued = head.join(" ");
+                if !glued.is_empty() {
+                    glued.push(' ');
+                }
+                glued.push_str(stem);
+                glued.push_str(other);
+                spellings.push(glued);
+            }
+        }
         spellings.retain(|spelling| spelling != key);
+        spellings.dedup();
         spellings.truncate(MAX_SPELLINGS);
         spellings
     }
@@ -115,18 +133,33 @@ impl Abbreviations {
     /// A word ending in a glued street type, with that type in each of its
     /// other forms ("hauptstr" to "hauptstraße" and "hauptstrasse").
     pub(super) fn unglued(&self, word: &str) -> Vec<String> {
-        let Some((form, others)) = self.glued.iter().find(|(form, _)| {
-            word.len() > form.len()
-                && word.ends_with(form.as_str())
-                && word[..word.len() - form.len()].chars().count() >= MIN_GLUED_STEM_CHARS
-        }) else {
+        let Some((stem, form)) = self.split_glued(word) else {
             return Vec::new();
         };
-        let stem = &word[..word.len() - form.len()];
-        others
+        self.glued_forms(form)
             .iter()
             .map(|other| format!("{stem}{other}"))
             .collect()
+    }
+
+    /// A word ending in a glued street type, as its stem and that type
+    /// ("hauptstraße" as "haupt" and "straße").
+    pub(super) fn split_glued<'w>(&self, word: &'w str) -> Option<(&'w str, &'w str)> {
+        let (form, _) = self.glued.iter().find(|(form, _)| {
+            word.len() > form.len()
+                && word.ends_with(form.as_str())
+                && word[..word.len() - form.len()].chars().count() >= MIN_GLUED_STEM_CHARS
+        })?;
+        Some(word.split_at(word.len() - form.len()))
+    }
+
+    /// The other forms of a street type that glues onto a name, none when it
+    /// does not.
+    fn glued_forms(&self, form: &str) -> &[String] {
+        self.glued
+            .iter()
+            .find(|(glued, _)| glued == form)
+            .map_or(&[], |(_, others)| others.as_slice())
     }
 }
 
@@ -195,6 +228,17 @@ mod tests {
         let unglued = table.unglued("hauptstr");
         assert!(unglued.contains(&"hauptstraße".to_string()), "{unglued:?}");
         assert!(table.unglued("str").is_empty());
+    }
+
+    #[test]
+    fn a_street_type_written_apart_is_also_read_glued() {
+        let table = abbreviations();
+        let spellings = table.spellings("lechwehr strasse");
+        assert!(
+            spellings.contains(&"lechwehrstraße".to_string()),
+            "{spellings:?}"
+        );
+        assert_eq!(table.split_glued("hauptstraße"), Some(("haupt", "straße")));
     }
 
     #[test]

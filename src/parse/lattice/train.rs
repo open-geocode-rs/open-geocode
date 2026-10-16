@@ -1250,7 +1250,25 @@ const ALT_NAME_SHARE: f64 = 0.3;
 const POI_ADDRESS_SHARE: f64 = 0.7;
 /// Share of written units whose unit, PO box or level word follows the
 /// number instead of leading it.
-const UNIT_WORD_AFTER_SHARE: f64 = 0.3;
+const UNIT_WORD_AFTER_SHARE: f64 = 0.5;
+/// Share of rows that keep the commas and line breaks between their fields.
+const KEEP_BREAKS_SHARE: f64 = 0.4;
+/// Share of the unit fields of rows without their breaks that keep the
+/// comma before them anyway, as an address written on one line keeps it.
+const UNIT_BREAK_SHARE: f64 = 0.5;
+/// Share of the street fields of rows whose street hits are hidden, so a
+/// name before a street type is learned as a street without the dictionary.
+const HIDDEN_STREET_SHARE: f64 = 0.3;
+/// Share of the venue fields of rows whose POI hits are hidden.
+const HIDDEN_POI_SHARE: f64 = 0.15;
+/// Share of street names with a glued street type that write it apart.
+const SPLIT_STREET_TYPE_SHARE: f64 = 0.15;
+/// libpostal's level and unit words written without a number
+/// ("erdgeschoss", "penthouse"), MIT (see `NOTICE`).
+const STANDALONE_UNIT_WORDS: [&str; 2] = [
+    include_str!("data/level_standalone.txt"),
+    include_str!("data/unit_standalone.txt"),
+];
 /// Share of written units of one word and a number that glue the two into
 /// one token ("4og", "apt4"), in scripts written with spaces.
 const GLUED_UNIT_SHARE: f64 = 0.3;
@@ -1258,6 +1276,10 @@ const GLUED_UNIT_SHARE: f64 = 0.3;
 /// ("cafe near toronto", "haus in der nähe von köln"), the phrase labelled
 /// other as libpostal labels it.
 const NEAR_SHARE: f64 = 0.04;
+/// Share of the rows that name areas that ask for a kind of place in them
+/// instead ("bäckerei in bremen", "hotels near toronto"), the kind and the
+/// phrase labelled other as libpostal labels them.
+const CATEGORY_SHARE: f64 = 0.03;
 /// Share of the numbered areas of addresses ("2丁目") written as their
 /// number alone after the area they number ("林2"), as libpostal's data
 /// writes them.
@@ -1288,6 +1310,8 @@ struct Renderer<'a> {
     unit_words: [Vec<String>; 3],
     /// The words that ask for what is near a place.
     near: Vec<String>,
+    /// The kinds of place a query asks for.
+    categories: Vec<String>,
     template_countries: Vec<String>,
 }
 
@@ -1301,6 +1325,7 @@ impl<'a> Renderer<'a> {
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
             near: tagger.dictionaries().keys(Field::Near),
+            categories: tagger.dictionaries().keys(Field::Category),
             template_countries: templates().keys().cloned().collect(),
         }
     }
@@ -1441,6 +1466,20 @@ impl<'a> Renderer<'a> {
             // every language's list: "straße" as "str", "hauptstraße" as
             // "hauptstr", "north" as "n".
             let table = abbreviations();
+            // A street type glued onto the name written apart from it some
+            // of the time ("lechwehrstraße" as "lechwehr straße"), as people
+            // who do not know the name write it.
+            let mut split = Tokens::default();
+            for (word, joiner) in street.words.iter().zip(&street.joiners) {
+                match table.split_glued(word) {
+                    Some((stem, form)) if random.chance(SPLIT_STREET_TYPE_SHARE) => {
+                        split.push(stem.to_string(), false, *joiner);
+                        split.push(form.to_string(), false, None);
+                    }
+                    _ => split.push(word.clone(), false, *joiner),
+                }
+            }
+            *street = split;
             for word in street.words.iter_mut() {
                 if !random.chance(0.7) {
                     continue;
@@ -1542,7 +1581,39 @@ impl<'a> Renderer<'a> {
         {
             self.add_near(&mut groups, phrase);
         }
-        let keep_breaks = random.chance(0.2);
+        let areas = groups.iter().any(|group| {
+            matches!(
+                group.label,
+                Label::Locality | Label::Region | Label::Postcode | Label::Country
+            )
+        });
+        if areas
+            && !self.categories.is_empty()
+            && !self.near.is_empty()
+            && random.chance(CATEGORY_SHARE)
+            && let (Some(category), Some(near)) = (
+                words(&self.categories[random.below(self.categories.len() as u64) as usize]),
+                words(&self.near[random.below(self.near.len() as u64) as usize]),
+            )
+        {
+            groups.retain(|group| {
+                matches!(
+                    group.label,
+                    Label::Locality | Label::Region | Label::Postcode | Label::Country
+                )
+            });
+            self.add_near(&mut groups, near);
+            groups.insert(
+                0,
+                Group {
+                    label: Label::Other,
+                    words: category,
+                    break_before: false,
+                    joiner: None,
+                },
+            );
+        }
+        let keep_breaks = random.chance(KEEP_BREAKS_SHARE);
         let mut tokens = Tokens::default();
         let mut gold = Vec::new();
         let mut suppression = Suppression::default();
@@ -1555,7 +1626,13 @@ impl<'a> Renderer<'a> {
                     word.clone()
                 };
                 let (break_before, joiner) = if index == 0 {
-                    (group.break_before && keep_breaks, group.joiner)
+                    // A unit keeps the comma before it more often than other
+                    // fields: "lessingstraße 11, 9 og".
+                    let unit_break = group.label == Label::Unit && random.chance(UNIT_BREAK_SHARE);
+                    (
+                        group.break_before && (keep_breaks || unit_break),
+                        group.joiner,
+                    )
                 } else {
                     (false, group.words.joiners[index])
                 };
@@ -1565,12 +1642,12 @@ impl<'a> Renderer<'a> {
             // Streets and venues are open classes: a query names many the
             // Pack does not hold. Areas are closed: a locality or region is
             // one the Pack knows, so their hits are never hidden.
-            let field = match group.label {
-                Label::Street => Field::Street,
-                Label::Other => Field::Poi,
+            let (field, share) = match group.label {
+                Label::Street => (Field::Street, HIDDEN_STREET_SHARE),
+                Label::Other => (Field::Poi, HIDDEN_POI_SHARE),
                 _ => continue,
             };
-            if random.chance(0.15) {
+            if random.chance(share) {
                 suppression.hide(field, start, tokens.len());
             }
         }
@@ -1686,6 +1763,14 @@ impl<'a> Renderer<'a> {
             .then(|| &vocabulary[random.below(vocabulary.len() as u64) as usize])
             .and_then(|phrase| words(phrase));
         let after = random.chance(UNIT_WORD_AFTER_SHARE);
+        // A word that is a unit or level of its own ("erdgeschoss") takes no
+        // number.
+        if let Some(phrase) = &phrase
+            && standalone_unit_words().contains(&phrase.words.join(" "))
+        {
+            self.insert_unit(groups, phrase.clone(), random);
+            return;
+        }
         let glue = phrase.as_ref().is_some_and(|phrase| {
             phrase.words.len() == 1 && !phrase.words[0].chars().any(is_unspaced)
         }) && value.words.len() == 1
@@ -1722,6 +1807,12 @@ impl<'a> Renderer<'a> {
                 push_phrase(&mut words);
             }
         }
+        self.insert_unit(groups, words, random);
+    }
+
+    /// A unit field after the street and house number, or before the
+    /// address some of the time.
+    fn insert_unit(&self, groups: &mut Vec<Group>, words: Tokens, random: &mut Random) {
         let street_end = groups
             .iter()
             .rposition(|group| matches!(group.label, Label::Street | Label::HouseNumber))
@@ -1841,6 +1932,21 @@ impl<'a> Renderer<'a> {
         self.names.insert(id, names.clone());
         Ok(names)
     }
+}
+
+/// The standalone unit and level words, as [`words`] writes them.
+fn standalone_unit_words() -> &'static std::collections::HashSet<String> {
+    static WORDS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    WORDS.get_or_init(|| {
+        STANDALONE_UNIT_WORDS
+            .iter()
+            .flat_map(|list| list.lines())
+            .filter(|line| !line.starts_with('#'))
+            .flat_map(|line| line.split('|'))
+            .filter_map(words)
+            .map(|tokens| tokens.words.join(" "))
+            .collect()
+    })
 }
 
 /// A record's `name`, or one of its alternate names in [`ALT_NAME_SHARE`]

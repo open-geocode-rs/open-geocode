@@ -96,6 +96,11 @@ const LIBPOSTAL_STAIRCASES: &str = include_str!("data/staircases.txt");
 const LIBPOSTAL_ENTRANCES: &str = include_str!("data/entrances.txt");
 /// Words that ask for what is near a place ("near", "in der nähe von").
 const LIBPOSTAL_NEAR: &str = include_str!("data/near.txt");
+/// Words of kinds of place a query asks for ("bäckerei", "hotels").
+const LIBPOSTAL_CATEGORIES: &str = include_str!("data/categories.txt");
+/// Vendored words dropped because they clash with what queries mean by them
+/// (`data/vocabulary_overrides.txt`).
+const VOCABULARY_OVERRIDES: &str = include_str!("data/vocabulary_overrides.txt");
 /// libpostal's qualifiers: words that say what kind of place a name is, its
 /// admin type words among them ("県", "bezirk", "township").
 const LIBPOSTAL_QUALIFIERS: &str = include_str!("data/qualifiers.txt");
@@ -155,10 +160,13 @@ pub enum Field {
     /// Words that ask for what is near a place ("near", "in der nähe"),
     /// from libpostal.
     Near,
+    /// Kinds of place a query asks for ("bäckerei", "hotels"), from
+    /// libpostal.
+    Category,
 }
 
 impl Field {
-    pub const ALL: [Field; 13] = [
+    pub const ALL: [Field; 14] = [
         Field::Locality,
         Field::Region,
         Field::Street,
@@ -172,6 +180,7 @@ impl Field {
         Field::Building,
         Field::Directional,
         Field::Near,
+        Field::Category,
     ];
     /// The fields of names that a whole span of a query can be.
     pub const NAMES: [Field; 5] = [
@@ -185,7 +194,7 @@ impl Field {
     pub const AREAS: [Field; 3] = [Field::Locality, Field::Region, Field::Country];
     /// The fields of vocabulary phrases a span of a query can be: words
     /// that say what the words beside them are.
-    pub const PHRASES: [Field; 7] = [
+    pub const PHRASES: [Field; 8] = [
         Field::Unit,
         Field::PoBox,
         Field::Level,
@@ -193,6 +202,7 @@ impl Field {
         Field::StreetType,
         Field::Directional,
         Field::Near,
+        Field::Category,
     ];
 
     /// The Pack section that holds the field.
@@ -211,6 +221,7 @@ impl Field {
             Field::Building => "parse/building",
             Field::Directional => "parse/directional",
             Field::Near => "parse/near",
+            Field::Category => "parse/category",
         }
     }
 
@@ -991,15 +1002,19 @@ impl DictionaryBuilder {
                 units.entry(word.clone()).or_insert(*entry).count = entry.count;
             }
         }
-        fields[Field::Unit.index()] = units;
+        fields[Field::Unit.index()] = with_glued_forms(units);
         for (field, list) in [
             (Field::PoBox, LIBPOSTAL_PO_BOXES),
             (Field::Level, LIBPOSTAL_LEVEL_TYPES),
             (Field::Building, LIBPOSTAL_BUILDING_TYPES),
             (Field::Directional, LIBPOSTAL_DIRECTIONALS),
             (Field::Near, LIBPOSTAL_NEAR),
+            (Field::Category, LIBPOSTAL_CATEGORIES),
         ] {
-            fields[field.index()] = vocabulary(list);
+            fields[field.index()] = match field {
+                Field::PoBox | Field::Level => with_glued_forms(vocabulary(list)),
+                _ => vocabulary(list),
+            };
         }
         // Every word of every name but a POI's: a venue's name is any word
         // at all, and would make typos of street names known words.
@@ -1022,6 +1037,9 @@ impl DictionaryBuilder {
             }
         }
         fields[Field::Word.index()] = words;
+        for (field, phrase) in vocabulary_overrides() {
+            fields[field.index()].remove(&phrase);
+        }
         for field in Field::ALL {
             pack.add(
                 field.section(),
@@ -1255,6 +1273,43 @@ fn unit_designators(value: &str) -> Vec<String> {
 /// A vendored word list as dictionary entries: one phrase per line, its
 /// variants separated by `|`, `#` lines comments. Every language of a list
 /// is read alike.
+/// The vendored words [`VOCABULARY_OVERRIDES`] drops, as dictionary keys.
+fn vocabulary_overrides() -> Vec<(Field, String)> {
+    VOCABULARY_OVERRIDES
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let (field, phrase) = line.split_once('\t')?;
+            let field = match field {
+                "unit" => Field::Unit,
+                "po_box" => Field::PoBox,
+                "level" => Field::Level,
+                "building" => Field::Building,
+                "street_type" => Field::StreetType,
+                "directional" => Field::Directional,
+                "near" => Field::Near,
+                "category" => Field::Category,
+                _ => return None,
+            };
+            Some((field, dictionary_key(phrase)?))
+        })
+        .collect()
+}
+
+/// A phrase of several words is also written glued into one, beside its
+/// number ("pobox29", "shishobako4256"), so its glued form is a key too.
+fn with_glued_forms(mut entries: BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
+    let glued = entries
+        .iter()
+        .filter(|(key, _)| key.contains(' '))
+        .map(|(key, entry)| (key.replace(' ', ""), *entry))
+        .collect::<Vec<_>>();
+    for (key, entry) in glued {
+        entries.entry(key).or_insert(entry);
+    }
+    entries
+}
+
 pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
     list.lines()
         .map(str::trim)
