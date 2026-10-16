@@ -19,8 +19,8 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -28,6 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 
 use crate::{
+    builder::BuildCancelled,
     memory::{MemoryBudget, Reservation, Spillable},
     resources,
     util::codec::{get_u64, put_u64},
@@ -44,6 +45,9 @@ const MIN_RUN_FRACTION: usize = 16;
 const MIN_CAPACITY: usize = 1_024;
 /// Smallest read buffer per run during a merge.
 const MIN_MERGE_BUFFER_BYTES: usize = 64 << 10;
+/// Items a merge round writes between two checks of whether the build goes
+/// on.
+const CHECK_EVERY_ITEMS: usize = 1 << 16;
 
 /// A value that can be written to and read back from scratch files.
 pub trait Spill: Sized {
@@ -71,6 +75,8 @@ pub struct Scratch {
     spilled_bytes: AtomicU64,
     /// Spilled bytes up to which new files are marked temporary.
     cache_bytes: AtomicU64,
+    /// Set to stop the build this scratch serves.
+    cancel: OnceLock<Arc<AtomicBool>>,
 }
 
 impl Scratch {
@@ -83,7 +89,27 @@ impl Scratch {
             next_file: AtomicU64::new(0),
             spilled_bytes: AtomicU64::new(0),
             cache_bytes: AtomicU64::new(0),
+            cancel: OnceLock::new(),
         }))
+    }
+
+    /// Stop the work that holds this scratch once `cancel` is set: merges,
+    /// and the stages that check [`Scratch::check_cancelled`].
+    pub fn cancel_on(&self, cancel: Arc<AtomicBool>) {
+        let _ = self.cancel.set(cancel);
+    }
+
+    /// Fails with [`BuildCancelled`] once the flag given to
+    /// [`Scratch::cancel_on`] is set.
+    pub fn check_cancelled(&self) -> Result<()> {
+        if self
+            .cancel
+            .get()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            return Err(BuildCancelled.into());
+        }
+        Ok(())
     }
 
     /// Mark new scratch files temporary while fewer than `bytes` have been
@@ -260,7 +286,10 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             let batch = self.runs.drain(..MAX_MERGE_FAN_IN).collect::<Vec<_>>();
             let merged = self.scratch.new_file(self.label);
             let mut writer = SpoolWriter::<T>::create(&self.scratch, &merged)?;
-            for item in Merge::<T>::open(&batch, &self.budget, share)? {
+            for (written, item) in Merge::<T>::open(&batch, &self.budget, share)?.enumerate() {
+                if written % CHECK_EVERY_ITEMS == 0 {
+                    self.scratch.check_cancelled()?;
+                }
                 writer.write(&item?)?;
             }
             writer.finish()?;

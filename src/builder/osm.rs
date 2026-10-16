@@ -170,6 +170,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         },
     )?;
     let scratch = Arc::clone(writer.scratch());
+    scratch.cancel_on(Arc::clone(&options.cancel));
     let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel));
     let input_bytes = input_bytes(&options.input)?;
     // Spill files stay in the page cache while they fit in a quarter of what
@@ -347,7 +348,9 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     for (way_id, line) in &member_vertices {
         member_lines.insert(*way_id, line.as_deref());
     }
-    let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines);
+    let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines, || {
+        progress.check()
+    })?;
     build
         .report
         .unmatched_admin_level_ids

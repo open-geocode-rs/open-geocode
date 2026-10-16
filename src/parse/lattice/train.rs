@@ -295,6 +295,7 @@ pub fn train(
     // take a whole country's rows.
     let in_countries = candidates.keys().any(Option::is_some);
     for (country, candidates) in candidates {
+        scratch.check_cancelled()?;
         if country.is_none() && in_countries {
             continue;
         }
@@ -378,6 +379,7 @@ pub fn train(
     for (part, cache) in parts.iter().zip(&mut caches) {
         let mut rows = part.reader()?;
         loop {
+            scratch.check_cancelled()?;
             let batch = rows
                 .by_ref()
                 .take(LATTICE_BATCH)
@@ -433,7 +435,13 @@ pub fn train(
                 let mut errors = 0;
                 let count = epoch + 1 == EPOCHS;
                 let at = Instant::now();
-                for index in shuffled_order(cache.len(), &mut order) {
+                for (seen, index) in shuffled_order(cache.len(), &mut order)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if seen % LATTICE_BATCH == 0 {
+                        scratch.check_cancelled()?;
+                    }
                     cache.visit(index as usize, |row| {
                         if count {
                             errors += usize::from(model.is_wrong(&row.lattice, &row.gold));
