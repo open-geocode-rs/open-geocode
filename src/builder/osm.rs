@@ -18,6 +18,7 @@
 //! ```
 
 mod address;
+mod admin_levels;
 mod boundary;
 mod containment;
 mod emit;
@@ -279,6 +280,10 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         member_lines.insert(*way_id, line.as_deref());
     }
     let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines);
+    build
+        .report
+        .unmatched_admin_level_ids
+        .extend_from_slice(boundaries.unmatched_admin_ids());
     drop(member_lines);
     drop((
         boundary_ways,

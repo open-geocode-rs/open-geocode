@@ -8,7 +8,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 15;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -31,6 +31,9 @@ pub struct BuilderReport {
     pub output: PackOutputReport,
     /// The address parser trained on the Pack's records.
     pub parser_training: TrainReport,
+    /// Ways and relations libpostal's admin level table names for the
+    /// input's countries that the input lacks: rules that apply to nothing.
+    pub unmatched_admin_level_ids: Vec<String>,
 }
 
 impl BuilderReport {
