@@ -62,9 +62,7 @@ use crate::{
     },
     extsort::{ExternalSorter, SortStats, Spool},
     memory::Budget,
-    pack::{
-        AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
-    },
+    pack::{AUDIT_DIR, BUILD_REPORT_FILE, REJECTIONS_FILE, RecordContext, Writer, WriterOptions},
     parse::lattice::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
@@ -177,9 +175,9 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     // a few times less than the others, and are capped to stay so.
     let memory = Budget::new(budget);
     memory.sample(&plan.resources);
-    let mut writer = PackWriter::create_with(
+    let mut writer = Writer::create_with(
         &options.pack,
-        PackWriterOptions {
+        WriterOptions {
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
             sort_budget_bytes: (budget / 4).max(1),
@@ -605,7 +603,7 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
 /// lies in. Boundary and derived-country records describe context and get
 /// none, but are offered under the country their point lies in.
 fn write_ordered(
-    writer: &mut PackWriter,
+    writer: &mut Writer,
     sample: &mut Sampler,
     records: impl Iterator<Item = Result<PendingRecord>> + Send,
     total: u64,
@@ -709,10 +707,10 @@ impl Audit {
 mod tests {
     use crate::{
         builder::progress::StageUnit,
-        pack::{PackReader, PointPrecision},
+        pack::{PointPrecision, Reader},
         record::Record,
         reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
-        search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+        search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     };
 
     use super::{
@@ -889,7 +887,7 @@ mod tests {
         write_pbf(&input, &town());
         let report = build(&dir.join("pack"), &input, None);
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
         let count = |layer: &str| counts.get(layer).copied().unwrap_or_default();
         assert_eq!(
@@ -967,7 +965,7 @@ mod tests {
         assert_eq!(name(context.admin_context.region_record_id), "Ontario");
         assert_eq!(name(context.admin_context.country_record_id), "Canada");
 
-        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let hits = searcher
             .search(TextSearchOptions {
                 query: "10 King Street".into(),
@@ -1096,7 +1094,7 @@ mod tests {
         assert_eq!(report.accepted.by_layer.get("address"), Some(&1));
         assert_eq!(report.rejected.total, 0);
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let address = reader
             .find_by_source_id("osm:node:10")
             .expect("lookup")
@@ -1117,7 +1115,7 @@ mod tests {
             vec!["千代田区", "Chiyoda", "ちよだく", "chiyodaku"]
         );
 
-        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let first = |query: &str, layer: &str| {
             searcher
                 .search(TextSearchOptions {
@@ -1224,7 +1222,7 @@ mod tests {
         assert_eq!(report.accepted.by_layer.get("place"), Some(&1));
         assert_eq!(report.accepted.by_layer.get("neighbourhood"), Some(&1));
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let island = reader
             .find_by_source_id("osm:relation:900")
             .expect("lookup")
@@ -1333,7 +1331,7 @@ mod tests {
         write_pbf(&input, &town_with_pois());
         let report = build(&dir.join("pack"), &input, None);
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
         assert_eq!(counts.get("poi"), Some(&4), "{counts:?}");
         assert_eq!(
@@ -1366,7 +1364,7 @@ mod tests {
             Some("King Street West")
         );
 
-        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
             searcher
                 .search(TextSearchOptions {
@@ -1461,8 +1459,8 @@ mod tests {
         assert_eq!(in_memory.rejected, spilled.rejected);
         assert_eq!(in_memory.triage, spilled.triage);
 
-        let memory = PackReader::open(dir.join("memory")).expect("memory pack");
-        let spilled = PackReader::open(dir.join("spilled")).expect("spilled pack");
+        let memory = Reader::open(dir.join("memory")).expect("memory pack");
+        let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
         assert_eq!(
             memory.manifest().record_count,
             spilled.manifest().record_count

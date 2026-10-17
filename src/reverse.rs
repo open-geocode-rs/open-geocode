@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::{
     labels,
-    pack::{ContextRecord, PackReader, RecordId},
+    pack::{self, ContextRecord, RecordId},
     record::{AddressComponents, InterpolationAddressComponents, Layer, PoiRecord, Record},
-    spatial_index::Reader,
+    spatial_index,
 };
 
 const ADDRESS_RADIUS_M: f64 = 30.0;
@@ -18,8 +18,8 @@ const CANDIDATE_LIMIT: usize = 16;
 
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
-    pack: Arc<PackReader>,
-    spatial: Reader,
+    pack: Arc<pack::Reader>,
+    spatial: spatial_index::Reader,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,12 +113,12 @@ pub struct Evidence {
 
 impl PackReverseGeocoder {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_pack(Arc::new(PackReader::open(pack_path)?))
+        Self::from_pack(Arc::new(pack::Reader::open(pack_path)?))
     }
 
     /// Open the spatial index using an existing shared pack reader.
-    pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
-        let spatial = Reader::open(pack.container(), pack.records().clone())?;
+    pub fn from_pack(pack: Arc<pack::Reader>) -> Result<Self> {
+        let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         Ok(Self { pack, spatial })
     }
 
@@ -474,7 +474,7 @@ mod tests {
 
     use crate::{
         context::AdminContextTuple,
-        pack::{PackWriter, RecordContext},
+        pack::{RecordContext, Writer},
         record::{
             AddressRecord, InterpolationRange, LocationPrecision, OsmObjectType, PlaceLayer,
             PlaceRecord, Record, SourceProvenance, StreetRecord, point_geometry,
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn reverse_prefers_explicit_address() {
         let temp_dir = temp_pack_dir("explicit");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         writer
             .write(&address_record().into(), None)
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn reverse_estimates_address_from_interpolation() {
         let temp_dir = temp_pack_dir("interpolation");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(&interpolation_record().into(), None)
             .expect("interpolation");
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn reverse_falls_back_to_street() {
         let temp_dir = temp_pack_dir("street");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         writer.finish().expect("finish");
 
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn reverse_prefers_materialized_boundary_context_over_source_locality() {
         let temp_dir = temp_pack_dir("boundary-context");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let locality_id = writer
             .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
             .expect("place");
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn reverse_answers_with_the_address_of_a_poi_but_not_its_name() {
         let temp_dir = temp_pack_dir("poi");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         // An unaddressed POI on top of the query point is not an address.
         writer

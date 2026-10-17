@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
-use super::{PACK_FILE, PackManifest, PackReader};
+use super::{Manifest, PACK_FILE, Reader};
 
 const GENERATIONS: &str = "generations";
 const CURRENT: &str = "CURRENT";
@@ -56,12 +56,12 @@ pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
 pub(super) fn publish(
     destination: &Path,
     generation: &Path,
-    manifest: &PackManifest,
+    manifest: &Manifest,
     keep: &mut bool,
 ) -> Result<()> {
     // Exercise the same readers used for serving before making the build visible.
     let pack = generation.join(PACK_FILE);
-    let reader = PackReader::open(&pack)?;
+    let reader = Reader::open(&pack)?;
     reader.verify()?;
     if reader.manifest() != manifest {
         bail!("Pack manifest does not match the build");

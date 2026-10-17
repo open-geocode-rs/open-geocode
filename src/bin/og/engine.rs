@@ -7,16 +7,16 @@ use std::{path::Path, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use open_geocode::{
     api::{self, ForwardCollection, ReverseCollection},
-    pack::PackReader,
+    pack::Reader,
     parse::lattice::LatticeTagger,
     reverse::{GeocodeOptions, PackReverseGeocoder},
-    search::{AddressGeocodeOptions, DEFAULT_SEARCH_LIMIT, PackTextSearcher, TextSearchOptions},
+    search::{AddressGeocodeOptions, DEFAULT_SEARCH_LIMIT, TextSearchOptions, TextSearcher},
 };
 use serde::Serialize;
 
 pub struct Engine {
-    pack: Arc<PackReader>,
-    searcher: PackTextSearcher,
+    pack: Arc<Reader>,
+    searcher: TextSearcher,
     reverse: PackReverseGeocoder,
     tagger: LatticeTagger,
 }
@@ -87,9 +87,9 @@ pub struct Reading {
 impl Engine {
     pub fn open(path: &Path) -> Result<Self> {
         let pack = Arc::new(
-            PackReader::open(path).with_context(|| format!("failed to open {}", path.display()))?,
+            Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?,
         );
-        let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+        let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         let tagger = LatticeTagger::from_container(pack.container())?;
         Ok(Self {

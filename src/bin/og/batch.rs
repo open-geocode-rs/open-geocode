@@ -23,8 +23,8 @@ use anyhow::Result;
 use open_geocode::{
     api::Accuracy,
     batch::{
-        BatchGeocodeOptions, BatchObserver, BatchRow, Column, cells, delimiter_of,
-        detect_delimiter, open_delimited, run_batch_geocode, unnamed_columns,
+        Column, GeocodeOptions, Observer, Row, cells, delimiter_of, detect_delimiter,
+        open_delimited, run_batch_geocode, unnamed_columns,
     },
 };
 
@@ -505,8 +505,8 @@ pub struct RunStats {
     pub latest: Mutex<VecDeque<Latest>>,
 }
 
-impl BatchObserver for RunStats {
-    fn row(&self, row: &BatchRow) {
+impl Observer for RunStats {
+    fn row(&self, row: &Row) {
         let millis = row.elapsed.as_secs_f64() * 1_000.0;
         // A row is done before it is matched, so `matched` read before
         // `done` is never more.
@@ -649,7 +649,7 @@ impl BatchSession {
         let output = self.output.clone();
         let stats = Arc::new(RunStats::default());
         let cancel = Arc::new(AtomicBool::new(false));
-        let options = BatchGeocodeOptions {
+        let options = GeocodeOptions {
             pack: Some(pack.to_path_buf()),
             input: self.file.path.clone(),
             output: output.clone(),
@@ -663,9 +663,9 @@ impl BatchSession {
                     .map(|(index, _)| Column::At(index))
                     .collect(),
             ],
-            observer: Some(Arc::clone(&stats) as Arc<dyn BatchObserver>),
+            observer: Some(Arc::clone(&stats) as Arc<dyn Observer>),
             cancel: Arc::clone(&cancel),
-            ..BatchGeocodeOptions::default()
+            ..GeocodeOptions::default()
         };
         let handle = thread::spawn(move || run_batch_geocode(options).map(|_| ()));
         self.summary = None;

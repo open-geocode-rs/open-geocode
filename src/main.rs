@@ -12,16 +12,14 @@ use serde_json::Value;
 use open_geocode::{
     alloc::CountingAlloc,
     api,
-    batch::{
-        BatchGeocodeOptions, Column, CoordinateJoinOptions, parse_field_groups, run_batch_geocode,
-    },
+    batch::{Column, CoordinateJoinOptions, GeocodeOptions, parse_field_groups, run_batch_geocode},
     bench::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
     },
     builder::{BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
-    pack::{PackReader, RecordId},
+    pack::{Reader, RecordId},
     parse::{
         bench::{
             ParseBenchOptions, TaggerKind, align_predictions, mapping::Scheme, normalize_fixtures,
@@ -30,9 +28,9 @@ use open_geocode::{
         lattice::LatticeTagger,
     },
     resources,
-    reverse::{GeocodeOptions, PackReverseGeocoder},
+    reverse::{self, PackReverseGeocoder},
     runtime::{ServeOptions, serve},
-    search::{PackTextSearcher, TextSearchOptions},
+    search::{TextSearchOptions, TextSearcher},
 };
 
 /// mimalloc, counted. The Windows process heap serializes a many-threaded
@@ -512,7 +510,7 @@ async fn main() -> Result<()> {
             context,
         } => inspect_pack(pack, row, id, layer, limit, rejections, context),
         Commands::VerifyPack { pack } => {
-            let reader = PackReader::open(pack)?;
+            let reader = Reader::open(pack)?;
             reader.verify()?;
             write_json(serde_json::json!({
                 "path": reader.path().display().to_string(),
@@ -661,7 +659,7 @@ fn inspect_pack(
     rejections: bool,
     include_context: bool,
 ) -> Result<()> {
-    let reader = PackReader::open(pack)?;
+    let reader = Reader::open(pack)?;
     let output = if rejections {
         serde_json::to_value(reader.rejections(limit)?)?
     } else if let Some(row) = row {
@@ -682,7 +680,7 @@ fn inspect_pack(
 }
 
 fn inspect_record_by_source_id_json(
-    reader: &PackReader,
+    reader: &Reader,
     source_id: &str,
     include_context: bool,
 ) -> Result<Value> {
@@ -693,7 +691,7 @@ fn inspect_record_by_source_id_json(
 }
 
 fn inspect_record_json(
-    reader: &PackReader,
+    reader: &Reader,
     record_id: RecordId,
     include_context: bool,
 ) -> Result<Value> {
@@ -710,7 +708,7 @@ fn inspect_record_json(
     Ok(value)
 }
 
-fn boundary_context_json(reader: &PackReader, record_id: RecordId) -> Result<Value> {
+fn boundary_context_json(reader: &Reader, record_id: RecordId) -> Result<Value> {
     let Some(context) = reader.boundary_context(record_id)? else {
         return Ok(serde_json::json!(null));
     };
@@ -821,8 +819,8 @@ fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
 
 /// The `/search` answer for `query`, as the Runtime gives it.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
-    let pack = Arc::new(PackReader::open(pack)?);
-    let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+    let pack = Arc::new(Reader::open(pack)?);
+    let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
     let hits = searcher.search(TextSearchOptions {
         query: query.clone(),
         limit,
@@ -835,9 +833,9 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
 
 /// The `/reverse` answer for a point, as the Runtime gives it.
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
-    let pack = Arc::new(PackReader::open(pack)?);
+    let pack = Arc::new(Reader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
-    let response = geocoder.reverse(GeocodeOptions { lon, lat })?;
+    let response = geocoder.reverse(reverse::GeocodeOptions { lon, lat })?;
     write_json(serde_json::to_value(api::reverse_collection(
         &pack, &response,
     )?)?)
@@ -895,7 +893,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     } else {
         None
     };
-    let report = run_batch_geocode(BatchGeocodeOptions {
+    let report = run_batch_geocode(GeocodeOptions {
         pack,
         input,
         output: output.clone(),
@@ -909,7 +907,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         lat_column,
         lon_column,
         join,
-        ..BatchGeocodeOptions::default()
+        ..GeocodeOptions::default()
     })?;
     write_json(serde_json::json!({
         "rows": report.rows,

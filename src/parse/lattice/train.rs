@@ -48,7 +48,7 @@ use super::{
 use crate::{
     extsort::{ExternalSorter, IndexedSpool, IndexedSpoolFile, Scratch, Spill, Spool, SpoolFile},
     memory::{Budget, Reservation, Spillable},
-    pack::{PackReader, RecordId},
+    pack::{Reader, RecordId},
     parse::types::Label,
     record::{AddressComponents, Layer, PlaceLayer, Record},
     resources::Resources,
@@ -274,7 +274,7 @@ pub fn train(
         epochs: EPOCHS,
         ..Report::default()
     };
-    let pack = PackReader::open(pack)?;
+    let pack = Reader::open(pack)?;
     // Every lattice looks names up all over the dictionaries.
     report.pack_prefaulted = pack
         .container()
@@ -1483,7 +1483,7 @@ const REGION_AND_GROUP_SHARE: f64 = 0.2;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
-    pack: &'a PackReader,
+    pack: &'a Reader,
     tagger: &'a LatticeTagger,
     /// Every name of each area record, its `name` first.
     names: HashMap<RecordId, Vec<String>>,
@@ -1498,7 +1498,7 @@ struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(pack: &'a PackReader, tagger: &'a LatticeTagger) -> Self {
+    fn new(pack: &'a Reader, tagger: &'a LatticeTagger) -> Self {
         Self {
             pack,
             tagger,

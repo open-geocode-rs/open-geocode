@@ -39,7 +39,7 @@ use crate::{
         dictionary::{Builder, RecordNames},
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
-    records::{Reader, Writer},
+    records,
     spatial_index::{self, RecordCells},
     text_index::{self, PostcodeAreas},
 };
@@ -68,7 +68,7 @@ const DEFAULT_SORT_BUDGET_BYTES: usize = 512 << 20;
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PackManifest {
+pub struct Manifest {
     pub schema_version: u32,
     pub crate_version: String,
     pub built_at_unix: u64,
@@ -77,11 +77,11 @@ pub struct PackManifest {
     pub string_count: u64,
     pub context_tuple_count: u64,
     pub text_document_count: u64,
-    pub spatial: PackSpatialManifest,
+    pub spatial: SpatialManifest,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PackSpatialManifest {
+pub struct SpatialManifest {
     pub point_count: u64,
     pub segment_count: u64,
     pub cell_count: u64,
@@ -89,7 +89,7 @@ pub struct PackSpatialManifest {
 }
 
 #[derive(Debug, Clone)]
-pub struct PackWriterOptions {
+pub struct WriterOptions {
     /// Directory for temporary build files. Defaults to a directory inside the
     /// new generation.
     pub scratch_dir: Option<PathBuf>,
@@ -101,7 +101,7 @@ pub struct PackWriterOptions {
     pub text_index_memory_bytes: usize,
 }
 
-impl Default for PackWriterOptions {
+impl Default for WriterOptions {
     fn default() -> Self {
         Self {
             scratch_dir: None,
@@ -140,11 +140,11 @@ fn indexed_area_names<'a>(
 
 /// Writes records in their final order. Record ids are assigned sequentially.
 #[derive(Debug)]
-pub struct PackWriter {
+pub struct Writer {
     destination: PathBuf,
     generation: GenerationGuard,
     scratch: Arc<Scratch>,
-    records: Writer,
+    records: records::Writer,
     contexts: TupleWriter,
     text: text_index::Writer,
     spatial: spatial_index::Writer,
@@ -159,7 +159,7 @@ pub struct PackWriter {
 pub struct SealedPack {
     destination: PathBuf,
     generation: GenerationGuard,
-    manifest: PackManifest,
+    manifest: Manifest,
     bytes: u64,
 }
 
@@ -180,19 +180,19 @@ impl Drop for GenerationGuard {
 
 /// Statistics a build reports after sealing the Pack.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct PackBuildStats {
+pub struct BuildStats {
     pub bytes: u64,
     pub sections: BTreeMap<String, u64>,
     pub spatial_pair_runs: u64,
     pub text_index_bytes: u64,
 }
 
-impl PackWriter {
+impl Writer {
     pub fn create(destination: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with(destination, PackWriterOptions::default())
+        Self::create_with(destination, WriterOptions::default())
     }
 
-    pub fn create_with(destination: impl AsRef<Path>, options: PackWriterOptions) -> Result<Self> {
+    pub fn create_with(destination: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
         let destination = destination.as_ref().to_path_buf();
         let generation = GenerationGuard {
             path: publication::create_generation(&destination)?,
@@ -205,7 +205,7 @@ impl PackWriter {
                 .unwrap_or_else(|| generation.path.join(SCRATCH_DIR)),
         )?;
         Ok(Self {
-            records: Writer::create(&scratch, &options.memory)?,
+            records: records::Writer::create(&scratch, &options.memory)?,
             contexts: TupleWriter::default(),
             text: text_index::Writer::create(
                 &scratch,
@@ -328,7 +328,7 @@ impl PackWriter {
     }
 
     /// Write the Pack file without publishing it.
-    pub fn seal(self) -> Result<(SealedPack, PackBuildStats)> {
+    pub fn seal(self) -> Result<(SealedPack, BuildStats)> {
         let Self {
             destination,
             generation,
@@ -360,7 +360,7 @@ impl PackWriter {
         dictionaries.finish(&mut pack, &context_names)?;
         drop(context_names);
 
-        let manifest = PackManifest {
+        let manifest = Manifest {
             schema_version: PACK_SCHEMA_VERSION,
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
             built_at_unix: SystemTime::now()
@@ -375,7 +375,7 @@ impl PackWriter {
             string_count,
             context_tuple_count,
             text_document_count: text_commit.document_count,
-            spatial: PackSpatialManifest {
+            spatial: SpatialManifest {
                 point_count: spatial_commit.point_count,
                 segment_count: spatial_commit.segment_count,
                 cell_count: spatial_commit.cell_count,
@@ -403,7 +403,7 @@ impl PackWriter {
                 manifest,
                 bytes,
             },
-            PackBuildStats {
+            BuildStats {
                 bytes,
                 sections,
                 spatial_pair_runs: spatial_commit.fine_pairs.runs
@@ -414,7 +414,7 @@ impl PackWriter {
     }
 
     /// Seal and publish.
-    pub fn finish(self) -> Result<PackManifest> {
+    pub fn finish(self) -> Result<Manifest> {
         self.seal()?.0.publish()
     }
 }
@@ -424,7 +424,7 @@ impl SealedPack {
         &self.generation.path
     }
 
-    pub fn manifest(&self) -> &PackManifest {
+    pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
@@ -447,7 +447,7 @@ impl SealedPack {
     }
 
     /// Validate the Pack with the serving readers, then point `CURRENT` at it.
-    pub fn publish(mut self) -> Result<PackManifest> {
+    pub fn publish(mut self) -> Result<Manifest> {
         publication::publish(
             &self.destination,
             &self.generation.path,
@@ -458,30 +458,30 @@ impl SealedPack {
     }
 }
 
-pub struct PackReader {
+pub struct Reader {
     path: PathBuf,
     container: Container,
-    manifest: PackManifest,
-    records: Reader,
+    manifest: Manifest,
+    records: records::Reader,
     context: context::Reader,
 }
 
-impl std::fmt::Debug for PackReader {
+impl std::fmt::Debug for Reader {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("PackReader")
+            .debug_struct("Reader")
             .field("path", &self.path)
             .field("manifest", &self.manifest)
             .finish_non_exhaustive()
     }
 }
 
-impl PackReader {
+impl Reader {
     /// Open a Pack directory (its published generation) or a Pack file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = resolve_pack_path(path)?;
         let container = Container::open(&path)?;
-        let manifest: PackManifest =
+        let manifest: Manifest =
             serde_json::from_slice(&container.section(MANIFEST_SECTION, MANIFEST_VERSION)?)
                 .with_context(|| format!("failed to parse the manifest of {}", path.display()))?;
         if manifest.schema_version != PACK_SCHEMA_VERSION {
@@ -491,7 +491,7 @@ impl PackReader {
                 PACK_SCHEMA_VERSION
             );
         }
-        let records = Reader::open(&container)?;
+        let records = records::Reader::open(&container)?;
         if records.record_count() != manifest.record_count {
             bail!(
                 "record store has {} records but the manifest declares {}",
@@ -509,7 +509,7 @@ impl PackReader {
         })
     }
 
-    pub const fn manifest(&self) -> &PackManifest {
+    pub const fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
@@ -529,7 +529,7 @@ impl PackReader {
             .with_context(|| format!("{} failed verification", self.path.display()))
     }
 
-    pub fn records(&self) -> &Reader {
+    pub fn records(&self) -> &records::Reader {
         &self.records
     }
 
@@ -654,7 +654,7 @@ impl PackReader {
 }
 
 /// Computes what a batch of records adds to the Pack's indexes, in parallel,
-/// for the record ids they will be written at. See [`PackWriter::preparer`].
+/// for the record ids they will be written at. See [`Writer::preparer`].
 #[derive(Debug)]
 pub struct BatchPreparer {
     next: RecordId,
@@ -699,7 +699,7 @@ impl BatchPreparer {
 }
 
 /// Records with their text documents, spatial cells and dictionary names,
-/// ready for [`PackWriter::commit`].
+/// ready for [`Writer::commit`].
 #[derive(Debug)]
 pub struct PreparedBatch {
     first: RecordId,
@@ -742,7 +742,7 @@ mod tests {
             AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
             point_geometry,
         },
-        search::{PackTextSearcher, TextSearchOptions},
+        search::{TextSearchOptions, TextSearcher},
     };
 
     use super::*;
@@ -770,8 +770,8 @@ mod tests {
         })
     }
 
-    fn write_pack(root: &Path, records: &[Record]) -> PackManifest {
-        let mut writer = PackWriter::create(root).expect("writer");
+    fn write_pack(root: &Path, records: &[Record]) -> Manifest {
+        let mut writer = Writer::create(root).expect("writer");
         for record in records {
             writer.write(record, None).expect("write");
         }
@@ -779,7 +779,7 @@ mod tests {
     }
 
     fn first_hit(root: &Path, query: &str) -> Option<String> {
-        PackTextSearcher::open(root)
+        TextSearcher::open(root)
             .expect("searcher")
             .search(TextSearchOptions {
                 query: query.into(),
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(manifest.text_document_count, 2);
         assert_eq!(manifest.spatial.point_count, 2);
 
-        let reader = PackReader::open(&root).expect("reader");
+        let reader = Reader::open(&root).expect("reader");
         assert_eq!(
             reader.path().file_name().and_then(|name| name.to_str()),
             Some(PACK_FILE)
@@ -866,10 +866,10 @@ mod tests {
     fn publishes_replacement_without_changing_existing_readers() {
         let root = temp_root("publish");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
-        let original = PackReader::open(&root).expect("original reader");
-        let searcher = PackTextSearcher::open(&root).expect("original searcher");
+        let original = Reader::open(&root).expect("original reader");
+        let searcher = TextSearcher::open(&root).expect("original searcher");
 
-        let mut replacement = PackWriter::create(&root).expect("replacement");
+        let mut replacement = Writer::create(&root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -897,7 +897,7 @@ mod tests {
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let published = fs::read(root.join("CURRENT")).expect("pointer");
 
-        let mut replacement = PackWriter::create(&root).expect("replacement");
+        let mut replacement = Writer::create(&root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -923,7 +923,7 @@ mod tests {
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let published = fs::read(root.join("CURRENT")).expect("pointer");
 
-        let mut replacement = PackWriter::create(&root).expect("replacement");
+        let mut replacement = Writer::create(&root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -944,7 +944,7 @@ mod tests {
     fn a_failure_after_the_pointer_switch_keeps_the_published_generation() {
         let root = temp_root("switch-failure");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
-        let mut replacement = PackWriter::create(&root).expect("replacement");
+        let mut replacement = Writer::create(&root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -962,9 +962,9 @@ mod tests {
     fn text_index_memory_fits_the_budget_and_waits_for_records() {
         let root = temp_root("text-memory");
         let memory = Budget::new(64 << 20);
-        let mut writer = PackWriter::create_with(
+        let mut writer = Writer::create_with(
             &root,
-            PackWriterOptions {
+            WriterOptions {
                 scratch_dir: None,
                 memory: Arc::clone(&memory),
                 sort_budget_bytes: 16 << 20,
@@ -995,6 +995,6 @@ mod tests {
     fn rejects_paths_without_a_pack() {
         let root = temp_root("empty");
         fs::create_dir_all(&root).expect("dir");
-        assert!(PackReader::open(&root).is_err());
+        assert!(Reader::open(&root).is_err());
     }
 }

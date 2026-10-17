@@ -532,7 +532,7 @@ mod screens {
         std::fs::create_dir_all(&dir).unwrap();
         let address = "carrer prat de la creu 70, andorra la vella";
         std::fs::write(dir.join("in.csv"), format!("address\n\"{address}\"\n")).unwrap();
-        open_geocode::batch::run_batch_geocode(open_geocode::batch::BatchGeocodeOptions {
+        open_geocode::batch::run_batch_geocode(open_geocode::batch::GeocodeOptions {
             pack: Some(pack),
             input: dir.join("in.csv"),
             output: dir.join("out.csv"),

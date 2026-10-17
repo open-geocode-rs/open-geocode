@@ -20,7 +20,7 @@ use utoipa::ToSchema;
 
 use crate::{
     labels,
-    pack::{PackReader, RecordId, Source, Summary},
+    pack::{Reader, RecordId, Source, Summary},
     record::{AddressComponents, InterpolationAddressComponents, Layer, OsmObjectType},
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
@@ -416,12 +416,12 @@ impl ReverseFeature {
 /// hits of one query mostly share them.
 #[derive(Debug)]
 pub struct Contexts<'a> {
-    pack: &'a PackReader,
+    pack: &'a Reader,
     areas: HashMap<RecordId, Option<ContextArea>>,
 }
 
 impl<'a> Contexts<'a> {
-    pub fn new(pack: &'a PackReader) -> Self {
+    pub fn new(pack: &'a Reader) -> Self {
         Self {
             pack,
             areas: HashMap::new(),
@@ -467,7 +467,7 @@ impl<'a> Contexts<'a> {
 /// The answer to `/search` or `/autocomplete`: one feature per hit, in the
 /// order search ranked them.
 pub fn forward_collection(
-    pack: &PackReader,
+    pack: &Reader,
     query: String,
     hits: Vec<TextSearchHit>,
 ) -> Result<ForwardCollection> {
@@ -525,10 +525,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
 /// An estimated address states its house number only in its label, which
 /// reverse writes as `"{number} {street}, ..."`; the number is read back from
 /// there.
-pub fn reverse_collection(
-    pack: &PackReader,
-    response: &GeocodeResponse,
-) -> Result<ReverseCollection> {
+pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<ReverseCollection> {
     let mut contexts = Contexts::new(pack);
     let mut features = Vec::new();
     let mut primary_record_id = None;

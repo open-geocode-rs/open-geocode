@@ -18,7 +18,7 @@ use std::{
 use anyhow::{Context, Result};
 use open_geocode::{
     builder::BuilderReport,
-    pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackReader},
+    pack::{AUDIT_DIR, BUILD_REPORT_FILE, Reader},
     record::Layer,
 };
 use serde::{Deserialize, Serialize};
@@ -138,7 +138,7 @@ pub struct PackInfo {
 
 impl PackInfo {
     pub fn read(dir: &Path) -> Option<Self> {
-        let reader = PackReader::open(dir).ok()?;
+        let reader = Reader::open(dir).ok()?;
         let manifest = reader.manifest();
         let report = reader
             .path()
