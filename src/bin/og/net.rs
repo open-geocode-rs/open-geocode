@@ -45,11 +45,11 @@ fn agent() -> &'static Agent {
 
 /// A file on a server, as its headers describe it.
 #[derive(Debug, Clone, Copy)]
-pub struct Remote {
+pub(crate) struct Remote {
     pub bytes: Option<u64>,
 }
 
-pub fn head(url: &str) -> Result<Remote> {
+pub(crate) fn head(url: &str) -> Result<Remote> {
     let response = agent()
         .head(url)
         .call()
@@ -69,7 +69,7 @@ fn header<B>(response: &Response<B>, name: &str) -> Option<String> {
 
 /// The time an extract's data is from, read from its replication state
 /// file (`timestamp=2026-10-15T20\:21\:42Z`).
-pub fn state_timestamp(url: &str) -> Result<i64> {
+pub(crate) fn state_timestamp(url: &str) -> Result<i64> {
     let text = agent()
         .get(url)
         .call()
@@ -84,7 +84,7 @@ pub fn state_timestamp(url: &str) -> Result<i64> {
 }
 
 /// The MD5 sum an extract is published with, from `<url>.md5`.
-pub fn published_md5(url: &str) -> Result<String> {
+pub(crate) fn published_md5(url: &str) -> Result<String> {
     let url = format!("{url}.md5");
     let text = agent()
         .get(&url)
@@ -105,7 +105,7 @@ pub fn published_md5(url: &str) -> Result<String> {
 }
 
 /// The file a download is written to until it is complete and checked.
-pub fn partial_path(path: &Path) -> PathBuf {
+pub(crate) fn partial_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
     path.with_file_name(name)
@@ -121,7 +121,7 @@ fn version_path(partial: &Path) -> PathBuf {
 }
 
 /// Moves a complete, checked download into place.
-pub fn complete(partial: &Path, path: &Path) -> Result<()> {
+pub(crate) fn complete(partial: &Path, path: &Path) -> Result<()> {
     fs::rename(partial, path)
         .with_context(|| format!("failed to move {} into place", path.display()))?;
     let _ = fs::remove_file(version_path(partial));
@@ -129,7 +129,7 @@ pub fn complete(partial: &Path, path: &Path) -> Result<()> {
 }
 
 /// Removes a partial file there is no use continuing from.
-pub fn discard(partial: &Path) {
+pub(crate) fn discard(partial: &Path) {
     let _ = fs::remove_file(partial);
     let _ = fs::remove_file(version_path(partial));
 }
@@ -138,7 +138,7 @@ pub fn discard(partial: &Path) {
 /// download that stopped while the server still has the same version of
 /// the file, and starting over when it does not. `progress` is told the
 /// bytes on disk so far and the whole size, when the server says it.
-pub fn download(
+pub(crate) fn download(
     url: &str,
     path: &Path,
     cancel: &AtomicBool,
@@ -305,7 +305,7 @@ fn fetch(
 }
 
 /// Checks a file against an MD5 sum. `progress` is told the bytes read.
-pub fn check_md5(
+pub(crate) fn check_md5(
     path: &Path,
     expected: &str,
     cancel: &AtomicBool,

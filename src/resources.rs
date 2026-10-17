@@ -282,7 +282,7 @@ mod platform {
 
     use super::Resources;
 
-    pub fn probe() -> Resources {
+    pub(super) fn probe() -> Resources {
         // On Linux this reads the affinity mask and the cgroup CPU quota.
         let usable_cpus = std::thread::available_parallelism().map_or(1, usize::from);
         let mut resources = Resources {
@@ -413,15 +413,17 @@ mod platform {
         resources.memory_limit = "half of installed memory".to_string();
     }
 
-    pub fn free_disk(path: &Path) -> Option<u64> {
+    pub(super) fn free_disk(path: &Path) -> Option<u64> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `statvfs` is a plain C struct of integers, for which an
+        // all-zero bit pattern is a valid value; `statvfs` overwrites it.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is NUL-terminated and `stat` valid for the call.
         (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0)
             .then(|| (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
     }
 
-    pub fn same_volume(left: &Path, right: &Path) -> bool {
+    pub(super) fn same_volume(left: &Path, right: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         match (std::fs::metadata(left), std::fs::metadata(right)) {
             (Ok(left), Ok(right)) => left.dev() == right.dev(),
@@ -429,7 +431,7 @@ mod platform {
         }
     }
 
-    pub fn opt_out_of_power_throttling() {}
+    pub(super) fn opt_out_of_power_throttling() {}
 }
 
 #[cfg(test)]

@@ -121,17 +121,17 @@ const MIN_NUMBERED_NAMES: usize = 5;
 
 /// The admin levels a name is used at, one bit each.
 pub(super) mod level {
-    pub const COUNTRY: u8 = 1;
-    pub const REGION: u8 = 1 << 1;
-    pub const DISTRICT: u8 = 1 << 2;
-    pub const LOCALITY: u8 = 1 << 3;
-    pub const NEIGHBOURHOOD: u8 = 1 << 4;
-    pub const PLACE: u8 = 1 << 5;
+    pub(crate) const COUNTRY: u8 = 1;
+    pub(crate) const REGION: u8 = 1 << 1;
+    pub(crate) const DISTRICT: u8 = 1 << 2;
+    pub(crate) const LOCALITY: u8 = 1 << 3;
+    pub(crate) const NEIGHBOURHOOD: u8 = 1 << 4;
+    pub(crate) const PLACE: u8 = 1 << 5;
     /// The levels whose areas are also named without their type word.
-    pub const ALIASED: u8 = REGION | DISTRICT | LOCALITY;
+    pub(crate) const ALIASED: u8 = REGION | DISTRICT | LOCALITY;
 
     /// The levels whose areas are named in `field`.
-    pub fn of_field(field: super::Field) -> u8 {
+    pub(crate) fn of_field(field: super::Field) -> u8 {
         match field {
             super::Field::Country => COUNTRY,
             super::Field::Region => REGION,

@@ -17,7 +17,7 @@ use crate::{
     engine::{Answer, Engine, Hit},
 };
 
-pub enum Question {
+pub(crate) enum Question {
     /// What search answers for a query, and how the parser reads it.
     Search(String),
     Reverse {
@@ -30,7 +30,7 @@ pub enum Question {
     Addresses(Vec<String>),
 }
 
-pub enum Reply {
+pub(crate) enum Reply {
     Search {
         answer: Result<Answer, String>,
         reading: Vec<(String, &'static str)>,
@@ -45,18 +45,18 @@ pub enum Reply {
 }
 
 /// One pasted address and the answer for it.
-pub struct PastedRow {
+pub(crate) struct PastedRow {
     pub input: String,
     pub answer: Option<Arc<Answer>>,
 }
 
 impl PastedRow {
-    pub fn hit(&self) -> Option<&Hit> {
+    pub(crate) fn hit(&self) -> Option<&Hit> {
         self.answer.as_ref().and_then(|answer| answer.hits.first())
     }
 }
 
-pub struct Asker {
+pub(crate) struct Asker {
     shared: Arc<Shared>,
     /// The id of the newest question.
     asked: u64,
@@ -75,7 +75,7 @@ struct Shared {
 }
 
 impl Asker {
-    pub fn new(engine: Arc<Engine>) -> Self {
+    pub(crate) fn new(engine: Arc<Engine>) -> Self {
         let shared = Arc::new(Shared {
             waiting: Mutex::new(None),
             wake: Condvar::new(),
@@ -91,7 +91,7 @@ impl Asker {
         Self { shared, asked: 0 }
     }
 
-    pub fn ask(&mut self, question: Question) {
+    pub(crate) fn ask(&mut self, question: Question) {
         self.asked += 1;
         self.shared.newest.store(self.asked, Ordering::Relaxed);
         *self.shared.waiting.lock().expect("question lock") = Some((self.asked, question));
@@ -99,7 +99,7 @@ impl Asker {
     }
 
     /// Drops the questions asked so far: their answers are not taken.
-    pub fn forget(&mut self) {
+    pub(crate) fn forget(&mut self) {
         self.asked += 1;
         self.shared.newest.store(self.asked, Ordering::Relaxed);
         self.shared.settled.fetch_max(self.asked, Ordering::Relaxed);
@@ -107,7 +107,7 @@ impl Asker {
     }
 
     /// The answer to the newest question, once it is there.
-    pub fn take(&mut self) -> Option<Reply> {
+    pub(crate) fn take(&mut self) -> Option<Reply> {
         match self.shared.answered.lock().expect("answer lock").take() {
             Some((id, reply)) if id == self.asked => Some(reply),
             _ => None,
@@ -115,7 +115,7 @@ impl Asker {
     }
 
     /// Whether the newest question is still being answered.
-    pub fn busy(&self) -> bool {
+    pub(crate) fn busy(&self) -> bool {
         self.shared.settled.load(Ordering::Relaxed) < self.asked
     }
 }

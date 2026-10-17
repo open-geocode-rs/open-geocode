@@ -34,7 +34,10 @@ pub(super) struct Span {
 
 impl Span {
     /// The feature ids of the span decoded as `country`.
-    pub fn features_in(&self, country: Option<CountryCode>) -> impl Iterator<Item = u32> + '_ {
+    pub(super) fn features_in(
+        &self,
+        country: Option<CountryCode>,
+    ) -> impl Iterator<Item = u32> + '_ {
         self.features.iter().copied().chain(
             self.country_features
                 .iter()
@@ -61,7 +64,7 @@ pub(super) struct Lattice {
 }
 
 impl Lattice {
-    pub fn new(units: Units, spans: Vec<Span>, candidates: Vec<CountryCode>) -> Self {
+    pub(super) fn new(units: Units, spans: Vec<Span>, candidates: Vec<CountryCode>) -> Self {
         let len = units.len();
         let mut by_end = vec![Vec::new(); len + 1];
         for (index, span) in spans.iter().enumerate() {
@@ -78,7 +81,7 @@ impl Lattice {
     }
 
     /// The areas the span `start..end` names, when the Pack knows them.
-    pub fn place(&self, start: usize, end: usize) -> Option<&[u32]> {
+    pub(super) fn place(&self, start: usize, end: usize) -> Option<&[u32]> {
         self.places
             .iter()
             .find(|place| place.0 == start && place.1 == end)
@@ -86,7 +89,7 @@ impl Lattice {
     }
 
     /// Bytes the lattice holds, its heap data included.
-    pub fn resident_bytes(&self) -> usize {
+    pub(super) fn resident_bytes(&self) -> usize {
         use std::mem::size_of;
         let tokens = &self.units.tokens;
         size_of::<Self>()
@@ -124,7 +127,7 @@ impl Lattice {
     }
 
     /// Write the lattice for [`Self::decode`], which reads back an equal one.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub(super) fn encode(&self, out: &mut Vec<u8>) {
         let units = &self.units;
         put_u64(out, units.len() as u64);
         for index in 0..units.len() {
@@ -162,7 +165,7 @@ impl Lattice {
         }
     }
 
-    pub fn decode(input: &mut &[u8]) -> Result<Self> {
+    pub(super) fn decode(input: &mut &[u8]) -> Result<Self> {
         let country = |input: &mut &[u8]| -> Result<CountryCode> {
             u16::try_from(get_u64(input)?)
                 .ok()
@@ -251,7 +254,7 @@ pub(super) struct Path {
 
 impl Path {
     /// The units and label of every segment, in order.
-    pub fn segments(&self, lattice: &Lattice) -> Vec<(usize, usize, Label)> {
+    pub(super) fn segments(&self, lattice: &Lattice) -> Vec<(usize, usize, Label)> {
         self.segments
             .iter()
             .map(|segment| {
@@ -262,7 +265,7 @@ impl Path {
     }
 
     /// The label of every unit.
-    pub fn labels(&self, lattice: &Lattice) -> Vec<Label> {
+    pub(super) fn labels(&self, lattice: &Lattice) -> Vec<Label> {
         let mut labels = Vec::with_capacity(lattice.len);
         for segment in &self.segments {
             let span = &lattice.spans[segment.span];
