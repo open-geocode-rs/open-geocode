@@ -59,6 +59,7 @@ tower-http = { version = "0.6", features = ["fs"] }
 unicode-script = "0.5.7"
 # Downloads extracts and checks for newer ones in the interactive `og` interface.
 ureq = { version = "3.4.2", optional = true }
+utoipa = { version = "6.0.0", features = ["axum_extras", "preserve_order"] }
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 

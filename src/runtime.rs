@@ -22,11 +22,12 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
-        bounds, health, method,
-        problem::Problem,
+        bounds, health, method, openapi,
+        problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
     pack::PackReader,
+    record::Layer,
     resources::Resources,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     search::{PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
@@ -76,16 +77,48 @@ impl AppState {
     }
 }
 
+/// `/search` and `/autocomplete` take the same parameters. They differ only in
+/// how `q` is bounded, which the handlers do: `/search` requires it, and
+/// `/autocomplete` answers an empty query with no suggestions.
 #[derive(Debug, Deserialize)]
-struct SearchParams {
+pub(crate) struct SearchParams {
     q: Option<String>,
     #[serde(default)]
     limit: usize,
+    /// Left as a string here and parsed by [`parse_layer`], so an unknown
+    /// layer is a 400 naming the valid ones rather than a serde rejection
+    /// reading `unknown variant`.
     layer: Option<String>,
 }
 
+/// Resolve the `layer` filter, rejecting a layer that does not exist.
+///
+/// An unknown layer used to pass through to the index and match nothing, so a
+/// typo looked exactly like "no results here" and clients had no way to tell
+/// the two apart. Both comparable open geocoders reject it instead: Pelias
+/// answers `'bogus' is an invalid layers parameter. Valid options: ...` and
+/// Photon `Unknown layer type. Available layers: [...]`, each a 400 listing
+/// what it would have accepted. We do the same.
+///
+/// An empty or whitespace-only value means "no filter", which is what a form
+/// that always sends the key produces.
+fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
+    let Some(value) = layer.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    Layer::parse(value).map(Some).ok_or_else(|| {
+        let valid = Layer::ALL
+            .iter()
+            .map(|layer| layer.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Problem::malformed_parameter(format!("unknown layer {value:?}. Valid layers: {valid}"))
+            .with_invalid_params(vec![InvalidParam::new("layer", "unknown layer")])
+    })
+}
+
 #[derive(Debug, Deserialize)]
-struct ReverseParams {
+pub(crate) struct ReverseParams {
     lon: f64,
     lat: f64,
 }
@@ -124,6 +157,7 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
         .route("/reverse", get_only(reverse))
+        .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz));
 
@@ -196,7 +230,37 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
     Problem::malformed_parameter("could not parse query parameters")
 }
 
-async fn search(
+/// Search for a place by text.
+///
+/// Answers are ordered by `score`, best first.
+#[utoipa::path(
+    get,
+    path = "/search",
+    tag = "geocoding",
+    params(
+        ("q" = String, Query,
+         description = "The text to search for.",
+         example = "10 King Street, Toronto",
+         min_length = 1, max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "How many answers to return. 0, the default, lets the \
+                        server choose.",
+         minimum = 0, maximum = 50),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only answers of this layer. An unknown layer is \
+                        rejected rather than silently matching nothing."),
+    ),
+    responses(
+        (status = 200, description = "The places that matched, best first.",
+         body = ForwardCollection),
+        (status = 400, description = "`q` was empty or too long, `limit` was above \
+                                      the maximum, or a parameter did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The search failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn search(
     State(state): State<AppState>,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
@@ -204,11 +268,12 @@ async fn search(
 
     let query = bounds::validate_query(params.q.as_deref().unwrap_or_default())?;
     bounds::validate_search_limit(params.limit)?;
+    let layer = parse_layer(params.layer.as_deref())?;
 
     let options = TextSearchOptions {
         query: query.clone(),
         limit: params.limit,
-        layer: params.layer,
+        layer: layer.map(|layer| layer.as_str().to_string()),
     };
     let collection = blocking(move || {
         let hits = state.searcher.search(options)?;
@@ -219,7 +284,38 @@ async fn search(
     Ok(Json(collection))
 }
 
-async fn autocomplete(
+/// Suggest places as a query is typed.
+///
+/// Like `/search`, but tuned for partial input: an empty or very short `q` is
+/// not an error, it simply has no suggestions.
+#[utoipa::path(
+    get,
+    path = "/autocomplete",
+    tag = "geocoding",
+    params(
+        ("q" = Option<String>, Query,
+         description = "The text typed so far. Empty returns no suggestions.",
+         example = "10 King St",
+         max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "How many suggestions to return. 0, the default, lets the \
+                        server choose.",
+         minimum = 0, maximum = 20),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only suggestions of this layer. An unknown layer is \
+                        rejected rather than silently matching nothing."),
+    ),
+    responses(
+        (status = 200, description = "The suggestions, best first.",
+         body = ForwardCollection),
+        (status = 400, description = "`q` was too long, `limit` was above the \
+                                      maximum, or a parameter did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The search failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn autocomplete(
     State(state): State<AppState>,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
@@ -229,11 +325,12 @@ async fn autocomplete(
     // only bound the length here; the searcher caps the result count internally.
     let query = bounds::validate_query_length(params.q.as_deref().unwrap_or_default())?;
     bounds::validate_autocomplete_limit(params.limit)?;
+    let layer = parse_layer(params.layer.as_deref())?;
 
     let options = TextAutocompleteOptions {
         query: query.clone(),
         limit: params.limit,
-        layer: params.layer,
+        layer: layer.map(|layer| layer.as_str().to_string()),
     };
     let collection = blocking(move || {
         let hits = state.searcher.autocomplete(options)?;
@@ -244,7 +341,32 @@ async fn autocomplete(
     Ok(Json(collection))
 }
 
-async fn reverse(
+/// Find the places at a point.
+///
+/// The first feature is the place itself, when there is one, carrying its
+/// `distance_m`. The features after it are the areas the point lies in, from
+/// the most precise outwards, and carry no distance.
+#[utoipa::path(
+    get,
+    path = "/reverse",
+    tag = "geocoding",
+    params(
+        ("lon" = f64, Query, description = "Longitude, in degrees.",
+         example = -79.3832, minimum = -180.0, maximum = 180.0),
+        ("lat" = f64, Query, description = "Latitude, in degrees.",
+         example = 43.6532, minimum = -90.0, maximum = 90.0),
+    ),
+    responses(
+        (status = 200, description = "What lies at the point, most precise first. \
+                                      `features` is empty when nothing is near.",
+         body = ReverseCollection),
+        (status = 400, description = "`lon` or `lat` was missing or out of range.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "Reverse geocoding failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn reverse(
     State(state): State<AppState>,
     params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
@@ -432,6 +554,37 @@ mod router_tests {
         let reply = send(router.clone(), request("GET", "/search?q=king&limit=abc")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["error_code"], "malformed_parameter");
+
+        // An unknown layer -> 400 naming the layers that would have been
+        // accepted, not an empty answer that looks like "nothing here".
+        let reply = send(router.clone(), request("GET", "/search?q=king&layer=bogus")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        let body = reply.json();
+        assert_eq!(body["error_code"], "malformed_parameter");
+        assert_eq!(body["invalid_params"][0]["name"], "layer");
+        let detail = body["detail"].as_str().expect("detail");
+        assert!(detail.contains("bogus"), "{detail}");
+        assert!(detail.contains("address"), "{detail}");
+
+        // An unknown layer is rejected on /autocomplete too.
+        let reply = send(
+            router.clone(),
+            request("GET", "/autocomplete?q=kin&layer=bogus"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+
+        // A known layer filters, and an empty one means "no filter" rather
+        // than a rejection, which is what a form that always sends the key
+        // produces.
+        let reply = send(
+            router.clone(),
+            request("GET", "/search?q=King%20Street&layer=address"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let reply = send(router.clone(), request("GET", "/search?q=king&layer=")).await;
+        assert_eq!(reply.status, StatusCode::OK);
 
         // A valid query succeeds.
         let reply = send(router, request("GET", "/search?q=King%20Street&limit=5")).await;

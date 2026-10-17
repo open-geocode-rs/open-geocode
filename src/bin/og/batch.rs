@@ -517,7 +517,7 @@ impl BatchObserver for RunStats {
                 .accuracy
                 .lock()
                 .expect("accuracy lock")
-                .entry(feature.properties.accuracy)
+                .entry(feature.properties.common.accuracy)
                 .or_default() += 1;
         }
         self.latencies.record(millis);
@@ -526,7 +526,7 @@ impl BatchObserver for RunStats {
             query: row.query.to_string(),
             hit: row.feature.map(|feature| {
                 (
-                    feature.properties.name.clone(),
+                    feature.properties.common.name.clone(),
                     feature.lat(),
                     feature.lon(),
                 )

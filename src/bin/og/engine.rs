@@ -50,24 +50,22 @@ pub enum Collection {
 impl Collection {
     /// Pretty JSON of the whole answer, or of it with only feature `only`.
     pub fn json(&self, only: Option<usize>) -> String {
-        fn pick<G: Clone, R: Clone>(
-            collection: &api::FeatureCollection<G, R>,
-            only: Option<usize>,
-        ) -> api::FeatureCollection<G, R> {
-            let mut collection = collection.clone();
-            if let Some(index) = only {
-                collection.features = collection
-                    .features
-                    .into_iter()
-                    .skip(index)
-                    .take(1)
-                    .collect();
+        /// Keep only feature `index`, when one was asked for.
+        fn only_one<F: Clone>(features: &[F], only: Option<usize>) -> Vec<F> {
+            match only {
+                Some(index) => features.iter().skip(index).take(1).cloned().collect(),
+                None => features.to_vec(),
             }
-            collection
         }
         let text = match self {
-            Self::Forward(collection) => serde_json::to_string_pretty(&pick(collection, only)),
-            Self::Reverse(collection) => serde_json::to_string_pretty(&pick(collection, only)),
+            Self::Forward(collection) => serde_json::to_string_pretty(&api::ForwardCollection {
+                features: only_one(&collection.features, only),
+                ..collection.clone()
+            }),
+            Self::Reverse(collection) => serde_json::to_string_pretty(&api::ReverseCollection {
+                features: only_one(&collection.features, only),
+                ..collection.clone()
+            }),
         };
         text.expect("an answer serializes")
     }
@@ -120,7 +118,13 @@ impl Engine {
         let hits = collection
             .features
             .iter()
-            .map(|feature| hit(feature, Measure::Score(feature.properties.rank.score)))
+            .map(|feature| {
+                hit(
+                    &feature.properties.common,
+                    &feature.geometry,
+                    Measure::Score(feature.properties.score),
+                )
+            })
             .collect();
         Ok(Answer {
             hits,
@@ -151,7 +155,13 @@ impl Engine {
         let hits = collection
             .features
             .iter()
-            .map(|feature| hit(feature, Measure::Score(feature.properties.rank.score)))
+            .map(|feature| {
+                hit(
+                    &feature.properties.common,
+                    &feature.geometry,
+                    Measure::Score(feature.properties.score),
+                )
+            })
             .collect();
         Ok(Answer {
             hits,
@@ -171,8 +181,9 @@ impl Engine {
             .iter()
             .map(|feature| {
                 hit(
-                    feature,
-                    Measure::Distance(feature.properties.rank.distance_m),
+                    &feature.properties.common,
+                    &feature.geometry,
+                    Measure::Distance(feature.properties.distance_m),
                 )
             })
             .collect();
@@ -202,14 +213,13 @@ impl Engine {
     }
 }
 
-fn hit<R>(feature: &api::Feature<R>, measure: Measure) -> Hit {
-    let properties = &feature.properties;
+fn hit(common: &api::Common, geometry: &api::Point, measure: Measure) -> Hit {
     Hit {
-        layer: properties.layer.as_str().to_string(),
-        name: properties.name.clone(),
-        label: properties.label.clone(),
-        lat: feature.lat(),
-        lon: feature.lon(),
+        layer: common.layer.as_str().to_string(),
+        name: common.name.clone(),
+        label: common.label.clone(),
+        lat: geometry.lat(),
+        lon: geometry.lon(),
         measure,
     }
 }

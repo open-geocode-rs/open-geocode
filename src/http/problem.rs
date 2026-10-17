@@ -33,7 +33,81 @@ impl InvalidParam {
     }
 }
 
+/// Every error this API answers with. The stable, machine-readable half of
+/// the contract: `detail` is prose that may be reworded, `error_code` is not.
+///
+/// A closed enum so a new error cannot reach a client undocumented, and so
+/// the published contract can list every value it is allowed to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ErrorCode {
+    InvalidQuery,
+    InvalidCoordinate,
+    LimitTooLarge,
+    MalformedParameter,
+    NotFound,
+    MethodNotAllowed,
+    InternalError,
+}
+
+impl ErrorCode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidQuery => "invalid_query",
+            Self::InvalidCoordinate => "invalid_coordinate",
+            Self::LimitTooLarge => "limit_too_large",
+            Self::MalformedParameter => "malformed_parameter",
+            Self::NotFound => "not_found",
+            Self::MethodNotAllowed => "method_not_allowed",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    /// The slug this code uses in its `type` URI: the code with underscores
+    /// as hyphens, so the URI reads as a path.
+    fn slug(self) -> String {
+        self.as_str().replace('_', "-")
+    }
+
+    /// The `type` member: a documentation URI once [`DOCS_BASE`] is set, and
+    /// RFC 9457's `about:blank` until then.
+    fn type_uri(self) -> String {
+        match DOCS_BASE {
+            Some(base) => format!("{base}/{}", self.slug()),
+            None => "about:blank".to_string(),
+        }
+    }
+}
+
+/// Where the problem types are documented, once they are.
+///
+/// `None` until then, which renders `type` as `about:blank`: RFC 9457's
+/// default, and the only honest value while there is nothing to dereference.
+/// A `type` that looks like a link but 404s is worse than one that never
+/// promised anything.
+///
+/// Giving this a base URL turns every `type` into a real link, which is the
+/// property the error contracts developers like best all have: somewhere to
+/// read next to the code to branch on (Stripe `doc_url`, GitHub
+/// `documentation_url`, Twilio `more_info`, Meilisearch `link`). No separate
+/// link member is needed, because `type` already is one.
+///
+/// That change is additive — `about:blank` promises nothing, so replacing it
+/// breaks no client — but it does change every error body, so it lands with
+/// the pages, not before. `error_code` is the stable value either way.
+const DOCS_BASE: Option<&str> = None;
+
 /// The RFC 9457 problem document fields.
+///
+/// `instance` is not among them: it identifies the specific occurrence, and
+/// `request_id` already does that here, with a value the logs are indexed by.
+/// RFC 9457 makes every member optional, so leaving it out stays compliant.
+///
+/// `error_code` is an extension member: the stable value to branch on, where
+/// `title` and `detail` are prose that may be reworded. RFC 9457 requires
+/// clients to ignore extensions they do not know, so adding it stays
+/// compliant. The companion link those APIs provide is [`DOCS_BASE`], carried
+/// by `type` rather than a second member.
 #[derive(Debug, Clone, Serialize)]
 struct ProblemInner {
     #[serde(rename = "type")]
@@ -42,12 +116,9 @@ struct ProblemInner {
     status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instance: Option<String>,
+    error_code: ErrorCode,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     invalid_params: Vec<InvalidParam>,
     /// Value for the `Allow` response header (405 only); never serialized.
@@ -67,15 +138,14 @@ struct ProblemInner {
 pub(crate) struct Problem(Box<ProblemInner>);
 
 impl Problem {
-    fn new(status: StatusCode, error_code: &str) -> Self {
+    fn new(status: StatusCode, error_code: ErrorCode) -> Self {
         Self(Box::new(ProblemInner {
-            type_uri: format!("/problems/{}", error_code.replace('_', "-")),
+            type_uri: error_code.type_uri(),
             title: status.canonical_reason().unwrap_or("Error").to_string(),
             status: status.as_u16(),
             detail: None,
-            instance: None,
+            error_code,
             request_id: None,
-            error_code: Some(error_code.to_string()),
             invalid_params: Vec::new(),
             allow: None,
             cause: None,
@@ -112,8 +182,8 @@ impl Problem {
     }
 
     #[cfg(test)]
-    pub(crate) fn error_code(&self) -> Option<&str> {
-        self.0.error_code.as_deref()
+    pub(crate) fn error_code(&self) -> ErrorCode {
+        self.0.error_code
     }
 
     #[cfg(test)]
@@ -129,34 +199,34 @@ impl Problem {
     // --- 400 ---------------------------------------------------------------
 
     pub(crate) fn invalid_query(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "invalid_query").with_detail(detail)
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery).with_detail(detail)
     }
 
     pub(crate) fn invalid_coordinate(params: Vec<InvalidParam>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "invalid_coordinate")
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidCoordinate)
             .with_detail("coordinate out of range")
             .with_invalid_params(params)
     }
 
     pub(crate) fn limit_too_large(params: Vec<InvalidParam>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "limit_too_large")
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::LimitTooLarge)
             .with_detail("requested result count exceeds the maximum")
             .with_invalid_params(params)
     }
 
     pub(crate) fn malformed_parameter(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "malformed_parameter").with_detail(detail)
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedParameter).with_detail(detail)
     }
 
     // --- 404 / 405 ---------------------------------------------------------
 
     pub(crate) fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found").with_detail("unknown route")
+        Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound).with_detail("unknown route")
     }
 
     pub(crate) fn method_not_allowed(allow: impl Into<String>) -> Self {
         let allow = allow.into();
-        let mut problem = Self::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+        let mut problem = Self::new(StatusCode::METHOD_NOT_ALLOWED, ErrorCode::MethodNotAllowed)
             .with_detail("method not allowed for this route");
         problem.0.allow = Some(allow);
         problem
@@ -167,7 +237,7 @@ impl Problem {
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
     pub(crate) fn internal(cause: anyhow::Error) -> Self {
-        let mut problem = Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        let mut problem = Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError);
         problem.0.cause = Some(Arc::new(cause));
         problem
     }
@@ -267,12 +337,55 @@ mod tests {
             body_json(Problem::invalid_query("invalid search query").with_request_id("req-123"))
                 .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(value["type"], "/problems/invalid-query");
+        // `about:blank` while there are no problem pages to point at; the
+        // machine-readable value clients branch on is `error_code`.
+        assert_eq!(value["type"], "about:blank");
         assert_eq!(value["title"], "Bad Request");
         assert_eq!(value["status"], 400);
         assert_eq!(value["detail"], "invalid search query");
         assert_eq!(value["error_code"], "invalid_query");
         assert_eq!(value["request_id"], "req-123");
+        // `instance` was never populated and `request_id` identifies the
+        // occurrence instead. RFC 9457 makes every member optional.
+        assert!(value.get("instance").is_none());
+    }
+
+    const ALL_CODES: [ErrorCode; 7] = [
+        ErrorCode::InvalidQuery,
+        ErrorCode::InvalidCoordinate,
+        ErrorCode::LimitTooLarge,
+        ErrorCode::MalformedParameter,
+        ErrorCode::NotFound,
+        ErrorCode::MethodNotAllowed,
+        ErrorCode::InternalError,
+    ];
+
+    /// `type` is either RFC 9457's `about:blank` or a URI that can actually be
+    /// followed. A relative path or a link to pages that do not exist would be
+    /// worse than promising nothing.
+    #[test]
+    fn every_type_uri_is_blank_or_absolute() {
+        for code in ALL_CODES {
+            let uri = code.type_uri();
+            assert!(
+                uri == "about:blank" || uri.starts_with("https://"),
+                "{uri} is neither about:blank nor an absolute https URI"
+            );
+        }
+    }
+
+    /// The slugs are the `type` path segments once there are pages to serve,
+    /// so they are fixed now even though nothing reads them yet.
+    #[test]
+    fn slugs_read_as_paths_and_are_distinct() {
+        let slugs: Vec<String> = ALL_CODES.iter().map(|code| code.slug()).collect();
+        for slug in &slugs {
+            assert!(!slug.contains('_'), "{slug} should use hyphens");
+        }
+        let mut unique = slugs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), slugs.len(), "slugs collide: {slugs:?}");
     }
 
     #[tokio::test]
@@ -304,7 +417,7 @@ mod tests {
     fn parse_error_converts_to_400_without_a_cause() {
         let problem = Problem::from(anyhow::anyhow!("failed to parse search query \"(\""));
         assert_eq!(problem.status(), 400);
-        assert_eq!(problem.error_code(), Some("invalid_query"));
+        assert_eq!(problem.error_code(), ErrorCode::InvalidQuery);
         assert!(problem.cause().is_none());
     }
 

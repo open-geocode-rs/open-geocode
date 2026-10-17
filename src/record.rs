@@ -86,7 +86,19 @@ pub struct PlaceRecord {
 
 /// Every record layer. Place layers are the context layers used to describe
 /// where an address is.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Layer {
     Address,
@@ -331,7 +343,19 @@ pub struct RejectedRecord {
     pub source: SourceProvenance,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OsmObjectType {
     Node,

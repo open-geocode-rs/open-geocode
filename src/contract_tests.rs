@@ -61,9 +61,156 @@ fn assert_example(name: &str, body: &Value) {
     assert_committed(&format!("responses/{name}.json"), &text);
 }
 
+/// The committed contract is the one the code generates, and the one the
+/// server actually hands out at `/openapi.json`.
+#[tokio::test]
+async fn committed_openapi_is_the_served_contract() {
+    let document = crate::http::openapi::document().expect("spec serializes");
+    assert_committed("openapi.json", &document);
+
+    let pack = contract_pack();
+    let router = build_router(
+        AppState::open(&pack).expect("open pack"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
+    );
+    let response = router
+        .oneshot(
+            Request::get("/openapi.json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let served = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(
+        String::from_utf8(served.to_vec()).expect("spec is UTF-8"),
+        document,
+        "/openapi.json differs from the committed contract"
+    );
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// The committed contract survives release-please rewriting its version.
+///
+/// `release-please-config.json` lists `contract/openapi.json` as an extra
+/// file, and release-please rewrites a JSON file by parsing it and
+/// re-serializing with `JSON.stringify(value, null, 2)`. If the committed
+/// text were not already exactly that, every release would reformat the file
+/// and the drift test above would fail on main until someone regenerated it.
+///
+/// Keeping the file a fixed point of that transform is what makes the two
+/// safe together. The risk is integral floats: a bound written `-180.0` in
+/// Rust would serialize as `-180.0` but come back `-180`. Today none survive
+/// serialization, and this notices if one ever does.
+#[test]
+fn the_contract_survives_a_release_version_bump() {
+    let document = crate::http::openapi::document().expect("spec serializes");
+    let value: Value = serde_json::from_str(&document).expect("spec is JSON");
+    let mut restringified = serde_json::to_string_pretty(&value).expect("re-serializes");
+    restringified.push('\n');
+    assert_eq!(
+        restringified, document,
+        "the contract is not a fixed point of parse-then-serialize, so a release \
+         would reformat it"
+    );
+}
+
+/// Every `$ref` in the contract resolves, and every schema in it is reachable.
+///
+/// A schema that is only ever reached through a parameter is not collected
+/// automatically, so a dangling `$ref` is the failure this guards: the spec
+/// would still parse, and would still be wrong.
+#[test]
+fn every_schema_reference_resolves() {
+    let document = crate::http::openapi::document().expect("spec serializes");
+    let spec: Value = serde_json::from_str(&document).expect("spec is JSON");
+    let defined: std::collections::BTreeSet<String> = spec["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas")
+        .keys()
+        .cloned()
+        .collect();
+
+    let mut referenced = std::collections::BTreeSet::new();
+    collect_refs(&spec, &mut referenced);
+
+    let dangling: Vec<_> = referenced.difference(&defined).collect();
+    assert!(dangling.is_empty(), "unresolved $ref: {dangling:?}");
+    let unused: Vec<_> = defined.difference(&referenced).collect();
+    assert!(unused.is_empty(), "schemas nothing points at: {unused:?}");
+}
+
+/// The contract never admits a null, because the API never sends one: an
+/// absent value is an absent key.
+#[test]
+fn the_contract_admits_no_nulls() {
+    let document = crate::http::openapi::document().expect("spec serializes");
+    assert!(
+        !document.contains("\"null\""),
+        "the contract still allows a null somewhere"
+    );
+}
+
+fn collect_refs(value: &Value, found: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("$ref")
+                && let Some(name) = reference.strip_prefix("#/components/schemas/")
+            {
+                found.insert(name.to_string());
+            }
+            for item in map.values() {
+                collect_refs(item, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_refs(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn committed_audit_columns_are_the_batch_columns() {
     assert_committed(batch::AUDIT_COLUMNS_FILE, &batch::audit_columns_text());
+}
+
+/// Write the contract Pack where `OG_CONTRACT_PACK` points, for serving it
+/// by hand:
+///
+/// ```text
+/// OG_CONTRACT_PACK=/tmp/contract-pack cargo test write_the_contract_pack -- --ignored
+/// open-geocode serve --pack /tmp/contract-pack --bind 127.0.0.1:8080
+/// ```
+///
+/// Ignored because it writes outside the temp dir it cleans up, and exists
+/// so the committed examples can be checked against a running server.
+#[test]
+#[ignore = "writes a Pack to OG_CONTRACT_PACK for serving by hand"]
+fn write_the_contract_pack() {
+    let path = std::env::var_os("OG_CONTRACT_PACK")
+        .map(PathBuf::from)
+        .expect("set OG_CONTRACT_PACK to where the Pack should be written");
+    write_pack(&path);
+    println!("wrote the contract Pack to {}", path.display());
+}
+
+/// A Pack holding the handful of records the examples are built from, in a
+/// directory of its own so tests can run side by side.
+fn contract_pack() -> PathBuf {
+    let pack = std::env::temp_dir().join(format!(
+        "open-geocode-contract-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    write_pack(&pack);
+    pack
 }
 
 #[tokio::test]
@@ -178,7 +325,59 @@ async fn responses_match_the_committed_examples() {
     assert_example("reverse-nothing", &nothing);
     assert_eq!(nothing["features"], json!([]));
 
+    // Errors are part of the contract too: a client branches on `error_code`
+    // and shows `detail`, so both are committed like any answer.
+    let (status, empty_query) = get_error(&router, "/search?q=").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_example("error-invalid-query", &empty_query);
+    assert_eq!(empty_query["error_code"], "invalid_query");
+    assert_eq!(empty_query["type"], "about:blank");
+    assert_eq!(empty_query["request_id"], "contract-example");
+    assert!(empty_query.get("instance").is_none());
+
+    let (status, out_of_range) = get_error(&router, "/reverse?lon=-79&lat=999").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_example("error-invalid-coordinate", &out_of_range);
+    assert_eq!(out_of_range["error_code"], "invalid_coordinate");
+    assert_eq!(out_of_range["invalid_params"][0]["name"], "lat");
+
+    let (status, unknown_layer) = get_error(&router, "/search?q=king&layer=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_example("error-malformed-parameter", &unknown_layer);
+    assert_eq!(unknown_layer["error_code"], "malformed_parameter");
+
     let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// A request that is expected to fail, returning its status and problem body.
+/// The request id is fixed so the committed example is stable.
+async fn get_error(router: &Router, uri: &str) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::get(uri)
+                .header("x-request-id", "contract-example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    let status = response.status();
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json"),
+        "{uri} should be served as a problem document"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (
+        status,
+        serde_json::from_slice(&body).expect("problem is JSON"),
+    )
 }
 
 async fn get(router: &Router, uri: &str) -> Value {

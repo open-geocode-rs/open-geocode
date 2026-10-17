@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context as _, Result};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::{
     labels,
@@ -26,44 +27,58 @@ use crate::{
 };
 
 /// A forward answer: `/search` and `/autocomplete`.
-pub type ForwardCollection = FeatureCollection<ForwardGeocoding, Forward>;
-/// A reverse answer: `/reverse`.
-pub type ReverseCollection = FeatureCollection<ReverseGeocoding, Reverse>;
-pub type ForwardFeature = Feature<Forward>;
-pub type ReverseFeature = Feature<Reverse>;
-
-/// A GeoJSON FeatureCollection of geocoding answers, best or most precise
-/// first.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct FeatureCollection<G, R> {
+///
+/// Forward and reverse answers are the same GeoJSON FeatureCollection, best
+/// or most precise first, differing only in what `geocoding` says and in the
+/// one ranking field each feature carries. Each direction is written out
+/// rather than shared through a generic, because a generic reached through a
+/// type alias is transparent to the schema generator: it produced one
+/// `FeatureCollection` component for both directions and pointed `/search`
+/// and `/reverse` at it, so the published contract described each endpoint
+/// with the other's fields. The duplication here is what makes the generated
+/// schemas distinct and true. The construction logic is still shared, by
+/// [`common`] and the builders below.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ForwardCollection {
     #[serde(rename = "type")]
     pub kind: FeatureCollectionType,
     /// What was asked, the contract version and the data attribution.
-    pub geocoding: G,
-    pub features: Vec<Feature<R>>,
+    pub geocoding: ForwardGeocoding,
+    pub features: Vec<ForwardFeature>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// A reverse answer: `/reverse`. See [`ForwardCollection`] for why the two
+/// directions are written out rather than shared through a generic.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ReverseCollection {
+    #[serde(rename = "type")]
+    pub kind: FeatureCollectionType,
+    /// The point asked about, the contract version and the data attribution.
+    pub geocoding: ReverseGeocoding,
+    pub features: Vec<ReverseFeature>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum FeatureCollectionType {
     FeatureCollection,
 }
 
 /// The contract version. It changes only when a field changes meaning or
 /// goes away; new optional fields keep it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum Version {
     #[serde(rename = "1")]
     V1,
 }
 
 /// The licence every answer is given under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum Attribution {
     #[serde(rename = "© OpenStreetMap contributors, ODbL")]
     OpenStreetMap,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardGeocoding {
     pub version: Version,
     /// The query text as received, trimmed.
@@ -71,7 +86,7 @@ pub struct ForwardGeocoding {
     pub attribution: Attribution,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ReverseGeocoding {
     pub version: Version,
     /// The point asked about.
@@ -79,42 +94,56 @@ pub struct ReverseGeocoding {
     pub attribution: Attribution,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
 pub struct LonLat {
     pub lon: f64,
     pub lat: f64,
 }
 
-/// One answer: a record of the Pack, or a house number placed on one.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Feature<R> {
+/// One forward answer: a record of the Pack, or a house number placed on one.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ForwardFeature {
     #[serde(rename = "type")]
     pub kind: FeatureType,
     pub geometry: Point,
-    pub properties: Properties<R>,
+    pub properties: ForwardProperties,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// One reverse answer: the record found at the point, or an area around it.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ReverseFeature {
+    #[serde(rename = "type")]
+    pub kind: FeatureType,
+    pub geometry: Point,
+    pub properties: ReverseProperties,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum FeatureType {
     Feature,
 }
 
 /// A GeoJSON Point, `[lon, lat]`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
 pub struct Point {
     #[serde(rename = "type")]
     pub kind: PointType,
     pub coordinates: [f64; 2],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum PointType {
     Point,
 }
 
-/// What a feature is, where it lies and where it comes from.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Properties<R> {
+/// What a feature is, where it lies and where it comes from: everything both
+/// directions say about an answer.
+///
+/// Not a response type of its own. It is flattened into
+/// [`ForwardProperties`] and [`ReverseProperties`], which add the one field
+/// their direction ranks by, so that both are one flat object on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct Common {
     /// Stable source id, for example `osm:node:123`.
     pub id: String,
     /// Row of the record in this Pack. Not stable across Pack builds.
@@ -136,20 +165,30 @@ pub struct Properties<R> {
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     pub source: RecordSource,
-    #[serde(flatten)]
-    pub rank: R,
 }
 
-/// The field only forward features carry.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct Forward {
+/// A forward feature's properties: the common fields, and the text relevance
+/// `/search` and `/autocomplete` rank by.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ForwardProperties {
+    #[serde(flatten)]
+    pub common: Common,
     /// Text relevance: higher is better, comparable only within one answer.
+    ///
+    /// It orders the features of one response and nothing else. It is not a
+    /// probability, not a quality score, and not comparable between queries
+    /// or between Packs — two answers' scores say nothing about each other.
+    /// To judge how good a single answer is, read `accuracy` and `layer`,
+    /// which mean the same thing in every response.
     pub score: f32,
 }
 
-/// The field only reverse features carry.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct Reverse {
+/// A reverse feature's properties: the common fields, and how far the feature
+/// lies from the point asked about.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ReverseProperties {
+    #[serde(flatten)]
+    pub common: Common,
     /// Metres from the point asked about to the feature's geometry, for the
     /// features found by distance. The areas around the point carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,7 +206,7 @@ pub struct Reverse {
 /// | `approximate` | a node or derived point standing for something larger: a place node, a postcode |
 ///
 /// Accuracies order from the most precise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Accuracy {
     Rooftop,
@@ -205,7 +244,7 @@ impl Accuracy {
 /// Address parts as the record states them. A part the record leaves out is
 /// absent, never filled in from the areas around it: those are the
 /// `context`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Address {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub housenumber: Option<String>,
@@ -288,7 +327,7 @@ fn stated(value: Option<&str>) -> Option<String> {
 
 /// The areas a record lies in, one per level: the admin areas most specific
 /// first, then the place area.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Context {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub neighbourhood: Option<ContextArea>,
@@ -312,41 +351,63 @@ impl Context {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ContextArea {
     /// The area's source id, as a feature's `id`.
     pub id: String,
     pub name: String,
 }
 
-impl<G, R> FeatureCollection<G, R> {
-    fn new(geocoding: G, features: Vec<Feature<R>>) -> Self {
+impl Point {
+    fn new(lon: f64, lat: f64) -> Self {
         Self {
-            kind: FeatureCollectionType::FeatureCollection,
-            geocoding,
-            features,
+            kind: PointType::Point,
+            coordinates: [lon, lat],
         }
+    }
+
+    pub fn lon(&self) -> f64 {
+        self.coordinates[0]
+    }
+
+    pub fn lat(&self) -> f64 {
+        self.coordinates[1]
     }
 }
 
-impl<R> Feature<R> {
-    fn new(lon: f64, lat: f64, properties: Properties<R>) -> Self {
+impl ForwardFeature {
+    fn new(lon: f64, lat: f64, properties: ForwardProperties) -> Self {
         Self {
             kind: FeatureType::Feature,
-            geometry: Point {
-                kind: PointType::Point,
-                coordinates: [lon, lat],
-            },
+            geometry: Point::new(lon, lat),
             properties,
         }
     }
 
     pub fn lon(&self) -> f64 {
-        self.geometry.coordinates[0]
+        self.geometry.lon()
     }
 
     pub fn lat(&self) -> f64 {
-        self.geometry.coordinates[1]
+        self.geometry.lat()
+    }
+}
+
+impl ReverseFeature {
+    fn new(lon: f64, lat: f64, properties: ReverseProperties) -> Self {
+        Self {
+            kind: FeatureType::Feature,
+            geometry: Point::new(lon, lat),
+            properties,
+        }
+    }
+
+    pub fn lon(&self) -> f64 {
+        self.geometry.lon()
+    }
+
+    pub fn lat(&self) -> f64 {
+        self.geometry.lat()
     }
 }
 
@@ -413,14 +474,15 @@ pub fn forward_collection(
         .into_iter()
         .map(|hit| forward_feature(&mut contexts, hit))
         .collect::<Result<Vec<_>>>()?;
-    Ok(FeatureCollection::new(
-        ForwardGeocoding {
+    Ok(ForwardCollection {
+        kind: FeatureCollectionType::FeatureCollection,
+        geocoding: ForwardGeocoding {
             version: Version::V1,
             query,
             attribution: Attribution::OpenStreetMap,
         },
         features,
-    ))
+    })
 }
 
 /// One search hit as a feature. The hit's summary already holds what search
@@ -432,14 +494,11 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         .point
         .with_context(|| format!("search hit {} has no point", hit.record.id))?;
     let accuracy = Accuracy::of(point.precision, &hit.record.source);
-    let properties = properties(
-        contexts,
-        hit.record_id,
-        hit.record,
-        accuracy,
-        Forward { score: hit.score },
-    )?;
-    Ok(Feature::new(point.lon, point.lat, properties))
+    let properties = ForwardProperties {
+        common: common(contexts, hit.record_id, hit.record, accuracy)?,
+        score: hit.score,
+    };
+    Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }
 
 /// The answer to `/reverse`, converted from what reverse geocoding returns.
@@ -511,16 +570,11 @@ pub fn reverse_collection(
             summary.layer = layer.clone();
         }
         summary.label = result.label.clone();
-        let properties = properties(
-            &mut contexts,
-            record_id,
-            summary,
-            accuracy,
-            Reverse {
-                distance_m: result.distance_m,
-            },
-        )?;
-        features.push(Feature::new(lon, lat, properties));
+        let properties = ReverseProperties {
+            common: common(&mut contexts, record_id, summary, accuracy)?,
+            distance_m: result.distance_m,
+        };
+        features.push(ReverseFeature::new(lon, lat, properties));
     }
 
     let mut areas = Vec::new();
@@ -540,18 +594,16 @@ pub fn reverse_collection(
             .point
             .with_context(|| format!("context record {record_id} has no point"))?;
         let accuracy = Accuracy::of(point.precision, &summary.source);
-        let properties = properties(
-            &mut contexts,
-            record_id,
-            summary,
-            accuracy,
-            Reverse { distance_m: None },
-        )?;
-        features.push(Feature::new(point.lon, point.lat, properties));
+        let properties = ReverseProperties {
+            common: common(&mut contexts, record_id, summary, accuracy)?,
+            distance_m: None,
+        };
+        features.push(ReverseFeature::new(point.lon, point.lat, properties));
     }
 
-    Ok(FeatureCollection::new(
-        ReverseGeocoding {
+    Ok(ReverseCollection {
+        kind: FeatureCollectionType::FeatureCollection,
+        geocoding: ReverseGeocoding {
             version: Version::V1,
             point: LonLat {
                 lon: response.lon,
@@ -560,7 +612,7 @@ pub fn reverse_collection(
             attribution: Attribution::OpenStreetMap,
         },
         features,
-    ))
+    })
 }
 
 /// The house number at the start of an estimated address's label.
@@ -589,16 +641,16 @@ fn breadth(layer: &str) -> usize {
         .unwrap_or(ORDER.len())
 }
 
-fn properties<R>(
+/// The fields both directions share, read once from the record.
+fn common(
     contexts: &mut Contexts,
     record_id: RecordId,
     summary: RecordSummary,
     accuracy: Accuracy,
-    rank: R,
-) -> Result<Properties<R>> {
+) -> Result<Common> {
     let layer = Layer::parse(&summary.layer)
         .with_context(|| format!("record {record_id} has unknown layer {}", summary.layer))?;
-    Ok(Properties {
+    Ok(Common {
         id: summary.id,
         record_id,
         layer,
@@ -609,7 +661,6 @@ fn properties<R>(
         address: summary.address,
         context: contexts.of(record_id)?,
         source: summary.source,
-        rank,
     })
 }
 
@@ -618,12 +669,12 @@ fn properties<R>(
 /// empty, so this is also the one list of column names.
 pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, String)> {
     let properties = feature.map(|feature| &feature.properties);
-    let field = |value: &dyn Fn(&Properties<Forward>) -> Option<String>| {
+    let field = |value: &dyn Fn(&ForwardProperties) -> Option<String>| {
         properties.and_then(value).unwrap_or_default()
     };
     let area = |area: fn(&Context) -> &Option<ContextArea>| {
         properties
-            .and_then(|properties| area(&properties.context).as_ref())
+            .and_then(|properties| area(&properties.common.context).as_ref())
             .map(|area| area.name.clone())
             .unwrap_or_default()
     };
@@ -633,34 +684,55 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
             .unwrap_or_default()
     };
     vec![
-        ("score", field(&|p| Some(p.rank.score.to_string()))),
-        ("record_id", field(&|p| Some(p.record_id.to_string()))),
-        ("id", field(&|p| Some(p.id.clone()))),
-        ("layer", field(&|p| Some(p.layer.as_str().to_string()))),
+        ("score", field(&|p| Some(p.score.to_string()))),
+        (
+            "record_id",
+            field(&|p| Some(p.common.record_id.to_string())),
+        ),
+        ("id", field(&|p| Some(p.common.id.clone()))),
+        (
+            "layer",
+            field(&|p| Some(p.common.layer.as_str().to_string())),
+        ),
         (
             "accuracy",
-            field(&|p| Some(p.accuracy.as_str().to_string())),
+            field(&|p| Some(p.common.accuracy.as_str().to_string())),
         ),
-        ("name", field(&|p| Some(p.name.clone()))),
-        ("label", field(&|p| Some(p.label.clone()))),
-        ("category", field(&|p| p.category.clone())),
+        ("name", field(&|p| Some(p.common.name.clone()))),
+        ("label", field(&|p| Some(p.common.label.clone()))),
+        ("category", field(&|p| p.common.category.clone())),
         ("lat", coordinate(1)),
         ("lon", coordinate(0)),
         (
             "address_housenumber",
-            field(&|p| p.address.housenumber.clone()),
+            field(&|p| p.common.address.housenumber.clone()),
         ),
-        ("address_unit", field(&|p| p.address.unit.clone())),
-        ("address_street", field(&|p| p.address.street.clone())),
-        ("address_place", field(&|p| p.address.place.clone())),
+        ("address_unit", field(&|p| p.common.address.unit.clone())),
+        (
+            "address_street",
+            field(&|p| p.common.address.street.clone()),
+        ),
+        ("address_place", field(&|p| p.common.address.place.clone())),
         (
             "address_areas",
-            field(&|p| Some(p.address.areas.join("; "))),
+            field(&|p| Some(p.common.address.areas.join("; "))),
         ),
-        ("address_locality", field(&|p| p.address.locality.clone())),
-        ("address_region", field(&|p| p.address.region.clone())),
-        ("address_postcode", field(&|p| p.address.postcode.clone())),
-        ("address_country", field(&|p| p.address.country.clone())),
+        (
+            "address_locality",
+            field(&|p| p.common.address.locality.clone()),
+        ),
+        (
+            "address_region",
+            field(&|p| p.common.address.region.clone()),
+        ),
+        (
+            "address_postcode",
+            field(&|p| p.common.address.postcode.clone()),
+        ),
+        (
+            "address_country",
+            field(&|p| p.common.address.country.clone()),
+        ),
         (
             "context_neighbourhood",
             area(|context| &context.neighbourhood),
@@ -670,26 +742,30 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
         ("context_region", area(|context| &context.region)),
         ("context_country", area(|context| &context.country)),
         ("context_place", area(|context| &context.place)),
-        ("source_dataset", field(&|p| Some(p.source.dataset.clone()))),
+        (
+            "source_dataset",
+            field(&|p| Some(p.common.source.dataset.clone())),
+        ),
         (
             "source_object_type",
             field(&|p| {
-                p.source
+                p.common
+                    .source
                     .object_type
                     .map(|kind| labels::osm_object_type_name(kind).to_string())
             }),
         ),
         (
             "source_object_id",
-            field(&|p| p.source.object_id.map(|id| id.to_string())),
+            field(&|p| p.common.source.object_id.map(|id| id.to_string())),
         ),
         (
             "source_derived_from",
-            field(&|p| p.source.derived_from.clone()),
+            field(&|p| p.common.source.derived_from.clone()),
         ),
         (
             "source_record_count",
-            field(&|p| p.source.record_count.map(|count| count.to_string())),
+            field(&|p| p.common.source.record_count.map(|count| count.to_string())),
         ),
     ]
 }
