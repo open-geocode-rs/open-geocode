@@ -634,7 +634,7 @@ fn nesting_section(mut pairs: Vec<u64>) -> Vec<u8> {
 }
 
 /// The names a record adds to the dictionaries, normalized. Computed beside
-/// its text document, in parallel; [`DictionaryBuilder::add`] then counts it.
+/// its text document, in parallel; [`Builder::add`] then counts it.
 #[derive(Debug, Default)]
 pub struct RecordNames {
     /// Each name with its field and the admin level it names (see
@@ -804,14 +804,14 @@ struct Alias {
 
 /// Collects the dictionaries while the Pack writer writes records.
 #[derive(Debug, Default)]
-pub struct DictionaryBuilder {
+pub struct Builder {
     names: HashMap<(Field, String), NameStats>,
     /// Records lying in each admin area, by the area's record id.
     areas: HashMap<RecordId, Area>,
     /// Every admin context a record lies in, for which areas lie in which.
     contexts: HashSet<AdminContextTuple>,
     /// Each place with the areas its own context places it in, as
-    /// [`nesting_pair`]s (see [`DictionaryBuilder::add_place`]).
+    /// [`nesting_pair`]s (see [`Builder::add_place`]).
     area_pairs: Vec<u64>,
     /// Each name of a place with the place's record id, so a name of a
     /// place held only as a point names it too.
@@ -822,7 +822,7 @@ pub struct DictionaryBuilder {
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
-impl DictionaryBuilder {
+impl Builder {
     /// Country codes of the country records, so every record can be counted
     /// in the country its admin context places it in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
@@ -1568,7 +1568,7 @@ mod tests {
 
     #[test]
     fn every_name_of_an_area_counts_the_records_in_it() {
-        let mut builder = DictionaryBuilder::default();
+        let mut builder = Builder::default();
         let context = RecordContext {
             admin_context: crate::pack::AdminContextTuple {
                 locality_record_id: Some(9),
@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn aliases_and_nesting_come_from_the_areas_records_lie_in() {
-        let mut builder = DictionaryBuilder::default();
+        let mut builder = Builder::default();
         let context = |region: RecordId, locality: RecordId| RecordContext {
             admin_context: AdminContextTuple {
                 region_record_id: Some(region),
@@ -1695,7 +1695,7 @@ mod tests {
                 source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
             })
         };
-        let mut builder = DictionaryBuilder::default();
+        let mut builder = Builder::default();
         for index in 0..MIN_UNIT_WORD_VALUES {
             builder.add(RecordNames::of(&address(&format!("Bay {index}"))), None);
         }

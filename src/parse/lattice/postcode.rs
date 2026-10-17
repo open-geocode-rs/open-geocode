@@ -19,15 +19,15 @@ pub const MAX_TOKENS: usize = 3;
 
 /// Every country's postcode pattern, matched in one pass.
 #[derive(Debug)]
-pub struct PostcodeTable {
+pub struct Table {
     countries: Vec<CountryCode>,
     patterns: RegexSet,
 }
 
-impl PostcodeTable {
+impl Table {
     /// The table compiled once per process.
     pub fn global() -> &'static Self {
-        static TABLE: OnceLock<PostcodeTable> = OnceLock::new();
+        static TABLE: OnceLock<Table> = OnceLock::new();
         TABLE.get_or_init(|| Self::parse(POSTCODES))
     }
 
@@ -80,7 +80,7 @@ impl PostcodeTable {
 mod tests {
     use super::*;
 
-    fn codes(table: &PostcodeTable, text: &str) -> Vec<String> {
+    fn codes(table: &Table, text: &str) -> Vec<String> {
         table
             .matches(text)
             .iter()
@@ -90,13 +90,13 @@ mod tests {
 
     #[test]
     fn the_vendored_table_compiles_and_covers_the_world() {
-        let table = PostcodeTable::global();
+        let table = Table::global();
         assert!(table.len() > 150, "{}", table.len());
     }
 
     #[test]
     fn patterns_match_whole_postcodes_in_any_case() {
-        let table = PostcodeTable::global();
+        let table = Table::global();
         let ca = CountryCode::parse("CA").unwrap();
         assert!(table.matches_country(ca, "m5v 1m9"));
         assert!(table.matches_country(ca, "M5V1M9"));
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn rows_without_a_pattern_or_code_are_skipped() {
-        let table = PostcodeTable::parse("CA\t\\d{3}\nbad row\nXYZ\t\\d\n");
+        let table = Table::parse("CA\t\\d{3}\nbad row\nXYZ\t\\d\n");
         assert_eq!(table.len(), 1);
         assert_eq!(codes(&table, "123"), vec!["CA"]);
     }

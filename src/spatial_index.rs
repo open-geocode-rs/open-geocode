@@ -30,7 +30,7 @@ use serde::Serialize;
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     extsort::{ExternalSorter, Scratch, SortStats, Spill},
-    memory::MemoryBudget,
+    memory::Budget,
     pack::RecordId,
     record::{Layer, Record},
     records::{RecordsReader, dequantize},
@@ -179,7 +179,7 @@ pub struct SpatialIndexWriter {
 }
 
 impl SpatialIndexWriter {
-    pub fn new(scratch: &Arc<Scratch>, budget: &Arc<MemoryBudget>, share_bytes: usize) -> Self {
+    pub fn new(scratch: &Arc<Scratch>, budget: &Arc<Budget>, share_bytes: usize) -> Self {
         Self {
             fine: ExternalSorter::new(scratch, "spatial-fine", budget, share_bytes),
             context: ExternalSorter::new(scratch, "spatial-context", budget, share_bytes / 8),
@@ -915,9 +915,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer =
-            RecordsWriter::create(&scratch, &MemoryBudget::unlimited()).expect("records");
-        let mut spatial = SpatialIndexWriter::new(&scratch, &MemoryBudget::unlimited(), 64);
+        let mut writer = RecordsWriter::create(&scratch, &Budget::unlimited()).expect("records");
+        let mut spatial = SpatialIndexWriter::new(&scratch, &Budget::unlimited(), 64);
         for record in records {
             let id = writer.write(record, None).expect("write");
             spatial

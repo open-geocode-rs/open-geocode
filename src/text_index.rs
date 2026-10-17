@@ -27,7 +27,7 @@ use tantivy::{
 use crate::{
     container::{Bytes, Container, ContainerWriter},
     extsort::Scratch,
-    memory::{MemoryBudget, Reservation},
+    memory::{Budget, Reservation},
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
@@ -67,7 +67,7 @@ pub struct TextIndexWriter {
     /// Created with the first document, so its buffers are reserved only for
     /// the phase that writes records.
     writer: Option<(IndexWriter, Reservation)>,
-    budget: Arc<MemoryBudget>,
+    budget: Arc<Budget>,
     memory_bytes: usize,
     index: Index,
     path: PathBuf,
@@ -145,7 +145,7 @@ impl fmt::Debug for TextIndexWriter {
 impl TextIndexWriter {
     pub fn create(
         scratch: &Arc<Scratch>,
-        budget: &Arc<MemoryBudget>,
+        budget: &Arc<Budget>,
         memory_bytes: usize,
     ) -> Result<Self> {
         let (schema, fields) = build_schema();

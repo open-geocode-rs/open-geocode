@@ -61,7 +61,7 @@ use crate::{
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
     },
     extsort::{ExternalSorter, SortStats, Spool},
-    memory::MemoryBudget,
+    memory::Budget,
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
     },
@@ -175,7 +175,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     // is what every record waits on, so it takes half: more indexing
     // threads, fewer segments. The context record and spatial sorters hold
     // a few times less than the others, and are capped to stay so.
-    let memory = MemoryBudget::new(budget);
+    let memory = Budget::new(budget);
     memory.sample(&plan.resources);
     let mut writer = PackWriter::create_with(
         &options.pack,

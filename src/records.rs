@@ -50,7 +50,7 @@ use crate::{
     api::Address,
     container::{Bytes, Container, ContainerWriter},
     extsort::Scratch,
-    memory::{MemoryBudget, Reservation},
+    memory::{Budget, Reservation},
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
@@ -316,7 +316,7 @@ impl StringTable {
 }
 
 impl RecordsWriter {
-    pub fn create(scratch: &Arc<Scratch>, budget: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn create(scratch: &Arc<Scratch>, budget: &Arc<Budget>) -> Result<Self> {
         let blocks_path = scratch.path().join("records-blocks.bin");
         let block_offsets_path = scratch.path().join("records-block-offsets.bin");
         let bytes_path = scratch.path().join("records-strings.bin");
@@ -1392,8 +1392,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-records-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer =
-            RecordsWriter::create(&scratch, &MemoryBudget::unlimited()).expect("writer");
+        let mut writer = RecordsWriter::create(&scratch, &Budget::unlimited()).expect("writer");
         for (index, record) in records.iter().enumerate() {
             let id = writer
                 .write(record, contexts.get(index).copied().flatten())
@@ -1492,7 +1491,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-segments-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let budget = MemoryBudget::unlimited();
+        let budget = Budget::unlimited();
         let mut writer = RecordsWriter::create(&scratch, &budget)
             .expect("writer")
             .with_segment_records(100);
@@ -1531,7 +1530,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-dictionary-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let budget = MemoryBudget::new(64 << 20);
+        let budget = Budget::new(64 << 20);
         let mut writer = RecordsWriter::create(&scratch, &budget).expect("writer");
         let base = sample_records().remove(0);
         // Every record brings a new street name: the worst case.

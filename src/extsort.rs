@@ -1,7 +1,7 @@
 //! Disk-backed sorting and spooling for builds larger than memory.
 //!
 //! [`ExternalSorter`] buffers items until its fair share of the build
-//! [`MemoryBudget`] is used (or the shared pool runs out), sorts the buffer,
+//! [`Budget`] is used (or the shared pool runs out), sorts the buffer,
 //! and writes it to a run file in the build scratch directory. Reading merges
 //! every run with a k-way heap. When everything fits no run is written and the
 //! sort is an ordinary in-memory sort, so a city extract and a planet build
@@ -29,7 +29,7 @@ use rayon::prelude::*;
 
 use crate::{
     builder::BuildCancelled,
-    memory::{MemoryBudget, Reservation, Spillable},
+    memory::{Budget, Reservation, Spillable},
     resources,
     util::codec::{get_u64, put_u64},
 };
@@ -178,7 +178,7 @@ pub struct SortStats {
 #[derive(Debug)]
 pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
-    budget: Arc<MemoryBudget>,
+    budget: Arc<Budget>,
     label: &'static str,
     /// The most bytes this sorter may buffer before it spills, whatever its
     /// fair share of the pool.
@@ -194,7 +194,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
     pub fn new(
         scratch: &Arc<Scratch>,
         label: &'static str,
-        budget: &Arc<MemoryBudget>,
+        budget: &Arc<Budget>,
         share_bytes: usize,
     ) -> Self {
         Self {
@@ -382,7 +382,7 @@ impl<T: Spill + Ord> Merge<T> {
     /// Read buffers are sized so all of them fit the sorter's share, between
     /// [`MIN_MERGE_BUFFER_BYTES`] and [`IO_BUFFER_BYTES`] each. They are needed
     /// to make progress, so they are reserved even when the pool is full.
-    fn open(runs: &[PathBuf], budget: &Arc<MemoryBudget>, share_bytes: usize) -> Result<Self> {
+    fn open(runs: &[PathBuf], budget: &Arc<Budget>, share_bytes: usize) -> Result<Self> {
         let buffer_bytes =
             (share_bytes / runs.len().max(1)).clamp(MIN_MERGE_BUFFER_BYTES, IO_BUFFER_BYTES);
         let mut buffers = Reservation::empty(budget);
@@ -793,8 +793,7 @@ mod tests {
     #[test]
     fn in_memory_sort_writes_no_runs() {
         let scratch = scratch("memory");
-        let mut sorter =
-            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), usize::MAX);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), usize::MAX);
         let input = pseudo_random(10_000);
         for item in &input {
             sorter.push(*item).expect("push");
@@ -816,8 +815,7 @@ mod tests {
         let scratch = scratch("spill");
         // Each item counts 16 bytes, so this spills every 50 items: 400 runs,
         // more than one merge round.
-        let mut sorter =
-            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), 50 * 16);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 50 * 16);
         let input = pseudo_random(20_000);
         for item in &input {
             sorter.push(*item).expect("push");
@@ -839,7 +837,7 @@ mod tests {
         let scratch = scratch("shared");
         let item = std::mem::size_of::<(u64, u64)>();
         // Each sorter's share alone would fit; together they do not.
-        let budget = MemoryBudget::new(64 * 1024 * item);
+        let budget = Budget::new(64 * 1024 * item);
         let mut first = ExternalSorter::new(&scratch, "first", &budget, 48 * 1024 * item);
         let mut second = ExternalSorter::new(&scratch, "second", &budget, 48 * 1024 * item);
         let input = pseudo_random(400_000);
@@ -885,8 +883,7 @@ mod tests {
     #[test]
     fn run_files_are_removed_once_merged() {
         let scratch = scratch("cleanup");
-        let mut sorter =
-            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), 10 * 16);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 10 * 16);
         for item in pseudo_random(1_000) {
             sorter.push(item).expect("push");
         }
@@ -931,7 +928,7 @@ mod tests {
         let mut sorter = ExternalSorter::new(
             &scratch,
             "keyed",
-            &MemoryBudget::unlimited(),
+            &Budget::unlimited(),
             7 * std::mem::size_of::<Keyed>(),
         );
         for payload in 0..1_000 {

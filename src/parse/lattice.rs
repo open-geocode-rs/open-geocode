@@ -38,7 +38,7 @@ use self::{
     decode::Lattice,
     dictionary::{Dictionaries, Field, Match},
     features::{FeatureSet, TokenInfo},
-    postcode::PostcodeTable,
+    postcode::Table,
     weights::Weights,
 };
 use super::types::{Label, Tagged, Tagger};
@@ -549,7 +549,7 @@ impl ParsedQuery {
 /// dictionaries and a learned linear model. Cheap to share across threads.
 pub struct LatticeTagger {
     dictionaries: Dictionaries,
-    postcodes: &'static PostcodeTable,
+    postcodes: &'static Table,
     weights: Weights,
 }
 
@@ -590,7 +590,7 @@ impl LatticeTagger {
     pub fn new(dictionaries: Dictionaries, weights: Weights) -> Self {
         Self {
             dictionaries,
-            postcodes: PostcodeTable::global(),
+            postcodes: Table::global(),
             weights,
         }
     }

@@ -1,6 +1,6 @@
 //! Build memory accounting.
 //!
-//! One [`MemoryBudget`] is shared by every large buffer of a build: sort
+//! One [`Budget`] is shared by every large buffer of a build: sort
 //! buffers (counted by capacity, so `Vec` growth is included), merge read
 //! buffers, the text indexing buffers and the parser's lattice cache. A
 //! buffer reserves bytes before it grows; when the pool is full its owner
@@ -59,7 +59,7 @@ pub fn derived_budget(resources: &Resources, untracked_bytes: u64) -> usize {
 }
 
 #[derive(Debug)]
-pub struct MemoryBudget {
+pub struct Budget {
     limit: usize,
     used: AtomicUsize,
     /// Bytes reserved by buffers that can spill.
@@ -71,7 +71,7 @@ pub struct MemoryBudget {
     heap_ceiling: AtomicUsize,
 }
 
-impl MemoryBudget {
+impl Budget {
     pub fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             limit,
@@ -177,14 +177,14 @@ impl MemoryBudget {
 /// Bytes held from a budget, returned when dropped.
 #[derive(Debug)]
 pub struct Reservation {
-    budget: Arc<MemoryBudget>,
+    budget: Arc<Budget>,
     bytes: usize,
     spillable: bool,
 }
 
 impl Reservation {
     /// A reservation of a buffer that cannot spill.
-    pub fn empty(budget: &Arc<MemoryBudget>) -> Self {
+    pub fn empty(budget: &Arc<Budget>) -> Self {
         Self {
             budget: Arc::clone(budget),
             bytes: 0,
@@ -193,7 +193,7 @@ impl Reservation {
     }
 
     /// A reservation that is granted regardless of the limit.
-    pub fn forced(budget: &Arc<MemoryBudget>, bytes: usize) -> Self {
+    pub fn forced(budget: &Arc<Budget>, bytes: usize) -> Self {
         let mut reservation = Self::empty(budget);
         reservation.force_grow(bytes);
         reservation
@@ -236,7 +236,7 @@ pub struct Spillable {
 }
 
 impl Spillable {
-    pub fn new(budget: &Arc<MemoryBudget>) -> Self {
+    pub fn new(budget: &Arc<Budget>) -> Self {
         budget.spillable.fetch_add(1, Ordering::Relaxed);
         Self {
             reservation: Reservation {
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn reservations_respect_the_limit_and_track_the_peak() {
-        let budget = MemoryBudget::new(100);
+        let budget = Budget::new(100);
         let mut first = Reservation::empty(&budget);
         assert!(first.try_grow(60));
         let mut second = Reservation::empty(&budget);
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn spillable_buffers_split_what_the_others_leave() {
-        let budget = MemoryBudget::new(1_000);
+        let budget = Budget::new(1_000);
         let _fixed = Reservation::forced(&budget, 200);
         let mut first = Spillable::new(&budget);
         assert_eq!(first.share(usize::MAX), 800);

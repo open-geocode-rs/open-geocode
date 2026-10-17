@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     builder::plan::BuildPlan,
-    parse::lattice::train::TrainReport,
+    parse::lattice::train::Report,
     record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
     resources::Resources,
     util::geo::point_lon_lat,
@@ -42,7 +42,7 @@ pub struct BuilderReport {
     pub scratch: ScratchReport,
     pub output: PackOutputReport,
     /// The address parser trained on the Pack's records.
-    pub parser_training: TrainReport,
+    pub parser_training: Report,
     /// Ways and relations libpostal's admin level table names for the
     /// input's countries that the input lacks: rules that apply to nothing.
     pub unmatched_admin_level_ids: Vec<String>,

@@ -33,10 +33,10 @@ use crate::{
     context::{ContextReader, ContextTupleWriter},
     extsort::Scratch,
     labels,
-    memory::MemoryBudget,
+    memory::Budget,
     parse::lattice::{
         CountryCode,
-        dictionary::{DictionaryBuilder, RecordNames},
+        dictionary::{Builder, RecordNames},
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
@@ -94,7 +94,7 @@ pub struct PackWriterOptions {
     /// new generation.
     pub scratch_dir: Option<PathBuf>,
     /// Pool every buffer of the build reserves from.
-    pub memory: Arc<MemoryBudget>,
+    pub memory: Arc<Budget>,
     /// Share of the pool the spatial index sorter may hold before it spills.
     pub sort_budget_bytes: usize,
     /// Memory for Tantivy's indexing buffers, taken from the pool.
@@ -105,7 +105,7 @@ impl Default for PackWriterOptions {
     fn default() -> Self {
         Self {
             scratch_dir: None,
-            memory: MemoryBudget::unlimited(),
+            memory: Budget::unlimited(),
             sort_budget_bytes: DEFAULT_SORT_BUDGET_BYTES,
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
         }
@@ -151,7 +151,7 @@ pub struct PackWriter {
     layer_counts: BTreeMap<Layer, u64>,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     postcode_areas: Arc<PostcodeAreas>,
-    dictionaries: DictionaryBuilder,
+    dictionaries: Builder,
 }
 
 /// A finished, unpublished Pack.
@@ -219,7 +219,7 @@ impl PackWriter {
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
             postcode_areas: Arc::default(),
-            dictionaries: DictionaryBuilder::default(),
+            dictionaries: Builder::default(),
         })
     }
 
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn text_index_memory_fits_the_budget_and_waits_for_records() {
         let root = temp_root("text-memory");
-        let memory = MemoryBudget::new(64 << 20);
+        let memory = Budget::new(64 << 20);
         let mut writer = PackWriter::create_with(
             &root,
             PackWriterOptions {
