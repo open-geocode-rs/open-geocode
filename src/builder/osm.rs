@@ -50,7 +50,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use rayon::prelude::*;
 
 use crate::{
@@ -142,7 +142,10 @@ impl fmt::Debug for BuildOsmOptions {
 /// the threads, and check the memory and disk the input needs.
 pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     if !options.input.is_file() {
-        bail!("input {} does not exist", options.input.display());
+        return Err(Error::BadInput(format!(
+            "input {} does not exist",
+            options.input.display()
+        )));
     }
     let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
     plan_build(
@@ -551,9 +554,9 @@ impl Build {
     }
 
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
-        let [lon, lat] = record
-            .display_point()
-            .with_context(|| format!("record {} has no display point", record.id()))?;
+        let [lon, lat] = record.display_point().ok_or_else(|| {
+            Error::BadGeometry(format!("record {} has no display point", record.id()))
+        })?;
         let pending = PendingRecord {
             key: hilbert_key(quantize(lon)?, quantize(lat)?),
             seq: self.seq,
@@ -579,7 +582,8 @@ fn request_nodes(
         requests.push(NodeRequest {
             node_id: *node_id,
             owner,
-            pos: u32::try_from(pos).context("way has too many nodes")?,
+            pos: u32::try_from(pos)
+                .map_err(|_| Error::BadInput("way has too many nodes".into()))?,
             want_tags,
         })?;
     }
@@ -675,10 +679,17 @@ struct Audit {
 impl Audit {
     fn create(generation: &Path) -> Result<Self> {
         let dir = generation.join(AUDIT_DIR);
-        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        fs::create_dir_all(&dir).map_err(|source| Error::IoPath {
+            action: "failed to create",
+            path: dir.clone(),
+            source,
+        })?;
         let path = dir.join(REJECTIONS_FILE);
-        let file =
-            File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+        let file = File::create(&path).map_err(|source| Error::IoPath {
+            action: "failed to create",
+            path: path.clone(),
+            source,
+        })?;
         Ok(Self {
             dir,
             rejections: BufWriter::with_capacity(1 << 20, file),
@@ -696,10 +707,12 @@ impl Audit {
     fn finish(mut self, report: &BuilderReport) -> Result<()> {
         self.rejections.flush()?;
         let path = self.dir.join(BUILD_REPORT_FILE);
-        let file =
-            File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
-        serde_json::to_writer_pretty(BufWriter::new(file), report)
-            .with_context(|| format!("failed to write {}", path.display()))
+        let file = File::create(&path).map_err(|source| Error::IoPath {
+            action: "failed to create",
+            path: path.clone(),
+            source,
+        })?;
+        serde_json::to_writer_pretty(BufWriter::new(file), report).map_err(Error::from)
     }
 }
 
@@ -1596,11 +1609,7 @@ mod tests {
             ..BuildOsmOptions::default()
         })
         .unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::builder::BuildCancelled>()
-                .is_some()
-        );
+        assert!(matches!(error, Error::Cancelled));
         assert!(!dir.join("pack").join("CURRENT").exists());
     }
 }

@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail, ensure};
+use crate::error::{Error, Result};
 
 use super::{
     CountryCode,
@@ -381,7 +381,7 @@ impl Weights {
         }
         let bytes = container.section(WEIGHTS_SECTION, WEIGHTS_VERSION)?;
         Self::from_bytes(&bytes)
-            .with_context(|| format!("invalid Pack section {WEIGHTS_SECTION}"))
+            .map_err(|_| Error::Decode("invalid parser weights section"))
             .map(Some)
     }
 
@@ -413,12 +413,13 @@ impl Weights {
     /// Weights written by [`Self::to_bytes`] for this build's feature layout.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader(bytes);
-        ensure!(reader.take(MAGIC.len())? == MAGIC, "not parser weights");
+        if reader.take(MAGIC.len())? != MAGIC {
+            return Err(Error::Decode("not parser weights"));
+        }
         let version = reader.u32()?;
-        ensure!(
-            version == WEIGHTS_VERSION,
-            "parser weights have version {version}, this build reads version {WEIGHTS_VERSION}"
-        );
+        if version != WEIGHTS_VERSION {
+            return Err(Error::UnsupportedVersion { found: version });
+        }
         let schema = reader.u64()?;
         let (features, labels, states) = (reader.u32()?, reader.u32()?, reader.u32()?);
         if schema != features::schema()
@@ -426,17 +427,22 @@ impl Weights {
             || labels as usize != LABELS
             || states as usize != STATES
         {
-            bail!("parser weights were trained for another feature layout; retrain them");
+            return Err(Error::Decode(
+                "parser weights were trained for another feature layout; retrain them",
+            ));
         }
         let edge = reader.floats(features::COUNT * LABELS)?;
         let global = reader.floats(STATES * STATES)?;
         let mut countries = BTreeMap::new();
         for _ in 0..reader.u32()? {
             let code = u16::from_le_bytes(reader.take(2)?.try_into().expect("two bytes"));
-            let country = CountryCode::from_u16(code).context("invalid country code")?;
+            let country =
+                CountryCode::from_u16(code).ok_or(Error::Decode("invalid country code"))?;
             countries.insert(country, reader.floats(STATES * STATES)?);
         }
-        ensure!(reader.0.is_empty(), "trailing bytes after parser weights");
+        if !reader.0.is_empty() {
+            return Err(Error::Decode("trailing bytes after parser weights"));
+        }
         Ok(Self {
             edge,
             global,
@@ -471,7 +477,9 @@ struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        ensure!(self.0.len() >= len, "parser weights are truncated");
+        if self.0.len() < len {
+            return Err(Error::Decode("parser weights are truncated"));
+        }
         let (head, tail) = self.0.split_at(len);
         self.0 = tail;
         Ok(head)

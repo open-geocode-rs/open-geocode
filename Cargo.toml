@@ -26,6 +26,9 @@ dbg_macro = "deny"
 undocumented_unsafe_blocks = "deny"
 
 [dependencies]
+# The binaries and the benchmark and fixture tooling, which report a failure
+# to a person rather than to a caller who matches on it. The geocoding API
+# returns open_geocode::Error.
 anyhow = "1.0"
 # Copies a GeoJSON answer from the interactive `og` interface. Text only.
 arboard = { version = "3.7.0", default-features = false, optional = true }
@@ -64,6 +67,7 @@ signal-hook = { version = "0.3", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
 stable_deref_trait = "1.2"
 tantivy = "0.25.0"
+thiserror = "2"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }
 # The Unicode Script property: which characters the parser reads as a

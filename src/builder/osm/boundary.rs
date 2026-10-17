@@ -494,8 +494,8 @@ pub(crate) fn build_boundaries(
     ways: &[BoundaryWay],
     relations: &[BoundaryRelationStub],
     member_lines: &HashMap<i64, Option<&[Vertex]>>,
-    check: impl Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<BoundarySet> {
+    check: impl Fn() -> crate::error::Result<()>,
+) -> crate::error::Result<BoundarySet> {
     let mut candidates = Vec::new();
     for (index, way) in ways.iter().enumerate() {
         if index % CHECK_EVERY == 0 {

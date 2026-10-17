@@ -30,7 +30,7 @@ pub mod weights;
 
 use std::{collections::HashMap, fmt, path::Path, rc::Rc, sync::OnceLock};
 
-use anyhow::Result;
+use crate::error::Result;
 use levenshtein_automata::{DFA, LevenshteinAutomatonBuilder};
 use unicode_script::{Script, UnicodeScript};
 

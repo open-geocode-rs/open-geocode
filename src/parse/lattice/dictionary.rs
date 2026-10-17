@@ -33,7 +33,7 @@ use std::{
     sync::OnceLock,
 };
 
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
 
@@ -319,7 +319,7 @@ impl Dictionaries {
                     return Ok(empty_map());
                 }
                 let bytes = container.section(field.section(), DICTIONARY_VERSION)?;
-                Map::new(bytes).with_context(|| format!("invalid Pack section {}", field.section()))
+                Ok(Map::new(bytes)?)
             })
             .collect::<Result<Vec<_>>>()?;
         let section = |name: &str| -> Result<Option<Bytes>> {
@@ -336,7 +336,7 @@ impl Dictionaries {
             section(NESTING_SECTION)?,
         ) {
             dictionaries.areas =
-                Map::new(areas).with_context(|| format!("invalid Pack section {AREAS_SECTION}"))?;
+                Map::new(areas).map_err(|_| Error::Decode("invalid dictionary map in the Pack"))?;
             dictionaries.area_ids = area_ids;
             dictionaries.nesting = nesting;
         }

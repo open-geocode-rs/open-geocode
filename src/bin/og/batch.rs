@@ -667,7 +667,8 @@ impl BatchSession {
             cancel: Arc::clone(&cancel),
             ..GeocodeOptions::default()
         };
-        let handle = thread::spawn(move || run_batch_geocode(options).map(|_| ()));
+        let handle =
+            thread::spawn(move || run_batch_geocode(options).map(|_| ()).map_err(Into::into));
         self.summary = None;
         self.run = Some(Run {
             stats,

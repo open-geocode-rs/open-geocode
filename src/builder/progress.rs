@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use crate::error::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// The stages of a build, in the order they run.

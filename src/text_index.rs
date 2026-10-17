@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use rstar::{RTree, primitives::GeomWithData};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
@@ -150,10 +150,12 @@ impl Writer {
     ) -> Result<Self> {
         let (schema, fields) = build_schema();
         let path = scratch.path().join("text");
-        fs::create_dir_all(&path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        let index = Index::create_in_dir(&path, schema)
-            .with_context(|| format!("failed to create Tantivy index {}", path.display()))?;
+        fs::create_dir_all(&path).map_err(|source| Error::IoPath {
+            action: "failed to create",
+            path: path.clone(),
+            source,
+        })?;
+        let index = Index::create_in_dir(&path, schema)?;
         Ok(Self {
             writer: None,
             budget: Arc::clone(budget),
@@ -185,8 +187,7 @@ impl Writer {
                 .max(1);
             let writer = self
                 .index
-                .writer_with_num_threads(threads, self.memory_bytes)
-                .context("failed to create Tantivy index writer")?;
+                .writer_with_num_threads(threads, self.memory_bytes)?;
             // Disable background auto-merges during the build so the only
             // merge is the single deterministic one forced in `finish()`.
             writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -201,9 +202,7 @@ impl Writer {
     /// of queuing every record of the build (a batch of documents would be
     /// one message, and the queue would hold thousands of batches).
     pub fn add(&mut self, document: TantivyDocument) -> Result<()> {
-        self.writer()?
-            .add_document(document)
-            .context("failed to index record")?;
+        self.writer()?.add_document(document)?;
         self.document_count += 1;
         Ok(())
     }
@@ -212,16 +211,11 @@ impl Writer {
     pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
         self.writer()?;
         let (mut writer, memory) = self.writer.take().expect("writer created");
-        writer
-            .commit()
-            .context("failed to commit Tantivy text index")?;
+        writer.commit()?;
         // Join the segments the indexing threads wrote into a few, merged side
         // by side: one merge of every segment runs on one thread, and search
         // reads a few segments as well as one.
-        let segment_ids = self
-            .index
-            .searchable_segment_ids()
-            .context("failed to list text index segments")?;
+        let segment_ids = self.index.searchable_segment_ids()?;
         let groups = segment_ids.len().min(MERGED_SEGMENTS);
         if segment_ids.len() > groups {
             let mut merges = vec![Vec::new(); groups];
@@ -234,21 +228,12 @@ impl Writer {
                 .map(|segments| writer.merge(segments))
                 .collect::<Vec<_>>();
             for merge in pending {
-                merge
-                    .wait()
-                    .context("failed to merge text index segments")?;
+                merge.wait()?;
             }
-            writer
-                .commit()
-                .context("failed to commit merged text index")?;
+            writer.commit()?;
         }
-        writer
-            .garbage_collect_files()
-            .wait()
-            .context("failed to garbage collect text index files")?;
-        writer
-            .wait_merging_threads()
-            .context("failed to stop Tantivy indexing threads")?;
+        writer.garbage_collect_files().wait()?;
+        writer.wait_merging_threads()?;
         drop(memory);
 
         let mut files = fs::read_dir(&self.path)?
@@ -260,7 +245,7 @@ impl Writer {
             let name = file
                 .file_name()
                 .and_then(|name| name.to_str())
-                .context("text index file name is not UTF-8")?;
+                .ok_or(Error::Decode("text index file name is not UTF-8"))?;
             if name.ends_with(".lock") {
                 continue;
             }
@@ -477,7 +462,7 @@ impl Document {
 }
 
 pub fn open_text_index(container: &Container) -> Result<Index> {
-    Index::open(PackDirectory::new(container)?).context("failed to open the Pack text index")
+    Ok(Index::open(PackDirectory::new(container)?)?)
 }
 
 /// Read-only Tantivy directory over the `text/` sections of a Pack. Writes the
@@ -505,15 +490,16 @@ impl PackDirectory {
                 continue;
             };
             if info.version != TEXT_INDEX_SCHEMA_VERSION {
-                bail!(
-                    "text index version {} is unsupported; rebuild the Pack for version {TEXT_INDEX_SCHEMA_VERSION}",
-                    info.version
-                );
+                return Err(Error::UnsupportedVersion {
+                    found: info.version,
+                });
             }
             files.insert(PathBuf::from(file), container.raw_section(name)?);
         }
         if files.is_empty() {
-            bail!("Pack has no text index");
+            return Err(Error::MissingSection {
+                section: "text index",
+            });
         }
         Ok(Self {
             files: Arc::new(files),

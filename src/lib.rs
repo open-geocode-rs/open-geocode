@@ -7,6 +7,7 @@ pub mod container;
 pub mod context;
 #[cfg(test)]
 mod contract_tests;
+pub mod error;
 pub mod extsort;
 pub mod geocode_bench;
 mod http;
@@ -23,3 +24,5 @@ pub mod search;
 pub mod spatial_index;
 pub mod text_index;
 mod util;
+
+pub use error::{Error, Result};

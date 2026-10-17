@@ -14,12 +14,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use open_geocode::{
-    batch::Cancelled,
-    builder::{
-        BuildCancelled, BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit,
-        build_planned_osm_pack, plan_osm_build,
-    },
+use open_geocode::builder::{
+    BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit, build_planned_osm_pack,
+    plan_osm_build,
 };
 
 use crate::{
@@ -233,7 +230,10 @@ impl Drop for BuildJob {
 
 /// Whether an error is a job stopping because it was asked to.
 pub(crate) fn cancelled(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<BuildCancelled>().is_some() || error.downcast_ref::<Cancelled>().is_some()
+    matches!(
+        error.downcast_ref::<open_geocode::Error>(),
+        Some(open_geocode::Error::Cancelled)
+    )
 }
 
 fn build_step(stage: BuildStage) -> Step {

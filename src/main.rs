@@ -627,7 +627,8 @@ async fn main() -> Result<()> {
                 bind,
                 basemap: Some(basemap),
             })
-            .await
+            .await?;
+            Ok(())
         }
     }
 }

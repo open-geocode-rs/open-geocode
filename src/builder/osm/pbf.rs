@@ -5,7 +5,7 @@ use std::{
     sync::mpsc,
 };
 
-use anyhow::{Context, Result, anyhow};
+use crate::error::{Error, Result};
 use osmpbf::{Blob, BlobDecode, BlobReader, ByteOffset, PrimitiveBlock};
 use rayon::prelude::*;
 
@@ -41,7 +41,11 @@ where
         None => input_bytes(input)?,
     };
     progress.start(stage, Some(total))?;
-    let file = File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
+    let file = File::open(input).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: input.to_path_buf(),
+        source,
+    })?;
     let reader = BufReader::with_capacity(
         READ_BUFFER_BYTES,
         ProgressReader {
@@ -49,8 +53,7 @@ where
             progress: offsets.is_none().then(|| progress.clone()),
         },
     );
-    let mut blobs = BlobReader::new_seekable(reader)
-        .with_context(|| format!("failed to read {}", input.display()))?;
+    let mut blobs = BlobReader::new_seekable(reader)?;
 
     std::thread::scope(|scope| -> Result<()> {
         let (sender, receiver) = mpsc::sync_channel::<Result<Vec<Blob>>>(2);
@@ -81,7 +84,7 @@ where
                         }
                     }
                     Some(Err(error)) => {
-                        let _ = sender.send(Err(anyhow!(error)));
+                        let _ = sender.send(Err(Error::from(error)));
                         return;
                     }
                     None => {
@@ -108,9 +111,7 @@ where
                 })
                 .collect::<Vec<Result<Option<T>>>>();
             for output in outputs {
-                if let Some(output) =
-                    output.with_context(|| format!("failed to parse {}", input.display()))?
-                {
+                if let Some(output) = output? {
                     sink(output)?;
                 }
             }
@@ -125,25 +126,24 @@ where
 /// states it, in seconds since the Unix epoch. `None` when the header does
 /// not say; Geofabrik and planet extracts do.
 pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
-    let file = File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
+    let file = File::open(input).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: input.to_path_buf(),
+        source,
+    })?;
     let mut blobs = BlobReader::new(BufReader::new(file));
     let Some(blob) = blobs.next() else {
         return Ok(None);
     };
-    let blob = blob.with_context(|| format!("failed to read {}", input.display()))?;
-    match blob
-        .decode()
-        .with_context(|| format!("failed to read the header of {}", input.display()))?
-    {
+    let blob = blob?;
+    match blob.decode()? {
         BlobDecode::OsmHeader(header) => Ok(header.osmosis_replication_timestamp()),
         BlobDecode::OsmData(_) | BlobDecode::Unknown(_) => Ok(None),
     }
 }
 
 pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
-    Ok(fs::metadata(input)
-        .with_context(|| format!("failed to stat {}", input.display()))?
-        .len())
+    Ok(fs::metadata(input)?.len())
 }
 
 struct ProgressReader<R> {

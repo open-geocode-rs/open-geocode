@@ -139,6 +139,7 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             bind,
             basemap: None,
         }))
+        .map_err(Into::into)
 }
 
 /// `og build`: the build the interface runs, with one line per step. Ctrl-C

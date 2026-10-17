@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use geojson::{Geometry, GeometryValue};
 
 use crate::{
@@ -162,7 +162,7 @@ impl Spill for WayFeature {
                 2 => WayKind::Interpolation,
                 3 => WayKind::Boundary,
                 4 => WayKind::Poi,
-                other => bail!("unknown way feature kind {other}"),
+                _ => return Err(Error::Decode("unknown way feature kind")),
             },
             way_id: get_i64(input)?,
             node_count: get_u32(input)?,
@@ -222,7 +222,7 @@ impl Spill for PendingRecord {
                 0 => None,
                 1 => Some(ContextOrigin::Boundary(get_u32(input)?)),
                 2 => Some(ContextOrigin::DerivedCountry(get_string(input)?)),
-                other => bail!("unknown record origin {other}"),
+                _ => return Err(Error::Decode("unknown record origin")),
             },
             record: decode_record(input)?,
         })
@@ -294,7 +294,7 @@ fn put_strs(out: &mut Vec<u8>, values: &[String]) {
 fn get_strings(input: &mut &[u8]) -> Result<Vec<String>> {
     let count = get_u64(input)?;
     if count > input.len() as u64 {
-        bail!("spilled string list is truncated");
+        return Err(Error::Decode("spilled string list is truncated"));
     }
     (0..count).map(|_| get_string(input)).collect()
 }
@@ -375,7 +375,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
 fn decode_record(input: &mut &[u8]) -> Result<Record> {
     let layer = *Layer::ALL
         .get(usize::from(get_u8(input)?))
-        .context("unknown spilled record layer")?;
+        .ok_or(Error::Decode("unknown spilled record layer"))?;
     Ok(match layer {
         Layer::Address => Record::Address(AddressRecord {
             address: decode_address(input)?,
@@ -511,7 +511,7 @@ fn decode_source(input: &mut &[u8]) -> Result<SourceProvenance> {
         0 => OsmObjectType::Node,
         1 => OsmObjectType::Way,
         2 => OsmObjectType::Relation,
-        other => bail!("unknown spilled object type {other}"),
+        _ => return Err(Error::Decode("unknown spilled object type")),
     };
     Ok(SourceProvenance::osm(object_type, get_i64(input)?))
 }
@@ -527,7 +527,7 @@ fn decode_point(input: &mut &[u8]) -> Result<[f64; 2]> {
     for value in &mut point {
         let (bytes, rest) = input
             .split_at_checked(8)
-            .context("spilled point is truncated")?;
+            .ok_or(Error::Decode("spilled point is truncated"))?;
         *value = f64::from_bits(u64::from_le_bytes(bytes.try_into().expect("8 bytes")));
         *input = rest;
     }
@@ -608,7 +608,7 @@ fn decode_geometry(input: &mut &[u8]) -> Result<Geometry> {
             }
             line(coordinates)
         }
-        other => bail!("unknown spilled geometry {other}"),
+        _ => Err(Error::Decode("unknown spilled geometry")),
     }
 }
 

@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use axum::{
     Json, Router,
     extract::{Query, State, rejection::QueryRejection},
@@ -136,21 +136,22 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack)
-        .with_context(|| format!("failed to open Pack {}", options.pack.display()))?;
+    let state = AppState::open(&options.pack)?;
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
     let listener = TcpListener::bind(options.bind)
         .await
-        .with_context(|| format!("failed to bind {}", options.bind))?;
+        .map_err(|source| Error::IoPath {
+            action: "failed to bind",
+            path: options.pack.clone(),
+            source,
+        })?;
     println!(
         "Serving {} at http://{}",
         options.pack.display(),
         options.bind
     );
-    axum::serve(listener, app)
-        .await
-        .context("runtime server failed")
+    axum::serve(listener, app).await.map_err(Error::from)
 }
 
 /// Assemble the public-demo router with its boundary policy: method-restricted
@@ -875,8 +876,9 @@ mod router_tests {
                 "/error",
                 axum::routing::get(|| async {
                     blocking(|| -> Result<()> {
-                        Err(anyhow::anyhow!("section offset past end of file")
-                            .context("failed to build the GeoJSON"))
+                        Err(Error::Inconsistent(
+                            "section offset past end of file".into(),
+                        ))
                     })
                     .await
                 }),
@@ -931,7 +933,7 @@ mod router_tests {
         assert!(line["latency_ms"].is_u64());
         assert_eq!(
             line["cause"],
-            "failed to build the GeoJSON: section offset past end of file"
+            "Pack is inconsistent: section offset past end of file"
         );
         assert!(!log.lines()[0].contains("Private"));
     }

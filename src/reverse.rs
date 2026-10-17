@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
-use anyhow::Result;
+use crate::error::Result;
 use serde::Serialize;
 
 use crate::{

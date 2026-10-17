@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use uuid::Uuid;
 
 use super::{Manifest, PACK_FILE, Reader};
@@ -23,28 +23,39 @@ pub fn resolve_pack_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let current = match fs::read_to_string(path.join(CURRENT)) {
         Ok(current) => current,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            bail!(
-                "no Pack at {}: expected a Pack file or a Pack directory",
-                path.display()
-            )
+            return Err(Error::IoPath {
+                action: "no Pack at",
+                path: path.to_path_buf(),
+                source: error,
+            });
         }
-        Err(error) => return Err(error).context("failed to read pack CURRENT pointer"),
+        Err(error) => {
+            return Err(Error::IoPath {
+                action: "failed to read the CURRENT pointer of",
+                path: path.to_path_buf(),
+                source: error,
+            });
+        }
     };
-    let id = Uuid::parse_str(current.trim()).context("invalid pack generation in CURRENT")?;
+    let id = Uuid::parse_str(current.trim())
+        .map_err(|_| Error::Inconsistent("invalid pack generation in CURRENT".into()))?;
     let pack = path.join(GENERATIONS).join(id.to_string()).join(PACK_FILE);
     if !pack.is_file() {
-        bail!(
+        return Err(Error::Inconsistent(format!(
             "pack generation {} is incomplete or missing",
             pack.display()
-        );
+        )));
     }
     Ok(pack)
 }
 
 pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
     let generations = destination.join(GENERATIONS);
-    fs::create_dir_all(&generations)
-        .with_context(|| format!("failed to create {}", generations.display()))?;
+    fs::create_dir_all(&generations).map_err(|source| Error::IoPath {
+        action: "failed to create",
+        path: generations.clone(),
+        source,
+    })?;
     let generation = generations.join(Uuid::new_v4().to_string());
     fs::create_dir(&generation)?;
     Ok(generation)
@@ -64,11 +75,13 @@ pub(super) fn publish(
     let reader = Reader::open(&pack)?;
     reader.verify()?;
     if reader.manifest() != manifest {
-        bail!("Pack manifest does not match the build");
+        return Err(Error::ManifestMismatch);
     }
     let text = crate::text_index::open_text_index(reader.container())?;
     if text.reader()?.searcher().num_docs() != manifest.record_count {
-        bail!("text index document count does not match Pack records");
+        return Err(Error::Inconsistent(
+            "text index document count does not match Pack records".into(),
+        ));
     }
     crate::spatial_index::Reader::open(reader.container(), reader.records().clone())?;
     drop((reader, text));
@@ -85,7 +98,7 @@ pub(super) fn publish(
         "{}",
         generation
             .file_name()
-            .context("missing generation name")?
+            .ok_or(Error::Inconsistent("missing generation name".into()))?
             .to_string_lossy()
     )?;
     file.sync_all()?;
@@ -95,11 +108,17 @@ pub(super) fn publish(
         // CURRENT still names the previous generation.
         *keep = false;
         let _ = fs::remove_file(&pending);
-        return Err(error).context("failed to publish pack CURRENT pointer");
+        return Err(Error::IoPath {
+            action: "failed to publish the CURRENT pointer of",
+            path: destination.to_path_buf(),
+            source: error,
+        });
     }
     #[cfg(test)]
     if FAIL_AFTER_SWITCH.get() {
-        bail!("injected failure after the CURRENT switch");
+        return Err(Error::Inconsistent(
+            "injected failure after the CURRENT switch".into(),
+        ));
     }
     sync_directory(destination)?;
     Ok(())

@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -167,10 +167,10 @@ pub fn plan_build(
         );
     }
     if !shortfalls.is_empty() && !force {
-        bail!(
+        return Err(Error::OutOfResources(format!(
             "insufficient resources for this build, pass --force to build anyway:\n  {}",
             shortfalls.join("\n  ")
-        );
+        )));
     }
     plan.shortfalls = shortfalls;
     Ok(plan)

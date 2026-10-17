@@ -22,7 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -295,10 +295,10 @@ impl Writer {
     pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
         let first = self.records.record_count();
         if batch.first != first {
-            bail!(
+            return Err(Error::Inconsistent(format!(
                 "batch prepared for record {} was committed at record {first}",
                 batch.first
-            );
+            )));
         }
         for (offset, prepared) in batch.records.into_iter().enumerate() {
             let PreparedRecord {
@@ -482,22 +482,15 @@ impl Reader {
         let path = resolve_pack_path(path)?;
         let container = Container::open(&path)?;
         let manifest: Manifest =
-            serde_json::from_slice(&container.section(MANIFEST_SECTION, MANIFEST_VERSION)?)
-                .with_context(|| format!("failed to parse the manifest of {}", path.display()))?;
+            serde_json::from_slice(&container.section(MANIFEST_SECTION, MANIFEST_VERSION)?)?;
         if manifest.schema_version != PACK_SCHEMA_VERSION {
-            bail!(
-                "Pack schema version {} is unsupported; rebuild the Pack for schema {}",
-                manifest.schema_version,
-                PACK_SCHEMA_VERSION
-            );
+            return Err(Error::UnsupportedVersion {
+                found: manifest.schema_version,
+            });
         }
         let records = records::Reader::open(&container)?;
         if records.record_count() != manifest.record_count {
-            bail!(
-                "record store has {} records but the manifest declares {}",
-                records.record_count(),
-                manifest.record_count
-            );
+            return Err(Error::ManifestMismatch);
         }
         let context = context::Reader::open(&container)?;
         Ok(Self {
@@ -524,9 +517,7 @@ impl Reader {
 
     /// Check every section of the Pack file against its checksum.
     pub fn verify(&self) -> Result<()> {
-        self.container
-            .verify()
-            .with_context(|| format!("{} failed verification", self.path.display()))
+        self.container.verify()
     }
 
     pub fn records(&self) -> &records::Reader {
@@ -577,8 +568,7 @@ impl Reader {
     }
 
     pub fn records_json_by_layer(&self, layer: &str, limit: usize) -> Result<Vec<Value>> {
-        let layer =
-            Layer::parse(layer).with_context(|| format!("unknown record layer: {layer}"))?;
+        let layer = Layer::parse(layer).ok_or(Error::Decode("unknown record layer"))?;
         let mut records = Vec::new();
         for record_id in 0..self.records.record_count() {
             if self.records.header(record_id)?.layer != layer {
@@ -639,15 +629,20 @@ impl Reader {
             .path
             .parent()
             .map(|dir| dir.join(AUDIT_DIR).join(REJECTIONS_FILE))
-            .context("Pack file has no parent directory")?;
-        let file = fs::File::open(&path)
-            .with_context(|| format!("failed to open build audit {}", path.display()))?;
+            .ok_or(Error::Inconsistent(
+                "Pack file has no parent directory".into(),
+            ))?;
+        let file = fs::File::open(&path).map_err(|source| Error::IoPath {
+            action: "failed to open build audit",
+            path: path.clone(),
+            source,
+        })?;
         let mut rejections = Vec::new();
         for line in BufReader::new(file).lines() {
             if limit > 0 && rejections.len() >= limit {
                 break;
             }
-            rejections.push(serde_json::from_str(&line?).context("invalid rejection record")?);
+            rejections.push(serde_json::from_str(&line?)?);
         }
         Ok(rejections)
     }
