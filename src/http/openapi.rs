@@ -6,13 +6,15 @@
 //! it, and `contract_tests` fails when the committed
 //! `contract/openapi.json` and the code disagree.
 //!
-//! Two things are adjusted after generation, in [`transform`]:
+//! Three things are adjusted after generation, in [`transform`]:
 //!
 //! 1. `Option<T>` renders as a nullable union, `["string", "null"]`, but this
 //!    API never emits a null: an absent value is an absent key
 //!    (`skip_serializing_if`). The nulls are dropped so the spec says what
 //!    the API does.
-//! 2. Every response gains the `X-Request-Id` header it actually returns.
+//! 2. Every route answers a non-GET with a 405, from the router's fallbacks
+//!    rather than from a handler, so there is no attribute to carry it.
+//! 3. Every response gains the `X-Request-Id` header it actually returns.
 //!
 //! Bounds in the parameter attributes below are written as literals, because
 //! the attribute macro cannot read a constant. `bounds_match_the_constants`
@@ -58,6 +60,10 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
                        `application/problem+json`. Branch on `error_code`, which is a \
                        closed set; `title` and `detail` are prose and may be reworded.",
         license(name = "MIT", identifier = "MIT"),
+    ),
+    servers(
+        (url = "http://127.0.0.1:8080",
+         description = "A Runtime serving a Pack locally, the default bind address."),
     ),
     paths(
         crate::runtime::search,
@@ -211,7 +217,58 @@ pub(crate) fn document() -> serde_json::Result<String> {
 /// Adjust the generated spec to describe what the API actually does.
 fn transform(value: &mut Value) {
     drop_nulls(value);
+    add_boundary_responses(value);
     add_request_id_header(value);
+}
+
+/// Document the 405 every route answers a non-GET with.
+///
+/// It comes from the router's own fallbacks rather than from a handler, so
+/// there is no handler attribute to carry it and it has to be added here.
+/// Every route is GET-only, including HEAD, which the router answers 405
+/// rather than letting axum route it to the GET handler.
+///
+/// The 404 is deliberately not added per operation: it belongs to paths that
+/// are not in this document at all, so hanging it off the paths that are
+/// would say the wrong thing.
+fn add_boundary_responses(value: &mut Value) {
+    let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for operations in paths.values_mut() {
+        let Some(operations) = operations.as_object_mut() else {
+            continue;
+        };
+        for operation in operations.values_mut() {
+            let Some(responses) = operation
+                .get_mut("responses")
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            responses
+                .entry("405")
+                .or_insert_with(method_not_allowed_response);
+        }
+    }
+}
+
+fn method_not_allowed_response() -> Value {
+    serde_json::json!({
+        "description": "The route takes GET only. The `Allow` header lists the methods \
+                        it accepts.",
+        "headers": {
+            "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": { "type": "string", "example": "GET" },
+            },
+        },
+        "content": {
+            PROBLEM_JSON: {
+                "schema": { "$ref": "#/components/schemas/Problem" },
+            },
+        },
+    })
 }
 
 /// Drop `null` from everywhere the generator admitted one for an `Option<T>`.

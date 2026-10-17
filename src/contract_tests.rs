@@ -181,6 +181,26 @@ fn committed_audit_columns_are_the_batch_columns() {
     assert_committed(batch::AUDIT_COLUMNS_FILE, &batch::audit_columns_text());
 }
 
+/// Write the contract Pack where `OG_CONTRACT_PACK` points, for serving it
+/// by hand:
+///
+/// ```text
+/// OG_CONTRACT_PACK=/tmp/contract-pack cargo test write_the_contract_pack -- --ignored
+/// open-geocode serve --pack /tmp/contract-pack --bind 127.0.0.1:8080
+/// ```
+///
+/// Ignored because it writes outside the temp dir it cleans up, and exists
+/// so the committed examples can be checked against a running server.
+#[test]
+#[ignore = "writes a Pack to OG_CONTRACT_PACK for serving by hand"]
+fn write_the_contract_pack() {
+    let path = std::env::var_os("OG_CONTRACT_PACK")
+        .map(PathBuf::from)
+        .expect("set OG_CONTRACT_PACK to where the Pack should be written");
+    write_pack(&path);
+    println!("wrote the contract Pack to {}", path.display());
+}
+
 /// A Pack holding the handful of records the examples are built from, in a
 /// directory of its own so tests can run side by side.
 fn contract_pack() -> PathBuf {

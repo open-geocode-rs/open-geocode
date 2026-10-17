@@ -609,6 +609,32 @@
               }
             }
           },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -651,6 +677,32 @@
                 }
               }
             }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Is the process alive?",
@@ -678,6 +730,32 @@
                 }
               }
             }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "The contract this server is serving.",
@@ -694,6 +772,32 @@
           "200": {
             "description": "The Pack is loaded and queries can be served.",
             "headers": {
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -784,6 +888,32 @@
             },
             "description": "`lon` or `lat` was missing or out of range.",
             "headers": {
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -896,6 +1026,32 @@
               }
             }
           },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -923,6 +1079,12 @@
       }
     }
   },
+  "servers": [
+    {
+      "description": "A Runtime serving a Pack locally, the default bind address.",
+      "url": "http://127.0.0.1:8080"
+    }
+  ],
   "tags": [
     {
       "description": "Turn text or a point into places.",
