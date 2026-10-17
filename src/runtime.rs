@@ -30,7 +30,7 @@ use crate::{
     record::Layer,
     resources::Resources,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
-    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
+    search::{AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
 };
 
 #[derive(Debug, Clone)]
@@ -117,6 +117,18 @@ fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
     })
 }
 
+/// `/geocode`: an address whose parts the caller already has apart.
+#[derive(Debug, Deserialize)]
+pub(crate) struct GeocodeParams {
+    address: Option<String>,
+    locality: Option<String>,
+    region: Option<String>,
+    postcode: Option<String>,
+    #[serde(default)]
+    limit: usize,
+    layer: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReverseParams {
     lon: f64,
@@ -156,6 +168,7 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
     let mut app: Router<AppState> = Router::new()
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
+        .route("/geocode", get_only(geocode))
         .route("/reverse", get_only(reverse))
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
@@ -334,6 +347,99 @@ pub(crate) async fn autocomplete(
     };
     let collection = blocking(move || {
         let hits = state.searcher.autocomplete(options)?;
+        api::forward_collection(&state.pack, query, hits)
+    })
+    .await?;
+
+    Ok(Json(collection))
+}
+
+/// Geocode an address whose parts are already apart.
+///
+/// For callers who hold a street address, a town and a postcode in separate
+/// fields and would otherwise have to paste them into one string and hope the
+/// parser pulls them apart again. The street address is searched on its own
+/// and hits are kept only where they fit the locality, region and postcode
+/// given, so a town in the address cannot outrank the street.
+///
+/// This is the lookup `batch-geocode` runs per row, over HTTP.
+///
+/// The answer is the same FeatureCollection every other route returns, with
+/// at most one feature: `features` holds the one match, or is empty when
+/// nothing fits. `geocoding.query` is the rewrite that matched, which is not
+/// always the address as it was sent.
+#[utoipa::path(
+    get,
+    path = "/geocode",
+    tag = "geocoding",
+    params(
+        ("address" = String, Query,
+         description = "The street address on its own: house number and street, \
+                        without the town or postcode.",
+         example = "10 King Street", min_length = 1, max_length = 256),
+        ("locality" = Option<String>, Query,
+         description = "The town or city the address is in.",
+         example = "Toronto", max_length = 256),
+        ("region" = Option<String>, Query,
+         description = "The state, province or region.",
+         example = "Ontario", max_length = 256),
+        ("postcode" = Option<String>, Query,
+         description = "The postcode.", example = "M5V 1A1", max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "How many candidates to consider before picking the best. \
+                        0, the default, lets the server choose. At most one is \
+                        ever returned.",
+         minimum = 0, maximum = 50),
+        ("layer" = Option<Layer>, Query,
+         description = "Consider only candidates of this layer. An unknown layer \
+                        is rejected rather than silently matching nothing."),
+    ),
+    responses(
+        (status = 200,
+         description = "The one address that fits, or no features when none does.",
+         body = ForwardCollection),
+        (status = 400, description = "`address` was empty or too long, a context \
+                                      field was too long, `limit` was above the \
+                                      maximum, or a parameter did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The lookup failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn geocode(
+    State(state): State<AppState>,
+    params: Result<Query<GeocodeParams>, QueryRejection>,
+) -> Result<Json<ForwardCollection>, Problem> {
+    let Query(params) = params.map_err(malformed_parameters)?;
+
+    let address = bounds::validate_query(params.address.as_deref().unwrap_or_default())
+        .map_err(|_| Problem::invalid_query("address must not be empty"))?;
+    // The context fields narrow the search rather than drive it, so an empty
+    // one means "not given" instead of being an error the way `address` is.
+    let context = |value: Option<String>| -> Result<Option<String>, Problem> {
+        let value = bounds::validate_query_length(value.as_deref().unwrap_or_default())?;
+        Ok(Some(value).filter(|value| !value.is_empty()))
+    };
+    let locality = context(params.locality)?;
+    let region = context(params.region)?;
+    let postcode = context(params.postcode)?;
+    bounds::validate_search_limit(params.limit)?;
+    let layer = parse_layer(params.layer.as_deref())?;
+
+    let options = AddressGeocodeOptions {
+        address: address.clone(),
+        locality,
+        region,
+        postcode,
+        limit: params.limit,
+        layer: layer.map(|layer| layer.as_str().to_string()),
+    };
+    let collection = blocking(move || {
+        let found = state.searcher.geocode_address(options)?;
+        let (query, hits) = match found {
+            Some(found) => (found.query, vec![found.hit]),
+            None => (address, Vec::new()),
+        };
         api::forward_collection(&state.pack, query, hits)
     })
     .await?;
@@ -612,6 +718,69 @@ mod router_tests {
 
         let reply = send(router, request("GET", "/reverse?lon=-79.0&lat=43.0")).await;
         assert_eq!(reply.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The cases the endpoint was asked for: a hit inside the postcode, a
+    /// miss in another one, and a missing address.
+    #[tokio::test]
+    async fn geocode_keeps_hits_in_the_given_postcode() {
+        let pack = temp_path("geocode");
+        write_pack(&pack);
+        let demo = temp_path("geocode-demo");
+        let no_basemap = temp_path("geocode-no-basemap");
+        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
+
+        // The address is in this postcode, so it is found.
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        assert_eq!(body["type"], "FeatureCollection");
+        assert_eq!(body["features"].as_array().expect("features").len(), 1);
+        let feature = &body["features"][0];
+        assert_eq!(feature["properties"]["layer"], "address");
+        assert_eq!(feature["geometry"]["coordinates"][0], -79.0);
+
+        // The same address in a postcode it is not in finds nothing. An empty
+        // collection, not an error: the request was fine, the answer is that
+        // there is none.
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=V6B%201A1",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        assert_eq!(body["type"], "FeatureCollection");
+        assert!(
+            body["features"].as_array().expect("features").is_empty(),
+            "an address in the wrong postcode should match nothing"
+        );
+
+        // Context without an address is not a query.
+        let reply = send(router.clone(), request("GET", "/geocode?locality=Toronto")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.json()["error_code"], "invalid_query");
+
+        // The layer filter is validated here as everywhere else.
+        let reply = send(
+            router,
+            request("GET", "/geocode?address=10%20King%20Street&layer=bogus"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.json()["error_code"], "malformed_parameter");
 
         let _ = std::fs::remove_dir_all(&pack);
     }

@@ -325,6 +325,35 @@ async fn responses_match_the_committed_examples() {
     assert_example("reverse-nothing", &nothing);
     assert_eq!(nothing["features"], json!([]));
 
+    // `/geocode` answers with the same collection as `/search`, holding the
+    // one address that fits, so a client parses one shape for both.
+    let structured = get(
+        &router,
+        "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
+    )
+    .await;
+    assert_example("geocode-address", &structured);
+    assert_eq!(structured["type"], "FeatureCollection");
+    assert_eq!(
+        structured["features"].as_array().expect("features").len(),
+        1
+    );
+    assert_eq!(structured["features"][0]["properties"]["layer"], "address");
+
+    // Nothing fits: an empty collection, not an error and not a null.
+    let unmatched = get(
+        &router,
+        "/geocode?address=10%20King%20Street&postcode=V6B%201A1",
+    )
+    .await;
+    assert_example("geocode-nothing", &unmatched);
+    assert!(
+        unmatched["features"]
+            .as_array()
+            .expect("features")
+            .is_empty()
+    );
+
     // Errors are part of the contract too: a client branches on `error_code`
     // and shows `detail`, so both are committed like any answer.
     let (status, empty_query) = get_error(&router, "/search?q=").await;

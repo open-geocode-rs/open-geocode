@@ -68,6 +68,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     paths(
         crate::runtime::search,
         crate::runtime::autocomplete,
+        crate::runtime::geocode,
         crate::runtime::reverse,
         crate::http::health::healthz,
         crate::http::health::readyz,

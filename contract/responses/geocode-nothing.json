@@ -1,0 +1,9 @@
+{
+  "features": [],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "query": "10 King Street",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

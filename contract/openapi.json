@@ -661,6 +661,168 @@
         ]
       }
     },
+    "/geocode": {
+      "get": {
+        "description": "For callers who hold a street address, a town and a postcode in separate\nfields and would otherwise have to paste them into one string and hope the\nparser pulls them apart again. The street address is searched on its own\nand hits are kept only where they fit the locality, region and postcode\ngiven, so a town in the address cannot outrank the street.\n\nThis is the lookup `batch-geocode` runs per row, over HTTP.\n\nThe answer is the same FeatureCollection every other route returns, with\nat most one feature: `features` holds the one match, or is empty when\nnothing fits. `geocoding.query` is the rewrite that matched, which is not\nalways the address as it was sent.",
+        "operationId": "geocode",
+        "parameters": [
+          {
+            "description": "The street address on its own: house number and street, without the town or postcode.",
+            "example": "10 King Street",
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The town or city the address is in.",
+            "example": "Toronto",
+            "in": "query",
+            "name": "locality",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The state, province or region.",
+            "example": "Ontario",
+            "in": "query",
+            "name": "region",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The postcode.",
+            "example": "M5V 1A1",
+            "in": "query",
+            "name": "postcode",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "How many candidates to consider before picking the best. 0, the default, lets the server choose. At most one is ever returned.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 50,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Consider only candidates of this layer. An unknown layer is rejected rather than silently matching nothing.",
+            "in": "query",
+            "name": "layer",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Layer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardCollection"
+                }
+              }
+            },
+            "description": "The one address that fits, or no features when none does.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "`address` was empty or too long, a context field was too long, `limit` was above the maximum, or a parameter did not parse.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The lookup failed inside the server.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Geocode an address whose parts are already apart.",
+        "tags": [
+          "geocoding"
+        ]
+      }
+    },
     "/healthz": {
       "get": {
         "description": "Answers 200 as soon as the server is listening, whether or not the Pack is\nloaded. Use `/readyz` to know whether it can answer geocoding requests.\nThe body is always empty.",
