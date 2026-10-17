@@ -1046,7 +1046,8 @@ mod tests {
             fn row(&self, row: &BatchRow) {
                 self.0.lock().expect("rows").push((
                     row.index,
-                    row.feature.map(|feature| feature.properties.id.clone()),
+                    row.feature
+                        .map(|feature| feature.properties.common.id.clone()),
                 ));
             }
         }

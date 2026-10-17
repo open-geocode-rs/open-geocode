@@ -1,0 +1,8 @@
+{
+  "detail": "q must not be empty",
+  "error_code": "invalid_query",
+  "request_id": "contract-example",
+  "status": 400,
+  "title": "Bad Request",
+  "type": "about:blank"
+}

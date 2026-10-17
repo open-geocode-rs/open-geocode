@@ -1,0 +1,14 @@
+{
+  "detail": "coordinate out of range",
+  "error_code": "invalid_coordinate",
+  "invalid_params": [
+    {
+      "name": "lat",
+      "reason": "must be within [-90, 90]"
+    }
+  ],
+  "request_id": "contract-example",
+  "status": 400,
+  "title": "Bad Request",
+  "type": "about:blank"
+}

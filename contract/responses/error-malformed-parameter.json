@@ -1,0 +1,14 @@
+{
+  "detail": "unknown layer \"bogus\". Valid layers: address, country, district, interpolation, locality, neighbourhood, place, poi, postcode, region, street",
+  "error_code": "malformed_parameter",
+  "invalid_params": [
+    {
+      "name": "layer",
+      "reason": "unknown layer"
+    }
+  ],
+  "request_id": "contract-example",
+  "status": 400,
+  "title": "Bad Request",
+  "type": "about:blank"
+}

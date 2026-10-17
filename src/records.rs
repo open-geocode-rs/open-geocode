@@ -135,7 +135,7 @@ pub enum RecordPointPrecision {
 
 /// Where a record comes from: an OSM object, or the address records a
 /// derived record (a postcode) was made from.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct RecordSource {
     pub dataset: String,
     #[serde(skip_serializing_if = "Option::is_none")]

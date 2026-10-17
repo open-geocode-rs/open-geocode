@@ -22,7 +22,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
-        bounds, health, method,
+        bounds, health, method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
@@ -81,7 +81,7 @@ impl AppState {
 /// how `q` is bounded, which the handlers do: `/search` requires it, and
 /// `/autocomplete` answers an empty query with no suggestions.
 #[derive(Debug, Deserialize)]
-struct SearchParams {
+pub(crate) struct SearchParams {
     q: Option<String>,
     #[serde(default)]
     limit: usize,
@@ -118,7 +118,7 @@ fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
 }
 
 #[derive(Debug, Deserialize)]
-struct ReverseParams {
+pub(crate) struct ReverseParams {
     lon: f64,
     lat: f64,
 }
@@ -157,6 +157,7 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
         .route("/reverse", get_only(reverse))
+        .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz));
 
@@ -229,7 +230,37 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
     Problem::malformed_parameter("could not parse query parameters")
 }
 
-async fn search(
+/// Search for a place by text.
+///
+/// Answers are ordered by `score`, best first.
+#[utoipa::path(
+    get,
+    path = "/search",
+    tag = "geocoding",
+    params(
+        ("q" = String, Query,
+         description = "The text to search for.",
+         example = "10 King Street, Toronto",
+         min_length = 1, max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "How many answers to return. 0, the default, lets the \
+                        server choose.",
+         minimum = 0, maximum = 50),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only answers of this layer. An unknown layer is \
+                        rejected rather than silently matching nothing."),
+    ),
+    responses(
+        (status = 200, description = "The places that matched, best first.",
+         body = ForwardCollection),
+        (status = 400, description = "`q` was empty or too long, `limit` was above \
+                                      the maximum, or a parameter did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The search failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn search(
     State(state): State<AppState>,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
@@ -253,7 +284,38 @@ async fn search(
     Ok(Json(collection))
 }
 
-async fn autocomplete(
+/// Suggest places as a query is typed.
+///
+/// Like `/search`, but tuned for partial input: an empty or very short `q` is
+/// not an error, it simply has no suggestions.
+#[utoipa::path(
+    get,
+    path = "/autocomplete",
+    tag = "geocoding",
+    params(
+        ("q" = Option<String>, Query,
+         description = "The text typed so far. Empty returns no suggestions.",
+         example = "10 King St",
+         max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "How many suggestions to return. 0, the default, lets the \
+                        server choose.",
+         minimum = 0, maximum = 20),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only suggestions of this layer. An unknown layer is \
+                        rejected rather than silently matching nothing."),
+    ),
+    responses(
+        (status = 200, description = "The suggestions, best first.",
+         body = ForwardCollection),
+        (status = 400, description = "`q` was too long, `limit` was above the \
+                                      maximum, or a parameter did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The search failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn autocomplete(
     State(state): State<AppState>,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
@@ -279,7 +341,32 @@ async fn autocomplete(
     Ok(Json(collection))
 }
 
-async fn reverse(
+/// Find the places at a point.
+///
+/// The first feature is the place itself, when there is one, carrying its
+/// `distance_m`. The features after it are the areas the point lies in, from
+/// the most precise outwards, and carry no distance.
+#[utoipa::path(
+    get,
+    path = "/reverse",
+    tag = "geocoding",
+    params(
+        ("lon" = f64, Query, description = "Longitude, in degrees.",
+         example = -79.3832, minimum = -180.0, maximum = 180.0),
+        ("lat" = f64, Query, description = "Latitude, in degrees.",
+         example = 43.6532, minimum = -90.0, maximum = 90.0),
+    ),
+    responses(
+        (status = 200, description = "What lies at the point, most precise first. \
+                                      `features` is empty when nothing is near.",
+         body = ReverseCollection),
+        (status = 400, description = "`lon` or `lat` was missing or out of range.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "Reverse geocoding failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn reverse(
     State(state): State<AppState>,
     params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
