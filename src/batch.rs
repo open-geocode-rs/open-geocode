@@ -64,6 +64,21 @@ pub struct BatchGeocodeOptions {
     pub cancel: Arc<AtomicBool>,
 }
 
+impl fmt::Debug for BatchGeocodeOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchGeocodeOptions")
+            .field("pack", &self.pack)
+            .field("input", &self.input)
+            .field("output", &self.output)
+            .field("audit", &self.audit)
+            .field("header_row", &self.header_row)
+            .field("address_field_groups", &self.address_field_groups)
+            .field("layer", &self.layer)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for BatchGeocodeOptions {
     fn default() -> Self {
         Self {
@@ -88,6 +103,7 @@ impl Default for BatchGeocodeOptions {
 }
 
 /// One geocoded row, as a [`BatchObserver`] is told about it.
+#[derive(Debug)]
 pub struct BatchRow<'a> {
     /// The row's place in the input, from 0, header excluded.
     pub index: usize,

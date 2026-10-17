@@ -244,6 +244,7 @@ impl RecordHeader {
     }
 }
 
+#[derive(Debug)]
 pub struct RecordsWriter {
     blocks: BufWriter<File>,
     blocks_path: PathBuf,
@@ -262,6 +263,7 @@ pub struct RecordsWriter {
 
 /// Strings of the current segment. Bytes and end offsets stream to scratch
 /// files; only the current segment's dictionary is held in memory.
+#[derive(Debug)]
 struct StringTable {
     ids: HashMap<Box<str>, u32>,
     /// The dictionary's memory, held against the build budget. It cannot
@@ -592,7 +594,7 @@ impl RecordsWriter {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RecordsReader {
     record_count: u64,
     index: Bytes,

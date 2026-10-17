@@ -16,6 +16,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     fs::{File, OpenOptions},
     io::{self, BufWriter, Seek, SeekFrom, Write},
     ops::Deref,
@@ -49,6 +50,7 @@ pub struct SectionInfo {
     pub checksum: u64,
 }
 
+#[derive(Debug)]
 pub struct ContainerWriter {
     path: PathBuf,
     file: BufWriter<File>,
@@ -62,6 +64,16 @@ struct OpenSection {
     version: u32,
     start: u64,
     hasher: Xxh3,
+}
+
+impl fmt::Debug for OpenSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenSection")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("start", &self.start)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ContainerWriter {

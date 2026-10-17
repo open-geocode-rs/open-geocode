@@ -175,6 +175,7 @@ pub struct SortStats {
     pub runs: u64,
 }
 
+#[derive(Debug)]
 pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
     budget: Arc<MemoryBudget>,
@@ -320,6 +321,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
 }
 
 /// Sorted output. The in-memory form keeps its memory reserved until dropped.
+#[derive(Debug)]
 pub enum Sorted<T> {
     Memory(std::vec::IntoIter<T>, Reservation),
     Merge(Merge<T>),
@@ -337,6 +339,7 @@ impl<T: Spill + Ord> Iterator for Sorted<T> {
 }
 
 /// K-way merge over sorted run files.
+#[derive(Debug)]
 pub struct Merge<T> {
     sources: Vec<SpoolReader<T>>,
     heap: BinaryHeap<Reverse<HeapEntry<T>>>,
@@ -345,6 +348,7 @@ pub struct Merge<T> {
     _buffers: Reservation,
 }
 
+#[derive(Debug)]
 struct HeapEntry<T> {
     item: T,
     source: usize,
@@ -435,6 +439,7 @@ impl<T: Spill + Ord> Iterator for Merge<T> {
 }
 
 /// Append-only scratch file replayed in write order.
+#[derive(Debug)]
 pub struct Spool<T> {
     writer: SpoolWriter<T>,
     path: PathBuf,
@@ -481,6 +486,7 @@ impl<T: Spill> Spool<T> {
 }
 
 /// A closed spool, read from the start by each [`SpoolFile::reader`].
+#[derive(Debug)]
 pub struct SpoolFile<T> {
     path: PathBuf,
     items: u64,
@@ -508,6 +514,7 @@ impl<T> Drop for SpoolFile<T> {
     }
 }
 
+#[derive(Debug)]
 struct SpoolWriter<T> {
     file: BufWriter<File>,
     scratch: Arc<Scratch>,
@@ -556,6 +563,7 @@ impl<T: Spill> SpoolWriter<T> {
 
 /// A scratch file of items read back by their index, in any order and as
 /// often as needed.
+#[derive(Debug)]
 pub struct IndexedSpool<T> {
     writer: SpoolWriter<T>,
     path: PathBuf,
@@ -602,6 +610,7 @@ impl<T: Spill> IndexedSpool<T> {
 }
 
 /// A closed [`IndexedSpool`].
+#[derive(Debug)]
 pub struct IndexedSpoolFile<T> {
     /// Taken before the file is removed: Windows cannot remove a mapped file.
     map: Option<memmap2::Mmap>,
@@ -650,6 +659,7 @@ impl<T> Drop for IndexedSpoolFile<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct SpoolReader<T> {
     file: BufReader<File>,
     path: PathBuf,

@@ -35,6 +35,7 @@ thread_local! {
 }
 
 /// An allocator that counts the bytes live on the heap.
+#[derive(Debug)]
 pub struct CountingAlloc<A> {
     inner: A,
 }

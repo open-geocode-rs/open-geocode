@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    io,
+    fmt, io,
     ops::{Bound, Range},
     path::Path,
     sync::Arc,
@@ -50,6 +50,14 @@ pub struct PackTextSearcher {
     /// The fast fields ranking reads, per segment. The Pack's index never
     /// changes, so they are opened once rather than per query.
     columns: Arc<HashMap<SegmentId, SegmentColumns>>,
+}
+
+impl fmt::Debug for PackTextSearcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PackTextSearcher")
+            .field("segments", &self.columns.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]

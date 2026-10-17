@@ -140,7 +140,7 @@ impl ContextTupleWriter {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ContextReader {
     tuples: Bytes,
     count: u64,

@@ -139,6 +139,7 @@ fn indexed_area_names<'a>(
 }
 
 /// Writes records in their final order. Record ids are assigned sequentially.
+#[derive(Debug)]
 pub struct PackWriter {
     destination: PathBuf,
     generation: GenerationGuard,
@@ -154,6 +155,7 @@ pub struct PackWriter {
 }
 
 /// A finished, unpublished Pack.
+#[derive(Debug)]
 pub struct SealedPack {
     destination: PathBuf,
     generation: GenerationGuard,
@@ -162,6 +164,7 @@ pub struct SealedPack {
 }
 
 /// Removes a generation that was never published: no reader can be using it.
+#[derive(Debug)]
 struct GenerationGuard {
     path: PathBuf,
     keep: bool,
@@ -648,6 +651,7 @@ impl PackReader {
 
 /// Computes what a batch of records adds to the Pack's indexes, in parallel,
 /// for the record ids they will be written at. See [`PackWriter::preparer`].
+#[derive(Debug)]
 pub struct BatchPreparer {
     next: RecordId,
     fields: TextIndexFields,
@@ -692,6 +696,7 @@ impl BatchPreparer {
 
 /// Records with their text documents, spatial cells and dictionary names,
 /// ready for [`PackWriter::commit`].
+#[derive(Debug)]
 pub struct PreparedBatch {
     first: RecordId,
     records: Vec<PreparedRecord>,
@@ -715,6 +720,7 @@ impl PreparedBatch {
     }
 }
 
+#[derive(Debug)]
 struct PreparedRecord {
     record: Record,
     context: Option<RecordContext>,

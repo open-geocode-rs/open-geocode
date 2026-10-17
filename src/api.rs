@@ -413,6 +413,7 @@ impl ReverseFeature {
 
 /// The areas records lie in, each read from the Pack once per answer: the
 /// hits of one query mostly share them.
+#[derive(Debug)]
 pub struct Contexts<'a> {
     pack: &'a PackReader,
     areas: HashMap<RecordId, Option<ContextArea>>,

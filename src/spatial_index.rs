@@ -170,6 +170,7 @@ pub struct SpatialCommit {
     pub context_pairs: SortStats,
 }
 
+#[derive(Debug)]
 pub struct SpatialIndexWriter {
     fine: ExternalSorter<CellRef>,
     context: ExternalSorter<CellRef>,
