@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     builder::report::{BuilderReport, PhaseTimings, ScratchReport, Throughput},
-    pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackManifest, PackReader},
+    pack::{AUDIT_DIR, BUILD_REPORT_FILE, Manifest, Reader},
     record::{Layer, OsmObjectType, Record},
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
-    search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+    reverse::{GeocodeOptions, PackReverseGeocoder},
+    search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     text_index::normalize_index_text,
 };
 
@@ -48,7 +48,7 @@ pub struct PackBenchmarkSettings {
 
 #[derive(Debug, Serialize)]
 pub struct PackMetricReport {
-    pub manifest: PackManifest,
+    pub manifest: Manifest,
     pub bytes: PackByteMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildMetricReport>,
@@ -206,10 +206,10 @@ pub fn benchmark_pack(options: PackBenchmarkOptions) -> Result<PackBenchmarkRepo
     let warmup = options.warmup;
     let fixture = read_fixture(options.queries.as_deref())?;
 
-    let (reader, pack_reader_ms) = measure_value(|| PackReader::open(&options.pack).map(Arc::new))?;
+    let (reader, pack_reader_ms) = measure_value(|| Reader::open(&options.pack).map(Arc::new))?;
     let pack = pack_metrics(&reader)?;
     let (searcher, text_searcher_ms) =
-        measure_value(|| PackTextSearcher::from_pack(Arc::clone(&reader)))?;
+        measure_value(|| TextSearcher::from_pack(Arc::clone(&reader)))?;
     let (reverse_geocoder, reverse_geocoder_ms) =
         measure_value(|| PackReverseGeocoder::from_pack(Arc::clone(&reader)))?;
 
@@ -253,7 +253,7 @@ fn read_fixture(path: Option<&Path>) -> Result<BenchmarkFixture> {
     serde_json::from_reader(file).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn pack_metrics(reader: &PackReader) -> Result<PackMetricReport> {
+fn pack_metrics(reader: &Reader) -> Result<PackMetricReport> {
     let manifest = reader.manifest();
     let mut bytes = PackByteMetrics {
         total: reader.container().file_size(),
@@ -314,7 +314,7 @@ fn build_metrics(report: BuilderReport) -> BuildMetricReport {
 }
 
 fn benchmark_search_cases(
-    searcher: &PackTextSearcher,
+    searcher: &TextSearcher,
     cases: &[TextQueryFixture],
     iterations: usize,
     warmup: usize,
@@ -329,7 +329,7 @@ fn benchmark_search_cases(
 }
 
 fn benchmark_autocomplete_cases(
-    searcher: &PackTextSearcher,
+    searcher: &TextSearcher,
     cases: &[TextQueryFixture],
     iterations: usize,
     warmup: usize,
@@ -400,7 +400,7 @@ fn benchmark_reverse_cases(
     for case in cases {
         let mut result_present = false;
         let durations = measure_iterations(iterations, warmup, || {
-            let response = geocoder.reverse(ReverseGeocodeOptions {
+            let response = geocoder.reverse(GeocodeOptions {
                 lon: case.lon,
                 lat: case.lat,
             })?;
@@ -472,9 +472,9 @@ pub struct PoiFixtureOptions {
 /// An answer key of named POIs: `count` cases drawn with `seed` from the POIs
 /// whose name is unique within their locality, each queried as
 /// "<name>, <locality>" and expected to find that POI. The locality is the
-/// one [`PackReader::locality`] names; POIs without one are not drawn.
+/// one [`Reader::locality`] names; POIs without one are not drawn.
 pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture> {
-    let reader = PackReader::open(&options.pack)?;
+    let reader = Reader::open(&options.pack)?;
     let mut candidates = Vec::new();
     // POIs per (area, name), over both the locality and the district a POI
     // lies in: "<name>, Toronto" must be unique among every POI in Toronto,
@@ -609,7 +609,7 @@ fn nanos_to_ms(nanos: u128) -> f64 {
 mod tests {
     use crate::{
         context::AdminContextTuple,
-        pack::{PackWriter, RecordContext},
+        pack::{RecordContext, Writer},
         record::{
             AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer,
             PlaceRecord, PoiRecord, SourceProvenance, point_geometry,
@@ -622,7 +622,7 @@ mod tests {
     fn samples_unique_pois_and_scores_hits_at_one_and_five() {
         let temp_dir = temp_pack_path("bench-poi-fixture");
         let _ = fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut area = |layer, name: &str, object_id| {
             writer
                 .write(
@@ -688,7 +688,7 @@ mod tests {
             writer.write(&poi.into(), context).expect("POI");
         }
         writer.finish().expect("finish");
-        let reader = PackReader::open(&temp_dir).expect("reader");
+        let reader = Reader::open(&temp_dir).expect("reader");
         let riverdale = reader
             .find_by_source_id("osm:node:13")
             .expect("lookup")
@@ -830,7 +830,7 @@ mod tests {
     }
 
     fn write_test_pack(path: &Path) {
-        let mut writer = PackWriter::create(path).expect("writer");
+        let mut writer = Writer::create(path).expect("writer");
         writer
             .write(
                 &AddressRecord {

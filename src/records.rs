@@ -48,9 +48,9 @@ use serde_json::{Value, json};
 
 use crate::{
     api::Address,
-    container::{Bytes, Container, ContainerWriter},
+    container::{self, Bytes, Container},
     extsort::Scratch,
-    memory::{MemoryBudget, Reservation},
+    memory::{Budget, Reservation},
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
@@ -98,7 +98,7 @@ pub struct ContextRef {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct RecordSummary {
+pub struct Summary {
     pub id: String,
     pub layer: String,
     /// The thing itself: a POI's, place's or street's name, an address's
@@ -112,20 +112,20 @@ pub struct RecordSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub point: Option<RecordPoint>,
-    pub source: RecordSource,
+    pub point: Option<Point>,
+    pub source: Source,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
-pub struct RecordPoint {
+pub struct Point {
     pub lon: f64,
     pub lat: f64,
-    pub precision: RecordPointPrecision,
+    pub precision: PointPrecision,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RecordPointPrecision {
+pub enum PointPrecision {
     Point,
     Centroid,
     /// A house number placed along an interpolation range.
@@ -136,7 +136,7 @@ pub enum RecordPointPrecision {
 /// Where a record comes from: an OSM object, or the address records a
 /// derived record (a postcode) was made from.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
-pub struct RecordSource {
+pub struct Source {
     pub dataset: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_type: Option<OsmObjectType>,
@@ -155,7 +155,7 @@ pub struct ContextRecord {
     pub label: String,
     pub name: String,
     pub postcode: Option<String>,
-    pub point: Option<RecordPoint>,
+    pub point: Option<Point>,
 }
 
 /// Global string ids `first..end` belong to one segment.
@@ -168,7 +168,7 @@ struct StringSegment {
 /// The fixed part of a record: enough for spatial filtering without touching
 /// strings or geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecordHeader {
+pub struct Header {
     pub layer: Layer,
     strings: StringSegment,
     pub lon_e7: i32,
@@ -180,7 +180,7 @@ pub struct RecordHeader {
     source_value: u64,
 }
 
-impl RecordHeader {
+impl Header {
     pub fn lon(&self) -> f64 {
         dequantize(self.lon_e7)
     }
@@ -193,15 +193,15 @@ impl RecordHeader {
         self.line
     }
 
-    fn point(&self) -> RecordPoint {
+    fn point(&self) -> Point {
         let precision = if self.line {
-            RecordPointPrecision::RepresentativePoint
+            PointPrecision::RepresentativePoint
         } else if matches!(self.layer, Layer::Address | Layer::Poi) && !self.centroid {
-            RecordPointPrecision::Point
+            PointPrecision::Point
         } else {
-            RecordPointPrecision::Centroid
+            PointPrecision::Centroid
         };
-        RecordPoint {
+        Point {
             lon: self.lon(),
             lat: self.lat(),
             precision,
@@ -218,9 +218,9 @@ impl RecordHeader {
         Ok((object_type, crate::util::codec::unzigzag(self.source_value)))
     }
 
-    fn source(&self) -> Result<RecordSource> {
+    fn source(&self) -> Result<Source> {
         if self.source_kind == SourceKind::Derived {
-            return Ok(RecordSource {
+            return Ok(Source {
                 dataset: "osm".into(),
                 object_type: None,
                 object_id: None,
@@ -229,7 +229,7 @@ impl RecordHeader {
             });
         }
         let (object_type, object_id) = self.osm_source()?;
-        Ok(RecordSource {
+        Ok(Source {
             dataset: "osm".into(),
             object_type: Some(object_type),
             object_id: Some(object_id),
@@ -244,7 +244,8 @@ impl RecordHeader {
     }
 }
 
-pub struct RecordsWriter {
+#[derive(Debug)]
+pub struct Writer {
     blocks: BufWriter<File>,
     blocks_path: PathBuf,
     blocks_len: u64,
@@ -262,6 +263,7 @@ pub struct RecordsWriter {
 
 /// Strings of the current segment. Bytes and end offsets stream to scratch
 /// files; only the current segment's dictionary is held in memory.
+#[derive(Debug)]
 struct StringTable {
     ids: HashMap<Box<str>, u32>,
     /// The dictionary's memory, held against the build budget. It cannot
@@ -313,8 +315,8 @@ impl StringTable {
     }
 }
 
-impl RecordsWriter {
-    pub fn create(scratch: &Arc<Scratch>, budget: &Arc<MemoryBudget>) -> Result<Self> {
+impl Writer {
+    pub fn create(scratch: &Arc<Scratch>, budget: &Arc<Budget>) -> Result<Self> {
         let blocks_path = scratch.path().join("records-blocks.bin");
         let block_offsets_path = scratch.path().join("records-block-offsets.bin");
         let bytes_path = scratch.path().join("records-strings.bin");
@@ -563,7 +565,7 @@ impl RecordsWriter {
     }
 
     /// Copy the store into the Pack.
-    pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<()> {
+    pub fn finish(mut self, pack: &mut container::Writer) -> Result<()> {
         self.flush_block()?;
         self.blocks.flush()?;
         self.block_offsets.flush()?;
@@ -592,8 +594,8 @@ impl RecordsWriter {
     }
 }
 
-#[derive(Clone)]
-pub struct RecordsReader {
+#[derive(Debug, Clone)]
+pub struct Reader {
     record_count: u64,
     index: Bytes,
     blocks: Bytes,
@@ -605,7 +607,7 @@ pub struct RecordsReader {
     text_start: usize,
 }
 
-impl RecordsReader {
+impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
         let index = container.section(SECTION_INDEX, RECORDS_VERSION)?;
         let blocks = container.section(SECTION_BLOCKS, RECORDS_VERSION)?;
@@ -666,7 +668,7 @@ impl RecordsReader {
         self.record_count
     }
 
-    pub fn header(&self, id: RecordId) -> Result<RecordHeader> {
+    pub fn header(&self, id: RecordId) -> Result<Header> {
         Ok(self.body(id)?.0)
     }
 
@@ -743,7 +745,7 @@ impl RecordsReader {
 
     /// Id, name, label, address, layer, point and source without decoding
     /// geometry.
-    pub fn summary(&self, id: RecordId) -> Result<RecordSummary> {
+    pub fn summary(&self, id: RecordId) -> Result<Summary> {
         let (header, mut fields) = self.body(id)?;
         let source = header.source()?;
         let mut category = None;
@@ -814,7 +816,7 @@ impl RecordsReader {
                 )
             }
         };
-        Ok(RecordSummary {
+        Ok(Summary {
             id: record_id,
             layer: header.layer.as_str().to_string(),
             name,
@@ -1014,7 +1016,7 @@ impl RecordsReader {
         Ok((layer, dequantize(lon), dequantize(lat)))
     }
 
-    fn body(&self, id: RecordId) -> Result<(RecordHeader, &[u8])> {
+    fn body(&self, id: RecordId) -> Result<(Header, &[u8])> {
         let (base_lon, base_lat, mut body) = self.locate(id)?;
         let tag = get_u8(&mut body)?;
         let layer = *Layer::ALL
@@ -1037,7 +1039,7 @@ impl RecordsReader {
         };
         let source_value = get_u64(&mut body)?;
         Ok((
-            RecordHeader {
+            Header {
                 layer,
                 strings: self.segment(id),
                 lon_e7,
@@ -1150,7 +1152,7 @@ impl RecordsReader {
         ))
     }
 
-    fn skip_fields(&self, header: &RecordHeader, fields: &mut &[u8]) -> Result<()> {
+    fn skip_fields(&self, header: &Header, fields: &mut &[u8]) -> Result<()> {
         match header.layer {
             Layer::Address => {
                 self.address_components(header.strings, fields)?;
@@ -1177,7 +1179,7 @@ impl RecordsReader {
         Ok(())
     }
 
-    fn geometry(&self, header: &RecordHeader, fields: &mut &[u8]) -> Result<Geometry> {
+    fn geometry(&self, header: &Header, fields: &mut &[u8]) -> Result<Geometry> {
         if !header.line {
             return Ok(point_geometry(header.lon(), header.lat()));
         }
@@ -1189,7 +1191,7 @@ impl RecordsReader {
         Ok(Geometry::new(GeometryValue::LineString { coordinates }))
     }
 
-    fn line_points(&self, header: &RecordHeader, fields: &mut &[u8]) -> Result<Vec<[i32; 2]>> {
+    fn line_points(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<[i32; 2]>> {
         let count = usize::try_from(get_u64(fields)?)?;
         if count < 2 || count > fields.len() {
             bail!("stored line geometry has an invalid point count {count}");
@@ -1386,12 +1388,11 @@ mod tests {
         records
     }
 
-    fn write_store(records: &[Record], contexts: &[Option<ContextRef>]) -> RecordsReader {
+    fn write_store(records: &[Record], contexts: &[Option<ContextRef>]) -> Reader {
         let root =
             std::env::temp_dir().join(format!("open-geocode-records-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer =
-            RecordsWriter::create(&scratch, &MemoryBudget::unlimited()).expect("writer");
+        let mut writer = Writer::create(&scratch, &Budget::unlimited()).expect("writer");
         for (index, record) in records.iter().enumerate() {
             let id = writer
                 .write(record, contexts.get(index).copied().flatten())
@@ -1399,10 +1400,10 @@ mod tests {
             assert_eq!(id, index as u64);
         }
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = container::Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
-        RecordsReader::open(&Container::open(&path).expect("open")).expect("reader")
+        Reader::open(&Container::open(&path).expect("open")).expect("reader")
     }
 
     #[test]
@@ -1435,7 +1436,7 @@ mod tests {
         assert_eq!(poi.label, "Tim Hortons, 123 King Street West, M5V 1A1");
         assert_eq!(
             poi.point.expect("point").precision,
-            RecordPointPrecision::Centroid
+            PointPrecision::Centroid
         );
         assert_eq!(
             reader
@@ -1444,7 +1445,7 @@ mod tests {
                 .point
                 .expect("point")
                 .precision,
-            RecordPointPrecision::Point
+            PointPrecision::Point
         );
         assert_eq!(
             reader.postcode(4).expect("postcode").as_deref(),
@@ -1490,8 +1491,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-segments-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let budget = MemoryBudget::unlimited();
-        let mut writer = RecordsWriter::create(&scratch, &budget)
+        let budget = Budget::unlimited();
+        let mut writer = Writer::create(&scratch, &budget)
             .expect("writer")
             .with_segment_records(100);
         let base = sample_records().remove(0);
@@ -1515,10 +1516,10 @@ mod tests {
         );
         assert!(budget.peak() < 200 * (DICTIONARY_ENTRY_OVERHEAD + 16));
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = container::Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
-        let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
         for (id, record) in records.iter().enumerate() {
             assert_eq!(&reader.record(id as u64).expect("record"), record);
         }
@@ -1529,8 +1530,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-dictionary-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let budget = MemoryBudget::new(64 << 20);
-        let mut writer = RecordsWriter::create(&scratch, &budget).expect("writer");
+        let budget = Budget::new(64 << 20);
+        let mut writer = Writer::create(&scratch, &budget).expect("writer");
         let base = sample_records().remove(0);
         // Every record brings a new street name: the worst case.
         for index in 0..200_000 {
@@ -1551,10 +1552,10 @@ mod tests {
         );
         assert!(writer.strings.segments.len() > 1);
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = container::Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
-        let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
         for id in [0, 99_999, 199_999] {
             let Record::Address(address) = reader.record(id).expect("record") else {
                 panic!("address");

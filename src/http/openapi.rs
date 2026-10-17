@@ -37,7 +37,7 @@ use crate::{
         ReverseProperties, Version,
     },
     record::{Layer, OsmObjectType},
-    records::RecordSource,
+    records::Source,
 };
 
 /// The media type every error is served as (RFC 9457).
@@ -95,7 +95,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Address,
         Context,
         ContextArea,
-        RecordSource,
+        Source,
         OsmObjectType,
         // Only ever reached through a parameter, so it needs naming here or
         // it is left out of the components and the `$ref` dangles.

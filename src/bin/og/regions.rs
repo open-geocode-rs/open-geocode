@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Kind {
+pub(crate) enum Kind {
     World,
     Continent,
     Country,
@@ -38,7 +38,7 @@ struct Entry {
 
 /// The region's OpenStreetMap extract, as the catalog snapshot saw it.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Osm {
+pub(crate) struct Osm {
     pub url: String,
     pub bytes: u64,
 }
@@ -46,7 +46,7 @@ pub struct Osm {
 /// The catalog schema this build reads.
 const SCHEMA: u32 = 1;
 
-pub struct Region {
+pub(crate) struct Region {
     pub index: usize,
     pub id: String,
     pub name: String,
@@ -64,23 +64,23 @@ pub struct Region {
 impl Region {
     /// The Pack directory name: the id with its parts joined by `-`, so two
     /// regions of one name (`georgia`, `us-georgia`) never share one.
-    pub fn slug(&self) -> String {
+    pub(crate) fn slug(&self) -> String {
         self.id.replace('/', "-")
     }
 
     /// The dataset a Pack of the region is built from: its extract is
     /// OpenStreetMap's.
-    pub fn dataset(&self) -> &'static str {
+    pub(crate) fn dataset(&self) -> &'static str {
         OSM_DATASET
     }
 
-    pub fn is_world(&self) -> bool {
+    pub(crate) fn is_world(&self) -> bool {
         self.kind == Kind::World
     }
 
     /// The Geofabrik replication state of the extract, which names the time
     /// its data is from. The planet is published elsewhere and has none.
-    pub fn state_url(&self) -> Option<String> {
+    pub(crate) fn state_url(&self) -> Option<String> {
         self.osm
             .url
             .strip_suffix("-latest.osm.pbf")
@@ -89,7 +89,7 @@ impl Region {
     }
 
     /// What the regions below are called.
-    pub fn unit(&self) -> &'static str {
+    pub(crate) fn unit(&self) -> &'static str {
         match self.kind {
             Kind::World => "continents",
             Kind::Continent => "countries",
@@ -98,26 +98,26 @@ impl Region {
     }
 }
 
-pub struct Tree {
+pub(crate) struct Tree {
     regions: Vec<Region>,
     root: usize,
 }
 
 impl Tree {
-    pub fn root(&self) -> &Region {
+    pub(crate) fn root(&self) -> &Region {
         &self.regions[self.root]
     }
 
-    pub fn get(&self, id: &str) -> Option<&Region> {
+    pub(crate) fn get(&self, id: &str) -> Option<&Region> {
         self.regions.iter().find(|region| region.id == id)
     }
 
-    pub fn at(&self, index: usize) -> &Region {
+    pub(crate) fn at(&self, index: usize) -> &Region {
         &self.regions[index]
     }
 
     /// Everything a search can find: the browsable regions, not the planet.
-    pub fn searchable(&self) -> impl Iterator<Item = &Region> {
+    pub(crate) fn searchable(&self) -> impl Iterator<Item = &Region> {
         self.regions
             .iter()
             .filter(|region| !matches!(region.kind, Kind::World | Kind::Group))
@@ -125,7 +125,7 @@ impl Tree {
 
     /// The regions above this one, nearest first, without the planet:
     /// `Canada · North America` for Ontario.
-    pub fn trail(&self, region: &Region) -> String {
+    pub(crate) fn trail(&self, region: &Region) -> String {
         let mut names = Vec::new();
         let mut next = region.parent;
         while let Some(index) = next {
@@ -139,7 +139,7 @@ impl Tree {
     }
 
     /// The indices from the top continent down to this region's parent.
-    pub fn ancestors(&self, region: &Region) -> Vec<usize> {
+    pub(crate) fn ancestors(&self, region: &Region) -> Vec<usize> {
         let mut chain = Vec::new();
         let mut next = region.parent;
         while let Some(index) = next {
@@ -154,14 +154,14 @@ impl Tree {
 }
 
 /// How a dataset id reads: `osm` is OpenStreetMap.
-pub fn dataset_name(id: &str) -> &str {
+pub(crate) fn dataset_name(id: &str) -> &str {
     match id {
         OSM_DATASET => "OpenStreetMap",
         other => other,
     }
 }
 
-pub fn tree() -> &'static Tree {
+pub(crate) fn tree() -> &'static Tree {
     static TREE: OnceLock<Tree> = OnceLock::new();
     TREE.get_or_init(|| load(include_str!("../../../catalog/regions.json")))
 }

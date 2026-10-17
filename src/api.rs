@@ -8,7 +8,7 @@
 //! compare real answers with the committed examples in
 //! `contract/responses/`, so a change to the shape lands with its examples.
 //!
-//! The same features are the result columns of `batch-geocode`
+//! The same features are the result columns of `geocode batch`
 //! ([`flat_columns`]), so a CSV row and a JSON answer never drift apart
 //! either.
 
@@ -20,9 +20,10 @@ use utoipa::ToSchema;
 
 use crate::{
     labels,
-    pack::{PackReader, RecordId, RecordPointPrecision, RecordSource, RecordSummary},
+    pack::{Reader, RecordId, Source, Summary},
     record::{AddressComponents, InterpolationAddressComponents, Layer, OsmObjectType},
-    reverse::{ReverseGeocodeResponse, ReverseMatchKind, ReversePointPrecision},
+    records, reverse,
+    reverse::{GeocodeResponse, MatchKind},
     search::TextSearchHit,
 };
 
@@ -164,7 +165,7 @@ pub struct Common {
     /// The areas the record lies in, from the Pack's boundaries.
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
-    pub source: RecordSource,
+    pub source: Source,
 }
 
 /// A forward feature's properties: the common fields, and the text relevance
@@ -218,12 +219,12 @@ pub enum Accuracy {
 
 impl Accuracy {
     /// The accuracy of a record's own point.
-    pub fn of(precision: RecordPointPrecision, source: &RecordSource) -> Self {
+    pub fn of(precision: records::PointPrecision, source: &Source) -> Self {
         match precision {
-            RecordPointPrecision::Point => Self::Rooftop,
-            RecordPointPrecision::Estimated => Self::Interpolated,
-            RecordPointPrecision::RepresentativePoint => Self::Street,
-            RecordPointPrecision::Centroid => match source.object_type {
+            records::PointPrecision::Point => Self::Rooftop,
+            records::PointPrecision::Estimated => Self::Interpolated,
+            records::PointPrecision::RepresentativePoint => Self::Street,
+            records::PointPrecision::Centroid => match source.object_type {
                 Some(OsmObjectType::Way | OsmObjectType::Relation) => Self::Centroid,
                 Some(OsmObjectType::Node) | None => Self::Approximate,
             },
@@ -413,13 +414,14 @@ impl ReverseFeature {
 
 /// The areas records lie in, each read from the Pack once per answer: the
 /// hits of one query mostly share them.
+#[derive(Debug)]
 pub struct Contexts<'a> {
-    pack: &'a PackReader,
+    pack: &'a Reader,
     areas: HashMap<RecordId, Option<ContextArea>>,
 }
 
 impl<'a> Contexts<'a> {
-    pub fn new(pack: &'a PackReader) -> Self {
+    pub fn new(pack: &'a Reader) -> Self {
         Self {
             pack,
             areas: HashMap::new(),
@@ -465,7 +467,7 @@ impl<'a> Contexts<'a> {
 /// The answer to `/search` or `/autocomplete`: one feature per hit, in the
 /// order search ranked them.
 pub fn forward_collection(
-    pack: &PackReader,
+    pack: &Reader,
     query: String,
     hits: Vec<TextSearchHit>,
 ) -> Result<ForwardCollection> {
@@ -523,10 +525,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
 /// An estimated address states its house number only in its label, which
 /// reverse writes as `"{number} {street}, ..."`; the number is read back from
 /// there.
-pub fn reverse_collection(
-    pack: &PackReader,
-    response: &ReverseGeocodeResponse,
-) -> Result<ReverseCollection> {
+pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<ReverseCollection> {
     let mut contexts = Contexts::new(pack);
     let mut features = Vec::new();
     let mut primary_record_id = None;
@@ -545,13 +544,13 @@ pub fn reverse_collection(
                 (point.lon, point.lat)
             });
         let accuracy = match result.point.as_ref().map(|point| point.precision) {
-            Some(ReversePointPrecision::Estimated) => Accuracy::Interpolated,
-            Some(ReversePointPrecision::Street) => Accuracy::Street,
-            Some(ReversePointPrecision::Point | ReversePointPrecision::Context) | None => {
+            Some(reverse::PointPrecision::Estimated) => Accuracy::Interpolated,
+            Some(reverse::PointPrecision::Street) => Accuracy::Street,
+            Some(reverse::PointPrecision::Point | reverse::PointPrecision::Context) | None => {
                 Accuracy::of(own_point.precision, &summary.source)
             }
         };
-        if result.match_kind == ReverseMatchKind::EstimatedAddress {
+        if result.match_kind == MatchKind::EstimatedAddress {
             let number = estimated_number(&result.label)?;
             let interpolation = pack
                 .interpolation(record_id)?
@@ -645,7 +644,7 @@ fn breadth(layer: &str) -> usize {
 fn common(
     contexts: &mut Contexts,
     record_id: RecordId,
-    summary: RecordSummary,
+    summary: Summary,
     accuracy: Accuracy,
 ) -> Result<Common> {
     let layer = Layer::parse(&summary.layer)
@@ -665,7 +664,7 @@ fn common(
 }
 
 /// The result columns of one forward feature, by name, in the order
-/// `batch-geocode` writes them. With no feature the same columns come back
+/// `geocode batch` writes them. With no feature the same columns come back
 /// empty, so this is also the one list of column names.
 pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, String)> {
     let properties = feature.map(|feature| &feature.properties);
@@ -776,8 +775,8 @@ mod tests {
 
     use super::*;
 
-    fn source(object_type: Option<OsmObjectType>) -> RecordSource {
-        RecordSource {
+    fn source(object_type: Option<OsmObjectType>) -> Source {
+        Source {
             dataset: "osm".to_string(),
             object_type,
             object_id: object_type.map(|_| 1),
@@ -792,21 +791,25 @@ mod tests {
         let way = source(Some(OsmObjectType::Way));
         let derived = source(None);
         for (precision, source, accuracy) in [
-            (RecordPointPrecision::Point, &node, Accuracy::Rooftop),
+            (records::PointPrecision::Point, &node, Accuracy::Rooftop),
             (
-                RecordPointPrecision::Estimated,
+                records::PointPrecision::Estimated,
                 &derived,
                 Accuracy::Interpolated,
             ),
             (
-                RecordPointPrecision::RepresentativePoint,
+                records::PointPrecision::RepresentativePoint,
                 &way,
                 Accuracy::Street,
             ),
-            (RecordPointPrecision::Centroid, &way, Accuracy::Centroid),
-            (RecordPointPrecision::Centroid, &node, Accuracy::Approximate),
+            (records::PointPrecision::Centroid, &way, Accuracy::Centroid),
             (
-                RecordPointPrecision::Centroid,
+                records::PointPrecision::Centroid,
+                &node,
+                Accuracy::Approximate,
+            ),
+            (
+                records::PointPrecision::Centroid,
                 &derived,
                 Accuracy::Approximate,
             ),

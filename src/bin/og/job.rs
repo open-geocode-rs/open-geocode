@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use open_geocode::{
-    batch::BatchCancelled,
+    batch::Cancelled,
     builder::{
         BuildCancelled, BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit,
         build_planned_osm_pack, plan_osm_build,
@@ -31,7 +31,7 @@ use crate::{
 
 /// What a step's work is counted in.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Unit {
+pub(crate) enum Unit {
     Bytes,
     Count(&'static str),
     /// Only the step's time is known.
@@ -39,7 +39,7 @@ pub enum Unit {
 }
 
 /// One line of a running job.
-pub struct Step {
+pub(crate) struct Step {
     /// What it did, once finished: `Scanned`.
     pub did: &'static str,
     /// What it does while it runs: `Scanning`.
@@ -56,7 +56,7 @@ pub struct Step {
 }
 
 /// A job's steps and where it is, shared with its thread.
-pub struct Progress {
+pub(crate) struct Progress {
     pub steps: Mutex<Vec<Step>>,
     /// The running step, by index.
     pub current: AtomicU64,
@@ -100,17 +100,17 @@ impl Progress {
         }
     }
 
-    pub fn current(&self) -> usize {
+    pub(crate) fn current(&self) -> usize {
         self.current.load(Ordering::Relaxed) as usize
     }
 
-    pub fn done(&self) -> u64 {
+    pub(crate) fn done(&self) -> u64 {
         self.done.load(Ordering::Relaxed)
     }
 }
 
 /// A build to run: a region's extract into its Pack.
-pub struct BuildRequest {
+pub(crate) struct BuildRequest {
     pub region: &'static Region,
     pub extract: PathBuf,
     /// Download the extract first, also when one is on disk.
@@ -124,13 +124,13 @@ pub struct BuildRequest {
 }
 
 /// A finished build.
-pub struct Built {
+pub(crate) struct Built {
     pub pack: PackInfo,
     /// The build itself, without the download.
     pub build_secs: f64,
 }
 
-pub struct BuildJob {
+pub(crate) struct BuildJob {
     pub progress: Arc<Progress>,
     /// The Pack it writes, and the extract it reads or downloads.
     pack: PathBuf,
@@ -140,7 +140,7 @@ pub struct BuildJob {
 }
 
 impl BuildJob {
-    pub fn start(request: BuildRequest, home: Arc<Home>) -> Self {
+    pub(crate) fn start(request: BuildRequest, home: Arc<Home>) -> Self {
         let mut steps = Vec::new();
         if request.download {
             steps.push(Step {
@@ -188,26 +188,26 @@ impl BuildJob {
         }
     }
 
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
     /// The flag that stops the job, for a signal handler to set.
-    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancel)
     }
 
     /// Whether the job writes this Pack, or reads or downloads this extract.
-    pub fn touches(&self, pack: &Path, extract: &Path) -> bool {
+    pub(crate) fn touches(&self, pack: &Path, extract: &Path) -> bool {
         self.pack == pack || self.extract == extract
     }
 
-    pub fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// The job's outcome, once it is finished.
-    pub fn take(&mut self) -> Option<Result<Built>> {
+    pub(crate) fn take(&mut self) -> Option<Result<Built>> {
         if !self.is_finished() {
             return None;
         }
@@ -232,9 +232,8 @@ impl Drop for BuildJob {
 }
 
 /// Whether an error is a job stopping because it was asked to.
-pub fn cancelled(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<BuildCancelled>().is_some()
-        || error.downcast_ref::<BatchCancelled>().is_some()
+pub(crate) fn cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BuildCancelled>().is_some() || error.downcast_ref::<Cancelled>().is_some()
 }
 
 fn build_step(stage: BuildStage) -> Step {

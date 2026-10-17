@@ -1,7 +1,7 @@
 //! Numbers as the interface shows them.
 
 /// `812 KB`, `4.2 MB`, `752 MB`, `6.5 GB`.
-pub fn bytes(bytes: u64) -> String {
+pub(crate) fn bytes(bytes: u64) -> String {
     let mb = bytes as f64 / 1e6;
     if bytes < 1_000 {
         format!("{bytes} B")
@@ -17,7 +17,7 @@ pub fn bytes(bytes: u64) -> String {
 }
 
 /// `0.4s`, `9s`, `4m05s`, `2h10m`.
-pub fn duration(secs: f64) -> String {
+pub(crate) fn duration(secs: f64) -> String {
     if secs < 1.0 {
         return format!("{:.1}s", secs.max(0.0));
     }
@@ -30,7 +30,7 @@ pub fn duration(secs: f64) -> String {
 }
 
 /// A duration for estimates, rounded up: `< 1 min`, `~ 9 min`, `~ 14 h`.
-pub fn about(secs: f64) -> String {
+pub(crate) fn about(secs: f64) -> String {
     if secs < 60.0 {
         "< 1 min".to_string()
     } else if secs >= 3_600.0 {
@@ -41,7 +41,7 @@ pub fn about(secs: f64) -> String {
 }
 
 /// `950`, `48.2K`, `7.6M`.
-pub fn count(value: u64) -> String {
+pub(crate) fn count(value: u64) -> String {
     let value = value as f64;
     if value >= 1e6 {
         format!("{:.1}M", value / 1e6)
@@ -53,7 +53,7 @@ pub fn count(value: u64) -> String {
 }
 
 /// `10,000`.
-pub fn thousands(value: u64) -> String {
+pub(crate) fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {
@@ -66,13 +66,13 @@ pub fn thousands(value: u64) -> String {
 }
 
 /// A day as `2026-10-16`, from seconds since the Unix epoch.
-pub fn date(unix: i64) -> String {
+pub(crate) fn date(unix: i64) -> String {
     let (year, month, day) = civil(unix.div_euclid(86_400));
     format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// How long ago, short: `5m ago`, `3h ago`, `2d ago`.
-pub fn ago(unix: i64, now: i64) -> String {
+pub(crate) fn ago(unix: i64, now: i64) -> String {
     let secs = (now - unix).max(0);
     match secs {
         0..60 => "just now".to_string(),
@@ -83,7 +83,7 @@ pub fn ago(unix: i64, now: i64) -> String {
 }
 
 /// Seconds since the Unix epoch, now.
-pub fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
@@ -107,7 +107,7 @@ fn civil(days: i64) -> (i64, u32, u32) {
 /// Seconds since the Unix epoch of an RFC 3339 UTC time such as
 /// `2026-10-16T04:50:38Z`, or of an HTTP date such as
 /// `Fri, 16 Oct 2026 04:50:38 GMT`.
-pub fn parse_time(text: &str) -> Option<i64> {
+pub(crate) fn parse_time(text: &str) -> Option<i64> {
     let text = text.trim().replace("\\:", ":");
     let rfc = text.as_bytes().get(4) == Some(&b'-');
     let (year, month, day, clock) =

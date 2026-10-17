@@ -40,7 +40,7 @@ Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machin
 1. Download an OSM extract, for example Ontario from [Geofabrik](https://download.geofabrik.de/north-america/canada/ontario.html), and save it as `data/ontario.pbf`.
 2. Build the pack:
    ```
-   cargo run --release -- build --input data/ontario.pbf --pack data/pack
+   cargo run --release -- pack build --input data/ontario.pbf --pack data/pack
    ```
 3. Serve the API and demo UI on `http://127.0.0.1:8080`:
    ```

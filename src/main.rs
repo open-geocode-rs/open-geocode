@@ -12,16 +12,14 @@ use serde_json::Value;
 use open_geocode::{
     alloc::CountingAlloc,
     api,
-    batch::{
-        BatchGeocodeOptions, Column, CoordinateJoinOptions, parse_field_groups, run_batch_geocode,
-    },
+    batch::{Column, CoordinateJoinOptions, GeocodeOptions, parse_field_groups, run_batch_geocode},
     bench::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
     },
     builder::{BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
-    pack::{PackReader, RecordId},
+    pack::{Reader, RecordId},
     parse::{
         bench::{
             ParseBenchOptions, TaggerKind, align_predictions, mapping::Scheme, normalize_fixtures,
@@ -30,9 +28,9 @@ use open_geocode::{
         lattice::LatticeTagger,
     },
     resources,
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    reverse::{self, PackReverseGeocoder},
     runtime::{ServeOptions, serve},
-    search::{PackTextSearcher, TextSearchOptions},
+    search::{TextSearchOptions, TextSearcher},
 };
 
 /// mimalloc, counted. The Windows process heap serializes a many-threaded
@@ -52,6 +50,45 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Build, inspect and query a Pack.
+    #[command(subcommand)]
+    Pack(PackCommand),
+
+    /// Geocode in bulk, and score how well it does.
+    #[command(subcommand)]
+    Geocode(GeocodeCommand),
+
+    /// Label address queries, and score the parser.
+    #[command(subcommand)]
+    Parse(ParseCommand),
+
+    /// Build the fixtures the benchmarks read.
+    #[command(subcommand)]
+    Fixture(FixtureCommand),
+
+    /// Serve the Runtime HTTP API and static demo files.
+    Serve {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Static demo directory to serve.
+        #[arg(long, default_value = "demo")]
+        demo: PathBuf,
+
+        /// Address and port to bind.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: SocketAddr,
+
+        /// Basemap PMTiles archive to serve at /basemap.pmtiles. Skipped if the
+        /// file is absent, so the demo still runs without a local basemap.
+        #[arg(long, default_value = "data/ontario.pmtiles")]
+        basemap: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PackCommand {
     /// Build a Pack from an OSM .pbf extract, from a city up to the planet.
     Build {
         /// Input .osm.pbf file, sorted by type and id (the standard layout).
@@ -83,8 +120,7 @@ enum Commands {
     },
 
     /// Inspect Pack records as readable JSON.
-    #[command(name = "inspect-pack")]
-    InspectPack {
+    Inspect {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
@@ -116,16 +152,14 @@ enum Commands {
 
     /// Check a Pack file against its section checksums, for example after
     /// copying or downloading it.
-    #[command(name = "verify-pack")]
-    VerifyPack {
+    Verify {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
     },
 
     /// Search a Pack text index and hydrate matching records.
-    #[command(name = "search-pack")]
-    SearchPack {
+    Search {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
@@ -143,20 +177,8 @@ enum Commands {
         limit: usize,
     },
 
-    /// Label the tokens of an address query with the Pack's parser, and print
-    /// its best labellings.
-    Parse {
-        /// Pack directory or Pack file.
-        #[arg(long)]
-        pack: PathBuf,
-
-        /// Address query to label.
-        query: String,
-    },
-
     /// Reverse geocode one coordinate from a Pack spatial index.
-    #[command(name = "reverse-pack")]
-    ReversePack {
+    Reverse {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
@@ -171,8 +193,7 @@ enum Commands {
     },
 
     /// Benchmark Pack size, open time, and query latency.
-    #[command(name = "bench-pack")]
-    BenchPack {
+    Bench {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
@@ -193,12 +214,17 @@ enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum GeocodeCommand {
+    /// Geocode CSV rows into lat/lon columns using a Pack text index.
+    Batch(Box<BatchGeocodeArgs>),
 
     /// Score forward geocoding against authoritative coordinates, in frozen
-    /// distance buckets plus geohash agreement. Separate from bench-pack
+    /// distance buckets plus geohash agreement. Separate from `pack bench`
     /// because that matches object ids and this measures distance.
-    #[command(name = "bench-geocode")]
-    BenchGeocode {
+    Bench {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
@@ -215,33 +241,25 @@ enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+}
 
-    /// Sample a seeded answer key of named POIs for bench-pack: each case
-    /// queries "<name>, <locality>" and expects that POI.
-    #[command(name = "sample-poi-fixture")]
-    SamplePoiFixture {
+#[derive(Debug, Subcommand)]
+enum ParseCommand {
+    /// Label the tokens of an address query with the Pack's parser, and print
+    /// its best labellings.
+    Query {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
-        /// Number of POIs to draw.
-        #[arg(long, default_value_t = 500)]
-        count: usize,
-
-        /// Seed of the draw; the same Pack and seed give the same fixture.
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
-
-        /// Output path for the fixture JSON.
-        #[arg(long)]
-        output: PathBuf,
+        /// Address query to label.
+        query: String,
     },
 
     /// Score address parsing per token against the gold rows, as-is,
     /// stripped of commas and messy, beside stored baseline predictions for
     /// the same rows.
-    #[command(name = "parse-bench")]
-    ParseBench {
+    Bench {
         /// Gold directory, <cc>.tsv per country.
         #[arg(long, default_value = "fixtures/parse/gold")]
         gold: PathBuf,
@@ -281,34 +299,33 @@ enum Commands {
         json: Option<PathBuf>,
     },
 
-    /// Build parse-bench fixtures: normalize source rows into gold rows,
+    /// Build `parse bench` fixtures: normalize source rows into gold rows,
     /// export each variant's queries for a baseline, and align its answers
     /// back to the gold tokens.
-    #[command(name = "parse-fixture", subcommand)]
-    ParseFixture(ParseFixtureCommand),
+    #[command(subcommand)]
+    Fixture(ParseFixtureCommand),
+}
 
-    /// Geocode CSV rows into lat/lon columns using a Pack text index.
-    #[command(name = "batch-geocode")]
-    BatchGeocode(Box<BatchGeocodeArgs>),
-
-    /// Serve the Runtime HTTP API and static demo files.
-    Serve {
+#[derive(Debug, Subcommand)]
+enum FixtureCommand {
+    /// Sample a seeded answer key of named POIs for `pack bench`: each case
+    /// queries "<name>, <locality>" and expects that POI.
+    SamplePoi {
         /// Pack directory or Pack file.
         #[arg(long)]
         pack: PathBuf,
 
-        /// Static demo directory to serve.
-        #[arg(long, default_value = "demo")]
-        demo: PathBuf,
+        /// Number of POIs to draw.
+        #[arg(long, default_value_t = 500)]
+        count: usize,
 
-        /// Address and port to bind.
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        bind: SocketAddr,
+        /// Seed of the draw; the same Pack and seed give the same fixture.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
 
-        /// Basemap PMTiles archive to serve at /basemap.pmtiles. Skipped if the
-        /// file is absent, so the demo still runs without a local basemap.
-        #[arg(long, default_value = "data/ontario.pmtiles")]
-        basemap: PathBuf,
+        /// Output path for the fixture JSON.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -450,13 +467,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build {
+        Commands::Pack(PackCommand::Build {
             input,
             pack,
             memory_budget_mb,
             scratch_dir,
             force,
-        } => {
+        }) => {
             resources::opt_out_of_power_throttling();
             let options = BuildOsmOptions {
                 input,
@@ -502,7 +519,7 @@ async fn main() -> Result<()> {
                 "seconds": report.phases.total_ms as f64 / 1000.0,
             }))
         }
-        Commands::InspectPack {
+        Commands::Pack(PackCommand::Inspect {
             pack,
             row,
             id,
@@ -510,9 +527,9 @@ async fn main() -> Result<()> {
             limit,
             rejections,
             context,
-        } => inspect_pack(pack, row, id, layer, limit, rejections, context),
-        Commands::VerifyPack { pack } => {
-            let reader = PackReader::open(pack)?;
+        }) => inspect_pack(pack, row, id, layer, limit, rejections, context),
+        Commands::Pack(PackCommand::Verify { pack }) => {
+            let reader = Reader::open(pack)?;
             reader.verify()?;
             write_json(serde_json::json!({
                 "path": reader.path().display().to_string(),
@@ -521,27 +538,27 @@ async fn main() -> Result<()> {
                 "verified": true,
             }))
         }
-        Commands::SearchPack {
+        Commands::Pack(PackCommand::Search {
             pack,
             query,
             layer,
             limit,
-        } => search_pack(pack, query, layer, limit),
-        Commands::ReversePack { pack, lon, lat } => reverse_pack(pack, lon, lat),
-        Commands::Parse { pack, query } => parse_query(pack, &query),
-        Commands::BenchPack {
+        }) => search_pack(pack, query, layer, limit),
+        Commands::Pack(PackCommand::Reverse { pack, lon, lat }) => reverse_pack(pack, lon, lat),
+        Commands::Parse(ParseCommand::Query { pack, query }) => parse_query(pack, &query),
+        Commands::Pack(PackCommand::Bench {
             pack,
             queries,
             iterations,
             warmup,
             output,
-        } => bench_pack(pack, queries, iterations, warmup, output),
-        Commands::BenchGeocode {
+        }) => bench_pack(pack, queries, iterations, warmup, output),
+        Commands::Geocode(GeocodeCommand::Bench {
             pack,
             queries,
             limit,
             output,
-        } => {
+        }) => {
             let report = benchmark_geocode(GeocodeBenchmarkOptions {
                 pack,
                 fixture: queries,
@@ -555,12 +572,12 @@ async fn main() -> Result<()> {
                 write_json(value)
             }
         }
-        Commands::SamplePoiFixture {
+        Commands::Fixture(FixtureCommand::SamplePoi {
             pack,
             count,
             seed,
             output,
-        } => {
+        }) => {
             let fixture = sample_poi_fixture(PoiFixtureOptions { pack, count, seed })?;
             let cases = fixture.search.len();
             write_fixture_to_path(&fixture, &output)?;
@@ -569,7 +586,7 @@ async fn main() -> Result<()> {
                 "output": output.display().to_string(),
             }))
         }
-        Commands::ParseBench {
+        Commands::Parse(ParseCommand::Bench {
             gold,
             predictions,
             countries,
@@ -579,7 +596,7 @@ async fn main() -> Result<()> {
             show_misses,
             coverage,
             json,
-        } => {
+        }) => {
             let report = run_parse_bench(&ParseBenchOptions {
                 gold,
                 predictions,
@@ -596,8 +613,8 @@ async fn main() -> Result<()> {
             print!("{}", report.to_markdown());
             Ok(())
         }
-        Commands::ParseFixture(command) => parse_fixture(command),
-        Commands::BatchGeocode(args) => batch_geocode(*args),
+        Commands::Parse(ParseCommand::Fixture(command)) => parse_fixture(command),
+        Commands::Geocode(GeocodeCommand::Batch(args)) => batch_geocode(*args),
         Commands::Serve {
             pack,
             demo,
@@ -661,7 +678,7 @@ fn inspect_pack(
     rejections: bool,
     include_context: bool,
 ) -> Result<()> {
-    let reader = PackReader::open(pack)?;
+    let reader = Reader::open(pack)?;
     let output = if rejections {
         serde_json::to_value(reader.rejections(limit)?)?
     } else if let Some(row) = row {
@@ -682,7 +699,7 @@ fn inspect_pack(
 }
 
 fn inspect_record_by_source_id_json(
-    reader: &PackReader,
+    reader: &Reader,
     source_id: &str,
     include_context: bool,
 ) -> Result<Value> {
@@ -693,7 +710,7 @@ fn inspect_record_by_source_id_json(
 }
 
 fn inspect_record_json(
-    reader: &PackReader,
+    reader: &Reader,
     record_id: RecordId,
     include_context: bool,
 ) -> Result<Value> {
@@ -710,7 +727,7 @@ fn inspect_record_json(
     Ok(value)
 }
 
-fn boundary_context_json(reader: &PackReader, record_id: RecordId) -> Result<Value> {
+fn boundary_context_json(reader: &Reader, record_id: RecordId) -> Result<Value> {
     let Some(context) = reader.boundary_context(record_id)? else {
         return Ok(serde_json::json!(null));
     };
@@ -821,8 +838,8 @@ fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
 
 /// The `/search` answer for `query`, as the Runtime gives it.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
-    let pack = Arc::new(PackReader::open(pack)?);
-    let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+    let pack = Arc::new(Reader::open(pack)?);
+    let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
     let hits = searcher.search(TextSearchOptions {
         query: query.clone(),
         limit,
@@ -835,9 +852,9 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
 
 /// The `/reverse` answer for a point, as the Runtime gives it.
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
-    let pack = Arc::new(PackReader::open(pack)?);
+    let pack = Arc::new(Reader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
-    let response = geocoder.reverse(ReverseGeocodeOptions { lon, lat })?;
+    let response = geocoder.reverse(reverse::GeocodeOptions { lon, lat })?;
     write_json(serde_json::to_value(api::reverse_collection(
         &pack, &response,
     )?)?)
@@ -895,7 +912,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     } else {
         None
     };
-    let report = run_batch_geocode(BatchGeocodeOptions {
+    let report = run_batch_geocode(GeocodeOptions {
         pack,
         input,
         output: output.clone(),
@@ -909,7 +926,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         lat_column,
         lon_column,
         join,
-        ..BatchGeocodeOptions::default()
+        ..GeocodeOptions::default()
     })?;
     write_json(serde_json::json!({
         "rows": report.rows,
@@ -928,6 +945,7 @@ mod tests {
     fn build_budget(value: Option<&str>) -> Result<Option<u64>, clap::Error> {
         let mut args = vec![
             "open-geocode",
+            "pack",
             "build",
             "--input",
             "in.osm.pbf",
@@ -938,9 +956,9 @@ mod tests {
             args.extend(["--memory-budget-mb", value]);
         }
         match Cli::try_parse_from(args)?.command {
-            Commands::Build {
+            Commands::Pack(PackCommand::Build {
                 memory_budget_mb, ..
-            } => Ok(memory_budget_mb),
+            }) => Ok(memory_budget_mb),
             _ => unreachable!("parsed a build command"),
         }
     }

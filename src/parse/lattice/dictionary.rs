@@ -41,7 +41,7 @@ use unicode_script::{Script, UnicodeScript};
 
 use super::{CountryCode, dictionary_key, is_numeral, is_unspaced, mask_numerals};
 use crate::{
-    container::{Bytes, Container, ContainerWriter},
+    container::{Bytes, Container, Writer},
     context::AdminContextTuple,
     pack::{RecordContext, RecordId},
     record::{AddressComponents, PlaceLayer, Record},
@@ -121,17 +121,17 @@ const MIN_NUMBERED_NAMES: usize = 5;
 
 /// The admin levels a name is used at, one bit each.
 pub(super) mod level {
-    pub const COUNTRY: u8 = 1;
-    pub const REGION: u8 = 1 << 1;
-    pub const DISTRICT: u8 = 1 << 2;
-    pub const LOCALITY: u8 = 1 << 3;
-    pub const NEIGHBOURHOOD: u8 = 1 << 4;
-    pub const PLACE: u8 = 1 << 5;
+    pub(crate) const COUNTRY: u8 = 1;
+    pub(crate) const REGION: u8 = 1 << 1;
+    pub(crate) const DISTRICT: u8 = 1 << 2;
+    pub(crate) const LOCALITY: u8 = 1 << 3;
+    pub(crate) const NEIGHBOURHOOD: u8 = 1 << 4;
+    pub(crate) const PLACE: u8 = 1 << 5;
     /// The levels whose areas are also named without their type word.
-    pub const ALIASED: u8 = REGION | DISTRICT | LOCALITY;
+    pub(crate) const ALIASED: u8 = REGION | DISTRICT | LOCALITY;
 
     /// The levels whose areas are named in `field`.
-    pub fn of_field(field: super::Field) -> u8 {
+    pub(crate) fn of_field(field: super::Field) -> u8 {
         match field {
             super::Field::Country => COUNTRY,
             super::Field::Region => REGION,
@@ -634,7 +634,7 @@ fn nesting_section(mut pairs: Vec<u64>) -> Vec<u8> {
 }
 
 /// The names a record adds to the dictionaries, normalized. Computed beside
-/// its text document, in parallel; [`DictionaryBuilder::add`] then counts it.
+/// its text document, in parallel; [`Builder::add`] then counts it.
 #[derive(Debug, Default)]
 pub struct RecordNames {
     /// Each name with its field and the admin level it names (see
@@ -804,14 +804,14 @@ struct Alias {
 
 /// Collects the dictionaries while the Pack writer writes records.
 #[derive(Debug, Default)]
-pub struct DictionaryBuilder {
+pub struct Builder {
     names: HashMap<(Field, String), NameStats>,
     /// Records lying in each admin area, by the area's record id.
     areas: HashMap<RecordId, Area>,
     /// Every admin context a record lies in, for which areas lie in which.
     contexts: HashSet<AdminContextTuple>,
     /// Each place with the areas its own context places it in, as
-    /// [`nesting_pair`]s (see [`DictionaryBuilder::add_place`]).
+    /// [`nesting_pair`]s (see [`Builder::add_place`]).
     area_pairs: Vec<u64>,
     /// Each name of a place with the place's record id, so a name of a
     /// place held only as a point names it too.
@@ -822,7 +822,7 @@ pub struct DictionaryBuilder {
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
-impl DictionaryBuilder {
+impl Builder {
     /// Country codes of the country records, so every record can be counted
     /// in the country its admin context places it in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
@@ -917,7 +917,7 @@ impl DictionaryBuilder {
     /// ([`admin_aliases`]) that names no area of another level.
     pub fn finish(
         self,
-        pack: &mut ContainerWriter,
+        pack: &mut Writer,
         area_names: &HashMap<RecordId, Vec<String>>,
     ) -> Result<()> {
         let Self {
@@ -1568,7 +1568,7 @@ mod tests {
 
     #[test]
     fn every_name_of_an_area_counts_the_records_in_it() {
-        let mut builder = DictionaryBuilder::default();
+        let mut builder = Builder::default();
         let context = RecordContext {
             admin_context: crate::pack::AdminContextTuple {
                 locality_record_id: Some(9),
@@ -1583,7 +1583,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("og-dictionary-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         builder.finish(&mut pack, &names).expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn aliases_and_nesting_come_from_the_areas_records_lie_in() {
-        let mut builder = DictionaryBuilder::default();
+        let mut builder = Builder::default();
         let context = |region: RecordId, locality: RecordId| RecordContext {
             admin_context: AdminContextTuple {
                 region_record_id: Some(region),
@@ -1642,7 +1642,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("og-aliases-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         builder.finish(&mut pack, &names).expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
@@ -1695,7 +1695,7 @@ mod tests {
                 source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
             })
         };
-        let mut builder = DictionaryBuilder::default();
+        let mut builder = Builder::default();
         for index in 0..MIN_UNIT_WORD_VALUES {
             builder.add(RecordNames::of(&address(&format!("Bay {index}"))), None);
         }
@@ -1703,7 +1703,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("og-units-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         builder.finish(&mut pack, &HashMap::new()).expect("finish");
         pack.finish().expect("seal");
         let dictionaries =

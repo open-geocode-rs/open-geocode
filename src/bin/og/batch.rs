@@ -1,6 +1,6 @@
 //! The batch geocoding flow: a file of addresses is read, the columns that
 //! make up the address are picked, and the file is geocoded by the engine's
-//! batch run, the same `open-geocode batch-geocode` does, into a new file
+//! batch run, the same `open-geocode geocode batch` does, into a new file
 //! beside it. Text pasted into the batch tab is read the same way.
 //!
 //! A row's address is its picked cells joined in file order into one line,
@@ -23,15 +23,15 @@ use anyhow::Result;
 use open_geocode::{
     api::Accuracy,
     batch::{
-        BatchGeocodeOptions, BatchObserver, BatchRow, Column, cells, delimiter_of,
-        detect_delimiter, open_delimited, run_batch_geocode, unnamed_columns,
+        Column, GeocodeOptions, Observer, Row, cells, delimiter_of, detect_delimiter,
+        open_delimited, run_batch_geocode, unnamed_columns,
     },
 };
 
 use crate::engine::{Hit, name_of};
 
 /// Rows of the file shown, and geocoded, before the run starts.
-pub const PREVIEW_ROWS: usize = 3;
+pub(crate) const PREVIEW_ROWS: usize = 3;
 /// Rows the running screen lists, newest first.
 const LATEST_ROWS: usize = 8;
 
@@ -222,7 +222,7 @@ fn address(used: &[bool], row: &[String]) -> String {
 /// Reads pasted text as a file would be read: a first row that names its
 /// columns picks the address columns, and every other row is one address.
 /// Returns the addresses and a short note on how they were read.
-pub fn pasted_addresses(text: &str) -> (Vec<String>, String) {
+pub(crate) fn pasted_addresses(text: &str) -> (Vec<String>, String) {
     let records: Vec<Vec<String>> = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -264,7 +264,7 @@ pub fn pasted_addresses(text: &str) -> (Vec<String>, String) {
     (addresses, note)
 }
 
-pub struct BatchFile {
+pub(crate) struct BatchFile {
     pub path: PathBuf,
     pub name: String,
     pub bytes: u64,
@@ -284,7 +284,7 @@ impl BatchFile {
     /// Reads a delimited file's header and first rows, and starts counting
     /// its rows in the background. None when the path is no file with at
     /// least one row.
-    pub fn from_path(path: &Path) -> Option<Self> {
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let meta = path.metadata().ok()?;
         if !meta.is_file() {
             return None;
@@ -354,17 +354,17 @@ impl BatchFile {
     }
 
     /// Rows of data counted so far.
-    pub fn rows(&self) -> u64 {
+    pub(crate) fn rows(&self) -> u64 {
         self.rows.load(Ordering::Relaxed)
     }
 
     /// Whether [`Self::rows`] is the whole file.
-    pub fn counted(&self) -> bool {
+    pub(crate) fn counted(&self) -> bool {
         self.counted.load(Ordering::Relaxed)
     }
 
     /// The first rows, each with one cell per header.
-    pub fn sample(&self) -> Vec<Vec<String>> {
+    pub(crate) fn sample(&self) -> Vec<Vec<String>> {
         self.sample
             .iter()
             .map(|row| {
@@ -376,7 +376,7 @@ impl BatchFile {
     }
 
     /// The file name without its extension.
-    pub fn stem(&self) -> &str {
+    pub(crate) fn stem(&self) -> &str {
         self.name
             .rsplit_once('.')
             .map_or(&self.name, |(stem, _)| stem)
@@ -404,7 +404,7 @@ impl Drop for BatchFile {
 }
 
 /// One row of the running screen.
-pub struct Latest {
+pub(crate) struct Latest {
     pub query: String,
     pub hit: Option<(String, f64, f64)>,
     pub millis: f64,
@@ -421,7 +421,7 @@ const LATENCY_BUCKETS: usize =
 
 /// How long rows took, in buckets of fixed bounds: memory that does not
 /// grow with the rows, and quantiles to within an eighth.
-pub struct Latencies {
+pub(crate) struct Latencies {
     buckets: [AtomicU64; LATENCY_BUCKETS],
     slowest_micros: AtomicU64,
 }
@@ -460,7 +460,7 @@ impl Latencies {
         (sub + (bucket - sub) % sub) << shift
     }
 
-    pub fn record(&self, millis: f64) {
+    pub(crate) fn record(&self, millis: f64) {
         let micros = (millis * 1_000.0) as u64;
         self.buckets[Self::bucket(micros)].fetch_add(1, Ordering::Relaxed);
         self.slowest_micros.fetch_max(micros, Ordering::Relaxed);
@@ -468,7 +468,7 @@ impl Latencies {
 
     /// The time below which a share `q` of the rows took, in milliseconds:
     /// the middle of its bucket.
-    pub fn quantile(&self, q: f64) -> f64 {
+    pub(crate) fn quantile(&self, q: f64) -> f64 {
         let counts: Vec<u64> = self
             .buckets
             .iter()
@@ -490,14 +490,14 @@ impl Latencies {
         self.slowest()
     }
 
-    pub fn slowest(&self) -> f64 {
+    pub(crate) fn slowest(&self) -> f64 {
         self.slowest_micros.load(Ordering::Relaxed) as f64 / 1_000.0
     }
 }
 
 /// What a run has done so far, shared with its thread.
 #[derive(Default)]
-pub struct RunStats {
+pub(crate) struct RunStats {
     done: AtomicU64,
     matched: AtomicU64,
     accuracy: Mutex<BTreeMap<Accuracy, u64>>,
@@ -505,8 +505,8 @@ pub struct RunStats {
     pub latest: Mutex<VecDeque<Latest>>,
 }
 
-impl BatchObserver for RunStats {
-    fn row(&self, row: &BatchRow) {
+impl Observer for RunStats {
+    fn row(&self, row: &Row) {
         let millis = row.elapsed.as_secs_f64() * 1_000.0;
         // A row is done before it is matched, so `matched` read before
         // `done` is never more.
@@ -539,7 +539,7 @@ impl BatchObserver for RunStats {
 
 impl RunStats {
     /// Rows done and rows matched so far.
-    pub fn counts(&self) -> (u64, u64) {
+    pub(crate) fn counts(&self) -> (u64, u64) {
         let matched = self.matched.load(Ordering::SeqCst);
         let done = self.done.load(Ordering::SeqCst);
         (done, matched.min(done))
@@ -547,7 +547,7 @@ impl RunStats {
 }
 
 /// What a finished run found.
-pub struct Summary {
+pub(crate) struct Summary {
     pub rows: u64,
     pub matched: u64,
     /// Matches by accuracy, the most precise first.
@@ -563,7 +563,7 @@ pub struct Summary {
     pub output_head: Vec<Vec<String>>,
 }
 
-pub struct Run {
+pub(crate) struct Run {
     pub stats: Arc<RunStats>,
     pub started: Instant,
     pub output: PathBuf,
@@ -572,16 +572,16 @@ pub struct Run {
 }
 
 impl Run {
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    pub fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// The run's outcome, once it is finished.
-    pub fn take(&mut self) -> Option<Result<()>> {
+    pub(crate) fn take(&mut self) -> Option<Result<()>> {
         if !self.is_finished() {
             return None;
         }
@@ -605,7 +605,7 @@ impl Drop for Run {
     }
 }
 
-pub struct BatchSession {
+pub(crate) struct BatchSession {
     pub file: BatchFile,
     /// Which columns make up the address.
     pub used: Vec<bool>,
@@ -620,7 +620,7 @@ pub struct BatchSession {
 }
 
 impl BatchSession {
-    pub fn new(file: BatchFile) -> Self {
+    pub(crate) fn new(file: BatchFile) -> Self {
         let used = address_columns(&file.headers);
         let column = used.iter().position(|on| *on).unwrap_or(0);
         Self {
@@ -635,21 +635,21 @@ impl BatchSession {
     }
 
     /// The address searched for a row.
-    pub fn query(&self, row: &[String]) -> String {
+    pub(crate) fn query(&self, row: &[String]) -> String {
         address(&self.used, row)
     }
 
-    pub fn has_address(&self) -> bool {
+    pub(crate) fn has_address(&self) -> bool {
         self.used.contains(&true)
     }
 
     /// Starts geocoding the whole file.
-    pub fn start(&mut self, pack: &Path) {
+    pub(crate) fn start(&mut self, pack: &Path) {
         self.output = self.file.output_path();
         let output = self.output.clone();
         let stats = Arc::new(RunStats::default());
         let cancel = Arc::new(AtomicBool::new(false));
-        let options = BatchGeocodeOptions {
+        let options = GeocodeOptions {
             pack: Some(pack.to_path_buf()),
             input: self.file.path.clone(),
             output: output.clone(),
@@ -663,9 +663,9 @@ impl BatchSession {
                     .map(|(index, _)| Column::At(index))
                     .collect(),
             ],
-            observer: Some(Arc::clone(&stats) as Arc<dyn BatchObserver>),
+            observer: Some(Arc::clone(&stats) as Arc<dyn Observer>),
             cancel: Arc::clone(&cancel),
-            ..BatchGeocodeOptions::default()
+            ..GeocodeOptions::default()
         };
         let handle = thread::spawn(move || run_batch_geocode(options).map(|_| ()));
         self.summary = None;
@@ -679,7 +679,7 @@ impl BatchSession {
     }
 
     /// Totals for the done screen, from the finished run and its output.
-    pub fn summarize(&mut self) {
+    pub(crate) fn summarize(&mut self) {
         let Some(run) = &self.run else {
             return;
         };

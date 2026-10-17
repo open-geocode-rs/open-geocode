@@ -42,7 +42,7 @@ const SHIMMER: [(u8, u8, u8); 2] = [(112, 150, 205), (240, 248, 255)];
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Rows of JSON the GeoJSON box shows at once.
-pub const JSON_ROWS: usize = 14;
+pub(crate) const JSON_ROWS: usize = 14;
 
 fn span(text: impl Into<Cow<'static, str>>, color: Color) -> Span<'static> {
     Span::styled(text, Style::new().fg(color))
@@ -95,7 +95,7 @@ fn spinner(app: &App) -> &'static str {
 }
 
 /// The header printed once on start. It stays in terminal history.
-pub fn logo() -> Vec<Line<'static>> {
+pub(crate) fn logo() -> Vec<Line<'static>> {
     let o = Style::new().fg(DIM);
     let g = Style::new().add_modifier(Modifier::BOLD);
     vec![
@@ -171,7 +171,7 @@ fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
 }
 
 /// What a started build leaves in terminal history.
-pub fn choices(app: &App) -> Vec<Line<'static>> {
+pub(crate) fn choices(app: &App) -> Vec<Line<'static>> {
     // History lines start at the terminal's edge; the live window is one
     // column in.
     answers(app, 3)
@@ -185,12 +185,12 @@ pub fn choices(app: &App) -> Vec<Line<'static>> {
 }
 
 /// Width of the content: the terminal minus its margins, at most 96.
-pub fn content_width(terminal: u16) -> usize {
+pub(crate) fn content_width(terminal: u16) -> usize {
     terminal.saturating_sub(2).min(96) as usize
 }
 
 /// The line that opens a build in terminal history.
-pub fn build_header(app: &App) -> Vec<Line<'static>> {
+pub(crate) fn build_header(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
         Line::from(vec![
@@ -203,12 +203,12 @@ pub fn build_header(app: &App) -> Vec<Line<'static>> {
 
 /// A finished step as it goes into terminal history, with a blank line
 /// after it so the steps do not run together.
-pub fn step_done(step: &Step, inner: usize) -> Vec<Line<'static>> {
+pub(crate) fn step_done(step: &Step, inner: usize) -> Vec<Line<'static>> {
     vec![finished_line(step, inner), Line::raw("")]
 }
 
 /// A build's warning as it goes into terminal history.
-pub fn warning_line(warning: &str, inner: usize) -> Vec<Line<'static>> {
+pub(crate) fn warning_line(warning: &str, inner: usize) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
             plain("    "),
@@ -218,7 +218,7 @@ pub fn warning_line(warning: &str, inner: usize) -> Vec<Line<'static>> {
     ]
 }
 
-pub fn done_summary(app: &App) -> Vec<Line<'static>> {
+pub(crate) fn done_summary(app: &App) -> Vec<Line<'static>> {
     let Some(built) = &app.built else {
         return Vec::new();
     };
@@ -252,9 +252,9 @@ pub fn done_summary(app: &App) -> Vec<Line<'static>> {
 /// Rows of the window every screen is drawn into. The window never changes
 /// size: a short screen leaves blank rows, and the key hints stay on the last
 /// row.
-pub const HEIGHT: u16 = 20;
+pub(crate) const HEIGHT: u16 = 20;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub(crate) fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
     // The last two rows belong to the rule and the key hints.
     let area = Rect {
@@ -1605,7 +1605,7 @@ fn hit_row(hit: &Hit, selected: bool) -> Line<'static> {
 }
 
 /// The answer as the API returns it, one styled line per JSON line.
-pub fn json_lines(app: &App) -> Vec<Line<'static>> {
+pub(crate) fn json_lines(app: &App) -> Vec<Line<'static>> {
     app.json_text().lines().map(json_line).collect()
 }
 
@@ -1713,7 +1713,7 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The line that opens a batch run in terminal history.
-pub fn batch_header(app: &App) -> Vec<Line<'static>> {
+pub(crate) fn batch_header(app: &App) -> Vec<Line<'static>> {
     let name = app
         .batch
         .as_ref()

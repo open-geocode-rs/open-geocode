@@ -48,6 +48,6 @@ python3 scripts/gnaf_fixture.py \
 Scoring:
 
 ```
-cargo run --release -- bench-geocode \
+cargo run --release -- geocode bench \
   --pack data/tas-pack --queries fixtures/queries/tas-gnaf-holdout.json
 ```

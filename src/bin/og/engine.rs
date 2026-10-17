@@ -7,23 +7,23 @@ use std::{path::Path, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use open_geocode::{
     api::{self, ForwardCollection, ReverseCollection},
-    pack::PackReader,
+    pack::Reader,
     parse::lattice::LatticeTagger,
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
-    search::{AddressGeocodeOptions, DEFAULT_SEARCH_LIMIT, PackTextSearcher, TextSearchOptions},
+    reverse::{GeocodeOptions, PackReverseGeocoder},
+    search::{AddressGeocodeOptions, DEFAULT_SEARCH_LIMIT, TextSearchOptions, TextSearcher},
 };
 use serde::Serialize;
 
-pub struct Engine {
-    pack: Arc<PackReader>,
-    searcher: PackTextSearcher,
+pub(crate) struct Engine {
+    pack: Arc<Reader>,
+    searcher: TextSearcher,
     reverse: PackReverseGeocoder,
     tagger: LatticeTagger,
 }
 
 /// One feature of an answer, as a row of the results shows it.
 #[derive(Clone)]
-pub struct Hit {
+pub(crate) struct Hit {
     pub layer: String,
     pub name: String,
     pub label: String,
@@ -34,7 +34,7 @@ pub struct Hit {
 }
 
 #[derive(Clone, Copy)]
-pub enum Measure {
+pub(crate) enum Measure {
     Score(f32),
     /// Reverse gives no distance for the areas around the point.
     Distance(Option<f64>),
@@ -42,14 +42,14 @@ pub enum Measure {
 
 /// An answer as the HTTP API would give it.
 #[derive(Clone)]
-pub enum Collection {
+pub(crate) enum Collection {
     Forward(ForwardCollection),
     Reverse(ReverseCollection),
 }
 
 impl Collection {
     /// Pretty JSON of the whole answer, or of it with only feature `only`.
-    pub fn json(&self, only: Option<usize>) -> String {
+    pub(crate) fn json(&self, only: Option<usize>) -> String {
         /// Keep only feature `index`, when one was asked for.
         fn only_one<F: Clone>(features: &[F], only: Option<usize>) -> Vec<F> {
             match only {
@@ -71,7 +71,7 @@ impl Collection {
     }
 }
 
-pub struct Answer {
+pub(crate) struct Answer {
     pub hits: Vec<Hit>,
     pub collection: Collection,
     /// How long the engine took, in milliseconds.
@@ -80,16 +80,16 @@ pub struct Answer {
 
 /// A query as the parser reads it: words with one label each, joined while
 /// the label stays the same.
-pub struct Reading {
+pub(crate) struct Reading {
     pub parts: Vec<(String, &'static str)>,
 }
 
 impl Engine {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let pack = Arc::new(
-            PackReader::open(path).with_context(|| format!("failed to open {}", path.display()))?,
+            Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?,
         );
-        let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+        let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         let tagger = LatticeTagger::from_container(pack.container())?;
         Ok(Self {
@@ -100,12 +100,12 @@ impl Engine {
         })
     }
 
-    pub fn records(&self) -> u64 {
+    pub(crate) fn records(&self) -> u64 {
         self.pack.manifest().record_count
     }
 
     /// What `/search?q=` answers.
-    pub fn search(&self, query: &str) -> Result<Answer> {
+    pub(crate) fn search(&self, query: &str) -> Result<Answer> {
         let started = Instant::now();
         let query = query.trim().to_string();
         let hits = self.searcher.search(TextSearchOptions {
@@ -135,7 +135,7 @@ impl Engine {
 
     /// What a batch run answers for one row's address: its one match, or
     /// none.
-    pub fn geocode_address(&self, address: &str) -> Result<Answer> {
+    pub(crate) fn geocode_address(&self, address: &str) -> Result<Answer> {
         let started = Instant::now();
         let address = address.trim().to_string();
         let found = self.searcher.geocode_address(AddressGeocodeOptions {
@@ -171,9 +171,9 @@ impl Engine {
     }
 
     /// What `/reverse?lat=&lon=` answers.
-    pub fn reverse(&self, lat: f64, lon: f64) -> Result<Answer> {
+    pub(crate) fn reverse(&self, lat: f64, lon: f64) -> Result<Answer> {
         let started = Instant::now();
-        let response = self.reverse.reverse(ReverseGeocodeOptions { lon, lat })?;
+        let response = self.reverse.reverse(GeocodeOptions { lon, lat })?;
         let collection = api::reverse_collection(&self.pack, &response)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
         let hits = collection
@@ -195,7 +195,7 @@ impl Engine {
     }
 
     /// The parser's best reading of a query.
-    pub fn read(&self, query: &str) -> Reading {
+    pub(crate) fn read(&self, query: &str) -> Reading {
         let mut parts: Vec<(String, &'static str)> = Vec::new();
         if let Some(best) = self.tagger.parse(query).into_iter().next() {
             for tagged in best.pieces {
@@ -225,7 +225,7 @@ fn hit(common: &api::Common, geometry: &api::Point, measure: Measure) -> Hit {
 }
 
 /// A unit enum's name as it is serialized: `rooftop`.
-pub fn name_of(value: &impl Serialize) -> String {
+pub(crate) fn name_of(value: &impl Serialize) -> String {
     serde_json::to_value(value)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
@@ -233,7 +233,7 @@ pub fn name_of(value: &impl Serialize) -> String {
 }
 
 /// Reads `lat, lon` from a query.
-pub fn point(query: &str) -> Option<(f64, f64)> {
+pub(crate) fn point(query: &str) -> Option<(f64, f64)> {
     let mut numbers = query
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|part| !part.is_empty())

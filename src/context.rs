@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    container::{Bytes, Container, ContainerWriter},
+    container::{Bytes, Container, Writer},
     pack::RecordId,
     records::ContextRef,
     util::codec::{read_u32_le, read_u64_le},
@@ -92,12 +92,12 @@ impl AdminContextTuple {
 }
 
 #[derive(Debug, Default)]
-pub struct ContextTupleWriter {
+pub struct TupleWriter {
     tuples: Vec<AdminContextTuple>,
     ids: HashMap<AdminContextTuple, u32>,
 }
 
-impl ContextTupleWriter {
+impl TupleWriter {
     /// Reference for a record's context; `None` when there is no admin context.
     pub fn intern(&mut self, context: RecordContext) -> Result<Option<ContextRef>> {
         if context.admin_context.is_empty() {
@@ -127,7 +127,7 @@ impl ContextTupleWriter {
         self.tuples.len() as u64
     }
 
-    pub fn finish(self, pack: &mut ContainerWriter) -> Result<()> {
+    pub fn finish(self, pack: &mut Writer) -> Result<()> {
         let mut bytes = Vec::with_capacity(8 + self.tuples.len() * TUPLE_BYTES);
         bytes.extend_from_slice(&(self.tuples.len() as u64).to_le_bytes());
         for tuple in &self.tuples {
@@ -140,13 +140,13 @@ impl ContextTupleWriter {
     }
 }
 
-#[derive(Clone)]
-pub struct ContextReader {
+#[derive(Debug, Clone)]
+pub struct Reader {
     tuples: Bytes,
     count: u64,
 }
 
-impl ContextReader {
+impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
         let tuples = container.section(SECTION_TUPLES, CONTEXT_VERSION)?;
         let count = read_u64_le(&tuples, 0).context("context table is truncated")?;
@@ -191,7 +191,7 @@ mod tests {
             locality_record_id: Some(3),
             ..AdminContextTuple::default()
         };
-        let mut writer = ContextTupleWriter::default();
+        let mut writer = TupleWriter::default();
         let first = writer
             .intern(RecordContext {
                 admin_context: tuple,
@@ -214,10 +214,10 @@ mod tests {
         );
         assert_eq!(writer.tuple_count(), 1);
 
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
-        let reader = ContextReader::open(&Container::open(&path).expect("open")).expect("reader");
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
         let resolved = reader.resolve(second).expect("resolve");
         assert_eq!(resolved.admin_context, tuple);
         assert_eq!(resolved.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);

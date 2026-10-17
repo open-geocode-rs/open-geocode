@@ -61,10 +61,8 @@ use crate::{
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
     },
     extsort::{ExternalSorter, SortStats, Spool},
-    memory::MemoryBudget,
-    pack::{
-        AUDIT_DIR, BUILD_REPORT_FILE, PackWriter, PackWriterOptions, REJECTIONS_FILE, RecordContext,
-    },
+    memory::Budget,
+    pack::{AUDIT_DIR, BUILD_REPORT_FILE, REJECTIONS_FILE, RecordContext, Writer, WriterOptions},
     parse::lattice::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
@@ -175,11 +173,11 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     // is what every record waits on, so it takes half: more indexing
     // threads, fewer segments. The context record and spatial sorters hold
     // a few times less than the others, and are capped to stay so.
-    let memory = MemoryBudget::new(budget);
+    let memory = Budget::new(budget);
     memory.sample(&plan.resources);
-    let mut writer = PackWriter::create_with(
+    let mut writer = Writer::create_with(
         &options.pack,
-        PackWriterOptions {
+        WriterOptions {
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
             sort_budget_bytes: (budget / 4).max(1),
@@ -605,7 +603,7 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
 /// lies in. Boundary and derived-country records describe context and get
 /// none, but are offered under the country their point lies in.
 fn write_ordered(
-    writer: &mut PackWriter,
+    writer: &mut Writer,
     sample: &mut Sampler,
     records: impl Iterator<Item = Result<PendingRecord>> + Send,
     total: u64,
@@ -709,10 +707,10 @@ impl Audit {
 mod tests {
     use crate::{
         builder::progress::StageUnit,
-        pack::{PackReader, RecordPointPrecision},
+        pack::{PointPrecision, Reader},
         record::Record,
-        reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
-        search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
+        reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
+        search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     };
 
     use super::{
@@ -889,7 +887,7 @@ mod tests {
         write_pbf(&input, &town());
         let report = build(&dir.join("pack"), &input, None);
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
         let count = |layer: &str| counts.get(layer).copied().unwrap_or_default();
         assert_eq!(
@@ -967,7 +965,7 @@ mod tests {
         assert_eq!(name(context.admin_context.region_record_id), "Ontario");
         assert_eq!(name(context.admin_context.country_record_id), "Canada");
 
-        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let hits = searcher
             .search(TextSearchOptions {
                 query: "10 King Street".into(),
@@ -981,23 +979,23 @@ mod tests {
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = |lon, lat| {
             reverse
-                .reverse(ReverseGeocodeOptions { lon, lat })
+                .reverse(GeocodeOptions { lon, lat })
                 .expect("reverse")
                 .result
                 .expect("result")
         };
         let building = result(-79.4299, 43.6201);
-        assert_eq!(building.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(building.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(building.id.as_deref(), Some("osm:way:602"));
         let estimated = result(-79.44001, 43.6305);
-        assert_eq!(estimated.match_kind, ReverseMatchKind::EstimatedAddress);
+        assert_eq!(estimated.match_kind, MatchKind::EstimatedAddress);
         assert!(
             estimated.label.starts_with("6 Elm Street"),
             "{}",
             estimated.label
         );
         let street = result(-79.415, 43.61001);
-        assert_eq!(street.match_kind, ReverseMatchKind::NearestStreet);
+        assert_eq!(street.match_kind, MatchKind::NearestStreet);
         assert!(
             street.label.starts_with("Queen Street, ") && street.label.contains("Toronto"),
             "{}",
@@ -1096,7 +1094,7 @@ mod tests {
         assert_eq!(report.accepted.by_layer.get("address"), Some(&1));
         assert_eq!(report.rejected.total, 0);
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let address = reader
             .find_by_source_id("osm:node:10")
             .expect("lookup")
@@ -1117,7 +1115,7 @@ mod tests {
             vec!["千代田区", "Chiyoda", "ちよだく", "chiyodaku"]
         );
 
-        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let first = |query: &str, layer: &str| {
             searcher
                 .search(TextSearchOptions {
@@ -1224,7 +1222,7 @@ mod tests {
         assert_eq!(report.accepted.by_layer.get("place"), Some(&1));
         assert_eq!(report.accepted.by_layer.get("neighbourhood"), Some(&1));
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let island = reader
             .find_by_source_id("osm:relation:900")
             .expect("lookup")
@@ -1333,7 +1331,7 @@ mod tests {
         write_pbf(&input, &town_with_pois());
         let report = build(&dir.join("pack"), &input, None);
 
-        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
         let counts = &reader.manifest().layer_counts;
         assert_eq!(counts.get("poi"), Some(&4), "{counts:?}");
         assert_eq!(
@@ -1366,7 +1364,7 @@ mod tests {
             Some("King Street West")
         );
 
-        let searcher = PackTextSearcher::open(dir.join("pack")).expect("searcher");
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
             searcher
                 .search(TextSearchOptions {
@@ -1410,7 +1408,7 @@ mod tests {
         assert_eq!(ids(&station), vec!["osm:way:700"]);
         assert_eq!(
             station[0].record.point.expect("point").precision,
-            RecordPointPrecision::Centroid
+            PointPrecision::Centroid
         );
         assert!(search("Memorial Bench", None).is_empty());
 
@@ -1427,14 +1425,14 @@ mod tests {
         // an address record.
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = reverse
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.38,
                 lat: 43.65,
             })
             .expect("reverse")
             .result
             .expect("result");
-        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
@@ -1461,8 +1459,8 @@ mod tests {
         assert_eq!(in_memory.rejected, spilled.rejected);
         assert_eq!(in_memory.triage, spilled.triage);
 
-        let memory = PackReader::open(dir.join("memory")).expect("memory pack");
-        let spilled = PackReader::open(dir.join("spilled")).expect("spilled pack");
+        let memory = Reader::open(dir.join("memory")).expect("memory pack");
+        let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
         assert_eq!(
             memory.manifest().record_count,
             spilled.manifest().record_count

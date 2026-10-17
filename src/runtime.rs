@@ -26,11 +26,11 @@ use crate::{
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
-    pack::PackReader,
+    pack::Reader,
     record::Layer,
     resources::Resources,
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
-    search::{AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
+    reverse::{GeocodeOptions, PackReverseGeocoder},
+    search::{AddressGeocodeOptions, TextAutocompleteOptions, TextSearchOptions, TextSearcher},
 };
 
 #[derive(Debug, Clone)]
@@ -45,8 +45,8 @@ pub struct ServeOptions {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pack: Arc<PackReader>,
-    searcher: Arc<PackTextSearcher>,
+    pack: Arc<Reader>,
+    searcher: Arc<TextSearcher>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
     error_log: ErrorLog,
@@ -54,12 +54,12 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let pack = Arc::new(PackReader::open(path)?);
+        let pack = Arc::new(Reader::open(path)?);
         // Every query looks things up all over the Pack: read it in now
         // when it fits, so the first queries do not each wait on faults.
         pack.container()
             .advise_random_reads(Resources::probe().available_memory_bytes);
-        let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
+        let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         Ok(Self {
             pack,
@@ -362,7 +362,7 @@ pub(crate) async fn autocomplete(
 /// and hits are kept only where they fit the locality, region and postcode
 /// given, so a town in the address cannot outrank the street.
 ///
-/// This is the lookup `batch-geocode` runs per row, over HTTP.
+/// This is the lookup `geocode batch` runs per row, over HTTP.
 ///
 /// The answer is the same FeatureCollection every other route returns, with
 /// at most one feature: `features` holds the one match, or is empty when
@@ -481,7 +481,7 @@ pub(crate) async fn reverse(
     bounds::validate_coords(params.lon, params.lat)?;
 
     let collection = blocking(move || {
-        let response = state.reverse_geocoder.reverse(ReverseGeocodeOptions {
+        let response = state.reverse_geocoder.reverse(GeocodeOptions {
             lon: params.lon,
             lat: params.lat,
         })?;
@@ -502,7 +502,7 @@ mod router_tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::pack::PackWriter;
+    use crate::pack::Writer;
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
         point_geometry,
@@ -514,7 +514,7 @@ mod router_tests {
 
     fn write_pack(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
-        let mut writer = PackWriter::create(dir).expect("writer");
+        let mut writer = Writer::create(dir).expect("writer");
         writer
             .write(
                 &AddressRecord {

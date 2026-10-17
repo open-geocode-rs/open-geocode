@@ -277,7 +277,7 @@ impl IntoResponse for Problem {
 /// Map a geocoder error into a Problem without leaking internals, so handlers
 /// can just use `?`.
 ///
-/// `PackTextSearcher` reports a Tantivy query-parse failure with a message that
+/// `TextSearcher` reports a Tantivy query-parse failure with a message that
 /// contains `"failed to parse search query"`; that is a client error (400).
 /// Everything else is an unexpected runtime failure (500, no detail) and keeps
 /// its cause for the log.

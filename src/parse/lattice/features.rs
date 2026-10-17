@@ -430,7 +430,7 @@ pub(super) struct TokenInfo {
 }
 
 impl TokenInfo {
-    pub fn new(word: &str, dictionaries: &Dictionaries) -> Self {
+    pub(super) fn new(word: &str, dictionaries: &Dictionaries) -> Self {
         let chars = word.chars().count();
         // A numeral of any script counts as a digit (see [`super::is_numeral`]).
         let digits = word
@@ -475,7 +475,7 @@ impl TokenInfo {
     }
 
     /// Digits, maybe with one letter after them: how house numbers look.
-    pub fn is_number(&self) -> bool {
+    pub(super) fn is_number(&self) -> bool {
         matches!(self.shape, Shape::Digits | Shape::DigitsLetter)
     }
 
@@ -531,7 +531,7 @@ pub(super) struct FeatureSet {
 impl FeatureSet {
     /// What every span has: its length, where it sits, its neighbours, and
     /// for one token its shape.
-    pub fn new(tokens: &Tokens, infos: &[TokenInfo], start: usize, end: usize) -> Self {
+    pub(super) fn new(tokens: &Tokens, infos: &[TokenInfo], start: usize, end: usize) -> Self {
         let mut set = Self {
             start,
             end,
@@ -619,7 +619,7 @@ impl FeatureSet {
 
     /// The span is a name in `field`, `hit.distance` edits away. `key_chars`
     /// is the length of the span as one key.
-    pub fn dictionary_hit(&mut self, field: Field, hit: &Match, key_chars: usize) {
+    pub(super) fn dictionary_hit(&mut self, field: Field, hit: &Match, key_chars: usize) {
         let Some(field_index) = field_index(field) else {
             return;
         };
@@ -663,7 +663,7 @@ impl FeatureSet {
     /// The prefixes and suffixes of `word`, the span as one word, each of
     /// [`AFFIX_SIZES`] characters and shorter than the word, hashed into
     /// their blocks.
-    pub fn affixes(&mut self, word: &str) {
+    pub(super) fn affixes(&mut self, word: &str) {
         let bounds = word
             .char_indices()
             .map(|(index, _)| index)
@@ -688,14 +688,14 @@ impl FeatureSet {
 
     /// The span is a vocabulary phrase of the kinds of `kinds`, one bit per
     /// field of [`Field::PHRASES`]: "po box", "私書箱", "floor".
-    pub fn phrase(&mut self, kinds: u8) {
+    pub(super) fn phrase(&mut self, kinds: u8) {
         self.phrase_bits(Block::Phrase, kinds);
     }
 
     /// A phrase of the kinds of `before` ends right before the span, and one
     /// of the kinds of `after` starts right after it: the number of "po box
     /// 29" follows a PO box phrase.
-    pub fn phrase_neighbours(&mut self, before: u8, after: u8) {
+    pub(super) fn phrase_neighbours(&mut self, before: u8, after: u8) {
         self.phrase_bits(Block::PhraseBefore, before);
         self.phrase_bits(Block::PhraseAfter, after);
     }
@@ -708,7 +708,7 @@ impl FeatureSet {
 
     /// The span is `pieces` area names glued one after the other, one of
     /// them a region when `region`.
-    pub fn chain(&mut self, pieces: usize, region: bool) {
+    pub(super) fn chain(&mut self, pieces: usize, region: bool) {
         self.features
             .push(chain_feature(super::Chain { pieces, region }));
         if region {
@@ -717,13 +717,13 @@ impl FeatureSet {
     }
 
     /// The units the span covers.
-    pub fn range(&self) -> (usize, usize) {
+    pub(super) fn range(&self) -> (usize, usize) {
         (self.start, self.end)
     }
 
     /// The span is one token that glues a number to a unit, PO box or level
     /// phrase or an admin type word ("4og", "apt4", "4chome").
-    pub fn glued_phrase(&mut self, glued: super::Glued) {
+    pub(super) fn glued_phrase(&mut self, glued: super::Glued) {
         let index = match glued {
             super::Glued::Unit => 0,
             super::Glued::PoBox => 1,
@@ -735,24 +735,24 @@ impl FeatureSet {
 
     /// Of the fields whose names the span is, `field` is the one the most
     /// records use it in: "sachsen" is a state far more than a village.
-    pub fn dominant_field(&mut self, field: Field) {
+    pub(super) fn dominant_field(&mut self, field: Field) {
         if let Some(index) = field_index(field) {
             self.push(Block::DictDominant, index);
         }
     }
 
     /// The span is one number written in parts: "993.5", "1384 1/2".
-    pub fn number_in_parts(&mut self) {
+    pub(super) fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
     }
 
     /// Some country's postcode pattern matches the span.
-    pub fn postcode_any(&mut self) {
+    pub(super) fn postcode_any(&mut self) {
         self.push(Block::PostcodeAny, self.end - self.start - 1);
     }
 
     /// `country`'s postcode pattern matches the span.
-    pub fn postcode_in(&mut self, country: CountryCode) {
+    pub(super) fn postcode_in(&mut self, country: CountryCode) {
         self.country_features.push((
             country,
             id(Block::PostcodeCountry, self.end - self.start - 1),
@@ -765,7 +765,7 @@ impl FeatureSet {
         (self.end - self.start).min(MAX_SPAN_TOKENS) - 1
     }
 
-    pub fn into_span(self) -> Span {
+    pub(super) fn into_span(self) -> Span {
         Span {
             start: self.start,
             end: self.end,

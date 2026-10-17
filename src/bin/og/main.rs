@@ -354,130 +354,15 @@ fn print_scrollback(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     })
 }
 
-/// Draws each screen of a session against the og home in `OG_HOME`, as a
-/// person would step through it, and prints them. Run with
-/// `cargo test --bin og screens -- --ignored --nocapture`, after a Pack is
-/// built there; `OG_SCREENS_CSV` names a CSV for the batch flow.
+/// Checks the interface against a Pack in `OG_HOME`. Both tests are
+/// `#[ignore]`d: they need that Pack and bind a port.
 #[cfg(test)]
-mod screens {
-    use std::time::{Duration, Instant};
+mod tests {
+    use std::time::Duration;
 
-    use ratatui::{
-        Terminal,
-        backend::TestBackend,
-        crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    };
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{App, Home, ui};
-    use crate::app::Screen;
-
-    fn press(app: &mut App, keys: &[KeyCode]) {
-        for key in keys {
-            app.on_key(KeyEvent::new(*key, KeyModifiers::NONE));
-        }
-    }
-
-    fn typed(app: &mut App, text: &str) {
-        for c in text.chars() {
-            press(app, &[KeyCode::Char(c)]);
-        }
-    }
-
-    fn show(app: &App, name: &str) {
-        let mut terminal = Terminal::new(TestBackend::new(100, ui::HEIGHT)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        println!("=== {name}");
-        for y in 0..buffer.area.height {
-            let row: String = (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol().to_string())
-                .collect();
-            println!("{}", row.trim_end());
-        }
-    }
-
-    /// Ticks the app until `done` holds, at most `limit`.
-    fn wait(app: &mut App, limit: Duration, done: impl Fn(&App) -> bool) {
-        let started = Instant::now();
-        while !done(app) && started.elapsed() < limit {
-            app.tick();
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Ticks the app until the open Pack has answered.
-    fn answered(app: &mut App) {
-        app.tick();
-        wait(app, Duration::from_secs(10), |app| !app.asking());
-        app.tick();
-    }
-
-    #[test]
-    #[ignore = "needs a Pack in OG_HOME"]
-    fn session() {
-        let mut app = App::new(Home::locate().unwrap());
-        // Let the update checks answer.
-        std::thread::sleep(Duration::from_secs(3));
-        show(&app, "home");
-
-        press(&mut app, &[KeyCode::Enter]);
-        typed(&mut app, "heitastrasse 144 triesenberg");
-        answered(&mut app);
-        show(&app, "search");
-        press(&mut app, &[KeyCode::Enter]);
-        show(&app, "geojson");
-        press(&mut app, &[KeyCode::Esc]);
-
-        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        typed(&mut app, "47.0973, 9.6118");
-        answered(&mut app);
-        show(&app, "reverse");
-
-        press(&mut app, &[KeyCode::Tab]);
-        app.on_paste(
-            "address\nheitastrasse 144 triesenberg\nfuhraweg 6 ruggell\nnirgendweg 999 vaduz\n"
-                .to_string(),
-        );
-        answered(&mut app);
-        show(&app, "batch pasted");
-
-        if let Ok(csv) = std::env::var("OG_SCREENS_CSV") {
-            press(&mut app, &[KeyCode::Char('u')]);
-            app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-            app.on_paste(csv);
-            app.tick();
-            show(&app, "batch file card");
-            press(&mut app, &[KeyCode::Enter]);
-            answered(&mut app);
-            show(&app, "batch setup");
-            press(&mut app, &[KeyCode::Enter]);
-            wait(&mut app, Duration::from_secs(8), |_| false);
-            show(&app, "batch running");
-            wait(&mut app, Duration::from_secs(1800), |app| {
-                app.screen != Screen::BatchRun
-            });
-            show(&app, "batch done");
-            for line in &app.scrollback {
-                let text: String = line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect();
-                println!("history | {text}");
-            }
-            press(&mut app, &[KeyCode::Esc]);
-        }
-
-        press(&mut app, &[KeyCode::Char('b')]);
-        show(&app, "regions");
-        typed(&mut app, "ontario");
-        show(&app, "region search");
-        press(&mut app, &[KeyCode::Enter]);
-        wait(&mut app, Duration::from_secs(15), |app| {
-            app.live.lock().unwrap().done
-        });
-        show(&app, "confirm");
-    }
+    use super::{App, Home};
 
     /// The query shell's GeoJSON is the HTTP API's answer, value for value.
     #[test]
@@ -532,7 +417,7 @@ mod screens {
         std::fs::create_dir_all(&dir).unwrap();
         let address = "carrer prat de la creu 70, andorra la vella";
         std::fs::write(dir.join("in.csv"), format!("address\n\"{address}\"\n")).unwrap();
-        open_geocode::batch::run_batch_geocode(open_geocode::batch::BatchGeocodeOptions {
+        open_geocode::batch::run_batch_geocode(open_geocode::batch::GeocodeOptions {
             pack: Some(pack),
             input: dir.join("in.csv"),
             output: dir.join("out.csv"),
@@ -582,54 +467,5 @@ mod screens {
             pack.display()
         );
         let _ = std::fs::remove_dir_all(&pack);
-    }
-
-    /// Builds the region named by `OG_SCREENS_REGION` through the interface:
-    /// confirm, the running build at each step, history, and the done screen.
-    #[test]
-    #[ignore = "downloads and builds a region"]
-    fn build_flow() {
-        let region = std::env::var("OG_SCREENS_REGION").unwrap_or_else(|_| "andorra".into());
-        let mut app = App::new(Home::locate().unwrap());
-        press(&mut app, &[KeyCode::Char('b')]);
-        typed(&mut app, &region);
-        press(&mut app, &[KeyCode::Enter]);
-        wait(&mut app, Duration::from_secs(15), |app| {
-            app.live.lock().unwrap().done
-        });
-        show(&app, "confirm");
-        press(&mut app, &[KeyCode::Enter]);
-        let mut seen = usize::MAX;
-        while app.screen == Screen::Build && app.build_error.is_none() {
-            let step = app.job.as_ref().map(|job| job.progress.current());
-            if let Some(step) = step
-                && step != seen
-            {
-                // Let the step get going before drawing it.
-                std::thread::sleep(Duration::from_millis(700));
-                app.tick();
-                app.show_logs = step % 3 == 0;
-                show(&app, &format!("build step {step}"));
-                seen = step;
-            }
-            app.tick();
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if app.build_error.is_some() {
-            show(&app, "build failed");
-        }
-        for line in &app.scrollback {
-            let text: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            println!("history | {text}");
-        }
-        show(&app, "done");
-        press(&mut app, &[KeyCode::Enter]);
-        typed(&mut app, "andorra la vella");
-        answered(&mut app);
-        show(&app, "search the new Pack");
     }
 }

@@ -1,7 +1,7 @@
 //! The response contract checked against what the code produces (ADR 0022):
 //! real `/search`, `/autocomplete` and `/reverse` answers from the router on
 //! a small Pack are the committed examples in `contract/responses/`, and the
-//! batch-geocode audit columns are the committed
+//! geocode batch audit columns are the committed
 //! `contract/batch-audit-columns.txt`. A change to the shape of an answer
 //! fails here until its examples are regenerated, with
 //! `OG_UPDATE_CONTRACT=1 cargo test contract`, and committed with it.
@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use crate::{
     batch,
     context::{AdminContextTuple, RecordContext},
-    pack::{PackWriter, RecordId},
+    pack::{RecordId, Writer},
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
         InterpolationRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord, PoiRecord,
@@ -430,8 +430,8 @@ struct Ids {
 /// and an interpolation range in Toronto.
 fn write_pack(dir: &PathBuf) -> Ids {
     let _ = std::fs::remove_dir_all(dir);
-    let mut writer = PackWriter::create(dir).expect("writer");
-    let place = |writer: &mut PackWriter, layer, name: &str, id| {
+    let mut writer = Writer::create(dir).expect("writer");
+    let place = |writer: &mut Writer, layer, name: &str, id| {
         writer
             .write(
                 &Record::Place(

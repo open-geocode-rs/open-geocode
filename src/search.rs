@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    io,
+    fmt, io,
     ops::{Bound, Range},
     path::Path,
     sync::Arc,
@@ -23,7 +23,7 @@ use tantivy::{
 use crate::{
     api::Address,
     labels,
-    pack::{PackReader, RecordId, RecordPoint, RecordPointPrecision, RecordSource, RecordSummary},
+    pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
         lattice::{LatticeTagger, Tokens},
         types::{Label, Tagged},
@@ -31,25 +31,33 @@ use crate::{
     record::{
         AddressComponents, DERIVED_FROM_ADDRESS_RECORDS, Layer, OsmObjectType, PoiRecord, Record,
     },
-    spatial_index::SpatialIndexReader,
+    spatial_index,
     text_index::{
-        HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
-        TextIndexFields, base_house_number, compact_postcode, expand_address_abbreviations,
+        Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
+        RANK_POSTCODE_FIELD, base_house_number, compact_postcode, expand_address_abbreviations,
         expand_final_direction, is_numeric_token, normalize_index_text, open_text_index,
         street_search_text,
     },
 };
 
-pub struct PackTextSearcher {
-    pack: Arc<PackReader>,
-    spatial: SpatialIndexReader,
+pub struct TextSearcher {
+    pack: Arc<pack::Reader>,
+    spatial: spatial_index::Reader,
     reader: IndexReader,
-    fields: TextIndexFields,
+    fields: Fields,
     /// Labels the words of a query from the Pack's own dictionaries.
     tagger: Arc<LatticeTagger>,
     /// The fast fields ranking reads, per segment. The Pack's index never
     /// changes, so they are opened once rather than per query.
     columns: Arc<HashMap<SegmentId, SegmentColumns>>,
+}
+
+impl fmt::Debug for TextSearcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextSearcher")
+            .field("segments", &self.columns.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -78,7 +86,7 @@ pub struct TextAutocompleteOptions {
 pub struct TextSearchHit {
     pub record_id: RecordId,
     pub score: Score,
-    pub record: RecordSummary,
+    pub record: Summary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,18 +136,18 @@ const NEIGHBOUR_CANDIDATES: usize = 4;
 /// name lies far from both.
 const NEIGHBOUR_STREET_RADIUS_M: f64 = 100.0;
 
-impl PackTextSearcher {
+impl TextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_pack(Arc::new(PackReader::open(pack_path)?))
+        Self::from_pack(Arc::new(pack::Reader::open(pack_path)?))
     }
 
     /// Open the text index using an existing shared pack reader.
-    pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
+    pub fn from_pack(pack: Arc<pack::Reader>) -> Result<Self> {
         let index = open_text_index(pack.container())?;
         let schema = index.schema();
-        let fields = TextIndexFields::from_schema(&schema)?;
+        let fields = Fields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
-        let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
+        let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         let tagger = Arc::new(LatticeTagger::from_container(pack.container())?);
         let mut columns = HashMap::new();
         for segment in reader.searcher().segment_readers() {
@@ -856,7 +864,7 @@ impl PackTextSearcher {
     /// it uses only the street's own geometry. Where a number can be placed
     /// properly, by a range that holds it or between stated neighbours, that
     /// runs first and this never applies.
-    fn place_on_street_line(&self, record_id: RecordId, record: &mut RecordSummary) -> Result<()> {
+    fn place_on_street_line(&self, record_id: RecordId, record: &mut Summary) -> Result<()> {
         let Some(point) = record.point else {
             return Ok(());
         };
@@ -865,7 +873,7 @@ impl PackTextSearcher {
         let Some([lon, lat]) = self.spatial.point_along_line(record_id, 0.5)? else {
             return Ok(());
         };
-        record.point = Some(RecordPoint {
+        record.point = Some(Point {
             lon,
             lat,
             precision: point.precision,
@@ -877,7 +885,7 @@ impl PackTextSearcher {
         &self,
         record_id: RecordId,
         number: u32,
-        record: &mut RecordSummary,
+        record: &mut Summary,
     ) -> Result<bool> {
         let Some(interpolation) = self.pack.interpolation(record_id)? else {
             return Ok(false);
@@ -888,10 +896,10 @@ impl PackTextSearcher {
         let Some([lon, lat]) = self.spatial.point_along_line(record_id, fraction)? else {
             return Ok(false);
         };
-        record.point = Some(RecordPoint {
+        record.point = Some(Point {
             lon,
             lat,
-            precision: RecordPointPrecision::Estimated,
+            precision: PointPrecision::Estimated,
         });
         if let Some(label) = labels::estimated_address_label(number, &interpolation.address) {
             record.label = label;
@@ -1118,19 +1126,19 @@ impl PackTextSearcher {
         Ok(TextSearchHit {
             record_id: nearer.record_id,
             score: 0.0,
-            record: RecordSummary {
+            record: Summary {
                 id: labels::estimated_address_id(number, &id(low)?, &id(high)?),
                 layer: Layer::Address.as_str().to_string(),
                 name: labels::address_name(&address),
                 label: labels::address_label(&address),
                 address: Address::from(&address),
                 category: None,
-                point: Some(RecordPoint {
+                point: Some(Point {
                     lon,
                     lat,
-                    precision: RecordPointPrecision::Estimated,
+                    precision: PointPrecision::Estimated,
                 }),
-                source: RecordSource {
+                source: Source {
                     dataset: "osm".to_string(),
                     object_type: None,
                     object_id: None,
@@ -1257,7 +1265,7 @@ struct TieBreak {
 }
 
 impl TieBreak {
-    fn new(record: &RecordSummary, query_words: &HashSet<&str>) -> Self {
+    fn new(record: &Summary, query_words: &HashSet<&str>) -> Self {
         let extra_label_tokens = normalize_index_text(&record.label)
             .map(|label| {
                 label
@@ -1267,10 +1275,10 @@ impl TieBreak {
             })
             .unwrap_or_default();
         let precision = match record.point.map(|point| point.precision) {
-            Some(RecordPointPrecision::Point) => 0,
-            Some(RecordPointPrecision::Centroid) => 1,
-            Some(RecordPointPrecision::Estimated) => 2,
-            Some(RecordPointPrecision::RepresentativePoint) => 3,
+            Some(PointPrecision::Point) => 0,
+            Some(PointPrecision::Centroid) => 1,
+            Some(PointPrecision::Estimated) => 2,
+            Some(PointPrecision::RepresentativePoint) => 3,
             None => 4,
         };
         let source = match record.source.object_type {
@@ -1288,7 +1296,7 @@ impl TieBreak {
     }
 }
 
-/// The retrieval passes of [`PackTextSearcher::search_variants`], in order.
+/// The retrieval passes of [`TextSearcher::search_variants`], in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {
     /// The house number, stated or on a range, in every named locality.
@@ -1321,7 +1329,7 @@ impl Pass {
     }
 }
 
-/// What [`PackTextSearcher::ranked_hits`] ranks by besides the text score.
+/// What [`TextSearcher::ranked_hits`] ranks by besides the text score.
 #[derive(Debug, Clone, Default)]
 struct Ranking {
     /// The query's words as written, before abbreviations were expanded, to
@@ -1432,7 +1440,7 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
 /// A query's words by role, from one labelling of its tokens by the address
 /// parser (see [`crate::parse::lattice`]). Street and other words name what
 /// is sought and are required; locality, region, postcode and country words
-/// place it; unit words only rank (see [`PackTextSearcher::build_query`]).
+/// place it; unit words only rank (see [`TextSearcher::build_query`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct QueryPlan {
     /// The house number the parser read ("670", "221b", "993_5"), when other
@@ -1650,7 +1658,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::{
-        pack::PackWriter,
+        pack::Writer,
         record::{
             AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
             OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
@@ -1665,7 +1673,7 @@ mod tests {
         let temp_dir = temp_pack_path("search-ties");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut prince =
             address_record("osm:node:1", "", "342", "Prince Albert Street", None, None);
         prince.geometry = point_geometry(-75.6, 45.4);
@@ -1681,7 +1689,7 @@ mod tests {
         }
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .search(TextSearchOptions {
                 query: "342 Albert Street".to_string(),
@@ -1699,7 +1707,7 @@ mod tests {
     }
 
     fn geocode(
-        searcher: &PackTextSearcher,
+        searcher: &TextSearcher,
         address: &str,
         locality: Option<&str>,
         postcode: Option<&str>,
@@ -1721,7 +1729,7 @@ mod tests {
     fn geocode_rejects_hits_in_a_different_postcode() {
         let temp_dir = temp_pack_path("geocode-postcode");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record("osm:node:1", "", "10", "King Street", None, Some("M5V 1A1"))
@@ -1730,7 +1738,7 @@ mod tests {
             )
             .expect("write");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(
             geocode(&searcher, "10 King Street", None, Some("K7L 1A1")),
@@ -1752,7 +1760,7 @@ mod tests {
     fn geocode_infers_the_postcode_area_of_hits_without_one() {
         let temp_dir = temp_pack_path("geocode-inferred-postcode");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         // An address without addr:postcode, inside postcode area K0J.
         let mut cobden = address_record("osm:node:1", "", "44", "Gould Street", None, None);
         cobden.geometry = point_geometry(-76.88, 45.63);
@@ -1773,7 +1781,7 @@ mod tests {
         remote.geometry = point_geometry(-90.0, 50.0);
         writer.write(&remote.into(), None).expect("remote");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(
             geocode(&searcher, "44 Gould Street", None, Some("M5V 1A1")),
@@ -1794,7 +1802,7 @@ mod tests {
     fn geocode_accepts_hits_near_a_busier_neighbouring_postcode_area() {
         let temp_dir = temp_pack_path("geocode-postcode-border");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut border = address_record("osm:node:1", "", "5", "Line Road", None, None);
         border.geometry = point_geometry(-79.0, 43.0);
         writer.write(&border.into(), None).expect("address");
@@ -1821,7 +1829,7 @@ mod tests {
         }
         postcode("A1A 1A1".to_string(), -78.9);
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(
             geocode(&searcher, "5 Line Road", None, Some("A1A 2B2")).as_deref(),
@@ -1844,7 +1852,7 @@ mod tests {
 
         let temp_dir = temp_pack_path("geocode-variants");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut locality = |name: &str, object_id: i64| {
             writer
                 .write(
@@ -1886,7 +1894,7 @@ mod tests {
             )
             .expect("toronto address");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(
             geocode(&searcher, "10 King St W", Some("Toronto"), None).as_deref(),
@@ -1905,7 +1913,7 @@ mod tests {
 
         let temp_dir = temp_pack_path("search-poi-repeats");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let township = writer
             .write(
                 &Record::Place(
@@ -1970,7 +1978,7 @@ mod tests {
             )
             .expect("parkette");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let top = |query: &str| {
             searcher
                 .search(TextSearchOptions {
@@ -1995,7 +2003,7 @@ mod tests {
     fn search_reports_queries_that_cannot_be_parsed() {
         let temp_dir = temp_pack_path("search-parse-error");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record("osm:node:1", "", "10", "King Street", None, None).into(),
@@ -2003,7 +2011,7 @@ mod tests {
             )
             .expect("write");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         let error = searcher
             .search(TextSearchOptions {
@@ -2021,7 +2029,7 @@ mod tests {
         let temp_dir = temp_pack_path("search-hydrates");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2052,7 +2060,7 @@ mod tests {
             .expect("write queen address");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .search(TextSearchOptions {
                 query: "King Street Toronto".to_string(),
@@ -2074,7 +2082,7 @@ mod tests {
         let temp_dir = temp_pack_path("search-layer");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2094,7 +2102,7 @@ mod tests {
             .expect("write street");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .search(TextSearchOptions {
                 query: "King Street".to_string(),
@@ -2115,7 +2123,7 @@ mod tests {
         let temp_dir = temp_pack_path("search-postcode");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &PostcodeRecord {
@@ -2129,7 +2137,7 @@ mod tests {
             .expect("write postcode");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .search(TextSearchOptions {
                 query: "M5V".to_string(),
@@ -2150,7 +2158,7 @@ mod tests {
         let temp_dir = temp_pack_path("autocomplete-prefix");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2181,7 +2189,7 @@ mod tests {
             .expect("write queen address");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .autocomplete(TextAutocompleteOptions {
                 query: "kin".to_string(),
@@ -2202,7 +2210,7 @@ mod tests {
         let temp_dir = temp_pack_path("autocomplete-multi-token");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2219,7 +2227,7 @@ mod tests {
             .expect("write king address");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .autocomplete(TextAutocompleteOptions {
                 query: "king st".to_string(),
@@ -2239,7 +2247,7 @@ mod tests {
         let temp_dir = temp_pack_path("autocomplete-layer");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2259,7 +2267,7 @@ mod tests {
             .expect("write street");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .autocomplete(TextAutocompleteOptions {
                 query: "kin".to_string(),
@@ -2280,7 +2288,7 @@ mod tests {
         let temp_dir = temp_pack_path("autocomplete-postcode-house-number");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2297,7 +2305,7 @@ mod tests {
             .expect("write baker address");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let postcode_hits = searcher
             .autocomplete(TextAutocompleteOptions {
                 query: "nw16".to_string(),
@@ -2325,7 +2333,7 @@ mod tests {
         let temp_dir = temp_pack_path("autocomplete-number-street-prefix");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2342,7 +2350,7 @@ mod tests {
             .expect("write baker address");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
             .autocomplete(TextAutocompleteOptions {
                 query: "221 bak".to_string(),
@@ -2362,7 +2370,7 @@ mod tests {
         let temp_dir = temp_pack_path("autocomplete-short");
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record(
@@ -2379,7 +2387,7 @@ mod tests {
             .expect("write address");
         writer.finish().expect("finish");
 
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert!(
             searcher
@@ -2415,7 +2423,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    fn top_ids(searcher: &PackTextSearcher, query: &str) -> Vec<String> {
+    fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
         searcher
             .search(TextSearchOptions {
                 query: query.to_string(),
@@ -2438,7 +2446,7 @@ mod tests {
     fn a_street_stands_in_only_for_a_house_number_no_record_has() {
         let temp_dir = temp_pack_path("search-lenient");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
                 &address_record("osm:node:1", "", "10", "King Street", None, None).into(),
@@ -2449,7 +2457,7 @@ mod tests {
             .write(&street_record("osm:way:9", "King Street").into(), None)
             .expect("street");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(top_ids(&searcher, "10 King Street"), vec!["osm:node:1"]);
         // No record has 99: the street answers, never the address with 10.
@@ -2467,7 +2475,7 @@ mod tests {
 
         let temp_dir = temp_pack_path("search-tiers");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut street = street_record("osm:way:30", "Queen Street");
         street.geometry = queen_street_line();
         writer.write(&street.into(), None).expect("street");
@@ -2504,7 +2512,7 @@ mod tests {
             )
             .expect("address");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(
             top_ids(&searcher, "10 Queen Street"),
@@ -2527,7 +2535,7 @@ mod tests {
         let estimate = &hits[0].record;
         assert_eq!(estimate.label, "50 Queen Street");
         let point = estimate.point.expect("point");
-        assert_eq!(point.precision, RecordPointPrecision::Estimated);
+        assert_eq!(point.precision, PointPrecision::Estimated);
         assert!((point.lat - 43.0005).abs() < 1e-6, "{point:?}");
         assert!((point.lon + 79.0).abs() < 1e-6, "{point:?}");
 
@@ -2549,7 +2557,7 @@ mod tests {
 
         let temp_dir = temp_pack_path("search-localities");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut locality = |name: &str, object_id: i64| {
             writer
                 .write(
@@ -2659,7 +2667,7 @@ mod tests {
             )
             .expect("st catharines address");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         // The house number in the named town, though only a range has it.
         assert_eq!(
@@ -2707,7 +2715,7 @@ mod tests {
     fn a_postcode_ranks_records_by_how_much_of_it_they_share() {
         let temp_dir = temp_pack_path("search-postcode-rank");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.set_postcode_areas(PostcodeAreas::new([(
             "A1A 1A1".to_string(),
             [-79.001, 43.001],
@@ -2723,7 +2731,7 @@ mod tests {
             writer.write(&record.into(), None).expect("address");
         }
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         // The index knows no "A1A 9Z9", but the record near "A1A 1A1" shares
         // its first three characters. The record that states "B2B 2B2"
@@ -2754,7 +2762,7 @@ mod tests {
     fn a_hit_contradicting_the_stated_postcode_does_not_end_the_search() {
         let temp_dir = temp_pack_path("search-postcode-rejects-strict");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         // The number exists, but only in the wrong postcode.
         let mut elsewhere =
             address_record("osm:node:1", "", "8", "High Street", None, Some("7018"));
@@ -2766,7 +2774,7 @@ mod tests {
         writer.write(&elsewhere.into(), None).expect("address");
         writer.write(&street.into(), None).expect("street");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         let ids = top_ids(&searcher, "8 High Street, 7304");
         assert!(
@@ -2786,7 +2794,7 @@ mod tests {
 
         let temp_dir = temp_pack_path("search-rank-order");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.set_postcode_areas(PostcodeAreas::new([
             ("M5C 1A1".to_string(), [-79.0, 43.0005]),
             ("M8V 1A1".to_string(), [-79.5, 43.6]),
@@ -2831,7 +2839,7 @@ mod tests {
         number.geometry = point_geometry(-79.5, 43.6);
         writer.write(&number.into(), None).expect("number");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(
             top_ids(&searcher, "23 Victoria St, M5C 2A1"),
@@ -2866,7 +2874,7 @@ mod tests {
     fn a_missing_number_is_placed_between_its_stated_neighbours() {
         let temp_dir = temp_pack_path("search-neighbours");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut street = |id: &str, name: &str, lon: f64| {
             let mut street = street_record(id, name);
             street.geometry = line(lon, [43.0, 43.01]);
@@ -2889,7 +2897,7 @@ mod tests {
             writer.write(&address.into(), None).expect("address");
         }
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let top = |query: &str| {
             searcher
                 .search(TextSearchOptions {
@@ -2909,7 +2917,7 @@ mod tests {
         assert_eq!(estimate.label, "14 Bayview Avenue");
         assert_eq!(estimate.id, "derived:estimate:14:osm:node:10:osm:node:11");
         let point = estimate.point.expect("point");
-        assert_eq!(point.precision, RecordPointPrecision::Estimated);
+        assert_eq!(point.precision, PointPrecision::Estimated);
         assert!((point.lat - 43.0014).abs() < 1e-9, "{point:?}");
         assert!((point.lon + 79.0002).abs() < 1e-9, "{point:?}");
         assert_eq!(
@@ -2931,7 +2939,7 @@ mod tests {
     fn a_house_number_needs_its_street_not_a_name() {
         let temp_dir = temp_pack_path("search-number-street");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let dental = address_record(
             "osm:node:1",
             "",
@@ -2963,7 +2971,7 @@ mod tests {
             )
             .expect("address");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(top_ids(&searcher, "300 Spadina Ave"), vec!["osm:node:2"]);
         assert_eq!(top_ids(&searcher, "Spadina Dental")[0], "osm:node:1");
@@ -3107,7 +3115,7 @@ mod tests {
     fn searches_written_house_numbers_then_the_number_they_start_with() {
         let temp_dir = temp_pack_path("search-house-number-forms");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, number, street) in [
             ("osm:node:1", "1384 1/2", "Queen Street East"),
             ("osm:node:2", "1384", "Queen Street East"),
@@ -3124,7 +3132,7 @@ mod tests {
                 .expect("address");
         }
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(top_ids(&searcher, "1384 1/2 Queen St E")[0], "osm:node:1");
         assert_eq!(top_ids(&searcher, "993.5 Bloor St W"), vec!["osm:node:3"]);
@@ -3146,7 +3154,7 @@ mod tests {
 
         let temp_dir = temp_pack_path("geocode-community");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let huron_east = writer
             .write(
                 &Record::Place(
@@ -3183,7 +3191,7 @@ mod tests {
             )
             .expect("address");
         writer.finish().expect("finish");
-        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         for locality in ["Seaforth", "Huron East"] {
             assert_eq!(

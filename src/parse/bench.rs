@@ -302,7 +302,7 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                 ensure!(
                     path.is_file(),
                     "{} is missing, so {baseline} cannot be scored on the same rows; \
-                     run `parse-fixture align` for it",
+                     run `parse fixture align` for it",
                     path.display()
                 );
                 let predicted = read_predictions(&path)?;

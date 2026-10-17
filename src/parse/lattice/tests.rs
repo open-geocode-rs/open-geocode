@@ -800,7 +800,6 @@ fn glued_area_names_are_a_chain() {
 fn tag_latency_on_a_pack() {
     let pack = std::env::var("OG_PARSE_PACK").expect("OG_PARSE_PACK");
     let tagger = LatticeTagger::open(Path::new(&pack)).expect("pack");
-    println!("{:?}", tagger.dictionaries());
     let query = "Unit 602, 670 King Street West, Toronto, ON M5V 1M9";
     assert_eq!(Tokens::new(query).len(), 10);
     for _ in 0..200 {

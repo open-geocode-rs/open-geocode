@@ -33,7 +33,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
+pub(crate) enum Screen {
     Home,
     Region,
     Confirm,
@@ -48,7 +48,7 @@ pub enum Screen {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub(crate) enum Mode {
     Search,
     Reverse,
     /// Many addresses at once, pasted as CSV.
@@ -56,7 +56,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Search => "search",
             Self::Reverse => "reverse",
@@ -73,14 +73,14 @@ impl Mode {
     }
 }
 
-pub const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
+pub(crate) const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
 /// Rows of the region list, so the box keeps one height while browsing.
-pub const REGION_ROWS: usize = 13;
+pub(crate) const REGION_ROWS: usize = 13;
 /// Where `og serve` and "Serve now" listen.
-pub const SERVE_ADDRESS: &str = "127.0.0.1:8080";
+pub(crate) const SERVE_ADDRESS: &str = "127.0.0.1:8080";
 
 /// One row of the region list.
-pub struct RegionRow {
+pub(crate) struct RegionRow {
     pub region: &'static Region,
     /// Matched character positions of the name, for highlighting.
     pub positions: Vec<usize>,
@@ -90,7 +90,7 @@ pub struct RegionRow {
 
 /// What the server says about the chosen region's extract right now.
 #[derive(Default)]
-pub struct Live {
+pub(crate) struct Live {
     pub remote: Option<net::Remote>,
     /// When the newest extract's data is from.
     pub data_at: Option<i64>,
@@ -99,13 +99,13 @@ pub struct Live {
 }
 
 /// The extract on disk for the chosen region, and when its data is from.
-pub struct OnDisk {
+pub(crate) struct OnDisk {
     pub path: PathBuf,
     pub bytes: u64,
     pub data_at: Option<i64>,
 }
 
-pub struct App {
+pub(crate) struct App {
     pub screen: Screen,
     pub quit: bool,
     /// Lines to print above the live area: they stay in terminal history.
@@ -203,7 +203,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(home: Home) -> Self {
+    pub(crate) fn new(home: Home) -> Self {
         let home = Arc::new(home);
         let packs = home.packs();
         let history = home.history();
@@ -296,22 +296,22 @@ impl App {
     }
 
     /// When newer data than a Pack's is published, the time it is from.
-    pub fn update_for(&self, pack: &PackInfo) -> Option<i64> {
+    pub(crate) fn update_for(&self, pack: &PackInfo) -> Option<i64> {
         let newest = *self.updates.lock().expect("updates lock").get(&pack.dir)?;
         (newest > pack.data_at?).then_some(newest)
     }
 
-    pub fn pack_dir(&self) -> PathBuf {
+    pub(crate) fn pack_dir(&self) -> PathBuf {
         self.home.pack_dir(self.region)
     }
 
     /// Whether the build downloads the extract first.
-    pub fn downloads(&self) -> bool {
+    pub(crate) fn downloads(&self) -> bool {
         self.force_download || self.on_disk.is_none()
     }
 
     /// Bytes to download: the live size when the server gave one.
-    pub fn download_bytes(&self) -> u64 {
+    pub(crate) fn download_bytes(&self) -> u64 {
         let live = self.live.lock().expect("live lock");
         live.remote
             .and_then(|remote| remote.bytes)
@@ -319,7 +319,7 @@ impl App {
     }
 
     /// The extract the build reads, in bytes.
-    pub fn input_bytes(&self) -> u64 {
+    pub(crate) fn input_bytes(&self) -> u64 {
         match (&self.on_disk, self.downloads()) {
             (Some(extract), false) => extract.bytes,
             _ => self.download_bytes(),
@@ -328,11 +328,11 @@ impl App {
 
     /// How long the build of this region takes, scaled from this machine's
     /// own builds.
-    pub fn estimate(&self) -> Option<Estimate> {
+    pub(crate) fn estimate(&self) -> Option<Estimate> {
         home::estimate(&self.history, self.input_bytes())
     }
 
-    pub fn estimate_for(&self, region: &Region) -> Option<Estimate> {
+    pub(crate) fn estimate_for(&self, region: &Region) -> Option<Estimate> {
         home::estimate(&self.history, region.osm.bytes)
     }
 
@@ -349,7 +349,7 @@ impl App {
 
     /// What the build lacks: the plan's shortfalls, and room for the
     /// download where the extract is kept.
-    pub fn shortfalls(&self) -> Vec<String> {
+    pub(crate) fn shortfalls(&self) -> Vec<String> {
         let Some(Ok(plan)) = &self.plan else {
             return Vec::new();
         };
@@ -379,12 +379,12 @@ impl App {
     }
 
     /// Whether the build can start: it was planned, and fits or is forced.
-    pub fn can_build(&self) -> bool {
+    pub(crate) fn can_build(&self) -> bool {
         matches!(self.plan, Some(Ok(_))) && (self.force || self.shortfalls().is_empty())
     }
 
     /// The equivalent non-interactive command for this build.
-    pub fn command(&self) -> String {
+    pub(crate) fn command(&self) -> String {
         let mut command = format!("og build --region {}", self.region.id);
         if self.force_download {
             command.push_str(" --download");
@@ -396,7 +396,7 @@ impl App {
     }
 
     /// The region whose children the list shows.
-    pub fn region_here(&self) -> &'static Region {
+    pub(crate) fn region_here(&self) -> &'static Region {
         let tree = regions::tree();
         self.region_path
             .last()
@@ -406,7 +406,7 @@ impl App {
     /// The rows of the region list. Browsing shows the region itself first,
     /// as the first row, then its children. A search shows every region whose
     /// name or alias matches, with the regions above it.
-    pub fn region_rows(&self) -> Vec<RegionRow> {
+    pub(crate) fn region_rows(&self) -> Vec<RegionRow> {
         let tree = regions::tree();
         if self.region_browsing() {
             let here = self.region_here();
@@ -449,13 +449,13 @@ impl App {
     }
 
     /// Whether the list shows the browsed region's own children.
-    pub fn region_browsing(&self) -> bool {
+    pub(crate) fn region_browsing(&self) -> bool {
         self.region_query.trim().is_empty()
     }
 
     /// Rows the list can show from the current scroll: browsing at the top
     /// spends one on the line under the region itself.
-    pub fn region_capacity(&self) -> usize {
+    pub(crate) fn region_capacity(&self) -> usize {
         if self.region_browsing() && self.region_scroll == 0 {
             REGION_ROWS - 1
         } else {
@@ -546,7 +546,7 @@ impl App {
         self.screen = Screen::Confirm;
     }
 
-    pub fn flash_text(&self) -> Option<&str> {
+    pub(crate) fn flash_text(&self) -> Option<&str> {
         self.flash
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(4))
@@ -572,7 +572,7 @@ impl App {
         }
     }
 
-    pub fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         if self.job.is_some() && self.sampled.elapsed() >= Duration::from_secs(1) {
             self.heap = alloc::live_bytes().map(|bytes| bytes as u64);
             self.free_disk = resources::free_disk(&self.pack_dir());
@@ -704,11 +704,11 @@ impl App {
     }
 
     /// Whether the open Pack is still answering the newest question.
-    pub fn asking(&self) -> bool {
+    pub(crate) fn asking(&self) -> bool {
         self.asker.as_ref().is_some_and(Asker::busy)
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) {
+    pub(crate) fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if let Some(job) = &self.job {
                 job.cancel();
@@ -1035,7 +1035,7 @@ impl App {
         }
     }
 
-    pub fn hits(&self) -> &[engine::Hit] {
+    pub(crate) fn hits(&self) -> &[engine::Hit] {
         self.answer
             .as_ref()
             .map_or(&[], |answer| answer.hits.as_slice())
@@ -1205,7 +1205,7 @@ impl App {
     }
 
     /// Text pasted into the terminal as one piece.
-    pub fn on_paste(&mut self, text: String) {
+    pub(crate) fn on_paste(&mut self, text: String) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match self.screen {
             Screen::Query if self.mode == Mode::Batch => {
@@ -1328,7 +1328,7 @@ impl App {
     }
 
     /// The JSON the GeoJSON screen shows.
-    pub fn json_text(&self) -> String {
+    pub(crate) fn json_text(&self) -> String {
         if self.mode == Mode::Batch {
             return self
                 .batch_rows

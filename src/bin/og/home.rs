@@ -18,19 +18,19 @@ use std::{
 use anyhow::{Context, Result};
 use open_geocode::{
     builder::BuilderReport,
-    pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackReader},
+    pack::{AUDIT_DIR, BUILD_REPORT_FILE, Reader},
     record::Layer,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::regions::{self, Region};
 
-pub struct Home {
+pub(crate) struct Home {
     pub root: PathBuf,
 }
 
 impl Home {
-    pub fn locate() -> Result<Self> {
+    pub(crate) fn locate() -> Result<Self> {
         let root = match std::env::var_os("OG_HOME") {
             Some(path) if !path.is_empty() => PathBuf::from(path),
             _ => dirs::data_local_dir()
@@ -40,16 +40,16 @@ impl Home {
         Ok(Self { root })
     }
 
-    pub fn packs_dir(&self) -> PathBuf {
+    pub(crate) fn packs_dir(&self) -> PathBuf {
         self.root.join("packs")
     }
 
-    pub fn pack_dir(&self, region: &Region) -> PathBuf {
+    pub(crate) fn pack_dir(&self, region: &Region) -> PathBuf {
         self.packs_dir().join(region.slug())
     }
 
     /// Where the region's extract is kept.
-    pub fn extract_path(&self, region: &Region) -> PathBuf {
+    pub(crate) fn extract_path(&self, region: &Region) -> PathBuf {
         let mut path = self.root.join("pbf");
         for part in region.id.split('/') {
             path.push(part);
@@ -59,7 +59,7 @@ impl Home {
     }
 
     /// The extract of a region when it is on disk.
-    pub fn extract(&self, region: &Region) -> Option<Extract> {
+    pub(crate) fn extract(&self, region: &Region) -> Option<Extract> {
         let path = self.extract_path(region);
         let bytes = fs::metadata(&path)
             .ok()
@@ -73,7 +73,7 @@ impl Home {
     }
 
     /// Every build finished on this machine, oldest first.
-    pub fn history(&self) -> Vec<BuildRecord> {
+    pub(crate) fn history(&self) -> Vec<BuildRecord> {
         let Ok(file) = fs::File::open(self.history_path()) else {
             return Vec::new();
         };
@@ -84,7 +84,7 @@ impl Home {
             .collect()
     }
 
-    pub fn record_build(&self, record: &BuildRecord) -> Result<()> {
+    pub(crate) fn record_build(&self, record: &BuildRecord) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("failed to create {}", self.root.display()))?;
         let path = self.history_path();
@@ -98,7 +98,7 @@ impl Home {
     }
 
     /// The Packs in the home, by name.
-    pub fn packs(&self) -> Vec<PackInfo> {
+    pub(crate) fn packs(&self) -> Vec<PackInfo> {
         let Ok(entries) = fs::read_dir(self.packs_dir()) else {
             return Vec::new();
         };
@@ -112,13 +112,13 @@ impl Home {
     }
 }
 
-pub struct Extract {
+pub(crate) struct Extract {
     pub path: PathBuf,
     pub bytes: u64,
 }
 
 /// A Pack on disk, as the home screen lists it.
-pub struct PackInfo {
+pub(crate) struct PackInfo {
     pub name: String,
     pub dir: PathBuf,
     /// The catalog region it was built from, when og built it.
@@ -137,8 +137,8 @@ pub struct PackInfo {
 }
 
 impl PackInfo {
-    pub fn read(dir: &Path) -> Option<Self> {
-        let reader = PackReader::open(dir).ok()?;
+    pub(crate) fn read(dir: &Path) -> Option<Self> {
+        let reader = Reader::open(dir).ok()?;
         let manifest = reader.manifest();
         let report = reader
             .path()
@@ -180,7 +180,7 @@ impl PackInfo {
     }
 
     /// Records in the layers `pick` takes.
-    pub fn records_in(&self, pick: impl Fn(Layer) -> bool) -> u64 {
+    pub(crate) fn records_in(&self, pick: impl Fn(Layer) -> bool) -> u64 {
         self.layers
             .iter()
             .filter(|(layer, _)| pick(*layer))
@@ -192,7 +192,7 @@ impl PackInfo {
 /// One finished build, as `builds.jsonl` keeps it: what a later build of
 /// another region is estimated from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildRecord {
+pub(crate) struct BuildRecord {
     pub region: String,
     pub input_bytes: u64,
     /// The build itself, without the download.
@@ -211,14 +211,14 @@ const ESTIMATE_RANGE: f64 = 4.0;
 /// How long a build of `input_bytes` is expected to take on this machine,
 /// scaled from the finished build closest in input size. What it needs of
 /// memory and disk is the build plan's to say.
-pub struct Estimate {
+pub(crate) struct Estimate {
     pub secs: f64,
     /// The build it is scaled from.
     pub from: BuildRecord,
 }
 
 /// None when no build on this machine is within [`ESTIMATE_RANGE`] of it.
-pub fn estimate(history: &[BuildRecord], input_bytes: u64) -> Option<Estimate> {
+pub(crate) fn estimate(history: &[BuildRecord], input_bytes: u64) -> Option<Estimate> {
     let distance =
         |record: &BuildRecord| (record.input_bytes as f64 / input_bytes as f64).ln().abs();
     let nearest = history

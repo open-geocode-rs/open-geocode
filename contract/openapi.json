@@ -95,7 +95,7 @@
             "description": "Row of the record in this Pack. Not stable across Pack builds."
           },
           "source": {
-            "$ref": "#/components/schemas/RecordSource"
+            "$ref": "#/components/schemas/Source"
           }
         },
         "required": [
@@ -399,33 +399,6 @@
         "title": "Problem",
         "type": "object"
       },
-      "RecordSource": {
-        "description": "Where a record comes from: an OSM object, or the address records a\nderived record (a postcode) was made from.",
-        "properties": {
-          "dataset": {
-            "type": "string"
-          },
-          "derived_from": {
-            "type": "string"
-          },
-          "object_id": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "object_type": {
-            "$ref": "#/components/schemas/OsmObjectType"
-          },
-          "record_count": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "dataset"
-        ],
-        "type": "object"
-      },
       "ReverseCollection": {
         "description": "A reverse answer: `/reverse`. See [`ForwardCollection`] for why the two\ndirections are written out rather than shared through a generic.",
         "properties": {
@@ -507,6 +480,33 @@
           }
         ],
         "description": "A reverse feature's properties: the common fields, and how far the feature\nlies from the point asked about."
+      },
+      "Source": {
+        "description": "Where a record comes from: an OSM object, or the address records a\nderived record (a postcode) was made from.",
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "derived_from": {
+            "type": "string"
+          },
+          "object_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "object_type": {
+            "$ref": "#/components/schemas/OsmObjectType"
+          },
+          "record_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset"
+        ],
+        "type": "object"
       },
       "Version": {
         "description": "The contract version. It changes only when a field changes meaning or\ngoes away; new optional fields keep it.",
@@ -663,7 +663,7 @@
     },
     "/geocode": {
       "get": {
-        "description": "For callers who hold a street address, a town and a postcode in separate\nfields and would otherwise have to paste them into one string and hope the\nparser pulls them apart again. The street address is searched on its own\nand hits are kept only where they fit the locality, region and postcode\ngiven, so a town in the address cannot outrank the street.\n\nThis is the lookup `batch-geocode` runs per row, over HTTP.\n\nThe answer is the same FeatureCollection every other route returns, with\nat most one feature: `features` holds the one match, or is empty when\nnothing fits. `geocoding.query` is the rewrite that matched, which is not\nalways the address as it was sent.",
+        "description": "For callers who hold a street address, a town and a postcode in separate\nfields and would otherwise have to paste them into one string and hope the\nparser pulls them apart again. The street address is searched on its own\nand hits are kept only where they fit the locality, region and postcode\ngiven, so a town in the address cannot outrank the street.\n\nThis is the lookup `geocode batch` runs per row, over HTTP.\n\nThe answer is the same FeatureCollection every other route returns, with\nat most one feature: `features` holds the one match, or is empty when\nnothing fits. `geocoding.query` is the rewrite that matched, which is not\nalways the address as it was sent.",
         "operationId": "geocode",
         "parameters": [
           {

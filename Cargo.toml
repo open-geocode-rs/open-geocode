@@ -9,9 +9,21 @@ repository = "https://github.com/open-geocode-rs/open-geocode"
 readme = "README.md"
 keywords = ["geocoding", "geocoder", "osm", "gis", "geospatial"]
 categories = ["science::geo", "command-line-utilities"]
-# Publish-time packaging (crates.io ~10 MB limit). Uncomment before `cargo
-# publish`; verify the demo still serves once data artifacts are excluded.
-# exclude = ["data/", "demo/vendor/", "docs/", "*.pmtiles"]
+exclude = ["data/", "demo/vendor/", "docs/", "*.pmtiles"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unreachable_pub = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "deny"
+
+[lints.clippy]
+todo = "deny"
+dbg_macro = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 anyhow = "1.0"

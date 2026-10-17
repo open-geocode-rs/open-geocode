@@ -47,8 +47,8 @@ use super::{
 };
 use crate::{
     extsort::{ExternalSorter, IndexedSpool, IndexedSpoolFile, Scratch, Spill, Spool, SpoolFile},
-    memory::{MemoryBudget, Reservation, Spillable},
-    pack::{PackReader, RecordId},
+    memory::{Budget, Reservation, Spillable},
+    pack::{Reader, RecordId},
     parse::types::Label,
     record::{AddressComponents, Layer, PlaceLayer, Record},
     resources::Resources,
@@ -115,7 +115,7 @@ fn quota(draw: Draw) -> Option<usize> {
 
 /// What a training run did and how well the weights label held-out rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct TrainReport {
+pub struct Report {
     pub rows_per_country: usize,
     /// Rendered rows by the `name` of the country record they lie in.
     pub rows_by_country: BTreeMap<String, usize>,
@@ -264,17 +264,17 @@ pub fn train(
     pack: &Path,
     sample: Sampler,
     scratch: &Arc<Scratch>,
-    memory: &Arc<MemoryBudget>,
+    memory: &Arc<Budget>,
     sort_budget_bytes: usize,
-) -> Result<(Option<Weights>, TrainReport)> {
+) -> Result<(Option<Weights>, Report)> {
     let started = Instant::now();
-    let mut report = TrainReport {
+    let mut report = Report {
         rows_per_country: ROWS_PER_COUNTRY,
         sample_bytes: sample.resident_bytes() as u64,
         epochs: EPOCHS,
-        ..TrainReport::default()
+        ..Report::default()
     };
-    let pack = PackReader::open(pack)?;
+    let pack = Reader::open(pack)?;
     // Every lattice looks names up all over the dictionaries.
     report.pack_prefaulted = pack
         .container()
@@ -543,7 +543,7 @@ enum Lattices {
 }
 
 impl LatticeCache {
-    fn new(scratch: &Arc<Scratch>, memory: &Arc<MemoryBudget>) -> Self {
+    fn new(scratch: &Arc<Scratch>, memory: &Arc<Budget>) -> Self {
         Self {
             scratch: Arc::clone(scratch),
             reservation: Spillable::new(memory),
@@ -1483,7 +1483,7 @@ const REGION_AND_GROUP_SHARE: f64 = 0.2;
 
 /// Renders training rows from the Pack's records.
 struct Renderer<'a> {
-    pack: &'a PackReader,
+    pack: &'a Reader,
     tagger: &'a LatticeTagger,
     /// Every name of each area record, its `name` first.
     names: HashMap<RecordId, Vec<String>>,
@@ -1498,7 +1498,7 @@ struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(pack: &'a PackReader, tagger: &'a LatticeTagger) -> Self {
+    fn new(pack: &'a Reader, tagger: &'a LatticeTagger) -> Self {
         Self {
             pack,
             tagger,
@@ -2755,10 +2755,7 @@ mod tests {
             std::env::temp_dir().join(format!("open-geocode-lattices-{}", uuid::Uuid::new_v4())),
         )
         .expect("scratch");
-        for (budget, in_memory) in [
-            (MemoryBudget::unlimited(), true),
-            (MemoryBudget::new(1), false),
-        ] {
+        for (budget, in_memory) in [(Budget::unlimited(), true), (Budget::new(1), false)] {
             let mut cache = LatticeCache::new(&scratch, &budget);
             for row in &rows {
                 cache.push(row.clone()).expect("push");

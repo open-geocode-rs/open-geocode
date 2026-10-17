@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::search::{PackTextSearcher, TextSearchOptions};
+use crate::search::{TextSearchOptions, TextSearcher};
 
 /// Metres per degree of latitude, good enough for the sub-kilometre
 /// comparisons these buckets make.
@@ -145,7 +145,7 @@ pub fn benchmark_geocode(options: GeocodeBenchmarkOptions) -> Result<GeocodeBenc
             .with_context(|| format!("failed to parse fixture {}", options.fixture.display()))?
     };
 
-    let searcher = PackTextSearcher::open(&options.pack)?;
+    let searcher = TextSearcher::open(&options.pack)?;
     let limit = options.limit.max(5);
 
     let mut groups: BTreeMap<String, GroupAccumulator> = BTreeMap::new();

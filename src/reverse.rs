@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::{
     labels,
-    pack::{ContextRecord, PackReader, RecordId},
+    pack::{self, ContextRecord, RecordId},
     record::{AddressComponents, InterpolationAddressComponents, Layer, PoiRecord, Record},
-    spatial_index::SpatialIndexReader,
+    spatial_index,
 };
 
 const ADDRESS_RADIUS_M: f64 = 30.0;
@@ -18,27 +18,27 @@ const CANDIDATE_LIMIT: usize = 16;
 
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
-    pack: Arc<PackReader>,
-    spatial: SpatialIndexReader,
+    pack: Arc<pack::Reader>,
+    spatial: spatial_index::Reader,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ReverseGeocodeOptions {
+pub struct GeocodeOptions {
     pub lon: f64,
     pub lat: f64,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
-pub struct ReverseGeocodeResponse {
+pub struct GeocodeResponse {
     pub lon: f64,
     pub lat: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<ReverseGeocodeResult>,
+    pub result: Option<GeocodeResult>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
-pub struct ReverseGeocodeResult {
-    pub match_kind: ReverseMatchKind,
+pub struct GeocodeResult {
+    pub match_kind: MatchKind,
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_record_id: Option<RecordId>,
@@ -49,14 +49,14 @@ pub struct ReverseGeocodeResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_m: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub point: Option<ReversePoint>,
-    pub context: ReverseContext,
-    pub evidence: ReverseEvidence,
+    pub point: Option<Point>,
+    pub context: Context,
+    pub evidence: Evidence,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ReverseMatchKind {
+pub enum MatchKind {
     ExplicitAddress,
     EstimatedAddress,
     NearestStreet,
@@ -64,15 +64,15 @@ pub enum ReverseMatchKind {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct ReversePoint {
+pub struct Point {
     pub lon: f64,
     pub lat: f64,
-    pub precision: ReversePointPrecision,
+    pub precision: PointPrecision,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ReversePointPrecision {
+pub enum PointPrecision {
     Point,
     Estimated,
     Street,
@@ -80,7 +80,7 @@ pub enum ReversePointPrecision {
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct ReverseContext {
+pub struct Context {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub street: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,7 +100,7 @@ pub struct ReverseContext {
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct ReverseEvidence {
+pub struct Evidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explicit_address_record_id: Option<RecordId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,17 +113,17 @@ pub struct ReverseEvidence {
 
 impl PackReverseGeocoder {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_pack(Arc::new(PackReader::open(pack_path)?))
+        Self::from_pack(Arc::new(pack::Reader::open(pack_path)?))
     }
 
     /// Open the spatial index using an existing shared pack reader.
-    pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
-        let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
+    pub fn from_pack(pack: Arc<pack::Reader>) -> Result<Self> {
+        let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         Ok(Self { pack, spatial })
     }
 
-    pub fn reverse(&self, options: ReverseGeocodeOptions) -> Result<ReverseGeocodeResponse> {
-        let mut context = ReverseContext::default();
+    pub fn reverse(&self, options: GeocodeOptions) -> Result<GeocodeResponse> {
+        let mut context = Context::default();
         let mut context_record_ids = Vec::new();
 
         let mut result = self.explicit_address(options, &mut context, &mut context_record_ids)?;
@@ -137,7 +137,7 @@ impl PackReverseGeocoder {
             result = self.context_only(options, &mut context, &mut context_record_ids)?;
         }
 
-        Ok(ReverseGeocodeResponse {
+        Ok(GeocodeResponse {
             lon: options.lon,
             lat: options.lat,
             result,
@@ -146,10 +146,10 @@ impl PackReverseGeocoder {
 
     fn explicit_address(
         &self,
-        options: ReverseGeocodeOptions,
-        context: &mut ReverseContext,
+        options: GeocodeOptions,
+        context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
-    ) -> Result<Option<ReverseGeocodeResult>> {
+    ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
             .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
@@ -173,33 +173,33 @@ impl PackReverseGeocoder {
         apply_address_context(context, address);
         self.enrich_context(options, context, context_record_ids)?;
 
-        Ok(Some(ReverseGeocodeResult {
-            match_kind: ReverseMatchKind::ExplicitAddress,
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::ExplicitAddress,
             label: labels::address_label(address),
             primary_record_id: Some(candidate.record_id),
             id: Some(record.id()),
             layer: Some(record.layer().as_str().to_string()),
             distance_m: Some(candidate.distance_m),
-            point: Some(ReversePoint {
+            point: Some(Point {
                 lon: candidate.lon,
                 lat: candidate.lat,
-                precision: ReversePointPrecision::Point,
+                precision: PointPrecision::Point,
             }),
             context: context.clone(),
-            evidence: ReverseEvidence {
+            evidence: Evidence {
                 explicit_address_record_id: Some(candidate.record_id),
                 context_record_ids: context_record_ids.clone(),
-                ..ReverseEvidence::default()
+                ..Evidence::default()
             },
         }))
     }
 
     fn estimated_address(
         &self,
-        options: ReverseGeocodeOptions,
-        context: &mut ReverseContext,
+        options: GeocodeOptions,
+        context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
-    ) -> Result<Option<ReverseGeocodeResult>> {
+    ) -> Result<Option<GeocodeResult>> {
         for candidate in self.spatial.segment_candidates(
             options.lon,
             options.lat,
@@ -217,23 +217,23 @@ impl PackReverseGeocoder {
             let primary = labels::estimated_address_name(number, &interpolation.address)
                 .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
 
-            return Ok(Some(ReverseGeocodeResult {
-                match_kind: ReverseMatchKind::EstimatedAddress,
+            return Ok(Some(GeocodeResult {
+                match_kind: MatchKind::EstimatedAddress,
                 label: compose_label(&primary, context),
                 primary_record_id: Some(candidate.record_id),
                 id: Some(interpolation.id()),
                 layer: Some("interpolation".to_string()),
                 distance_m: Some(candidate.distance_m),
-                point: Some(ReversePoint {
+                point: Some(Point {
                     lon: candidate.closest_lon,
                     lat: candidate.closest_lat,
-                    precision: ReversePointPrecision::Estimated,
+                    precision: PointPrecision::Estimated,
                 }),
                 context: context.clone(),
-                evidence: ReverseEvidence {
+                evidence: Evidence {
                     interpolation_record_id: Some(candidate.record_id),
                     context_record_ids: context_record_ids.clone(),
-                    ..ReverseEvidence::default()
+                    ..Evidence::default()
                 },
             }));
         }
@@ -243,10 +243,10 @@ impl PackReverseGeocoder {
 
     fn nearest_street(
         &self,
-        options: ReverseGeocodeOptions,
-        context: &mut ReverseContext,
+        options: GeocodeOptions,
+        context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
-    ) -> Result<Option<ReverseGeocodeResult>> {
+    ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
             .segment_candidates(options.lon, options.lat, Layer::Street, STREET_RADIUS_M, 1)?
@@ -263,33 +263,33 @@ impl PackReverseGeocoder {
         self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
         self.enrich_context(options, context, context_record_ids)?;
 
-        Ok(Some(ReverseGeocodeResult {
-            match_kind: ReverseMatchKind::NearestStreet,
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::NearestStreet,
             label: compose_label(&street.label(), context),
             primary_record_id: Some(candidate.record_id),
             id: Some(street.id()),
             layer: Some("street".to_string()),
             distance_m: Some(candidate.distance_m),
-            point: Some(ReversePoint {
+            point: Some(Point {
                 lon: candidate.closest_lon,
                 lat: candidate.closest_lat,
-                precision: ReversePointPrecision::Street,
+                precision: PointPrecision::Street,
             }),
             context: context.clone(),
-            evidence: ReverseEvidence {
+            evidence: Evidence {
                 street_record_id: Some(candidate.record_id),
                 context_record_ids: context_record_ids.clone(),
-                ..ReverseEvidence::default()
+                ..Evidence::default()
             },
         }))
     }
 
     fn context_only(
         &self,
-        options: ReverseGeocodeOptions,
-        context: &mut ReverseContext,
+        options: GeocodeOptions,
+        context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
-    ) -> Result<Option<ReverseGeocodeResult>> {
+    ) -> Result<Option<GeocodeResult>> {
         self.enrich_context(options, context, context_record_ids)?;
         let Some(primary_record_id) = context_record_ids.first().copied() else {
             return Ok(None);
@@ -301,8 +301,8 @@ impl PackReverseGeocoder {
             return Ok(None);
         };
 
-        Ok(Some(ReverseGeocodeResult {
-            match_kind: ReverseMatchKind::ContextOnly,
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::ContextOnly,
             label,
             primary_record_id: Some(primary_record_id),
             id: Some(record.id),
@@ -310,17 +310,17 @@ impl PackReverseGeocoder {
             distance_m: None,
             point: record.point.map(context_point),
             context: context.clone(),
-            evidence: ReverseEvidence {
+            evidence: Evidence {
                 context_record_ids: context_record_ids.clone(),
-                ..ReverseEvidence::default()
+                ..Evidence::default()
             },
         }))
     }
 
     fn enrich_context(
         &self,
-        options: ReverseGeocodeOptions,
-        context: &mut ReverseContext,
+        options: GeocodeOptions,
+        context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<()> {
         let mut seen = context_record_ids.iter().copied().collect::<BTreeSet<_>>();
@@ -345,7 +345,7 @@ impl PackReverseGeocoder {
     fn enrich_record_context(
         &self,
         record_id: RecordId,
-        context: &mut ReverseContext,
+        context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<()> {
         let Some(boundary_context) = self.pack.boundary_context(record_id)? else {
@@ -366,7 +366,7 @@ impl PackReverseGeocoder {
     }
 }
 
-fn apply_address_context(context: &mut ReverseContext, address: &AddressComponents) {
+fn apply_address_context(context: &mut Context, address: &AddressComponents) {
     set_option_if_missing(&mut context.street, address.street.clone());
     set_option_if_missing(&mut context.place, address.place.clone());
     set_option_if_missing(&mut context.postcode, address.postcode.clone());
@@ -375,10 +375,7 @@ fn apply_address_context(context: &mut ReverseContext, address: &AddressComponen
     set_option_if_missing(&mut context.country, address.country.clone());
 }
 
-fn apply_interpolation_context(
-    context: &mut ReverseContext,
-    address: &InterpolationAddressComponents,
-) {
+fn apply_interpolation_context(context: &mut Context, address: &InterpolationAddressComponents) {
     set_option_if_missing(&mut context.street, address.street.clone());
     set_option_if_missing(&mut context.place, address.place.clone());
     set_option_if_missing(&mut context.postcode, address.postcode.clone());
@@ -387,7 +384,7 @@ fn apply_interpolation_context(
     set_option_if_missing(&mut context.country, address.country.clone());
 }
 
-fn apply_context_record(context: &mut ReverseContext, record: &ContextRecord) -> bool {
+fn apply_context_record(context: &mut Context, record: &ContextRecord) -> bool {
     match record.layer.as_str() {
         "postcode" => set_option_if_missing(&mut context.postcode, record.postcode.clone()),
         "neighbourhood" => set_if_missing(&mut context.neighbourhood, record.name.clone()),
@@ -400,7 +397,7 @@ fn apply_context_record(context: &mut ReverseContext, record: &ContextRecord) ->
     }
 }
 
-fn compose_label(primary: &str, context: &ReverseContext) -> String {
+fn compose_label(primary: &str, context: &Context) -> String {
     let mut parts = vec![primary.to_string()];
     for part in [
         context.place.as_deref(),
@@ -421,7 +418,7 @@ fn compose_label(primary: &str, context: &ReverseContext) -> String {
     parts.join(", ")
 }
 
-fn context_only_label(context: &ReverseContext) -> Option<String> {
+fn context_only_label(context: &Context) -> Option<String> {
     [
         context.place.as_deref(),
         context.neighbourhood.as_deref(),
@@ -437,11 +434,11 @@ fn context_only_label(context: &ReverseContext) -> Option<String> {
     .map(|primary| compose_label(primary, context))
 }
 
-fn context_point(point: crate::pack::RecordPoint) -> ReversePoint {
-    ReversePoint {
+fn context_point(point: crate::pack::Point) -> Point {
+    Point {
         lon: point.lon,
         lat: point.lat,
-        precision: ReversePointPrecision::Context,
+        precision: PointPrecision::Context,
     }
 }
 
@@ -477,7 +474,7 @@ mod tests {
 
     use crate::{
         context::AdminContextTuple,
-        pack::{PackWriter, RecordContext},
+        pack::{RecordContext, Writer},
         record::{
             AddressRecord, InterpolationRange, LocationPrecision, OsmObjectType, PlaceLayer,
             PlaceRecord, Record, SourceProvenance, StreetRecord, point_geometry,
@@ -489,7 +486,7 @@ mod tests {
     #[test]
     fn reverse_prefers_explicit_address() {
         let temp_dir = temp_pack_dir("explicit");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         writer
             .write(&address_record().into(), None)
@@ -498,14 +495,14 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.0,
                 lat: 43.0,
             })
             .expect("reverse");
         let result = response.result.expect("result");
 
-        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(result.primary_record_id, Some(1));
         assert_eq!(result.evidence.explicit_address_record_id, Some(1));
 
@@ -515,7 +512,7 @@ mod tests {
     #[test]
     fn reverse_estimates_address_from_interpolation() {
         let temp_dir = temp_pack_dir("interpolation");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(&interpolation_record().into(), None)
             .expect("interpolation");
@@ -523,14 +520,14 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.00001,
                 lat: 43.0005,
             })
             .expect("reverse");
         let result = response.result.expect("result");
 
-        assert_eq!(result.match_kind, ReverseMatchKind::EstimatedAddress);
+        assert_eq!(result.match_kind, MatchKind::EstimatedAddress);
         assert!(result.label.starts_with("50 Queen Street"));
         assert_eq!(result.evidence.interpolation_record_id, Some(0));
 
@@ -540,20 +537,20 @@ mod tests {
     #[test]
     fn reverse_falls_back_to_street() {
         let temp_dir = temp_pack_dir("street");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         writer.finish().expect("finish");
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.00001,
                 lat: 43.0005,
             })
             .expect("reverse");
         let result = response.result.expect("result");
 
-        assert_eq!(result.match_kind, ReverseMatchKind::NearestStreet);
+        assert_eq!(result.match_kind, MatchKind::NearestStreet);
         assert!(result.label.starts_with("Queen Street"));
         assert_eq!(result.evidence.street_record_id, Some(0));
 
@@ -563,7 +560,7 @@ mod tests {
     #[test]
     fn reverse_prefers_materialized_boundary_context_over_source_locality() {
         let temp_dir = temp_pack_dir("boundary-context");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         let locality_id = writer
             .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
             .expect("place");
@@ -585,7 +582,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.0,
                 lat: 43.0,
             })
@@ -612,7 +609,7 @@ mod tests {
     #[test]
     fn reverse_answers_with_the_address_of_a_poi_but_not_its_name() {
         let temp_dir = temp_pack_dir("poi");
-        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         // An unaddressed POI on top of the query point is not an address.
         writer
@@ -649,7 +646,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let result = geocoder
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.0,
                 lat: 43.0,
             })
@@ -657,7 +654,7 @@ mod tests {
             .result
             .expect("result");
 
-        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(result.id.as_deref(), Some("osm:way:41"));
         assert_eq!(result.layer.as_deref(), Some("poi"));
         assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");

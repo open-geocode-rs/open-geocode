@@ -168,6 +168,7 @@ impl Progress {
 /// Draws one bar per stage on stderr when it is a terminal, and writes a
 /// line per stage with the time since the build began when it is not, so a
 /// build run from a script or a service logs where its time goes.
+#[derive(Debug)]
 pub struct TerminalObserver {
     started: Instant,
     bar: Mutex<Option<ProgressBar>>,

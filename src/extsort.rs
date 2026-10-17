@@ -1,7 +1,7 @@
 //! Disk-backed sorting and spooling for builds larger than memory.
 //!
 //! [`ExternalSorter`] buffers items until its fair share of the build
-//! [`MemoryBudget`] is used (or the shared pool runs out), sorts the buffer,
+//! [`Budget`] is used (or the shared pool runs out), sorts the buffer,
 //! and writes it to a run file in the build scratch directory. Reading merges
 //! every run with a k-way heap. When everything fits no run is written and the
 //! sort is an ordinary in-memory sort, so a city extract and a planet build
@@ -29,7 +29,7 @@ use rayon::prelude::*;
 
 use crate::{
     builder::BuildCancelled,
-    memory::{MemoryBudget, Reservation, Spillable},
+    memory::{Budget, Reservation, Spillable},
     resources,
     util::codec::{get_u64, put_u64},
 };
@@ -175,9 +175,10 @@ pub struct SortStats {
     pub runs: u64,
 }
 
+#[derive(Debug)]
 pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
-    budget: Arc<MemoryBudget>,
+    budget: Arc<Budget>,
     label: &'static str,
     /// The most bytes this sorter may buffer before it spills, whatever its
     /// fair share of the pool.
@@ -193,7 +194,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
     pub fn new(
         scratch: &Arc<Scratch>,
         label: &'static str,
-        budget: &Arc<MemoryBudget>,
+        budget: &Arc<Budget>,
         share_bytes: usize,
     ) -> Self {
         Self {
@@ -320,6 +321,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
 }
 
 /// Sorted output. The in-memory form keeps its memory reserved until dropped.
+#[derive(Debug)]
 pub enum Sorted<T> {
     Memory(std::vec::IntoIter<T>, Reservation),
     Merge(Merge<T>),
@@ -337,6 +339,7 @@ impl<T: Spill + Ord> Iterator for Sorted<T> {
 }
 
 /// K-way merge over sorted run files.
+#[derive(Debug)]
 pub struct Merge<T> {
     sources: Vec<SpoolReader<T>>,
     heap: BinaryHeap<Reverse<HeapEntry<T>>>,
@@ -345,6 +348,7 @@ pub struct Merge<T> {
     _buffers: Reservation,
 }
 
+#[derive(Debug)]
 struct HeapEntry<T> {
     item: T,
     source: usize,
@@ -378,7 +382,7 @@ impl<T: Spill + Ord> Merge<T> {
     /// Read buffers are sized so all of them fit the sorter's share, between
     /// [`MIN_MERGE_BUFFER_BYTES`] and [`IO_BUFFER_BYTES`] each. They are needed
     /// to make progress, so they are reserved even when the pool is full.
-    fn open(runs: &[PathBuf], budget: &Arc<MemoryBudget>, share_bytes: usize) -> Result<Self> {
+    fn open(runs: &[PathBuf], budget: &Arc<Budget>, share_bytes: usize) -> Result<Self> {
         let buffer_bytes =
             (share_bytes / runs.len().max(1)).clamp(MIN_MERGE_BUFFER_BYTES, IO_BUFFER_BYTES);
         let mut buffers = Reservation::empty(budget);
@@ -435,6 +439,7 @@ impl<T: Spill + Ord> Iterator for Merge<T> {
 }
 
 /// Append-only scratch file replayed in write order.
+#[derive(Debug)]
 pub struct Spool<T> {
     writer: SpoolWriter<T>,
     path: PathBuf,
@@ -481,6 +486,7 @@ impl<T: Spill> Spool<T> {
 }
 
 /// A closed spool, read from the start by each [`SpoolFile::reader`].
+#[derive(Debug)]
 pub struct SpoolFile<T> {
     path: PathBuf,
     items: u64,
@@ -508,6 +514,7 @@ impl<T> Drop for SpoolFile<T> {
     }
 }
 
+#[derive(Debug)]
 struct SpoolWriter<T> {
     file: BufWriter<File>,
     scratch: Arc<Scratch>,
@@ -556,6 +563,7 @@ impl<T: Spill> SpoolWriter<T> {
 
 /// A scratch file of items read back by their index, in any order and as
 /// often as needed.
+#[derive(Debug)]
 pub struct IndexedSpool<T> {
     writer: SpoolWriter<T>,
     path: PathBuf,
@@ -602,6 +610,7 @@ impl<T: Spill> IndexedSpool<T> {
 }
 
 /// A closed [`IndexedSpool`].
+#[derive(Debug)]
 pub struct IndexedSpoolFile<T> {
     /// Taken before the file is removed: Windows cannot remove a mapped file.
     map: Option<memmap2::Mmap>,
@@ -650,6 +659,7 @@ impl<T> Drop for IndexedSpoolFile<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct SpoolReader<T> {
     file: BufReader<File>,
     path: PathBuf,
@@ -783,8 +793,7 @@ mod tests {
     #[test]
     fn in_memory_sort_writes_no_runs() {
         let scratch = scratch("memory");
-        let mut sorter =
-            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), usize::MAX);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), usize::MAX);
         let input = pseudo_random(10_000);
         for item in &input {
             sorter.push(*item).expect("push");
@@ -806,8 +815,7 @@ mod tests {
         let scratch = scratch("spill");
         // Each item counts 16 bytes, so this spills every 50 items: 400 runs,
         // more than one merge round.
-        let mut sorter =
-            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), 50 * 16);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 50 * 16);
         let input = pseudo_random(20_000);
         for item in &input {
             sorter.push(*item).expect("push");
@@ -829,7 +837,7 @@ mod tests {
         let scratch = scratch("shared");
         let item = std::mem::size_of::<(u64, u64)>();
         // Each sorter's share alone would fit; together they do not.
-        let budget = MemoryBudget::new(64 * 1024 * item);
+        let budget = Budget::new(64 * 1024 * item);
         let mut first = ExternalSorter::new(&scratch, "first", &budget, 48 * 1024 * item);
         let mut second = ExternalSorter::new(&scratch, "second", &budget, 48 * 1024 * item);
         let input = pseudo_random(400_000);
@@ -875,8 +883,7 @@ mod tests {
     #[test]
     fn run_files_are_removed_once_merged() {
         let scratch = scratch("cleanup");
-        let mut sorter =
-            ExternalSorter::new(&scratch, "pairs", &MemoryBudget::unlimited(), 10 * 16);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 10 * 16);
         for item in pseudo_random(1_000) {
             sorter.push(item).expect("push");
         }
@@ -921,7 +928,7 @@ mod tests {
         let mut sorter = ExternalSorter::new(
             &scratch,
             "keyed",
-            &MemoryBudget::unlimited(),
+            &Budget::unlimited(),
             7 * std::mem::size_of::<Keyed>(),
         );
         for payload in 0..1_000 {

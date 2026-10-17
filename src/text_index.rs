@@ -25,9 +25,9 @@ use tantivy::{
 };
 
 use crate::{
-    container::{Bytes, Container, ContainerWriter},
+    container::{self, Bytes, Container},
     extsort::Scratch,
-    memory::{MemoryBudget, Reservation},
+    memory::{Budget, Reservation},
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
@@ -63,20 +63,20 @@ const INTERPOLATION_END_FIELD: &str = "interpolation_end";
 pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
 pub(crate) const RANK_POSTCODE_FIELD: &str = "rank_postcode";
 
-pub struct TextIndexWriter {
+pub struct Writer {
     /// Created with the first document, so its buffers are reserved only for
     /// the phase that writes records.
     writer: Option<(IndexWriter, Reservation)>,
-    budget: Arc<MemoryBudget>,
+    budget: Arc<Budget>,
     memory_bytes: usize,
     index: Index,
     path: PathBuf,
-    fields: TextIndexFields,
+    fields: Fields,
     document_count: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct TextIndexFields {
+pub struct Fields {
     pub record_id: Field,
     pub layer: Field,
     /// What a record is: its name, street or place, house number, unit and
@@ -106,13 +106,13 @@ pub struct TextIndexFields {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextIndexCommit {
+pub struct Commit {
     pub document_count: u64,
     pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TextIndexDocument {
+pub struct Document {
     pub record_id: RecordId,
     /// Layers a `layer` filter finds the record under: its own, and `address`
     /// for a POI that carries one.
@@ -120,7 +120,7 @@ pub struct TextIndexDocument {
     pub content_text: String,
     pub context_text: String,
     pub name: Option<String>,
-    /// The names of the street (see [`TextIndexFields::street_text`]): a
+    /// The names of the street (see [`Fields::street_text`]): a
     /// street's every name, an address's one.
     pub streets: Vec<String>,
     pub address_number: Option<String>,
@@ -132,20 +132,20 @@ pub struct TextIndexDocument {
     pub rank_postcode: Option<String>,
 }
 
-impl fmt::Debug for TextIndexWriter {
+impl fmt::Debug for Writer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TextIndexWriter")
+            .debug_struct("Writer")
             .field("fields", &self.fields)
             .field("document_count", &self.document_count)
             .finish_non_exhaustive()
     }
 }
 
-impl TextIndexWriter {
+impl Writer {
     pub fn create(
         scratch: &Arc<Scratch>,
-        budget: &Arc<MemoryBudget>,
+        budget: &Arc<Budget>,
         memory_bytes: usize,
     ) -> Result<Self> {
         let (schema, fields) = build_schema();
@@ -165,7 +165,7 @@ impl TextIndexWriter {
         })
     }
 
-    pub fn fields(&self) -> TextIndexFields {
+    pub fn fields(&self) -> Fields {
         self.fields
     }
 
@@ -209,7 +209,7 @@ impl TextIndexWriter {
     }
 
     /// Commit, merge to a single segment and copy the index into the Pack.
-    pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<TextIndexCommit> {
+    pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
         self.writer()?;
         let (mut writer, memory) = self.writer.take().expect("writer created");
         writer
@@ -271,14 +271,14 @@ impl TextIndexWriter {
                 &file,
             )?;
         }
-        Ok(TextIndexCommit {
+        Ok(Commit {
             document_count: self.document_count,
             bytes,
         })
     }
 }
 
-impl TextIndexFields {
+impl Fields {
     pub fn from_schema(schema: &Schema) -> Result<Self> {
         Ok(Self {
             record_id: schema.get_field("record_id")?,
@@ -307,7 +307,7 @@ impl TextIndexFields {
         context_names: &[&str],
         postcode_areas: &PostcodeAreas,
     ) -> TantivyDocument {
-        self.to_tantivy_document(&TextIndexDocument::from_record(
+        self.to_tantivy_document(&Document::from_record(
             record_id,
             record,
             context_names,
@@ -315,7 +315,7 @@ impl TextIndexFields {
         ))
     }
 
-    fn to_tantivy_document(self, projected: &TextIndexDocument) -> TantivyDocument {
+    fn to_tantivy_document(self, projected: &Document) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
         for layer in &projected.layers {
@@ -368,7 +368,7 @@ impl TextIndexFields {
     }
 }
 
-impl TextIndexDocument {
+impl Document {
     /// What a record is and where it is go to separate fields, so a word that
     /// names what is sought is not matched by an area's name ("Kingston Road"
     /// by an address in Kingston, "Danforth Avenue" by one in the Danforth
@@ -562,7 +562,7 @@ impl Directory for PackDirectory {
     }
 }
 
-fn build_schema() -> (Schema, TextIndexFields) {
+fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let record_id = builder.add_u64_field("record_id", FAST);
     let exact_unstored = exact_string_options();
@@ -585,7 +585,7 @@ fn build_schema() -> (Schema, TextIndexFields) {
         TextOptions::default().set_fast(Some("raw")),
     );
     let schema = builder.build();
-    let fields = TextIndexFields {
+    let fields = Fields {
         record_id,
         layer,
         content_text,
@@ -632,7 +632,7 @@ fn exact_string_options() -> TextOptions {
 
 #[derive(Debug)]
 struct ProjectionBuilder {
-    projected: TextIndexDocument,
+    projected: Document,
     name_parts: Vec<String>,
     content_parts: Vec<String>,
     /// Where the record says it is, one part per stated value.
@@ -643,7 +643,7 @@ struct ProjectionBuilder {
 impl ProjectionBuilder {
     fn new(record_id: RecordId, layer: &str) -> Self {
         Self {
-            projected: TextIndexDocument {
+            projected: Document {
                 record_id,
                 layers: vec![layer.to_string()],
                 content_text: String::new(),
@@ -780,7 +780,7 @@ impl ProjectionBuilder {
     /// The document, placed in the stated areas and in `context_names`. Each
     /// area word is indexed once, and each name is expanded on its own, as a
     /// query's comma-separated parts are ("St Catharines" keeps its "st").
-    fn build(mut self, context_names: &[&str]) -> TextIndexDocument {
+    fn build(mut self, context_names: &[&str]) -> Document {
         let name_parts = unique_parts(self.name_parts);
         self.projected.name = (!name_parts.is_empty()).then(|| name_parts.join(" "));
         let content_parts = unique_parts(self.content_parts);
@@ -1111,7 +1111,7 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Node, 123),
         };
 
-        let projected = TextIndexDocument::from_record(
+        let projected = Document::from_record(
             42,
             &record.into(),
             &["Westminster"],
@@ -1158,8 +1158,7 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Way, 9),
         };
 
-        let projected =
-            TextIndexDocument::from_record(7, &record.into(), &[], &PostcodeAreas::default());
+        let projected = Document::from_record(7, &record.into(), &[], &PostcodeAreas::default());
 
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
@@ -1188,9 +1187,8 @@ mod tests {
             },
         };
 
-        let postcode =
-            TextIndexDocument::from_record(1, &postcode.into(), &[], &PostcodeAreas::default());
-        let place = TextIndexDocument::from_record(
+        let postcode = Document::from_record(1, &postcode.into(), &[], &PostcodeAreas::default());
+        let place = Document::from_record(
             2,
             &Record::Place(PlaceLayer::Locality, place),
             &[],
@@ -1226,7 +1224,7 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Node, 5),
         };
 
-        let projected = TextIndexDocument::from_record(
+        let projected = Document::from_record(
             3,
             &poi.clone().into(),
             &["Toronto", "Ontario"],
@@ -1273,8 +1271,7 @@ mod tests {
             ("M5R 2Z3".to_string(), [-79.38, 43.659]),
             ("K0J 1K0".to_string(), [-79.38, 43.8]),
         ]);
-        let projected =
-            TextIndexDocument::from_record(4, &plain.clone().into(), &["Toronto"], &areas);
+        let projected = Document::from_record(4, &plain.clone().into(), &["Toronto"], &areas);
         assert_eq!(projected.name.as_deref(), Some("walmer road parkette"));
         assert_eq!(projected.streets, vec!["walmer road"]);
         assert_eq!(
@@ -1296,7 +1293,7 @@ mod tests {
             ..plain
         };
         let projected =
-            TextIndexDocument::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default());
+            Document::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default());
         assert_eq!(projected.layers, vec!["poi"]);
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.rank_postcode, None, "no postcode data nearby");
