@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use memmap2::{Mmap, MmapOptions};
 pub use tantivy::directory::OwnedBytes as Bytes;
 
@@ -79,8 +79,11 @@ impl fmt::Debug for OpenSection {
 impl Writer {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file =
-            File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+        let file = File::create(&path).map_err(|source| Error::IoPath {
+            action: "failed to create",
+            path: path.clone(),
+            source,
+        })?;
         let mut file = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
         file.write_all(MAGIC)?;
         file.write_all(&CONTAINER_VERSION.to_le_bytes())?;
@@ -110,9 +113,15 @@ impl Writer {
         let mut file = OpenOptions::new()
             .write(true)
             .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        file.set_len(end).with_context(|| {
-            format!("failed to cut the table of contents of {}", path.display())
+            .map_err(|source| Error::IoPath {
+                action: "failed to open",
+                path: path.clone(),
+                source,
+            })?;
+        file.set_len(end).map_err(|source| Error::IoPath {
+            action: "failed to cut the table of contents of",
+            path: path.clone(),
+            source,
         })?;
         file.seek(SeekFrom::Start(end))?;
         Ok(Self {
@@ -127,10 +136,14 @@ impl Writer {
     /// Start a section. Bytes written until [`Self::end`] belong to it.
     pub fn begin(&mut self, name: &str, version: u32) -> Result<()> {
         if self.open.is_some() {
-            bail!("section {name} started while another section is open");
+            return Err(Error::Inconsistent(format!(
+                "section {name} started while another section is open"
+            )));
         }
         if self.sections.contains_key(name) {
-            bail!("duplicate Pack section {name}");
+            return Err(Error::DuplicateSection {
+                section: name.into(),
+            });
         }
         let padding = (SECTION_ALIGN - self.offset % SECTION_ALIGN) % SECTION_ALIGN;
         self.file.write_all(&vec![0u8; padding as usize])?;
@@ -145,7 +158,10 @@ impl Writer {
     }
 
     pub fn end(&mut self) -> Result<()> {
-        let section = self.open.take().context("no open Pack section")?;
+        let section = self
+            .open
+            .take()
+            .ok_or(Error::Inconsistent("no open Pack section".into()))?;
         self.sections.insert(
             section.name,
             SectionInfo {
@@ -166,17 +182,25 @@ impl Writer {
 
     pub fn add_file(&mut self, name: &str, version: u32, path: &Path) -> Result<()> {
         self.begin(name, version)?;
-        let mut source =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        io::copy(&mut source, self)
-            .with_context(|| format!("failed to copy {} into the Pack", path.display()))?;
+        let mut source = File::open(path).map_err(|source| Error::IoPath {
+            action: "failed to open",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        io::copy(&mut source, self).map_err(|source| Error::IoPath {
+            action: "failed to copy into the Pack",
+            path: path.to_path_buf(),
+            source,
+        })?;
         self.end()
     }
 
     /// Write the table of contents and sync the file. Returns the Pack size.
     pub fn finish(mut self) -> Result<u64> {
         if self.open.is_some() {
-            bail!("Pack finished with an open section");
+            return Err(Error::Inconsistent(
+                "Pack finished with an open section".into(),
+            ));
         }
         let mut toc = Vec::new();
         put_u64(&mut toc, self.sections.len() as u64);
@@ -194,8 +218,11 @@ impl Writer {
         self.file.write_all(TRAILER_MAGIC)?;
         self.file.flush()?;
         let file = self.file.get_mut();
-        file.sync_all()
-            .with_context(|| format!("failed to sync {}", self.path.display()))?;
+        file.sync_all().map_err(|source| Error::IoPath {
+            action: "failed to sync",
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(file.stream_position()?)
     }
 }
@@ -236,13 +263,18 @@ impl std::fmt::Debug for Container {
 impl Container {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let file = File::open(path).map_err(|source| Error::IoPath {
+            action: "failed to open",
+            path: path.to_path_buf(),
+            source,
+        })?;
         // SAFETY: Pack files are immutable once published and mapped read-only.
-        let mmap = unsafe { MmapOptions::new().map(&file) }
-            .with_context(|| format!("failed to mmap {}", path.display()))?;
-        let sections =
-            parse_toc(&mmap).with_context(|| format!("invalid Pack {}", path.display()))?;
+        let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|source| Error::IoPath {
+            action: "failed to mmap",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let sections = parse_toc(&mmap)?;
         Ok(Self {
             bytes: SharedMmap(Arc::new(mmap)),
             sections: Arc::new(sections),
@@ -280,7 +312,9 @@ impl Container {
         self.sections.par_iter().try_for_each(|(name, info)| {
             let bytes = self.bytes_of(info);
             if xxh3_64(&bytes) != info.checksum {
-                bail!("Pack section {name} is corrupt: its checksum does not match");
+                return Err(Error::ChecksumMismatch {
+                    section: name.clone(),
+                });
             }
             Ok(())
         })
@@ -291,10 +325,9 @@ impl Container {
     pub fn section(&self, name: &str, version: u32) -> Result<Bytes> {
         let info = self.info(name)?;
         if info.version != version {
-            bail!(
-                "Pack section {name} has version {}, this build reads version {version}; rebuild the Pack",
-                info.version
-            );
+            return Err(Error::UnsupportedVersion {
+                found: info.version,
+            });
         }
         Ok(self.bytes_of(info))
     }
@@ -305,9 +338,9 @@ impl Container {
     }
 
     fn info(&self, name: &str) -> Result<&SectionInfo> {
-        self.sections
-            .get(name)
-            .with_context(|| format!("Pack is missing section {name}"))
+        self.sections.get(name).ok_or(Error::Inconsistent(format!(
+            "Pack is missing section {name}"
+        )))
     }
 
     fn bytes_of(&self, info: &SectionInfo) -> Bytes {
@@ -319,22 +352,24 @@ impl Container {
 
 fn parse_toc(bytes: &[u8]) -> Result<BTreeMap<String, SectionInfo>> {
     if bytes.len() < HEADER_BYTES as usize + TRAILER_BYTES || &bytes[0..8] != MAGIC {
-        bail!("not an open-geocode Pack file");
+        return Err(Error::NotAPack);
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().expect("header slice"));
     if version != CONTAINER_VERSION {
-        bail!("Pack container version {version} is unsupported; rebuild the Pack");
+        return Err(Error::UnsupportedVersion { found: version });
     }
     let trailer = bytes.len() - TRAILER_BYTES;
     if &bytes[trailer + 16..] != TRAILER_MAGIC {
-        bail!("Pack file is truncated or still being written");
+        return Err(Error::Truncated);
     }
     let toc_offset = read_u64_le(bytes, trailer).expect("trailer slice") as usize;
     let toc_len = read_u64_le(bytes, trailer + 8).expect("trailer slice") as usize;
     let toc_end = toc_offset
         .checked_add(toc_len)
         .filter(|end| *end == trailer)
-        .context("Pack table of contents is out of bounds")?;
+        .ok_or(Error::Inconsistent(
+            "Pack table of contents is out of bounds".into(),
+        ))?;
     let mut input = &bytes[toc_offset..toc_end];
     let count = get_u64(&mut input)?;
     let mut sections = BTreeMap::new();
@@ -349,14 +384,14 @@ fn parse_toc(bytes: &[u8]) -> Result<BTreeMap<String, SectionInfo>> {
         let end = info
             .offset
             .checked_add(info.len)
-            .context("Pack section bounds overflow")?;
+            .ok_or(Error::Inconsistent("Pack section bounds overflow".into()))?;
         if info.offset < HEADER_BYTES || end > toc_offset as u64 {
-            bail!("Pack section {name} is out of bounds");
+            return Err(Error::SectionOutOfBounds { section: name });
         }
         sections.insert(name, info);
     }
     if !input.is_empty() {
-        bail!("Pack table of contents has trailing bytes");
+        return Err(Error::TrailingBytes);
     }
     Ok(sections)
 }

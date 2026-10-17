@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use crate::error::{Error, Result};
 use osmpbf::{Element, PrimitiveBlock};
 
 use crate::{
@@ -120,10 +120,10 @@ impl Join {
             if let Some(last) = self.last_node_id
                 && node_id <= last
             {
-                bail!(
+                return Err(Error::BadInput(format!(
                     "node {node_id} follows node {last}: the input PBF must be sorted by id \
                      (sort it with `osmium sort`)"
-                );
+                )));
             }
             self.last_node_id = Some(node_id);
 

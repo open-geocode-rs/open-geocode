@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context as _, Result};
+use crate::error::{Error, Result};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -494,7 +494,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
     let point = hit
         .record
         .point
-        .with_context(|| format!("search hit {} has no point", hit.record.id))?;
+        .ok_or_else(|| Error::Inconsistent(format!("search hit {} has no point", hit.record.id)))?;
     let accuracy = Accuracy::of(point.precision, &hit.record.source);
     let properties = ForwardProperties {
         common: common(contexts, hit.record_id, hit.record, accuracy)?,
@@ -536,7 +536,7 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
         let mut summary = pack.record_summary(record_id)?;
         let own_point = summary
             .point
-            .with_context(|| format!("record {record_id} has no point"))?;
+            .ok_or_else(|| Error::Inconsistent(format!("record {record_id} has no point")))?;
         let (lon, lat) = result
             .point
             .as_ref()
@@ -552,9 +552,9 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
         };
         if result.match_kind == MatchKind::EstimatedAddress {
             let number = estimated_number(&result.label)?;
-            let interpolation = pack
-                .interpolation(record_id)?
-                .with_context(|| format!("record {record_id} is not an interpolation"))?;
+            let interpolation = pack.interpolation(record_id)?.ok_or_else(|| {
+                Error::Inconsistent(format!("record {record_id} is not an interpolation"))
+            })?;
             summary.name = labels::estimated_address_name(number, &interpolation.address)
                 .unwrap_or_else(|| format!("{number} {}", interpolation.name()));
             summary.address = Address {
@@ -589,9 +589,9 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
     }
     areas.sort_by_key(|(_, summary)| breadth(&summary.layer));
     for (record_id, summary) in areas {
-        let point = summary
-            .point
-            .with_context(|| format!("context record {record_id} has no point"))?;
+        let point = summary.point.ok_or_else(|| {
+            Error::Inconsistent(format!("context record {record_id} has no point"))
+        })?;
         let accuracy = Accuracy::of(point.precision, &summary.source);
         let properties = ReverseProperties {
             common: common(&mut contexts, record_id, summary, accuracy)?,
@@ -620,7 +620,11 @@ fn estimated_number(label: &str) -> Result<u32> {
         .split_whitespace()
         .next()
         .and_then(|number| number.parse().ok())
-        .with_context(|| format!("estimated address label {label:?} starts with no number"))
+        .ok_or_else(|| {
+            Error::Inconsistent(format!(
+                "estimated address label {label:?} starts with no number"
+            ))
+        })
 }
 
 /// Order of context areas: precise to broad, the place area last.
@@ -647,8 +651,12 @@ fn common(
     summary: Summary,
     accuracy: Accuracy,
 ) -> Result<Common> {
-    let layer = Layer::parse(&summary.layer)
-        .with_context(|| format!("record {record_id} has unknown layer {}", summary.layer))?;
+    let layer = Layer::parse(&summary.layer).ok_or_else(|| {
+        Error::Inconsistent(format!(
+            "record {record_id} has unknown layer {}",
+            summary.layer
+        ))
+    })?;
     Ok(Common {
         id: summary.id,
         record_id,

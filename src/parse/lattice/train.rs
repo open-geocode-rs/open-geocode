@@ -33,7 +33,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Result, bail};
+use crate::error::{Error, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -510,7 +510,9 @@ impl Spill for Learned {
         let mut gold = Vec::new();
         for _ in 0..get_u64(input)? {
             let Some(label) = Label::ALL.get(usize::from(get_u8(input)?)) else {
-                bail!("invalid label in a training lattice");
+                return Err(Error::BadFixtureRow(
+                    "invalid label in a training lattice".into(),
+                ));
             };
             gold.push(*label);
         }
@@ -698,12 +700,9 @@ impl Spill for Row {
             let break_before = get_u8(input)? != 0;
             let joiner = match get_u64(input)? {
                 0 => None,
-                code => Some(
-                    u32::try_from(code)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .ok_or_else(|| anyhow::anyhow!("invalid joiner in a training row"))?,
-                ),
+                code => Some(u32::try_from(code).ok().and_then(char::from_u32).ok_or(
+                    Error::BadFixtureRow("invalid joiner in a training row".into()),
+                )?),
             };
             tokens.words.push(word);
             tokens.breaks.push(break_before);
@@ -712,14 +711,18 @@ impl Spill for Row {
         let mut gold = Vec::new();
         for _ in 0..get_u64(input)? {
             let Some(label) = Label::ALL.get(usize::from(get_u8(input)?)) else {
-                bail!("invalid label in a training row");
+                return Err(Error::BadFixtureRow(
+                    "invalid label in a training row".into(),
+                ));
             };
             gold.push(*label);
         }
         let mut suppression = Suppression::default();
         for _ in 0..get_u64(input)? {
             let Some(field) = HIDDEN_FIELDS.get(usize::from(get_u8(input)?)) else {
-                bail!("invalid hidden field in a training row");
+                return Err(Error::BadFixtureRow(
+                    "invalid hidden field in a training row".into(),
+                ));
             };
             let start = get_u64(input)? as usize;
             let end = get_u64(input)? as usize;

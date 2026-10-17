@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 
 pub(crate) fn put_u64(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -59,7 +59,7 @@ pub(crate) const fn unzigzag(value: u64) -> i64 {
 pub(crate) fn get_u8(input: &mut &[u8]) -> Result<u8> {
     let (&byte, rest) = input
         .split_first()
-        .context("unexpected end of encoded data")?;
+        .ok_or(Error::Decode("unexpected end of encoded data"))?;
     *input = rest;
     Ok(byte)
 }
@@ -73,11 +73,11 @@ pub(crate) fn get_u64(input: &mut &[u8]) -> Result<u64> {
             return Ok(value);
         }
     }
-    bail!("varint is longer than 64 bits")
+    Err(Error::Decode("varint is longer than 64 bits"))
 }
 
 pub(crate) fn get_u32(input: &mut &[u8]) -> Result<u32> {
-    u32::try_from(get_u64(input)?).context("varint does not fit in u32")
+    u32::try_from(get_u64(input)?).map_err(|_| Error::Decode("varint does not fit in u32"))
 }
 
 pub(crate) fn get_i64(input: &mut &[u8]) -> Result<i64> {
@@ -85,13 +85,14 @@ pub(crate) fn get_i64(input: &mut &[u8]) -> Result<i64> {
 }
 
 pub(crate) fn get_i32(input: &mut &[u8]) -> Result<i32> {
-    i32::try_from(get_i64(input)?).context("varint does not fit in i32")
+    i32::try_from(get_i64(input)?).map_err(|_| Error::Decode("varint does not fit in i32"))
 }
 
 pub(crate) fn get_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
-    let len = usize::try_from(get_u64(input)?).context("length does not fit in usize")?;
+    let len = usize::try_from(get_u64(input)?)
+        .map_err(|_| Error::Decode("length does not fit in usize"))?;
     if input.len() < len {
-        bail!("unexpected end of encoded data");
+        return Err(Error::Decode("unexpected end of encoded data"));
     }
     let (bytes, rest) = input.split_at(len);
     *input = rest;
@@ -99,7 +100,8 @@ pub(crate) fn get_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 pub(crate) fn get_str<'a>(input: &mut &'a [u8]) -> Result<&'a str> {
-    std::str::from_utf8(get_bytes(input)?).context("encoded text is not valid UTF-8")
+    std::str::from_utf8(get_bytes(input)?)
+        .map_err(|_| Error::Decode("encoded text is not valid UTF-8"))
 }
 
 pub(crate) fn get_string(input: &mut &[u8]) -> Result<String> {
@@ -110,7 +112,7 @@ pub(crate) fn get_opt_string(input: &mut &[u8]) -> Result<Option<String>> {
     match get_u8(input)? {
         0 => Ok(None),
         1 => get_string(input).map(Some),
-        other => bail!("invalid option tag {other}"),
+        _ => Err(Error::Decode("invalid option tag")),
     }
 }
 

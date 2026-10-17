@@ -7,7 +7,7 @@
 //! the same label are one labelling, so each decoding cell keeps the best
 //! path per label sequence and the n best are n different labellings.
 
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 
 use super::{CountryCode, Tokens, Units, weights::Weights};
 use crate::{
@@ -170,10 +170,11 @@ impl Lattice {
             u16::try_from(get_u64(input)?)
                 .ok()
                 .and_then(CountryCode::from_u16)
-                .context("invalid country in a lattice")
+                .ok_or(Error::Decode("invalid country in a lattice"))
         };
         let count = |input: &mut &[u8]| -> Result<usize> {
-            usize::try_from(get_u64(input)?).context("lattice length out of range")
+            usize::try_from(get_u64(input)?)
+                .map_err(|_| Error::Decode("lattice length out of range"))
         };
         let mut units = Units {
             tokens: Tokens::default(),
@@ -191,7 +192,7 @@ impl Lattice {
                     u32::try_from(code)
                         .ok()
                         .and_then(char::from_u32)
-                        .context("invalid joiner in a lattice")?,
+                        .ok_or(Error::Decode("invalid joiner in a lattice"))?,
                 ),
             };
             units.tokens.joiners.push(joiner);
@@ -210,7 +211,7 @@ impl Lattice {
                 .map(|_| Ok((country(input)?, get_u32(input)?)))
                 .collect::<Result<Vec<_>>>()?;
             if start >= end || end > units.len() {
-                anyhow::bail!("invalid span in a lattice");
+                return Err(Error::Decode("invalid span in a lattice"));
             }
             spans.push(Span {
                 start,

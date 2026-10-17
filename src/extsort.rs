@@ -24,7 +24,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use crate::error::{Error, Result};
 use rayon::prelude::*;
 
 use crate::{
@@ -82,8 +82,11 @@ pub struct Scratch {
 impl Scratch {
     pub fn create(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
         let path = path.into();
-        fs::create_dir_all(&path)
-            .with_context(|| format!("failed to create scratch directory {}", path.display()))?;
+        fs::create_dir_all(&path).map_err(|source| Error::IoPath {
+            action: "failed to create scratch directory",
+            path: path.clone(),
+            source,
+        })?;
         Ok(Arc::new(Self {
             path,
             next_file: AtomicU64::new(0),
@@ -125,12 +128,12 @@ impl Scratch {
         if let Some(free) = resources::free_disk(&self.path)
             && bytes > free / 10 * 9
         {
-            bail!(
+            return Err(Error::OutOfResources(format!(
                 "scratch volume of {} has {} MiB free, and the build needs about {} MiB more; free space there or pass --scratch-dir on a larger volume",
                 self.path.display(),
                 free >> 20,
                 bytes >> 20
-            );
+            )));
         }
         Ok(())
     }
@@ -234,10 +237,10 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             (growth, needed) = self.needed(heap, share);
             self.reservation.reservation().force_grow(needed);
             self.buffer.try_reserve_exact(growth).map_err(|_| {
-                anyhow!(
+                Error::OutOfResources(format!(
                     "out of memory: the {} sorter cannot buffer one item after spilling",
                     self.label
-                )
+                ))
             })?;
         }
         self.buffer.push(item);
@@ -527,9 +530,11 @@ struct SpoolWriter<T> {
 
 impl<T: Spill> SpoolWriter<T> {
     fn create(scratch: &Arc<Scratch>, path: &Path) -> Result<Self> {
-        let file = scratch
-            .create_file(path)
-            .with_context(|| format!("failed to create scratch file {}", path.display()))?;
+        let file = scratch.create_file(path).map_err(|source| Error::IoPath {
+            action: "failed to create scratch file",
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(Self {
             file: BufWriter::with_capacity(IO_BUFFER_BYTES, file),
             scratch: Arc::clone(scratch),
@@ -557,7 +562,7 @@ impl<T: Spill> SpoolWriter<T> {
     }
 
     fn finish(mut self) -> Result<()> {
-        self.file.flush().context("failed to flush scratch file")
+        Ok(self.file.flush()?)
     }
 }
 
@@ -594,12 +599,18 @@ impl<T: Spill> IndexedSpool<T> {
     /// removed once the [`IndexedSpoolFile`] is dropped.
     pub fn finish(self) -> Result<IndexedSpoolFile<T>> {
         self.writer.finish()?;
-        let file = File::open(&self.path)
-            .with_context(|| format!("failed to open scratch file {}", self.path.display()))?;
+        let file = File::open(&self.path).map_err(|source| Error::IoPath {
+            action: "failed to open scratch file",
+            path: self.path.clone(),
+            source,
+        })?;
         // SAFETY: the scratch file is this build's own and is not written
         // again while mapped.
-        let map = unsafe { memmap2::Mmap::map(&file) }
-            .with_context(|| format!("failed to map scratch file {}", self.path.display()))?;
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| Error::IoPath {
+            action: "failed to map scratch file",
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(IndexedSpoolFile {
             map: Some(map),
             path: self.path,
@@ -639,14 +650,22 @@ impl<T: Spill> IndexedSpoolFile<T> {
         let mut input = usize::try_from(self.offsets[index])
             .ok()
             .and_then(|offset| bytes.get(offset..))
-            .with_context(|| format!("scratch file {} is truncated", self.path.display()))?;
-        let len = usize::try_from(get_u64(&mut input)?).context("scratch item too large")?;
-        let mut item = input
-            .get(..len)
-            .with_context(|| format!("scratch file {} is truncated", self.path.display()))?;
+            .ok_or(Error::BadScratch {
+                path: self.path.clone(),
+                detail: "truncated",
+            })?;
+        let len = usize::try_from(get_u64(&mut input)?)
+            .map_err(|_| Error::Decode("scratch item too large"))?;
+        let mut item = input.get(..len).ok_or(Error::BadScratch {
+            path: self.path.clone(),
+            detail: "truncated",
+        })?;
         let value = T::decode(&mut item)?;
         if !item.is_empty() {
-            bail!("scratch item in {} has trailing bytes", self.path.display());
+            return Err(Error::BadScratch {
+                path: self.path.clone(),
+                detail: "item has trailing bytes",
+            });
         }
         Ok(value)
     }
@@ -670,8 +689,11 @@ pub struct SpoolReader<T> {
 
 impl<T: Spill> SpoolReader<T> {
     fn open(path: &Path, buffer_bytes: usize) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("failed to open scratch file {}", path.display()))?;
+        let file = File::open(path).map_err(|source| Error::IoPath {
+            action: "failed to open scratch file",
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(Self {
             file: BufReader::with_capacity(buffer_bytes, file),
             path: path.to_path_buf(),
@@ -687,19 +709,25 @@ impl<T: Spill> SpoolReader<T> {
         };
         self.buffer.clear();
         self.buffer.try_reserve_exact(len).map_err(|_| {
-            anyhow!(
+            Error::OutOfResources(format!(
                 "scratch item of {len} bytes in {} does not fit in memory",
                 self.path.display()
-            )
+            ))
         })?;
         self.buffer.resize(len, 0);
         self.file
             .read_exact(&mut self.buffer)
-            .with_context(|| format!("truncated scratch file {}", self.path.display()))?;
+            .map_err(|_| Error::BadScratch {
+                path: self.path.clone(),
+                detail: "truncated",
+            })?;
         let mut input = self.buffer.as_slice();
         let item = T::decode(&mut input)?;
         if !input.is_empty() {
-            bail!("scratch item in {} has trailing bytes", self.path.display());
+            return Err(Error::BadScratch {
+                path: self.path.clone(),
+                detail: "item has trailing bytes",
+            });
         }
         Ok(Some(item))
     }
@@ -714,7 +742,10 @@ impl<T: Spill> SpoolReader<T> {
                 if used == 0 {
                     return Ok(None);
                 }
-                bail!("truncated length prefix in {}", self.path.display());
+                return Err(Error::BadScratch {
+                    path: self.path.clone(),
+                    detail: "truncated length prefix",
+                });
             }
             prefix[used] = byte[0];
             used += 1;
@@ -722,12 +753,15 @@ impl<T: Spill> SpoolReader<T> {
                 break;
             }
             if used == prefix.len() {
-                bail!("invalid length prefix in {}", self.path.display());
+                return Err(Error::BadScratch {
+                    path: self.path.clone(),
+                    detail: "invalid length prefix",
+                });
             }
         }
         let len = get_u64(&mut &prefix[..used])?;
         Ok(Some(
-            usize::try_from(len).context("scratch item too large")?,
+            usize::try_from(len).map_err(|_| Error::Decode("scratch item too large"))?,
         ))
     }
 }
@@ -757,7 +791,7 @@ macro_rules! spill_tuple_of_unsigned {
             }
 
             fn decode(input: &mut &[u8]) -> Result<Self> {
-                Ok(($(<$ty>::try_from(get_u64(input)?).context("scratch value out of range")?,)+))
+                Ok(($(<$ty>::try_from(get_u64(input)?).map_err(|_| $crate::error::Error::Decode("scratch value out of range"))?,)+))
             }
         }
     };

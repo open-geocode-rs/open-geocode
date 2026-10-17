@@ -1817,6 +1817,7 @@ dependencies = [
  "signal-hook",
  "stable_deref_trait",
  "tantivy",
+ "thiserror 2.0.18",
  "tokio",
  "tower",
  "tower-http",

@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use serde::Serialize;
 use tantivy::{
     DocId, IndexReader, Order, Score, Searcher, SegmentReader, Term,
@@ -146,7 +146,7 @@ impl TextSearcher {
         let index = open_text_index(pack.container())?;
         let schema = index.schema();
         let fields = Fields::from_schema(&schema)?;
-        let reader = index.reader().context("failed to open Tantivy reader")?;
+        let reader = index.reader()?;
         let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         let tagger = Arc::new(LatticeTagger::from_container(pack.container())?);
         let mut columns = HashMap::new();
@@ -180,7 +180,7 @@ impl TextSearcher {
 
         let query_text = options.query.trim();
         if query_text.is_empty() {
-            bail!("search query cannot be empty");
+            return Err(Error::EmptyQuery);
         }
 
         // A hit that contradicts a postcode the query states is not an answer
@@ -286,7 +286,6 @@ impl TextSearcher {
             ..Ranking::default()
         };
         self.ranked_hits(&query, &ranking, limit)
-            .with_context(|| format!("failed to autocomplete text index for {query_text:?}"))
     }
 
     /// The house number, then what a record is and where. See
@@ -518,7 +517,9 @@ impl TextSearcher {
             }
         }
         let Some(first_plan) = plans.first() else {
-            bail!("failed to parse search query {query_text:?}: it has no words to search");
+            return Err(Error::UnparsableQuery {
+                query: query_text.to_string(),
+            });
         };
         let first_query = first_plan.text();
         let query_words: HashSet<String> = normalize_index_text(query_text)
@@ -536,9 +537,8 @@ impl TextSearcher {
                     if !pass.searches_anew(plan) {
                         continue;
                     }
-                    let hits = self
-                        .search_plan(plan, pass, &query_words, layer, limit, &mut accept)
-                        .with_context(|| format!("failed to search text index for {text:?}"))?;
+                    let hits =
+                        self.search_plan(plan, pass, &query_words, layer, limit, &mut accept)?;
                     if !hits.is_empty() {
                         return Ok((text, hits));
                     }
@@ -816,7 +816,9 @@ impl TextSearcher {
                 .record_id
                 .values_for_doc(doc.doc_id)
                 .next()
-                .context("text index hit is missing fast record_id")?;
+                .ok_or(Error::Inconsistent(
+                    "text index hit is missing fast record_id".into(),
+                ))?;
             let mut record = self.pack.record_summary(record_id)?;
             if let Some(number) = ranking.house_number
                 && record.layer == Layer::Interpolation.as_str()
@@ -1023,11 +1025,14 @@ impl TextSearcher {
         let mut neighbours = Vec::new();
         for (number, doc) in docs {
             let columns = self.segment_columns(searcher, doc.segment_ord)?;
-            let record_id = columns
-                .record_id
-                .values_for_doc(doc.doc_id)
-                .next()
-                .context("text index hit is missing fast record_id")?;
+            let record_id =
+                columns
+                    .record_id
+                    .values_for_doc(doc.doc_id)
+                    .next()
+                    .ok_or(Error::Inconsistent(
+                        "text index hit is missing fast record_id".into(),
+                    ))?;
             let address = match self.pack.records().record(record_id)? {
                 Record::Address(record) => record.address,
                 Record::Poi(PoiRecord {
@@ -1057,7 +1062,8 @@ impl TextSearcher {
             };
             neighbours.push(Neighbour {
                 record_id,
-                number: u32::try_from(number).context("house number is out of range")?,
+                number: u32::try_from(number)
+                    .map_err(|_| Error::Decode("house number is out of range"))?,
                 point: [lon, lat],
                 street,
                 address,
@@ -1070,7 +1076,9 @@ impl TextSearcher {
     fn segment_columns(&self, searcher: &Searcher, segment_ord: u32) -> Result<&SegmentColumns> {
         self.columns
             .get(&searcher.segment_reader(segment_ord).segment_id())
-            .context("text index segment has no fast fields")
+            .ok_or(Error::Inconsistent(
+                "text index segment has no fast fields".into(),
+            ))
     }
 
     /// Whether a street record named `street` (as [`street_search_text`]
@@ -2020,7 +2028,7 @@ mod tests {
                 layer: None,
             })
             .expect_err("unparseable query");
-        assert!(format!("{error:#}").contains("failed to parse search query"));
+        assert!(matches!(error, Error::UnparsableQuery { .. }));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

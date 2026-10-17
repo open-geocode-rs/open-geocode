@@ -22,7 +22,7 @@
 
 use std::{cmp::Ordering, collections::HashMap, io::Write, sync::Arc};
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use geojson::GeometryValue;
 use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
@@ -124,7 +124,7 @@ impl RecordCells {
                     }
                     let index = u64::try_from(index)?;
                     if index >= 1 << SEGMENT_INDEX_BITS {
-                        bail!("line record {} has too many segments to index", record.id());
+                        return Err(Error::TooManySegments { id: record.id() });
                     }
                     let reference = record_id << SEGMENT_INDEX_BITS | index;
                     for cell in segment_cells(pair[0], pair[1], H3_FINE_RESOLUTION)? {
@@ -306,14 +306,14 @@ fn put_delta_list(out: &mut Vec<u8>, values: &[u64]) {
 fn get_delta_list(input: &mut &[u8]) -> Result<Vec<u64>> {
     let count = usize::try_from(get_u64(input)?)?;
     if count > input.len() {
-        bail!("spatial reference list is truncated");
+        return Err(Error::Decode("spatial reference list is truncated"));
     }
     let mut values = Vec::with_capacity(count);
     let mut previous = 0u64;
     for _ in 0..count {
         previous = previous
             .checked_add(get_u64(input)?)
-            .context("spatial reference overflows")?;
+            .ok_or(Error::Decode("spatial reference overflows"))?;
         values.push(previous);
     }
     Ok(values)
@@ -335,13 +335,17 @@ impl CellTable {
     fn open(container: &Container, name: &str) -> Result<Self> {
         let index = container.section(&format!("{name}/index"), SPATIAL_VERSION)?;
         let data = container.section(&format!("{name}/data"), SPATIAL_VERSION)?;
-        let cell_count = read_u64_le(&index, 0).context("spatial index is truncated")?;
-        let block_count = read_u64_le(&index, 8).context("spatial index is truncated")?;
+        let cell_count =
+            read_u64_le(&index, 0).ok_or(Error::Decode("spatial index is truncated"))?;
+        let block_count =
+            read_u64_le(&index, 8).ok_or(Error::Decode("spatial index is truncated"))?;
         if block_count != cell_count.div_ceil(CELLS_PER_BLOCK)
             || index.len() as u64 != 24 + block_count * 16
             || read_u64_le(&index, index.len() - 8) != Some(data.len() as u64)
         {
-            bail!("spatial index {name} is inconsistent with its data");
+            return Err(Error::Inconsistent(format!(
+                "spatial index {name} is inconsistent with its data"
+            )));
         }
         Ok(Self {
             index,
@@ -381,12 +385,14 @@ impl CellTable {
         let mut input = self
             .data
             .get(start as usize..end as usize)
-            .context("spatial block is out of range")?;
+            .ok_or(Error::Decode("spatial block is out of range"))?;
         let mut current = first_cell;
         while !input.is_empty() {
             current += get_u64(&mut input)?;
             let len = usize::try_from(get_u64(&mut input)?)?;
-            let mut refs = input.get(..len).context("spatial cell is truncated")?;
+            let mut refs = input
+                .get(..len)
+                .ok_or(Error::Decode("spatial cell is truncated"))?;
             input = &input[len..];
             match current.cmp(&cell) {
                 Ordering::Less => continue,
@@ -573,7 +579,10 @@ impl Reader {
                 let (Some(start), Some(end)) =
                     (line.points.get(segment), line.points.get(segment + 1))
                 else {
-                    bail!("segment reference {reference} is out of range");
+                    return Err(Error::IdOutOfRange {
+                        what: "segment reference",
+                        id: reference,
+                    });
                 };
                 let projection = project_to_segment_m(lon, lat, *start, *end);
                 if projection.distance_m <= radius_m {
@@ -709,7 +718,7 @@ fn line_cache(points: Vec<[i32; 2]>) -> LineCache {
 }
 
 fn cell_id(lon: f64, lat: f64, resolution: Resolution) -> Result<u64> {
-    let lat_lng = LatLng::new(lat, lon).context("invalid coordinate for h3 cell")?;
+    let lat_lng = LatLng::new(lat, lon).map_err(|_| Error::CoordinateNotFinite)?;
     Ok(u64::from(lat_lng.to_cell(resolution)))
 }
 

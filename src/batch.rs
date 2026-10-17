@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use csv::{ByteRecord, ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 
@@ -196,14 +196,17 @@ impl Fields {
         let lookup = header_lookup(headers);
         let place = |column: &Column| -> Result<usize> {
             match column {
-                Column::Named(name) => find_header(&lookup, name)
-                    .with_context(|| format!("{} has no column {name:?}", options.input.display())),
+                Column::Named(name) => {
+                    find_header(&lookup, name).ok_or_else(|| Error::MissingColumn {
+                        input: options.input.clone(),
+                        column: name.clone(),
+                    })
+                }
                 Column::At(index) if *index < headers.len() => Ok(*index),
-                Column::At(index) => bail!(
-                    "{} has {} columns, none at place {index}",
-                    options.input.display(),
-                    headers.len()
-                ),
+                Column::At(index) => Err(Error::MissingColumn {
+                    input: options.input.clone(),
+                    column: format!("at place {index}"),
+                }),
             }
         };
         let optional = |column: &Option<Column>| column.as_ref().map(place).transpose();
@@ -258,7 +261,9 @@ const BATCH_CHUNK_ROWS: usize = 50_000;
 /// so text in another encoding than UTF-8 comes out as it went in.
 pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
     if options.address_field_groups.is_empty() == options.join.is_none() {
-        bail!("provide either --address-fields or --join-coordinates-from, but not both");
+        return Err(Error::BadOptions(
+            "provide either --address-fields or --join-coordinates-from, but not both".into(),
+        ));
     }
     ensure_distinct_paths(&options.input, &options.output, options.audit.as_deref())?;
 
@@ -266,16 +271,7 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
     let mut reader = open_delimited(&options.input, delimiter)?;
     let mut records = reader.byte_records();
     let header = if options.header_row {
-        records
-            .next()
-            .transpose()
-            .with_context(|| {
-                format!(
-                    "failed to read CSV headers from {}",
-                    options.input.display()
-                )
-            })?
-            .unwrap_or_default()
+        records.next().transpose()?.unwrap_or_default()
     } else {
         unnamed_columns(&options.input)?.iter().collect()
     };
@@ -300,20 +296,21 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
         Some(join) => Resolver::Join {
             lookup: read_join_lookup(join)?,
             key_index: find_header(&header_lookup(&original_headers), &join.key_column)
-                .with_context(|| format!("missing join key column {:?}", join.key_column))?,
+                .ok_or_else(|| Error::MissingColumn {
+                    input: join.path.clone(),
+                    column: join.key_column.clone(),
+                })?,
         },
         None => {
-            let path = options
-                .pack
-                .as_ref()
-                .context("--pack is required when geocoding address fields")?;
+            let path = options.pack.as_ref().ok_or(Error::BadOptions(
+                "--pack is required when geocoding address fields".into(),
+            ))?;
             let open = || -> Result<(Arc<Reader>, TextSearcher)> {
                 let pack = Arc::new(Reader::open(path)?);
                 let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
                 Ok((pack, searcher))
             };
-            let (pack, searcher) =
-                open().with_context(|| format!("failed to open Pack {}", path.display()))?;
+            let (pack, searcher) = open()?;
             Resolver::Pack {
                 pack,
                 searcher: Box::new(searcher),
@@ -341,11 +338,7 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
         let chunk = records
             .by_ref()
             .take(BATCH_CHUNK_ROWS)
-            .map(|record| {
-                record.with_context(|| {
-                    format!("failed to read CSV record from {}", options.input.display())
-                })
-            })
+            .map(|record| record.map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
         if chunk.is_empty() {
             break;
@@ -383,10 +376,13 @@ const SNIFF_BYTES: usize = 64 << 10;
 pub fn detect_delimiter(path: &Path) -> Result<u8> {
     let mut sample = Vec::with_capacity(SNIFF_BYTES);
     File::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?
+        .map_err(|source| Error::IoPath {
+            action: "failed to open",
+            path: path.to_path_buf(),
+            source,
+        })?
         .take(SNIFF_BYTES as u64)
-        .read_to_end(&mut sample)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+        .read_to_end(&mut sample)?;
     // A line cut short by the sample's end would count against every
     // separator alike; leave it out.
     if sample.len() == SNIFF_BYTES
@@ -430,7 +426,7 @@ pub fn open_delimited(path: &Path, delimiter: u8) -> Result<csv::Reader<File>> {
         .has_headers(false)
         .delimiter(delimiter)
         .from_path(path)
-        .with_context(|| format!("failed to open {}", path.display()))
+        .map_err(Error::from)
 }
 
 /// The byte order mark some files start with. Reading leaves it out.
@@ -440,10 +436,13 @@ const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 fn starts_with_byte_order_mark(path: &Path) -> Result<bool> {
     let mut start = Vec::with_capacity(BYTE_ORDER_MARK.len());
     File::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?
+        .map_err(|source| Error::IoPath {
+            action: "failed to open",
+            path: path.to_path_buf(),
+            source,
+        })?
         .take(BYTE_ORDER_MARK.len() as u64)
-        .read_to_end(&mut start)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+        .read_to_end(&mut start)?;
     Ok(start == BYTE_ORDER_MARK)
 }
 
@@ -573,7 +572,9 @@ pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<Column>>> {
                 .map(|field| Column::Named(field.to_string()))
                 .collect::<Vec<_>>();
             if fields.is_empty() {
-                bail!("address field group must include at least one column")
+                return Err(Error::BadOptions(
+                    "address field group must include at least one column".into(),
+                ));
             }
             Ok(fields)
         })
@@ -633,22 +634,15 @@ fn read_csv(path: &Path) -> Result<CsvTable> {
     let mut reader = ReaderBuilder::new()
         .flexible(true)
         .from_path(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+        .map_err(Error::from)?;
     let headers = reader
-        .headers()
-        .with_context(|| format!("failed to read CSV headers from {}", path.display()))?
+        .headers()?
         .iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
     for record in reader.records() {
-        rows.push(
-            record
-                .with_context(|| format!("failed to read CSV record from {}", path.display()))?
-                .iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>(),
-        );
+        rows.push(record?.iter().map(str::to_string).collect::<Vec<_>>());
     }
     Ok(CsvTable { headers, rows })
 }
@@ -662,24 +656,27 @@ fn create_csv(
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|source| Error::IoPath {
+            action: "failed to create",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
     let file_name = path
         .file_name()
-        .with_context(|| format!("{} is not a file path", path.display()))?
+        .ok_or(Error::BadOptions("output is not a file path".into()))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = File::create(&temporary)
-        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    let mut file = File::create(&temporary).map_err(|source| Error::IoPath {
+        action: "failed to create",
+        path: temporary.clone(),
+        source,
+    })?;
     if byte_order_mark {
-        file.write_all(BYTE_ORDER_MARK)
-            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.write_all(BYTE_ORDER_MARK)?;
     }
     let mut writer = WriterBuilder::new().delimiter(delimiter).from_writer(file);
-    writer
-        .write_byte_record(header)
-        .with_context(|| format!("failed to write headers to {}", path.display()))?;
+    writer.write_byte_record(header)?;
     Ok(PendingCsv {
         writer,
         temporary,
@@ -699,17 +696,16 @@ struct PendingCsv {
 
 impl PendingCsv {
     fn write_record(&mut self, record: &ByteRecord) -> Result<()> {
-        self.writer
-            .write_byte_record(record)
-            .with_context(|| format!("failed to write a row to {}", self.path.display()))
+        Ok(self.writer.write_byte_record(record)?)
     }
 
     fn finish(mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .with_context(|| format!("failed to flush {}", self.path.display()))?;
-        std::fs::rename(&self.temporary, &self.path)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.writer.flush().map_err(|source| Error::IoPath {
+            action: "failed to flush",
+            path: self.path.clone(),
+            source,
+        })?;
+        std::fs::rename(&self.temporary, &self.path)?;
         self.finished = true;
         Ok(())
     }
@@ -728,9 +724,11 @@ impl Drop for PendingCsv {
 fn ensure_distinct_paths(input: &Path, output: &Path, audit: Option<&Path>) -> Result<()> {
     let resolve = |path: &Path| -> Result<PathBuf> {
         if path.exists() {
-            return path
-                .canonicalize()
-                .with_context(|| format!("failed to resolve {}", path.display()));
+            return path.canonicalize().map_err(|source| Error::IoPath {
+                action: "failed to resolve",
+                path: path.to_path_buf(),
+                source,
+            });
         }
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -748,10 +746,13 @@ fn ensure_distinct_paths(input: &Path, output: &Path, audit: Option<&Path>) -> R
     }
     for (first, second, first_name, second_name) in pairs {
         if first == second {
-            bail!(
-                "{first_name} and {second_name} name the same file ({}); choose a different path",
-                first.display()
-            );
+            return Err(Error::BadOptions(
+                format!(
+                    "{first_name} and {second_name} name the same file ({}); choose a different path",
+                    first.display()
+                )
+                .into(),
+            ));
         }
     }
     Ok(())
@@ -760,12 +761,18 @@ fn ensure_distinct_paths(input: &Path, output: &Path, audit: Option<&Path>) -> R
 fn read_join_lookup(join: &CoordinateJoinOptions) -> Result<HashMap<String, JoinedCoordinate>> {
     let table = read_csv(&join.path)?;
     let lookup = header_lookup(&table.headers);
-    let key_index = find_header(&lookup, &join.key_column)
-        .with_context(|| format!("missing join key column {:?}", join.key_column))?;
-    let lat_index = find_header(&lookup, &join.lat_column)
-        .with_context(|| format!("missing join latitude column {:?}", join.lat_column))?;
-    let lon_index = find_header(&lookup, &join.lon_column)
-        .with_context(|| format!("missing join longitude column {:?}", join.lon_column))?;
+    let key_index = find_header(&lookup, &join.key_column).ok_or_else(|| Error::MissingColumn {
+        input: join.path.clone(),
+        column: join.key_column.clone(),
+    })?;
+    let lat_index = find_header(&lookup, &join.lat_column).ok_or_else(|| Error::MissingColumn {
+        input: join.path.clone(),
+        column: join.lat_column.clone(),
+    })?;
+    let lon_index = find_header(&lookup, &join.lon_column).ok_or_else(|| Error::MissingColumn {
+        input: join.path.clone(),
+        column: join.lon_column.clone(),
+    })?;
     let mut coordinates = HashMap::new();
     for row in table.rows {
         let key = row.get(key_index).cloned().unwrap_or_default();
@@ -817,7 +824,9 @@ fn ensure_coordinate_columns(
     lon_column: &str,
 ) -> Result<CoordinateColumns> {
     if lat_column.eq_ignore_ascii_case(lon_column) {
-        bail!("latitude and longitude columns must be different");
+        return Err(Error::BadOptions(
+            "latitude and longitude columns must be different".into(),
+        ));
     }
     let mut lookup = header_lookup(headers);
     let lat_index = find_header(&lookup, lat_column).unwrap_or_else(|| {
@@ -1098,7 +1107,7 @@ mod tests {
             ..GeocodeOptions::default()
         })
         .unwrap_err();
-        assert!(error.downcast_ref::<Cancelled>().is_some());
+        assert!(matches!(error, Error::Cancelled));
         assert!(!root.join("stopped.csv").exists());
 
         // A file as offices export it: a byte order mark, semicolons, a

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -108,10 +108,14 @@ impl TupleWriter {
             None => {
                 for id in context.admin_context.ids().into_iter().flatten() {
                     if id >= u64::from(MISSING_ID) {
-                        bail!("context record id {id} does not fit the context table");
+                        return Err(Error::IdOutOfRange {
+                            what: "context record",
+                            id,
+                        });
                     }
                 }
-                let id = u32::try_from(self.tuples.len()).context("context table is full")?;
+                let id = u32::try_from(self.tuples.len())
+                    .map_err(|_| Error::Inconsistent("context table is full".into()))?;
                 self.tuples.push(context.admin_context);
                 self.ids.insert(context.admin_context, id);
                 id
@@ -149,9 +153,12 @@ pub struct Reader {
 impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
         let tuples = container.section(SECTION_TUPLES, CONTEXT_VERSION)?;
-        let count = read_u64_le(&tuples, 0).context("context table is truncated")?;
+        let count = read_u64_le(&tuples, 0)
+            .ok_or(Error::Inconsistent("context table is truncated".into()))?;
         if tuples.len() as u64 != 8 + count * TUPLE_BYTES as u64 {
-            bail!("context table does not match its tuple count");
+            return Err(Error::Inconsistent(
+                "context table does not match its tuple count".into(),
+            ));
         }
         Ok(Self { tuples, count })
     }
@@ -159,7 +166,10 @@ impl Reader {
     pub fn resolve(&self, reference: ContextRef) -> Result<RecordContext> {
         let id = u64::from(reference.tuple_id);
         if id >= self.count {
-            bail!("context tuple {id} is out of range");
+            return Err(Error::IdOutOfRange {
+                what: "context tuple",
+                id,
+            });
         }
         let offset = 8 + id as usize * TUPLE_BYTES;
         let ids = std::array::from_fn(|index| {

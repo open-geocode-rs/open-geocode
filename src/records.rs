@@ -41,7 +41,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use geojson::{Geometry, GeometryValue};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -213,7 +213,11 @@ impl Header {
             SourceKind::Node => OsmObjectType::Node,
             SourceKind::Way => OsmObjectType::Way,
             SourceKind::Relation => OsmObjectType::Relation,
-            SourceKind::Derived => bail!("derived record has no OSM source"),
+            SourceKind::Derived => {
+                return Err(Error::Inconsistent(
+                    "derived record has no OSM source".into(),
+                ));
+            }
         };
         Ok((object_type, crate::util::codec::unzigzag(self.source_value)))
     }
@@ -288,7 +292,8 @@ impl StringTable {
         if let Some(&id) = self.ids.get(value) {
             return Ok(id);
         }
-        let id = u32::try_from(self.ids.len()).context("string segment is full")?;
+        let id = u32::try_from(self.ids.len())
+            .map_err(|_| Error::Inconsistent("string segment is full".into()))?;
         self.bytes.write_all(value.as_bytes())?;
         self.bytes_len += value.len() as u64;
         self.ends.write_all(&self.bytes_len.to_le_bytes())?;
@@ -324,8 +329,11 @@ impl Writer {
         let create = |path: &PathBuf| -> Result<BufWriter<File>> {
             Ok(BufWriter::with_capacity(
                 1 << 20,
-                File::create(path)
-                    .with_context(|| format!("failed to create {}", path.display()))?,
+                File::create(path).map_err(|source| Error::IoPath {
+                    action: "failed to create",
+                    path: path.clone(),
+                    source,
+                })?,
             ))
         };
         Ok(Self {
@@ -376,9 +384,12 @@ impl Writer {
     }
 
     pub fn write(&mut self, record: &Record, context: Option<ContextRef>) -> Result<RecordId> {
-        let [lon, lat] = record
-            .display_point()
-            .with_context(|| format!("record {} has no finite display point", record.id()))?;
+        let [lon, lat] = record.display_point().ok_or_else(|| {
+            Error::BadGeometry(format!(
+                "record {} has no finite display point",
+                record.id()
+            ))
+        })?;
         let point = (quantize(lon)?, quantize(lat)?);
         if self.strings.segment_full(self.record_count) {
             self.strings.start_segment(self.record_count);
@@ -392,8 +403,10 @@ impl Writer {
         body.clear();
         self.encode_body(&mut body, record, point, context)?;
         self.block.extend_from_slice(&body);
-        self.block_ends
-            .push(u32::try_from(self.block.len()).context("record block exceeds 4 GiB")?);
+        self.block_ends.push(
+            u32::try_from(self.block.len())
+                .map_err(|_| Error::Inconsistent("record block exceeds 4 GiB".into()))?,
+        );
         self.body = body;
 
         let id = self.record_count;
@@ -482,7 +495,10 @@ impl Writer {
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
-                    bail!("unsupported postcode source {}", record.source.derived_from);
+                    return Err(Error::Inconsistent(format!(
+                        "unsupported postcode source {}",
+                        record.source.derived_from
+                    )));
                 }
                 put_u64(out, u64::from(self.strings.id(&record.postcode)?));
             }
@@ -613,15 +629,20 @@ impl Reader {
         let blocks = container.section(SECTION_BLOCKS, RECORDS_VERSION)?;
         let strings = container.section(SECTION_STRINGS, RECORDS_VERSION)?;
 
-        let record_count = read_u64_le(&index, 0).context("records index is truncated")?;
+        let record_count =
+            read_u64_le(&index, 0).ok_or(Error::Decode("records index is truncated"))?;
         let block_count = record_count.div_ceil(BLOCK_RECORDS);
         if index.len() as u64 != 8 + (block_count + 1) * 8 {
-            bail!("records index does not match its record count");
+            return Err(Error::Inconsistent(
+                "records index does not match its record count".into(),
+            ));
         }
         if read_u64_le(&index, index.len() - 8) != Some(blocks.len() as u64) {
-            bail!("records index does not match the blocks section");
+            return Err(Error::Inconsistent(
+                "records index does not match the blocks section".into(),
+            ));
         }
-        let truncated = || anyhow::anyhow!("string table is truncated");
+        let truncated = || Error::Decode("string table is truncated");
         let segment_count = read_u64_le(&strings, 0).ok_or_else(truncated)?;
         let count_at = usize::try_from(8 + segment_count * 16)?;
         let mut previous: Option<(u64, u64)> = None;
@@ -634,12 +655,16 @@ impl Reader {
                 Some((record, string)) => first_record > record && first_string >= string,
             };
             if !ordered || first_record >= record_count {
-                bail!("string table segments do not match the records");
+                return Err(Error::Inconsistent(
+                    "string table segments do not match the records".into(),
+                ));
             }
             previous = Some((first_record, first_string));
         }
         if (segment_count == 0) != (record_count == 0) {
-            bail!("string table segments do not match the records");
+            return Err(Error::Inconsistent(
+                "string table segments do not match the records".into(),
+            ));
         }
         let string_count = read_u64_le(&strings, count_at).ok_or_else(truncated)?;
         let ends_start = count_at + 8;
@@ -650,7 +675,9 @@ impl Reader {
             read_u64_le(&strings, text_start - 8).ok_or_else(truncated)?
         };
         if strings.len() as u64 != text_start as u64 + text_len {
-            bail!("string table does not match its offsets");
+            return Err(Error::Inconsistent(
+                "string table does not match its offsets".into(),
+            ));
         }
         Ok(Self {
             record_count,
@@ -925,7 +952,7 @@ impl Reader {
         let mut value = serde_json::to_value(&record)?;
         let object = value
             .as_object_mut()
-            .context("record JSON must be an object")?;
+            .ok_or(Error::BadGeometry("record JSON must be an object".into()))?;
         object.insert("layer".to_string(), json!(record.layer().as_str()));
         Ok(value)
     }
@@ -959,7 +986,10 @@ impl Reader {
     fn string(&self, segment: StringSegment, local: u32) -> Result<&str> {
         let id = segment.first + u64::from(local);
         if id >= segment.end {
-            bail!("string id {local} is out of range for its segment");
+            return Err(Error::IdOutOfRange {
+                what: "string",
+                id: u64::from(local),
+            });
         }
         let end_of = |id: u64| {
             read_u64_le(&self.strings, self.ends_start + id as usize * 8).expect("validated ends")
@@ -968,14 +998,15 @@ impl Reader {
         let bytes = self
             .strings
             .get(self.text_start + start as usize..self.text_start + end_of(id) as usize)
-            .context("string offsets are out of range")?;
-        std::str::from_utf8(bytes).context("string table entry is not valid UTF-8")
+            .ok_or(Error::Decode("string offsets are out of range"))?;
+        std::str::from_utf8(bytes)
+            .map_err(|_| Error::Decode("string table entry is not valid UTF-8"))
     }
 
     /// The block base point and the body bytes of a record.
     fn locate(&self, id: RecordId) -> Result<(i32, i32, &[u8])> {
         if id >= self.record_count {
-            bail!("record {id} is out of range");
+            return Err(Error::IdOutOfRange { what: "record", id });
         }
         let block = id / BLOCK_RECORDS;
         let start = read_u64_le(&self.index, (8 + block * 8) as usize).expect("validated index");
@@ -983,12 +1014,12 @@ impl Reader {
         let block_bytes = self
             .blocks
             .get(start as usize..end as usize)
-            .context("record block is out of range")?;
+            .ok_or(Error::Decode("record block is out of range"))?;
         let records_in_block =
             (self.record_count - block * BLOCK_RECORDS).min(BLOCK_RECORDS) as usize;
         let bodies_start = BLOCK_HEADER_BYTES + records_in_block * 4;
         if block_bytes.len() < bodies_start {
-            bail!("record block {block} is truncated");
+            return Err(Error::Decode("record block is truncated"));
         }
         let base_lon = i32::from_le_bytes(block_bytes[0..4].try_into().expect("block header"));
         let base_lat = i32::from_le_bytes(block_bytes[4..8].try_into().expect("block header"));
@@ -1000,7 +1031,7 @@ impl Reader {
         let body_start = if slot == 0 { 0 } else { body_end(slot - 1) };
         let body = block_bytes
             .get(bodies_start + body_start..bodies_start + body_end(slot))
-            .context("record body is out of range")?;
+            .ok_or(Error::Decode("record body is out of range"))?;
         Ok((base_lon, base_lat, body))
     }
 
@@ -1010,7 +1041,7 @@ impl Reader {
         let tag = get_u8(&mut body)?;
         let layer = *Layer::ALL
             .get(usize::from(tag & TAG_LAYER_MASK))
-            .with_context(|| format!("record {id} has an unknown layer code"))?;
+            .ok_or(Error::Decode("record has an unknown layer code"))?;
         let lon = add_delta(base_lon, get_i64(&mut body)?)?;
         let lat = add_delta(base_lat, get_i64(&mut body)?)?;
         Ok((layer, dequantize(lon), dequantize(lat)))
@@ -1021,7 +1052,7 @@ impl Reader {
         let tag = get_u8(&mut body)?;
         let layer = *Layer::ALL
             .get(usize::from(tag & TAG_LAYER_MASK))
-            .with_context(|| format!("record {id} has an unknown layer code"))?;
+            .ok_or(Error::Decode("record has an unknown layer code"))?;
         let source_kind = match tag >> TAG_SOURCE_SHIFT {
             0 => SourceKind::Node,
             1 => SourceKind::Way,
@@ -1033,7 +1064,8 @@ impl Reader {
         let context = match get_u64(&mut body)? {
             0 => None,
             value => Some(ContextRef {
-                tuple_id: u32::try_from((value >> 1) - 1).context("context id out of range")?,
+                tuple_id: u32::try_from((value >> 1) - 1)
+                    .map_err(|_| Error::Decode("context id out of range"))?,
                 ambiguous: value & 1 == 1,
             }),
         };
@@ -1062,7 +1094,7 @@ impl Reader {
         let count = get_u64(fields)?;
         // Every id takes at least a byte, so a corrupt count allocates nothing.
         if count > fields.len() as u64 {
-            bail!("string list is truncated");
+            return Err(Error::Decode("string list is truncated"));
         }
         (0..count)
             .map(|_| Ok(self.string_field(strings, fields)?.to_string()))
@@ -1194,7 +1226,9 @@ impl Reader {
     fn line_points(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<[i32; 2]>> {
         let count = usize::try_from(get_u64(fields)?)?;
         if count < 2 || count > fields.len() {
-            bail!("stored line geometry has an invalid point count {count}");
+            return Err(Error::BadGeometry(format!(
+                "stored line geometry has an invalid point count {count}"
+            )));
         }
         let mut points = Vec::with_capacity(count);
         let mut previous = [header.lon_e7, header.lat_e7];
@@ -1230,30 +1264,37 @@ fn line_coordinates(geometry: &Geometry) -> Result<Option<Vec<(i32, i32)>>> {
         GeometryValue::Point { .. } => Ok(None),
         GeometryValue::LineString { coordinates } => {
             if coordinates.len() < 2 {
-                bail!("line geometry needs at least two positions");
+                return Err(Error::BadGeometry(
+                    "line geometry needs at least two positions".into(),
+                ));
             }
             coordinates
                 .iter()
                 .map(|position| {
                     let [lon, lat, ..] = position.as_slice() else {
-                        bail!("line position is missing lon/lat");
+                        return Err(Error::BadGeometry(
+                            "line position is missing lon/lat".into(),
+                        ));
                     };
                     Ok((quantize(*lon)?, quantize(*lat)?))
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(Some)
         }
-        other => bail!("unsupported stored record geometry: {}", other.type_name()),
+        other => Err(Error::BadGeometry(format!(
+            "unsupported stored record geometry: {}",
+            other.type_name()
+        ))),
     }
 }
 
 pub(crate) fn quantize(value: f64) -> Result<i32> {
     if !value.is_finite() {
-        bail!("coordinate must be finite");
+        return Err(Error::CoordinateNotFinite);
     }
     let scaled = (value * COORDINATE_SCALE).round();
     if scaled < i32::MIN as f64 || scaled > i32::MAX as f64 {
-        bail!("coordinate {value} is out of range");
+        return Err(Error::CoordinateOutOfRange { value });
     }
     Ok(scaled as i32)
 }
@@ -1263,7 +1304,8 @@ pub(crate) fn dequantize(value: i32) -> f64 {
 }
 
 fn add_delta(base: i32, delta: i64) -> Result<i32> {
-    i32::try_from(i64::from(base) + delta).context("coordinate delta is out of range")
+    i32::try_from(i64::from(base) + delta)
+        .map_err(|_| Error::Decode("coordinate delta is out of range"))
 }
 
 #[cfg(test)]

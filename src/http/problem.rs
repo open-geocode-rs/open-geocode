@@ -277,16 +277,16 @@ impl IntoResponse for Problem {
 /// Map a geocoder error into a Problem without leaking internals, so handlers
 /// can just use `?`.
 ///
-/// `TextSearcher` reports a Tantivy query-parse failure with a message that
-/// contains `"failed to parse search query"`; that is a client error (400).
-/// Everything else is an unexpected runtime failure (500, no detail) and keeps
-/// its cause for the log.
-impl From<anyhow::Error> for Problem {
-    fn from(error: anyhow::Error) -> Self {
-        if format!("{error:#}").contains("failed to parse search query") {
-            Problem::invalid_query("invalid search query")
+/// A failure the caller could have avoided is a 400 that says what was wrong;
+/// everything else is a 500 whose body carries no detail and whose cause goes
+/// to the log. `Error::is_caller_error` draws the line, so a new variant is
+/// classified there rather than by matching on its message here.
+impl From<crate::Error> for Problem {
+    fn from(error: crate::Error) -> Self {
+        if error.is_caller_error() {
+            Problem::invalid_query(error.to_string())
         } else {
-            Problem::internal(error)
+            Problem::internal(anyhow::Error::new(error))
         }
     }
 }
@@ -415,7 +415,9 @@ mod tests {
 
     #[test]
     fn parse_error_converts_to_400_without_a_cause() {
-        let problem = Problem::from(anyhow::anyhow!("failed to parse search query \"(\""));
+        let problem = Problem::from(crate::Error::UnparsableQuery {
+            query: "(".to_string(),
+        });
         assert_eq!(problem.status(), 400);
         assert_eq!(problem.error_code(), ErrorCode::InvalidQuery);
         assert!(problem.cause().is_none());
@@ -423,13 +425,14 @@ mod tests {
 
     #[test]
     fn other_errors_convert_to_500_keeping_the_cause() {
-        let error = anyhow::anyhow!("tantivy index read failed").context("search failed");
-        let problem = Problem::from(error);
+        let problem = Problem::from(crate::Error::Inconsistent(
+            "tantivy index read failed".to_string(),
+        ));
         assert_eq!(problem.status(), 500);
         assert!(problem.detail().is_none());
         assert_eq!(
             format!("{:#}", problem.cause().expect("cause kept")),
-            "search failed: tantivy index read failed"
+            "Pack is inconsistent: tantivy index read failed"
         );
     }
 }

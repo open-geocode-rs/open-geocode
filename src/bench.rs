@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -248,9 +248,12 @@ fn read_fixture(path: Option<&Path>) -> Result<BenchmarkFixture> {
     let Some(path) = path else {
         return Ok(BenchmarkFixture::default());
     };
-    let file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    serde_json::from_reader(file).with_context(|| format!("failed to parse {}", path.display()))
+    let file = fs::File::open(path).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(serde_json::from_reader(file)?)
 }
 
 fn pack_metrics(reader: &Reader) -> Result<PackMetricReport> {
@@ -291,11 +294,12 @@ fn read_build_report(pack_file: &Path) -> Result<Option<BuilderReport>> {
     else {
         return Ok(None);
     };
-    let file =
-        fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
-    serde_json::from_reader(file)
-        .map(Some)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    let file = fs::File::open(&path).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(serde_json::from_reader(file)?))
 }
 
 fn build_metrics(report: BuilderReport) -> BuildMetricReport {
