@@ -30,7 +30,7 @@ use open_geocode::{
         lattice::LatticeTagger,
     },
     resources,
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    reverse::{GeocodeOptions, PackReverseGeocoder},
     runtime::{ServeOptions, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
@@ -837,7 +837,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let pack = Arc::new(PackReader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
-    let response = geocoder.reverse(ReverseGeocodeOptions { lon, lat })?;
+    let response = geocoder.reverse(GeocodeOptions { lon, lat })?;
     write_json(serde_json::to_value(api::reverse_collection(
         &pack, &response,
     )?)?)

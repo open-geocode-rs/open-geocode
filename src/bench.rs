@@ -13,7 +13,7 @@ use crate::{
     builder::report::{BuilderReport, PhaseTimings, ScratchReport, Throughput},
     pack::{AUDIT_DIR, BUILD_REPORT_FILE, PackManifest, PackReader},
     record::{Layer, OsmObjectType, Record},
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
     text_index::normalize_index_text,
 };
@@ -400,7 +400,7 @@ fn benchmark_reverse_cases(
     for case in cases {
         let mut result_present = false;
         let durations = measure_iterations(iterations, warmup, || {
-            let response = geocoder.reverse(ReverseGeocodeOptions {
+            let response = geocoder.reverse(GeocodeOptions {
                 lon: case.lon,
                 lat: case.lat,
             })?;

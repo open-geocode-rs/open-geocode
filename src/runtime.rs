@@ -29,7 +29,7 @@ use crate::{
     pack::PackReader,
     record::Layer,
     resources::Resources,
-    reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
+    reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchOptions},
 };
 
@@ -481,7 +481,7 @@ pub(crate) async fn reverse(
     bounds::validate_coords(params.lon, params.lat)?;
 
     let collection = blocking(move || {
-        let response = state.reverse_geocoder.reverse(ReverseGeocodeOptions {
+        let response = state.reverse_geocoder.reverse(GeocodeOptions {
             lon: params.lon,
             lat: params.lat,
         })?;

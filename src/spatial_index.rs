@@ -33,7 +33,7 @@ use crate::{
     memory::Budget,
     pack::RecordId,
     record::{Layer, Record},
-    records::{RecordsReader, dequantize},
+    records::{self, dequantize},
     util::codec::{get_u64, put_u64, read_u64_le},
 };
 
@@ -407,7 +407,7 @@ impl CellTable {
 pub struct Reader {
     fine: CellTable,
     context: CellTable,
-    records: RecordsReader,
+    records: records::Reader,
 }
 
 impl std::fmt::Debug for Reader {
@@ -427,7 +427,7 @@ struct LineCache {
 }
 
 impl Reader {
-    pub fn open(container: &Container, records: RecordsReader) -> Result<Self> {
+    pub fn open(container: &Container, records: records::Reader) -> Result<Self> {
         Ok(Self {
             fine: CellTable::open(container, FINE)?,
             context: CellTable::open(container, CONTEXT)?,
@@ -858,7 +858,7 @@ mod tests {
             AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
             OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
         },
-        records::RecordsWriter,
+        records,
     };
 
     #[test]
@@ -915,7 +915,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer = RecordsWriter::create(&scratch, &Budget::unlimited()).expect("records");
+        let mut writer = records::Writer::create(&scratch, &Budget::unlimited()).expect("records");
         let mut spatial = Writer::new(&scratch, &Budget::unlimited(), 64);
         for record in records {
             let id = writer.write(record, None).expect("write");
@@ -929,7 +929,7 @@ mod tests {
         let commit = spatial.finish(&mut pack).expect("spatial finish");
         pack.finish().expect("pack finish");
         let container = Container::open(&path).expect("open");
-        let records = RecordsReader::open(&container).expect("records reader");
+        let records = records::Reader::open(&container).expect("records reader");
         (
             Reader::open(&container, records).expect("spatial reader"),
             commit,

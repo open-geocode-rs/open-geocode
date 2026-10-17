@@ -39,14 +39,14 @@ use crate::{
         dictionary::{Builder, RecordNames},
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
-    records::{RecordsReader, RecordsWriter},
+    records::{Reader, Writer},
     spatial_index::{self, RecordCells},
     text_index::{self, PostcodeAreas},
 };
 
 pub use crate::{
     context::{AdminContextTuple, RecordContext},
-    records::{ContextRecord, RecordPoint, RecordPointPrecision, RecordSource, RecordSummary},
+    records::{ContextRecord, Point, PointPrecision, Source, Summary},
 };
 
 pub type RecordId = u64;
@@ -144,7 +144,7 @@ pub struct PackWriter {
     destination: PathBuf,
     generation: GenerationGuard,
     scratch: Arc<Scratch>,
-    records: RecordsWriter,
+    records: Writer,
     contexts: TupleWriter,
     text: text_index::Writer,
     spatial: spatial_index::Writer,
@@ -205,7 +205,7 @@ impl PackWriter {
                 .unwrap_or_else(|| generation.path.join(SCRATCH_DIR)),
         )?;
         Ok(Self {
-            records: RecordsWriter::create(&scratch, &options.memory)?,
+            records: Writer::create(&scratch, &options.memory)?,
             contexts: TupleWriter::default(),
             text: text_index::Writer::create(
                 &scratch,
@@ -462,7 +462,7 @@ pub struct PackReader {
     path: PathBuf,
     container: Container,
     manifest: PackManifest,
-    records: RecordsReader,
+    records: Reader,
     context: context::Reader,
 }
 
@@ -491,7 +491,7 @@ impl PackReader {
                 PACK_SCHEMA_VERSION
             );
         }
-        let records = RecordsReader::open(&container)?;
+        let records = Reader::open(&container)?;
         if records.record_count() != manifest.record_count {
             bail!(
                 "record store has {} records but the manifest declares {}",
@@ -529,7 +529,7 @@ impl PackReader {
             .with_context(|| format!("{} failed verification", self.path.display()))
     }
 
-    pub fn records(&self) -> &RecordsReader {
+    pub fn records(&self) -> &Reader {
         &self.records
     }
 
@@ -544,7 +544,7 @@ impl PackReader {
 
     /// The summary search and autocomplete return. A POI whose address states
     /// no locality is labelled with the locality it lies in.
-    pub fn record_summary(&self, record_id: RecordId) -> Result<RecordSummary> {
+    pub fn record_summary(&self, record_id: RecordId) -> Result<Summary> {
         let mut summary = self.records.summary(record_id)?;
         if summary.layer == Layer::Poi.as_str()
             && let Record::Poi(poi) = self.records.record(record_id)?

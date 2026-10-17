@@ -709,9 +709,9 @@ impl Audit {
 mod tests {
     use crate::{
         builder::progress::StageUnit,
-        pack::{PackReader, RecordPointPrecision},
+        pack::{PackReader, PointPrecision},
         record::Record,
-        reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
+        reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
         search::{PackTextSearcher, TextAutocompleteOptions, TextSearchHit, TextSearchOptions},
     };
 
@@ -981,23 +981,23 @@ mod tests {
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = |lon, lat| {
             reverse
-                .reverse(ReverseGeocodeOptions { lon, lat })
+                .reverse(GeocodeOptions { lon, lat })
                 .expect("reverse")
                 .result
                 .expect("result")
         };
         let building = result(-79.4299, 43.6201);
-        assert_eq!(building.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(building.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(building.id.as_deref(), Some("osm:way:602"));
         let estimated = result(-79.44001, 43.6305);
-        assert_eq!(estimated.match_kind, ReverseMatchKind::EstimatedAddress);
+        assert_eq!(estimated.match_kind, MatchKind::EstimatedAddress);
         assert!(
             estimated.label.starts_with("6 Elm Street"),
             "{}",
             estimated.label
         );
         let street = result(-79.415, 43.61001);
-        assert_eq!(street.match_kind, ReverseMatchKind::NearestStreet);
+        assert_eq!(street.match_kind, MatchKind::NearestStreet);
         assert!(
             street.label.starts_with("Queen Street, ") && street.label.contains("Toronto"),
             "{}",
@@ -1410,7 +1410,7 @@ mod tests {
         assert_eq!(ids(&station), vec!["osm:way:700"]);
         assert_eq!(
             station[0].record.point.expect("point").precision,
-            RecordPointPrecision::Centroid
+            PointPrecision::Centroid
         );
         assert!(search("Memorial Bench", None).is_empty());
 
@@ -1427,14 +1427,14 @@ mod tests {
         // an address record.
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = reverse
-            .reverse(ReverseGeocodeOptions {
+            .reverse(GeocodeOptions {
                 lon: -79.38,
                 lat: 43.65,
             })
             .expect("reverse")
             .result
             .expect("result");
-        assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
+        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));

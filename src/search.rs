@@ -23,7 +23,7 @@ use tantivy::{
 use crate::{
     api::Address,
     labels,
-    pack::{PackReader, RecordId, RecordPoint, RecordPointPrecision, RecordSource, RecordSummary},
+    pack::{PackReader, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
         lattice::{LatticeTagger, Tokens},
         types::{Label, Tagged},
@@ -86,7 +86,7 @@ pub struct TextAutocompleteOptions {
 pub struct TextSearchHit {
     pub record_id: RecordId,
     pub score: Score,
-    pub record: RecordSummary,
+    pub record: Summary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,7 +864,7 @@ impl PackTextSearcher {
     /// it uses only the street's own geometry. Where a number can be placed
     /// properly, by a range that holds it or between stated neighbours, that
     /// runs first and this never applies.
-    fn place_on_street_line(&self, record_id: RecordId, record: &mut RecordSummary) -> Result<()> {
+    fn place_on_street_line(&self, record_id: RecordId, record: &mut Summary) -> Result<()> {
         let Some(point) = record.point else {
             return Ok(());
         };
@@ -873,7 +873,7 @@ impl PackTextSearcher {
         let Some([lon, lat]) = self.spatial.point_along_line(record_id, 0.5)? else {
             return Ok(());
         };
-        record.point = Some(RecordPoint {
+        record.point = Some(Point {
             lon,
             lat,
             precision: point.precision,
@@ -885,7 +885,7 @@ impl PackTextSearcher {
         &self,
         record_id: RecordId,
         number: u32,
-        record: &mut RecordSummary,
+        record: &mut Summary,
     ) -> Result<bool> {
         let Some(interpolation) = self.pack.interpolation(record_id)? else {
             return Ok(false);
@@ -896,10 +896,10 @@ impl PackTextSearcher {
         let Some([lon, lat]) = self.spatial.point_along_line(record_id, fraction)? else {
             return Ok(false);
         };
-        record.point = Some(RecordPoint {
+        record.point = Some(Point {
             lon,
             lat,
-            precision: RecordPointPrecision::Estimated,
+            precision: PointPrecision::Estimated,
         });
         if let Some(label) = labels::estimated_address_label(number, &interpolation.address) {
             record.label = label;
@@ -1126,19 +1126,19 @@ impl PackTextSearcher {
         Ok(TextSearchHit {
             record_id: nearer.record_id,
             score: 0.0,
-            record: RecordSummary {
+            record: Summary {
                 id: labels::estimated_address_id(number, &id(low)?, &id(high)?),
                 layer: Layer::Address.as_str().to_string(),
                 name: labels::address_name(&address),
                 label: labels::address_label(&address),
                 address: Address::from(&address),
                 category: None,
-                point: Some(RecordPoint {
+                point: Some(Point {
                     lon,
                     lat,
-                    precision: RecordPointPrecision::Estimated,
+                    precision: PointPrecision::Estimated,
                 }),
-                source: RecordSource {
+                source: Source {
                     dataset: "osm".to_string(),
                     object_type: None,
                     object_id: None,
@@ -1265,7 +1265,7 @@ struct TieBreak {
 }
 
 impl TieBreak {
-    fn new(record: &RecordSummary, query_words: &HashSet<&str>) -> Self {
+    fn new(record: &Summary, query_words: &HashSet<&str>) -> Self {
         let extra_label_tokens = normalize_index_text(&record.label)
             .map(|label| {
                 label
@@ -1275,10 +1275,10 @@ impl TieBreak {
             })
             .unwrap_or_default();
         let precision = match record.point.map(|point| point.precision) {
-            Some(RecordPointPrecision::Point) => 0,
-            Some(RecordPointPrecision::Centroid) => 1,
-            Some(RecordPointPrecision::Estimated) => 2,
-            Some(RecordPointPrecision::RepresentativePoint) => 3,
+            Some(PointPrecision::Point) => 0,
+            Some(PointPrecision::Centroid) => 1,
+            Some(PointPrecision::Estimated) => 2,
+            Some(PointPrecision::RepresentativePoint) => 3,
             None => 4,
         };
         let source = match record.source.object_type {
@@ -2535,7 +2535,7 @@ mod tests {
         let estimate = &hits[0].record;
         assert_eq!(estimate.label, "50 Queen Street");
         let point = estimate.point.expect("point");
-        assert_eq!(point.precision, RecordPointPrecision::Estimated);
+        assert_eq!(point.precision, PointPrecision::Estimated);
         assert!((point.lat - 43.0005).abs() < 1e-6, "{point:?}");
         assert!((point.lon + 79.0).abs() < 1e-6, "{point:?}");
 
@@ -2917,7 +2917,7 @@ mod tests {
         assert_eq!(estimate.label, "14 Bayview Avenue");
         assert_eq!(estimate.id, "derived:estimate:14:osm:node:10:osm:node:11");
         let point = estimate.point.expect("point");
-        assert_eq!(point.precision, RecordPointPrecision::Estimated);
+        assert_eq!(point.precision, PointPrecision::Estimated);
         assert!((point.lat - 43.0014).abs() < 1e-9, "{point:?}");
         assert!((point.lon + 79.0002).abs() < 1e-9, "{point:?}");
         assert_eq!(
