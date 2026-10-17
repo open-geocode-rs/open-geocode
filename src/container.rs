@@ -51,7 +51,7 @@ pub struct SectionInfo {
 }
 
 #[derive(Debug)]
-pub struct ContainerWriter {
+pub struct Writer {
     path: PathBuf,
     file: BufWriter<File>,
     offset: u64,
@@ -76,7 +76,7 @@ impl fmt::Debug for OpenSection {
     }
 }
 
-impl ContainerWriter {
+impl Writer {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file =
@@ -200,7 +200,7 @@ impl ContainerWriter {
     }
 }
 
-impl Write for ContainerWriter {
+impl Write for Writer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let Some(section) = &mut self.open else {
             return Err(io::Error::other("Pack bytes written outside a section"));
@@ -427,7 +427,7 @@ mod tests {
         let path = temp_file("round-trip");
         let source = temp_file("source");
         std::fs::write(&source, b"from a file").expect("source");
-        let mut writer = ContainerWriter::create(&path).expect("writer");
+        let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 3, b"abc").expect("alpha");
         writer.begin("beta", 1).expect("begin");
         writer.write_all(b"streamed ").expect("write");
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn verify_catches_a_flipped_byte_inside_a_section() {
         let path = temp_file("checksum");
-        let mut writer = ContainerWriter::create(&path).expect("writer");
+        let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 1, &[7u8; 4096]).expect("alpha");
         writer.add("beta", 1, b"untouched").expect("beta");
         writer.finish().expect("finish");
@@ -490,11 +490,11 @@ mod tests {
     #[test]
     fn appends_sections_to_a_finished_file() {
         let path = temp_file("append");
-        let mut writer = ContainerWriter::create(&path).expect("writer");
+        let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 1, b"first").expect("alpha");
         writer.finish().expect("finish");
 
-        let mut writer = ContainerWriter::append(&path).expect("append");
+        let mut writer = Writer::append(&path).expect("append");
         writer.add("beta", 2, b"added later").expect("beta");
         assert!(writer.add("alpha", 1, b"again").is_err());
         let size = writer.finish().expect("finish");
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn rejects_truncated_files() {
         let path = temp_file("truncated");
-        let mut writer = ContainerWriter::create(&path).expect("writer");
+        let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 1, b"abcdef").expect("alpha");
         writer.finish().expect("finish");
         let bytes = std::fs::read(&path).expect("read");

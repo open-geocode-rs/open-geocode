@@ -41,7 +41,7 @@ use unicode_script::{Script, UnicodeScript};
 
 use super::{CountryCode, dictionary_key, is_numeral, is_unspaced, mask_numerals};
 use crate::{
-    container::{Bytes, Container, ContainerWriter},
+    container::{Bytes, Container, Writer},
     context::AdminContextTuple,
     pack::{RecordContext, RecordId},
     record::{AddressComponents, PlaceLayer, Record},
@@ -917,7 +917,7 @@ impl Builder {
     /// ([`admin_aliases`]) that names no area of another level.
     pub fn finish(
         self,
-        pack: &mut ContainerWriter,
+        pack: &mut Writer,
         area_names: &HashMap<RecordId, Vec<String>>,
     ) -> Result<()> {
         let Self {
@@ -1583,7 +1583,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("og-dictionary-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         builder.finish(&mut pack, &names).expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
@@ -1642,7 +1642,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("og-aliases-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         builder.finish(&mut pack, &names).expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
@@ -1703,7 +1703,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("og-units-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         builder.finish(&mut pack, &HashMap::new()).expect("finish");
         pack.finish().expect("seal");
         let dictionaries =

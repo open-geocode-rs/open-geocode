@@ -28,7 +28,7 @@ use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
 
 use crate::{
-    container::{Bytes, Container, ContainerWriter},
+    container::{self, Bytes, Container},
     extsort::{ExternalSorter, Scratch, SortStats, Spill},
     memory::Budget,
     pack::RecordId,
@@ -161,7 +161,7 @@ impl RecordCells {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SpatialCommit {
+pub struct Commit {
     pub point_count: u64,
     pub segment_count: u64,
     pub cell_count: u64,
@@ -171,14 +171,14 @@ pub struct SpatialCommit {
 }
 
 #[derive(Debug)]
-pub struct SpatialIndexWriter {
+pub struct Writer {
     fine: ExternalSorter<CellRef>,
     context: ExternalSorter<CellRef>,
     points: u64,
     segments: u64,
 }
 
-impl SpatialIndexWriter {
+impl Writer {
     pub fn new(scratch: &Arc<Scratch>, budget: &Arc<Budget>, share_bytes: usize) -> Self {
         Self {
             fine: ExternalSorter::new(scratch, "spatial-fine", budget, share_bytes),
@@ -200,12 +200,12 @@ impl SpatialIndexWriter {
         Ok(())
     }
 
-    pub fn finish(self, pack: &mut ContainerWriter) -> Result<SpatialCommit> {
+    pub fn finish(self, pack: &mut container::Writer) -> Result<Commit> {
         let fine_pairs = self.fine.stats();
         let context_pairs = self.context.stats();
         let cell_count = write_cell_index(pack, FINE, self.fine)?;
         let context_cell_count = write_cell_index(pack, CONTEXT, self.context)?;
-        Ok(SpatialCommit {
+        Ok(Commit {
             point_count: self.points,
             segment_count: self.segments,
             cell_count,
@@ -217,7 +217,7 @@ impl SpatialIndexWriter {
 }
 
 fn write_cell_index(
-    pack: &mut ContainerWriter,
+    pack: &mut container::Writer,
     name: &str,
     pairs: ExternalSorter<CellRef>,
 ) -> Result<u64> {
@@ -232,7 +232,7 @@ fn write_cell_index(
     let mut refs = Vec::new();
 
     pack.begin(&format!("{name}/data"), SPATIAL_VERSION)?;
-    let mut flush = |pack: &mut ContainerWriter,
+    let mut flush = |pack: &mut container::Writer,
                      cell: u64,
                      points: &mut Vec<u64>,
                      segments: &mut Vec<u64>|
@@ -404,16 +404,16 @@ impl CellTable {
 }
 
 #[derive(Clone)]
-pub struct SpatialIndexReader {
+pub struct Reader {
     fine: CellTable,
     context: CellTable,
     records: RecordsReader,
 }
 
-impl std::fmt::Debug for SpatialIndexReader {
+impl std::fmt::Debug for Reader {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("SpatialIndexReader")
+            .debug_struct("Reader")
             .field("fine_blocks", &self.fine.block_count)
             .field("context_blocks", &self.context.block_count)
             .finish()
@@ -426,7 +426,7 @@ struct LineCache {
     lengths: Vec<f64>,
 }
 
-impl SpatialIndexReader {
+impl Reader {
     pub fn open(container: &Container, records: RecordsReader) -> Result<Self> {
         Ok(Self {
             fine: CellTable::open(container, FINE)?,
@@ -911,12 +911,12 @@ mod tests {
 
     /// Build a Pack holding only records and the spatial index, with a sorter
     /// budget small enough to force spilling.
-    fn build(records: &[Record]) -> (SpatialIndexReader, SpatialCommit) {
+    fn build(records: &[Record]) -> (Reader, Commit) {
         let root =
             std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let mut writer = RecordsWriter::create(&scratch, &Budget::unlimited()).expect("records");
-        let mut spatial = SpatialIndexWriter::new(&scratch, &Budget::unlimited(), 64);
+        let mut spatial = Writer::new(&scratch, &Budget::unlimited(), 64);
         for record in records {
             let id = writer.write(record, None).expect("write");
             spatial
@@ -924,14 +924,14 @@ mod tests {
                 .expect("add");
         }
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = container::Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("records finish");
         let commit = spatial.finish(&mut pack).expect("spatial finish");
         pack.finish().expect("pack finish");
         let container = Container::open(&path).expect("open");
         let records = RecordsReader::open(&container).expect("records reader");
         (
-            SpatialIndexReader::open(&container, records).expect("spatial reader"),
+            Reader::open(&container, records).expect("spatial reader"),
             commit,
         )
     }

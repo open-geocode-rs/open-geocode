@@ -70,7 +70,7 @@ pub(super) fn publish(
     if text.reader()?.searcher().num_docs() != manifest.record_count {
         bail!("text index document count does not match Pack records");
     }
-    crate::spatial_index::SpatialIndexReader::open(reader.container(), reader.records().clone())?;
+    crate::spatial_index::Reader::open(reader.container(), reader.records().clone())?;
     drop((reader, text));
 
     sync_tree(generation)?;

@@ -31,10 +31,10 @@ use crate::{
     record::{
         AddressComponents, DERIVED_FROM_ADDRESS_RECORDS, Layer, OsmObjectType, PoiRecord, Record,
     },
-    spatial_index::SpatialIndexReader,
+    spatial_index::Reader,
     text_index::{
-        HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
-        TextIndexFields, base_house_number, compact_postcode, expand_address_abbreviations,
+        Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
+        RANK_POSTCODE_FIELD, base_house_number, compact_postcode, expand_address_abbreviations,
         expand_final_direction, is_numeric_token, normalize_index_text, open_text_index,
         street_search_text,
     },
@@ -42,9 +42,9 @@ use crate::{
 
 pub struct PackTextSearcher {
     pack: Arc<PackReader>,
-    spatial: SpatialIndexReader,
+    spatial: Reader,
     reader: IndexReader,
-    fields: TextIndexFields,
+    fields: Fields,
     /// Labels the words of a query from the Pack's own dictionaries.
     tagger: Arc<LatticeTagger>,
     /// The fast fields ranking reads, per segment. The Pack's index never
@@ -145,9 +145,9 @@ impl PackTextSearcher {
     pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
         let index = open_text_index(pack.container())?;
         let schema = index.schema();
-        let fields = TextIndexFields::from_schema(&schema)?;
+        let fields = Fields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
-        let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
+        let spatial = Reader::open(pack.container(), pack.records().clone())?;
         let tagger = Arc::new(LatticeTagger::from_container(pack.container())?);
         let mut columns = HashMap::new();
         for segment in reader.searcher().segment_readers() {

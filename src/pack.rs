@@ -29,8 +29,8 @@ use serde_json::Value;
 use tantivy::TantivyDocument;
 
 use crate::{
-    container::{Container, ContainerWriter},
-    context::{ContextReader, ContextTupleWriter},
+    container::{self, Container},
+    context::{self, TupleWriter},
     extsort::Scratch,
     labels,
     memory::Budget,
@@ -40,8 +40,8 @@ use crate::{
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
-    spatial_index::{RecordCells, SpatialIndexWriter},
-    text_index::{PostcodeAreas, TextIndexFields, TextIndexWriter},
+    spatial_index::{self, RecordCells},
+    text_index::{self, PostcodeAreas},
 };
 
 pub use crate::{
@@ -145,9 +145,9 @@ pub struct PackWriter {
     generation: GenerationGuard,
     scratch: Arc<Scratch>,
     records: RecordsWriter,
-    contexts: ContextTupleWriter,
-    text: TextIndexWriter,
-    spatial: SpatialIndexWriter,
+    contexts: TupleWriter,
+    text: text_index::Writer,
+    spatial: spatial_index::Writer,
     layer_counts: BTreeMap<Layer, u64>,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     postcode_areas: Arc<PostcodeAreas>,
@@ -206,13 +206,17 @@ impl PackWriter {
         )?;
         Ok(Self {
             records: RecordsWriter::create(&scratch, &options.memory)?,
-            contexts: ContextTupleWriter::default(),
-            text: TextIndexWriter::create(
+            contexts: TupleWriter::default(),
+            text: text_index::Writer::create(
                 &scratch,
                 &options.memory,
                 options.text_index_memory_bytes,
             )?,
-            spatial: SpatialIndexWriter::new(&scratch, &options.memory, options.sort_budget_bytes),
+            spatial: spatial_index::Writer::new(
+                &scratch,
+                &options.memory,
+                options.sort_budget_bytes,
+            ),
             scratch,
             destination,
             generation,
@@ -339,7 +343,7 @@ impl PackWriter {
             ..
         } = self;
         let path = generation.path.join(PACK_FILE);
-        let mut pack = ContainerWriter::create(&path)?;
+        let mut pack = container::Writer::create(&path)?;
         let record_count = records.record_count();
         let string_count = records.string_count();
         let context_tuple_count = contexts.tuple_count();
@@ -436,7 +440,7 @@ impl SealedPack {
     /// Add a section made from the sealed Pack itself, such as the parser
     /// weights trained on its records. Nothing reads the Pack file yet.
     pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
-        let mut pack = ContainerWriter::append(self.path())?;
+        let mut pack = container::Writer::append(self.path())?;
         pack.add(name, version, bytes)?;
         self.bytes = pack.finish()?;
         Ok(())
@@ -459,7 +463,7 @@ pub struct PackReader {
     container: Container,
     manifest: PackManifest,
     records: RecordsReader,
-    context: ContextReader,
+    context: context::Reader,
 }
 
 impl std::fmt::Debug for PackReader {
@@ -495,7 +499,7 @@ impl PackReader {
                 manifest.record_count
             );
         }
-        let context = ContextReader::open(&container)?;
+        let context = context::Reader::open(&container)?;
         Ok(Self {
             path,
             container,
@@ -654,7 +658,7 @@ impl PackReader {
 #[derive(Debug)]
 pub struct BatchPreparer {
     next: RecordId,
-    fields: TextIndexFields,
+    fields: text_index::Fields,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     postcode_areas: Arc<PostcodeAreas>,
 }

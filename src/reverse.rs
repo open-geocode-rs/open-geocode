@@ -7,7 +7,7 @@ use crate::{
     labels,
     pack::{ContextRecord, PackReader, RecordId},
     record::{AddressComponents, InterpolationAddressComponents, Layer, PoiRecord, Record},
-    spatial_index::SpatialIndexReader,
+    spatial_index::Reader,
 };
 
 const ADDRESS_RADIUS_M: f64 = 30.0;
@@ -19,7 +19,7 @@ const CANDIDATE_LIMIT: usize = 16;
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
     pack: Arc<PackReader>,
-    spatial: SpatialIndexReader,
+    spatial: Reader,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,7 +118,7 @@ impl PackReverseGeocoder {
 
     /// Open the spatial index using an existing shared pack reader.
     pub fn from_pack(pack: Arc<PackReader>) -> Result<Self> {
-        let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
+        let spatial = Reader::open(pack.container(), pack.records().clone())?;
         Ok(Self { pack, spatial })
     }
 

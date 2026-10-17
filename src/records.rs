@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 
 use crate::{
     api::Address,
-    container::{Bytes, Container, ContainerWriter},
+    container::{Bytes, Container, Writer},
     extsort::Scratch,
     memory::{Budget, Reservation},
     pack::RecordId,
@@ -565,7 +565,7 @@ impl RecordsWriter {
     }
 
     /// Copy the store into the Pack.
-    pub fn finish(mut self, pack: &mut ContainerWriter) -> Result<()> {
+    pub fn finish(mut self, pack: &mut Writer) -> Result<()> {
         self.flush_block()?;
         self.blocks.flush()?;
         self.block_offsets.flush()?;
@@ -1400,7 +1400,7 @@ mod tests {
             assert_eq!(id, index as u64);
         }
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
         RecordsReader::open(&Container::open(&path).expect("open")).expect("reader")
@@ -1516,7 +1516,7 @@ mod tests {
         );
         assert!(budget.peak() < 200 * (DICTIONARY_ENTRY_OVERHEAD + 16));
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
         let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
@@ -1552,7 +1552,7 @@ mod tests {
         );
         assert!(writer.strings.segments.len() > 1);
         let path = root.join("pack.ogp");
-        let mut pack = ContainerWriter::create(&path).expect("pack");
+        let mut pack = Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
         let reader = RecordsReader::open(&Container::open(&path).expect("open")).expect("reader");
