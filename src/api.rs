@@ -8,7 +8,7 @@
 //! compare real answers with the committed examples in
 //! `contract/responses/`, so a change to the shape lands with its examples.
 //!
-//! The same features are the result columns of `batch-geocode`
+//! The same features are the result columns of `geocode batch`
 //! ([`flat_columns`]), so a CSV row and a JSON answer never drift apart
 //! either.
 
@@ -664,7 +664,7 @@ fn common(
 }
 
 /// The result columns of one forward feature, by name, in the order
-/// `batch-geocode` writes them. With no feature the same columns come back
+/// `geocode batch` writes them. With no feature the same columns come back
 /// empty, so this is also the one list of column names.
 pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, String)> {
     let properties = feature.map(|feature| &feature.properties);

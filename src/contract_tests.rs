@@ -1,7 +1,7 @@
 //! The response contract checked against what the code produces (ADR 0022):
 //! real `/search`, `/autocomplete` and `/reverse` answers from the router on
 //! a small Pack are the committed examples in `contract/responses/`, and the
-//! batch-geocode audit columns are the committed
+//! geocode batch audit columns are the committed
 //! `contract/batch-audit-columns.txt`. A change to the shape of an answer
 //! fails here until its examples are regenerated, with
 //! `OG_UPDATE_CONTRACT=1 cargo test contract`, and committed with it.

@@ -663,7 +663,7 @@
     },
     "/geocode": {
       "get": {
-        "description": "For callers who hold a street address, a town and a postcode in separate\nfields and would otherwise have to paste them into one string and hope the\nparser pulls them apart again. The street address is searched on its own\nand hits are kept only where they fit the locality, region and postcode\ngiven, so a town in the address cannot outrank the street.\n\nThis is the lookup `batch-geocode` runs per row, over HTTP.\n\nThe answer is the same FeatureCollection every other route returns, with\nat most one feature: `features` holds the one match, or is empty when\nnothing fits. `geocoding.query` is the rewrite that matched, which is not\nalways the address as it was sent.",
+        "description": "For callers who hold a street address, a town and a postcode in separate\nfields and would otherwise have to paste them into one string and hope the\nparser pulls them apart again. The street address is searched on its own\nand hits are kept only where they fit the locality, region and postcode\ngiven, so a town in the address cannot outrank the street.\n\nThis is the lookup `geocode batch` runs per row, over HTTP.\n\nThe answer is the same FeatureCollection every other route returns, with\nat most one feature: `features` holds the one match, or is empty when\nnothing fits. `geocoding.query` is the rewrite that matched, which is not\nalways the address as it was sent.",
         "operationId": "geocode",
         "parameters": [
           {

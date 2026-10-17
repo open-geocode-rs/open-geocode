@@ -362,7 +362,7 @@ pub(crate) async fn autocomplete(
 /// and hits are kept only where they fit the locality, region and postcode
 /// given, so a town in the address cannot outrank the street.
 ///
-/// This is the lookup `batch-geocode` runs per row, over HTTP.
+/// This is the lookup `geocode batch` runs per row, over HTTP.
 ///
 /// The answer is the same FeatureCollection every other route returns, with
 /// at most one feature: `features` holds the one match, or is empty when

@@ -1,6 +1,6 @@
 //! The batch geocoding flow: a file of addresses is read, the columns that
 //! make up the address are picked, and the file is geocoded by the engine's
-//! batch run, the same `open-geocode batch-geocode` does, into a new file
+//! batch run, the same `open-geocode geocode batch` does, into a new file
 //! beside it. Text pasted into the batch tab is read the same way.
 //!
 //! A row's address is its picked cells joined in file order into one line,

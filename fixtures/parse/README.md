@@ -1,6 +1,6 @@
 # Parse fixtures
 
-Gold rows and stored libpostal predictions for `open-geocode parse-bench`.
+Gold rows and stored libpostal predictions for `open-geocode parse bench`.
 `docs/parse-eval.md` describes the benchmark, the scoring and the results.
 
 ## Provenance
@@ -14,7 +14,7 @@ It is the only gold source.
 `scripts/parse-eval/sample_libpostal.py` streams the dump once and keeps each row of a wanted country with probability 0.5 from a generator seeded with 2026, until it holds 5000 rows per country.
 The sampler draws once per eligible row of 14 countries (`ca ch de hu jp in id gr ru gb fr us au it`), so its country list is part of the sample's definition and must stay as it is to reproduce the rows.
 The benchmark uses five of them: `ca`, `fr`, `de`, `ru` and `jp`.
-Rows are kept unchanged, with libpostal's labels, and `parse-fixture normalize` maps and normalizes them.
+Rows are kept unchanged, with libpostal's labels, and `parse fixture normalize` maps and normalizes them.
 
 ## Layout
 
@@ -93,12 +93,12 @@ Run Python with `-I`, never run anything from the downloaded data, and keep the 
 ```sh
 curl -sL https://archive.org/download/libpostal-parser-training-data-20170304/formatted_addresses_tagged.random.tsv.gz \
   | gzip -dc | python -I scripts/parse-eval/sample_libpostal.py --out-dir tmp/raw/libpostal
-cargo run --release -- parse-fixture normalize --scheme libpostal --input tmp/raw/libpostal --countries jp --output fixtures/parse/gold
-cargo run --release -- parse-fixture queries --gold fixtures/parse/gold --countries jp --output tmp/queries
+cargo run --release -- parse fixture normalize --scheme libpostal --input tmp/raw/libpostal --countries jp --output fixtures/parse/gold
+cargo run --release -- parse fixture queries --gold fixtures/parse/gold --countries jp --output tmp/queries
 docker run -d --memory=3g --name og-parse-eval-libpostal -p 127.0.0.1:4400:4400 pelias/libpostal-service:latest
 python -I scripts/parse-eval/libpostal_answers.py --queries tmp/queries --countries jp --out tmp/answers/libpostal
 docker rm -f og-parse-eval-libpostal
-cargo run --release -- parse-fixture align --scheme libpostal --gold fixtures/parse/gold --countries jp --input tmp/answers/libpostal --output fixtures/parse/predictions/libpostal
+cargo run --release -- parse fixture align --scheme libpostal --gold fixtures/parse/gold --countries jp --input tmp/answers/libpostal --output fixtures/parse/predictions/libpostal
 ```
 
 For more countries, pass a comma-separated list such as `--countries ca,fr,de,ru,jp` to each command.
