@@ -9,7 +9,7 @@ use rstar::{AABB, RTree, RTreeObject};
 
 use crate::{
     builder::report::BuilderReport,
-    context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext},
+    context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext, TierSet},
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
@@ -92,6 +92,11 @@ pub(crate) struct SourceContext<'a> {
 struct AcceptedBoundary {
     record_id: RecordId,
     layer: PlaceLayer,
+    /// Everything this area is. Usually just `layer`, but a boundary whose
+    /// own `place` tag names a different tier is both: Berlin is a German
+    /// state by its admin level and a city by its tag, and an address there
+    /// has to answer a query for either.
+    tiers: TierSet,
     name: String,
     /// `None` for a place drawn as an area.
     admin_level: Option<u8>,
@@ -326,6 +331,7 @@ impl BoundarySet {
                 Some(AcceptedBoundary {
                     record_id: *record_id,
                     layer: boundary.layer,
+                    tiers: boundary_tiers(&boundary),
                     area: boundary.geometry.unsigned_area(),
                     bounds,
                     inferred_country_record_id: boundary
@@ -456,11 +462,15 @@ impl BoundaryIndex {
             }
         }
 
-        let mut tuple = AdminContextTuple::from_tiers(
-            PlaceLayer::ALL
-                .into_iter()
-                .filter_map(|tier| Some((tier, best[tier as usize]?.record_id))),
-        );
+        // Each tier takes the best boundary ranked into it, and a boundary
+        // that is more than one thing is set under each: it stays one entry
+        // of the chain carrying both tiers.
+        let mut tuple =
+            AdminContextTuple::from_tiers(PlaceLayer::ALL.into_iter().flat_map(|tier| {
+                best[tier as usize].into_iter().flat_map(move |boundary| {
+                    boundary.tiers.iter().map(|at| (at, boundary.record_id))
+                })
+            }));
         if tuple.country_record_id().is_none()
             && let Some(country) = best[PlaceLayer::Region as usize]
                 .and_then(|region| region.inferred_country_record_id)
@@ -1311,6 +1321,33 @@ impl Countries {
     }
 }
 
+/// Every tier an area is: the one the ranking gave it, and the one its own
+/// `place` tag names where that differs.
+///
+/// Only an admin boundary gains a second tier. A place area takes its layer
+/// from its tag in the first place, so the two can never disagree, and
+/// giving it both would say an island is also a city.
+fn boundary_tiers(boundary: &BuiltBoundary) -> TierSet {
+    let mut tiers = TierSet::of(boundary.layer);
+    // The tag is what the ranking reads to place a level in the first place,
+    // so it is a second role only where it disagrees with what the level
+    // itself means: Berlin's relation is an admin level 4, a state
+    // everywhere else in Germany, tagged `place=city`. A suburb tagged
+    // `place=suburb` says nothing its level did not already say, and taking
+    // it as a second role would file every one of them under two tiers.
+    let Some(conventional) = boundary.admin_level.and_then(conventional_admin_layer) else {
+        return tiers;
+    };
+    if let Some(tagged) = boundary.place_layer
+        && tagged != PlaceLayer::Place
+        && tagged.record_layer() != conventional.record_layer()
+        && tagged.record_layer() != boundary.layer.record_layer()
+    {
+        tiers.insert(tagged);
+    }
+    tiers
+}
+
 /// Boundaries at or above this level are countries whatever their depth.
 const COUNTRY_ADMIN_LEVEL: u8 = 2;
 
@@ -1443,6 +1480,93 @@ mod tests {
                 "the smallest covering boundary, whatever the order"
             );
             assert_eq!(assignment.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);
+        }
+    }
+
+    /// A boundary that is two things reaches a point as both. Berlin's
+    /// relation is a German state by its admin level and a city by its
+    /// `place` tag; an address there has to answer a query for its state
+    /// and one for its city, which one tier per area cannot do.
+    #[test]
+    fn a_dual_role_boundary_carries_both_tiers_to_a_point() {
+        let germany = square_boundary(1, "Deutschland", PlaceLayer::Country, -9.0, -9.0, 9.0, 9.0);
+        let mut berlin = square_boundary(2, "Berlin", PlaceLayer::Region, -1.0, -1.0, 1.0, 1.0);
+        berlin.tiers = [PlaceLayer::Region, PlaceLayer::Locality]
+            .into_iter()
+            .collect();
+        let index = BoundaryIndex::new(vec![germany, berlin]);
+
+        let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+
+        let tuple = &assignment.admin_context;
+        assert_eq!(tuple.get(PlaceLayer::Region), Some(2), "Berlin the state");
+        assert_eq!(tuple.get(PlaceLayer::Locality), Some(2), "Berlin the city");
+        assert_eq!(tuple.get(PlaceLayer::Country), Some(1));
+        assert_eq!(tuple.entries().len(), 2, "one entry for Berlin: {tuple:?}");
+    }
+
+    /// A boundary is two tiers only where its `place` tag disagrees with
+    /// what its admin level means. The tag is what the ranking reads to
+    /// place a level, so taking it as a second role whenever it differs
+    /// from the ranked tier files every tagged suburb under two tiers --
+    /// which it did, putting every ACT suburb in both the neighbourhood and
+    /// the sub-locality of its address.
+    #[test]
+    fn only_a_tag_that_contradicts_the_level_is_a_second_tier() {
+        // Berlin: an admin level 4, a state everywhere else in Germany,
+        // tagged a city.
+        let mut berlin = test_boundary(PlaceLayer::Region);
+        berlin.admin_level = Some(4);
+        berlin.place_layer = Some(PlaceLayer::Locality);
+        assert_eq!(
+            boundary_tiers(&berlin).iter().collect::<Vec<_>>(),
+            [PlaceLayer::Region, PlaceLayer::Locality],
+            "a state that is also a city"
+        );
+
+        // An ACT suburb: tagged a suburb, ranked below the locality. The
+        // tag agrees with the level, so there is no second role.
+        let mut suburb = test_boundary(PlaceLayer::SubLocality);
+        suburb.admin_level = Some(10);
+        suburb.place_layer = Some(PlaceLayer::Neighbourhood);
+        assert_eq!(
+            boundary_tiers(&suburb).iter().collect::<Vec<_>>(),
+            [PlaceLayer::SubLocality],
+            "a suburb is one thing"
+        );
+
+        // A place area takes its layer from its tag, so the two can never
+        // disagree and an island is never also a city.
+        let mut area = test_boundary(PlaceLayer::Place);
+        area.admin_level = None;
+        area.place_layer = Some(PlaceLayer::Place);
+        assert_eq!(
+            boundary_tiers(&area).iter().collect::<Vec<_>>(),
+            [PlaceLayer::Place],
+            "an island is not also a city"
+        );
+    }
+
+    fn test_boundary(layer: PlaceLayer) -> BuiltBoundary {
+        let ring = LineString::from(vec![
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, -1.0),
+        ]);
+        let geometry = MultiPolygon::new(vec![Polygon::new(ring, Vec::new())]);
+        BuiltBoundary {
+            layer,
+            admin_level: Some(4),
+            place_type: None,
+            name: "Test".to_string(),
+            alt_names: Vec::new(),
+            place_layer: None,
+            designation: None,
+            inferred_country_code: None,
+            representative_point: representative_point(&geometry).expect("point"),
+            geometry,
         }
     }
 
@@ -1928,6 +2052,7 @@ mod tests {
         AcceptedBoundary {
             record_id,
             layer,
+            tiers: TierSet::of(layer),
             name: name.to_string(),
             admin_level: Some(8),
             inferred_country_record_id: None,

@@ -876,9 +876,13 @@ impl Builder {
             .collect::<Vec<_>>();
         // Walked rather than listed per tier, so a tier added to the chain is
         // indexed without a second place to remember.
-        let tiers = tuple.entries().iter().map(|entry| {
-            let (field, level) = field_and_level(entry.tier);
-            (field, level, Some(entry.record_id))
+        // An area that is two tiers is indexed under both: Berlin has to be
+        // found as a city and as a state.
+        let tiers = tuple.entries().iter().flat_map(|entry| {
+            entry.tiers.iter().map(move |tier| {
+                let (field, level) = field_and_level(tier);
+                (field, level, Some(entry.record_id))
+            })
         });
         for (field, level, area) in groups.into_iter().chain(tiers) {
             if let Some(area) = area {
