@@ -947,8 +947,8 @@ const PLACE_TAG_AGREEMENT: f64 = 0.8;
 /// that one sparsely mapped region cannot classify differently to its
 /// neighbours, the usual way a relative-depth scheme goes wrong.
 fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<String> {
-    let countries = country_of_each_boundary(candidates);
-    let (verdicts, unmatched) = table_layers(candidates, &countries);
+    let (countries, country_ids) = Countries::intern(country_of_each_boundary(candidates));
+    let (verdicts, unmatched) = table_layers(candidates, &countries, &country_ids);
     // A boundary the table says is no area of the Pack (a group of regions)
     // goes, and the rest are ranked without it.
     let keep = verdicts
@@ -957,7 +957,7 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
         .collect::<Vec<_>>();
     let mut kept = keep.iter();
     candidates.retain(|_| *kept.next().expect("one verdict per candidate"));
-    let countries = countries
+    let country_ids = country_ids
         .into_iter()
         .zip(&keep)
         .filter_map(|(country, keep)| keep.then_some(country))
@@ -967,22 +967,22 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
         .filter(|verdict| !matches!(verdict, Some(None)))
         .map(Option::flatten)
         .collect::<Vec<_>>();
-    let tagged = tagged_level_layers(candidates, &countries);
+    let tagged = tagged_level_layers(candidates, &country_ids);
 
     // What each country's levels want, before any of them compete. A level
     // the table names, whose boundaries tag what they are, or that follows
     // the convention has a preference; the rest have none and take whatever
     // their depth earns them.
-    let mut wanted: BTreeMap<Option<String>, BTreeMap<u8, Want>> = BTreeMap::new();
+    let mut wanted: BTreeMap<CountryId, BTreeMap<u8, Want>> = BTreeMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let Some(level) = candidate.boundary.admin_level else {
             continue;
         };
-        let country = countries[index].clone();
+        let country = country_ids[index];
         // Whether the tier is stated -- by the table or by the level's own
         // tags -- or only the convention for the number. A stated tier
         // outranks a conventional one when the two want the same place.
-        let stated = verdicts[index].or_else(|| tagged.get(&(country.clone(), level)).copied());
+        let stated = verdicts[index].or_else(|| tagged.get(&(country, level)).copied());
         let want = Want {
             layer: stated.or_else(|| conventional_admin_layer(level)),
             stated: stated.is_some(),
@@ -1012,7 +1012,7 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
     // A country deeper than that runs out at the innermost tier, where the
     // chain keeps the outermost of the pair rather than dropping it.
     const LOCALITY_AT: usize = 5;
-    let mut assigned: BTreeMap<(Option<String>, u8), PlaceLayer> = BTreeMap::new();
+    let mut assigned: BTreeMap<(CountryId, u8), PlaceLayer> = BTreeMap::new();
     for (country, levels) in &wanted {
         // One level of each country anchors the locality tier, the tier an
         // address query matches a town on. It is the outermost level the
@@ -1075,7 +1075,7 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
                 };
                 if at > cap { cap.max(next) } else { at }
             };
-            assigned.insert((country.clone(), level), ADMIN_LAYER_ORDER[at]);
+            assigned.insert((*country, level), ADMIN_LAYER_ORDER[at]);
             next = at + 1;
         }
     }
@@ -1084,7 +1084,7 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
         let Some(level) = candidate.boundary.admin_level else {
             continue;
         };
-        if let Some(layer) = assigned.get(&(countries[index].clone(), level)) {
+        if let Some(layer) = assigned.get(&(country_ids[index], level)) {
             candidate.boundary.layer = *layer;
         }
     }
@@ -1097,14 +1097,15 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
 /// countries that the input lacks.
 fn table_layers(
     candidates: &[BoundaryCandidate],
-    countries: &[Option<String>],
+    countries: &Countries,
+    country_ids: &[CountryId],
 ) -> (Vec<Option<Option<PlaceLayer>>>, Vec<String>) {
     let table = admin_levels();
-    let present = countries
-        .iter()
-        .flatten()
-        .map(|code| code.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
+    // Lower-cased once per country rather than once per boundary: the table
+    // is keyed in lower case and a build has hundreds of thousands of
+    // boundaries across a handful of countries.
+    let lowered = countries.lowercased();
+    let present = lowered.iter().flatten().cloned().collect::<BTreeSet<_>>();
     let by_object = candidates
         .iter()
         .enumerate()
@@ -1117,12 +1118,12 @@ fn table_layers(
         .collect::<HashMap<_, _>>();
     let verdicts = candidates
         .iter()
-        .zip(countries)
+        .zip(country_ids)
         .map(|(candidate, country)| {
-            let country = country.as_ref().map(|code| code.to_ascii_lowercase());
+            let country = country.and_then(|id| lowered[usize::from(id)].as_deref());
             let boundary = admin_levels::Boundary {
                 object: (candidate.source_object_type, candidate.source_object_id),
-                country: country.as_deref(),
+                country,
                 admin_level: candidate.boundary.admin_level,
                 designation: candidate.boundary.designation.as_deref(),
             };
@@ -1152,9 +1153,9 @@ fn table_layers(
 /// Country levels are left to their number.
 fn tagged_level_layers(
     candidates: &[BoundaryCandidate],
-    countries: &[Option<String>],
-) -> BTreeMap<(Option<String>, u8), PlaceLayer> {
-    let mut votes: BTreeMap<(Option<String>, u8), BTreeMap<PlaceLayer, usize>> = BTreeMap::new();
+    countries: &[CountryId],
+) -> BTreeMap<(CountryId, u8), PlaceLayer> {
+    let mut votes: BTreeMap<(CountryId, u8), BTreeMap<PlaceLayer, usize>> = BTreeMap::new();
     for (candidate, country) in candidates.iter().zip(countries) {
         let boundary = &candidate.boundary;
         let Some(level) = boundary
@@ -1165,7 +1166,7 @@ fn tagged_level_layers(
         };
         if let Some(layer) = boundary.place_layer {
             *votes
-                .entry((country.clone(), level))
+                .entry((*country, level))
                 .or_default()
                 .entry(layer)
                 .or_default() += 1;
@@ -1262,6 +1263,52 @@ fn country_of_each_boundary(candidates: &[BoundaryCandidate]) -> Vec<Option<Stri
                 .map(|(_, code)| code.clone())
         })
         .collect()
+}
+
+/// The countries of a build, each code stored once.
+///
+/// Every per-country map of the ranking is keyed by boundary, so a `String`
+/// key meant cloning a code per boundary per lookup. A build sees a handful
+/// of countries and hundreds of thousands of boundaries, so the codes are
+/// interned once and the maps key on the index.
+#[derive(Debug, Default)]
+struct Countries {
+    codes: Vec<String>,
+}
+
+/// Which country a boundary lies in, as an index into [`Countries`].
+/// `None` where the extract gives no code at all, which groups those
+/// boundaries together as one unknown country.
+type CountryId = Option<u16>;
+
+impl Countries {
+    /// Interns `codes`, giving each boundary its id.
+    fn intern(codes: Vec<Option<String>>) -> (Self, Vec<CountryId>) {
+        let mut countries = Self::default();
+        let mut ids = Vec::with_capacity(codes.len());
+        for code in codes {
+            ids.push(code.and_then(|code| countries.id_of(&code)));
+        }
+        (countries, ids)
+    }
+
+    fn id_of(&mut self, code: &str) -> Option<u16> {
+        if let Some(at) = self.codes.iter().position(|held| held == code) {
+            return u16::try_from(at).ok();
+        }
+        let at = u16::try_from(self.codes.len()).ok()?;
+        self.codes.push(code.to_string());
+        Some(at)
+    }
+
+    /// Each country's code in lower case, by id: libpostal's table is keyed
+    /// that way and the codes come off OSM tags in upper.
+    fn lowercased(&self) -> Vec<Option<String>> {
+        self.codes
+            .iter()
+            .map(|code| Some(code.to_ascii_lowercase()))
+            .collect()
+    }
 }
 
 /// Boundaries at or above this level are countries whatever their depth.
@@ -1370,6 +1417,33 @@ mod tests {
 
         assert_eq!(assignment.admin_context.locality_record_id(), Some(10));
         assert_eq!(assignment.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);
+    }
+
+    /// Several boundaries of one tier over a point pick the same one however
+    /// many there are, and flag the point ambiguous. The selection folds over
+    /// the covering set in place rather than collecting each tier and taking
+    /// a minimum, so the tie-break has to stay on the first of equals.
+    #[test]
+    fn one_tier_many_boundaries_picks_the_smallest_and_flags_it() {
+        let big = square_boundary(1, "Big", PlaceLayer::Locality, -2.0, -2.0, 2.0, 2.0);
+        let small = square_boundary(2, "Small", PlaceLayer::Locality, -1.0, -1.0, 1.0, 1.0);
+        let mid = square_boundary(3, "Mid", PlaceLayer::Locality, -1.5, -1.5, 1.5, 1.5);
+
+        for order in [vec![big, small, mid], {
+            let big = square_boundary(1, "Big", PlaceLayer::Locality, -2.0, -2.0, 2.0, 2.0);
+            let small = square_boundary(2, "Small", PlaceLayer::Locality, -1.0, -1.0, 1.0, 1.0);
+            let mid = square_boundary(3, "Mid", PlaceLayer::Locality, -1.5, -1.5, 1.5, 1.5);
+            vec![mid, small, big]
+        }] {
+            let index = BoundaryIndex::new(order);
+            let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+            assert_eq!(
+                assignment.admin_context.locality_record_id(),
+                Some(2),
+                "the smallest covering boundary, whatever the order"
+            );
+            assert_eq!(assignment.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);
+        }
     }
 
     /// The ACT as it really is: a district at 7 and a suburb at 9, nested.
