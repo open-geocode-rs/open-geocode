@@ -15,7 +15,7 @@
         "layer": "locality",
         "name": "Toronto",
         "record_id": 2,
-        "score": 13.355862,
+        "score": 12.95697,
         "source": {
           "dataset": "osm",
           "object_id": 3,
@@ -57,7 +57,7 @@
         "layer": "interpolation",
         "name": "Queen Street",
         "record_id": 6,
-        "score": 1.6739764,
+        "score": 0.8369882,
         "source": {
           "dataset": "osm",
           "object_id": 13,

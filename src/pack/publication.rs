@@ -78,11 +78,24 @@ pub(super) fn publish(
         return Err(Error::ManifestMismatch);
     }
     let text = crate::text_index::open_text_index(reader.container())?;
-    if text.reader()?.searcher().num_docs() != manifest.record_count {
+    let searcher = text.reader()?.searcher();
+    // A street group's document stands for its addresses, so the documents
+    // cover every record once between them.
+    let mut covered = 0;
+    for segment in searcher.segment_readers() {
+        let counts = segment
+            .fast_fields()
+            .u64(crate::text_index::RECORD_COUNT_FIELD)?;
+        covered += (0..segment.max_doc())
+            .filter_map(|doc| counts.first(doc))
+            .sum::<u64>();
+    }
+    if searcher.num_docs() != manifest.text_document_count || covered != manifest.record_count {
         return Err(Error::Inconsistent(
-            "text index document count does not match Pack records".into(),
+            "text index documents do not cover the Pack records".into(),
         ));
     }
+    drop(searcher);
     crate::spatial_index::Reader::open(reader.container(), reader.records().clone())?;
     drop((reader, text));
 

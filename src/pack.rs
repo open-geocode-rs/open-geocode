@@ -26,7 +26,6 @@ use crate::error::{Error, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tantivy::TantivyDocument;
 
 use crate::{
     container::{self, Container},
@@ -316,7 +315,10 @@ impl Writer {
                 None => None,
             };
             self.records.write(&record, context)?;
-            self.text.add(document)?;
+            match document {
+                text_index::Prepared::Document(document) => self.text.add(document)?,
+                text_index::Prepared::Address(document) => self.text.add_address(document)?,
+            }
             self.spatial.add(record_id, &record)?;
             *self.layer_counts.entry(record.layer()).or_default() += 1;
         }
@@ -678,7 +680,7 @@ impl BatchPreparer {
                     .and_then(|id| self.country_codes.get(&id))
                     .map(CountryCode::as_str);
                 Ok(PreparedRecord {
-                    document: self.fields.document(
+                    document: self.fields.prepare(
                         record_id,
                         &record,
                         &names,
@@ -726,7 +728,7 @@ impl PreparedBatch {
 struct PreparedRecord {
     record: Record,
     context: Option<RecordContext>,
-    document: TantivyDocument,
+    document: text_index::Prepared,
     names: RecordNames,
 }
 

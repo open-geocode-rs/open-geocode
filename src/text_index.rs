@@ -38,7 +38,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 9;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 10;
 /// Postcode data within this radius describes where a record is: a record
 /// that states no postcode is ranked by the nearest postcode centroid within
 /// it, and the batch check compares the postcode areas within it.
@@ -63,6 +63,10 @@ const INTERPOLATION_END_FIELD: &str = "interpolation_end";
 pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
 pub(crate) const RANK_POSTCODE_FIELD: &str = "rank_postcode";
 pub(crate) const COUNTRY_CODE_FIELD: &str = "country_code";
+pub(crate) const RECORD_COUNT_FIELD: &str = "record_count";
+/// Addresses one document holds at most, so finding a number in a group reads
+/// a bounded run of records.
+const MAX_GROUP_RECORDS: u64 = 1_024;
 
 pub struct Writer {
     /// Created with the first document, so its buffers are reserved only for
@@ -74,11 +78,24 @@ pub struct Writer {
     path: PathBuf,
     fields: Fields,
     document_count: u64,
+    /// The address group the next address may join.
+    group: Option<Document>,
+}
+
+/// What a record adds to the text index: a document of its own, or, for an
+/// address, its share of the document of its street group.
+#[derive(Debug)]
+pub enum Prepared {
+    Document(TantivyDocument),
+    Address(Box<Document>),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Fields {
     pub record_id: Field,
+    /// How many records from `record_id` on the document stands for: the
+    /// addresses of one street group, else 1.
+    pub record_count: Field,
     pub layer: Field,
     /// What a record is: its name, street or place, house number, unit and
     /// category.
@@ -98,8 +115,9 @@ pub struct Fields {
     /// ranges that contain a requested house number.
     pub interpolation_start: Field,
     pub interpolation_end: Field,
-    /// The number a stated house number starts with ("407" of "407A"), so a
-    /// search finds the numbers nearest one that no record states.
+    /// The smallest number a stated house number starts with ("407" of
+    /// "407A"). Ranking asks only whether a record states one, so a street
+    /// group keeps one value, not one per address.
     pub house_number: Field,
     /// The postcode a record is ranked by: the one it states, else the
     /// nearest postcode centroid (see [`PostcodeAreas`]).
@@ -116,9 +134,13 @@ pub struct Commit {
     pub bytes: u64,
 }
 
+/// The text document of one record, or of the run of addresses a group
+/// document holds: consecutive addresses whose documents differ only in their
+/// numbers and units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub record_id: RecordId,
+    pub record_count: u64,
     /// Layers a `layer` filter finds the record under: its own, and `address`
     /// for a POI that carries one.
     pub layers: Vec<String>,
@@ -128,7 +150,10 @@ pub struct Document {
     /// The names of the street (see [`Fields::street_text`]): a
     /// street's every name, an address's one.
     pub streets: Vec<String>,
-    pub address_number: Option<String>,
+    /// The house numbers of the record, or of each address of a group.
+    pub address_numbers: Vec<String>,
+    /// The units of a group's addresses, searched with what it is.
+    pub units: Vec<String>,
     pub postcode: Option<String>,
     pub autocomplete_subject_text: String,
     /// First and last number of an interpolation range.
@@ -171,6 +196,7 @@ impl Writer {
             path,
             fields,
             document_count: 0,
+            group: None,
         })
     }
 
@@ -209,13 +235,46 @@ impl Writer {
     /// of queuing every record of the build (a batch of documents would be
     /// one message, and the queue would hold thousands of batches).
     pub fn add(&mut self, document: TantivyDocument) -> Result<()> {
+        self.close_group()?;
+        self.add_document(document)
+    }
+
+    fn add_document(&mut self, document: TantivyDocument) -> Result<()> {
         self.writer()?.add_document(document)?;
         self.document_count += 1;
         Ok(())
     }
 
+    /// Index the address `document` projects: into the group of the address
+    /// before it when it is the next record and states the same, else into a
+    /// group of its own.
+    pub fn add_address(&mut self, document: Box<Document>) -> Result<()> {
+        if let Some(group) = &mut self.group
+            && group.record_id + group.record_count == document.record_id
+            && group.record_count < MAX_GROUP_RECORDS
+            && group.same_group(&document)
+        {
+            group.record_count += 1;
+            group.address_numbers.extend(document.address_numbers);
+            group.units.extend(document.units);
+            return Ok(());
+        }
+        self.close_group()?;
+        self.group = Some(*document);
+        Ok(())
+    }
+
+    fn close_group(&mut self) -> Result<()> {
+        if let Some(group) = self.group.take() {
+            let document = self.fields.to_tantivy_document(&group);
+            self.add_document(document)?;
+        }
+        Ok(())
+    }
+
     /// Commit, merge to a single segment and copy the index into the Pack.
     pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
+        self.close_group()?;
         self.writer()?;
         let (mut writer, memory) = self.writer.take().expect("writer created");
         writer.commit()?;
@@ -274,6 +333,7 @@ impl Fields {
     pub fn from_schema(schema: &Schema) -> Result<Self> {
         Ok(Self {
             record_id: schema.get_field("record_id")?,
+            record_count: schema.get_field(RECORD_COUNT_FIELD)?,
             layer: schema.get_field("layer")?,
             content_text: schema.get_field("content_text")?,
             context_text: schema.get_field("context_text")?,
@@ -290,34 +350,51 @@ impl Fields {
         })
     }
 
-    /// Tantivy document for a record. Pure, so callers can build documents in
-    /// parallel before handing them to the writer. `context_names` are the
-    /// admin areas the record lies in.
-    pub fn document(
+    /// What a record adds to the text index. Pure, so callers can prepare
+    /// records in parallel before handing them to the writer.
+    /// `context_names` are the admin areas the record lies in.
+    pub fn prepare(
         self,
         record_id: RecordId,
         record: &Record,
         context_names: &[&str],
         postcode_areas: &PostcodeAreas,
         country_code: Option<&str>,
-    ) -> TantivyDocument {
-        self.to_tantivy_document(&Document::from_record(
+    ) -> Prepared {
+        let document = Document::from_record(
             record_id,
             record,
             context_names,
             postcode_areas,
             country_code,
-        ))
+        );
+        match record {
+            Record::Address(_) => Prepared::Address(Box::new(document)),
+            _ => Prepared::Document(self.to_tantivy_document(&document)),
+        }
     }
 
     fn to_tantivy_document(self, projected: &Document) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
+        document.add_u64(self.record_count, projected.record_count);
         for layer in &projected.layers {
             document.add_text(self.layer, layer);
         }
-        if !projected.content_text.is_empty() {
-            document.add_text(self.content_text, &projected.content_text);
+        let units = unique_parts(
+            projected
+                .units
+                .iter()
+                .filter_map(|unit| search_text(unit))
+                .collect(),
+        );
+        let content_text = std::iter::once(projected.content_text.as_str())
+            .chain(units.iter().map(String::as_str))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !content_text.is_empty() {
+            document.add_text(self.content_text, &content_text);
         }
         if !projected.context_text.is_empty() {
             document.add_text(self.context_text, &projected.context_text);
@@ -326,20 +403,19 @@ impl Fields {
         for street in &projected.streets {
             add_text_if_present(&mut document, self.street_text, Some(street));
         }
-        // Each value of a list ("12;14") is a house number of its own.
-        for number in projected
-            .address_number
-            .iter()
-            .flat_map(|number| number.split(';'))
-        {
-            add_normalized_text_if_present(&mut document, self.address_number, Some(number));
+        let mut terms = BTreeSet::new();
+        let mut lowest: Option<u32> = None;
+        for number in &projected.address_numbers {
+            terms.extend(address_number_terms(number));
+            if let Some(base) = base_house_number(number) {
+                lowest = Some(lowest.map_or(base, |lowest| lowest.min(base)));
+            }
         }
-        if let Some(number) = projected
-            .address_number
-            .as_deref()
-            .and_then(base_house_number)
-        {
-            document.add_u64(self.house_number, number.into());
+        for term in &terms {
+            document.add_text(self.address_number, term);
+        }
+        if let Some(base) = lowest {
+            document.add_u64(self.house_number, base.into());
         }
         add_normalized_text_if_present(
             &mut document,
@@ -367,6 +443,21 @@ impl Fields {
 }
 
 impl Document {
+    /// Whether `other` belongs to this document's group: it states the same
+    /// in every field but its numbers and units.
+    fn same_group(&self, other: &Self) -> bool {
+        self.layers == other.layers
+            && self.content_text == other.content_text
+            && self.context_text == other.context_text
+            && self.name == other.name
+            && self.streets == other.streets
+            && self.postcode == other.postcode
+            && self.autocomplete_subject_text == other.autocomplete_subject_text
+            && self.interpolation_range == other.interpolation_range
+            && self.rank_postcode == other.rank_postcode
+            && self.country_code == other.country_code
+    }
+
     /// What a record is and where it is go to separate fields, so a word that
     /// names what is sought is not matched by an area's name ("Kingston Road"
     /// by an address in Kingston, "Danforth Avenue" by one in the Danforth
@@ -416,9 +507,14 @@ impl Document {
     }
 
     fn project_address(record_id: RecordId, address: &AddressRecord) -> ProjectionBuilder {
+        // Named by its street alone, and its number and unit kept apart, so
+        // the addresses of one street project alike and share a group.
         let mut builder = ProjectionBuilder::new(record_id, "address");
-        builder.name_for_search(&address.name());
-        builder.address(&address.address);
+        if let Some(subject) = address.address.subject() {
+            builder.name_for_search(subject);
+        }
+        builder.address_parts(&address.address);
+        builder.projected.units.extend(address.address.unit.clone());
         builder
     }
 
@@ -566,6 +662,7 @@ impl Directory for PackDirectory {
 fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let record_id = builder.add_u64_field("record_id", FAST);
+    let record_count = builder.add_u64_field(RECORD_COUNT_FIELD, FAST);
     let exact_unstored = exact_string_options();
     let layer = builder.add_text_field("layer", exact_unstored.clone());
     let content_text = builder.add_text_field("content_text", searchable_text_options());
@@ -589,6 +686,7 @@ fn build_schema() -> (Schema, Fields) {
     let schema = builder.build();
     let fields = Fields {
         record_id,
+        record_count,
         layer,
         content_text,
         context_text,
@@ -648,12 +746,14 @@ impl ProjectionBuilder {
         Self {
             projected: Document {
                 record_id,
+                record_count: 1,
                 layers: vec![layer.to_string()],
                 content_text: String::new(),
                 context_text: String::new(),
                 name: None,
                 streets: Vec::new(),
-                address_number: None,
+                address_numbers: Vec::new(),
+                units: Vec::new(),
                 postcode: None,
                 autocomplete_subject_text: String::new(),
                 interpolation_range: None,
@@ -693,13 +793,22 @@ impl ProjectionBuilder {
         }
     }
 
+    /// A POI's address: its number and unit are part of what it is.
     fn address(&mut self, address: &AddressComponents) {
-        self.street(address.subject());
-        self.projected.address_number = collapse_whitespace(&address.number);
         self.add_content_text(&address.number);
+        self.address_parts(address);
+        self.add_optional_content_text(address.unit.as_deref());
+    }
+
+    /// Every part of an address but its unit; the number only as a house
+    /// number.
+    fn address_parts(&mut self, address: &AddressComponents) {
+        self.street(address.subject());
+        self.projected
+            .address_numbers
+            .extend(collapse_whitespace(&address.number));
         self.add_optional_content_text(address.street.as_deref());
         self.add_optional_content_text(address.place.as_deref());
-        self.add_optional_content_text(address.unit.as_deref());
         self.add_optional_context_text(address.locality.as_deref());
         for area in &address.areas {
             self.add_optional_context_text(Some(area));
@@ -988,6 +1097,12 @@ pub(crate) fn is_numeric_token(token: &str) -> bool {
     token.chars().all(|character| character.is_ascii_digit())
 }
 
+/// The terms a house number is indexed under: each value of a list ("12;14")
+/// is a number of its own, normalized ("407A" is "407a").
+pub(crate) fn address_number_terms(number: &str) -> impl Iterator<Item = String> + '_ {
+    number.split(';').filter_map(normalize_index_text)
+}
+
 /// The digits a house number starts with: 407 of "407A", "407 1/2" and
 /// "407;409". `None` when it does not start with one.
 pub(crate) fn base_house_number(number: &str) -> Option<u32> {
@@ -1133,9 +1248,13 @@ mod tests {
             assert!(!projected.content_text.contains(area), "{area}");
         }
         assert!(!projected.autocomplete_subject_text.contains("westminster"));
-        assert_eq!(projected.address_number.as_deref(), Some("221B"));
-        assert_eq!(projected.name.as_deref(), Some("221b baker street"));
-        assert!(projected.content_text.contains("221b baker street"));
+        assert_eq!(projected.address_numbers, vec!["221B"]);
+        assert_eq!(
+            projected.name.as_deref(),
+            Some("baker street"),
+            "the number is kept apart, so the street's addresses share a document"
+        );
+        assert_eq!(projected.content_text, "baker street");
         assert_eq!(projected.autocomplete_subject_text, "baker street nw1");
         assert!(!projected.autocomplete_subject_text.contains("london"));
     }
@@ -1166,7 +1285,7 @@ mod tests {
         let projected =
             Document::from_record(7, &record.into(), &[], &PostcodeAreas::default(), None);
 
-        assert_eq!(projected.address_number, None);
+        assert!(projected.address_numbers.is_empty());
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
         assert_eq!(projected.content_text, "baker street");
         assert_eq!(projected.context_text, "london nw1 gb");
@@ -1247,7 +1366,7 @@ mod tests {
             "the address is its street's, not the name's"
         );
         assert_eq!(projected.streets, vec!["king street west"]);
-        assert_eq!(projected.address_number.as_deref(), Some("123"));
+        assert_eq!(projected.address_numbers, vec!["123"]);
         assert_eq!(projected.rank_postcode.as_deref(), Some("m5v1a1"));
         for text in ["tim hortons", "amenity cafe", "king street west"] {
             assert!(projected.content_text.contains(text), "{text}");
@@ -1304,7 +1423,7 @@ mod tests {
         let projected =
             Document::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default(), None);
         assert_eq!(projected.layers, vec!["poi"]);
-        assert_eq!(projected.address_number, None);
+        assert!(projected.address_numbers.is_empty());
         assert_eq!(projected.rank_postcode, None, "no postcode data nearby");
     }
 

@@ -4,6 +4,44 @@
       "geometry": {
         "coordinates": [
           -79.0,
+          43.0005
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "street",
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "id": "osm:way:12",
+        "label": "King Street",
+        "layer": "street",
+        "name": "King Street",
+        "record_id": 5,
+        "score": 14.649926,
+        "source": {
+          "dataset": "osm",
+          "object_id": 12,
+          "object_type": "way"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
           43.0
         ],
         "type": "Point"
@@ -34,49 +72,11 @@
         "layer": "address",
         "name": "10 King Street",
         "record_id": 3,
-        "score": 15.537057,
+        "score": 14.649926,
         "source": {
           "dataset": "osm",
           "object_id": 10,
           "object_type": "node"
-        }
-      },
-      "type": "Feature"
-    },
-    {
-      "geometry": {
-        "coordinates": [
-          -79.0,
-          43.0005
-        ],
-        "type": "Point"
-      },
-      "properties": {
-        "accuracy": "street",
-        "context": {
-          "country": {
-            "id": "osm:relation:1",
-            "name": "Canada"
-          },
-          "locality": {
-            "id": "osm:relation:3",
-            "name": "Toronto"
-          },
-          "region": {
-            "id": "osm:relation:2",
-            "name": "Ontario"
-          }
-        },
-        "id": "osm:way:12",
-        "label": "King Street",
-        "layer": "street",
-        "name": "King Street",
-        "record_id": 5,
-        "score": 15.083338,
-        "source": {
-          "dataset": "osm",
-          "object_id": 12,
-          "object_type": "way"
         }
       },
       "type": "Feature"
@@ -116,7 +116,7 @@
         "layer": "poi",
         "name": "Queen Bakery",
         "record_id": 4,
-        "score": 1.8904963,
+        "score": 1.7933104,
         "source": {
           "dataset": "osm",
           "object_id": 11,

@@ -9,7 +9,7 @@ use std::{
 use crate::error::{Error, Result};
 use serde::Serialize;
 use tantivy::{
-    DocId, IndexReader, Order, Score, Searcher, SegmentReader, Term,
+    DocAddress, DocId, IndexReader, Score, Searcher, SegmentReader, Term,
     collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
     columnar::{Column, StrColumn},
     index::SegmentId,
@@ -35,9 +35,9 @@ use crate::{
     spatial_index,
     text_index::{
         Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
-        RANK_POSTCODE_FIELD, base_house_number, compact_postcode, expand_address_abbreviations,
-        expand_final_direction, is_numeric_token, normalize_index_text, open_text_index,
-        street_search_text,
+        RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms, base_house_number,
+        compact_postcode, expand_address_abbreviations, expand_final_direction, is_numeric_token,
+        normalize_index_text, open_text_index, street_search_text,
     },
 };
 
@@ -64,6 +64,7 @@ impl fmt::Debug for TextSearcher {
 #[derive(Clone)]
 struct SegmentColumns {
     record_id: Column<u64>,
+    record_count: Column<u64>,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     rank_postcode: Option<StrColumn>,
@@ -150,10 +151,18 @@ const MAX_RANK_WINDOW: usize = 256;
 const NAME_BOOST: Score = 5.5;
 const NUMBER_BOOST: Score = 2.0;
 const POSTCODE_BOOST: Score = 2.0;
+/// A word that may name an area, where the query names none, counts for less
+/// there than in what a record is: "7 Lynn Place" is the street, not a place
+/// in the New Lynn suburb. Close scores between the two otherwise rank on
+/// how common each word happens to be in each field.
+const AREA_STANDS_IN_BOOST: Score = 0.5;
 /// Stated house numbers read on each side of one that no record states: a
 /// few, so the nearest of the same parity can be found and the numbers of a
 /// same-named street elsewhere passed over.
 const NEIGHBOUR_CANDIDATES: usize = 4;
+/// Documents read for neighbours: street groups and addressed POIs that match the
+/// street and localities, best first.
+const NEIGHBOUR_DOCUMENTS: usize = 256;
 /// How far an address point may lie from the street it is on. Address points
 /// sit on their lots, and the lots front the street: 100 m covers the depth
 /// of nearly every lot, including large buildings set back behind parking,
@@ -181,6 +190,7 @@ impl TextSearcher {
                 segment.segment_id(),
                 SegmentColumns {
                     record_id: fast_fields.u64("record_id")?,
+                    record_count: fast_fields.u64(RECORD_COUNT_FIELD)?,
                     house_number: fast_fields.u64(HOUSE_NUMBER_FIELD)?,
                     interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
@@ -309,8 +319,10 @@ impl TextSearcher {
         else {
             return Ok(Vec::new());
         };
+        let tokens = autocomplete_query_tokens(&query_text);
         let ranking = Ranking {
             query_words: query_text.split_whitespace().map(str::to_string).collect(),
+            number_text: autocomplete_number(&tokens).map(str::to_string),
             ..Ranking::default()
         };
         self.ranked_hits(&query, &ranking, limit)
@@ -361,7 +373,10 @@ impl TextSearcher {
                 self.word_query(word)
             };
             let query = if anywhere {
-                Box::new(DisjunctionMaxQuery::new(vec![what, self.area_query(word)]))
+                Box::new(DisjunctionMaxQuery::new(vec![
+                    what,
+                    Box::new(BoostQuery::new(self.area_query(word), AREA_STANDS_IN_BOOST)),
+                ]))
             } else {
                 what
             };
@@ -625,6 +640,7 @@ impl TextSearcher {
         let ranking = Ranking {
             query_words: query_words.clone(),
             house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
+            number_text: plan.house_number.as_ref().map(|number| number.text.clone()),
             numbered: plan.house_number.is_some(),
             postcode: plan.postcode(),
         };
@@ -781,11 +797,11 @@ impl TextSearcher {
 
         let mut subqueries = Vec::new();
 
-        let subject_tokens = if tokens.len() > 1 && is_address_number_token(&tokens[0]) {
+        let subject_tokens = if let Some(number) = autocomplete_number(&tokens) {
             subqueries.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.address_number, &tokens[0]),
+                    Term::from_field_text(self.fields.address_number, number),
                     IndexRecordOption::Basic,
                 )) as Box<dyn Query>,
             ));
@@ -868,33 +884,28 @@ impl TextSearcher {
         }
         let mut hits = Vec::new();
         for (key, doc) in top_docs {
-            let record_id = self
-                .segment_columns(&searcher, doc.segment_ord)?
-                .record_id
-                .values_for_doc(doc.doc_id)
-                .next()
-                .ok_or(Error::Inconsistent(
-                    "text index hit is missing fast record_id".into(),
-                ))?;
-            let mut record = self.pack.record_summary(record_id)?;
-            if let Some(number) = ranking.house_number
-                && record.layer == Layer::Interpolation.as_str()
-                && !self.estimate_house(record_id, number, &mut record)?
-            {
-                continue;
+            let (first, count) = self.document_records(&searcher, doc)?;
+            for record_id in self.hit_records(first, count, ranking)? {
+                let mut record = self.pack.record_summary(record_id)?;
+                if let Some(number) = ranking.house_number
+                    && record.layer == Layer::Interpolation.as_str()
+                    && !self.estimate_house(record_id, number, &mut record)?
+                {
+                    continue;
+                }
+                if ranking.numbered && record.layer == Layer::Street.as_str() {
+                    self.place_on_street_line(record_id, &mut record)?;
+                }
+                hits.push((
+                    key.clone(),
+                    TieBreak::new(&record, &query_words),
+                    TextSearchHit {
+                        record_id,
+                        score: key.text_score,
+                        record,
+                    },
+                ));
             }
-            if ranking.numbered && record.layer == Layer::Street.as_str() {
-                self.place_on_street_line(record_id, &mut record)?;
-            }
-            hits.push((
-                key.clone(),
-                TieBreak::new(&record, &query_words),
-                TextSearchHit {
-                    record_id,
-                    score: key.text_score,
-                    record,
-                },
-            ));
         }
         hits.sort_by(|(left_key, left_tie, _), (right_key, right_tie, _)| {
             right_key
@@ -906,9 +917,43 @@ impl TextSearcher {
         Ok(hits.into_iter().map(|(_, _, hit)| hit).collect())
     }
 
-    /// Place `number` on the interpolation range `record` summarizes: the
-    /// point that far along its line, labelled as that address. `false` when
-    /// the range does not contain the number.
+    /// The first record a document stands for, and how many.
+    fn document_records(&self, searcher: &Searcher, doc: DocAddress) -> Result<(RecordId, u64)> {
+        let columns = self.segment_columns(searcher, doc.segment_ord)?;
+        let record_id =
+            columns
+                .record_id
+                .values_for_doc(doc.doc_id)
+                .next()
+                .ok_or(Error::Inconsistent(
+                    "text index hit is missing fast record_id".into(),
+                ))?;
+        let count = columns.record_count.first(doc.doc_id).unwrap_or(1);
+        Ok((record_id, count))
+    }
+
+    /// The records a matched document answers: of a street group, the
+    /// addresses with the house number the query asks for, or the first of
+    /// them when it asks for none; else the document's own record.
+    fn hit_records(&self, first: RecordId, count: u64, ranking: &Ranking) -> Result<Vec<RecordId>> {
+        let Some(number) = &ranking.number_text else {
+            return Ok(vec![first]);
+        };
+        if self.pack.records().header(first)?.layer != Layer::Address {
+            return Ok(vec![first]);
+        }
+        let mut matched = Vec::new();
+        self.pack
+            .records()
+            .address_numbers(first, count, |record_id, stated| {
+                if address_number_terms(stated).any(|term| term == *number) {
+                    matched.push(record_id);
+                }
+                Ok(())
+            })?;
+        Ok(matched)
+    }
+
     /// Move a street standing in for a house number onto its own centre line.
     ///
     /// A street's representative point is the centroid of its geometry, which
@@ -940,6 +985,9 @@ impl TextSearcher {
         Ok(())
     }
 
+    /// Place `number` on the interpolation range `record` summarizes: the
+    /// point that far along its line, labelled as that address. `false` when
+    /// the range does not contain the number.
     fn estimate_house(
         &self,
         record_id: RecordId,
@@ -996,26 +1044,10 @@ impl TextSearcher {
         let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
             return Ok(None);
         };
-        let searcher = self.reader.searcher();
-        let lower = self.neighbours(
-            &searcher,
-            plan,
-            pass,
-            ranking,
-            (Bound::Unbounded, Bound::Included(number)),
-            Order::Desc,
-        )?;
+        let (lower, higher) = self.neighbours(plan, pass, ranking, number)?;
         if lower.is_empty() {
             return Ok(None);
         }
-        let higher = self.neighbours(
-            &searcher,
-            plan,
-            pass,
-            ranking,
-            (Bound::Excluded(number), Bound::Unbounded),
-            Order::Asc,
-        )?;
         let parity = |neighbour: &Neighbour| neighbour.number % 2 == number % 2;
         let mut pairs = lower
             .iter()
@@ -1056,57 +1088,27 @@ impl TextSearcher {
         Ok(None)
     }
 
-    /// The stated house numbers nearest `number` in `range`, on the street
-    /// and in the localities `plan` and `pass` require, nearest first.
+    /// The stated house numbers nearest `number` on the street and in the
+    /// localities `plan` and `pass` require: those at or below it, then those
+    /// above it, each nearest first.
     fn neighbours(
         &self,
-        searcher: &Searcher,
         plan: &QueryPlan,
         pass: Pass,
         ranking: &Ranking,
-        (lower, upper): (Bound<u32>, Bound<u32>),
-        order: Order,
-    ) -> Result<Vec<Neighbour>> {
-        let term = |number: u32| Term::from_field_u64(self.fields.house_number, number.into());
+        number: u32,
+    ) -> Result<(Vec<Neighbour>, Vec<Neighbour>)> {
+        let searcher = self.reader.searcher();
         let mut clauses = self.subject_clauses(plan, pass);
         clauses.push((Occur::Must, self.layer_query(Layer::Address.as_str())));
-        clauses.push((
-            Occur::Must,
-            Box::new(RangeQuery::new(lower.map(term), upper.map(term))),
-        ));
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
-            &TopDocs::with_limit(NEIGHBOUR_CANDIDATES)
-                .order_by_fast_field::<u64>(HOUSE_NUMBER_FIELD, order),
+            &TopDocs::with_limit(NEIGHBOUR_DOCUMENTS),
         )?;
-        let mut neighbours = Vec::new();
-        for (number, doc) in docs {
-            let columns = self.segment_columns(searcher, doc.segment_ord)?;
-            let record_id =
-                columns
-                    .record_id
-                    .values_for_doc(doc.doc_id)
-                    .next()
-                    .ok_or(Error::Inconsistent(
-                        "text index hit is missing fast record_id".into(),
-                    ))?;
-            let address = match self.pack.records().record(record_id)? {
-                Record::Address(record) => record.address,
-                Record::Poi(PoiRecord {
-                    address: Some(address),
-                    ..
-                }) => address,
-                _ => continue,
-            };
-            let Some(street) = address
-                .street
-                .as_deref()
-                .or(address.place.as_deref())
-                .and_then(street_search_text)
-            else {
-                continue;
-            };
-            let (_, lon, lat) = self.pack.records().point(record_id)?;
+        let mut lower = Vec::new();
+        let mut higher = Vec::new();
+        for (_, doc) in docs {
+            let columns = self.segment_columns(&searcher, doc.segment_ord)?;
             let mut postcode = String::new();
             let postcode_agreement = match &columns.rank_postcode {
                 Some(column) => match column.term_ords(doc.doc_id).next() {
@@ -1117,17 +1119,80 @@ impl TextSearcher {
                 },
                 None => 0,
             };
-            neighbours.push(Neighbour {
-                record_id,
-                number: u32::try_from(number)
-                    .map_err(|_| Error::Decode("house number is out of range"))?,
-                point: [lon, lat],
-                street,
-                address,
-                postcode_agreement,
-            });
+            let mut consider = |record_id: RecordId, stated: &str| {
+                if let Some(base) = base_house_number(stated) {
+                    let side = if base <= number {
+                        &mut lower
+                    } else {
+                        &mut higher
+                    };
+                    side.push((base, record_id, postcode_agreement));
+                }
+            };
+            let (first, count) = self.document_records(&searcher, doc)?;
+            match self.pack.records().record(first)? {
+                Record::Address(_) => {
+                    self.pack
+                        .records()
+                        .address_numbers(first, count, |record_id, stated| {
+                            consider(record_id, stated);
+                            Ok(())
+                        })?
+                }
+                Record::Poi(PoiRecord {
+                    address: Some(address),
+                    ..
+                }) => consider(first, &address.number),
+                _ => {}
+            }
         }
-        Ok(neighbours)
+        lower.sort_by_key(|&(base, record_id, _)| (std::cmp::Reverse(base), record_id));
+        higher.sort_by_key(|&(base, record_id, _)| (base, record_id));
+        let found = |candidates: Vec<(u32, RecordId, u8)>| -> Result<Vec<Neighbour>> {
+            let mut neighbours = Vec::new();
+            for (number, record_id, postcode_agreement) in
+                candidates.into_iter().take(NEIGHBOUR_CANDIDATES)
+            {
+                neighbours.extend(self.neighbour(record_id, number, postcode_agreement)?);
+            }
+            Ok(neighbours)
+        };
+        Ok((found(lower)?, found(higher)?))
+    }
+
+    /// The address or POI at `record_id` as a neighbour, `None` when it names
+    /// no street.
+    fn neighbour(
+        &self,
+        record_id: RecordId,
+        number: u32,
+        postcode_agreement: u8,
+    ) -> Result<Option<Neighbour>> {
+        let address = match self.pack.records().record(record_id)? {
+            Record::Address(record) => record.address,
+            Record::Poi(PoiRecord {
+                address: Some(address),
+                ..
+            }) => address,
+            _ => return Ok(None),
+        };
+        let Some(street) = address
+            .street
+            .as_deref()
+            .or(address.place.as_deref())
+            .and_then(street_search_text)
+        else {
+            return Ok(None);
+        };
+        let (_, lon, lat) = self.pack.records().point(record_id)?;
+        Ok(Some(Neighbour {
+            record_id,
+            number,
+            point: [lon, lat],
+            street,
+            address,
+            postcode_agreement,
+        }))
     }
 
     fn segment_columns(&self, searcher: &Searcher, segment_ord: u32) -> Result<&SegmentColumns> {
@@ -1344,6 +1409,10 @@ struct TieBreak {
     /// were written: "342 Albert Street" beats "342 Prince Albert Street" for
     /// the query "342 albert street".
     extra_label_tokens: usize,
+    /// Query words the label lacks. The addresses of a street group share
+    /// one document and so one score, though only some state the unit the
+    /// query names.
+    missing_query_words: usize,
     /// Exact points before centroids before estimates before line midpoints.
     precision: u8,
     /// Nodes before ways before relations, then the lower id.
@@ -1353,14 +1422,16 @@ struct TieBreak {
 
 impl TieBreak {
     fn new(record: &Summary, query_words: &HashSet<&str>) -> Self {
-        let extra_label_tokens = normalize_index_text(&record.label)
-            .map(|label| {
-                label
-                    .split_whitespace()
-                    .filter(|word| !query_words.contains(word))
-                    .count()
-            })
-            .unwrap_or_default();
+        let label = normalize_index_text(&record.label).unwrap_or_default();
+        let label_words = label.split_whitespace().collect::<HashSet<_>>();
+        let extra_label_tokens = label
+            .split_whitespace()
+            .filter(|word| !query_words.contains(word))
+            .count();
+        let missing_query_words = query_words
+            .iter()
+            .filter(|word| !label_words.contains(*word))
+            .count();
         let precision = match record.point.map(|point| point.precision) {
             Some(PointPrecision::Point) => 0,
             Some(PointPrecision::Centroid) => 1,
@@ -1376,6 +1447,7 @@ impl TieBreak {
         };
         Self {
             extra_label_tokens,
+            missing_query_words,
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
@@ -1426,6 +1498,9 @@ struct Ranking {
     numbered: bool,
     /// The house number, when interpolation ranges can estimate it.
     house_number: Option<u32>,
+    /// The house number as the address number field indexes it, to find
+    /// the addresses of a street group that state it.
+    number_text: Option<String>,
     postcode: QueryPostcode,
 }
 
@@ -1731,6 +1806,11 @@ fn autocomplete_subject_query(field: Field, tokens: &[String]) -> Box<dyn Query>
     let mut query = PhrasePrefixQuery::new(terms);
     query.set_max_expansions(AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS);
     Box::new(query)
+}
+
+/// The house number an autocomplete query starts with, when words follow it.
+fn autocomplete_number(tokens: &[String]) -> Option<&str> {
+    (tokens.len() > 1 && is_address_number_token(&tokens[0])).then(|| tokens[0].as_str())
 }
 
 fn is_address_number_token(token: &str) -> bool {
@@ -3237,6 +3317,77 @@ mod tests {
         assert_eq!(
             top_ids(&searcher, "8 The Donway E, Unit-B"),
             vec!["osm:node:6"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn finds_each_address_of_a_street_group_by_its_number_and_unit() {
+        let temp_dir = temp_pack_path("search-street-group");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut records = Vec::new();
+        for (index, number) in ["1", "3", "5", "5", "5A", "7", "9;11", "13"]
+            .iter()
+            .enumerate()
+        {
+            let mut record = address_record(
+                &format!("osm:node:{}", index + 1),
+                "",
+                number,
+                "Queen Street",
+                Some("Toronto"),
+                None,
+            );
+            record.geometry = point_geometry(-79.0 + index as f64 * 0.0002, 43.0);
+            if index == 3 {
+                record.address.unit = Some("Unit 2".to_string());
+            }
+            records.push(record);
+        }
+        // A street of the same name in another town is a group of its own.
+        records.push(address_record(
+            "osm:node:20",
+            "",
+            "5",
+            "Queen Street",
+            Some("Oakville"),
+            None,
+        ));
+        for record in records {
+            writer.write(&record.into(), None).expect("address");
+        }
+        let manifest = writer.finish().expect("finish");
+        assert_eq!(
+            manifest.text_document_count, 2,
+            "one document per street group"
+        );
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(top_ids(&searcher, "7 Queen Street"), vec!["osm:node:6"]);
+        assert_eq!(top_ids(&searcher, "11 Queen Street"), vec!["osm:node:7"]);
+        assert_eq!(top_ids(&searcher, "5a Queen Street"), vec!["osm:node:5"]);
+        assert_eq!(
+            top_ids(&searcher, "5 Queen Street, Oakville"),
+            vec!["osm:node:20"]
+        );
+        let toronto = top_ids(&searcher, "Unit 2 5 Queen Street, Toronto");
+        assert_eq!(toronto[0], "osm:node:4", "the stated unit ranks first");
+        assert_eq!(toronto.len(), 2);
+        let autocomplete = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "13 queen".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+            })
+            .expect("autocomplete");
+        assert_eq!(
+            autocomplete
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["osm:node:8"]
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
