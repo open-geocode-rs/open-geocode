@@ -35,13 +35,15 @@ be far cheaper to run.
 
 ## Quickstart
 
-Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machine and produces a ~330 MB Pack.
+Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machine.
 
 1. Download an OSM extract, for example Ontario from [Geofabrik](https://download.geofabrik.de/north-america/canada/ontario.html), and save it as `data/ontario.pbf`.
 2. Build the pack:
    ```
    cargo run --release -- pack build --input data/ontario.pbf --pack data/pack
    ```
+   Add `--openaddresses` to merge in the OpenAddresses points of the countries the Pack covers, leaving out the ones OSM already has.
+   Downloading them needs an OpenAddresses API token in `OA_TOKEN`; `--addresses PATH` adds a local OpenAddresses GeoJSON or CSV file instead.
 3. Serve the API and demo UI on `http://127.0.0.1:8080`:
    ```
    cargo run --release -- serve --pack data/pack
