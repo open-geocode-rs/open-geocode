@@ -375,6 +375,28 @@ async fn responses_match_the_committed_examples() {
     assert_example("error-malformed-parameter", &unknown_layer);
     assert_eq!(unknown_layer["error_code"], "malformed_parameter");
 
+    // A country code that is not two letters is a typo, and is rejected like
+    // an unknown layer rather than silently matching nothing.
+    let (status, bad_country) = get_error(&router, "/search?q=king&country=Canada").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_country["error_code"], "malformed_parameter");
+    assert_eq!(bad_country["invalid_params"][0]["name"], "country");
+
+    // A well-formed country the Pack does not cover is not an error: it is
+    // an empty answer.
+    let elsewhere = get(&router, "/search?q=king&country=FR").await;
+    assert_eq!(
+        elsewhere["features"].as_array().expect("features").len(),
+        0,
+        "a country the Pack does not hold answers with no features"
+    );
+
+    // The country the contract Pack is built from finds the same places the
+    // unfiltered query does, so the filter narrows without changing ranking.
+    let unfiltered = get(&router, "/search?q=king").await;
+    let filtered = get(&router, "/search?q=king&country=CA").await;
+    assert_eq!(unfiltered["features"], filtered["features"]);
+
     let _ = std::fs::remove_dir_all(&pack);
 }
 
@@ -451,6 +473,17 @@ fn write_pack(dir: &PathBuf) -> Ids {
     let country = place(&mut writer, PlaceLayer::Country, "Canada", 1);
     let region = place(&mut writer, PlaceLayer::Region, "Ontario", 2);
     let locality = place(&mut writer, PlaceLayer::Locality, "Toronto", 3);
+    // The country record's ISO code, as a build derives it from the boundary.
+    // Without it no record carries a country and the `country` filter, which
+    // matches on the code, would find nothing.
+    writer.set_country_codes(
+        [(
+            country,
+            crate::parse::lattice::CountryCode::parse("CA").expect("code"),
+        )]
+        .into_iter()
+        .collect(),
+    );
     let context = Some(RecordContext {
         admin_context: AdminContextTuple {
             country_record_id: Some(country),
