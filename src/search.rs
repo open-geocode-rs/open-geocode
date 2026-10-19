@@ -2048,6 +2048,55 @@ mod tests {
     }
 
     #[test]
+    fn geocode_filters_hits_ranked_beyond_the_requested_limit() {
+        let temp_dir = temp_pack_path("geocode-filter-before-limit");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // Twelve identical streets without a postcode tie with, and sort ahead
+        // of, the one inside the requested postcode area. Only the postcode
+        // record beside each of them tells them apart.
+        let mut write_street = |id: &str, lon: f64, postcode: &str| {
+            let mut record = address_record(id, "", "10", "King Street", None, None);
+            record.geometry = point_geometry(lon, 43.0);
+            writer.write(&record.into(), None).expect("address");
+            writer
+                .write(
+                    &PostcodeRecord {
+                        postcode: postcode.to_string(),
+                        geometry: point_geometry(lon + 0.001, 43.0),
+                        source: DerivedSourceProvenance::osm_address_records(5),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("postcode");
+        };
+        for id in 1..=12 {
+            write_street(&format!("osm:node:{id}"), -90.0 - id as f64, "M5V 1A1");
+        }
+        write_street("osm:node:99", -76.0, "K7L 1A1");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        for limit in [1, 10] {
+            let hit = searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "10 King Street".to_string(),
+                    locality: None,
+                    region: None,
+                    postcode: Some("K7L 1A1".to_string()),
+                    limit,
+                    layer: None,
+                    countries: Vec::new(),
+                })
+                .expect("geocode")
+                .map(|hit| hit.hit.record.id);
+            assert_eq!(hit.as_deref(), Some("osm:node:99"), "limit {limit}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn geocode_ranks_hits_by_distance_from_the_named_postcode() {
         let temp_dir = temp_pack_path("geocode-postcode-distance");
         let _ = std::fs::remove_dir_all(&temp_dir);
