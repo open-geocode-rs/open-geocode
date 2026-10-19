@@ -1,56 +1,66 @@
-//! H3 spatial index over the record store.
+//! Spatial index over the record store.
 //!
-//! The index maps H3 cells to record references. It stores no coordinates of
-//! its own: point references are record ids and segment references are
-//! `(record id, segment index)`, both resolved against the record store, which
-//! already holds every point and line. Because records are in Hilbert order,
-//! the ids inside one cell are close together and their deltas are tiny.
+//! Three packed R-trees, each built bottom up from items already in Hilbert
+//! order, as Flatbush packs them: a node's children are the next 16 nodes of
+//! the level below, so the tree stores boxes and no pointers. The trees hold
+//! no coordinates of their own beyond the boxes; points and lines are read
+//! from the record store.
 //!
-//! Two indexes share one layout: a fine one (H3 resolution 11) over addresses,
-//! POIs, places, postcodes and road segments, and a coarse one (resolution 6) over
-//! context points for wide-radius admin lookups.
+//! - `spatial/blocks`: one box per record block, around the block's point
+//!   records. A query decodes the blocks near it whole, which takes
+//!   microseconds for 64 records, and a box per block costs a fraction of a
+//!   byte per record.
+//! - `spatial/lines`: one box per street or interpolation line, with its
+//!   record id. Lines get boxes of their own because one long road would
+//!   stretch a block's box over every query along it.
+//! - `spatial/context`: one box per place and postcode point, with its record
+//!   id, so wide-radius admin lookups pass over the address blocks.
 //!
 //! ```text
-//! spatial/<name>/index  cell_count u64, block_count u64,
-//!                       then per block of 16 cells: first_cell u64, data_offset u64,
-//!                       then the data length u64
-//! spatial/<name>/data   per cell: varint cell delta (0 for a block's first cell),
-//!                       varint refs length, refs:
-//!                       varint point count, delta-coded record ids,
-//!                       varint segment count, delta-coded segment refs
+//! spatial/<name>  item_count u64 | id width u8 (0 = the item's index, 4 or 8)
+//!                 | boxes: the items in order, then each level above, root last;
+//!                   min_lon i32, min_lat i32, max_lon i32, max_lat i32
+//!                 | ids, when stored
 //! ```
 
-use std::{cmp::Ordering, collections::HashMap, io::Write, sync::Arc};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    fs::File,
+    io::{BufReader, BufWriter, Read, Write},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::error::{Error, Result};
-use geojson::GeometryValue;
-use h3o::{CellIndex, LatLng, Resolution};
+use geojson::{Geometry, GeometryValue};
 use serde::Serialize;
 
 use crate::{
     container::{self, Bytes, Container},
-    extsort::{ExternalSorter, Scratch, SortStats, Spill},
-    memory::Budget,
+    extsort::Scratch,
     pack::RecordId,
     record::{Layer, Record},
-    records::{self, dequantize},
-    util::codec::{get_u64, put_u64, read_u64_le},
+    records::{self, BLOCK_RECORDS, dequantize, quantize},
+    util::codec::read_u64_le,
 };
 
-pub const SPATIAL_VERSION: u32 = 2;
-const FINE: &str = "spatial/fine";
+pub const SPATIAL_VERSION: u32 = 3;
+const BLOCKS: &str = "spatial/blocks";
+const LINES: &str = "spatial/lines";
 const CONTEXT: &str = "spatial/context";
 
-const H3_FINE_RESOLUTION: Resolution = Resolution::Eleven;
-const H3_CONTEXT_RESOLUTION: Resolution = Resolution::Six;
-const H3_SEGMENT_SAMPLE_DIVISOR: f64 = 2.0;
-const H3_RADIUS_EXTRA_RING: u32 = 1;
-const H3_MAX_QUERY_K: u32 = 128;
+const NODE_SIZE: usize = 16;
+const BOX_BYTES: usize = 16;
+const HEADER_BYTES: usize = 9;
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
-const CELLS_PER_BLOCK: u64 = 16;
-const SEGMENT_INDEX_BITS: u32 = 16;
-const KIND_POINT: u8 = 0;
-const KIND_SEGMENT: u8 = 1;
+/// Box distances are flat-earth estimates. Scaled down by this they stay
+/// below the haversine distance of every point inside the box for the radii
+/// queries use, so no candidate is skipped.
+const LOWER_BOUND_SLACK: f64 = 0.99;
+
+type BoundingBox = [i32; 4];
+const EMPTY: BoundingBox = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PointCandidate {
@@ -71,348 +81,457 @@ pub struct SegmentCandidate {
     pub fraction: f64,
 }
 
-/// One (cell, reference) pair produced while records are written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CellRef {
-    cell: u64,
-    kind: u8,
-    reference: u64,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Commit {
+    pub point_count: u64,
+    pub line_count: u64,
+    pub block_count: u64,
+    pub context_point_count: u64,
 }
 
-impl Spill for CellRef {
-    fn encode(&self, out: &mut Vec<u8>) {
-        (self.cell, self.kind, self.reference).encode(out);
-    }
+fn union(left: BoundingBox, right: BoundingBox) -> BoundingBox {
+    [
+        left[0].min(right[0]),
+        left[1].min(right[1]),
+        left[2].max(right[2]),
+        left[3].max(right[3]),
+    ]
+}
 
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        let (cell, kind, reference) = <(u64, u8, u64)>::decode(input)?;
+/// Leaves stream to scratch as they come; only the levels above them, a
+/// sixteenth of the items and less, are held in memory.
+#[derive(Debug)]
+struct TreeWriter {
+    leaves: BufWriter<File>,
+    leaves_path: PathBuf,
+    ids: Option<(BufWriter<File>, PathBuf)>,
+    count: u64,
+    widest_id: u64,
+    parents: Vec<BoundingBox>,
+    open: BoundingBox,
+}
+
+impl TreeWriter {
+    fn create(scratch: &Arc<Scratch>, name: &str, with_ids: bool) -> Result<Self> {
+        let create = |suffix: &str| -> Result<(BufWriter<File>, PathBuf)> {
+            let path = scratch.path().join(format!("spatial-{name}-{suffix}.bin"));
+            let file = File::create(&path).map_err(|source| Error::IoPath {
+                action: "failed to create",
+                path: path.clone(),
+                source,
+            })?;
+            Ok((BufWriter::with_capacity(1 << 20, file), path))
+        };
+        let (leaves, leaves_path) = create("leaves")?;
         Ok(Self {
-            cell,
-            kind,
-            reference,
+            leaves,
+            leaves_path,
+            ids: with_ids.then(|| create("ids")).transpose()?,
+            count: 0,
+            widest_id: 0,
+            parents: Vec::new(),
+            open: EMPTY,
         })
     }
+
+    fn push(&mut self, bbox: BoundingBox, id: u64) -> Result<()> {
+        for value in bbox {
+            self.leaves.write_all(&value.to_le_bytes())?;
+        }
+        if let Some((ids, _)) = &mut self.ids {
+            ids.write_all(&id.to_le_bytes())?;
+            self.widest_id = self.widest_id.max(id);
+        }
+        self.open = union(self.open, bbox);
+        self.count += 1;
+        if self.count.is_multiple_of(NODE_SIZE as u64) {
+            self.parents.push(std::mem::replace(&mut self.open, EMPTY));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, pack: &mut container::Writer, name: &str) -> Result<u64> {
+        if !self.count.is_multiple_of(NODE_SIZE as u64) {
+            self.parents.push(self.open);
+        }
+        let mut levels = Vec::new();
+        if !self.parents.is_empty() {
+            levels.push(std::mem::take(&mut self.parents));
+            while levels.last().is_some_and(|level| level.len() > 1) {
+                let below = levels.last().expect("a level");
+                let above = below
+                    .chunks(NODE_SIZE)
+                    .map(|children| children.iter().copied().fold(EMPTY, union))
+                    .collect();
+                levels.push(above);
+            }
+        }
+        let id_width = match &self.ids {
+            None => 0u8,
+            Some(_) if self.widest_id <= u64::from(u32::MAX) => 4,
+            Some(_) => 8,
+        };
+
+        self.leaves.flush()?;
+        pack.begin(name, SPATIAL_VERSION)?;
+        pack.write_all(&self.count.to_le_bytes())?;
+        pack.write_all(&[id_width])?;
+        std::io::copy(&mut File::open(&self.leaves_path)?, pack)?;
+        for level in &levels {
+            for bbox in level {
+                for value in bbox {
+                    pack.write_all(&value.to_le_bytes())?;
+                }
+            }
+        }
+        if let Some((mut ids, path)) = self.ids {
+            ids.flush()?;
+            drop(ids);
+            let mut input = BufReader::new(File::open(&path)?);
+            let mut id = [0; 8];
+            for _ in 0..self.count {
+                input.read_exact(&mut id)?;
+                pack.write_all(&id[..usize::from(id_width)])?;
+            }
+        }
+        pack.end()?;
+        Ok(self.count)
+    }
 }
 
-/// Index pairs for one record, computed off the write path in parallel.
-#[derive(Debug, Default)]
-pub struct RecordCells {
-    fine: Vec<CellRef>,
-    context: Vec<CellRef>,
+/// Boxes for the spatial index, taken from records as they are written, in
+/// record id order.
+#[derive(Debug)]
+pub struct Writer {
+    blocks: TreeWriter,
+    lines: TreeWriter,
+    context: TreeWriter,
+    /// The block whose box is open, and the box.
+    block: u64,
+    block_box: BoundingBox,
+    record_count: u64,
     points: u64,
-    segments: u64,
 }
 
-impl RecordCells {
-    pub fn for_record(record_id: RecordId, record: &Record) -> Result<Self> {
-        let mut cells = Self::default();
+impl Writer {
+    pub fn new(scratch: &Arc<Scratch>) -> Result<Self> {
+        Ok(Self {
+            blocks: TreeWriter::create(scratch, "blocks", false)?,
+            lines: TreeWriter::create(scratch, "lines", true)?,
+            context: TreeWriter::create(scratch, "context", true)?,
+            block: 0,
+            block_box: EMPTY,
+            record_count: 0,
+            points: 0,
+        })
+    }
+
+    /// Index the record written at `record_id`. Records come in id order.
+    pub fn add(&mut self, record_id: RecordId, record: &Record) -> Result<()> {
+        if record_id < self.record_count {
+            return Err(Error::Inconsistent(format!(
+                "record {record_id} was indexed after record {}",
+                self.record_count - 1
+            )));
+        }
+        self.close_blocks_before(record_id / BLOCK_RECORDS)?;
+        self.record_count = record_id + 1;
         match record {
             Record::Street(_) | Record::Interpolation(_) => {
-                let GeometryValue::LineString { coordinates } = &record.geometry().value else {
-                    return Ok(cells);
-                };
-                let positions = coordinates
-                    .iter()
-                    .filter_map(|position| match position.as_slice() {
-                        [lon, lat, ..] if lon.is_finite() && lat.is_finite() => Some([*lon, *lat]),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                for (index, pair) in positions.windows(2).enumerate() {
-                    if haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]) <= f64::EPSILON {
-                        continue;
-                    }
-                    let index = u64::try_from(index)?;
-                    if index >= 1 << SEGMENT_INDEX_BITS {
-                        return Err(Error::TooManySegments { id: record.id() });
-                    }
-                    let reference = record_id << SEGMENT_INDEX_BITS | index;
-                    for cell in segment_cells(pair[0], pair[1], H3_FINE_RESOLUTION)? {
-                        cells.fine.push(CellRef {
-                            cell,
-                            kind: KIND_SEGMENT,
-                            reference,
-                        });
-                    }
-                    cells.segments += 1;
+                if let Some(bbox) = line_box(record.geometry())? {
+                    self.lines.push(bbox, record_id)?;
                 }
             }
             _ => {
                 let Some([lon, lat]) = record.display_point() else {
-                    return Ok(cells);
+                    return Ok(());
                 };
-                cells.fine.push(CellRef {
-                    cell: cell_id(lon, lat, H3_FINE_RESOLUTION)?,
-                    kind: KIND_POINT,
-                    reference: record_id,
-                });
+                let (lon, lat) = (quantize(lon)?, quantize(lat)?);
+                let bbox = [lon, lat, lon, lat];
+                self.block_box = union(self.block_box, bbox);
                 if record.layer().is_context() {
-                    cells.context.push(CellRef {
-                        cell: cell_id(lon, lat, H3_CONTEXT_RESOLUTION)?,
-                        kind: KIND_POINT,
-                        reference: record_id,
-                    });
+                    self.context.push(bbox, record_id)?;
                 }
-                cells.points += 1;
+                self.points += 1;
             }
         }
-        Ok(cells)
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Commit {
-    pub point_count: u64,
-    pub segment_count: u64,
-    pub cell_count: u64,
-    pub context_cell_count: u64,
-    pub fine_pairs: SortStats,
-    pub context_pairs: SortStats,
-}
-
-#[derive(Debug)]
-pub struct Writer {
-    fine: ExternalSorter<CellRef>,
-    context: ExternalSorter<CellRef>,
-    points: u64,
-    segments: u64,
-}
-
-impl Writer {
-    pub fn new(scratch: &Arc<Scratch>, budget: &Arc<Budget>, share_bytes: usize) -> Self {
-        Self {
-            fine: ExternalSorter::new(scratch, "spatial-fine", budget, share_bytes),
-            context: ExternalSorter::new(scratch, "spatial-context", budget, share_bytes / 8),
-            points: 0,
-            segments: 0,
-        }
-    }
-
-    pub fn add(&mut self, cells: RecordCells) -> Result<()> {
-        for pair in cells.fine {
-            self.fine.push(pair)?;
-        }
-        for pair in cells.context {
-            self.context.push(pair)?;
-        }
-        self.points += cells.points;
-        self.segments += cells.segments;
         Ok(())
     }
 
-    pub fn finish(self, pack: &mut container::Writer) -> Result<Commit> {
-        let fine_pairs = self.fine.stats();
-        let context_pairs = self.context.stats();
-        let cell_count = write_cell_index(pack, FINE, self.fine)?;
-        let context_cell_count = write_cell_index(pack, CONTEXT, self.context)?;
+    fn close_blocks_before(&mut self, block: u64) -> Result<()> {
+        while self.block < block {
+            self.blocks.push(self.block_box, self.block)?;
+            self.block_box = EMPTY;
+            self.block += 1;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
+        self.close_blocks_before(self.record_count.div_ceil(BLOCK_RECORDS))?;
         Ok(Commit {
             point_count: self.points,
-            segment_count: self.segments,
-            cell_count,
-            context_cell_count,
-            fine_pairs,
-            context_pairs,
+            block_count: self.blocks.finish(pack, BLOCKS)?,
+            line_count: self.lines.finish(pack, LINES)?,
+            context_point_count: self.context.finish(pack, CONTEXT)?,
         })
     }
 }
 
-fn write_cell_index(
-    pack: &mut container::Writer,
-    name: &str,
-    pairs: ExternalSorter<CellRef>,
-) -> Result<u64> {
-    let mut blocks: Vec<(u64, u64)> = Vec::new();
-    let mut cell_count = 0u64;
-    let mut data_len = 0u64;
-    let mut previous_cell = 0u64;
-    let mut current: Option<u64> = None;
-    let mut points = Vec::new();
-    let mut segments = Vec::new();
-    let mut entry = Vec::new();
-    let mut refs = Vec::new();
-
-    pack.begin(&format!("{name}/data"), SPATIAL_VERSION)?;
-    let mut flush = |pack: &mut container::Writer,
-                     cell: u64,
-                     points: &mut Vec<u64>,
-                     segments: &mut Vec<u64>|
-     -> Result<()> {
-        if cell_count.is_multiple_of(CELLS_PER_BLOCK) {
-            blocks.push((cell, data_len));
-            previous_cell = cell;
-        }
-        refs.clear();
-        put_delta_list(&mut refs, points);
-        put_delta_list(&mut refs, segments);
-        entry.clear();
-        put_u64(&mut entry, cell - previous_cell);
-        put_u64(&mut entry, refs.len() as u64);
-        pack.write_all(&entry)?;
-        pack.write_all(&refs)?;
-        data_len += (entry.len() + refs.len()) as u64;
-        previous_cell = cell;
-        cell_count += 1;
-        points.clear();
-        segments.clear();
-        Ok(())
+fn line_box(geometry: &Geometry) -> Result<Option<BoundingBox>> {
+    let GeometryValue::LineString { coordinates } = &geometry.value else {
+        return Ok(None);
     };
-    let mut last: Option<CellRef> = None;
-    for pair in pairs.finish()? {
-        let pair = pair?;
-        if last == Some(pair) {
-            continue;
-        }
-        last = Some(pair);
-        if current.is_some_and(|cell| cell != pair.cell) {
-            flush(
-                pack,
-                current.expect("current cell"),
-                &mut points,
-                &mut segments,
-            )?;
-        }
-        current = Some(pair.cell);
-        match pair.kind {
-            KIND_POINT => points.push(pair.reference),
-            _ => segments.push(pair.reference),
+    let mut bbox = EMPTY;
+    for position in coordinates {
+        if let [lon, lat, ..] = position.as_slice()
+            && lon.is_finite()
+            && lat.is_finite()
+        {
+            let (lon, lat) = (quantize(*lon)?, quantize(*lat)?);
+            bbox = union(bbox, [lon, lat, lon, lat]);
         }
     }
-    if let Some(cell) = current {
-        flush(pack, cell, &mut points, &mut segments)?;
-    }
-    pack.end()?;
-
-    let mut index = Vec::with_capacity(24 + blocks.len() * 16);
-    index.extend_from_slice(&cell_count.to_le_bytes());
-    index.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
-    for (first_cell, offset) in &blocks {
-        index.extend_from_slice(&first_cell.to_le_bytes());
-        index.extend_from_slice(&offset.to_le_bytes());
-    }
-    index.extend_from_slice(&data_len.to_le_bytes());
-    pack.add(&format!("{name}/index"), SPATIAL_VERSION, &index)?;
-    Ok(cell_count)
-}
-
-fn put_delta_list(out: &mut Vec<u8>, values: &[u64]) {
-    put_u64(out, values.len() as u64);
-    let mut previous = 0;
-    for value in values {
-        put_u64(out, value - previous);
-        previous = *value;
-    }
-}
-
-fn get_delta_list(input: &mut &[u8]) -> Result<Vec<u64>> {
-    let count = usize::try_from(get_u64(input)?)?;
-    if count > input.len() {
-        return Err(Error::Decode("spatial reference list is truncated"));
-    }
-    let mut values = Vec::with_capacity(count);
-    let mut previous = 0u64;
-    for _ in 0..count {
-        previous = previous
-            .checked_add(get_u64(input)?)
-            .ok_or(Error::Decode("spatial reference overflows"))?;
-        values.push(previous);
-    }
-    Ok(values)
+    Ok((bbox[0] <= bbox[2]).then_some(bbox))
 }
 
 #[derive(Clone)]
-struct CellTable {
-    index: Bytes,
-    data: Bytes,
-    block_count: u64,
+struct Tree {
+    bytes: Bytes,
+    count: usize,
+    id_width: usize,
+    /// First node and node count of each level, leaves first.
+    levels: Vec<(usize, usize)>,
+    ids_start: usize,
 }
 
-struct CellRefs {
-    points: Vec<u64>,
-    segments: Vec<u64>,
-}
-
-impl CellTable {
+impl Tree {
     fn open(container: &Container, name: &str) -> Result<Self> {
-        let index = container.section(&format!("{name}/index"), SPATIAL_VERSION)?;
-        let data = container.section(&format!("{name}/data"), SPATIAL_VERSION)?;
-        let cell_count =
-            read_u64_le(&index, 0).ok_or(Error::Decode("spatial index is truncated"))?;
-        let block_count =
-            read_u64_le(&index, 8).ok_or(Error::Decode("spatial index is truncated"))?;
-        if block_count != cell_count.div_ceil(CELLS_PER_BLOCK)
-            || index.len() as u64 != 24 + block_count * 16
-            || read_u64_le(&index, index.len() - 8) != Some(data.len() as u64)
-        {
-            return Err(Error::Inconsistent(format!(
-                "spatial index {name} is inconsistent with its data"
-            )));
+        let bytes = container.section(name, SPATIAL_VERSION)?;
+        let inconsistent = || Error::Inconsistent(format!("spatial index {name} is inconsistent"));
+        let count = usize::try_from(read_u64_le(&bytes, 0).ok_or_else(inconsistent)?)?;
+        let id_width = usize::from(*bytes.get(8).ok_or_else(inconsistent)?);
+        if ![0, 4, 8].contains(&id_width) {
+            return Err(inconsistent());
+        }
+        let mut levels = Vec::new();
+        let mut nodes = 0;
+        if count > 0 {
+            let mut len = count;
+            loop {
+                levels.push((nodes, len));
+                nodes += len;
+                if levels.len() > 1 && len == 1 {
+                    break;
+                }
+                len = len.div_ceil(NODE_SIZE);
+            }
+        }
+        let ids_start = HEADER_BYTES + nodes * BOX_BYTES;
+        if bytes.len() != ids_start + count * id_width {
+            return Err(inconsistent());
         }
         Ok(Self {
-            index,
-            data,
-            block_count,
+            bytes,
+            count,
+            id_width,
+            levels,
+            ids_start,
         })
     }
 
-    fn block(&self, block: u64) -> (u64, u64) {
-        let offset = 16 + block as usize * 16;
-        (
-            read_u64_le(&self.index, offset).expect("validated index"),
-            read_u64_le(&self.index, offset + 8).expect("validated index"),
-        )
+    fn bbox(&self, node: usize) -> BoundingBox {
+        let at = HEADER_BYTES + node * BOX_BYTES;
+        std::array::from_fn(|index| {
+            let start = at + index * 4;
+            i32::from_le_bytes(
+                self.bytes[start..start + 4]
+                    .try_into()
+                    .expect("validated tree"),
+            )
+        })
     }
 
-    fn refs(&self, cell: u64) -> Result<Option<CellRefs>> {
-        // Last block whose first cell is <= cell.
-        let (mut low, mut high) = (0, self.block_count);
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if self.block(mid).0 <= cell {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
+    fn id(&self, item: usize) -> u64 {
+        if self.id_width == 0 {
+            return item as u64;
         }
-        let Some(block) = low.checked_sub(1) else {
-            return Ok(None);
-        };
-        let (first_cell, start) = self.block(block);
-        let end = if block + 1 < self.block_count {
-            self.block(block + 1).1
-        } else {
-            self.data.len() as u64
-        };
-        let mut input = self
-            .data
-            .get(start as usize..end as usize)
-            .ok_or(Error::Decode("spatial block is out of range"))?;
-        let mut current = first_cell;
-        while !input.is_empty() {
-            current += get_u64(&mut input)?;
-            let len = usize::try_from(get_u64(&mut input)?)?;
-            let mut refs = input
-                .get(..len)
-                .ok_or(Error::Decode("spatial cell is truncated"))?;
-            input = &input[len..];
-            match current.cmp(&cell) {
-                Ordering::Less => continue,
-                Ordering::Greater => return Ok(None),
-                Ordering::Equal => {
-                    return Ok(Some(CellRefs {
-                        points: get_delta_list(&mut refs)?,
-                        segments: get_delta_list(&mut refs)?,
+        let at = self.ids_start + item * self.id_width;
+        let mut id = [0; 8];
+        id[..self.id_width].copy_from_slice(&self.bytes[at..at + self.id_width]);
+        u64::from_le_bytes(id)
+    }
+
+    /// Items whose boxes lie within `radius_m` of the point, nearest box
+    /// first, each with a lower bound on its distance.
+    fn nearest(&self, lon: f64, lat: f64, radius_m: f64) -> Nearest<'_> {
+        let mut pending = BinaryHeap::new();
+        if let Some(&(root, _)) = self.levels.last() {
+            pending.push(Reverse(Pending {
+                distance_m: lower_bound_m(&self.bbox(root), lon, lat),
+                level: self.levels.len() - 1,
+                index: 0,
+            }));
+        }
+        Nearest {
+            tree: self,
+            lon,
+            lat,
+            radius_m,
+            pending,
+        }
+    }
+}
+
+struct Nearest<'a> {
+    tree: &'a Tree,
+    lon: f64,
+    lat: f64,
+    radius_m: f64,
+    pending: BinaryHeap<Reverse<Pending>>,
+}
+
+/// A node not yet visited, ordered by its lower bound.
+struct Pending {
+    distance_m: f64,
+    level: usize,
+    index: usize,
+}
+
+impl PartialEq for Pending {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Pending {}
+
+impl PartialOrd for Pending {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Pending {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance_m
+            .total_cmp(&other.distance_m)
+            .then_with(|| self.level.cmp(&other.level))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl Iterator for Nearest<'_> {
+    /// An item's index and the lower bound on its distance.
+    type Item = (usize, f64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(Reverse(node)) = self.pending.pop() {
+            if node.distance_m > self.radius_m {
+                self.pending.clear();
+                return None;
+            }
+            if node.level == 0 {
+                return Some((node.index, node.distance_m));
+            }
+            let (first, len) = self.tree.levels[node.level - 1];
+            let children = node.index * NODE_SIZE..((node.index + 1) * NODE_SIZE).min(len);
+            for child in children {
+                let distance_m = lower_bound_m(&self.tree.bbox(first + child), self.lon, self.lat);
+                if distance_m <= self.radius_m {
+                    self.pending.push(Reverse(Pending {
+                        distance_m,
+                        level: node.level - 1,
+                        index: child,
                     }));
                 }
             }
         }
-        Ok(None)
+        None
+    }
+}
+
+/// A lower bound on the distance from a point to anything in a box, in
+/// metres; infinite for an empty box. Longitude wraps, so a box across the
+/// antimeridian from the point is near it.
+fn lower_bound_m(bbox: &BoundingBox, lon: f64, lat: f64) -> f64 {
+    if bbox[0] > bbox[2] {
+        return f64::INFINITY;
+    }
+    let [min_lon, min_lat, max_lon, max_lat] = bbox.map(dequantize);
+    let d_lat = (min_lat - lat).max(lat - max_lat).max(0.0);
+    let d_lon = if (min_lon..=max_lon).contains(&lon) {
+        0.0
+    } else {
+        (min_lon - lon)
+            .rem_euclid(360.0)
+            .min((lon - max_lon).rem_euclid(360.0))
+    };
+    // A degree of longitude is shortest at the latitude nearest a pole.
+    let poleward = lat.abs().max(min_lat.abs()).max(max_lat.abs()).min(90.0);
+    let x = d_lon.to_radians() * poleward.to_radians().cos();
+    let y = d_lat.to_radians();
+    EARTH_RADIUS_M * x.hypot(y) * LOWER_BOUND_SLACK
+}
+
+/// The `limit` smallest distances seen, to stop a nearest-first scan once no
+/// unread box can hold anything closer.
+struct Closest {
+    limit: usize,
+    distances: BinaryHeap<OrderedDistance>,
+}
+
+#[derive(PartialEq)]
+struct OrderedDistance(f64);
+
+impl Eq for OrderedDistance {}
+
+impl PartialOrd for OrderedDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedDistance {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl Closest {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            distances: BinaryHeap::new(),
+        }
+    }
+
+    fn add(&mut self, distance_m: f64) {
+        if self.limit == 0 {
+            return;
+        }
+        self.distances.push(OrderedDistance(distance_m));
+        if self.distances.len() > self.limit {
+            self.distances.pop();
+        }
+    }
+
+    /// Whether nothing at `bound` or beyond can be among the closest.
+    fn settled(&self, bound: f64) -> bool {
+        self.distances.len() >= self.limit
+            && self.limit > 0
+            && self
+                .distances
+                .peek()
+                .is_some_and(|farthest| bound > farthest.0)
     }
 }
 
 #[derive(Clone)]
 pub struct Reader {
-    fine: CellTable,
-    context: CellTable,
+    blocks: Tree,
+    lines: Tree,
+    context: Tree,
     records: records::Reader,
 }
 
@@ -420,8 +539,9 @@ impl std::fmt::Debug for Reader {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Reader")
-            .field("fine_blocks", &self.fine.block_count)
-            .field("context_blocks", &self.context.block_count)
+            .field("blocks", &self.blocks.count)
+            .field("lines", &self.lines.count)
+            .field("context", &self.context.count)
             .finish()
     }
 }
@@ -434,9 +554,16 @@ struct LineCache {
 
 impl Reader {
     pub fn open(container: &Container, records: records::Reader) -> Result<Self> {
+        let blocks = Tree::open(container, BLOCKS)?;
+        if blocks.count as u64 != records.block_count() {
+            return Err(Error::Inconsistent(
+                "spatial index does not match the record blocks".into(),
+            ));
+        }
         Ok(Self {
-            fine: CellTable::open(container, FINE)?,
-            context: CellTable::open(container, CONTEXT)?,
+            blocks,
+            lines: Tree::open(container, LINES)?,
+            context: Tree::open(container, CONTEXT)?,
             records,
         })
     }
@@ -449,15 +576,9 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
-        let candidates = self.collect_points(
-            &self.fine,
-            H3_FINE_RESOLUTION,
-            lon,
-            lat,
-            radius_m,
-            limit,
-            |_, candidate| Ok(candidate == layer),
-        )?;
+        let candidates = self.block_points(lon, lat, radius_m, limit, |_, candidate| {
+            Ok(candidate == layer)
+        })?;
         Ok(closest_candidates(candidates, limit))
     }
 
@@ -470,19 +591,12 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
-        let candidates = self.collect_points(
-            &self.fine,
-            H3_FINE_RESOLUTION,
-            lon,
-            lat,
-            radius_m,
-            limit,
-            |record_id, layer| match layer {
+        let candidates =
+            self.block_points(lon, lat, radius_m, limit, |record_id, layer| match layer {
                 Layer::Address => Ok(true),
                 Layer::Poi => self.records.is_explicit_address(record_id),
                 _ => Ok(false),
-            },
-        )?;
+            })?;
         Ok(closest_candidates(candidates, limit))
     }
 
@@ -493,21 +607,32 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
-        let candidates = self.collect_points(
-            &self.context,
-            H3_CONTEXT_RESOLUTION,
-            lon,
-            lat,
-            radius_m,
-            limit,
-            |_, layer| Ok(layer.is_context()),
-        )?;
+        let mut candidates = Vec::new();
+        let mut closest = Closest::new(limit);
+        for (item, bound) in self.context.nearest(lon, lat, radius_m) {
+            if closest.settled(bound) {
+                break;
+            }
+            let record_id = self.context.id(item);
+            let (layer, point_lon, point_lat) = self.records.point(record_id)?;
+            let distance_m = haversine_m(lon, lat, point_lon, point_lat);
+            if distance_m <= radius_m && layer.is_context() {
+                closest.add(distance_m);
+                candidates.push(PointCandidate {
+                    record_id,
+                    layer,
+                    lon: point_lon,
+                    lat: point_lat,
+                    distance_m,
+                });
+            }
+        }
         Ok(closest_candidates(candidates, limit))
     }
 
     /// Whether any context point of `layer` within `radius_m` satisfies
-    /// `matches`, scanning rings outward and stopping at the first match.
-    /// `None` when there is no point of that layer within the radius at all.
+    /// `matches`, nearest first, stopping at the first match. `None` when
+    /// there is no point of that layer within the radius at all.
     pub fn any_context_point(
         &self,
         lon: f64,
@@ -516,27 +641,16 @@ impl Reader {
         radius_m: f64,
         mut matches: impl FnMut(RecordId) -> Result<bool>,
     ) -> Result<Option<bool>> {
-        let Ok(lat_lng) = LatLng::new(lat, lon) else {
-            return Ok(None);
-        };
-        let mut cells = lat_lng
-            .to_cell(H3_CONTEXT_RESOLUTION)
-            .grid_disk_distances::<Vec<(CellIndex, u32)>>(disk_k(H3_CONTEXT_RESOLUTION, radius_m));
-        cells.sort_unstable_by_key(|(cell, k)| (*k, u64::from(*cell)));
         let mut seen = false;
-        for (cell, _) in cells {
-            let Some(refs) = self.context.refs(u64::from(cell))? else {
+        for (item, _) in self.context.nearest(lon, lat, radius_m) {
+            let record_id = self.context.id(item);
+            let (point_layer, point_lon, point_lat) = self.records.point(record_id)?;
+            if point_layer != layer || haversine_m(lon, lat, point_lon, point_lat) > radius_m {
                 continue;
-            };
-            for record_id in refs.points {
-                let (point_layer, point_lon, point_lat) = self.records.point(record_id)?;
-                if point_layer != layer || haversine_m(lon, lat, point_lon, point_lat) > radius_m {
-                    continue;
-                }
-                seen = true;
-                if matches(record_id)? {
-                    return Ok(Some(true));
-                }
+            }
+            seen = true;
+            if matches(record_id)? {
+                return Ok(Some(true));
             }
         }
         Ok(seen.then_some(false))
@@ -550,45 +664,29 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<SegmentCandidate>> {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut lines: HashMap<RecordId, Option<LineCache>> = HashMap::new();
         let mut candidates = Vec::new();
-        for cell in query_cells(lon, lat, H3_FINE_RESOLUTION, radius_m) {
-            let Some(refs) = self.fine.refs(cell)? else {
+        let mut closest = Closest::new(limit);
+        for (item, bound) in self.lines.nearest(lon, lat, radius_m) {
+            if closest.settled(bound) {
+                break;
+            }
+            let record_id = self.lines.id(item);
+            if self.records.header(record_id)?.layer != layer {
+                continue;
+            }
+            let Some(line) = self.records.line(record_id)?.map(line_cache) else {
                 continue;
             };
-            for reference in refs.segments {
-                if !seen.insert(reference) {
+            let total = *line.lengths.last().expect("line has vertices");
+            for (segment, pair) in line.points.windows(2).enumerate() {
+                if haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]) <= f64::EPSILON {
                     continue;
                 }
-                let record_id = reference >> SEGMENT_INDEX_BITS;
-                let segment = (reference & ((1 << SEGMENT_INDEX_BITS) - 1)) as usize;
-                let line = match lines.entry(record_id) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(if self.records.header(record_id)?.layer == layer {
-                            self.records.line(record_id)?.map(line_cache)
-                        } else {
-                            None
-                        })
-                    }
-                };
-                let Some(line) = line.as_ref() else {
-                    continue;
-                };
-                let (Some(start), Some(end)) =
-                    (line.points.get(segment), line.points.get(segment + 1))
-                else {
-                    return Err(Error::IdOutOfRange {
-                        what: "segment reference",
-                        id: reference,
-                    });
-                };
-                let projection = project_to_segment_m(lon, lat, *start, *end);
+                let projection = project_to_segment_m(lon, lat, pair[0], pair[1]);
                 if projection.distance_m <= radius_m {
-                    let total = *line.lengths.last().expect("line has vertices");
                     let start_fraction = line.lengths[segment] / total;
                     let end_fraction = line.lengths[segment + 1] / total;
+                    closest.add(projection.distance_m);
                     candidates.push(SegmentCandidate {
                         record_id,
                         layer,
@@ -633,46 +731,38 @@ impl Reader {
         ]))
     }
 
-    /// Points within `radius_m`, scanning H3 rings outward from the query
-    /// cell. With a `limit`, the scan stops as soon as the `limit` closest hits
-    /// are certain: once the disk scanned so far covers a radius beyond the
-    /// `limit`-th distance, no unscanned point can be closer. Dense areas (a
-    /// city centre full of postcodes) then cost a few rings instead of the
-    /// whole radius.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_points(
+    /// Point records within `radius_m` that `accepts` keeps, reading the
+    /// blocks nearest first. With a `limit`, the scan stops once no unread
+    /// block can hold a point closer than the `limit` closest so far: a dense
+    /// city centre costs the few blocks around the query.
+    fn block_points(
         &self,
-        index: &CellTable,
-        resolution: Resolution,
         lon: f64,
         lat: f64,
         radius_m: f64,
         limit: usize,
         accepts: impl Fn(RecordId, Layer) -> Result<bool>,
     ) -> Result<Vec<PointCandidate>> {
-        let Ok(lat_lng) = LatLng::new(lat, lon) else {
-            return Ok(Vec::new());
-        };
-        let max_k = disk_k(resolution, radius_m);
-        let mut cells = lat_lng
-            .to_cell(resolution)
-            .grid_disk_distances::<Vec<(CellIndex, u32)>>(max_k);
-        cells.sort_unstable_by_key(|(cell, k)| (*k, u64::from(*cell)));
-
         let mut candidates = Vec::new();
-        let mut next = 0;
-        for k in 0..=max_k {
-            while let Some(&(cell, ring)) = cells.get(next)
-                && ring == k
-            {
-                next += 1;
-                let Some(refs) = index.refs(u64::from(cell))? else {
-                    continue;
-                };
-                for record_id in refs.points {
-                    let (layer, point_lon, point_lat) = self.records.point(record_id)?;
+        let mut closest = Closest::new(limit);
+        let window = DegreeWindow::around(lat, radius_m);
+        for (block, bound) in self.blocks.nearest(lon, lat, radius_m) {
+            if closest.settled(bound) {
+                break;
+            }
+            self.records.block_points(
+                block as u64,
+                |record_id, layer, point_lon, point_lat, line| {
+                    if line {
+                        return Ok(());
+                    }
+                    let (point_lon, point_lat) = (dequantize(point_lon), dequantize(point_lat));
+                    if !window.holds(lon, lat, point_lon, point_lat) {
+                        return Ok(());
+                    }
                     let distance_m = haversine_m(lon, lat, point_lon, point_lat);
                     if distance_m <= radius_m && accepts(record_id, layer)? {
+                        closest.add(distance_m);
                         candidates.push(PointCandidate {
                             record_id,
                             layer,
@@ -681,24 +771,40 @@ impl Reader {
                             distance_m,
                         });
                     }
-                }
-            }
-            if limit > 0 && candidates.len() >= limit && k < max_k {
-                // `disk_k` scans `ceil(r / edge) + H3_RADIUS_EXTRA_RING` rings to
-                // cover radius r, so the rings scanned so far cover this radius.
-                let covered_m =
-                    f64::from(k.saturating_sub(H3_RADIUS_EXTRA_RING)) * resolution.edge_length_m();
-                let mut distances = candidates
-                    .iter()
-                    .map(|candidate| candidate.distance_m)
-                    .collect::<Vec<_>>();
-                let (_, kth, _) = distances.select_nth_unstable_by(limit - 1, f64::total_cmp);
-                if *kth < covered_m {
-                    break;
-                }
-            }
+                    Ok(())
+                },
+            )?;
         }
         Ok(candidates)
+    }
+}
+
+/// The degrees of latitude and longitude a radius spans around a point, a
+/// little wide: points outside are farther than the radius, so a scan passes
+/// over them without the trigonometry of a haversine distance.
+struct DegreeWindow {
+    lat: f64,
+    lon: f64,
+}
+
+impl DegreeWindow {
+    fn around(lat: f64, radius_m: f64) -> Self {
+        let lat_degrees = (radius_m / EARTH_RADIUS_M).to_degrees() / LOWER_BOUND_SLACK;
+        // Within a degree of a pole every longitude is near: no window.
+        let cos = (lat.abs() + lat_degrees).min(90.0).to_radians().cos();
+        Self {
+            lat: lat_degrees,
+            lon: if cos > 0.02 {
+                lat_degrees / cos
+            } else {
+                f64::INFINITY
+            },
+        }
+    }
+
+    fn holds(&self, lon: f64, lat: f64, point_lon: f64, point_lat: f64) -> bool {
+        let d_lon = (point_lon - lon).abs();
+        (point_lat - lat).abs() <= self.lat && d_lon.min(360.0 - d_lon) <= self.lon
     }
 }
 
@@ -715,53 +821,6 @@ fn line_cache(points: Vec<[i32; 2]>) -> LineCache {
         lengths.push(total);
     }
     LineCache { points, lengths }
-}
-
-fn cell_id(lon: f64, lat: f64, resolution: Resolution) -> Result<u64> {
-    let lat_lng = LatLng::new(lat, lon).map_err(|_| Error::CoordinateNotFinite)?;
-    Ok(u64::from(lat_lng.to_cell(resolution)))
-}
-
-/// Rings around the query cell that cover `radius_m`.
-fn disk_k(resolution: Resolution, radius_m: f64) -> u32 {
-    if radius_m <= 0.0 {
-        H3_RADIUS_EXTRA_RING
-    } else {
-        ((radius_m / resolution.edge_length_m()).ceil() as u32)
-            .saturating_add(H3_RADIUS_EXTRA_RING)
-            .min(H3_MAX_QUERY_K)
-    }
-}
-
-fn query_cells(lon: f64, lat: f64, resolution: Resolution, radius_m: f64) -> Vec<u64> {
-    let Ok(lat_lng) = LatLng::new(lat, lon) else {
-        return Vec::new();
-    };
-    let mut cells = lat_lng
-        .to_cell(resolution)
-        .grid_disk::<Vec<CellIndex>>(disk_k(resolution, radius_m))
-        .into_iter()
-        .map(u64::from)
-        .collect::<Vec<_>>();
-    // Ascending cell ids read the index front to back.
-    cells.sort_unstable();
-    cells
-}
-
-fn segment_cells(start: [f64; 2], end: [f64; 2], resolution: Resolution) -> Result<Vec<u64>> {
-    let length = haversine_m(start[0], start[1], end[0], end[1]);
-    let step = (resolution.edge_length_m() / H3_SEGMENT_SAMPLE_DIVISOR).max(1.0);
-    let sample_count = ((length / step).ceil() as usize).max(1);
-    let mut cells = Vec::with_capacity(sample_count + 1);
-    for sample in 0..=sample_count {
-        let t = sample as f64 / sample_count as f64;
-        let lon = start[0] + t * (end[0] - start[0]);
-        let lat = start[1] + t * (end[1] - start[1]);
-        cells.push(cell_id(lon, lat, resolution)?);
-    }
-    cells.sort_unstable();
-    cells.dedup();
-    Ok(cells)
 }
 
 struct SegmentProjection {
@@ -859,7 +918,6 @@ fn closest_candidates<T: CandidateDistance>(mut candidates: Vec<T>, limit: usize
 
 #[cfg(test)]
 mod tests {
-    use geojson::Geometry;
 
     use super::*;
     use crate::{
@@ -918,19 +976,17 @@ mod tests {
         })
     }
 
-    /// Build a Pack holding only records and the spatial index, with a sorter
-    /// budget small enough to force spilling.
+    /// Build a Pack holding only records and the spatial index.
     fn build(records: &[Record]) -> (Reader, Commit) {
         let root =
             std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let mut writer = records::Writer::create(&scratch, &Budget::unlimited()).expect("records");
-        let mut spatial = Writer::new(&scratch, &Budget::unlimited(), 64);
+        let mut writer = records::Writer::create(&scratch, &crate::memory::Budget::unlimited())
+            .expect("records");
+        let mut spatial = Writer::new(&scratch).expect("spatial");
         for record in records {
             let id = writer.write(record, None).expect("write");
-            spatial
-                .add(RecordCells::for_record(id, record).expect("cells"))
-                .expect("add");
+            spatial.add(id, record).expect("add");
         }
         let path = root.join("pack.ogp");
         let mut pack = container::Writer::create(&path).expect("pack");
@@ -956,8 +1012,8 @@ mod tests {
             ));
         }
         let (reader, commit) = build(&records);
-        assert!(commit.fine_pairs.runs > 0, "the tiny budget must spill");
         assert_eq!(commit.point_count, 1_001);
+        assert_eq!(commit.block_count, 1_001_u64.div_ceil(BLOCK_RECORDS));
 
         let hits = reader
             .point_candidates(-79.0, 43.0, Layer::Address, 5.0, 1)
@@ -987,9 +1043,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn early_stopping_ring_scan_matches_the_full_scan() {
-        // Postcodes scattered over ~60 km, denser near the centre.
+    fn scattered(count: usize) -> Vec<[f64; 2]> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
             state ^= state << 13;
@@ -997,29 +1051,60 @@ mod tests {
             state ^= state << 17;
             (state % 1_000_000) as f64 / 1_000_000.0 - 0.5
         };
-        let records = (0..2_000)
+        (0..count)
             .map(|index| {
                 let spread = if index % 3 == 0 { 0.6 } else { 0.05 };
+                [-79.4 + next() * spread, 43.7 + next() * spread]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn early_stopping_scan_matches_the_full_scan() {
+        // Points scattered over ~60 km, denser near the centre.
+        let points = scattered(5_000);
+        let postcodes = points
+            .iter()
+            .enumerate()
+            .map(|(index, [lon, lat])| {
                 Record::Postcode(PostcodeRecord {
                     postcode: format!("P{index}"),
-                    geometry: point_geometry(-79.4 + next() * spread, 43.7 + next() * spread),
+                    geometry: point_geometry(*lon, *lat),
                     source: DerivedSourceProvenance::osm_address_records(1),
                 })
             })
             .collect::<Vec<_>>();
-        let (reader, _) = build(&records);
+        let addresses = points
+            .iter()
+            .enumerate()
+            .map(|(index, [lon, lat])| address(*lon, *lat, index as i64))
+            .collect::<Vec<_>>();
+        let (postcodes, _) = build(&postcodes);
+        let (addresses, _) = build(&addresses);
+        let distances =
+            |hits: &[PointCandidate]| hits.iter().map(|hit| hit.distance_m).collect::<Vec<_>>();
         for (lon, lat) in [(-79.4, 43.7), (-79.6, 43.9), (-79.1, 43.5), (-78.0, 43.0)] {
             for limit in [1, 16, 100] {
-                let early = reader
+                let early = postcodes
                     .context_candidates(lon, lat, 50_000.0, limit)
                     .expect("early");
-                let mut full = reader
+                let mut full = postcodes
                     .context_candidates(lon, lat, 50_000.0, 0)
                     .expect("full");
                 full.truncate(limit);
-                let distances = |hits: &[PointCandidate]| {
-                    hits.iter().map(|hit| hit.distance_m).collect::<Vec<_>>()
-                };
+                assert_eq!(
+                    distances(&early),
+                    distances(&full),
+                    "{lon},{lat} limit {limit}"
+                );
+
+                let early = addresses
+                    .point_candidates(lon, lat, Layer::Address, 50_000.0, limit)
+                    .expect("early");
+                let mut full = addresses
+                    .point_candidates(lon, lat, Layer::Address, 50_000.0, 0)
+                    .expect("full");
+                full.truncate(limit);
                 assert_eq!(
                     distances(&early),
                     distances(&full),
@@ -1030,17 +1115,33 @@ mod tests {
     }
 
     #[test]
-    fn indexes_context_points_with_coarse_cells() {
-        let (reader, _) = build(&[Record::Postcode(PostcodeRecord {
-            postcode: "M5V".to_string(),
-            geometry: point_geometry(-79.4, 43.6),
-            source: DerivedSourceProvenance::osm_address_records(1),
-        })]);
+    fn finds_points_across_the_antimeridian() {
+        let (reader, _) = build(&[address(179.99995, -44.0, 1), address(-179.99995, -44.0, 2)]);
+        let hits = reader
+            .point_candidates(-179.99999, -44.0, Layer::Address, 50.0, 0)
+            .expect("hits");
+        assert_eq!(
+            hits.iter().map(|hit| hit.record_id).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn indexes_context_points_apart_from_addresses() {
+        let (reader, commit) = build(&[
+            address(-79.4, 43.6, 1),
+            Record::Postcode(PostcodeRecord {
+                postcode: "M5V".to_string(),
+                geometry: point_geometry(-79.4, 43.6),
+                source: DerivedSourceProvenance::osm_address_records(1),
+            }),
+        ]);
+        assert_eq!(commit.context_point_count, 1);
         let hits = reader
             .context_candidates(-79.39, 43.6, 5_000.0, 5)
             .expect("hits");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 0);
+        assert_eq!(hits[0].record_id, 1);
         assert_eq!(hits[0].layer, Layer::Postcode);
     }
 
@@ -1062,7 +1163,7 @@ mod tests {
             })
         };
         let (reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);
-        assert_eq!(commit.segment_count, 4);
+        assert_eq!(commit.line_count, 2);
         let hits = reader
             .segment_candidates(-79.00001, 43.00075, Layer::Street, 5.0, 1)
             .expect("hits");
@@ -1072,6 +1173,12 @@ mod tests {
             (hits[0].fraction - 0.75).abs() < 0.01,
             "{}",
             hits[0].fraction
+        );
+        assert!(
+            reader
+                .point_candidates(-79.0, 43.0005, Layer::Street, 5.0, 1)
+                .expect("lines are not points")
+                .is_empty()
         );
         assert!(
             reader

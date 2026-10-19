@@ -234,7 +234,6 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         WriterOptions {
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
-            sort_budget_bytes: (budget / 4).max(1),
             text_index_memory_bytes: (budget / 2).max(1),
         },
     )?;
@@ -593,13 +592,6 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         ("addresses", address_stats),
         ("records", record_stats),
         ("context_records", context_stats),
-        (
-            "spatial_pairs",
-            SortStats {
-                items: 0,
-                runs: stats.spatial_pair_runs,
-            },
-        ),
     ] {
         report.scratch.sorters.insert(
             name.to_string(),

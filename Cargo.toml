@@ -41,7 +41,6 @@ dirs = { version = "7.0.0", optional = true }
 fst = "0.4"
 geo = "0.33"
 geojson = "1.0"
-h3o = "0.10"
 indicatif = "0.17"
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"

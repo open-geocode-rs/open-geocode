@@ -39,8 +39,7 @@ use crate::{
         dictionary::{Builder, RecordNames},
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
-    records,
-    spatial_index::{self, RecordCells},
+    records, spatial_index,
     text_index::{self, PostcodeAreas},
 };
 
@@ -58,13 +57,11 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 7;
+pub const PACK_SCHEMA_VERSION: u32 = 8;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
-/// Default memory for the spatial index sorter. The builder passes its own.
-const DEFAULT_SORT_BUDGET_BYTES: usize = 512 << 20;
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,9 +80,9 @@ pub struct Manifest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpatialManifest {
     pub point_count: u64,
-    pub segment_count: u64,
-    pub cell_count: u64,
-    pub context_cell_count: u64,
+    pub line_count: u64,
+    pub block_count: u64,
+    pub context_point_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -95,8 +92,6 @@ pub struct WriterOptions {
     pub scratch_dir: Option<PathBuf>,
     /// Pool every buffer of the build reserves from.
     pub memory: Arc<Budget>,
-    /// Share of the pool the spatial index sorter may hold before it spills.
-    pub sort_budget_bytes: usize,
     /// Memory for Tantivy's indexing buffers, taken from the pool.
     pub text_index_memory_bytes: usize,
 }
@@ -106,7 +101,6 @@ impl Default for WriterOptions {
         Self {
             scratch_dir: None,
             memory: Budget::unlimited(),
-            sort_budget_bytes: DEFAULT_SORT_BUDGET_BYTES,
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
         }
     }
@@ -184,7 +178,6 @@ impl Drop for GenerationGuard {
 pub struct BuildStats {
     pub bytes: u64,
     pub sections: BTreeMap<String, u64>,
-    pub spatial_pair_runs: u64,
     pub text_index_bytes: u64,
 }
 
@@ -213,11 +206,7 @@ impl Writer {
                 &options.memory,
                 options.text_index_memory_bytes,
             )?,
-            spatial: spatial_index::Writer::new(
-                &scratch,
-                &options.memory,
-                options.sort_budget_bytes,
-            ),
+            spatial: spatial_index::Writer::new(&scratch)?,
             scratch,
             destination,
             generation,
@@ -313,7 +302,6 @@ impl Writer {
                 record,
                 context,
                 document,
-                cells,
                 names,
             } = prepared;
             let record_id = first + offset as u64;
@@ -329,7 +317,7 @@ impl Writer {
             };
             self.records.write(&record, context)?;
             self.text.add(document)?;
-            self.spatial.add(cells)?;
+            self.spatial.add(record_id, &record)?;
             *self.layer_counts.entry(record.layer()).or_default() += 1;
         }
         Ok(())
@@ -385,9 +373,9 @@ impl Writer {
             text_document_count: text_commit.document_count,
             spatial: SpatialManifest {
                 point_count: spatial_commit.point_count,
-                segment_count: spatial_commit.segment_count,
-                cell_count: spatial_commit.cell_count,
-                context_cell_count: spatial_commit.context_cell_count,
+                line_count: spatial_commit.line_count,
+                block_count: spatial_commit.block_count,
+                context_point_count: spatial_commit.context_point_count,
             },
         };
         pack.add(
@@ -414,8 +402,6 @@ impl Writer {
             BuildStats {
                 bytes,
                 sections,
-                spatial_pair_runs: spatial_commit.fine_pairs.runs
-                    + spatial_commit.context_pairs.runs,
                 text_index_bytes: text_commit.bytes,
             },
         ))
@@ -699,7 +685,6 @@ impl BatchPreparer {
                         &self.postcode_areas,
                         country,
                     ),
-                    cells: RecordCells::for_record(record_id, &record)?,
                     names: RecordNames::of(&record),
                     record,
                     context,
@@ -742,7 +727,6 @@ struct PreparedRecord {
     record: Record,
     context: Option<RecordContext>,
     document: TantivyDocument,
-    cells: RecordCells,
     names: RecordNames,
 }
 
@@ -846,7 +830,7 @@ mod tests {
         let sections = reader.section_sizes();
         assert!(sections.contains_key("records/blocks"));
         assert!(sections.keys().any(|name| name.starts_with("text/")));
-        assert!(sections.contains_key("spatial/fine/data"));
+        assert!(sections.contains_key("spatial/blocks"));
         assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
 
         // The Pack file alone is a complete Pack.
@@ -982,7 +966,6 @@ mod tests {
             WriterOptions {
                 scratch_dir: None,
                 memory: Arc::clone(&memory),
-                sort_budget_bytes: 16 << 20,
                 text_index_memory_bytes: 16 << 20,
             },
         )
