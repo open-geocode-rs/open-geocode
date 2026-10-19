@@ -230,21 +230,7 @@ impl TextSearcher {
             &[],
             Filters::new(options.layer.as_deref(), &options.countries),
             limit,
-            |plan, hit| {
-                // The forms are the whole context part and the part from its
-                // first word with a digit ("sandybaytas7005", "7005"), so a
-                // hit is contradicted only when no form agrees with it.
-                let postcode = plan.postcode();
-                if postcode.forms.is_empty() {
-                    return Ok(true);
-                }
-                for form in &postcode.forms {
-                    if self.hit_in_postcode(hit, form)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            },
+            |_, postcode, hit| self.hit_in_postcode(hit, postcode),
         )?;
         Ok(hits)
     }
@@ -280,11 +266,12 @@ impl TextSearcher {
             &context,
             Filters::new(options.layer.as_deref(), &options.countries),
             limit,
-            |plan, hit| {
+            |plan, postcode, hit| {
                 // A street stands in for a house number it does not have in
                 // search, but a geocoded row needs the address itself.
                 Ok(hit.record.point.is_some()
                     && !(plan.house_number.is_some() && hit.record.layer == Layer::Street.as_str())
+                    && self.hit_in_postcode(hit, postcode)?
                     && self.hit_matches_address_context(hit, &options)?)
             },
         )?;
@@ -584,7 +571,7 @@ impl TextSearcher {
         context: &[ContextPart],
         filters: Filters<'_>,
         limit: usize,
-        mut accept: impl FnMut(&QueryPlan, &TextSearchHit) -> Result<bool>,
+        mut accept: impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut plans = Vec::<QueryPlan>::new();
         for parsed in self.tagger.parse(query_text) {
@@ -635,7 +622,7 @@ impl TextSearcher {
         query_words: &HashSet<String>,
         filters: Filters<'_>,
         limit: usize,
-        accept: &mut impl FnMut(&QueryPlan, &TextSearchHit) -> Result<bool>,
+        accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<Vec<TextSearchHit>> {
         let ranking = Ranking {
             query_words: query_words.clone(),
@@ -652,13 +639,13 @@ impl TextSearcher {
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str())
             && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking)?
-            && accept(plan, &estimate)?
+            && accept(plan, &ranking.postcode, &estimate)?
         {
             hits.push(estimate);
         }
         let query = self.build_query(plan, pass, filters);
         for hit in self.ranked_hits(&query, &ranking, limit)? {
-            if accept(plan, &hit)? {
+            if accept(plan, &ranking.postcode, &hit)? {
                 hits.push(hit);
             }
         }
@@ -673,12 +660,6 @@ impl TextSearcher {
     ) -> Result<bool> {
         let desired_region = normalized_for_match(options.region.as_deref());
         let desired_locality = normalized_for_match(options.locality.as_deref());
-        let desired_postcode = options.postcode.as_deref().and_then(compact_postcode);
-        if let Some(desired) = &desired_postcode
-            && !self.hit_in_postcode(hit, desired)?
-        {
-            return Ok(false);
-        }
         if desired_region.is_none() && desired_locality.is_none() {
             return Ok(true);
         }
@@ -748,26 +729,41 @@ impl TextSearcher {
         Ok(areas)
     }
 
-    /// Whether a hit can be in the requested (compacted) postcode.
-    ///
-    /// A hit that states a postcode must agree with it; either may be a prefix
-    /// of the other, so "M5V" matches "M5V 1A1". A hit without one is judged by
-    /// the postcode areas around it: if there are some nearby and none shares
-    /// the requested postcode's leading characters, the hit is somewhere else.
-    /// With no postcode data nearby there is nothing to contradict the row.
-    fn hit_in_postcode(&self, hit: &TextSearchHit, desired: &str) -> Result<bool> {
-        if let Some(postcode) = self.pack.records().postcode(hit.record_id)? {
-            return Ok(compact_postcode(&postcode).is_none_or(|postcode| {
-                postcode.starts_with(desired) || desired.starts_with(postcode.as_str())
+    /// Whether a hit can be in the postcode the query names. A hit that
+    /// states a postcode must agree with it; either may be a prefix of the
+    /// other, so "M5V" matches "M5V 1A1". A hit without one is judged by the
+    /// postcode records around it.
+    fn hit_in_postcode(&self, hit: &TextSearchHit, postcode: &QueryPostcode) -> Result<bool> {
+        if postcode.forms.is_empty() {
+            return Ok(true);
+        }
+        if let Some(stated) = self.pack.records().postcode(hit.record_id)? {
+            return Ok(compact_postcode(&stated).is_none_or(|stated| {
+                postcode
+                    .forms
+                    .iter()
+                    .any(|form| stated.starts_with(form.as_str()) || form.starts_with(&stated))
             }));
         }
         let Some(point) = hit.record.point else {
             return Ok(true);
         };
-        let area: String = desired.chars().take(POSTCODE_AREA_CHARS).collect();
+        for form in &postcode.forms {
+            if self.near_postcode_area(point.lon, point.lat, form)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the postcode records around a point share the leading
+    /// characters of `postcode`. With no postcode data nearby there is
+    /// nothing to contradict it.
+    fn near_postcode_area(&self, lon: f64, lat: f64, postcode: &str) -> Result<bool> {
+        let area: String = postcode.chars().take(POSTCODE_AREA_CHARS).collect();
         let in_area = self.spatial.any_context_point(
-            point.lon,
-            point.lat,
+            lon,
+            lat,
             Layer::Postcode,
             POSTCODE_AREA_RADIUS_M,
             |record_id| {
@@ -781,7 +777,6 @@ impl TextSearcher {
                     }))
             },
         )?;
-        // No postcode data nearby means nothing contradicts the row.
         Ok(in_area.unwrap_or(true))
     }
 
