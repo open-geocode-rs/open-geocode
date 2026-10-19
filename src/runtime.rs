@@ -426,6 +426,12 @@ pub(crate) async fn autocomplete(
 ///
 /// This is the lookup `geocode batch` runs per row, over HTTP.
 ///
+/// A house number the data lacks is placed between its neighbours
+/// (`accuracy` `interpolated`) or, failing that, answered with its street
+/// (`accuracy` `street`). A street answers a given postcode only where
+/// postcode data confirms it. The answer is never another house: a flat
+/// written "10/1367" is found as itself or by 1367, never as house 10.
+///
 /// The answer is the same FeatureCollection every other route returns, with
 /// at most one feature: `features` holds the one match, or is empty when
 /// nothing fits. `geocoding.query` is the rewrite that matched, which is not

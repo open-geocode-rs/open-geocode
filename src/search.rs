@@ -36,8 +36,8 @@ use crate::{
     text_index::{
         Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
         RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms, base_house_number,
-        compact_postcode, expand_address_abbreviations, expand_final_direction, is_numeric_token,
-        normalize_index_text, open_text_index, street_search_text,
+        compact_postcode, expand_address_abbreviations, expand_final_direction, flat_number_term,
+        is_numeric_token, normalize_index_text, open_text_index, street_search_text,
     },
 };
 
@@ -238,6 +238,7 @@ impl TextSearcher {
             &[],
             Filters::new(options.layer.as_deref(), &options.countries),
             limit,
+            Parses::All,
             |_, postcode, hit| self.hit_in_postcode(hit, postcode),
         )?;
         Ok(hits)
@@ -274,12 +275,32 @@ impl TextSearcher {
             &context,
             Filters::new(options.layer.as_deref(), &options.countries),
             limit,
+            // A weaker parse that reads the number as a unit or a word finds
+            // what the query never asked for: another house, or a POI on the
+            // street. Search lists such hits; a geocoded row would give one.
+            Parses::Numbered,
             |plan, postcode, hit| {
-                // A street stands in for a house number it does not have in
-                // search, but a geocoded row needs the address itself.
+                // A street stands in for a house number it lacks, as in search;
+                // its `accuracy` says so. Refused, the query fell through to
+                // parses that matched another street ("10 Eruera Street" to
+                // "10 Kevin Street"). A street states no postcode, so a given
+                // one must be confirmed by postcode data, not merely left
+                // uncontradicted.
+                let stands_in =
+                    plan.house_number.is_some() && hit.record.layer == Layer::Street.as_str();
+                let in_postcode = match self.postcode_agreement(hit, postcode)? {
+                    Some(agrees) => agrees,
+                    None => !stands_in || postcode.forms.is_empty(),
+                };
+                // A parse with no house number ("997" read as a unit) matches
+                // a street group by its words alone, and search answers such
+                // a query with the group's first address: as a geocoded row
+                // that is a house the query never named, given as exact.
+                let unnumbered_address =
+                    plan.house_number.is_none() && hit.record.layer == Layer::Address.as_str();
                 Ok(hit.record.point.is_some()
-                    && !(plan.house_number.is_some() && hit.record.layer == Layer::Street.as_str())
-                    && self.hit_in_postcode(hit, postcode)?
+                    && !unnumbered_address
+                    && in_postcode
                     && self.hit_matches_address_context(hit, &options)?)
             },
         )?;
@@ -329,7 +350,10 @@ impl TextSearcher {
     fn build_query(&self, plan: &QueryPlan, pass: Pass, filters: Filters<'_>) -> Box<dyn Query> {
         let mut clauses = Vec::new();
         if let Some(number) = &plan.house_number {
-            clauses.push((Occur::Must, self.house_number_query(number, pass)));
+            clauses.push((
+                Occur::Must,
+                self.house_number_query(number, plan.unit.as_deref(), pass),
+            ));
         }
         clauses.extend(self.subject_clauses(plan, pass));
         for word in &plan.optional {
@@ -489,15 +513,28 @@ impl TextSearcher {
     /// The house number a record states, or an interpolation range that
     /// contains it. In the later passes a street, which has no numbers, also
     /// stands in for it. Range and street score nothing for the number.
-    fn house_number_query(&self, number: &HouseNumber, pass: Pass) -> Box<dyn Query> {
-        let stated = TermQuery::new(
-            Term::from_field_text(self.fields.address_number, &number.text),
-            IndexRecordOption::Basic,
-        );
-        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = vec![(
-            Occur::Should,
-            Box::new(BoostQuery::new(Box::new(stated), NUMBER_BOOST)),
-        )];
+    fn house_number_query(
+        &self,
+        number: &HouseNumber,
+        unit: Option<&str>,
+        pass: Pass,
+    ) -> Box<dyn Query> {
+        // A named unit also finds its flat as written with it ("29/181"),
+        // which the build keeps where the street could not say which side
+        // is the unit.
+        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = std::iter::once(number.text.clone())
+            .chain(unit.map(|unit| number.flat_text(unit)))
+            .map(|text| {
+                let stated = TermQuery::new(
+                    Term::from_field_text(self.fields.address_number, &text),
+                    IndexRecordOption::Basic,
+                );
+                (
+                    Occur::Should,
+                    Box::new(BoostQuery::new(Box::new(stated), NUMBER_BOOST)) as Box<dyn Query>,
+                )
+            })
+            .collect();
         if let Some(number) = number.plain() {
             let bound = |field| Bound::Included(Term::from_field_u64(field, number.into()));
             let in_range = BooleanQuery::intersection(vec![
@@ -579,6 +616,7 @@ impl TextSearcher {
         context: &[ContextPart],
         filters: Filters<'_>,
         limit: usize,
+        parses: Parses,
         mut accept: impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut plans = Vec::<QueryPlan>::new();
@@ -588,6 +626,13 @@ impl TextSearcher {
             {
                 plans.push(plan);
             }
+        }
+        if parses == Parses::Numbered
+            && plans
+                .first()
+                .is_some_and(|plan| plan.house_number.is_some())
+        {
+            plans.retain(|plan| plan.house_number.is_some());
         }
         let Some(first_plan) = plans.first() else {
             return Err(Error::UnparsableQuery {
@@ -636,6 +681,15 @@ impl TextSearcher {
             query_words: query_words.clone(),
             house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
             number_text: plan.house_number.as_ref().map(|number| number.text.clone()),
+            flat_text: plan
+                .house_number
+                .as_ref()
+                .zip(plan.unit.as_deref())
+                .map(|(number, unit)| number.flat_text(unit)),
+            unit: plan.unit.clone().or_else(|| {
+                let number = plan.house_number.as_ref()?;
+                Some(number.text.split_once(' ')?.0.to_string())
+            }),
             numbered: plan.house_number.is_some(),
             postcode: self.query_postcode(plan)?,
         };
@@ -742,11 +796,22 @@ impl TextSearcher {
     /// other, so "M5V" matches "M5V 1A1". A hit without one is judged by the
     /// postcode records around it.
     fn hit_in_postcode(&self, hit: &TextSearchHit, postcode: &QueryPostcode) -> Result<bool> {
+        Ok(self.postcode_agreement(hit, postcode)?.unwrap_or(true))
+    }
+
+    /// Whether a hit is in the postcode the query names, `None` when nothing
+    /// says either way: the query names none, or the hit states none and no
+    /// postcode data lies around it.
+    fn postcode_agreement(
+        &self,
+        hit: &TextSearchHit,
+        postcode: &QueryPostcode,
+    ) -> Result<Option<bool>> {
         if postcode.forms.is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
         if let Some(stated) = self.pack.records().postcode(hit.record_id)? {
-            return Ok(compact_postcode(&stated).is_none_or(|stated| {
+            return Ok(compact_postcode(&stated).map(|stated| {
                 postcode
                     .forms
                     .iter()
@@ -754,20 +819,22 @@ impl TextSearcher {
             }));
         }
         let Some(point) = hit.record.point else {
-            return Ok(true);
+            return Ok(None);
         };
+        let mut agreement = Some(false);
         for form in &postcode.forms {
-            if self.near_postcode_area(point.lon, point.lat, form)? {
-                return Ok(true);
+            match self.near_postcode_area(point.lon, point.lat, form)? {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => {}
+                None => agreement = None,
             }
         }
-        Ok(false)
+        Ok(agreement)
     }
 
     /// Whether the postcode records around a point share the leading
-    /// characters of `postcode`. With no postcode data nearby there is
-    /// nothing to contradict it.
-    fn near_postcode_area(&self, lon: f64, lat: f64, postcode: &str) -> Result<bool> {
+    /// characters of `postcode`, `None` with no postcode data nearby.
+    fn near_postcode_area(&self, lon: f64, lat: f64, postcode: &str) -> Result<Option<bool>> {
         let area: String = postcode.chars().take(POSTCODE_AREA_CHARS).collect();
         let in_area = self.spatial.any_context_point(
             lon,
@@ -785,7 +852,7 @@ impl TextSearcher {
                     }))
             },
         )?;
-        Ok(in_area.unwrap_or(true))
+        Ok(in_area)
     }
 
     /// The postcode `plan` names, with the points of the Pack's records of
@@ -943,7 +1010,7 @@ impl TextSearcher {
                 }
                 hits.push((
                     key.clone(),
-                    TieBreak::new(&record, &query_words),
+                    TieBreak::new(&record, &query_words, ranking),
                     TextSearchHit {
                         record_id,
                         score: key.text_score,
@@ -990,8 +1057,13 @@ impl TextSearcher {
         let mut matched = Vec::new();
         self.pack
             .records()
-            .address_numbers(first, count, |record_id, stated| {
-                if address_number_terms(stated).any(|term| term == *number) {
+            .address_numbers(first, count, |record_id, stated, unit| {
+                let sought = |term: &String| {
+                    term == number || ranking.flat_text.as_ref().is_some_and(|flat| term == flat)
+                };
+                if address_number_terms(stated).any(|term| sought(&term))
+                    || flat_number_term(stated, unit).is_some_and(|term| sought(&term))
+                {
                     matched.push(record_id);
                 }
                 Ok(())
@@ -1179,7 +1251,7 @@ impl TextSearcher {
                 Record::Address(_) => {
                     self.pack
                         .records()
-                        .address_numbers(first, count, |record_id, stated| {
+                        .address_numbers(first, count, |record_id, stated, _| {
                             consider(record_id, stated);
                             Ok(())
                         })?
@@ -1508,6 +1580,12 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
 /// Secondary order for hits with equal ranks.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TieBreak {
+    /// The flat the query names, then the building, then its other flats:
+    /// "19 Eros Place" is the house, not its flat 1, though a richer house
+    /// label would lose on the words below. The unit is the one the plan
+    /// read, never a word of the house number ("7 Vialou Street" is no
+    /// unit 7).
+    unit: u8,
     /// Words of the record's own label the query did not ask for, as both
     /// were written: "342 Albert Street" beats "342 Prince Albert Street" for
     /// the query "342 albert street".
@@ -1524,7 +1602,7 @@ struct TieBreak {
 }
 
 impl TieBreak {
-    fn new(record: &Summary, query_words: &HashSet<&str>) -> Self {
+    fn new(record: &Summary, query_words: &HashSet<&str>, ranking: &Ranking) -> Self {
         let label = normalize_index_text(&record.label).unwrap_or_default();
         let label_words = label.split_whitespace().collect::<HashSet<_>>();
         let extra_label_tokens = label
@@ -1549,7 +1627,37 @@ impl TieBreak {
             Some(ObjectType::Row) => 3,
             None => 4,
         };
+        // A flat kept as written ("2/10") is the one "2/10" names, though it
+        // states no unit.
+        let as_written = ranking.unit.is_some()
+            && record
+                .address
+                .housenumber
+                .as_deref()
+                .and_then(normalize_index_text)
+                .is_some_and(|written| {
+                    [&ranking.number_text, &ranking.flat_text]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| *text == written)
+                });
+        let stated = record
+            .address
+            .unit
+            .as_deref()
+            .and_then(normalize_index_text);
+        let unit = match (ranking.unit.as_deref(), stated.as_deref()) {
+            _ if as_written => 0,
+            (Some(sought), Some(stated))
+                if stated.split_whitespace().any(|word| word == sought) =>
+            {
+                0
+            }
+            (Some(_), None) | (None, None) => 1,
+            (_, Some(_)) => 2,
+        };
         Self {
+            unit,
             extra_label_tokens,
             missing_query_words,
             precision,
@@ -1557,6 +1665,16 @@ impl TieBreak {
             id: record.id.clone(),
         }
     }
+}
+
+/// Which parses of a query [`TextSearcher::search_variants`] tries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parses {
+    /// Every parse, best first.
+    All,
+    /// Every parse, unless the best reads a house number: then only those
+    /// that read one.
+    Numbered,
 }
 
 /// The retrieval passes of [`TextSearcher::search_variants`], in order.
@@ -1605,6 +1723,11 @@ struct Ranking {
     /// The house number as the address number field indexes it, to find
     /// the addresses of a street group that state it.
     number_text: Option<String>,
+    /// The named unit and the number written together ("29 181").
+    flat_text: Option<String>,
+    /// The unit the query names, also the first part of a number written
+    /// with its unit ("29" of "29 181").
+    unit: Option<String>,
     postcode: QueryPostcode,
 }
 
@@ -1726,6 +1849,9 @@ struct QueryPlan {
     /// The house number the parser read ("670", "221b", "993_5"), when other
     /// required words name the street it is on.
     house_number: Option<HouseNumber>,
+    /// The unit the query names by a number ("29" of "unit 29" or of
+    /// "29/181" read as a unit), to find and rank the flat.
+    unit: Option<String>,
     required: Vec<String>,
     optional: Vec<String>,
     /// Each run of locality, region, postcode or country words, in order.
@@ -1780,7 +1906,17 @@ impl QueryPlan {
                         plan.required.extend(words);
                     }
                 }
-                Label::HouseNumber | Label::Unit => plan.optional.extend(words),
+                Label::Unit => {
+                    if let Some(unit) = words
+                        .iter()
+                        .rev()
+                        .find(|word| word.chars().any(|character| character.is_ascii_digit()))
+                    {
+                        plan.unit = Some(unit.clone());
+                    }
+                    plan.optional.extend(words);
+                }
+                Label::HouseNumber => plan.optional.extend(words),
                 Label::Street | Label::Other => plan.required.extend(
                     expand_address_abbreviations(&words.join(" "))
                         .split_whitespace()
@@ -1875,6 +2011,12 @@ struct HouseNumber {
 }
 
 impl HouseNumber {
+    /// The number written after `unit`, as the address number field indexes
+    /// a flat ("29 181").
+    fn flat_text(&self, unit: &str) -> String {
+        format!("{unit} {}", self.text)
+    }
+
     /// Digits with at most one letter after them: "670", "221b", but not
     /// "1st". The parts of a number written in parts, joined by "_", read as
     /// one ("993_5").
@@ -2877,8 +3019,16 @@ mod tests {
         assert_eq!(top_ids(&searcher, "10 King Street"), vec!["osm:node:1"]);
         // No record has 99: the street answers, never the address with 10.
         assert_eq!(top_ids(&searcher, "99 King St"), vec!["osm:way:9"]);
-        // A geocoded row needs the address itself, not its street.
-        assert_eq!(geocode(&searcher, "99 King Street", None, None), None);
+        // Geocoding falls back to the street too, never to another number.
+        assert_eq!(
+            geocode(&searcher, "99 King Street", None, None).as_deref(),
+            Some("osm:way:9")
+        );
+        // A street states no postcode: no postcode data confirms it here.
+        assert_eq!(
+            geocode(&searcher, "99 King Street", None, Some("M5V 1A1")),
+            None
+        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -3111,10 +3261,11 @@ mod tests {
             top_ids(&searcher, "99 Queen St, Toronto"),
             vec!["osm:way:50"]
         );
-        // A geocoded row needs the address itself, in the named town.
+        // A geocoded row falls back to the street in the named town, not to
+        // the number elsewhere.
         assert_eq!(
-            geocode(&searcher, "99 Queen Street", Some("Toronto"), None),
-            None
+            geocode(&searcher, "99 Queen Street", Some("Toronto"), None).as_deref(),
+            Some("osm:way:50")
         );
         // Area names are expanded like query parts: "St" stays a saint.
         assert_eq!(
@@ -3343,9 +3494,35 @@ mod tests {
         assert!((odd.lat - 43.0025).abs() < 1e-9, "{odd:?}");
         // Never past the last number known.
         assert_eq!(top("40 Bayview Ave").id, "osm:way:1");
-        assert_eq!(geocode(&searcher, "40 Bayview Avenue", None, None), None);
+        assert_eq!(
+            geocode(&searcher, "40 Bayview Avenue", None, None).as_deref(),
+            Some("osm:way:1")
+        );
         // 81 and 91 are on different Victoria Streets.
         assert_eq!(top("85 Victoria St").layer, "street");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocoding_no_number_names_no_house() {
+        let temp_dir = temp_pack_path("geocode-no-number");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, number) in [("osm:node:1", "1"), ("osm:node:2", "3")] {
+            writer
+                .write(
+                    &address_record(id, "", number, "Elizabeth Street", None, None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // Search lists the street's houses; a geocoded row would claim one
+        // the query never named.
+        assert_eq!(top_ids(&searcher, "Elizabeth Street")[0], "osm:node:1");
+        assert_eq!(geocode(&searcher, "Elizabeth Street", None, None), None);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

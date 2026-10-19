@@ -152,6 +152,9 @@ pub struct Document {
     pub streets: Vec<String>,
     /// The house numbers of the record, or of each address of a group.
     pub address_numbers: Vec<String>,
+    /// Flats as their units and numbers are written together, "10 1367":
+    /// found as written, but no house number.
+    pub flat_numbers: Vec<String>,
     /// The units of a group's addresses, searched with what it is.
     pub units: Vec<String>,
     pub postcode: Option<String>,
@@ -256,6 +259,7 @@ impl Writer {
         {
             group.record_count += 1;
             group.address_numbers.extend(document.address_numbers);
+            group.flat_numbers.extend(document.flat_numbers);
             group.units.extend(document.units);
             return Ok(());
         }
@@ -411,6 +415,7 @@ impl Fields {
                 lowest = Some(lowest.map_or(base, |lowest| lowest.min(base)));
             }
         }
+        terms.extend(projected.flat_numbers.iter().cloned());
         for term in &terms {
             document.add_text(self.address_number, term);
         }
@@ -515,6 +520,10 @@ impl Document {
         }
         builder.address_parts(&address.address);
         builder.projected.units.extend(address.address.unit.clone());
+        builder.projected.flat_numbers.extend(flat_number_term(
+            &address.address.number,
+            address.address.unit.as_deref(),
+        ));
         builder
     }
 
@@ -753,6 +762,7 @@ impl ProjectionBuilder {
                 name: None,
                 streets: Vec::new(),
                 address_numbers: Vec::new(),
+                flat_numbers: Vec::new(),
                 units: Vec::new(),
                 postcode: None,
                 autocomplete_subject_text: String::new(),
@@ -1101,6 +1111,17 @@ pub(crate) fn is_numeric_token(token: &str) -> bool {
 /// is a number of its own, normalized ("407A" is "407a").
 pub(crate) fn address_number_terms(number: &str) -> impl Iterator<Item = String> + '_ {
     number.split(';').filter_map(normalize_index_text)
+}
+
+/// The term a flat is also found under: its unit and number as a slash
+/// number writes them, "10 1367" for unit 10 of 1367 ("10/1367"). Only a unit
+/// of one word: "Flat 4" is written before no number.
+pub(crate) fn flat_number_term(number: &str, unit: Option<&str>) -> Option<String> {
+    let unit = normalize_index_text(unit?)?;
+    if unit.contains(' ') {
+        return None;
+    }
+    Some(format!("{unit} {}", normalize_index_text(number)?))
 }
 
 /// The digits a house number starts with: 407 of "407A", "407 1/2" and

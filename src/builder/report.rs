@@ -10,7 +10,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 20;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 21;
 
 /// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -59,6 +59,18 @@ pub struct BuilderReport {
     /// Ways and relations libpostal's admin level table names for the
     /// input's countries that the input lacks: rules that apply to nothing.
     pub unmatched_admin_level_ids: Vec<String>,
+    pub slash_numbers: SlashNumberCounts,
+}
+
+/// How the build read the house numbers written "N/M".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SlashNumberCounts {
+    /// Read as UNIT/NUMBER: stored as the number, with the unit.
+    pub unit_first: u64,
+    /// Read as a number first: a range, a corner or a building and its flat.
+    pub number_first: u64,
+    /// No neighbours to read them by: kept as written.
+    pub unresolved: u64,
 }
 
 impl BuilderReport {
