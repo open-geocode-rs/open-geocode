@@ -150,6 +150,7 @@ pub struct Writer {
     spatial: spatial_index::Writer,
     layer_counts: BTreeMap<Layer, u64>,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
+    country_codes: Arc<HashMap<RecordId, CountryCode>>,
     postcode_areas: Arc<PostcodeAreas>,
     dictionaries: Builder,
 }
@@ -222,6 +223,7 @@ impl Writer {
             generation,
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
+            country_codes: Arc::default(),
             postcode_areas: Arc::default(),
             dictionaries: Builder::default(),
         })
@@ -252,6 +254,11 @@ impl Writer {
     /// Country codes of the country records admin contexts point at, so the
     /// parser's dictionaries know which country each name is used in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
+        // The same map indexes each record's country, so a Pack covering
+        // several countries can be searched one at a time. Cloned rather
+        // than shared: the dictionary builder consumes its copy, and the map
+        // holds one entry per country record, not per record.
+        self.country_codes = Arc::new(codes.clone());
         self.dictionaries.set_country_codes(codes);
     }
 
@@ -286,6 +293,7 @@ impl Writer {
             next: self.records.record_count(),
             fields: self.text.fields(),
             context_names: Arc::clone(&self.context_names),
+            country_codes: Arc::clone(&self.country_codes),
             postcode_areas: Arc::clone(&self.postcode_areas),
         }
     }
@@ -655,6 +663,7 @@ pub struct BatchPreparer {
     next: RecordId,
     fields: text_index::Fields,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
+    country_codes: Arc<HashMap<RecordId, CountryCode>>,
     postcode_areas: Arc<PostcodeAreas>,
 }
 
@@ -674,12 +683,21 @@ impl BatchPreparer {
                     .iter()
                     .flat_map(|context| indexed_area_names(context, &self.context_names))
                     .collect::<Vec<_>>();
+                // The country the record lies in, from the country record its
+                // admin context points at. A record outside every country
+                // boundary has none and no country filter finds it.
+                let country = context
+                    .as_ref()
+                    .and_then(|context| context.admin_context.country_record_id)
+                    .and_then(|id| self.country_codes.get(&id))
+                    .map(CountryCode::as_str);
                 Ok(PreparedRecord {
                     document: self.fields.document(
                         record_id,
                         &record,
                         &names,
                         &self.postcode_areas,
+                        country,
                     ),
                     cells: RecordCells::for_record(record_id, &record)?,
                     names: RecordNames::of(&record),

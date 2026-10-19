@@ -62,6 +62,7 @@ pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
 const INTERPOLATION_END_FIELD: &str = "interpolation_end";
 pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
 pub(crate) const RANK_POSTCODE_FIELD: &str = "rank_postcode";
+pub(crate) const COUNTRY_CODE_FIELD: &str = "country_code";
 
 pub struct Writer {
     /// Created with the first document, so its buffers are reserved only for
@@ -103,6 +104,10 @@ pub struct Fields {
     /// The postcode a record is ranked by: the one it states, else the
     /// nearest postcode centroid (see [`PostcodeAreas`]).
     pub rank_postcode: Field,
+    /// The ISO 3166-1 alpha-2 code of the country the record lies in, upper
+    /// case, so a Pack covering several countries can be searched one at a
+    /// time. Exact, like `layer`: it is filtered on, never matched as text.
+    pub country_code: Field,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +135,8 @@ pub struct Document {
     pub interpolation_range: Option<(u32, u32)>,
     /// Normalized without spaces, as [`compact_postcode`] gives.
     pub rank_postcode: Option<String>,
+    /// The country the record lies in, from its admin context.
+    pub country_code: Option<String>,
 }
 
 impl fmt::Debug for Writer {
@@ -279,6 +286,7 @@ impl Fields {
             street_text: schema.get_field("street_text")?,
             house_number: schema.get_field(HOUSE_NUMBER_FIELD)?,
             rank_postcode: schema.get_field(RANK_POSTCODE_FIELD)?,
+            country_code: schema.get_field(COUNTRY_CODE_FIELD)?,
         })
     }
 
@@ -291,12 +299,14 @@ impl Fields {
         record: &Record,
         context_names: &[&str],
         postcode_areas: &PostcodeAreas,
+        country_code: Option<&str>,
     ) -> TantivyDocument {
         self.to_tantivy_document(&Document::from_record(
             record_id,
             record,
             context_names,
             postcode_areas,
+            country_code,
         ))
     }
 
@@ -349,6 +359,9 @@ impl Fields {
         if let Some(postcode) = &projected.rank_postcode {
             document.add_text(self.rank_postcode, postcode);
         }
+        if let Some(country) = &projected.country_code {
+            document.add_text(self.country_code, country);
+        }
         document
     }
 }
@@ -369,6 +382,7 @@ impl Document {
         record: &Record,
         context_names: &[&str],
         postcode_areas: &PostcodeAreas,
+        country_code: Option<&str>,
     ) -> Self {
         let builder = match record {
             Record::Address(record) => Self::project_address(record_id, record),
@@ -379,6 +393,7 @@ impl Document {
             Record::Place(layer, record) => Self::project_place(record_id, layer.as_str(), record),
         };
         let mut document = builder.build(context_names);
+        document.country_code = country_code.map(str::to_string);
         document.rank_postcode = match record {
             Record::Place(..) => None,
             _ => match document.postcode.as_deref() {
@@ -570,6 +585,7 @@ fn build_schema() -> (Schema, Fields) {
         RANK_POSTCODE_FIELD,
         TextOptions::default().set_fast(Some("raw")),
     );
+    let country_code = builder.add_text_field(COUNTRY_CODE_FIELD, exact_string_options());
     let schema = builder.build();
     let fields = Fields {
         record_id,
@@ -585,6 +601,7 @@ fn build_schema() -> (Schema, Fields) {
         street_text,
         house_number,
         rank_postcode,
+        country_code,
     };
     (schema, fields)
 }
@@ -641,6 +658,7 @@ impl ProjectionBuilder {
                 autocomplete_subject_text: String::new(),
                 interpolation_range: None,
                 rank_postcode: None,
+                country_code: None,
             },
             name_parts: Vec::new(),
             content_parts: Vec::new(),
@@ -1102,6 +1120,7 @@ mod tests {
             &record.into(),
             &["Westminster"],
             &PostcodeAreas::default(),
+            None,
         );
 
         assert_eq!(projected.record_id, 42);
@@ -1144,7 +1163,8 @@ mod tests {
             source: SourceProvenance::osm(OsmObjectType::Way, 9),
         };
 
-        let projected = Document::from_record(7, &record.into(), &[], &PostcodeAreas::default());
+        let projected =
+            Document::from_record(7, &record.into(), &[], &PostcodeAreas::default(), None);
 
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.postcode.as_deref(), Some("NW1"));
@@ -1173,12 +1193,14 @@ mod tests {
             },
         };
 
-        let postcode = Document::from_record(1, &postcode.into(), &[], &PostcodeAreas::default());
+        let postcode =
+            Document::from_record(1, &postcode.into(), &[], &PostcodeAreas::default(), None);
         let place = Document::from_record(
             2,
             &Record::Place(PlaceLayer::Locality, place),
             &[],
             &PostcodeAreas::default(),
+            None,
         );
 
         assert_eq!(postcode.postcode.as_deref(), Some("M5V"));
@@ -1215,6 +1237,7 @@ mod tests {
             &poi.clone().into(),
             &["Toronto", "Ontario"],
             &PostcodeAreas::default(),
+            None,
         );
 
         assert_eq!(projected.layers, vec!["poi", "address"]);
@@ -1257,7 +1280,7 @@ mod tests {
             ("M5R 2Z3".to_string(), [-79.38, 43.659]),
             ("K0J 1K0".to_string(), [-79.38, 43.8]),
         ]);
-        let projected = Document::from_record(4, &plain.clone().into(), &["Toronto"], &areas);
+        let projected = Document::from_record(4, &plain.clone().into(), &["Toronto"], &areas, None);
         assert_eq!(projected.name.as_deref(), Some("walmer road parkette"));
         assert_eq!(projected.streets, vec!["walmer road"]);
         assert_eq!(
@@ -1279,7 +1302,7 @@ mod tests {
             ..plain
         };
         let projected =
-            Document::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default());
+            Document::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default(), None);
         assert_eq!(projected.layers, vec!["poi"]);
         assert_eq!(projected.address_number, None);
         assert_eq!(projected.rank_postcode, None, "no postcode data nearby");
