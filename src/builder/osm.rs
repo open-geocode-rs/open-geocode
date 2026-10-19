@@ -94,7 +94,7 @@ pub use pbf::replication_timestamp;
 use pbf::{for_each_block, input_bytes};
 use postcode::PostcodeAccumulator;
 use scan::scan_block;
-use spill::{NodeRequest, PendingRecord, ResolvedRef, WayFeature, WayKind};
+use spill::{NodeRequest, PendingAddress, PendingRecord, ResolvedRef, WayFeature, WayKind};
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -262,6 +262,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         audit: Audit::create(writer.generation())?,
         postcodes: PostcodeAccumulator::default(),
         records: ExternalSorter::new(&scratch, "records", &memory, budget),
+        addresses: ExternalSorter::new(&scratch, "addresses", &memory, budget),
         context_records: ExternalSorter::new(
             &scratch,
             "context-records",
@@ -460,16 +461,50 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     progress.finish(BuildStage::Boundaries);
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
 
-    // Context records first: once their ids are known, the boundary index can
-    // describe every other record.
     let phase = Instant::now();
     let Build {
         mut report,
         audit,
-        records,
+        mut records,
+        addresses,
         context_records,
+        mut seq,
         ..
     } = build;
+    // Each street's addresses join the records as one run, in number order,
+    // placed in the Hilbert order by its first address: the run stays whole
+    // for the record store to share what its addresses state.
+    let address_stats = addresses.stats();
+    let mut anchor = None;
+    let mut previous: Option<PendingAddress> = None;
+    for address in addresses.finish()? {
+        let address = address?;
+        if previous
+            .as_ref()
+            .is_none_or(|previous| !previous.same_group(&address))
+        {
+            let [lon, lat] = address.record.display_point().ok_or_else(|| {
+                Error::BadGeometry(format!(
+                    "record {} has no display point",
+                    address.record.id()
+                ))
+            })?;
+            anchor = Some(hilbert_key(quantize(lon)?, quantize(lat)?));
+        }
+        records.push(PendingRecord {
+            key: anchor.expect("a group has an anchor"),
+            seq,
+            origin: None,
+            record: address.record.clone(),
+        })?;
+        seq += 1;
+        previous = Some(address);
+    }
+    report.phases.address_order_ms = phase.elapsed().as_millis();
+
+    // Context records first: once their ids are known, the boundary index can
+    // describe every other record.
+    let phase = Instant::now();
     let context_stats = context_records.stats();
     let record_stats = records.stats();
     let mut ordered = Spool::<PendingRecord>::create(&scratch, "context-ordered")?;
@@ -555,6 +590,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     for (name, stats) in [
         ("node_requests", request_stats),
         ("resolved_nodes", resolved_stats),
+        ("addresses", address_stats),
         ("records", record_stats),
         ("context_records", context_stats),
         (
@@ -591,8 +627,11 @@ struct Build {
     report: BuilderReport,
     audit: Audit,
     postcodes: PostcodeAccumulator,
-    /// Addresses, POIs, interpolations and streets.
+    /// POIs, interpolations and streets, then the addresses.
     records: ExternalSorter<PendingRecord>,
+    /// Addresses, until every one is known and they can join `records` a
+    /// street at a time.
+    addresses: ExternalSorter<PendingAddress>,
     /// Places and postcodes: everything a context tuple can point at.
     context_records: ExternalSorter<PendingRecord>,
     seq: u64,
@@ -619,6 +658,12 @@ impl Build {
     }
 
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
+        if let Record::Address(address) = record {
+            self.seq += 1;
+            return self
+                .addresses
+                .push(PendingAddress::new(address, self.seq - 1)?);
+        }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
         })?;
@@ -1129,7 +1174,8 @@ mod tests {
         assert!(report.scratch.peak_tracked_bytes > 0);
         assert!(report.scratch.peak_tracked_bytes <= report.scratch.memory_budget_bytes);
 
-        // Context records come first, and each group is in Hilbert order.
+        // Context records come first, and each group is in Hilbert order, a
+        // street's addresses placed at the first of them.
         let headers = (0..reader.manifest().record_count)
             .map(|id| reader.records().header(id).expect("header"))
             .collect::<Vec<_>>();
@@ -1147,11 +1193,22 @@ mod tests {
                 .iter()
                 .all(|header| !header.layer.is_context())
         );
-        for group in [&headers[..first_other], &headers[first_other..]] {
-            let keys = group
-                .iter()
-                .map(|header| hilbert_key(header.lon_e7, header.lat_e7))
-                .collect::<Vec<_>>();
+        for range in [0..first_other, first_other..headers.len()] {
+            let mut keys = Vec::new();
+            let mut street = None;
+            for id in range {
+                let header = &headers[id];
+                let summary = reader.records().summary(id as u64).expect("summary");
+                let this_street = (header.layer == crate::record::Layer::Address)
+                    .then(|| summary.address.street.clone())
+                    .flatten();
+                let key = match keys.last() {
+                    Some(&previous) if this_street.is_some() && this_street == street => previous,
+                    _ => hilbert_key(header.lon_e7, header.lat_e7),
+                };
+                street = this_street;
+                keys.push(key);
+            }
             assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
         }
 

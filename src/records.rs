@@ -6,11 +6,15 @@
 //! point as a small zigzag delta from that base, then its fields as varints and
 //! string-table ids, then any line geometry as a delta chain. Finding record
 //! `N` means jumping to block `N / 64` through the block index, then to the
-//! record through the block's table of body end offsets.
+//! record through the block's table of body starts, or on from its run's anchor.
+//! (Continued addresses, below, store their point from the record before them.)
 //!
 //! ```text
 //! records/index    record_count u64, then (block_count + 1) u64 block offsets
-//! records/blocks   blocks: base_lon i32 | base_lat i32 | n x u32 body end | bodies
+//! records/blocks   blocks: base_lon i32 | base_lat i32 | start width u8 (2 or 4)
+//!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
+//!                  u64, each when its flag is set | the start (u16 or u32) of
+//!                  each body that is not continued | bodies
 //! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
 //!
@@ -24,14 +28,34 @@
 //!                     an address's areas follow its other fields the same way;
 //!                     a POI's address follows a presence byte
 //!       geometry      line strings only: varint count, then zigzag deltas
+//!
+//! continued address (its bit set in `continued`; no tag, its precision and
+//! source kind are in the block's bitmaps)
+//!       dlon, dlat    zigzag varints from the record before it
+//!       source        zigzag OSM object id delta from the record before it
+//!       number        varint: value << 2 | unit (1) | text (1); a plain number's
+//!                     value is its zigzag delta from the last plain number of
+//!                     the run, a text number's its string id
+//!       unit          string id, when flagged
 //! ```
+//!
+//! The builder writes the addresses of one street as a run, ordered by house
+//! number. An address that states the same street, place, areas, locality,
+//! region, postcode, country and admin context as the address before it in its
+//! block is written as a continuation of that run: only its number, unit, point
+//! and id, each as a small delta. The run's first address in the block, its
+//! anchor, holds every shared field, so any record decodes from its own block.
+//! A continued address has no start of its own: it is read on from its
+//! anchor, as its number and point are deltas along the run anyway.
 //!
 //! Strings are interned per segment: the build keeps one segment's dictionary
 //! in memory, not every distinct string of the input. A segment ends after
 //! [`SEGMENT_RECORDS`] records or once its dictionary uses its share of the
-//! build budget, whichever comes first. Records are in Hilbert order, so a
-//! segment covers one area and most of its strings are its own; only widely
-//! shared ones (countries, regions) repeat across segments.
+//! build budget, whichever comes first, and only ever between blocks, so a
+//! continuation reads its anchor's strings from the same segment. Records are
+//! in Hilbert order, so a segment covers one area and most of its strings are
+//! its own; only widely shared ones (countries, regions) repeat across
+//! segments.
 
 use std::{
     collections::HashMap,
@@ -58,13 +82,15 @@ use crate::{
         LocationPrecision, OsmObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Record,
         SourceProvenance, StreetRecord, point_geometry,
     },
-    util::codec::{get_i64, get_u8, get_u32, get_u64, put_i64, put_u64, read_u32_le, read_u64_le},
+    util::codec::{
+        get_i64, get_u8, get_u32, get_u64, put_i64, put_u64, read_u64_le, unzigzag, zigzag,
+    },
 };
 
 pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 6;
+pub const RECORDS_VERSION: u32 = 7;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -75,12 +101,18 @@ pub const SEGMENT_RECORDS: u64 = 1 << 20;
 /// Share of the build budget the string dictionary may use.
 const DICTIONARY_BUDGET_FRACTION: usize = 8;
 const COORDINATE_SCALE: f64 = 10_000_000.0;
-const BLOCK_HEADER_BYTES: usize = 8;
+const BLOCK_HEADER_BYTES: usize = 18;
+const BLOCK_CENTROIDS: u8 = 1;
+const BLOCK_WAYS: u8 = 2;
+const BLOCK_RELATIONS: u8 = 4;
 
 const TAG_LAYER_MASK: u8 = 0x0f;
 const TAG_CENTROID: u8 = 0x10;
 const TAG_LINE: u8 = 0x20;
 const TAG_SOURCE_SHIFT: u8 = 6;
+const NUMBER_TEXT: u64 = 1;
+const NUMBER_UNIT: u64 = 2;
+const NUMBER_SHIFT: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
@@ -219,7 +251,7 @@ impl Header {
                 ));
             }
         };
-        Ok((object_type, crate::util::codec::unzigzag(self.source_value)))
+        Ok((object_type, unzigzag(self.source_value)))
     }
 
     fn source(&self) -> Result<Source> {
@@ -256,13 +288,57 @@ pub struct Writer {
     /// Start of every block, streamed to scratch.
     block_offsets: BufWriter<File>,
     block_offsets_path: PathBuf,
-    /// Bodies of the open block and where each one ends.
+    /// Bodies of the open block, where each one that is not continued
+    /// starts, and its slots so far.
     block: Vec<u8>,
-    block_ends: Vec<u32>,
+    block_starts: Vec<u32>,
+    block_slots: usize,
+    /// Bitmaps of the open block: see [`Block`].
+    continued: u64,
+    centroids: u64,
+    ways: u64,
+    relations: u64,
     block_base: (i32, i32),
     record_count: u64,
     strings: StringTable,
     body: Vec<u8>,
+    /// The address run the next address may continue, within the open block.
+    run: Option<AddressRun>,
+}
+
+/// The last address written in the open block, and the anchor of its run.
+#[derive(Debug)]
+struct AddressRun {
+    shared: AddressComponents,
+    context: Option<ContextRef>,
+    point: (i32, i32),
+    object_id: i64,
+    /// The last plain number of the run, 0 before the first.
+    number: u32,
+}
+
+impl AddressRun {
+    fn continues(&self, record: &AddressRecord, context: Option<ContextRef>) -> bool {
+        let shared = &self.shared;
+        let address = &record.address;
+        self.context == context
+            && shared.street == address.street
+            && shared.place == address.place
+            && shared.locality == address.locality
+            && shared.region == address.region
+            && shared.postcode == address.postcode
+            && shared.country == address.country
+            && shared.areas == address.areas
+    }
+}
+
+/// A house number written as digits alone, without a leading zero, so that it
+/// reads back exactly from its value.
+fn plain_number(number: &str) -> Option<u32> {
+    let canonical = !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && (number.len() == 1 || !number.starts_with('0'));
+    canonical.then(|| number.parse().ok()).flatten()
 }
 
 /// Strings of the current segment. Bytes and end offsets stream to scratch
@@ -273,7 +349,7 @@ struct StringTable {
     /// The dictionary's memory, held against the build budget. It cannot
     /// spill, but it is bounded by one segment and released at the next.
     memory: Reservation,
-    /// Dictionary bytes after which the next record starts a new segment.
+    /// Dictionary bytes after which the next block starts a new segment.
     memory_share: usize,
     segment_records: u64,
     /// First record and first string of every segment.
@@ -343,7 +419,12 @@ impl Writer {
             block_offsets: create(&block_offsets_path)?,
             block_offsets_path,
             block: Vec::new(),
-            block_ends: Vec::new(),
+            block_starts: Vec::new(),
+            block_slots: 0,
+            continued: 0,
+            centroids: 0,
+            ways: 0,
+            relations: 0,
             block_base: (0, 0),
             record_count: 0,
             strings: StringTable {
@@ -360,6 +441,7 @@ impl Writer {
                 ends_path,
             },
             body: Vec::new(),
+            run: None,
         })
     }
 
@@ -391,22 +473,56 @@ impl Writer {
             ))
         })?;
         let point = (quantize(lon)?, quantize(lat)?);
-        if self.strings.segment_full(self.record_count) {
-            self.strings.start_segment(self.record_count);
-        }
         if self.record_count.is_multiple_of(BLOCK_RECORDS) {
+            if self.strings.segment_full(self.record_count) {
+                self.strings.start_segment(self.record_count);
+            }
             self.flush_block()?;
             self.block_base = point;
+            self.run = None;
         }
 
         let mut body = std::mem::take(&mut self.body);
         body.clear();
-        self.encode_body(&mut body, record, point, context)?;
+        let slot = 1u64 << self.block_slots;
+        match record {
+            Record::Address(address)
+                if self
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.continues(address, context)) =>
+            {
+                self.encode_continuation(&mut body, address, point)?;
+                self.continued |= slot;
+                if address.location_precision == LocationPrecision::Centroid {
+                    self.centroids |= slot;
+                }
+                match address.source.object_type {
+                    OsmObjectType::Node => {}
+                    OsmObjectType::Way => self.ways |= slot,
+                    OsmObjectType::Relation => self.relations |= slot,
+                }
+            }
+            _ => {
+                self.block_starts.push(
+                    u32::try_from(self.block.len())
+                        .map_err(|_| Error::Inconsistent("record block exceeds 4 GiB".into()))?,
+                );
+                self.encode_body(&mut body, record, point, context)?;
+                self.run = match record {
+                    Record::Address(address) => Some(AddressRun {
+                        shared: address.address.clone(),
+                        context,
+                        point,
+                        object_id: address.source.object_id,
+                        number: plain_number(&address.address.number).unwrap_or(0),
+                    }),
+                    _ => None,
+                };
+            }
+        }
         self.block.extend_from_slice(&body);
-        self.block_ends.push(
-            u32::try_from(self.block.len())
-                .map_err(|_| Error::Inconsistent("record block exceeds 4 GiB".into()))?,
-        );
+        self.block_slots += 1;
         self.body = body;
 
         let id = self.record_count;
@@ -521,6 +637,39 @@ impl Writer {
         Ok(())
     }
 
+    fn encode_continuation(
+        &mut self,
+        out: &mut Vec<u8>,
+        record: &AddressRecord,
+        point: (i32, i32),
+    ) -> Result<()> {
+        let run = self.run.as_mut().expect("a continuation has a run");
+        put_i64(out, i64::from(point.0) - i64::from(run.point.0));
+        put_i64(out, i64::from(point.1) - i64::from(run.point.1));
+        put_i64(out, record.source.object_id.wrapping_sub(run.object_id));
+        let address = &record.address;
+        let unit = if address.unit.is_some() {
+            NUMBER_UNIT
+        } else {
+            0
+        };
+        let number = match plain_number(&address.number) {
+            Some(number) => {
+                let delta = zigzag(i64::from(number) - i64::from(run.number));
+                run.number = number;
+                delta << NUMBER_SHIFT
+            }
+            None => u64::from(self.strings.id(&address.number)?) << NUMBER_SHIFT | NUMBER_TEXT,
+        };
+        put_u64(out, number | unit);
+        if let Some(unit) = &address.unit {
+            put_u64(out, u64::from(self.strings.id(unit)?));
+        }
+        run.point = point;
+        run.object_id = record.source.object_id;
+        Ok(())
+    }
+
     fn put_address(&mut self, out: &mut Vec<u8>, address: &AddressComponents) -> Result<()> {
         put_u64(out, u64::from(self.strings.id(&address.number)?));
         self.put_optional_strings(
@@ -562,21 +711,47 @@ impl Writer {
     }
 
     fn flush_block(&mut self) -> Result<()> {
-        if self.block_ends.is_empty() {
+        if self.block_slots == 0 {
             return Ok(());
         }
         self.block_offsets
             .write_all(&self.blocks_len.to_le_bytes())?;
-        self.blocks.write_all(&self.block_base.0.to_le_bytes())?;
-        self.blocks.write_all(&self.block_base.1.to_le_bytes())?;
-        for end in &self.block_ends {
-            self.blocks.write_all(&end.to_le_bytes())?;
+        let width = if self.block.len() <= usize::from(u16::MAX) {
+            2
+        } else {
+            4
+        };
+        let bitmaps = [
+            (BLOCK_CENTROIDS, self.centroids),
+            (BLOCK_WAYS, self.ways),
+            (BLOCK_RELATIONS, self.relations),
+        ];
+        let flags = bitmaps
+            .iter()
+            .filter(|(_, bitmap)| *bitmap != 0)
+            .fold(0, |flags, (flag, _)| flags | flag);
+        let mut header = Vec::with_capacity(BLOCK_HEADER_BYTES + 24);
+        header.extend_from_slice(&self.block_base.0.to_le_bytes());
+        header.extend_from_slice(&self.block_base.1.to_le_bytes());
+        header.push(width as u8);
+        header.push(flags);
+        header.extend_from_slice(&self.continued.to_le_bytes());
+        for (_, bitmap) in bitmaps.iter().filter(|(_, bitmap)| *bitmap != 0) {
+            header.extend_from_slice(&bitmap.to_le_bytes());
         }
+        for start in &self.block_starts {
+            header.extend_from_slice(&start.to_le_bytes()[..width]);
+        }
+        self.blocks.write_all(&header)?;
         self.blocks.write_all(&self.block)?;
-        self.blocks_len +=
-            (BLOCK_HEADER_BYTES + self.block_ends.len() * 4 + self.block.len()) as u64;
+        self.blocks_len += (header.len() + self.block.len()) as u64;
         self.block.clear();
-        self.block_ends.clear();
+        self.block_starts.clear();
+        self.block_slots = 0;
+        self.continued = 0;
+        self.centroids = 0;
+        self.ways = 0;
+        self.relations = 0;
         Ok(())
     }
 
@@ -696,11 +871,12 @@ impl Reader {
     }
 
     pub fn header(&self, id: RecordId) -> Result<Header> {
-        Ok(self.body(id)?.0)
+        Ok(self.body(id)?.header)
     }
 
     pub fn record(&self, id: RecordId) -> Result<Record> {
-        let (header, mut fields) = self.body(id)?;
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
         let geometry = |fields: &mut &[u8]| self.geometry(&header, fields);
         let location_precision = if header.centroid {
             LocationPrecision::Centroid
@@ -709,7 +885,7 @@ impl Reader {
         };
         Ok(match header.layer {
             Layer::Address => {
-                let address = self.address_components(header.strings, &mut fields)?;
+                let address = self.entry_address(&entry, &mut fields)?;
                 Record::Address(AddressRecord {
                     address,
                     geometry: geometry(&mut fields)?,
@@ -773,13 +949,14 @@ impl Reader {
     /// Id, name, label, address, layer, point and source without decoding
     /// geometry.
     pub fn summary(&self, id: RecordId) -> Result<Summary> {
-        let (header, mut fields) = self.body(id)?;
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
         let source = header.source()?;
         let mut category = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
-                let address = self.address_components(header.strings, &mut fields)?;
+                let address = self.entry_address(&entry, &mut fields)?;
                 let (object_type, object_id) = header.osm_source()?;
                 stated = Address::from(&address);
                 (
@@ -858,7 +1035,8 @@ impl Reader {
     /// The postcode an address, POI, interpolation or postcode record states,
     /// without decoding its geometry.
     pub fn postcode(&self, id: RecordId) -> Result<Option<String>> {
-        let (header, mut fields) = self.body(id)?;
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
         Ok(match header.layer {
             Layer::Address => {
                 self.address_components(header.strings, &mut fields)?
@@ -881,7 +1059,8 @@ impl Reader {
     /// Whether a record is an explicit address: an address record or a POI
     /// that carries one. Reads no strings.
     pub fn is_explicit_address(&self, id: RecordId) -> Result<bool> {
-        let (header, mut fields) = self.body(id)?;
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
         Ok(match header.layer {
             Layer::Address => true,
             Layer::Poi => {
@@ -899,7 +1078,8 @@ impl Reader {
     /// Every name of a street, place or POI, its `name` first; empty for the
     /// other layers. Reads no geometry.
     pub fn names(&self, id: RecordId) -> Result<Vec<String>> {
-        let (header, mut fields) = self.body(id)?;
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
         let strings = header.strings;
         let (name, alt_names) = match header.layer {
             Layer::Address | Layer::Interpolation | Layer::Postcode => return Ok(Vec::new()),
@@ -939,7 +1119,8 @@ impl Reader {
 
     /// Line geometry as 1e-7 degree coordinates, `None` for point records.
     pub fn line(&self, id: RecordId) -> Result<Option<Vec<[i32; 2]>>> {
-        let (header, mut fields) = self.body(id)?;
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
         if !header.line {
             return Ok(None);
         }
@@ -1003,87 +1184,242 @@ impl Reader {
             .map_err(|_| Error::Decode("string table entry is not valid UTF-8"))
     }
 
-    /// The block base point and the body bytes of a record.
-    fn locate(&self, id: RecordId) -> Result<(i32, i32, &[u8])> {
-        if id >= self.record_count {
-            return Err(Error::IdOutOfRange { what: "record", id });
-        }
-        let block = id / BLOCK_RECORDS;
+    /// Blocks in the store; block `b` holds records `b * 64` up to 64 more.
+    pub fn block_count(&self) -> u64 {
+        self.record_count.div_ceil(BLOCK_RECORDS)
+    }
+
+    fn block(&self, block: u64) -> Result<Block<'_>> {
         let start = read_u64_le(&self.index, (8 + block * 8) as usize).expect("validated index");
         let end = read_u64_le(&self.index, (16 + block * 8) as usize).expect("validated index");
-        let block_bytes = self
+        let bytes = self
             .blocks
             .get(start as usize..end as usize)
             .ok_or(Error::Decode("record block is out of range"))?;
-        let records_in_block =
-            (self.record_count - block * BLOCK_RECORDS).min(BLOCK_RECORDS) as usize;
-        let bodies_start = BLOCK_HEADER_BYTES + records_in_block * 4;
-        if block_bytes.len() < bodies_start {
-            return Err(Error::Decode("record block is truncated"));
+        let truncated = || Error::Decode("record block is truncated");
+        let count = (self.record_count - block * BLOCK_RECORDS).min(BLOCK_RECORDS) as usize;
+        let header = bytes.get(..BLOCK_HEADER_BYTES).ok_or_else(truncated)?;
+        let width = usize::from(header[8]);
+        if width != 2 && width != 4 {
+            return Err(Error::Decode("record block has an unknown offset width"));
         }
-        let base_lon = i32::from_le_bytes(block_bytes[0..4].try_into().expect("block header"));
-        let base_lat = i32::from_le_bytes(block_bytes[4..8].try_into().expect("block header"));
-        let slot = (id % BLOCK_RECORDS) as usize;
-        let body_end = |slot: usize| {
-            read_u32_le(block_bytes, BLOCK_HEADER_BYTES + slot * 4).expect("validated header")
-                as usize
+        let flags = header[9];
+        let continued = read_u64_le(header, 10).expect("block header");
+        let mut at = BLOCK_HEADER_BYTES;
+        let mut bitmap = |flag: u8| -> Result<u64> {
+            if flags & flag == 0 {
+                return Ok(0);
+            }
+            let value = read_u64_le(bytes, at).ok_or_else(truncated)?;
+            at += 8;
+            Ok(value)
         };
-        let body_start = if slot == 0 { 0 } else { body_end(slot - 1) };
-        let body = block_bytes
-            .get(bodies_start + body_start..bodies_start + body_end(slot))
-            .ok_or(Error::Decode("record body is out of range"))?;
-        Ok((base_lon, base_lat, body))
+        let centroids = bitmap(BLOCK_CENTROIDS)?;
+        let ways = bitmap(BLOCK_WAYS)?;
+        let relations = bitmap(BLOCK_RELATIONS)?;
+        let mask = low_slots(count);
+        if continued & !mask != 0 || continued & 1 != 0 {
+            return Err(Error::Decode("record block marks a slot it does not have"));
+        }
+        let plain = count - continued.count_ones() as usize;
+        let bodies_start = at + plain * width;
+        if bytes.len() < bodies_start {
+            return Err(truncated());
+        }
+        Ok(Block {
+            first: block * BLOCK_RECORDS,
+            base: (
+                i32::from_le_bytes(bytes[0..4].try_into().expect("block header")),
+                i32::from_le_bytes(bytes[4..8].try_into().expect("block header")),
+            ),
+            width,
+            count,
+            continued,
+            centroids,
+            ways,
+            relations,
+            starts: &bytes[at..bodies_start],
+            bodies: &bytes[bodies_start..],
+        })
+    }
+
+    fn locate(&self, id: RecordId) -> Result<(Block<'_>, usize)> {
+        if id >= self.record_count {
+            return Err(Error::IdOutOfRange { what: "record", id });
+        }
+        Ok((
+            self.block(id / BLOCK_RECORDS)?,
+            (id % BLOCK_RECORDS) as usize,
+        ))
     }
 
     /// Layer and display point only: the hot path of spatial queries.
     pub fn point(&self, id: RecordId) -> Result<(Layer, f64, f64)> {
-        let (base_lon, base_lat, mut body) = self.locate(id)?;
-        let tag = get_u8(&mut body)?;
-        let layer = *Layer::ALL
-            .get(usize::from(tag & TAG_LAYER_MASK))
-            .ok_or(Error::Decode("record has an unknown layer code"))?;
-        let lon = add_delta(base_lon, get_i64(&mut body)?)?;
-        let lat = add_delta(base_lat, get_i64(&mut body)?)?;
+        let (block, slot) = self.locate(id)?;
+        let (layer, (lon, lat)) = if block.is_continued(slot) {
+            let anchor = block.anchor(slot)?;
+            let anchor_body = block.plain_body(anchor)?;
+            let mut point = plain_point(block.base, anchor_body)?;
+            let mut cursor = skip_address_body(anchor_body)?;
+            for _ in anchor + 1..=slot {
+                let continued = read_continuation(&mut cursor)?;
+                point = continued.point(point)?;
+            }
+            (Layer::Address, point)
+        } else {
+            let body = block.plain_body(slot)?;
+            (
+                layer_of(*body.first().ok_or(Error::Decode("record body is empty"))?)?,
+                plain_point(block.base, body)?,
+            )
+        };
         Ok((layer, dequantize(lon), dequantize(lat)))
     }
 
-    fn body(&self, id: RecordId) -> Result<(Header, &[u8])> {
-        let (base_lon, base_lat, mut body) = self.locate(id)?;
-        let tag = get_u8(&mut body)?;
-        let layer = *Layer::ALL
-            .get(usize::from(tag & TAG_LAYER_MASK))
-            .ok_or(Error::Decode("record has an unknown layer code"))?;
-        let source_kind = match tag >> TAG_SOURCE_SHIFT {
-            0 => SourceKind::Node,
-            1 => SourceKind::Way,
-            2 => SourceKind::Relation,
-            _ => SourceKind::Derived,
+    /// Every record of a block with its layer, display point and whether it
+    /// has line geometry, read front to back: what a spatial query scans.
+    pub fn block_points(
+        &self,
+        block: u64,
+        mut visit: impl FnMut(RecordId, Layer, i32, i32, bool) -> Result<()>,
+    ) -> Result<()> {
+        let block = self.block(block)?;
+        let mut previous = block.base;
+        // Where the next continued address starts: after the address before
+        // it, anchor or continued.
+        let mut cursor: &[u8] = &[];
+        for slot in 0..block.count {
+            let (layer, point, line) = if block.is_continued(slot) {
+                let continued = read_continuation(&mut cursor)?;
+                (Layer::Address, continued.point(previous)?, false)
+            } else {
+                let body = block.plain_body(slot)?;
+                let tag = *body.first().ok_or(Error::Decode("record body is empty"))?;
+                let layer = layer_of(tag)?;
+                if layer == Layer::Address && block.is_continued(slot + 1) {
+                    cursor = skip_address_body(body)?;
+                }
+                (layer, plain_point(block.base, body)?, tag & TAG_LINE != 0)
+            };
+            previous = point;
+            visit(block.first + slot as u64, layer, point.0, point.1, line)?;
+        }
+        Ok(())
+    }
+
+    /// The house number of every address among records `first..first +
+    /// count`, read front to back through each block rather than one record
+    /// at a time. Other records are passed over.
+    pub fn address_numbers(
+        &self,
+        first: RecordId,
+        count: u64,
+        mut visit: impl FnMut(RecordId, &str) -> Result<()>,
+    ) -> Result<()> {
+        let end = first.saturating_add(count).min(self.record_count);
+        let mut id = first;
+        let mut number = String::new();
+        while id < end {
+            let (block, start) = self.locate(id)?;
+            let strings = self.segment(id);
+            let stop = (end - block.first).min(block.count as u64) as usize;
+            // A continued address's number is a delta along its run, so the
+            // run is read from its anchor.
+            let begin = if block.is_continued(start) {
+                block.anchor(start)?
+            } else {
+                start
+            };
+            let mut plain = 0;
+            let mut cursor: &[u8] = &[];
+            for slot in begin..stop {
+                if block.is_continued(slot) {
+                    let continued = read_continuation(&mut cursor)?;
+                    number.clear();
+                    match continued.number(plain)? {
+                        ContinuedNumber::Text(id) => number.push_str(self.string(strings, id)?),
+                        ContinuedNumber::Plain(value) => {
+                            plain = value;
+                            number.push_str(&value.to_string());
+                        }
+                    }
+                } else {
+                    let body = block.plain_body(slot)?;
+                    let (header, mut fields) = plain_header(block.base, strings, body)?;
+                    if header.layer != Layer::Address {
+                        continue;
+                    }
+                    let text = self.string_field(strings, &mut fields)?;
+                    plain = plain_number(text).unwrap_or(0);
+                    number.clear();
+                    number.push_str(text);
+                    if block.is_continued(slot + 1) {
+                        cursor = skip_address_body(body)?;
+                    }
+                }
+                if slot >= start {
+                    visit(block.first + slot as u64, &number)?;
+                }
+            }
+            id = block.first + stop as u64;
+        }
+        Ok(())
+    }
+
+    fn body(&self, id: RecordId) -> Result<Entry<'_>> {
+        let (block, slot) = self.locate(id)?;
+        let strings = self.segment(id);
+        if !block.is_continued(slot) {
+            let (header, fields) = plain_header(block.base, strings, block.plain_body(slot)?)?;
+            return Ok(Entry {
+                header,
+                fields,
+                continued: None,
+            });
+        }
+
+        let anchor = block.anchor(slot)?;
+        let anchor_body = block.plain_body(anchor)?;
+        let (anchor_header, fields) = plain_header(block.base, strings, anchor_body)?;
+        if anchor_header.layer != Layer::Address {
+            return Err(Error::Decode(
+                "continued address follows a record of another layer",
+            ));
+        }
+        let mut point = (anchor_header.lon_e7, anchor_header.lat_e7);
+        let mut object_id = unzigzag(anchor_header.source_value);
+        let mut plain = {
+            let mut number = fields;
+            plain_number(self.string_field(strings, &mut number)?).unwrap_or(0)
         };
-        let lon_e7 = add_delta(base_lon, get_i64(&mut body)?)?;
-        let lat_e7 = add_delta(base_lat, get_i64(&mut body)?)?;
-        let context = match get_u64(&mut body)? {
-            0 => None,
-            value => Some(ContextRef {
-                tuple_id: u32::try_from((value >> 1) - 1)
-                    .map_err(|_| Error::Decode("context id out of range"))?,
-                ambiguous: value & 1 == 1,
-            }),
-        };
-        let source_value = get_u64(&mut body)?;
-        Ok((
-            Header {
-                layer,
-                strings: self.segment(id),
-                lon_e7,
-                lat_e7,
-                context,
-                centroid: tag & TAG_CENTROID != 0,
-                line: tag & TAG_LINE != 0,
-                source_kind,
-                source_value,
+        let mut cursor = skip_address_body(anchor_body)?;
+        let mut last = None;
+        for _ in anchor + 1..=slot {
+            let continued = read_continuation(&mut cursor)?;
+            point = continued.point(point)?;
+            object_id = object_id.wrapping_add(continued.object_delta);
+            let number = continued.number(plain)?;
+            if let ContinuedNumber::Plain(value) = number {
+                plain = value;
+            }
+            last = Some((number, continued.unit));
+        }
+        let (number, unit) = last.expect("a continued record follows its anchor");
+        Ok(Entry {
+            header: Header {
+                layer: Layer::Address,
+                strings,
+                lon_e7: point.0,
+                lat_e7: point.1,
+                context: anchor_header.context,
+                centroid: block.centroids & 1 << slot != 0,
+                line: false,
+                source_kind: block.source_kind(slot),
+                source_value: zigzag(object_id),
             },
-            body,
-        ))
+            fields,
+            continued: Some(Continued { number, unit }),
+        })
     }
 
     fn string_field(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<&str> {
@@ -1114,6 +1450,24 @@ impl Reader {
             }
         }
         Ok(values)
+    }
+
+    /// An address record's components: its anchor's, with its own number and
+    /// unit when it continues a run.
+    fn entry_address(&self, entry: &Entry<'_>, fields: &mut &[u8]) -> Result<AddressComponents> {
+        let strings = entry.header.strings;
+        let mut address = self.address_components(strings, fields)?;
+        if let Some(continued) = &entry.continued {
+            address.number = match continued.number {
+                ContinuedNumber::Plain(number) => number.to_string(),
+                ContinuedNumber::Text(id) => self.string(strings, id)?.to_string(),
+            };
+            address.unit = continued
+                .unit
+                .map(|id| self.string(strings, id).map(str::to_string))
+                .transpose()?;
+        }
+        Ok(address)
     }
 
     fn address_components(
@@ -1242,13 +1596,233 @@ impl Reader {
     }
 }
 
+/// One block of the store, as [`Reader::block`] finds it.
+struct Block<'a> {
+    first: RecordId,
+    base: (i32, i32),
+    width: usize,
+    count: usize,
+    /// Bit `n` set: slot `n` continues the address run before it.
+    continued: u64,
+    /// Of continued slots: a centroid point, a way, a relation.
+    centroids: u64,
+    ways: u64,
+    relations: u64,
+    /// Where each slot that is not continued starts in `bodies`.
+    starts: &'a [u8],
+    bodies: &'a [u8],
+}
+
+impl<'a> Block<'a> {
+    fn is_continued(&self, slot: usize) -> bool {
+        slot < self.count && self.continued & 1 << slot != 0
+    }
+
+    /// The bytes of a record that is not continued, to the end of the block:
+    /// every field reader stops where its record does.
+    fn plain_body(&self, slot: usize) -> Result<&'a [u8]> {
+        let rank = slot - (self.continued & low_slots(slot)).count_ones() as usize;
+        let at = rank * self.width;
+        let mut bytes = [0; 4];
+        bytes[..self.width].copy_from_slice(&self.starts[at..at + self.width]);
+        self.bodies
+            .get(u32::from_le_bytes(bytes) as usize..)
+            .filter(|body| !body.is_empty())
+            .ok_or(Error::Decode("record body is out of range"))
+    }
+
+    /// The slot of the anchor of the continued address at `slot`.
+    fn anchor(&self, slot: usize) -> Result<usize> {
+        let plain = !self.continued & low_slots(slot);
+        if plain == 0 {
+            return Err(Error::Decode(
+                "continued address has no anchor in its block",
+            ));
+        }
+        Ok(63 - plain.leading_zeros() as usize)
+    }
+
+    fn source_kind(&self, slot: usize) -> SourceKind {
+        let bit = 1 << slot;
+        if self.ways & bit != 0 {
+            SourceKind::Way
+        } else if self.relations & bit != 0 {
+            SourceKind::Relation
+        } else {
+            SourceKind::Node
+        }
+    }
+}
+
+/// Bits of the slots below `slot`.
+fn low_slots(slot: usize) -> u64 {
+    if slot >= 64 {
+        u64::MAX
+    } else {
+        (1 << slot) - 1
+    }
+}
+
+/// The fields of a continued address, read from its body.
+struct ContinuedFields {
+    d_lon: i64,
+    d_lat: i64,
+    object_delta: i64,
+    code: u64,
+    unit: Option<u32>,
+}
+
+impl ContinuedFields {
+    fn point(&self, previous: (i32, i32)) -> Result<(i32, i32)> {
+        Ok((
+            add_delta(previous.0, self.d_lon)?,
+            add_delta(previous.1, self.d_lat)?,
+        ))
+    }
+
+    /// Its number, `plain` being the last plain number of its run.
+    fn number(&self, plain: u32) -> Result<ContinuedNumber> {
+        let value = self.code >> NUMBER_SHIFT;
+        Ok(if self.code & NUMBER_TEXT != 0 {
+            ContinuedNumber::Text(
+                u32::try_from(value).map_err(|_| Error::Decode("house number id out of range"))?,
+            )
+        } else {
+            ContinuedNumber::Plain(
+                u32::try_from(i64::from(plain) + unzigzag(value))
+                    .map_err(|_| Error::Decode("house number out of range"))?,
+            )
+        })
+    }
+}
+
+fn read_continuation(cursor: &mut &[u8]) -> Result<ContinuedFields> {
+    let d_lon = get_i64(cursor)?;
+    let d_lat = get_i64(cursor)?;
+    let object_delta = get_i64(cursor)?;
+    let code = get_u64(cursor)?;
+    let unit = (code & NUMBER_UNIT != 0)
+        .then(|| get_u32(cursor))
+        .transpose()?;
+    Ok(ContinuedFields {
+        d_lon,
+        d_lat,
+        object_delta,
+        code,
+        unit,
+    })
+}
+
+/// The bytes after an address body that is not continued: where the first
+/// address continuing it starts.
+fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
+    get_u8(&mut body)?;
+    // The point, context, source and number.
+    for _ in 0..5 {
+        get_u64(&mut body)?;
+    }
+    let present = get_u8(&mut body)?;
+    for _ in 0..present.count_ones() {
+        get_u64(&mut body)?;
+    }
+    let areas = get_u64(&mut body)?;
+    if areas > body.len() as u64 {
+        return Err(Error::Decode("string list is truncated"));
+    }
+    for _ in 0..areas {
+        get_u64(&mut body)?;
+    }
+    Ok(body)
+}
+
+/// A record's header, the bytes of the fields it shares with its run's anchor
+/// (its own when it is not continued), and what a continued address states
+/// itself.
+struct Entry<'a> {
+    header: Header,
+    fields: &'a [u8],
+    continued: Option<Continued>,
+}
+
+struct Continued {
+    number: ContinuedNumber,
+    unit: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+enum ContinuedNumber {
+    Plain(u32),
+    /// A string id local to the record's segment.
+    Text(u32),
+}
+
+fn layer_of(tag: u8) -> Result<Layer> {
+    Layer::ALL
+        .get(usize::from(tag & TAG_LAYER_MASK))
+        .copied()
+        .ok_or(Error::Decode("record has an unknown layer code"))
+}
+
+fn source_kind_of(tag: u8) -> SourceKind {
+    match tag >> TAG_SOURCE_SHIFT {
+        0 => SourceKind::Node,
+        1 => SourceKind::Way,
+        2 => SourceKind::Relation,
+        _ => SourceKind::Derived,
+    }
+}
+
+/// The display point of a record that is not continued.
+fn plain_point(base: (i32, i32), mut body: &[u8]) -> Result<(i32, i32)> {
+    get_u8(&mut body)?;
+    Ok((
+        add_delta(base.0, get_i64(&mut body)?)?,
+        add_delta(base.1, get_i64(&mut body)?)?,
+    ))
+}
+
+fn plain_header(
+    base: (i32, i32),
+    strings: StringSegment,
+    mut body: &[u8],
+) -> Result<(Header, &[u8])> {
+    let tag = get_u8(&mut body)?;
+    let layer = layer_of(tag)?;
+    let lon_e7 = add_delta(base.0, get_i64(&mut body)?)?;
+    let lat_e7 = add_delta(base.1, get_i64(&mut body)?)?;
+    let context = match get_u64(&mut body)? {
+        0 => None,
+        value => Some(ContextRef {
+            tuple_id: u32::try_from((value >> 1) - 1)
+                .map_err(|_| Error::Decode("context id out of range"))?,
+            ambiguous: value & 1 == 1,
+        }),
+    };
+    let source_value = get_u64(&mut body)?;
+    let source_kind = source_kind_of(tag);
+    Ok((
+        Header {
+            layer,
+            strings,
+            lon_e7,
+            lat_e7,
+            context,
+            centroid: tag & TAG_CENTROID != 0,
+            line: tag & TAG_LINE != 0,
+            source_kind,
+            source_value,
+        },
+        body,
+    ))
+}
+
 fn osm_source(source: &SourceProvenance) -> (SourceKind, u64) {
     let kind = match source.object_type {
         OsmObjectType::Node => SourceKind::Node,
         OsmObjectType::Way => SourceKind::Way,
         OsmObjectType::Relation => SourceKind::Relation,
     };
-    (kind, crate::util::codec::zigzag(source.object_id))
+    (kind, zigzag(source.object_id))
 }
 
 fn layer_code(layer: Layer) -> u8 {
@@ -1553,7 +2127,7 @@ mod tests {
             records.push(record);
         }
         assert!(
-            most_resident <= 100 + 14,
+            most_resident <= 100_u64.next_multiple_of(BLOCK_RECORDS) as usize + 14,
             "dictionary held {most_resident} strings"
         );
         assert!(budget.peak() < 200 * (DICTIONARY_ENTRY_OVERHEAD + 16));
@@ -1583,10 +2157,10 @@ mod tests {
             }
             writer.write(&record, None).expect("write");
         }
-        // One entry can land after the share is reached; the next record
-        // starts a new segment.
+        // Segments end only between blocks, so the rest of the block lands after
+        // the share is reached.
         let share = budget.limit() / DICTIONARY_BUDGET_FRACTION;
-        let slack = 8 * (64 + DICTIONARY_ENTRY_OVERHEAD);
+        let slack = BLOCK_RECORDS as usize * (64 + DICTIONARY_ENTRY_OVERHEAD);
         assert!(
             budget.peak() <= share + slack,
             "dictionary peaked at {} of {share}",
@@ -1639,11 +2213,122 @@ mod tests {
     }
 
     #[test]
+    fn continues_a_street_run_and_reads_every_address_back() {
+        let anchor = sample_records().remove(0);
+        let street = sample_records().remove(1);
+        let mut records = Vec::new();
+        let mut contexts = Vec::new();
+        let numbers = [
+            "1",
+            "3",
+            "3A",
+            "007",
+            "0",
+            "12;14",
+            "4294967295",
+            "5",
+            "2",
+            "100",
+            "99",
+        ];
+        for index in 0..BLOCK_RECORDS * 2 + 9 {
+            let mut record = anchor.clone();
+            if let Record::Address(address) = &mut record {
+                let index_i64 = index as i64;
+                address.address.number = numbers[index as usize % numbers.len()].to_string();
+                address.address.unit = (index % 5 == 0).then(|| format!("Unit {index}"));
+                address.geometry =
+                    point_geometry(-79.0 + index as f64 * 0.0001, 43.0 - index as f64 * 0.00007);
+                address.location_precision = if index % 3 == 0 {
+                    LocationPrecision::Centroid
+                } else {
+                    LocationPrecision::Point
+                };
+                address.source = SourceProvenance::osm(
+                    if index % 4 == 0 {
+                        OsmObjectType::Way
+                    } else {
+                        OsmObjectType::Node
+                    },
+                    1_000_000 - index_i64 * 37,
+                );
+                if index == 70 {
+                    // A different postcode breaks the run; the next continues
+                    // the new one.
+                    address.address.postcode = Some("M5V 9Z9".into());
+                }
+            }
+            // A street between addresses ends their run.
+            if index == 20 {
+                records.push(street.clone());
+                contexts.push(None);
+            }
+            let context = (index != 30).then_some(ContextRef {
+                tuple_id: 4,
+                ambiguous: false,
+            });
+            records.push(record);
+            contexts.push(context);
+        }
+        let reader = write_store(&records, &contexts);
+        let mut scanned = Vec::new();
+        for block in 0..reader.block_count() {
+            reader
+                .block_points(block, |id, layer, lon, lat, line| {
+                    scanned.push((id, layer, lon, lat, line));
+                    Ok(())
+                })
+                .expect("block points");
+        }
+        assert_eq!(scanned.len(), records.len());
+        for (index, record) in records.iter().enumerate() {
+            let id = index as u64;
+            assert_eq!(&reader.record(id).expect("record"), record, "record {id}");
+            assert_eq!(
+                reader.header(id).expect("header").context,
+                contexts[index],
+                "record {id}"
+            );
+            let [lon, lat] = record.display_point().expect("point");
+            let (layer, point_lon, point_lat) = reader.point(id).expect("point");
+            assert_eq!(
+                (
+                    layer,
+                    quantize(point_lon).unwrap(),
+                    quantize(point_lat).unwrap()
+                ),
+                (
+                    record.layer(),
+                    quantize(lon).unwrap(),
+                    quantize(lat).unwrap()
+                )
+            );
+            assert_eq!(
+                (
+                    scanned[index].0,
+                    scanned[index].1,
+                    scanned[index].2,
+                    scanned[index].3
+                ),
+                (
+                    id,
+                    record.layer(),
+                    quantize(lon).unwrap(),
+                    quantize(lat).unwrap()
+                )
+            );
+            let summary = reader.summary(id).expect("summary");
+            assert_eq!(summary.id, reader.record_json(id).expect("json")["id"]);
+        }
+    }
+
+    #[test]
     fn line_geometry_follows_the_summary_fields() {
         let mut records = sample_records();
         records.truncate(2);
         let reader = write_store(&records, &[]);
-        let (header, fields) = reader.body(1).expect("body");
+        let entry = reader.body(1).expect("body");
+        let (header, fields) = (entry.header, entry.fields);
         let mut cursor = fields;
         reader.skip_fields(&header, &mut cursor).expect("fields");
         let geometry_offset = fields.len() - cursor.len();

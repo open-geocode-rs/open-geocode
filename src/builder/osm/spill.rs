@@ -182,6 +182,129 @@ pub(crate) struct PendingRecord {
     pub record: Record,
 }
 
+/// Addresses group by street within a grid cell this many degrees wide
+/// (about 2 km): a street with one name in two towns, or a long rural road,
+/// becomes runs that each stay compact, so the record blocks a run fills
+/// cover a small area for the spatial index.
+const ADDRESS_GROUP_CELL_DEGREES: f64 = 0.02;
+
+/// An address waiting to be written with the rest of its street. Sorted by
+/// what it states but its number and unit, then by number, so the addresses
+/// of one street come out together and in order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingAddress {
+    /// The group key, then the number key.
+    pub order: Vec<u8>,
+    /// Length of the group key at the start of `order`.
+    pub group_len: usize,
+    pub seq: u64,
+    pub record: Record,
+}
+
+impl PendingAddress {
+    pub(super) fn new(record: AddressRecord, seq: u64) -> Result<Self> {
+        let [lon, lat] = crate::util::geo::point_lon_lat(&record.geometry)
+            .ok_or_else(|| Error::BadGeometry(format!("address {} has no point", record.id())))?;
+        let mut order = Vec::new();
+        let cell = |degrees: f64| (degrees / ADDRESS_GROUP_CELL_DEGREES).floor() as i64;
+        order.extend_from_slice(&cell(lat).to_be_bytes());
+        order.extend_from_slice(&cell(lon).to_be_bytes());
+        let address = &record.address;
+        for field in [
+            &address.street,
+            &address.place,
+            &address.locality,
+            &address.region,
+            &address.postcode,
+            &address.country,
+        ] {
+            put_order_text(&mut order, field.as_deref());
+        }
+        order.extend_from_slice(&(address.areas.len() as u32).to_be_bytes());
+        for area in &address.areas {
+            put_order_text(&mut order, Some(area));
+        }
+        let group_len = order.len();
+        let base = crate::text_index::base_house_number(&address.number).unwrap_or(u32::MAX);
+        order.extend_from_slice(&base.to_be_bytes());
+        put_order_text(&mut order, Some(&address.number));
+        put_order_text(&mut order, address.unit.as_deref());
+        Ok(Self {
+            order,
+            group_len,
+            seq,
+            record: Record::Address(record),
+        })
+    }
+
+    /// Whether `other` is on the same street, in the same cell.
+    pub(super) fn same_group(&self, other: &Self) -> bool {
+        self.order[..self.group_len] == other.order[..other.group_len]
+    }
+}
+
+/// Text for a sort key: absent before present, and each value length-prefixed
+/// so no value can run into the next.
+fn put_order_text(order: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => order.push(0),
+        Some(value) => {
+            order.push(1);
+            order.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            order.extend_from_slice(value.as_bytes());
+        }
+    }
+}
+
+impl Eq for PendingAddress {}
+
+impl PartialOrd for PendingAddress {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingAddress {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.order, self.seq).cmp(&(&other.order, other.seq))
+    }
+}
+
+impl Spill for PendingAddress {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.order.len() as u64);
+        out.extend_from_slice(&self.order);
+        put_u64(out, self.group_len as u64);
+        put_u64(out, self.seq);
+        encode_record(out, &self.record);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let len = usize::try_from(get_u64(input)?)?;
+        if input.len() < len {
+            return Err(Error::Decode("address sort key is truncated"));
+        }
+        let (order, rest) = input.split_at(len);
+        *input = rest;
+        let group_len = usize::try_from(get_u64(input)?)?;
+        if group_len > len {
+            return Err(Error::Decode(
+                "address group key is longer than its sort key",
+            ));
+        }
+        Ok(Self {
+            order: order.to_vec(),
+            group_len,
+            seq: get_u64(input)?,
+            record: decode_record(input)?,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.order.capacity() + record_heap_bytes(&self.record)
+    }
+}
+
 impl Eq for PendingRecord {}
 
 impl PartialOrd for PendingRecord {

@@ -440,6 +440,8 @@ pub struct PhaseTimings {
     pub feature_emission_ms: u128,
     /// Build admin boundary polygons.
     pub boundary_build_ms: u128,
+    /// Order every address by street and number.
+    pub address_order_ms: u128,
     /// Write places, postcodes and boundaries.
     pub context_record_write_ms: u128,
     /// Write addresses, interpolations and streets in Hilbert order.
