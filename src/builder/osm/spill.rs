@@ -187,6 +187,9 @@ pub(crate) struct PendingRecord {
 /// cover a small area for the spatial index.
 const ADDRESS_GROUP_CELL_DEGREES: f64 = 0.02;
 
+/// Bytes of a street order key that name its cell: latitude, then longitude.
+const CELL_KEY_LEN: usize = 16;
+
 /// An address waiting to be written with the rest of its street. Sorted by
 /// what it states but its number and unit, then by number, so the addresses
 /// of one street come out together and in order.
@@ -274,6 +277,12 @@ impl PendingAddress {
     /// cell, or in house order the same house.
     pub(super) fn same_group(&self, other: &Self) -> bool {
         self.order[..self.group_len] == other.order[..other.group_len]
+    }
+
+    /// Whether both lie in one grid cell. Only for street order, whose key
+    /// starts with the cell.
+    pub(super) fn same_cell(&self, other: &Self) -> bool {
+        self.order[..CELL_KEY_LEN] == other.order[..CELL_KEY_LEN]
     }
 
     pub(super) fn into_address(self) -> AddressRecord {

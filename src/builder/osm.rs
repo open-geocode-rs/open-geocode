@@ -46,6 +46,7 @@ mod place;
 mod poi;
 mod postcode;
 mod scan;
+mod slash;
 mod spill;
 mod street;
 mod tags;
@@ -72,7 +73,10 @@ use crate::{
         addresses::{self, AddressSource},
         plan::{BuildPlan, plan_build},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
-        report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, ReportInput, SorterReport},
+        report::{
+            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, ReportInput, SlashNumberCounts,
+            SorterReport,
+        },
     },
     extsort::{ExternalSorter, SortStats, Spool},
     memory::Budget,
@@ -526,10 +530,20 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         ..
     } = build;
     let address_stats = addresses.stats();
+    // Slash numbers are read before imported rows are matched against OSM
+    // ones, so an OSM flat "10/1367" repeats an imported 1367 unit 10.
+    let mut slash_numbers = SlashNumberCounts::default();
     let addresses = if files.is_empty() {
         addresses
     } else {
-        drop_repeated_houses(addresses, &scratch, &memory, budget, &mut report)?
+        drop_repeated_houses(
+            addresses,
+            &scratch,
+            &memory,
+            budget,
+            &mut report,
+            &mut slash_numbers,
+        )?
     };
     // Each street's addresses join the records as one run, in number order,
     // placed in the Hilbert order by its first address: the run stays whole
@@ -537,8 +551,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     // state.
     let mut anchor = None;
     let mut previous: Option<PendingAddress> = None;
-    for address in addresses.finish()? {
-        let address = address?;
+    let mut push = |address: PendingAddress| -> Result<()> {
         if previous
             .as_ref()
             .is_none_or(|previous| !previous.same_group(&address))
@@ -559,7 +572,16 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         })?;
         seq += 1;
         previous = Some(address);
+        Ok(())
+    };
+    if files.is_empty() {
+        slash::read_slash_numbers(addresses.finish()?, &mut slash_numbers, &mut push)?;
+    } else {
+        for address in addresses.finish()? {
+            push(address?)?;
+        }
     }
+    report.slash_numbers = slash_numbers;
     report.phases.address_order_ms = phase.elapsed().as_millis();
 
     // Context records first: once their ids are known, the boundary index can
@@ -749,13 +771,13 @@ fn drop_repeated_houses(
     memory: &Arc<Budget>,
     budget: usize,
     report: &mut BuilderReport,
+    slash_numbers: &mut SlashNumberCounts,
 ) -> Result<ExternalSorter<PendingAddress>> {
     let mut houses = ExternalSorter::new(scratch, "houses", memory, budget);
-    for address in addresses.finish()? {
-        let address = address?;
+    slash::read_slash_numbers(addresses.finish()?, slash_numbers, |address| {
         let seq = address.seq;
-        houses.push(PendingAddress::house(address.into_address(), seq)?)?;
-    }
+        houses.push(PendingAddress::house(address.into_address(), seq)?)
+    })?;
     let mut grouped = ExternalSorter::new(scratch, "addresses-kept", memory, budget);
     let mut house: Option<PendingAddress> = None;
     let mut kept: Vec<[f64; 2]> = Vec::new();
@@ -1329,6 +1351,96 @@ mod tests {
         assert_eq!(top("16 King Street"), vec!["openaddresses:test:row:2"]);
         assert_eq!(top("10 King Street"), vec!["osm:node:1"]);
         assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// New Zealand writes a flat "UNIT/NUMBER". Read from the plain numbers
+    /// around it, "10/1367" is flat 10 of 1367: found by its building's
+    /// number, never standing for house 10.
+    #[test]
+    fn reads_a_slash_number_as_a_flat_of_its_building() {
+        let dir = temp_dir("slash");
+        let input = dir.join("slash.osm.pbf");
+        let address = |id, lon, number: &'static str| {
+            node(
+                id,
+                -38.1386,
+                lon,
+                &[
+                    ("addr:housenumber", number),
+                    ("addr:street", "Eruera Street"),
+                ],
+            )
+        };
+        write_pbf(
+            &input,
+            &[vec![
+                node(1, -38.1388, 176.2580, &[]),
+                node(2, -38.1388, 176.2430, &[]),
+                way(
+                    100,
+                    &[1, 2],
+                    &[("highway", "residential"), ("name", "Eruera Street")],
+                ),
+                address(10, 176.2570, "1000"),
+                address(11, 176.2510, "1182"),
+                address(12, 176.2509, "2/1182"),
+                address(13, 176.2456, "1345"),
+                address(14, 176.2451, "1367"),
+                address(15, 176.24505, "10/1367"),
+                address(16, 176.24506, "2/1367"),
+                address(17, 176.2440, "1400"),
+            ]],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(
+            report.slash_numbers,
+            SlashNumberCounts {
+                unit_first: 3,
+                ..SlashNumberCounts::default()
+            }
+        );
+
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let top = |query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 1,
+                    layer: None,
+                    countries: Vec::new(),
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        let geocode = |address: &str| {
+            searcher
+                .geocode_address(crate::search::AddressGeocodeOptions {
+                    countries: Vec::new(),
+                    address: address.to_string(),
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("geocode")
+                .map(|hit| hit.hit.record.id)
+        };
+        assert_eq!(top("1367 Eruera Street"), vec!["osm:node:14"]);
+        assert_eq!(top("10/1367 Eruera Street"), vec!["osm:node:15"]);
+        // No house 10 or 2: the street answers, not the flats.
+        for query in ["10 Eruera Street", "2 Eruera Street"] {
+            assert_eq!(top(query), vec!["osm:way:100"], "{query}");
+            assert_eq!(geocode(query).as_deref(), Some("osm:way:100"), "{query}");
+        }
+        // A missing number is placed between buildings, not flats.
+        assert_eq!(
+            top("1300 Eruera Street"),
+            vec!["derived:estimate:1300:osm:node:11:osm:node:13"]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

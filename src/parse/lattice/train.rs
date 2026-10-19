@@ -1929,7 +1929,12 @@ impl<'a> Renderer<'a> {
         {
             let break_before = groups[at].break_before;
             groups[at].break_before = false;
-            groups[at].joiner = random.chance(0.6).then_some('-');
+            // "10-1367" in most places, "10/1367" in Australia and New Zealand.
+            groups[at].joiner = match random.below(5) {
+                0 | 1 => None,
+                2 | 3 => Some('-'),
+                _ => Some('/'),
+            };
             groups.insert(
                 at,
                 Group {

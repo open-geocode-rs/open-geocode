@@ -1395,14 +1395,14 @@ impl Reader {
         Ok(())
     }
 
-    /// The house number of every address among records `first..first +
-    /// count`, read front to back through each block rather than one record
-    /// at a time. Other records are passed over.
+    /// The house number and unit of every address among records
+    /// `first..first + count`, read front to back through each block rather
+    /// than one record at a time. Other records are passed over.
     pub fn address_numbers(
         &self,
         first: RecordId,
         count: u64,
-        mut visit: impl FnMut(RecordId, &str) -> Result<()>,
+        mut visit: impl FnMut(RecordId, &str, Option<&str>) -> Result<()>,
     ) -> Result<()> {
         let end = first.saturating_add(count).min(self.record_count);
         let mut id = first;
@@ -1421,8 +1421,10 @@ impl Reader {
             let mut plain = 0;
             let mut cursor: &[u8] = &[];
             for slot in begin..stop {
+                let unit;
                 if block.is_continued(slot) {
                     let continued = read_continuation(&mut cursor)?;
+                    unit = continued.unit;
                     number.clear();
                     match continued.number(plain)? {
                         ContinuedNumber::Text(id) => number.push_str(self.string(strings, id)?),
@@ -1441,12 +1443,14 @@ impl Reader {
                     plain = plain_number(text).unwrap_or(0);
                     number.clear();
                     number.push_str(text);
+                    unit = unit_id(&mut fields)?;
                     if block.is_continued(slot + 1) {
                         cursor = skip_address_body(body)?;
                     }
                 }
                 if slot >= start {
-                    visit(block.first + slot as u64, &number)?;
+                    let unit = unit.map(|id| self.string(strings, id)).transpose()?;
+                    visit(block.first + slot as u64, &number, unit)?;
                 }
             }
             id = block.first + stop as u64;
@@ -1804,6 +1808,20 @@ fn read_continuation(cursor: &mut &[u8]) -> Result<ContinuedFields> {
         code,
         unit,
     })
+}
+
+/// The string id of an address's unit, `fields` starting after its number:
+/// the optional fields are street, place and unit, in that order.
+fn unit_id(fields: &mut &[u8]) -> Result<Option<u32>> {
+    let present = get_u8(fields)?;
+    for bit in 0..2 {
+        if present & (1 << bit) != 0 {
+            get_u32(fields)?;
+        }
+    }
+    (present & (1 << 2) != 0)
+        .then(|| get_u32(fields))
+        .transpose()
 }
 
 /// The bytes after an address body that is not continued: where the first
