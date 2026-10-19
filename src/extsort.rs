@@ -178,6 +178,15 @@ pub struct SortStats {
     pub runs: u64,
 }
 
+impl SortStats {
+    /// Adds another sorter's work to this total. A build with several inputs
+    /// sorts once per input, and the report counts them together.
+    pub fn merge(&mut self, other: Self) {
+        self.items += other.items;
+        self.runs += other.runs;
+    }
+}
+
 #[derive(Debug)]
 pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
