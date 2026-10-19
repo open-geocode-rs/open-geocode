@@ -568,6 +568,16 @@
             "schema": {
               "$ref": "#/components/schemas/Layer"
             }
+          },
+          {
+            "description": "Return only answers in these countries: ISO 3166-1 alpha-2 codes, comma-separated. A Pack covering one country needs none. A code that is not two letters is rejected; one the Pack does not cover simply matches nothing.",
+            "example": "NZ,AU",
+            "in": "query",
+            "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -729,6 +739,16 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/Layer"
+            }
+          },
+          {
+            "description": "Return only answers in these countries: ISO 3166-1 alpha-2 codes, comma-separated. A Pack covering one country needs none. A code that is not two letters is rejected; one the Pack does not cover simply matches nothing.",
+            "example": "NZ,AU",
+            "in": "query",
+            "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1146,6 +1166,16 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/Layer"
+            }
+          },
+          {
+            "description": "Return only answers in these countries: ISO 3166-1 alpha-2 codes, comma-separated. A Pack covering one country needs none. A code that is not two letters is rejected; one the Pack does not cover simply matches nothing.",
+            "example": "NZ,AU",
+            "in": "query",
+            "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],

@@ -155,6 +155,7 @@ pub fn benchmark_geocode(options: GeocodeBenchmarkOptions) -> Result<GeocodeBenc
                 query: case.query.clone(),
                 limit,
                 layer: None,
+                countries: Vec::new(),
             })
             .with_context(|| format!("failed to search for {:?}", case.query))?;
 

@@ -987,8 +987,10 @@ mod tests {
         ]]
     }
 
-    /// One Pack from two extracts holds the records of both: the passes run
-    /// per input and their records land in the same indexes.
+    /// One Pack from two extracts holds the records of both, in one text
+    /// index: a search with no country filter finds either, and `country`
+    /// narrows it to one. This is what covering several countries without a
+    /// router rests on, so scores stay comparable across them.
     #[test]
     fn builds_one_pack_covering_two_extracts() {
         let dir = temp_dir("two-countries");
@@ -1010,6 +1012,61 @@ mod tests {
             both.accepted.total,
             one.accepted.total
         );
+
+        let reader = Arc::new(Reader::open(dir.join("both")).expect("reader"));
+        let searcher = TextSearcher::from_pack(Arc::clone(&reader)).expect("searcher");
+        let search = |countries: Vec<String>| {
+            searcher
+                .search(TextSearchOptions {
+                    query: "King Street".to_string(),
+                    limit: 20,
+                    layer: None,
+                    countries,
+                })
+                .expect("search")
+        };
+
+        // One index over both: the query finds the street in either country.
+        let any = search(Vec::new());
+        assert!(any.len() >= 2, "both King Streets are indexed: {any:?}");
+
+        // The filter narrows to one, and the two sides partition the whole.
+        let ca = search(vec!["CA".to_string()]);
+        let nz = search(vec!["NZ".to_string()]);
+        assert!(!ca.is_empty(), "Canada has a King Street");
+        assert!(!nz.is_empty(), "New Zealand has one too");
+        assert_eq!(
+            ca.len() + nz.len(),
+            any.len(),
+            "every hit lies in exactly one of the two countries"
+        );
+
+        // Several codes are a union, and an uncovered country matches nothing
+        // rather than erroring: a legitimate empty answer.
+        assert_eq!(
+            search(vec!["CA".to_string(), "NZ".to_string()]).len(),
+            any.len()
+        );
+        assert!(search(vec!["FR".to_string()]).is_empty());
+
+        // The filter narrows, it does not rank: a hit keeps the score it had
+        // unfiltered. This is what makes one Pack over several countries
+        // worth more than a Runtime per country behind a router, where the
+        // scores being merged come from different indexes and are not
+        // comparable at all.
+        for filtered in [&ca, &nz] {
+            for hit in filtered {
+                let unfiltered = any
+                    .iter()
+                    .find(|other| other.record_id == hit.record_id)
+                    .expect("a filtered hit is also an unfiltered one");
+                assert_eq!(
+                    hit.score, unfiltered.score,
+                    "the country filter changed the score of record {}",
+                    hit.record_id
+                );
+            }
+        }
     }
 
     fn build(root: &Path, input: &Path, memory_budget_bytes: Option<usize>) -> BuilderReport {
@@ -1122,6 +1179,7 @@ mod tests {
                 query: "10 King Street".into(),
                 limit: 1,
                 layer: Some("address".into()),
+                countries: Vec::new(),
             })
             .expect("search");
         assert_eq!(hits[0].record.id, "osm:node:1");
@@ -1273,6 +1331,7 @@ mod tests {
                     query: query.into(),
                     limit: 1,
                     layer: Some(layer.into()),
+                    countries: Vec::new(),
                 })
                 .expect("search")
                 .first()
@@ -1522,6 +1581,7 @@ mod tests {
                     query: query.into(),
                     limit: 5,
                     layer: layer.map(str::to_string),
+                    countries: Vec::new(),
                 })
                 .expect("search")
         };
@@ -1568,6 +1628,7 @@ mod tests {
                 query: "riverdale fa".into(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("autocomplete");
         assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);

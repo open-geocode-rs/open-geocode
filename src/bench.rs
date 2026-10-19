@@ -328,6 +328,7 @@ fn benchmark_search_cases(
             query: case.query.clone(),
             limit,
             layer: case.layer.clone(),
+            countries: Vec::new(),
         })
     })
 }
@@ -343,6 +344,7 @@ fn benchmark_autocomplete_cases(
             query: case.query.clone(),
             limit,
             layer: case.layer.clone(),
+            countries: Vec::new(),
         })
     })
 }

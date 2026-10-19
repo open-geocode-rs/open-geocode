@@ -848,6 +848,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
         query: query.clone(),
         limit,
         layer,
+        countries: Vec::new(),
     })?;
     write_json(serde_json::to_value(api::forward_collection(
         &pack, query, hits,

@@ -73,6 +73,26 @@ pub struct TextSearchOptions {
     pub query: String,
     pub limit: usize,
     pub layer: Option<String>,
+    /// Return only records in these countries, by ISO 3166-1 alpha-2 code.
+    /// Empty means every country the Pack covers. A Pack of one country
+    /// needs none; one covering several is narrowed with it.
+    pub countries: Vec<String>,
+}
+
+/// What narrows a search to part of the Pack, apart from the query itself.
+/// Both are exact terms on indexed fields, so they cost a term lookup and
+/// leave scoring alone: the index and its collection statistics stay whole,
+/// which is what keeps scores comparable across the countries in a Pack.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Filters<'a> {
+    pub layer: Option<&'a str>,
+    pub countries: &'a [String],
+}
+
+impl<'a> Filters<'a> {
+    fn new(layer: Option<&'a str>, countries: &'a [String]) -> Self {
+        Self { layer, countries }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +100,8 @@ pub struct TextAutocompleteOptions {
     pub query: String,
     pub limit: usize,
     pub layer: Option<String>,
+    /// Return only records in these countries; see [`TextSearchOptions`].
+    pub countries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -91,6 +113,8 @@ pub struct TextSearchHit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressGeocodeOptions {
+    /// Return only records in these countries; see [`TextSearchOptions`].
+    pub countries: Vec<String>,
     pub address: String,
     pub locality: Option<String>,
     pub region: Option<String>,
@@ -193,7 +217,7 @@ impl TextSearcher {
         let (_, hits) = self.search_variants(
             query_text,
             &[],
-            options.layer.as_deref(),
+            Filters::new(options.layer.as_deref(), &options.countries),
             limit,
             |plan, hit| {
                 // The forms are the whole context part and the part from its
@@ -243,7 +267,7 @@ impl TextSearcher {
         let (query, hits) = self.search_variants(
             address,
             &context,
-            options.layer.as_deref(),
+            Filters::new(options.layer.as_deref(), &options.countries),
             limit,
             |plan, hit| {
                 // A street stands in for a house number it does not have in
@@ -277,7 +301,10 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        let Some(query) = self.build_autocomplete_query(&query_text, options.layer.as_deref())?
+        let Some(query) = self.build_autocomplete_query(
+            &query_text,
+            Filters::new(options.layer.as_deref(), &options.countries),
+        )?
         else {
             return Ok(Vec::new());
         };
@@ -291,7 +318,7 @@ impl TextSearcher {
     /// The house number, then what a record is and where. See
     /// [`Self::house_number_query`] for what `pass` lets stand in for the
     /// number.
-    fn build_query(&self, plan: &QueryPlan, pass: Pass, layer: Option<&str>) -> Box<dyn Query> {
+    fn build_query(&self, plan: &QueryPlan, pass: Pass, filters: Filters<'_>) -> Box<dyn Query> {
         let mut clauses = Vec::new();
         if let Some(number) = &plan.house_number {
             clauses.push((Occur::Must, self.house_number_query(number, pass)));
@@ -300,8 +327,15 @@ impl TextSearcher {
         for word in &plan.optional {
             clauses.push((Occur::Should, self.word_query(word)));
         }
-        if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
+        if let Some(layer) = filters
+            .layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+        {
             clauses.push((Occur::Must, self.layer_query(layer)));
+        }
+        if let Some(countries) = self.countries_query(filters.countries) {
+            clauses.push((Occur::Must, countries));
         }
         Box::new(BooleanQuery::new(clauses))
     }
@@ -489,6 +523,34 @@ impl TextSearcher {
         ))
     }
 
+    /// Records in any of `countries`. `None` when none are asked for, which
+    /// leaves the query untouched rather than adding a clause matching all.
+    fn countries_query(&self, countries: &[String]) -> Option<Box<dyn Query>> {
+        let clauses: Vec<(Occur, Box<dyn Query>)> = countries
+            .iter()
+            .map(|country| country.trim().to_ascii_uppercase())
+            .filter(|country| !country.is_empty())
+            .map(|country| {
+                let term = Term::from_field_text(self.fields.country_code, &country);
+                let query: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                (Occur::Should, query)
+            })
+            .collect();
+        // Scored at zero: the filter narrows what is answered, it does not
+        // rank it. A plain term query would add its own BM25 score to every
+        // hit, and because that score depends on how many records the country
+        // holds, the same query would rank differently filtered than
+        // unfiltered -- the cross-index comparison problem reintroduced
+        // inside one index.
+        (!clauses.is_empty()).then(|| {
+            Box::new(ConstScoreQuery::new(
+                Box::new(BooleanQuery::new(clauses)),
+                0.0,
+            )) as Box<dyn Query>
+        })
+    }
+
     /// Search a plan of each of the parser's best labellings of the query in
     /// turn, best first, and return the first hits that `accept` keeps.
     /// `context` joins every plan. A plan is searched as it is and with the
@@ -504,7 +566,7 @@ impl TextSearcher {
         &self,
         query_text: &str,
         context: &[ContextPart],
-        layer: Option<&str>,
+        filters: Filters<'_>,
         limit: usize,
         mut accept: impl FnMut(&QueryPlan, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
@@ -538,7 +600,7 @@ impl TextSearcher {
                         continue;
                     }
                     let hits =
-                        self.search_plan(plan, pass, &query_words, layer, limit, &mut accept)?;
+                        self.search_plan(plan, pass, &query_words, filters, limit, &mut accept)?;
                     if !hits.is_empty() {
                         return Ok((text, hits));
                     }
@@ -555,7 +617,7 @@ impl TextSearcher {
         plan: &QueryPlan,
         pass: Pass,
         query_words: &HashSet<String>,
-        layer: Option<&str>,
+        filters: Filters<'_>,
         limit: usize,
         accept: &mut impl FnMut(&QueryPlan, &TextSearchHit) -> Result<bool>,
     ) -> Result<Vec<TextSearchHit>> {
@@ -567,7 +629,8 @@ impl TextSearcher {
         };
         let mut hits = Vec::new();
         if pass == Pass::Street
-            && layer
+            && filters
+                .layer
                 .map(str::trim)
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str())
@@ -576,7 +639,7 @@ impl TextSearcher {
         {
             hits.push(estimate);
         }
-        let query = self.build_query(plan, pass, layer);
+        let query = self.build_query(plan, pass, filters);
         for hit in self.ranked_hits(&query, &ranking, limit)? {
             if accept(plan, &hit)? {
                 hits.push(hit);
@@ -719,7 +782,7 @@ impl TextSearcher {
     fn build_autocomplete_query(
         &self,
         query_text: &str,
-        layer: Option<&str>,
+        filters: Filters<'_>,
     ) -> Result<Option<Box<dyn Query>>> {
         let tokens = autocomplete_query_tokens(query_text);
         if tokens.is_empty() {
@@ -750,7 +813,11 @@ impl TextSearcher {
             autocomplete_subject_query(self.fields.autocomplete_subject_text, subject_tokens),
         ));
 
-        if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
+        if let Some(layer) = filters
+            .layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+        {
             subqueries.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
@@ -1703,6 +1770,7 @@ mod tests {
                 query: "342 Albert Street".to_string(),
                 limit: 3,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("search");
         let ids = hits
@@ -1728,6 +1796,7 @@ mod tests {
                 postcode: postcode.map(str::to_string),
                 limit: 10,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("geocode")
             .map(|hit| hit.hit.record.id)
@@ -1993,6 +2062,7 @@ mod tests {
                     query: query.to_string(),
                     limit: 5,
                     layer: None,
+                    countries: Vec::new(),
                 })
                 .expect("search")[0]
                 .record
@@ -2026,6 +2096,7 @@ mod tests {
                 query: "(".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect_err("unparseable query");
         assert!(matches!(error, Error::UnparsableQuery { .. }));
@@ -2074,6 +2145,7 @@ mod tests {
                 query: "King Street Toronto".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("search");
 
@@ -2116,6 +2188,7 @@ mod tests {
                 query: "King Street".to_string(),
                 limit: 10,
                 layer: Some("street".to_string()),
+                countries: Vec::new(),
             })
             .expect("search");
 
@@ -2151,6 +2224,7 @@ mod tests {
                 query: "M5V".to_string(),
                 limit: 5,
                 layer: Some("postcode".to_string()),
+                countries: Vec::new(),
             })
             .expect("search");
 
@@ -2203,6 +2277,7 @@ mod tests {
                 query: "kin".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("autocomplete");
 
@@ -2241,6 +2316,7 @@ mod tests {
                 query: "king st".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("autocomplete");
 
@@ -2281,6 +2357,7 @@ mod tests {
                 query: "kin".to_string(),
                 limit: 10,
                 layer: Some("street".to_string()),
+                countries: Vec::new(),
             })
             .expect("autocomplete");
 
@@ -2319,6 +2396,7 @@ mod tests {
                 query: "nw16".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("postcode autocomplete");
         let number_hits = searcher
@@ -2326,6 +2404,7 @@ mod tests {
                 query: "221".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("number autocomplete");
 
@@ -2364,6 +2443,7 @@ mod tests {
                 query: "221 bak".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("number plus street autocomplete");
 
@@ -2403,6 +2483,7 @@ mod tests {
                     query: " ".to_string(),
                     limit: 5,
                     layer: None,
+                    countries: Vec::new(),
                 })
                 .expect("blank autocomplete")
                 .is_empty()
@@ -2413,6 +2494,7 @@ mod tests {
                     query: "k".to_string(),
                     limit: 5,
                     layer: None,
+                    countries: Vec::new(),
                 })
                 .expect("single character autocomplete")
                 .is_empty()
@@ -2423,6 +2505,7 @@ mod tests {
                     query: "ki".to_string(),
                     limit: 5,
                     layer: None,
+                    countries: Vec::new(),
                 })
                 .expect("two character autocomplete")
                 .is_empty()
@@ -2437,6 +2520,7 @@ mod tests {
                 query: query.to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("search")
             .into_iter()
@@ -2533,6 +2617,7 @@ mod tests {
                 query: "50 Queen Street".to_string(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("search");
         assert_eq!(
@@ -2912,6 +2997,7 @@ mod tests {
                     query: query.to_string(),
                     limit: 5,
                     layer: None,
+                    countries: Vec::new(),
                 })
                 .expect("search")
                 .into_iter()

@@ -85,6 +85,8 @@ pub(crate) struct SearchParams {
     q: Option<String>,
     #[serde(default)]
     limit: usize,
+    /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
+    country: Option<String>,
     /// Left as a string here and parsed by [`parse_layer`], so an unknown
     /// layer is a 400 naming the valid ones rather than a serde rejection
     /// reading `unknown variant`.
@@ -117,6 +119,45 @@ fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
     })
 }
 
+/// Resolve the `country` filter: a comma-separated list of ISO 3166-1
+/// alpha-2 codes, upper-cased, naming the countries to answer from.
+///
+/// A Pack built from one extract covers one country and needs none. One built
+/// from several covers them all, and this narrows a search to part of it —
+/// the same job `country` does on a Pelias or Photon query, where it is also
+/// a filter on one index rather than a route to one of many.
+///
+/// A code that is not two letters is rejected, like an unknown `layer`: a
+/// typo that silently matched nothing would look exactly like "no results
+/// here". A country the Pack does not cover is *not* rejected, because it is
+/// a legitimate empty answer.
+///
+/// An empty or whitespace-only value means "no filter", which is what a form
+/// that always sends the key produces.
+fn parse_countries(country: Option<&str>) -> Result<Vec<String>, Problem> {
+    let Some(value) = country.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut codes = Vec::new();
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let code = part.to_ascii_uppercase();
+        if code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err(Problem::malformed_parameter(format!(
+                "country {part:?} is not an ISO 3166-1 alpha-2 code, such as CA or NZ"
+            ))
+            .with_invalid_params(vec![InvalidParam::new("country", "not a country code")]));
+        }
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    Ok(codes)
+}
+
 /// `/geocode`: an address whose parts the caller already has apart.
 #[derive(Debug, Deserialize)]
 pub(crate) struct GeocodeParams {
@@ -127,6 +168,8 @@ pub(crate) struct GeocodeParams {
     #[serde(default)]
     limit: usize,
     layer: Option<String>,
+    /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
+    country: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,6 +306,13 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
         ("layer" = Option<Layer>, Query,
          description = "Return only answers of this layer. An unknown layer is \
                         rejected rather than silently matching nothing."),
+        ("country" = Option<String>, Query,
+         description = "Return only answers in these countries: ISO 3166-1 \
+                        alpha-2 codes, comma-separated. A Pack covering one \
+                        country needs none. A code that is not two letters is \
+                        rejected; one the Pack does not cover simply matches \
+                        nothing.",
+         example = "NZ,AU"),
     ),
     responses(
         (status = 200, description = "The places that matched, best first.",
@@ -283,11 +333,13 @@ pub(crate) async fn search(
     let query = bounds::validate_query(params.q.as_deref().unwrap_or_default())?;
     bounds::validate_search_limit(params.limit)?;
     let layer = parse_layer(params.layer.as_deref())?;
+    let countries = parse_countries(params.country.as_deref())?;
 
     let options = TextSearchOptions {
         query: query.clone(),
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
+        countries: countries.clone(),
     };
     let collection = blocking(move || {
         let hits = state.searcher.search(options)?;
@@ -318,6 +370,13 @@ pub(crate) async fn search(
         ("layer" = Option<Layer>, Query,
          description = "Return only suggestions of this layer. An unknown layer is \
                         rejected rather than silently matching nothing."),
+        ("country" = Option<String>, Query,
+         description = "Return only answers in these countries: ISO 3166-1 \
+                        alpha-2 codes, comma-separated. A Pack covering one \
+                        country needs none. A code that is not two letters is \
+                        rejected; one the Pack does not cover simply matches \
+                        nothing.",
+         example = "NZ,AU"),
     ),
     responses(
         (status = 200, description = "The suggestions, best first.",
@@ -340,11 +399,13 @@ pub(crate) async fn autocomplete(
     let query = bounds::validate_query_length(params.q.as_deref().unwrap_or_default())?;
     bounds::validate_autocomplete_limit(params.limit)?;
     let layer = parse_layer(params.layer.as_deref())?;
+    let countries = parse_countries(params.country.as_deref())?;
 
     let options = TextAutocompleteOptions {
         query: query.clone(),
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
+        countries,
     };
     let collection = blocking(move || {
         let hits = state.searcher.autocomplete(options)?;
@@ -394,6 +455,13 @@ pub(crate) async fn autocomplete(
         ("layer" = Option<Layer>, Query,
          description = "Consider only candidates of this layer. An unknown layer \
                         is rejected rather than silently matching nothing."),
+        ("country" = Option<String>, Query,
+         description = "Return only answers in these countries: ISO 3166-1 \
+                        alpha-2 codes, comma-separated. A Pack covering one \
+                        country needs none. A code that is not two letters is \
+                        rejected; one the Pack does not cover simply matches \
+                        nothing.",
+         example = "NZ,AU"),
     ),
     responses(
         (status = 200,
@@ -426,6 +494,7 @@ pub(crate) async fn geocode(
     let postcode = context(params.postcode)?;
     bounds::validate_search_limit(params.limit)?;
     let layer = parse_layer(params.layer.as_deref())?;
+    let countries = parse_countries(params.country.as_deref())?;
 
     let options = AddressGeocodeOptions {
         address: address.clone(),
@@ -434,6 +503,7 @@ pub(crate) async fn geocode(
         postcode,
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
+        countries,
     };
     let collection = blocking(move || {
         let found = state.searcher.geocode_address(options)?;
@@ -988,5 +1058,34 @@ mod router_tests {
         assert!(log.lines().is_empty());
 
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `country` is parsed like `layer`: a value that cannot be a code is a
+    /// 400 rather than a filter that silently matches nothing.
+    #[test]
+    fn parses_the_country_filter() {
+        let parse = |value: Option<&str>| parse_countries(value).map_err(|_| ());
+
+        // No filter: absent, empty, or whitespace, as a form that always
+        // sends the key produces.
+        assert_eq!(parse(None), Ok(Vec::new()));
+        assert_eq!(parse(Some("")), Ok(Vec::new()));
+        assert_eq!(parse(Some("  ")), Ok(Vec::new()));
+
+        // Upper-cased, trimmed, comma-separated, and de-duplicated so a
+        // repeated code does not repeat a clause.
+        assert_eq!(parse(Some("nz")), Ok(vec!["NZ".to_string()]));
+        assert_eq!(
+            parse(Some(" nz , AU ")),
+            Ok(vec!["NZ".to_string(), "AU".to_string()])
+        );
+        assert_eq!(parse(Some("nz,NZ")), Ok(vec!["NZ".to_string()]));
+        // An empty item between commas is skipped, not an error.
+        assert_eq!(parse(Some("NZ,,AU")).map(|v| v.len()), Ok(2));
+
+        // Anything that is not two ASCII letters is a typo.
+        for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
+            assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
+        }
     }
 }

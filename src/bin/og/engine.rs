@@ -112,6 +112,7 @@ impl Engine {
             query: query.clone(),
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
+            countries: Vec::new(),
         })?;
         let collection = api::forward_collection(&self.pack, query, hits)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
@@ -145,6 +146,7 @@ impl Engine {
             postcode: None,
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
+            countries: Vec::new(),
         })?;
         let collection = api::forward_collection(
             &self.pack,

@@ -604,6 +604,7 @@ fn geocode_row(
             postcode: postcode.clone(),
             limit: options.limit,
             layer: options.layer.clone(),
+            countries: Vec::new(),
         })?;
         tried_queries.push(address);
         if let Some(response) = response {

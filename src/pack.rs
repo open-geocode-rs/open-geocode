@@ -798,6 +798,7 @@ mod tests {
                 query: query.into(),
                 limit: 1,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("search")
             .first()
@@ -899,6 +900,7 @@ mod tests {
                 query: "king".into(),
                 limit: 5,
                 layer: None,
+                countries: Vec::new(),
             })
             .expect("existing searcher after publish");
         assert_eq!(hits[0].record.id, "osm:node:1");
