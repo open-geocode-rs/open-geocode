@@ -14,9 +14,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use open_geocode::builder::{
-    BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit, build_planned_osm_pack,
-    plan_osm_build,
+use open_geocode::{
+    builder::{
+        BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit, build_planned_osm_pack,
+        plan_osm_build,
+    },
+    openaddresses::OpenAddresses,
 };
 
 use crate::{
@@ -126,6 +129,8 @@ pub(crate) struct BuildRequest {
     pub memory_budget_bytes: Option<usize>,
     /// Build even when the plan finds too little memory or disk.
     pub force: bool,
+    /// Add the OpenAddresses points of the countries the Pack covers.
+    pub openaddresses: bool,
 }
 
 /// A finished build.
@@ -463,6 +468,21 @@ fn run(
             offset,
         }),
         cancel: Arc::clone(cancel),
+        addresses: if request.openaddresses {
+            Some(Arc::new(OpenAddresses::from_env(home.openaddresses_dir())?))
+        } else {
+            None
+        },
+        imported_rows: if request.openaddresses {
+            request
+                .inputs
+                .iter()
+                .filter_map(|input| input.region.openaddresses)
+                .map(|data| data.rows)
+                .sum()
+        } else {
+            0
+        },
         ..BuildOsmOptions::default()
     };
     let plan = plan_osm_build(&options)?;
@@ -503,6 +523,8 @@ fn run(
             memory_budget_bytes: report.resources.plan.memory_budget_bytes,
             threads: report.resources.threads,
             finished_at,
+            pack_format: open_geocode::pack::PACK_SCHEMA_VERSION,
+            openaddresses: request.openaddresses,
         })?;
     }
     Ok(Built { pack, build_secs })

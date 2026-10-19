@@ -161,6 +161,8 @@ pub(crate) struct App {
     pub plan: Option<Result<BuildPlan, String>>,
     /// Build despite the shortfalls the plan finds.
     pub force: bool,
+    /// Add the OpenAddresses points of the countries the Pack covers.
+    pub openaddresses: bool,
     pub confirm_cursor: usize,
     pub job: Option<BuildJob>,
     /// Steps of the running job already printed into history.
@@ -251,6 +253,7 @@ impl App {
             live: Arc::new(Mutex::new(Live::default())),
             plan: None,
             force: false,
+            openaddresses: false,
             confirm_cursor: 0,
             job: None,
             printed: 0,
@@ -362,6 +365,25 @@ impl App {
         self.force_download || self.on_disk.is_none()
     }
 
+    /// The addresses OpenAddresses adds, at most, when it is turned on.
+    pub(crate) fn imported_rows(&self) -> u64 {
+        self.openaddresses_data()
+            .filter(|_| self.openaddresses)
+            .map_or(0, |data| data.rows)
+    }
+
+    /// The OpenAddresses data the build's regions hold, as the catalog counts
+    /// it; `None` where it has none.
+    pub(crate) fn openaddresses_data(&self) -> Option<regions::OpenAddresses> {
+        self.build_regions()
+            .iter()
+            .filter_map(|region| region.openaddresses)
+            .reduce(|total, data| regions::OpenAddresses {
+                rows: total.rows + data.rows,
+                bytes: total.bytes + data.bytes,
+            })
+    }
+
     /// Bytes to download: the live size when the server gave one.
     pub(crate) fn download_bytes(&self) -> u64 {
         let live = self.live.lock().expect("live lock");
@@ -386,11 +408,15 @@ impl App {
 
     /// How long the build takes, scaled from this machine's own builds.
     pub(crate) fn estimate(&self) -> Option<Estimate> {
-        home::estimate(&self.history, self.input_bytes())
+        home::estimate(
+            &self.history,
+            self.input_bytes(),
+            self.openaddresses && self.openaddresses_data().is_some(),
+        )
     }
 
     pub(crate) fn estimate_for(&self, region: &Region) -> Option<Estimate> {
-        home::estimate(&self.history, region.osm.bytes)
+        home::estimate(&self.history, region.osm.bytes, false)
     }
 
     /// Plans the build of the chosen region as the builder will: the memory
@@ -399,8 +425,15 @@ impl App {
     fn replan(&mut self) {
         let pack = self.pack_dir();
         self.plan = Some(
-            plan_build(self.input_bytes(), 0, &pack, &pack, None, true)
-                .map_err(|error| format!("{error:#}")),
+            plan_build(
+                self.input_bytes(),
+                self.imported_rows(),
+                &pack,
+                &pack,
+                None,
+                true,
+            )
+            .map_err(|error| format!("{error:#}")),
         );
     }
 
@@ -448,6 +481,9 @@ impl App {
         }
         if self.force {
             command.push_str(" --force");
+        }
+        if self.openaddresses && self.openaddresses_data().is_some() {
+            command.push_str(" --openaddresses");
         }
         command
     }
@@ -1030,6 +1066,10 @@ impl App {
                 self.replan();
             }
             KeyCode::Char('f') => self.force ^= true,
+            KeyCode::Char('o') if self.openaddresses_data().is_some() => {
+                self.openaddresses ^= true;
+                self.replan();
+            }
             KeyCode::Enter if self.confirm_cursor == 1 => self.screen = Screen::Region,
             KeyCode::Enter if !self.can_build() => {
                 self.flash(
@@ -1076,6 +1116,7 @@ impl App {
                 pack,
                 memory_budget_bytes: None,
                 force: self.force,
+                openaddresses: self.openaddresses && self.openaddresses_data().is_some(),
             },
             Arc::clone(&self.home),
         ));

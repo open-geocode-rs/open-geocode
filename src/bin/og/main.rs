@@ -92,6 +92,12 @@ enum Command {
         /// Download the extract again even when one is on disk.
         #[arg(long)]
         download: bool,
+
+        /// Add the OpenAddresses points of the countries the Pack covers,
+        /// leaving out the ones OSM already has. Needs an OpenAddresses API
+        /// token in OA_TOKEN.
+        #[arg(long)]
+        openaddresses: bool,
     },
     /// Serve a Pack's HTTP API.
     Serve {
@@ -117,6 +123,7 @@ fn main() -> Result<()> {
             memory_budget_mb,
             force,
             download,
+            openaddresses,
         }) => {
             let memory_budget_bytes = memory_budget_mb
                 .map(|mb| usize::try_from(mb << 20))
@@ -129,6 +136,7 @@ fn main() -> Result<()> {
                 memory_budget_bytes,
                 force,
                 download,
+                openaddresses,
             )
         }
         Some(Command::Serve { pack, bind }) => {
@@ -167,6 +175,7 @@ fn build(
     memory_budget_bytes: Option<usize>,
     force: bool,
     download: bool,
+    openaddresses: bool,
 ) -> Result<()> {
     let tree = regions::tree();
     let mut picked: Vec<&'static Region> = Vec::new();
@@ -221,6 +230,7 @@ fn build(
         pack,
         memory_budget_bytes,
         force,
+        openaddresses,
     };
     let pack = request.pack.clone();
     let mut job = BuildJob::start(request, Arc::new(home));
@@ -511,6 +521,7 @@ mod tests {
                 pack: pack.clone(),
                 memory_budget_bytes: None,
                 force: false,
+                openaddresses: false,
             },
             std::sync::Arc::new(home),
         ));

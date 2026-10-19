@@ -34,12 +34,23 @@ struct Entry {
     #[serde(default)]
     aliases: Vec<String>,
     osm: Osm,
+    #[serde(default)]
+    openaddresses: Option<OpenAddresses>,
 }
 
 /// The region's OpenStreetMap extract, as the catalog snapshot saw it.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Osm {
     pub url: String,
+    pub bytes: u64,
+}
+
+/// The OpenAddresses data within the region, as the catalog snapshot saw it.
+/// Sources overlap (a countrywide one and a city's), so these are what a
+/// build downloads at most.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct OpenAddresses {
+    pub rows: u64,
     pub bytes: u64,
 }
 
@@ -59,6 +70,7 @@ pub(crate) struct Region {
     /// Other names the region is known by, for search.
     pub aliases: Vec<String>,
     pub osm: Osm,
+    pub openaddresses: Option<OpenAddresses>,
 }
 
 impl Region {
@@ -200,6 +212,7 @@ fn load(text: &str) -> Tree {
             children: Vec::new(),
             aliases: entry.aliases.clone(),
             osm: entry.osm.clone(),
+            openaddresses: entry.openaddresses,
         })
         .collect();
     let root = regions

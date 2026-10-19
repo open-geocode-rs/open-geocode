@@ -138,8 +138,9 @@ fn choice(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The wizard's answers so far, one line each.
-fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
+/// The wizard's answers so far, one line each. `live` adds what the
+/// confirm screen can still change, which terminal history leaves out.
+fn answers(app: &App, count: usize, live: bool) -> Vec<Line<'static>> {
     let mut region = vec![
         plain(app.region.label.clone()),
         span(format!("  {}", format::bytes(app.input_bytes())), DIM),
@@ -159,22 +160,47 @@ fn answers(app: &App, count: usize) -> Vec<Line<'static>> {
     }
     let lines = vec![
         choice("Region", region),
-        choice(
-            "Sources",
-            vec![plain(
-                regions::dataset_name(app.region.dataset()).to_string(),
-            )],
-        ),
+        choice("Sources", sources(app, live)),
         choice("Output", output),
     ];
     lines.into_iter().take(count).collect()
+}
+
+/// The datasets the build reads: OpenStreetMap, and OpenAddresses when it is
+/// turned on, with what the confirm screen offers about it when `live`.
+fn sources(app: &App, live: bool) -> Vec<Span<'static>> {
+    let osm = regions::dataset_name(app.region.dataset()).to_string();
+    let Some(data) = app.openaddresses_data() else {
+        return vec![plain(osm)];
+    };
+    let addresses = format!("{} addresses", format::count(data.rows));
+    if !app.openaddresses {
+        let mut spans = vec![plain(osm)];
+        if live {
+            spans.push(span(
+                format!("    o add OpenAddresses, up to {addresses}"),
+                FAINT,
+            ));
+        }
+        return spans;
+    }
+    let mut spans = vec![plain(format!("{osm} · OpenAddresses"))];
+    if live {
+        spans.push(if open_geocode::openaddresses::token().is_some() {
+            span(format!("  up to {addresses}"), DIM)
+        } else {
+            span("  needs OA_TOKEN in .env or the environment", WARN)
+        });
+        spans.push(span("    o remove", FAINT));
+    }
+    spans
 }
 
 /// What a started build leaves in terminal history.
 pub(crate) fn choices(app: &App) -> Vec<Line<'static>> {
     // History lines start at the terminal's edge; the live window is one
     // column in.
-    answers(app, 3)
+    answers(app, 3, false)
         .into_iter()
         .map(|line| {
             let mut spans = vec![plain(" ")];
@@ -840,11 +866,11 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ],
         None => vec![span(
-            "no estimate: no build of a similar size has finished on this machine",
+            "no estimate yet: no build of this size and Pack format has finished here",
             DIM,
         )],
     };
-    let mut lines = answers(app, 2);
+    let mut lines = answers(app, 2, true);
     lines.extend([
         Line::raw(""),
         Line::from(bold("   Ready to build")),
@@ -876,7 +902,20 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         )),
         None => {}
     }
-    lines.extend([field("Download", download), field("Time", time)]);
+    lines.push(field("Download", download));
+    if let Some(data) = app.openaddresses_data().filter(|_| app.openaddresses) {
+        lines.push(field(
+            "",
+            vec![
+                plain(format!("up to {}", format::bytes(data.bytes))),
+                span(
+                    "  from batch.openaddresses.io, kept for the next build",
+                    DIM,
+                ),
+            ],
+        ));
+    }
+    lines.push(field("Time", time));
     if let Some(error) = live_error {
         lines.push(field(
             "",
@@ -924,6 +963,9 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
     }
     if !shortfalls.is_empty() {
         hints.push(("f", "force"));
+    }
+    if app.openaddresses_data().is_some() {
+        hints.push(("o", "openaddresses"));
     }
     hints.extend([("enter", "confirm"), ("esc", "back")]);
     footer(frame, app, &hints);

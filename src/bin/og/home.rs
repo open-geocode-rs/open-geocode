@@ -53,6 +53,11 @@ impl Home {
         self.packs_dir().join(slugify(name))
     }
 
+    /// Where downloaded OpenAddresses data is kept between builds.
+    pub(crate) fn openaddresses_dir(&self) -> PathBuf {
+        self.root.join("openaddresses")
+    }
+
     /// Where the region's extract is kept.
     pub(crate) fn extract_path(&self, region: &Region) -> PathBuf {
         let mut path = self.root.join("pbf");
@@ -221,6 +226,14 @@ pub(crate) struct BuildRecord {
     pub memory_budget_bytes: u64,
     pub threads: usize,
     pub finished_at: i64,
+    /// The Pack format it built, [`open_geocode::pack::PACK_SCHEMA_VERSION`];
+    /// 0 for records from before the field. A build of another format did
+    /// other work, so its time estimates nothing.
+    #[serde(default)]
+    pub pack_format: u32,
+    /// Whether it imported OpenAddresses, which a build without them skips.
+    #[serde(default)]
+    pub openaddresses: bool,
 }
 
 /// Furthest apart, as a ratio of input sizes, a past build and the one it
@@ -229,7 +242,8 @@ pub(crate) struct BuildRecord {
 const ESTIMATE_RANGE: f64 = 4.0;
 
 /// How long a build of `input_bytes` is expected to take on this machine,
-/// scaled from the finished build closest in input size. What it needs of
+/// scaled from the finished build closest in input size, of the current Pack
+/// format and with OpenAddresses as `openaddresses` says. What it needs of
 /// memory and disk is the build plan's to say.
 pub(crate) struct Estimate {
     pub secs: f64,
@@ -238,12 +252,20 @@ pub(crate) struct Estimate {
 }
 
 /// None when no build on this machine is within [`ESTIMATE_RANGE`] of it.
-pub(crate) fn estimate(history: &[BuildRecord], input_bytes: u64) -> Option<Estimate> {
+pub(crate) fn estimate(
+    history: &[BuildRecord],
+    input_bytes: u64,
+    openaddresses: bool,
+) -> Option<Estimate> {
     let distance =
         |record: &BuildRecord| (record.input_bytes as f64 / input_bytes as f64).ln().abs();
     let nearest = history
         .iter()
         .filter(|record| record.input_bytes > 0 && input_bytes > 0)
+        .filter(|record| {
+            record.pack_format == open_geocode::pack::PACK_SCHEMA_VERSION
+                && record.openaddresses == openaddresses
+        })
         .filter(|record| distance(record) <= ESTIMATE_RANGE.ln())
         .min_by(|a, b| distance(a).total_cmp(&distance(b)))?;
     let scale = input_bytes as f64 / nearest.input_bytes as f64;
