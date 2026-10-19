@@ -107,11 +107,19 @@ impl Progress {
 }
 
 /// A build to run: a region's extract into its Pack.
-pub(crate) struct BuildRequest {
+/// One region a build reads, with the extract it reads it from.
+#[derive(Clone)]
+pub(crate) struct BuildInput {
     pub region: &'static Region,
     pub extract: PathBuf,
     /// Download the extract first, also when one is on disk.
     pub download: bool,
+}
+
+pub(crate) struct BuildRequest {
+    /// The regions the Pack covers, in the order they are read. Several make
+    /// one Pack: one text index, one spatial index, one process to serve it.
+    pub inputs: Vec<BuildInput>,
     pub pack: PathBuf,
     /// Memory for the build's buffers; derived from what the machine can
     /// give when not set.
@@ -129,9 +137,9 @@ pub(crate) struct Built {
 
 pub(crate) struct BuildJob {
     pub progress: Arc<Progress>,
-    /// The Pack it writes, and the extract it reads or downloads.
+    /// The Pack it writes, and the extracts it reads or downloads.
     pack: PathBuf,
-    extract: PathBuf,
+    extracts: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<Built>>>,
 }
@@ -139,24 +147,33 @@ pub(crate) struct BuildJob {
 impl BuildJob {
     pub(crate) fn start(request: BuildRequest, home: Arc<Home>) -> Self {
         let mut steps = Vec::new();
-        if request.download {
+        // One download and checksum pair per input that needs fetching, each
+        // named after its region so a build of several says which it is on.
+        for input in request.inputs.iter().filter(|input| input.download) {
+            let named = |what: &str| {
+                if request.inputs.len() > 1 {
+                    format!("{what} for {}", input.region.name)
+                } else {
+                    what.to_string()
+                }
+            };
             steps.push(Step {
                 did: "Downloaded",
                 doing: "Downloading",
-                object: regions::dataset_name(request.region.dataset()).to_string(),
+                object: named(regions::dataset_name(input.region.dataset())),
                 explain: [
                     "Fetching the region's extract from its publisher.",
                     "A stopped download continues where it left off next time.",
                 ],
                 unit: Unit::Bytes,
-                total: Some(request.region.osm.bytes),
+                total: Some(input.region.osm.bytes),
                 started: None,
                 secs: None,
             });
             steps.push(Step {
                 did: "Checked",
                 doing: "Checking",
-                object: "checksum".to_string(),
+                object: named("checksum"),
                 explain: [
                     "Comparing the file with the MD5 sum it is published with,",
                     "so a broken download is never built.",
@@ -170,7 +187,12 @@ impl BuildJob {
         steps.extend(BuildStage::ALL.into_iter().map(build_step));
         let progress = Progress::new(steps);
         let cancel = Arc::new(AtomicBool::new(false));
-        let (pack, extract) = (request.pack.clone(), request.extract.clone());
+        let pack = request.pack.clone();
+        let extracts = request
+            .inputs
+            .iter()
+            .map(|input| input.extract.clone())
+            .collect();
         let handle = {
             let progress = Arc::clone(&progress);
             let cancel = Arc::clone(&cancel);
@@ -179,7 +201,7 @@ impl BuildJob {
         Self {
             progress,
             pack,
-            extract,
+            extracts,
             cancel,
             handle: Some(handle),
         }
@@ -196,7 +218,7 @@ impl BuildJob {
 
     /// Whether the job writes this Pack, or reads or downloads this extract.
     pub(crate) fn touches(&self, pack: &Path, extract: &Path) -> bool {
-        self.pack == pack || self.extract == extract
+        self.pack == pack || self.extracts.iter().any(|own| own == extract)
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -375,19 +397,22 @@ fn run(
     cancel: &Arc<AtomicBool>,
 ) -> Result<Built> {
     let mut offset = 0;
-    if request.download {
-        let url = &request.region.osm.url;
-        progress.start(0, Some(request.region.osm.bytes));
+    // Each input that needs its extract is downloaded and checked before any
+    // of them is built, so a build never starts on a set it cannot finish.
+    for input in request.inputs.iter().filter(|input| input.download) {
+        let url = &input.region.osm.url;
+        let (download_step, check_step) = (offset, offset + 1);
+        progress.start(download_step, Some(input.region.osm.bytes));
         let expected = net::published_md5(url)?;
-        let partial = net::download(url, &request.extract, cancel, |done, total| {
+        let partial = net::download(url, &input.extract, cancel, |done, total| {
             if let Some(total) = total {
-                progress.steps.lock().expect("steps lock")[0].total = Some(total);
+                progress.steps.lock().expect("steps lock")[download_step].total = Some(total);
             }
             progress.done.store(done, Ordering::Relaxed);
         })?;
-        progress.finish(0);
+        progress.finish(download_step);
         let bytes = fs::metadata(&partial)?.len();
-        progress.start(1, Some(bytes));
+        progress.start(check_step, Some(bytes));
         if let Err(error) = net::check_md5(&partial, &expected, cancel, |done| {
             progress.done.store(done, Ordering::Relaxed);
         }) {
@@ -397,25 +422,33 @@ fn run(
             }
             return Err(error);
         }
-        progress.finish(1);
-        net::complete(&partial, &request.extract)?;
-        let mut md5 = request.extract.clone().into_os_string();
+        progress.finish(check_step);
+        net::complete(&partial, &input.extract)?;
+        let mut md5 = input.extract.clone().into_os_string();
         md5.push(".md5");
-        let name = request
+        let name = input
             .extract
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
         fs::write(&md5, format!("{expected}  {name}\n"))?;
-        offset = 2;
+        offset += 2;
     }
 
     let options = BuildOsmOptions {
-        input: request.extract.clone(),
+        inputs: request
+            .inputs
+            .iter()
+            .map(|input| input.extract.clone())
+            .collect(),
         pack: request.pack.clone(),
         memory_budget_bytes: request.memory_budget_bytes,
         force: request.force,
-        input_source: Some(request.region.id.clone()),
+        input_sources: request
+            .inputs
+            .iter()
+            .map(|input| input.region.id.clone())
+            .collect(),
         observer: Arc::new(Observer {
             progress: Arc::clone(progress),
             offset,
@@ -442,14 +475,26 @@ fn run(
     let build_secs = started.elapsed().as_secs_f64();
     let pack = PackInfo::read(&request.pack)
         .with_context(|| format!("the new Pack at {} cannot be read", request.pack.display()))?;
-    home.record_build(&BuildRecord {
-        region: request.region.id.clone(),
-        input_bytes: report.input_bytes,
-        build_secs,
-        pack_bytes: report.output.pack_bytes,
-        memory_budget_bytes: report.resources.plan.memory_budget_bytes,
-        threads: report.resources.threads,
-        finished_at: format::now(),
-    })?;
+    // One row per region, each with the bytes it contributed, so the picker's
+    // estimate for a region stays about that region however it was built.
+    // The seconds are shared out by input size, since the stages after the
+    // per-input passes run once over all of them together.
+    let finished_at = format::now();
+    for (input, reported) in request.inputs.iter().zip(&report.inputs) {
+        let share = if report.input_bytes > 0 {
+            reported.bytes as f64 / report.input_bytes as f64
+        } else {
+            1.0
+        };
+        home.record_build(&BuildRecord {
+            region: input.region.id.clone(),
+            input_bytes: reported.bytes,
+            build_secs: build_secs * share,
+            pack_bytes: (report.output.pack_bytes as f64 * share) as u64,
+            memory_budget_bytes: report.resources.plan.memory_budget_bytes,
+            threads: report.resources.threads,
+            finished_at,
+        })?;
+    }
     Ok(Built { pack, build_secs })
 }

@@ -45,7 +45,8 @@ use ratatui::{
 
 use app::App;
 use home::Home;
-use job::{BuildJob, BuildRequest};
+use job::{BuildInput, BuildJob, BuildRequest};
+use regions::Region;
 
 /// mimalloc, counted, as the `open-geocode` binary has it: builds run on
 /// it, and the count lets a build's memory pool see the heap it does not
@@ -68,9 +69,15 @@ struct Cli {
 enum Command {
     /// Download a region's OpenStreetMap extract and build a Pack from it.
     Build {
-        /// The region's catalog id, for example `canada/ontario`.
+        /// The region's catalog id, for example `canada/ontario`. Repeat it
+        /// to build one Pack covering several regions, served by one process.
+        #[arg(long = "region", required = true)]
+        regions: Vec<String>,
+
+        /// What to call a Pack of several regions. Defaults to their ids
+        /// joined; ignored when building one region.
         #[arg(long)]
-        region: String,
+        name: Option<String>,
 
         /// Memory for the build's buffers, in MiB. Sized to what this
         /// machine can give when not set.
@@ -105,7 +112,8 @@ fn main() -> Result<()> {
     resources::opt_out_of_power_throttling();
     match cli.command {
         Some(Command::Build {
-            region,
+            regions,
+            name,
             memory_budget_mb,
             force,
             download,
@@ -114,7 +122,14 @@ fn main() -> Result<()> {
                 .map(|mb| usize::try_from(mb << 20))
                 .transpose()
                 .context("--memory-budget-mb is larger than this machine can address")?;
-            build(home, &region, memory_budget_bytes, force, download)
+            build(
+                home,
+                &regions,
+                name.as_deref(),
+                memory_budget_bytes,
+                force,
+                download,
+            )
         }
         Some(Command::Serve { pack, bind }) => {
             let dir = home.packs_dir().join(&pack);
@@ -147,20 +162,63 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
 /// at once.
 fn build(
     home: Home,
-    id: &str,
+    ids: &[String],
+    name: Option<&str>,
     memory_budget_bytes: Option<usize>,
     force: bool,
     download: bool,
 ) -> Result<()> {
-    let Some(region) = regions::tree().get(id) else {
-        bail!("no region {id} in the catalog; ids look like canada/ontario");
+    let tree = regions::tree();
+    let mut picked: Vec<&'static Region> = Vec::new();
+    for id in ids {
+        let Some(region) = tree.get(id) else {
+            bail!("no region {id} in the catalog; ids look like canada/ontario");
+        };
+        // An extract and the extract it is part of would index the same
+        // places twice, so a pair like `canada` and `canada/ontario`, or a
+        // region given twice, is refused rather than silently built.
+        if let Some(other) = picked
+            .iter()
+            .find(|other| regions::overlaps(tree, other, region))
+        {
+            if other.index == region.index {
+                bail!("region {id} was given twice");
+            }
+            bail!(
+                "{} and {} overlap: one contains the other, so build the wider one alone",
+                other.id,
+                region.id
+            );
+        }
+        picked.push(region);
+    }
+    let inputs: Vec<BuildInput> = picked
+        .iter()
+        .map(|region| {
+            let extract = home.extract_path(region);
+            BuildInput {
+                region,
+                download: download || !extract.is_file(),
+                extract,
+            }
+        })
+        .collect();
+    // One region names its own Pack; several go under the given name, or
+    // their slugs joined.
+    let pack = match (picked.as_slice(), name) {
+        ([region], None) => home.pack_dir(region),
+        (_, Some(name)) => home.named_pack_dir(name),
+        (many, None) => home.named_pack_dir(
+            &many
+                .iter()
+                .map(|region| region.slug())
+                .collect::<Vec<_>>()
+                .join("-"),
+        ),
     };
-    let extract = home.extract_path(region);
     let request = BuildRequest {
-        region,
-        download: download || !extract.is_file(),
-        extract,
-        pack: home.pack_dir(region),
+        inputs,
+        pack,
         memory_budget_bytes,
         force,
     };
@@ -445,9 +503,11 @@ mod tests {
         let mut app = App::new(Home::locate().unwrap());
         app.job = Some(crate::job::BuildJob::start(
             crate::job::BuildRequest {
-                region,
-                extract: home.extract_path(region),
-                download: false,
+                inputs: vec![crate::job::BuildInput {
+                    region,
+                    extract: home.extract_path(region),
+                    download: false,
+                }],
                 pack: pack.clone(),
                 memory_budget_bytes: None,
                 force: false,

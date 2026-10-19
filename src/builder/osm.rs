@@ -7,12 +7,24 @@
 //! and the worker threads are sized to what the machine can give before the
 //! build starts (see [`plan_build`]).
 //!
+//! One Pack can cover several extracts. The three PBF passes and the feature
+//! emission below run once per input, because each pass reads its input in
+//! file order and the node join merges against a request stream sorted by
+//! node id, which only holds within one sorted PBF. Their records all land in
+//! the same sorters, so the stages after them -- boundaries, the record
+//! write, the seal and the parser training -- run once over everything. That
+//! keeps one text index with one set of collection statistics, so BM25 scores
+//! stay comparable across regions, which is what searching several countries
+//! as one requires.
+//!
 //! ```text
-//! pass 1  scan every block (parallel)    -> records for nodes, way features,
+//! per inputs: vec![//! pass 1  scan every block (parallel)    -> records for nodes], way features,
 //!                                           node references, boundary relations
 //! pass 2  read way blocks                 -> boundary relation member ways
 //! pass 3  read node blocks, merge-join    -> coordinates per way position
 //! emit    ways + coordinates (parallel)   -> address, POI, street, interpolation records
+//!
+//! once:
 //! write   context records, then the rest, each in Hilbert order,
 //!         drawing a sample of each country's records
 //! seal    text, spatial and parser dictionary indexes into the Pack file
@@ -58,7 +70,7 @@ use crate::{
     builder::{
         plan::{BuildPlan, plan_build},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
-        report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, SorterReport},
+        report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, ReportInput, SorterReport},
     },
     extsort::{ExternalSorter, SortStats, Spool},
     memory::Budget,
@@ -88,7 +100,12 @@ const WRITE_BATCH_RECORDS: usize = 16_384;
 
 #[derive(Clone)]
 pub struct BuildOsmOptions {
-    pub input: PathBuf,
+    /// The extracts to build from, in the order they are read. Several make
+    /// one Pack covering them all: the passes below run per input and their
+    /// records accumulate into one set of indexes, so the Tantivy index and
+    /// its collection statistics stay global and scores stay comparable
+    /// across every region in the Pack.
+    pub inputs: Vec<PathBuf>,
     pub pack: PathBuf,
     /// Memory for the build's buffers; inputs that need more spill to
     /// scratch files. Derived from the memory the process can use when not
@@ -98,8 +115,9 @@ pub struct BuildOsmOptions {
     pub scratch_dir: Option<PathBuf>,
     /// Build even when the pre-flight check finds too little memory or disk.
     pub force: bool,
-    /// What the input is, for example a region id, kept in the build report.
-    pub input_source: Option<String>,
+    /// What the inputs are, for example region ids, kept in the build
+    /// report. One per input, in the same order.
+    pub input_sources: Vec<String>,
     /// Told about each stage as it starts, advances and finishes, and about
     /// the plan's warnings.
     pub observer: Arc<dyn BuildObserver>,
@@ -111,12 +129,12 @@ pub struct BuildOsmOptions {
 impl Default for BuildOsmOptions {
     fn default() -> Self {
         Self {
-            input: PathBuf::new(),
+            inputs: Vec::new(),
             pack: PathBuf::new(),
             memory_budget_bytes: None,
             scratch_dir: None,
             force: false,
-            input_source: None,
+            input_sources: Vec::new(),
             observer: Arc::new(TerminalObserver::new()),
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -127,12 +145,12 @@ impl fmt::Debug for BuildOsmOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BuildOsmOptions")
-            .field("input", &self.input)
+            .field("inputs", &self.inputs)
             .field("pack", &self.pack)
             .field("memory_budget_bytes", &self.memory_budget_bytes)
             .field("scratch_dir", &self.scratch_dir)
             .field("force", &self.force)
-            .field("input_source", &self.input_source)
+            .field("input_sources", &self.input_sources)
             .field("cancel", &self.cancel)
             .finish_non_exhaustive()
     }
@@ -141,20 +159,37 @@ impl fmt::Debug for BuildOsmOptions {
 /// Plan a build of `options` on this machine: probe it, size the budget and
 /// the threads, and check the memory and disk the input needs.
 pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
-    if !options.input.is_file() {
-        return Err(Error::BadInput(format!(
-            "input {} does not exist",
-            options.input.display()
-        )));
+    if options.inputs.is_empty() {
+        return Err(Error::BadInput(
+            "a build needs at least one input".to_string(),
+        ));
+    }
+    for input in &options.inputs {
+        if !input.is_file() {
+            return Err(Error::BadInput(format!(
+                "input {} does not exist",
+                input.display()
+            )));
+        }
     }
     let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
+    // The passes run per input but the sorters, the heap the boundary stage
+    // holds and the Pack are shared, so the build is sized to every input
+    // together.
     plan_build(
-        input_bytes(&options.input)?,
+        total_input_bytes(&options.inputs)?,
         scratch,
         &options.pack,
         options.memory_budget_bytes,
         options.force,
     )
+}
+
+/// The bytes of every input together.
+fn total_input_bytes(inputs: &[PathBuf]) -> Result<u64> {
+    inputs
+        .iter()
+        .try_fold(0, |total, input| Ok(total + input_bytes(input)?))
 }
 
 pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
@@ -178,6 +213,21 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     // a few times less than the others, and are capped to stay so.
     let memory = Budget::new(budget);
     memory.sample(&plan.resources);
+    let report_inputs = options
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            Ok(ReportInput {
+                path: input.display().to_string(),
+                source: options.input_sources.get(index).cloned(),
+                replication_timestamp: replication_timestamp(input)?,
+                bytes: input_bytes(input)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let input_bytes = report_inputs.iter().map(|input| input.bytes).sum::<u64>();
+
     let mut writer = Writer::create_with(
         &options.pack,
         WriterOptions {
@@ -190,7 +240,6 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let scratch = Arc::clone(writer.scratch());
     scratch.cancel_on(Arc::clone(&options.cancel));
     let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel));
-    let input_bytes = input_bytes(&options.input)?;
     // Spill files stay in the page cache while they fit in a quarter of what
     // the build leaves free: the rest keeps the Pack and the input it
     // rereads, and dirty pages the lazy writer holds back are not free.
@@ -203,9 +252,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let mut build = Build {
         report: BuilderReport {
             schema_version: BUILD_REPORT_SCHEMA_VERSION,
-            input: options.input.display().to_string(),
-            input_source: options.input_source.clone(),
-            input_replication_timestamp: replication_timestamp(&options.input)?,
+            inputs: report_inputs,
             pack: options.pack.display().to_string(),
             input_bytes,
             datasets: vec![OSM_DATASET.to_string()],
@@ -226,135 +273,152 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     build.report.resources.threads = rayon::current_num_threads();
     build.report.resources.plan = plan;
 
-    // Pass 1: classify everything.
-    let phase = Instant::now();
-    let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, budget);
-    let mut features = Spool::<WayFeature>::create(&scratch, "way-features")?;
+    // Boundary geometry accumulates across every input, because a boundary
+    // relation and the ways it is made of can only be assembled once all of
+    // them are known. Everything else each pass needs is per input.
     let mut relations = Vec::new();
     // Boundary ways kept by pass 1. When one is also a relation member, its
     // vertices are reused instead of being requested a second time.
     let mut boundary_feature_ids = HashSet::new();
-    let mut node_blobs = Vec::new();
-    let mut way_blobs = Vec::new();
-    for_each_block(
-        &options.input,
-        &progress,
-        BuildStage::Scan,
-        None,
-        |offset, block| Ok((offset, scan_block(&block))),
-        |(offset, output)| {
-            if output.has_nodes {
-                node_blobs.push(offset);
-            }
-            if output.has_ways {
-                way_blobs.push(offset);
-            }
-            for (feature, refs) in output.ways {
-                let resolution = &mut build.report.geometry_resolution;
-                match feature.kind {
-                    WayKind::Address => resolution.address_way_stubs += 1,
-                    WayKind::Poi => resolution.poi_way_stubs += 1,
-                    WayKind::Street => resolution.street_way_stubs += 1,
-                    WayKind::Interpolation => resolution.interpolation_way_stubs += 1,
-                    WayKind::Boundary => {
-                        resolution.boundary_way_stubs += 1;
-                        boundary_feature_ids.insert(feature.way_id);
-                    }
-                }
-                request_nodes(
-                    &mut requests,
-                    features.written(),
-                    &refs,
-                    feature.kind == WayKind::Interpolation,
-                )?;
-                features.write(&feature)?;
-            }
-            relations.extend(output.relations);
-            build.absorb(output.emitted)
-        },
-    )?;
-    build.report.phases.scan_ms = phase.elapsed().as_millis();
+    let mut boundary_ways = Vec::new();
+    let mut member_vertices: HashMap<i64, Option<Vec<Vertex>>> = HashMap::new();
+    let mut request_stats = SortStats::default();
+    let mut resolved_stats = SortStats::default();
 
-    // Pass 2: the ways boundary relations are made of. They often carry no
-    // tags of their own, so pass 1 could not know to keep them.
-    let phase = Instant::now();
-    let member_base = features.written();
-    let member_ids = boundary::required_boundary_way_ids(&relations)
-        .into_iter()
-        .filter(|way_id| !boundary_feature_ids.contains(way_id))
-        .collect::<HashSet<_>>();
-    let mut members: HashMap<i64, (u64, usize)> = HashMap::new();
-    if member_ids.is_empty() {
-        progress.start(BuildStage::BoundaryMembers, Some(0))?;
-        progress.finish(BuildStage::BoundaryMembers);
-    } else {
+    // Each input is read on its own: a pass reads its blocks in file order,
+    // and the node join merges a request stream sorted by node id against
+    // nodes that ascend only within one sorted PBF.
+    for input in &options.inputs {
+        // Pass 1: classify everything.
+        let phase = Instant::now();
+        let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, budget);
+        let mut features = Spool::<WayFeature>::create(&scratch, "way-features")?;
+        let mut node_blobs = Vec::new();
+        let mut way_blobs = Vec::new();
         for_each_block(
-            &options.input,
+            input,
             &progress,
-            BuildStage::BoundaryMembers,
-            Some(&way_blobs),
-            |_, block| Ok(member_ways(&block, &member_ids)),
-            |found| {
-                for (way_id, refs) in found {
-                    if members.contains_key(&way_id) {
-                        continue;
-                    }
-                    let owner = member_base + members.len() as u64;
-                    request_nodes(&mut requests, owner, &refs, false)?;
-                    members.insert(way_id, (owner, refs.len()));
+            BuildStage::Scan,
+            None,
+            |offset, block| Ok((offset, scan_block(&block))),
+            |(offset, output)| {
+                if output.has_nodes {
+                    node_blobs.push(offset);
                 }
-                Ok(())
+                if output.has_ways {
+                    way_blobs.push(offset);
+                }
+                for (feature, refs) in output.ways {
+                    let resolution = &mut build.report.geometry_resolution;
+                    match feature.kind {
+                        WayKind::Address => resolution.address_way_stubs += 1,
+                        WayKind::Poi => resolution.poi_way_stubs += 1,
+                        WayKind::Street => resolution.street_way_stubs += 1,
+                        WayKind::Interpolation => resolution.interpolation_way_stubs += 1,
+                        WayKind::Boundary => {
+                            resolution.boundary_way_stubs += 1;
+                            boundary_feature_ids.insert(feature.way_id);
+                        }
+                    }
+                    request_nodes(
+                        &mut requests,
+                        features.written(),
+                        &refs,
+                        feature.kind == WayKind::Interpolation,
+                    )?;
+                    features.write(&feature)?;
+                }
+                relations.extend(output.relations);
+                build.absorb(output.emitted)
             },
         )?;
-    }
-    build.report.phases.boundary_member_scan_ms = phase.elapsed().as_millis();
+        build.report.phases.scan_ms += phase.elapsed().as_millis();
 
-    // Pass 3: coordinates for every requested node.
-    let phase = Instant::now();
-    let request_stats = requests.stats();
-    build.report.geometry_resolution.required_node_refs = request_stats.items;
-    let mut resolved =
-        ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, budget);
-    let join = join_nodes(
-        &options.input,
-        &node_blobs,
-        requests.finish()?,
-        &mut resolved,
-        &progress,
-    )?;
-    build.report.geometry_resolution.resolved_node_refs = join.resolved;
-    build.report.phases.node_join_ms = phase.elapsed().as_millis();
+        // Pass 2: the ways boundary relations are made of. They often carry no
+        // tags of their own, so pass 1 could not know to keep them.
+        let phase = Instant::now();
+        let member_base = features.written();
+        let member_ids = boundary::required_boundary_way_ids(&relations)
+            .into_iter()
+            .filter(|way_id| !boundary_feature_ids.contains(way_id))
+            .collect::<HashSet<_>>();
+        let mut members: HashMap<i64, (u64, usize)> = HashMap::new();
+        if member_ids.is_empty() {
+            progress.start(BuildStage::BoundaryMembers, Some(0))?;
+            progress.finish(BuildStage::BoundaryMembers);
+        } else {
+            for_each_block(
+                input,
+                &progress,
+                BuildStage::BoundaryMembers,
+                Some(&way_blobs),
+                |_, block| Ok(member_ways(&block, &member_ids)),
+                |found| {
+                    for (way_id, refs) in found {
+                        if members.contains_key(&way_id) {
+                            continue;
+                        }
+                        let owner = member_base + members.len() as u64;
+                        request_nodes(&mut requests, owner, &refs, false)?;
+                        members.insert(way_id, (owner, refs.len()));
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        build.report.phases.boundary_member_scan_ms += phase.elapsed().as_millis();
 
-    // Assemble ways into records.
-    let phase = Instant::now();
-    let resolved_stats = resolved.stats();
-    let mut boundary_ways = Vec::new();
-    progress.start(BuildStage::AssembleWays, Some(features.written()))?;
-    let mut member_vertices = emit_features(
-        features.into_reader()?,
-        resolved.finish()?,
-        |output: FeatureOutput| {
-            progress.advance(1);
-            progress.check()?;
-            boundary_ways.extend(output.boundary_ways);
-            build.absorb(output.emitted)
-        },
-    )?;
-    progress.finish(BuildStage::AssembleWays);
-    build.report.phases.feature_emission_ms = phase.elapsed().as_millis();
+        // Pass 3: coordinates for every requested node.
+        let phase = Instant::now();
+        request_stats.merge(requests.stats());
+        build.report.geometry_resolution.required_node_refs = request_stats.items;
+        let mut resolved =
+            ExternalSorter::<ResolvedRef>::new(&scratch, "resolved-nodes", &memory, budget);
+        let join = join_nodes(
+            input,
+            &node_blobs,
+            requests.finish()?,
+            &mut resolved,
+            &progress,
+        )?;
+        build.report.geometry_resolution.resolved_node_refs = join.resolved;
+        build.report.phases.node_join_ms += phase.elapsed().as_millis();
 
-    // Admin boundaries, their place records and postcode centroids.
-    let phase = Instant::now();
-    progress.start(BuildStage::Boundaries, None)?;
-    let member_vertices: HashMap<i64, Option<Vec<Vertex>>> = members
-        .into_iter()
-        .map(|(way_id, (owner, count))| {
-            let line = member_vertices
+        // Assemble ways into records.
+        let phase = Instant::now();
+        resolved_stats.merge(resolved.stats());
+        progress.start(BuildStage::AssembleWays, Some(features.written()))?;
+        let input_member_vertices = emit_features(
+            features.into_reader()?,
+            resolved.finish()?,
+            |output: FeatureOutput| {
+                progress.advance(1);
+                progress.check()?;
+                boundary_ways.extend(output.boundary_ways);
+                build.absorb(output.emitted)
+            },
+        )?;
+        progress.finish(BuildStage::AssembleWays);
+        build.report.phases.feature_emission_ms += phase.elapsed().as_millis();
+
+        // This input's member ways, keyed by way id so the boundary stage
+        // can look them up once every input has been read. The owner ids
+        // `emit_features` returns are this input's own, so they are resolved
+        // here rather than kept.
+        let mut input_member_vertices = input_member_vertices;
+        for (way_id, (owner, count)) in members {
+            let line = input_member_vertices
                 .remove(&owner)
                 .filter(|vertices| vertices.len() == count);
-            (way_id, line)
-        })
-        .collect();
+            member_vertices.insert(way_id, line);
+        }
+    }
+
+    // Admin boundaries, their place records and postcode centroids. Every
+    // input has been read, so a relation whose ways span two extracts is
+    // assembled from all of them.
+    let phase = Instant::now();
+    progress.start(BuildStage::Boundaries, None)?;
     // Boundary features that were incomplete have no entry in `boundary_ways`
     // and resolve to `None`, like an incomplete member.
     let mut member_lines: HashMap<i64, Option<&[Vertex]>> = boundary_feature_ids
@@ -883,9 +947,83 @@ mod tests {
         ]
     }
 
+    /// A second country, far from `town`, so a Pack of both covers two.
+    /// Its region states `NZ-WGN`, from which a New Zealand country record is
+    /// derived exactly as `CA-ON` derives Canada's.
+    fn other_country() -> Vec<Vec<TestElement>> {
+        vec![vec![
+            node(
+                5001,
+                -41.29,
+                174.77,
+                &[
+                    ("addr:housenumber", "10"),
+                    ("addr:street", "King Street"),
+                    ("addr:city", "Wellington"),
+                    ("addr:country", "NZ"),
+                ],
+            ),
+            node(
+                5002,
+                -41.2901,
+                174.7701,
+                &[("addr:housenumber", "12"), ("addr:street", "Queen Street")],
+            ),
+            node(6001, -41.30, 174.76, &[]),
+            node(6002, -41.28, 174.76, &[]),
+            node(6003, -41.28, 174.78, &[]),
+            node(6004, -41.30, 174.78, &[]),
+            way(5500, &[6001, 6002, 6003, 6004, 6001], &[]),
+            relation(
+                5901,
+                &[(5500, "outer")],
+                &[
+                    ("boundary", "administrative"),
+                    ("admin_level", "4"),
+                    ("name", "Wellington Region"),
+                    ("ISO3166-2", "NZ-WGN"),
+                ],
+            ),
+        ]]
+    }
+
+    /// One Pack from two extracts holds the records of both: the passes run
+    /// per input and their records land in the same indexes.
+    #[test]
+    fn builds_one_pack_covering_two_extracts() {
+        let dir = temp_dir("two-countries");
+        let (first, second) = (dir.join("town.osm.pbf"), dir.join("other.osm.pbf"));
+        write_pbf(&first, &town());
+        write_pbf(&second, &other_country());
+
+        let one = build(&dir.join("one"), &first, None);
+        let both = build_all(&dir.join("both"), &[&first, &second], None);
+
+        assert_eq!(both.inputs.len(), 2, "the report names every input");
+        assert_eq!(
+            both.input_bytes,
+            both.inputs.iter().map(|i| i.bytes).sum::<u64>()
+        );
+        assert!(
+            both.accepted.total > one.accepted.total,
+            "the second extract's records are in the Pack too: {} vs {}",
+            both.accepted.total,
+            one.accepted.total
+        );
+    }
+
     fn build(root: &Path, input: &Path, memory_budget_bytes: Option<usize>) -> BuilderReport {
+        build_all(root, &[input], memory_budget_bytes)
+    }
+
+    /// Build one Pack from several extracts, as a multi-region build does.
+    fn build_all(
+        root: &Path,
+        inputs: &[&Path],
+        memory_budget_bytes: Option<usize>,
+    ) -> BuilderReport {
         build_osm_pack(BuildOsmOptions {
-            input: input.to_path_buf(),
+            inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
             pack: root.to_path_buf(),
             memory_budget_bytes,
             ..BuildOsmOptions::default()
@@ -1506,7 +1644,7 @@ mod tests {
             ],
         );
         let error = build_osm_pack(BuildOsmOptions {
-            input,
+            inputs: vec![input],
             pack: dir.join("pack"),
             ..BuildOsmOptions::default()
         })
@@ -1550,14 +1688,21 @@ mod tests {
         write_pbf(&input, &town());
         let recorder = Arc::new(Recorder::default());
         let report = build_osm_pack(BuildOsmOptions {
-            input: input.clone(),
+            inputs: vec![input.clone()],
             pack: dir.join("pack"),
-            input_source: Some("town".into()),
+            input_sources: vec!["town".into()],
             observer: Arc::clone(&recorder) as Arc<dyn BuildObserver>,
             ..BuildOsmOptions::default()
         })
         .expect("build");
-        assert_eq!(report.input_source.as_deref(), Some("town"));
+        assert_eq!(
+            report
+                .inputs
+                .iter()
+                .map(|input| input.source.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("town")]
+        );
         assert!(report.resources.threads > 0);
         assert_eq!(report.datasets, [OSM_DATASET]);
 
@@ -1603,7 +1748,7 @@ mod tests {
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let error = build_osm_pack(BuildOsmOptions {
-            input,
+            inputs: vec![input],
             pack: dir.join("pack"),
             cancel: Arc::new(AtomicBool::new(true)),
             ..BuildOsmOptions::default()

@@ -48,6 +48,11 @@ impl Home {
         self.packs_dir().join(region.slug())
     }
 
+    /// Where a Pack of several regions goes: under the name it was given.
+    pub(crate) fn named_pack_dir(&self, name: &str) -> PathBuf {
+        self.packs_dir().join(slugify(name))
+    }
+
     /// Where the region's extract is kept.
     pub(crate) fn extract_path(&self, region: &Region) -> PathBuf {
         let mut path = self.root.join("pbf");
@@ -121,8 +126,9 @@ pub(crate) struct Extract {
 pub(crate) struct PackInfo {
     pub name: String,
     pub dir: PathBuf,
-    /// The catalog region it was built from, when og built it.
-    pub region: Option<&'static Region>,
+    /// The catalog regions it was built from, when og built it. More than
+    /// one is a Pack covering them all, served by one process.
+    pub regions: Vec<&'static Region>,
     pub records: u64,
     pub bytes: u64,
     pub built_at: i64,
@@ -146,24 +152,38 @@ impl PackInfo {
             .map(|generation| generation.join(AUDIT_DIR).join(BUILD_REPORT_FILE))
             .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice::<BuilderReport>(&bytes).ok());
-        let region = report
+        let regions: Vec<&'static Region> = report
             .as_ref()
-            .and_then(|report| report.input_source.as_deref())
-            .and_then(|id| regions::tree().get(id));
-        let name = match region {
-            Some(region) => region.name.clone(),
-            None => dir.file_name()?.to_string_lossy().into_owned(),
+            .map(|report| {
+                report
+                    .inputs
+                    .iter()
+                    .filter_map(|input| regions::tree().get(input.source.as_deref()?))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // One region names the Pack; several leave the directory name, which
+        // is what the person called the Pack when they built it.
+        let name = match regions.as_slice() {
+            [region] => region.name.clone(),
+            _ => dir.file_name()?.to_string_lossy().into_owned(),
         };
         Some(Self {
             name,
             dir: dir.to_path_buf(),
-            region,
+            regions,
             records: manifest.record_count,
             bytes: reader.container().file_size(),
             built_at: manifest.built_at_unix as i64,
-            data_at: report
-                .as_ref()
-                .and_then(|report| report.input_replication_timestamp),
+            // The oldest input's date: the Pack is only as fresh as the
+            // least fresh region in it.
+            data_at: report.as_ref().and_then(|report| {
+                report
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.replication_timestamp)
+                    .min()
+            }),
             datasets: report
                 .as_ref()
                 .map(|report| report.datasets.clone())
@@ -231,4 +251,19 @@ pub(crate) fn estimate(history: &[BuildRecord], input_bytes: u64) -> Option<Esti
         secs: nearest.build_secs * scale,
         from: nearest.clone(),
     })
+}
+
+/// A typed Pack name as a directory name: lower case, with runs of anything
+/// but letters and digits as single dashes, so what the person typed is still
+/// recognisable in the path.
+pub(crate) fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.chars() {
+        if c.is_alphanumeric() {
+            slug.extend(c.to_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
 }

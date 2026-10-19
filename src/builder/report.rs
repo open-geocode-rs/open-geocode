@@ -10,19 +10,29 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 18;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 19;
+
+/// One extract a build read.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ReportInput {
+    pub path: String,
+    /// What the input is, as the caller named it: a region id for a Pack
+    /// built from a catalog region.
+    pub source: Option<String>,
+    /// When the input's data was taken from OpenStreetMap, in seconds since
+    /// the Unix epoch, as the PBF header states it.
+    pub replication_timestamp: Option<i64>,
+    pub bytes: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
     pub schema_version: u32,
-    pub input: String,
-    /// What the input is, as the caller named it: a region id for a Pack
-    /// built from a catalog region.
-    pub input_source: Option<String>,
-    /// When the input's data was taken from OpenStreetMap, in seconds since
-    /// the Unix epoch, as the PBF header states it.
-    pub input_replication_timestamp: Option<i64>,
+    /// The extracts the Pack was built from, in the order they were read.
+    /// A Pack covering several regions has one entry per region.
+    pub inputs: Vec<ReportInput>,
     pub pack: String,
+    /// The bytes of every input together.
     pub input_bytes: u64,
     /// The datasets the Pack's records come from, by the id their
     /// provenance names ([`crate::record::OSM_DATASET`]).

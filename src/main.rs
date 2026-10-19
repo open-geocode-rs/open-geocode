@@ -92,8 +92,11 @@ enum PackCommand {
     /// Build a Pack from an OSM .pbf extract, from a city up to the planet.
     Build {
         /// Input .osm.pbf file, sorted by type and id (the standard layout).
-        #[arg(long)]
-        input: PathBuf,
+        /// Repeat it to build one Pack covering several extracts; they
+        /// should be from the same date, as an older copy of a shared
+        /// boundary would otherwise win over a newer one.
+        #[arg(long = "input", required = true)]
+        inputs: Vec<PathBuf>,
 
         /// Output Pack directory. The new build is published atomically.
         #[arg(long)]
@@ -468,7 +471,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Pack(PackCommand::Build {
-            input,
+            inputs,
             pack,
             memory_budget_mb,
             scratch_dir,
@@ -476,7 +479,7 @@ async fn main() -> Result<()> {
         }) => {
             resources::opt_out_of_power_throttling();
             let options = BuildOsmOptions {
-                input,
+                inputs,
                 pack,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))

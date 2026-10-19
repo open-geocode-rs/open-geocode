@@ -153,6 +153,17 @@ impl Tree {
     }
 }
 
+/// Whether one region contains the other, either way round.
+///
+/// Two overlapping extracts index the same places twice, so a Pack is built
+/// from regions that are pairwise disjoint: `canada` and `canada/ontario`
+/// together would hold Ontario's addresses once from each.
+pub(crate) fn overlaps(tree: &Tree, one: &Region, other: &Region) -> bool {
+    one.index == other.index
+        || tree.ancestors(one).contains(&other.index)
+        || tree.ancestors(other).contains(&one.index)
+}
+
 /// How a dataset id reads: `osm` is OpenStreetMap.
 pub(crate) fn dataset_name(id: &str) -> &str {
     match id {
@@ -246,5 +257,24 @@ mod tests {
             }
             assert!(region.osm.bytes > 0, "{} has no size", region.id);
         }
+    }
+
+    /// A region overlaps itself and everything above or below it, and nothing
+    /// beside it.
+    #[test]
+    fn overlapping_regions_are_those_one_contains() {
+        let tree = tree();
+        let region = |id: &str| tree.get(id).unwrap_or_else(|| panic!("no region {id}"));
+        let (canada, ontario) = (region("canada"), region("canada/ontario"));
+        let australia = region("australia");
+
+        assert!(overlaps(tree, canada, canada), "a region overlaps itself");
+        assert!(overlaps(tree, canada, ontario), "a parent contains a child");
+        assert!(overlaps(tree, ontario, canada), "and the other way round");
+        assert!(
+            !overlaps(tree, ontario, australia),
+            "regions in different countries are disjoint"
+        );
+        assert!(!overlaps(tree, canada, australia));
     }
 }

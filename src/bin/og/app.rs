@@ -26,7 +26,7 @@ use crate::{
     engine::{self, Answer, Engine},
     format,
     home::{self, BuildRecord, Estimate, Home, PackInfo},
-    job::{self, BuildJob, BuildRequest, Built},
+    job::{self, BuildInput, BuildJob, BuildRequest, Built},
     net,
     regions::{self, Region},
     ui,
@@ -143,7 +143,15 @@ pub(crate) struct App {
     pub region_scroll: usize,
     /// The regions browsed into, from a continent down. Empty at the top.
     pub region_path: Vec<usize>,
+    /// The region the cursor last settled on: what a build covers when
+    /// nothing is ticked.
     pub region: &'static Region,
+    /// The regions ticked with space, by tree index, in the order they were
+    /// ticked. Empty means "just the one under the cursor", so the one-region
+    /// flow needs no ticking at all.
+    pub picked: Vec<usize>,
+    /// The name typed for a Pack of several regions, empty until one is.
+    pub pack_name: String,
     /// Download the extract even though one is on disk: an update.
     pub force_download: bool,
     pub on_disk: Option<OnDisk>,
@@ -209,7 +217,7 @@ impl App {
         let history = home.history();
         let region = packs
             .first()
-            .and_then(|pack| pack.region)
+            .and_then(|pack| pack.regions.first().copied())
             .unwrap_or_else(|| regions::tree().root());
         let app = Self {
             screen: Screen::Home,
@@ -233,6 +241,8 @@ impl App {
             active_dir: PathBuf::new(),
             region_query: String::new(),
             region_cursor: 0,
+            picked: Vec::new(),
+            pack_name: String::new(),
             region_scroll: 0,
             region_path: Vec::new(),
             region,
@@ -283,12 +293,25 @@ impl App {
     /// is from.
     fn check_updates(&self) {
         for pack in &self.packs {
-            let Some(url) = pack.region.and_then(Region::state_url) else {
+            // A Pack of several regions is only as fresh as its oldest
+            // input, so it is checked against every publisher it came from.
+            let urls: Vec<String> = pack
+                .regions
+                .iter()
+                .filter_map(|region| region.state_url())
+                .collect();
+            if urls.is_empty() {
                 continue;
-            };
+            }
             let (updates, dir) = (Arc::clone(&self.updates), pack.dir.clone());
             thread::spawn(move || {
-                if let Ok(at) = net::state_timestamp(&url) {
+                // The newest each publisher has, taken together: the Pack is
+                // behind when any one of its regions has newer data.
+                if let Some(at) = urls
+                    .iter()
+                    .filter_map(|url| net::state_timestamp(url).ok())
+                    .max()
+                {
                     updates.lock().expect("updates lock").insert(dir, at);
                 }
             });
@@ -301,8 +324,37 @@ impl App {
         (newest > pack.data_at?).then_some(newest)
     }
 
+    /// Where the build writes. One region names its own Pack; several go
+    /// under the name typed for them, falling back to their slugs joined.
     pub(crate) fn pack_dir(&self) -> PathBuf {
-        self.home.pack_dir(self.region)
+        let regions = self.build_regions();
+        match regions.as_slice() {
+            [region] => self.home.pack_dir(region),
+            _ if !self.pack_name.trim().is_empty() => {
+                self.home.named_pack_dir(self.pack_name.trim())
+            }
+            many => self.home.named_pack_dir(
+                &many
+                    .iter()
+                    .map(|region| region.slug())
+                    .collect::<Vec<_>>()
+                    .join("-"),
+            ),
+        }
+    }
+
+    /// What the build reads, with the extracts it must fetch first. The one
+    /// place that decides it, so the confirm screen and the build itself
+    /// never disagree.
+    pub(crate) fn build_inputs(&self) -> Vec<BuildInput> {
+        self.build_regions()
+            .into_iter()
+            .map(|region| BuildInput {
+                extract: self.home.extract_path(region),
+                download: self.force_download || self.home.extract(region).is_none(),
+                region,
+            })
+            .collect()
     }
 
     /// Whether the build downloads the extract first.
@@ -318,16 +370,21 @@ impl App {
             .unwrap_or(self.region.osm.bytes)
     }
 
-    /// The extract the build reads, in bytes.
+    /// The extracts the build reads, in bytes. One region is measured from
+    /// the copy on disk or the size its publisher states; several are
+    /// measured from the catalog, which is what the picker showed.
     pub(crate) fn input_bytes(&self) -> u64 {
+        let regions = self.build_regions();
+        if regions.len() > 1 {
+            return regions.iter().map(|region| region.osm.bytes).sum();
+        }
         match (&self.on_disk, self.downloads()) {
             (Some(extract), false) => extract.bytes,
             _ => self.download_bytes(),
         }
     }
 
-    /// How long the build of this region takes, scaled from this machine's
-    /// own builds.
+    /// How long the build takes, scaled from this machine's own builds.
     pub(crate) fn estimate(&self) -> Option<Estimate> {
         home::estimate(&self.history, self.input_bytes())
     }
@@ -463,6 +520,64 @@ impl App {
         }
     }
 
+    /// The regions a build would cover: the ticked ones, or, when none are
+    /// ticked, the one under the cursor. Always at least one.
+    pub(crate) fn build_regions(&self) -> Vec<&'static Region> {
+        let tree = regions::tree();
+        if self.picked.is_empty() {
+            return vec![self.region];
+        }
+        self.picked.iter().map(|index| tree.at(*index)).collect()
+    }
+
+    /// Whether this region is ticked.
+    pub(crate) fn is_picked(&self, region: &Region) -> bool {
+        self.picked.contains(&region.index)
+    }
+
+    /// Ticks or unticks the region under the cursor. Picking a region that
+    /// contains, or lies in, one already ticked replaces it: an extract and
+    /// the extract it is part of would index the same places twice, and the
+    /// wider one already covers the narrower.
+    ///
+    /// Returns what to tell the person when a pick displaced others.
+    pub(crate) fn toggle_picked(&mut self) -> Option<String> {
+        let tree = regions::tree();
+        let region = self
+            .region_rows()
+            .get(self.region_cursor)
+            .map(|row| row.region)?;
+        let index = region.index;
+        if let Some(at) = self.picked.iter().position(|picked| *picked == index) {
+            self.picked.remove(at);
+            return None;
+        }
+        // Everything already ticked that this region contains or lies in.
+        let overlapping: Vec<usize> = self
+            .picked
+            .iter()
+            .copied()
+            .filter(|picked| regions::overlaps(tree, region, tree.at(*picked)))
+            .collect();
+        self.picked.retain(|picked| !overlapping.contains(picked));
+        self.picked.push(index);
+        self.region = region;
+        match overlapping.as_slice() {
+            [] => None,
+            picked => {
+                let names = picked
+                    .iter()
+                    .map(|index| tree.at(*index).name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "{} covers {names}, so {names} came off the list.",
+                    region.name
+                ))
+            }
+        }
+    }
+
     /// Scrolls so the cursor row is on screen.
     fn region_follow(&mut self) {
         if self.region_cursor < self.region_scroll {
@@ -503,6 +618,8 @@ impl App {
     /// stays on that region for when the user comes back.
     fn region_select(&mut self, region: &'static Region) {
         self.region = region;
+        self.picked.clear();
+        self.pack_name.clear();
         self.region_query.clear();
         self.region_path = regions::tree().ancestors(region);
         let cursor = self
@@ -762,10 +879,24 @@ impl App {
             }
             KeyCode::Char('u') if !on_build => {
                 let pack = &self.packs[self.home_cursor];
-                match (pack.region, self.update_for(pack)) {
-                    (Some(region), Some(_)) => {
-                        self.region = region;
-                        self.region_path = regions::tree().ancestors(region);
+                // Updating rebuilds the Pack from every region it covers:
+                // one Pack is one build, so its regions are re-picked whole.
+                let covered = pack.regions.clone();
+                let pack_name = pack.name.clone();
+                match (covered.split_first(), self.update_for(pack)) {
+                    (Some((first, rest)), Some(_)) => {
+                        self.region = first;
+                        self.region_path = regions::tree().ancestors(first);
+                        self.picked = if rest.is_empty() {
+                            Vec::new()
+                        } else {
+                            covered.iter().map(|region| region.index).collect()
+                        };
+                        self.pack_name = if rest.is_empty() {
+                            String::new()
+                        } else {
+                            pack_name
+                        };
                         self.force_download = true;
                         self.open_confirm();
                     }
@@ -828,7 +959,22 @@ impl App {
                 self.region_cursor = (self.region_cursor + REGION_ROWS).min(count - 1);
                 self.region_follow();
             }
+            // Space ticks a region for a Pack covering several. It comes
+            // before the search box takes the key, which costs nothing: a
+            // search never starts with a space.
+            KeyCode::Char(' ') => {
+                if let Some(displaced) = self.toggle_picked() {
+                    self.flash(displaced);
+                }
+            }
             KeyCode::Enter => {
+                // Ticked regions build together, whatever the cursor is on,
+                // so enter on a parent does not open it into its children.
+                if !self.picked.is_empty() {
+                    self.region_query.clear();
+                    self.open_confirm();
+                    return;
+                }
                 let Some(row) = rows.get(self.region_cursor) else {
                     return;
                 };
@@ -854,6 +1000,8 @@ impl App {
                     self.region_query.clear();
                     self.region_reset(0);
                 } else if self.region_path.is_empty() {
+                    self.picked.clear();
+                    self.pack_name.clear();
                     self.screen = Screen::Home;
                 } else {
                     self.region_up();
@@ -895,14 +1043,18 @@ impl App {
     }
 
     fn start_build(&mut self) {
-        let (pack, extract) = (self.pack_dir(), self.home.extract_path(self.region));
+        let pack = self.pack_dir();
+        // Each region reads its own extract, and downloads it when it is
+        // missing — or when this is an update, which refetches them all.
+        let inputs = self.build_inputs();
+
         // A stopped build still removing its unfinished Pack generation, or
         // holding the download, would race this one.
-        if self
-            .stopping_builds
-            .iter()
-            .any(|job| job.touches(&pack, &extract))
-        {
+        if self.stopping_builds.iter().any(|job| {
+            inputs
+                .iter()
+                .any(|input| job.touches(&pack, &input.extract))
+        }) {
             self.flash(format!(
                 "The last build of {} is still stopping; start again in a moment.",
                 self.region.name
@@ -920,9 +1072,7 @@ impl App {
         self.free_disk = resources::free_disk(&pack);
         self.job = Some(BuildJob::start(
             BuildRequest {
-                region: self.region,
-                extract,
-                download: self.downloads(),
+                inputs,
                 pack,
                 memory_budget_bytes: None,
                 force: self.force,

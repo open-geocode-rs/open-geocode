@@ -18,7 +18,7 @@ use crate::{
     engine::{self, Hit, Measure},
     format,
     home::PackInfo,
-    job::{Step, Unit},
+    job::{BuildInput, Step, Unit},
     regions,
 };
 
@@ -454,11 +454,20 @@ fn pack_detail(pack: &PackInfo, update: Option<i64>, now: i64) -> Vec<Line<'stat
         Line::from(bold(pack.name.clone())),
         Line::raw(""),
         detail_line(
-            "Region",
-            pack.region.map_or_else(
-                || "not from the catalog".to_string(),
-                |region| region.label.clone(),
-            ),
+            if pack.regions.len() > 1 {
+                "Regions"
+            } else {
+                "Region"
+            },
+            match pack.regions.as_slice() {
+                [] => "not from the catalog".to_string(),
+                [region] => region.label.clone(),
+                many => many
+                    .iter()
+                    .map(|region| region.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            },
         ),
         detail_line(
             "Sources",
@@ -579,6 +588,33 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     while lines.len() < 4 + app::REGION_ROWS {
         lines.push(Line::raw(""));
     }
+    // Above the counts: what is ticked, and what building it would cost.
+    if !app.picked.is_empty() {
+        let picked = app.build_regions();
+        let names = picked
+            .iter()
+            .map(|region| region.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let secs: Option<f64> = picked
+            .iter()
+            .map(|region| app.estimate_for(region).map(|estimate| estimate.secs))
+            .sum();
+        let mut summary = vec![
+            plain("   "),
+            strong(format!("{} selected", picked.len()), ACCENT),
+            span(format!("  {}", cut(&names, inner.saturating_sub(28))), DIM),
+            span(format!("  {}", format::bytes(app.input_bytes())), DIM),
+        ];
+        // The sum of each region's own estimate. Building them together
+        // saves the setup and the parser training a second build repeats,
+        // so the real time lands a little under this.
+        if let Some(secs) = secs {
+            summary.push(span(format!("  about {}", format::about(secs)), DIM));
+        }
+        lines.push(Line::from(summary));
+    }
+
     // Under the list: how many rows are out of sight, and where the cursor is.
     let more = rows.len().saturating_sub(next);
     let left = if more > 0 {
@@ -596,21 +632,29 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
         span(right, DIM),
     ]));
     frame.render_widget(Paragraph::new(lines), area);
-    let hints: &[(&str, &str)] = if browsing {
-        &[
+    let picking = !app.picked.is_empty();
+    let enter = if picking {
+        ("enter", "build the selected")
+    } else {
+        ("enter", "open or select")
+    };
+    let hints: Vec<(&str, &str)> = if browsing {
+        vec![
             ("↑↓", "move"),
-            ("enter", "open or select"),
+            ("space", "select"),
+            enter,
             ("←→", "up or open"),
             ("esc", "back"),
         ]
     } else {
-        &[
+        vec![
             ("↑↓", "move"),
-            ("enter", "open or select"),
+            ("space", "select"),
+            enter,
             ("esc", "clear search"),
         ]
     };
-    footer(frame, app, hints);
+    footer(frame, app, &hints);
 }
 
 /// One line of the region list: the name, what is around it, the size of
@@ -635,10 +679,16 @@ fn region_row(
         (true, false) => region.label.clone(),
         (false, _) => region.name.clone(),
     };
-    let mut spans = vec![if selected {
-        span(" ❯ ", ACCENT)
-    } else {
-        plain("   ")
+    // The gutter holds the cursor marker, or, once anything is ticked, each
+    // region's tick. Both are three cells wide, so no row reflows.
+    let picking = !app.picked.is_empty();
+    let ticked = app.is_picked(region);
+    let mut spans = vec![match (picking, selected, ticked) {
+        (true, _, true) => span(" ◉ ", ACCENT),
+        (true, true, false) => span(" ◯ ", ACCENT),
+        (true, false, false) => span(" ◯ ", DIM),
+        (false, true, _) => span(" ❯ ", ACCENT),
+        (false, false, _) => plain("   "),
     }];
     for (index, c) in name.chars().enumerate() {
         let style = if row.positions.contains(&index) {
@@ -711,6 +761,9 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         let live = app.live.lock().expect("live lock");
         (live.data_at, live.done, live.error.clone())
     };
+    let picked = app.build_regions();
+    let inputs = app.build_inputs();
+    let several = picked.len() > 1;
     let host = app
         .region
         .osm
@@ -719,34 +772,49 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         .nth(2)
         .unwrap_or_default()
         .to_string();
-    let mut download = match (&app.on_disk, app.downloads()) {
-        (Some(extract), false) => {
-            let mut value = vec![
-                plain("nothing"),
-                span(format!("  using {}", extract.path.display()), DIM),
-            ];
-            if let Some(at) = extract.data_at {
-                value.push(span(format!("  data from {}", format::date(at)), DIM));
-            }
-            value
+    // A Pack of several regions downloads the ones not already on disk, so
+    // the single-region download detail below does not describe it.
+    let mut download = if several {
+        let fetched: Vec<&BuildInput> = inputs.iter().filter(|input| input.download).collect();
+        let bytes: u64 = fetched.iter().map(|input| input.region.osm.bytes).sum();
+        match fetched.len() {
+            0 => vec![plain("nothing"), span("  every extract is on disk", DIM)],
+            count => vec![
+                plain(format::bytes(bytes)),
+                span(format!("  {count} of {} from {host}", inputs.len()), DIM),
+            ],
         }
-        _ => {
-            let mut value = vec![
-                plain(format::bytes(app.download_bytes())),
-                span(format!("  from {host}"), DIM),
-            ];
-            match (newest, live_done) {
-                (Some(at), _) => {
+    } else {
+        match (&app.on_disk, app.downloads()) {
+            (Some(extract), false) => {
+                let mut value = vec![
+                    plain("nothing"),
+                    span(format!("  using {}", extract.path.display()), DIM),
+                ];
+                if let Some(at) = extract.data_at {
                     value.push(span(format!("  data from {}", format::date(at)), DIM));
                 }
-                (None, false) => value.push(span("  checking…", FAINT)),
-                (None, true) => {}
+                value
             }
-            value
+            _ => {
+                let mut value = vec![
+                    plain(format::bytes(app.download_bytes())),
+                    span(format!("  from {host}"), DIM),
+                ];
+                match (newest, live_done) {
+                    (Some(at), _) => {
+                        value.push(span(format!("  data from {}", format::date(at)), DIM));
+                    }
+                    (None, false) => value.push(span("  checking…", FAINT)),
+                    (None, true) => {}
+                }
+                value
+            }
         }
     };
     // An extract on disk with newer data published: say so, and how to take it.
     if let (Some(extract), Some(at)) = (&app.on_disk, newest)
+        && !several
         && !app.downloads()
         && extract.data_at.is_some_and(|own| at > own)
     {
@@ -755,7 +823,7 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
             ACCENT,
         ));
     }
-    if app.downloads() && app.on_disk.is_some() {
+    if !several && app.downloads() && app.on_disk.is_some() {
         download.push(span("  replaces the one on disk  d keep it", DIM));
     }
     let estimate = app.estimate();
@@ -783,6 +851,19 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         field("Output", vec![plain(app.pack_dir().display().to_string())]),
     ]);
+    if several {
+        // Every region the one Pack covers: one text index over all of them,
+        // so a search spans them without naming a country.
+        let names = picked
+            .iter()
+            .map(|region| region.name.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(field(
+            "Regions",
+            vec![plain(cut(&names, area.width.saturating_sub(20) as usize))],
+        ));
+    }
     let shortfalls = app.shortfalls();
     match &app.plan {
         Some(Ok(plan)) => lines.extend(plan_lines(plan)),

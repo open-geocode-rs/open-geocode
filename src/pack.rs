@@ -844,7 +844,7 @@ mod tests {
         let generations = fs::read_dir(root.join("generations")).expect("dir").count();
 
         let result = crate::builder::build_osm_pack(crate::builder::BuildOsmOptions {
-            input: root.join("missing.osm.pbf"),
+            inputs: vec![root.join("missing.osm.pbf")],
             pack: root.clone(),
             ..crate::builder::BuildOsmOptions::default()
         });
