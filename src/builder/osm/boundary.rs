@@ -1047,7 +1047,10 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
             // preference cannot eat the ladder and strand the rest at the
             // innermost tier. Taiwan calls its level 4 a city, which alone
             // would spend six tiers before its five deeper levels are placed.
-            let cap = ADMIN_LAYER_ORDER.len() - 1 - (levels.len() - index - 1);
+            // A country deeper than the tiers has no tier to keep for each: it
+            // fills them in order and its innermost levels share the last.
+            let innermost = ADMIN_LAYER_ORDER.len() - 1;
+            let cap = innermost.saturating_sub(levels.len() - index - 1);
             let at = if Some(index) == anchor_index {
                 next.max(LOCALITY_AT.min(cap))
             } else {
@@ -1084,7 +1087,8 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
                     _ => at,
                 };
                 if at > cap { cap.max(next) } else { at }
-            };
+            }
+            .min(innermost);
             assigned.insert((*country, level), ADMIN_LAYER_ORDER[at]);
             next = at + 1;
         }
@@ -1784,6 +1788,23 @@ mod tests {
         assert_eq!(layers[&8], PlaceLayer::Locality, "the city stays the city");
         assert_eq!(layers[&2], PlaceLayer::Country);
         assert_eq!(layers[&4], PlaceLayer::Region);
+    }
+
+    /// Ten levels for nine tiers, as a Pack of Canada with every level from 2
+    /// to 11 has: the deepest two share the innermost tier.
+    #[test]
+    fn a_country_deeper_than_the_tiers_ends_on_the_innermost() {
+        let levels = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let layers = layers_for_levels_in(Some("ca"), &levels);
+        assert_eq!(layers.len(), levels.len(), "every level keeps a tier");
+        assert_eq!(layers[&2], PlaceLayer::Country);
+        let innermost = *ADMIN_LAYER_ORDER.last().expect("tiers");
+        assert_eq!((layers[&10], layers[&11]), (innermost, innermost));
+        let tiers = levels.iter().map(|level| layers[level]).collect::<Vec<_>>();
+        assert!(
+            tiers.windows(2).all(|pair| pair[0] <= pair[1]),
+            "never back up: {tiers:?}"
+        );
     }
 
     /// Every country of the table keeps each of its levels in its own tier.
