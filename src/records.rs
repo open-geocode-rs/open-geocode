@@ -15,13 +15,16 @@
 //!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
 //!                  u64, each when its flag is set | the start (u16 or u32) of
 //!                  each body that is not continued | bodies
+//! records/datasets count varint, then each imported dataset's name
 //! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
 //!
 //! body  tag u8        layer (4 bits) | centroid (1) | line geometry (1) | source kind (2)
 //!       dlon, dlat    zigzag varints from the block base
 //!       context       varint, 0 = none, else (tuple_id + 1) << 1 | ambiguous
-//!       source        zigzag OSM object id, or the address count for postcodes
+//!       source        zigzag OSM object id, the address count of a postcode, or
+//!                     the zigzag row of an imported address followed by its
+//!                     dataset's index in `records/datasets`
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
 //!                     (and category or place type) as a varint count and ids, and
@@ -79,16 +82,18 @@ use crate::{
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, OsmObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Record,
+        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Record,
         SourceProvenance, StreetRecord, point_geometry,
     },
     util::codec::{
-        get_i64, get_u8, get_u32, get_u64, put_i64, put_u64, read_u64_le, unzigzag, zigzag,
+        get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
+        unzigzag, zigzag,
     },
 };
 
 pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
+pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
 pub const RECORDS_VERSION: u32 = 7;
 
@@ -114,12 +119,14 @@ const NUMBER_TEXT: u64 = 1;
 const NUMBER_UNIT: u64 = 2;
 const NUMBER_SHIFT: u32 = 2;
 
+/// What a record's source value is. `Other` is a postcode's address count,
+/// or an address's row in an imported dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
     Node = 0,
     Way = 1,
     Relation = 2,
-    Derived = 3,
+    Other = 3,
 }
 
 /// Admin context reference stored in a record body.
@@ -171,7 +178,7 @@ pub enum PointPrecision {
 pub struct Source {
     pub dataset: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_type: Option<OsmObjectType>,
+    pub object_type: Option<ObjectType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +217,9 @@ pub struct Header {
     line: bool,
     source_kind: SourceKind,
     source_value: u64,
+    /// The imported dataset an address comes from, by its index in the
+    /// store's dataset table.
+    dataset: Option<u32>,
 }
 
 impl Header {
@@ -240,22 +250,46 @@ impl Header {
         }
     }
 
-    fn osm_source(&self) -> Result<(OsmObjectType, i64)> {
-        let object_type = match self.source_kind {
-            SourceKind::Node => OsmObjectType::Node,
-            SourceKind::Way => OsmObjectType::Way,
-            SourceKind::Relation => OsmObjectType::Relation,
-            SourceKind::Derived => {
+    /// The object the record comes from: an OSM object, or an imported row.
+    fn object(&self) -> Result<(ObjectType, i64)> {
+        let object_type = match (self.source_kind, self.dataset) {
+            (SourceKind::Node, _) => ObjectType::Node,
+            (SourceKind::Way, _) => ObjectType::Way,
+            (SourceKind::Relation, _) => ObjectType::Relation,
+            (SourceKind::Other, Some(_)) => ObjectType::Row,
+            (SourceKind::Other, None) => {
                 return Err(Error::Inconsistent(
-                    "derived record has no OSM source".into(),
+                    "derived record has no source object".into(),
                 ));
             }
         };
         Ok((object_type, unzigzag(self.source_value)))
     }
 
-    fn source(&self) -> Result<Source> {
-        if self.source_kind == SourceKind::Derived {
+    /// The dataset the record comes from, by name.
+    fn dataset<'a>(&self, datasets: &'a [String]) -> Result<&'a str> {
+        match self.dataset {
+            None => Ok(OSM_DATASET),
+            Some(index) => datasets
+                .get(index as usize)
+                .map(String::as_str)
+                .ok_or(Error::Decode("record names an unknown dataset")),
+        }
+    }
+
+    /// The id search and inspect show: "osm:node:1",
+    /// "openaddresses:nz/countrywide:row:7".
+    fn record_id(&self, datasets: &[String]) -> Result<String> {
+        let (object_type, object_id) = self.object()?;
+        Ok(crate::labels::record_id(
+            self.dataset(datasets)?,
+            object_type,
+            object_id,
+        ))
+    }
+
+    fn source(&self, datasets: &[String]) -> Result<Source> {
+        if self.source_kind == SourceKind::Other && self.dataset.is_none() {
             return Ok(Source {
                 dataset: "osm".into(),
                 object_type: None,
@@ -264,9 +298,9 @@ impl Header {
                 record_count: Some(self.source_value),
             });
         }
-        let (object_type, object_id) = self.osm_source()?;
+        let (object_type, object_id) = self.object()?;
         Ok(Source {
-            dataset: "osm".into(),
+            dataset: self.dataset(datasets)?.to_string(),
             object_type: Some(object_type),
             object_id: Some(object_id),
             derived_from: None,
@@ -274,9 +308,12 @@ impl Header {
         })
     }
 
-    fn provenance(&self) -> Result<SourceProvenance> {
-        let (object_type, object_id) = self.osm_source()?;
-        Ok(SourceProvenance::osm(object_type, object_id))
+    fn provenance(&self, datasets: &[String]) -> Result<SourceProvenance> {
+        let (object_type, object_id) = self.object()?;
+        Ok(match self.dataset {
+            None => SourceProvenance::osm(object_type, object_id),
+            Some(_) => SourceProvenance::imported(self.dataset(datasets)?, object_id),
+        })
     }
 }
 
@@ -304,12 +341,16 @@ pub struct Writer {
     body: Vec<u8>,
     /// The address run the next address may continue, within the open block.
     run: Option<AddressRun>,
+    /// The imported datasets addresses come from, in order of first use.
+    datasets: Vec<String>,
 }
 
 /// The last address written in the open block, and the anchor of its run.
 #[derive(Debug)]
 struct AddressRun {
     shared: AddressComponents,
+    /// The imported dataset of the run, `None` for OSM addresses.
+    dataset: Option<String>,
     context: Option<ContextRef>,
     point: (i32, i32),
     object_id: i64,
@@ -321,7 +362,8 @@ impl AddressRun {
     fn continues(&self, record: &AddressRecord, context: Option<ContextRef>) -> bool {
         let shared = &self.shared;
         let address = &record.address;
-        self.context == context
+        self.dataset.as_deref() == imported_dataset(record)
+            && self.context == context
             && shared.street == address.street
             && shared.place == address.place
             && shared.locality == address.locality
@@ -330,6 +372,11 @@ impl AddressRun {
             && shared.country == address.country
             && shared.areas == address.areas
     }
+}
+
+/// The imported dataset an address comes from, `None` for OSM.
+fn imported_dataset(record: &AddressRecord) -> Option<&str> {
+    (record.source.object_type == ObjectType::Row).then_some(record.source.dataset.as_str())
 }
 
 /// A house number written as digits alone, without a leading zero, so that it
@@ -442,6 +489,7 @@ impl Writer {
             },
             body: Vec::new(),
             run: None,
+            datasets: Vec::new(),
         })
     }
 
@@ -498,9 +546,10 @@ impl Writer {
                     self.centroids |= slot;
                 }
                 match address.source.object_type {
-                    OsmObjectType::Node => {}
-                    OsmObjectType::Way => self.ways |= slot,
-                    OsmObjectType::Relation => self.relations |= slot,
+                    ObjectType::Node => {}
+                    ObjectType::Way => self.ways |= slot,
+                    ObjectType::Relation => self.relations |= slot,
+                    ObjectType::Row => {}
                 }
             }
             _ => {
@@ -512,6 +561,7 @@ impl Writer {
                 self.run = match record {
                     Record::Address(address) => Some(AddressRun {
                         shared: address.address.clone(),
+                        dataset: imported_dataset(address).map(str::to_string),
                         context,
                         point,
                         object_id: address.source.object_id,
@@ -544,7 +594,7 @@ impl Writer {
             Record::Street(record) => osm_source(&record.source),
             Record::Place(_, record) => osm_source(&record.source),
             Record::Poi(record) => osm_source(&record.source),
-            Record::Postcode(record) => (SourceKind::Derived, record.source.record_count),
+            Record::Postcode(record) => (SourceKind::Other, record.source.record_count),
         };
         let precision = match record {
             Record::Address(address) => Some(address.location_precision),
@@ -569,6 +619,12 @@ impl Writer {
             }),
         );
         put_u64(out, source_value);
+        if let Record::Address(record) = record
+            && let Some(dataset) = imported_dataset(record)
+        {
+            let id = self.dataset_id(dataset)?;
+            put_u64(out, u64::from(id));
+        }
 
         match record {
             Record::Address(record) => self.put_address(out, &record.address)?,
@@ -635,6 +691,18 @@ impl Writer {
             }
         }
         Ok(())
+    }
+
+    /// The index of an imported dataset in the store's table.
+    fn dataset_id(&mut self, dataset: &str) -> Result<u32> {
+        let index = match self.datasets.iter().position(|known| known == dataset) {
+            Some(index) => index,
+            None => {
+                self.datasets.push(dataset.to_string());
+                self.datasets.len() - 1
+            }
+        };
+        u32::try_from(index).map_err(|_| Error::Inconsistent("too many imported datasets".into()))
     }
 
     fn encode_continuation(
@@ -771,6 +839,13 @@ impl Writer {
 
         pack.add_file(SECTION_BLOCKS, RECORDS_VERSION, &self.blocks_path)?;
 
+        let mut datasets = Vec::new();
+        put_u64(&mut datasets, self.datasets.len() as u64);
+        for dataset in &self.datasets {
+            put_str(&mut datasets, dataset);
+        }
+        pack.add(SECTION_DATASETS, RECORDS_VERSION, &datasets)?;
+
         let strings = &self.strings;
         pack.begin(SECTION_STRINGS, RECORDS_VERSION)?;
         pack.write_all(&(strings.segments.len() as u64).to_le_bytes())?;
@@ -796,6 +871,8 @@ pub struct Reader {
     /// Byte offsets within `strings` of the end-offset table and the text.
     ends_start: usize,
     text_start: usize,
+    /// Names of the imported datasets, by the index records store.
+    datasets: Arc<Vec<String>>,
 }
 
 impl Reader {
@@ -803,6 +880,17 @@ impl Reader {
         let index = container.section(SECTION_INDEX, RECORDS_VERSION)?;
         let blocks = container.section(SECTION_BLOCKS, RECORDS_VERSION)?;
         let strings = container.section(SECTION_STRINGS, RECORDS_VERSION)?;
+        let datasets = {
+            let bytes = container.section(SECTION_DATASETS, RECORDS_VERSION)?;
+            let mut input = bytes.as_slice();
+            let count = get_u64(&mut input)?;
+            if count > input.len() as u64 {
+                return Err(Error::Decode("dataset table is truncated"));
+            }
+            (0..count)
+                .map(|_| get_str(&mut input).map(str::to_string))
+                .collect::<Result<Vec<_>>>()?
+        };
 
         let record_count =
             read_u64_le(&index, 0).ok_or(Error::Decode("records index is truncated"))?;
@@ -863,6 +951,7 @@ impl Reader {
             string_count,
             ends_start,
             text_start,
+            datasets: Arc::new(datasets),
         })
     }
 
@@ -890,7 +979,7 @@ impl Reader {
                     address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
-                    source: header.provenance()?,
+                    source: header.provenance(&self.datasets)?,
                 })
             }
             Layer::Poi => {
@@ -903,7 +992,7 @@ impl Reader {
                     address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
-                    source: header.provenance()?,
+                    source: header.provenance(&self.datasets)?,
                 })
             }
             Layer::Interpolation => {
@@ -915,7 +1004,7 @@ impl Reader {
                     anchor_node_ids,
                     geometry: geometry(&mut fields)?,
                     representative_point: [header.lon(), header.lat()],
-                    source: header.provenance()?,
+                    source: header.provenance(&self.datasets)?,
                 })
             }
             Layer::Street => Record::Street(StreetRecord {
@@ -923,7 +1012,7 @@ impl Reader {
                 alt_names: self.string_list(header.strings, &mut fields)?,
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
-                source: header.provenance()?,
+                source: header.provenance(&self.datasets)?,
             }),
             Layer::Postcode => Record::Postcode(PostcodeRecord {
                 postcode: self.string_field(header.strings, &mut fields)?.to_string(),
@@ -939,7 +1028,7 @@ impl Reader {
                         place_type: self.string_field(header.strings, &mut fields)?.to_string(),
                         alt_names: self.string_list(header.strings, &mut fields)?,
                         geometry: geometry(&mut fields)?,
-                        source: header.provenance()?,
+                        source: header.provenance(&self.datasets)?,
                     },
                 )
             }
@@ -951,16 +1040,15 @@ impl Reader {
     pub fn summary(&self, id: RecordId) -> Result<Summary> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
-        let source = header.source()?;
+        let source = header.source(&self.datasets)?;
         let mut category = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
                 let address = self.entry_address(&entry, &mut fields)?;
-                let (object_type, object_id) = header.osm_source()?;
                 stated = Address::from(&address);
                 (
-                    crate::labels::osm_record_id(object_type, object_id),
+                    header.record_id(&self.datasets)?,
                     crate::labels::address_name(&address),
                     crate::labels::address_label(&address),
                 )
@@ -968,7 +1056,7 @@ impl Reader {
             Layer::Poi => {
                 let (name, poi_category, _, address) =
                     self.poi_fields(header.strings, &mut fields)?;
-                let (object_type, object_id) = header.osm_source()?;
+                let (object_type, object_id) = header.object()?;
                 category = Some(poi_category.to_string());
                 if let Some(address) = &address {
                     stated = Address::from(address);
@@ -982,7 +1070,7 @@ impl Reader {
             Layer::Interpolation => {
                 let (address, range, anchors) =
                     self.interpolation_fields(header.strings, &mut fields)?;
-                let (_, way_id) = header.osm_source()?;
+                let (_, way_id) = header.object()?;
                 let name = crate::labels::interpolation_name(&address);
                 stated = Address::from(&address);
                 (
@@ -992,7 +1080,7 @@ impl Reader {
                 )
             }
             Layer::Street => {
-                let (object_type, object_id) = header.osm_source()?;
+                let (object_type, object_id) = header.object()?;
                 let name = self.string_field(header.strings, &mut fields)?.to_string();
                 (
                     crate::labels::osm_record_id(object_type, object_id),
@@ -1012,7 +1100,7 @@ impl Reader {
             _ => {
                 let name = self.string_field(header.strings, &mut fields)?;
                 let place_type = self.string_field(header.strings, &mut fields)?;
-                let (object_type, object_id) = header.osm_source()?;
+                let (object_type, object_id) = header.object()?;
                 (
                     crate::labels::place_record_id(object_type, object_id, place_type),
                     name.to_string(),
@@ -1414,8 +1502,13 @@ impl Reader {
                 context: anchor_header.context,
                 centroid: block.centroids & 1 << slot != 0,
                 line: false,
-                source_kind: block.source_kind(slot),
+                // A run is all OSM or all of one imported dataset.
+                source_kind: match anchor_header.dataset {
+                    Some(_) => SourceKind::Other,
+                    None => block.source_kind(slot),
+                },
                 source_value: zigzag(object_id),
+                dataset: anchor_header.dataset,
             },
             fields,
             continued: Some(Continued { number, unit }),
@@ -1716,9 +1809,10 @@ fn read_continuation(cursor: &mut &[u8]) -> Result<ContinuedFields> {
 /// The bytes after an address body that is not continued: where the first
 /// address continuing it starts.
 fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
-    get_u8(&mut body)?;
-    // The point, context, source and number.
-    for _ in 0..5 {
+    let tag = get_u8(&mut body)?;
+    // The point, context, source, an imported row's dataset, and the number.
+    let imported = source_kind_of(tag) == SourceKind::Other;
+    for _ in 0..5 + usize::from(imported) {
         get_u64(&mut body)?;
     }
     let present = get_u8(&mut body)?;
@@ -1768,7 +1862,7 @@ fn source_kind_of(tag: u8) -> SourceKind {
         0 => SourceKind::Node,
         1 => SourceKind::Way,
         2 => SourceKind::Relation,
-        _ => SourceKind::Derived,
+        _ => SourceKind::Other,
     }
 }
 
@@ -1800,6 +1894,9 @@ fn plain_header(
     };
     let source_value = get_u64(&mut body)?;
     let source_kind = source_kind_of(tag);
+    let dataset = (layer == Layer::Address && source_kind == SourceKind::Other)
+        .then(|| get_u32(&mut body))
+        .transpose()?;
     Ok((
         Header {
             layer,
@@ -1811,6 +1908,7 @@ fn plain_header(
             line: tag & TAG_LINE != 0,
             source_kind,
             source_value,
+            dataset,
         },
         body,
     ))
@@ -1818,9 +1916,10 @@ fn plain_header(
 
 fn osm_source(source: &SourceProvenance) -> (SourceKind, u64) {
     let kind = match source.object_type {
-        OsmObjectType::Node => SourceKind::Node,
-        OsmObjectType::Way => SourceKind::Way,
-        OsmObjectType::Relation => SourceKind::Relation,
+        ObjectType::Node => SourceKind::Node,
+        ObjectType::Way => SourceKind::Way,
+        ObjectType::Relation => SourceKind::Relation,
+        ObjectType::Row => SourceKind::Other,
     };
     (kind, zigzag(source.object_id))
 }
@@ -1909,14 +2008,14 @@ mod tests {
                 },
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Centroid,
-                source: SourceProvenance::osm(OsmObjectType::Node, 1),
+                source: SourceProvenance::osm(ObjectType::Node, 1),
             }),
             Record::Street(StreetRecord {
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
                 name: "King Street".into(),
                 geometry: line(&[[-79.0, 43.0], [-79.001, 43.001], [-79.0015, 43.0]]),
                 representative_point: [-79.0, 43.0],
-                source: SourceProvenance::osm(OsmObjectType::Way, 2),
+                source: SourceProvenance::osm(ObjectType::Way, 2),
             }),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V 1A1".into(),
@@ -1941,7 +2040,7 @@ mod tests {
                 anchor_node_ids: [10, 20],
                 geometry: line(&[[-79.0, 43.0], [-79.001, 43.001]]),
                 representative_point: [-79.0, 43.0],
-                source: SourceProvenance::osm(OsmObjectType::Way, 5),
+                source: SourceProvenance::osm(ObjectType::Way, 5),
             }),
             Record::Poi(PoiRecord {
                 alt_names: vec!["Tim's".into()],
@@ -1960,7 +2059,7 @@ mod tests {
                 }),
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Centroid,
-                source: SourceProvenance::osm(OsmObjectType::Way, 6),
+                source: SourceProvenance::osm(ObjectType::Way, 6),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -1969,7 +2068,7 @@ mod tests {
                 address: None,
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Point,
-                source: SourceProvenance::osm(OsmObjectType::Node, 7),
+                source: SourceProvenance::osm(ObjectType::Node, 7),
             }),
         ];
         for layer in [
@@ -1987,7 +2086,7 @@ mod tests {
                     name: "Example place".into(),
                     place_type: "city".into(),
                     geometry: point_geometry(-79.0, 43.0),
-                    source: SourceProvenance::osm(OsmObjectType::Relation, 3),
+                    source: SourceProvenance::osm(ObjectType::Relation, 3),
                 },
             ));
         }
@@ -1998,7 +2097,7 @@ mod tests {
                 name: "Canada".into(),
                 place_type: "derived_country:CA".into(),
                 geometry: point_geometry(-79.0, 43.0),
-                source: SourceProvenance::osm(OsmObjectType::Relation, 4),
+                source: SourceProvenance::osm(ObjectType::Relation, 4),
             },
         ));
         records
@@ -2246,9 +2345,9 @@ mod tests {
                 };
                 address.source = SourceProvenance::osm(
                     if index % 4 == 0 {
-                        OsmObjectType::Way
+                        ObjectType::Way
                     } else {
-                        OsmObjectType::Node
+                        ObjectType::Node
                     },
                     1_000_000 - index_i64 * 37,
                 );
@@ -2320,6 +2419,48 @@ mod tests {
             let summary = reader.summary(id).expect("summary");
             assert_eq!(summary.id, reader.record_json(id).expect("json")["id"]);
         }
+    }
+
+    #[test]
+    fn keeps_imported_rows_apart_from_osm_runs() {
+        let osm = sample_records().remove(0);
+        let mut records = Vec::new();
+        for (index, dataset) in [
+            None,
+            Some("openaddresses:nz/countrywide"),
+            Some("openaddresses:nz/countrywide"),
+            Some("openaddresses:au/countrywide"),
+            None,
+            Some("openaddresses:au/countrywide"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = osm.clone();
+            if let Record::Address(address) = &mut record {
+                address.address.number = (index * 2).to_string();
+                address.location_precision = LocationPrecision::Point;
+                if let Some(dataset) = dataset {
+                    address.source = SourceProvenance::imported(dataset, 1_000 + index as i64);
+                }
+            }
+            records.push(record);
+        }
+        let reader = write_store(&records, &[]);
+        for (index, record) in records.iter().enumerate() {
+            let id = index as u64;
+            assert_eq!(&reader.record(id).expect("record"), record, "record {id}");
+            let summary = reader.summary(id).expect("summary");
+            assert_eq!(summary.id, reader.record_json(id).expect("json")["id"]);
+        }
+        assert_eq!(
+            reader.summary(2).expect("summary").id,
+            "openaddresses:nz/countrywide:row:1002"
+        );
+        assert_eq!(
+            reader.summary(2).expect("summary").source.dataset,
+            "openaddresses:nz/countrywide"
+        );
     }
 
     #[test]

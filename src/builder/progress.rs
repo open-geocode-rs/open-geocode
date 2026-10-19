@@ -33,6 +33,9 @@ pub enum BuildStage {
     AssembleWays,
     /// Build the admin boundary polygons and postcode centroids. No measure.
     Boundaries,
+    /// Read address files from outside OSM, such as OpenAddresses, fetching
+    /// them first when the source downloads. Measured in bytes of the files.
+    ImportAddresses,
     /// Write places, postcodes and boundaries. Measured in records.
     ContextRecords,
     /// Write addresses, POIs, interpolations and streets. Measured in records.
@@ -56,12 +59,13 @@ pub enum StageUnit {
 }
 
 impl BuildStage {
-    pub const ALL: [BuildStage; 9] = [
+    pub const ALL: [BuildStage; 10] = [
         BuildStage::Scan,
         BuildStage::BoundaryMembers,
         BuildStage::NodeJoin,
         BuildStage::AssembleWays,
         BuildStage::Boundaries,
+        BuildStage::ImportAddresses,
         BuildStage::ContextRecords,
         BuildStage::Records,
         BuildStage::Indexes,
@@ -70,7 +74,7 @@ impl BuildStage {
 
     pub const fn unit(self) -> StageUnit {
         match self {
-            Self::Scan => StageUnit::Bytes,
+            Self::Scan | Self::ImportAddresses => StageUnit::Bytes,
             Self::BoundaryMembers | Self::NodeJoin => StageUnit::Blocks,
             Self::AssembleWays => StageUnit::Ways,
             Self::ContextRecords | Self::Records => StageUnit::Records,
@@ -86,6 +90,7 @@ impl BuildStage {
             Self::NodeJoin => "join node coordinates",
             Self::AssembleWays => "assemble ways",
             Self::Boundaries => "build admin boundaries",
+            Self::ImportAddresses => "import addresses",
             Self::ContextRecords => "write context records",
             Self::Records => "write records",
             Self::Indexes => "finish Pack indexes",

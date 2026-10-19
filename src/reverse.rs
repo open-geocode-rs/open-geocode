@@ -476,7 +476,7 @@ mod tests {
         context::AdminContextTuple,
         pack::{RecordContext, Writer},
         record::{
-            AddressRecord, InterpolationRange, LocationPrecision, OsmObjectType, PlaceLayer,
+            AddressRecord, InterpolationRange, LocationPrecision, ObjectType, PlaceLayer,
             PlaceRecord, Record, SourceProvenance, StreetRecord, point_geometry,
         },
     };
@@ -621,7 +621,7 @@ mod tests {
                     address: None,
                     geometry: point_geometry(-79.0, 43.0),
                     location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(OsmObjectType::Node, 40),
+                    source: SourceProvenance::osm(ObjectType::Node, 40),
                 }
                 .into(),
                 None,
@@ -636,7 +636,7 @@ mod tests {
                     address: Some(address_record().address),
                     geometry: point_geometry(-79.0, 43.00005),
                     location_precision: LocationPrecision::Centroid,
-                    source: SourceProvenance::osm(OsmObjectType::Way, 41),
+                    source: SourceProvenance::osm(ObjectType::Way, 41),
                 }
                 .into(),
                 None,
@@ -678,7 +678,7 @@ mod tests {
             },
             geometry: point_geometry(-79.0, 43.0),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, 10),
+            source: SourceProvenance::osm(ObjectType::Node, 10),
         }
     }
 
@@ -688,7 +688,7 @@ mod tests {
             name: "Toronto".to_string(),
             place_type: "admin_level:8".to_string(),
             geometry: point_geometry(-79.0, 43.0),
-            source: SourceProvenance::osm(OsmObjectType::Relation, 99),
+            source: SourceProvenance::osm(ObjectType::Relation, 99),
         }
     }
 
@@ -711,7 +711,7 @@ mod tests {
             anchor_node_ids: [2, 98],
             geometry: line_geometry(),
             representative_point: [-79.0, 43.0005],
-            source: SourceProvenance::osm(OsmObjectType::Way, 20),
+            source: SourceProvenance::osm(ObjectType::Way, 20),
         }
     }
 
@@ -721,7 +721,7 @@ mod tests {
             name: "Queen Street".to_string(),
             geometry: line_geometry(),
             representative_point: [-79.0, 43.0005],
-            source: SourceProvenance::osm(OsmObjectType::Way, 30),
+            source: SourceProvenance::osm(ObjectType::Way, 30),
         }
     }
 

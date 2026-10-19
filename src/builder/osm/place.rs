@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     builder::report::CandidateIssue,
-    record::{OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry},
+    record::{ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry},
     util::text::normalize_for_compare,
 };
 
@@ -29,7 +29,7 @@ pub(crate) fn emit_place_node(
         }
         Err(issue) => out.reject_in_report(
             issue,
-            OsmObjectType::Node,
+            ObjectType::Node,
             object_id,
             tags,
             None,
@@ -58,7 +58,7 @@ fn place_record_from_node(
             name,
             place_type,
             geometry: point_geometry(lon, lat),
-            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
         },
         layer,
     ))

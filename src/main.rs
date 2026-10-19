@@ -17,8 +17,13 @@ use open_geocode::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
     },
-    builder::{BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
+    builder::{
+        BuildOsmOptions,
+        addresses::{AddressFile, AddressFiles, AddressSource, AddressSources},
+        build_planned_osm_pack, plan_osm_build,
+    },
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
+    openaddresses::OpenAddresses,
     pack::{Reader, RecordId},
     parse::{
         bench::{
@@ -120,6 +125,21 @@ enum PackCommand {
         /// disk for the input.
         #[arg(long)]
         force: bool,
+
+        /// Add the OpenAddresses points of the countries the Pack covers,
+        /// leaving out the ones OSM already has. Downloading needs an
+        /// OpenAddresses API token in OA_TOKEN; the files are kept in
+        /// <PACK>/openaddresses for the next build.
+        #[arg(long)]
+        openaddresses: bool,
+
+        /// Add the address points of a file: OpenAddresses GeoJSON, one
+        /// feature per line, or CSV with LON, LAT, NUMBER and STREET columns,
+        /// gzipped or not. `DATASET=PATH` names the dataset its records
+        /// come from; a bare path is named by its file name. Repeat it to add
+        /// several.
+        #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
+        address_files: Vec<String>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -476,11 +496,15 @@ async fn main() -> Result<()> {
             memory_budget_mb,
             scratch_dir,
             force,
+            openaddresses,
+            address_files,
         }) => {
             resources::opt_out_of_power_throttling();
+            let addresses = address_sources(&pack, openaddresses, &address_files)?;
             let options = BuildOsmOptions {
                 inputs,
                 pack,
+                addresses,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()
@@ -634,6 +658,51 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// What `--openaddresses` and `--addresses` add to a build, `None` for
+/// neither.
+fn address_sources(
+    pack: &Path,
+    openaddresses: bool,
+    files: &[String],
+) -> Result<Option<Arc<dyn AddressSource>>> {
+    let mut sources: Vec<Arc<dyn AddressSource>> = Vec::new();
+    if openaddresses {
+        sources.push(Arc::new(OpenAddresses::from_env(
+            pack.join("openaddresses"),
+        )?));
+    }
+    if !files.is_empty() {
+        let files = files
+            .iter()
+            .map(|file| {
+                let (dataset, path) = match file.split_once('=') {
+                    Some((dataset, path)) if !dataset.is_empty() => {
+                        (dataset.to_string(), PathBuf::from(path))
+                    }
+                    _ => {
+                        let path = PathBuf::from(file);
+                        let name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(|name| name.split('.').next())
+                            .filter(|name| !name.is_empty())
+                            .with_context(|| format!("--addresses {file} names no file"))?
+                            .to_string();
+                        (name, path)
+                    }
+                };
+                Ok(AddressFile { dataset, path })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sources.push(Arc::new(AddressFiles(files)));
+    }
+    Ok(match sources.len() {
+        0 => None,
+        1 => sources.pop(),
+        _ => Some(Arc::new(AddressSources(sources))),
+    })
 }
 
 fn parse_fixture(command: ParseFixtureCommand) -> Result<()> {

@@ -1541,7 +1541,7 @@ mod tests {
                 place_type: "admin_level:7".into(),
                 geometry: crate::record::point_geometry(139.6, 35.4),
                 source: crate::record::SourceProvenance::osm(
-                    crate::record::OsmObjectType::Relation,
+                    crate::record::ObjectType::Relation,
                     1,
                 ),
             },
@@ -1565,7 +1565,7 @@ mod tests {
             address: None,
             geometry: crate::record::point_geometry(0.0, 0.0),
             location_precision: crate::record::LocationPrecision::Point,
-            source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+            source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
         });
         assert_eq!(
             named(&RecordNames::of(&poi)),
@@ -1698,7 +1698,7 @@ mod tests {
                 },
                 geometry: crate::record::point_geometry(0.0, 0.0),
                 location_precision: crate::record::LocationPrecision::Point,
-                source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+                source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
             })
         };
         let mut builder = Builder::default();
@@ -1746,7 +1746,7 @@ mod tests {
             },
             geometry: crate::record::point_geometry(-79.4, 43.6),
             location_precision: crate::record::LocationPrecision::Point,
-            source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+            source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
         }));
         assert_eq!(
             names

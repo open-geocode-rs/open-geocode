@@ -1205,8 +1205,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::record::{
-        AddressRecord, DerivedSourceProvenance, InterpolationRange, LocationPrecision,
-        OsmObjectType, PlaceLayer, PostcodeRecord, SourceProvenance, point_geometry,
+        AddressRecord, DerivedSourceProvenance, InterpolationRange, LocationPrecision, ObjectType,
+        PlaceLayer, PostcodeRecord, SourceProvenance, point_geometry,
     };
 
     use super::*;
@@ -1227,7 +1227,7 @@ mod tests {
             },
             geometry: point_geometry(-0.1586, 51.5237),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, 123),
+            source: SourceProvenance::osm(ObjectType::Node, 123),
         };
 
         let projected = Document::from_record(
@@ -1279,7 +1279,7 @@ mod tests {
             anchor_node_ids: [1, 2],
             geometry: point_geometry(-0.1586, 51.5237),
             representative_point: [-0.1586, 51.5237],
-            source: SourceProvenance::osm(OsmObjectType::Way, 9),
+            source: SourceProvenance::osm(ObjectType::Way, 9),
         };
 
         let projected =
@@ -1306,7 +1306,7 @@ mod tests {
             geometry: point_geometry(-79.4, 43.6),
             source: SourceProvenance {
                 dataset: "osm".to_string(),
-                object_type: OsmObjectType::Node,
+                object_type: ObjectType::Node,
                 object_id: 1,
                 tags: Some(BTreeMap::new()),
             },
@@ -1348,7 +1348,7 @@ mod tests {
             }),
             geometry: point_geometry(-79.38, 43.65),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, 5),
+            source: SourceProvenance::osm(ObjectType::Node, 5),
         };
 
         let projected = Document::from_record(

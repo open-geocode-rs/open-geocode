@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::record::{
-    LocationPrecision, OsmObjectType, PoiRecord, Record, SourceProvenance, point_geometry,
+    LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance, point_geometry,
 };
 
 use super::{
@@ -64,7 +64,7 @@ const AEROWAYS: [&str; 5] = ["aerodrome", "airstrip", "helipad", "heliport", "te
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PoiCandidate {
-    pub object_type: OsmObjectType,
+    pub object_type: ObjectType,
     pub object_id: i64,
     pub lat: f64,
     pub lon: f64,
@@ -166,7 +166,7 @@ mod tests {
         let mut out = Emitted::default();
         emit_poi(
             PoiCandidate {
-                object_type: OsmObjectType::Node,
+                object_type: ObjectType::Node,
                 object_id: 7,
                 lat: 43.65,
                 lon: -79.38,
@@ -260,7 +260,7 @@ mod tests {
         ]);
         emit_poi(
             PoiCandidate {
-                object_type: OsmObjectType::Way,
+                object_type: ObjectType::Way,
                 object_id: 9,
                 lat: 43.65,
                 lon: -79.38,

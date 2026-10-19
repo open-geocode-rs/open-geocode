@@ -13,6 +13,7 @@ pub mod geocode_bench;
 mod http;
 pub mod labels;
 pub mod memory;
+pub mod openaddresses;
 pub mod pack;
 pub mod parse;
 pub mod record;

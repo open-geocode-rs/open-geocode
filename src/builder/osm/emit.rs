@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::{
     builder::report::CandidateIssue,
     extsort::{Sorted, SpoolReader},
-    record::{LocationPrecision, OsmObjectType},
+    record::{LocationPrecision, ObjectType},
 };
 
 use super::{
@@ -111,7 +111,7 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
             match center {
                 Some((lat, lon)) => emit_address(
                     AddressCandidate {
-                        object_type: OsmObjectType::Way,
+                        object_type: ObjectType::Way,
                         object_id: feature.way_id,
                         lat,
                         lon,
@@ -122,7 +122,7 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
                 ),
                 None => out.reject(
                     CandidateIssue::WayWithoutResolvedNodes,
-                    OsmObjectType::Way,
+                    ObjectType::Way,
                     feature.way_id,
                     &feature.tags,
                     Some(&feature.tags),
@@ -135,7 +135,7 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
             match center {
                 Some((lat, lon)) => emit_poi(
                     PoiCandidate {
-                        object_type: OsmObjectType::Way,
+                        object_type: ObjectType::Way,
                         object_id: feature.way_id,
                         lat,
                         lon,
@@ -146,7 +146,7 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
                 ),
                 None => out.reject(
                     CandidateIssue::WayWithoutResolvedNodes,
-                    OsmObjectType::Way,
+                    ObjectType::Way,
                     feature.way_id,
                     &feature.tags,
                     None,

@@ -24,6 +24,12 @@ use crate::{
 const SCRATCH_PER_INPUT: f64 = 3.2;
 /// Pack bytes per input byte: Germany 0.55, Japan 0.25.
 const PACK_PER_INPUT: f64 = 0.6;
+/// Pack bytes an imported address adds at most: an anchor of a run, its house
+/// number term and its share of a block box. Most continue a run, at about 9 B.
+const PACK_PER_IMPORTED_ROW: u64 = 25;
+/// Scratch bytes an imported address takes at most: it is spilled about 150 B
+/// at a time by the address, house, kept-address and record sorters.
+const SCRATCH_PER_IMPORTED_ROW: u64 = 600;
 /// Heap a build holds outside its budget per input byte: boundary
 /// geometry, maps of ways and members, the training sample. Germany held
 /// about 1.6 GB beyond its 0.9 GB tracked peak.
@@ -92,11 +98,13 @@ fn sizes(
     (budget, threads)
 }
 
-/// Plan a build of `input_bytes` of PBF that spills to `scratch` and writes
-/// its Pack under `output`, with the budget `budget_override` when one is
-/// given. Fails, unless `force`, when memory or disk falls short.
+/// Plan a build of `input_bytes` of PBF and `imported_rows` addresses from
+/// outside OSM (0 when not known) that spills to `scratch` and writes its Pack
+/// under `output`, with the budget `budget_override` when one is given.
+/// Fails, unless `force`, when memory or disk falls short.
 pub fn plan_build(
     input_bytes: u64,
+    imported_rows: u64,
     scratch: &Path,
     output: &Path,
     budget_override: Option<usize>,
@@ -112,9 +120,11 @@ pub fn plan_build(
         memory_needed_bytes: budget_override.unwrap_or(MIN_BUDGET_BYTES) as u64
             + untracked_bytes(input_bytes, threads),
         scratch_disk_needed_bytes: ((input_bytes as f64 * SCRATCH_PER_INPUT) as u64)
-            .saturating_sub(budget as u64),
+            .saturating_sub(budget as u64)
+            + imported_rows * SCRATCH_PER_IMPORTED_ROW,
         scratch_disk_free_bytes: resources::free_disk(scratch),
-        output_disk_needed_bytes: (input_bytes as f64 * PACK_PER_INPUT) as u64,
+        output_disk_needed_bytes: (input_bytes as f64 * PACK_PER_INPUT) as u64
+            + imported_rows * PACK_PER_IMPORTED_ROW,
         output_disk_free_bytes: resources::free_disk(output),
         resources,
         forced: force,
@@ -183,12 +193,12 @@ mod tests {
     #[test]
     fn a_build_that_cannot_fit_stops_unless_forced() {
         let scratch = std::env::temp_dir();
-        let error = plan_build(u64::MAX / 8, &scratch, &scratch, None, false).unwrap_err();
+        let error = plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, false).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("--force"), "{message}");
         assert!(message.contains("memory"), "{message}");
         assert!(message.contains("disk"), "{message}");
-        let plan = plan_build(u64::MAX / 8, &scratch, &scratch, None, true).expect("forced");
+        let plan = plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, true).expect("forced");
         assert!(plan.forced);
         assert_eq!(plan.shortfalls.len(), 2, "{:?}", plan.shortfalls);
     }
@@ -196,11 +206,11 @@ mod tests {
     #[test]
     fn a_small_build_gets_a_derived_budget() {
         let scratch = std::env::temp_dir();
-        let plan = plan_build(1 << 20, &scratch, &scratch, None, false).expect("plan");
+        let plan = plan_build(1 << 20, 0, &scratch, &scratch, None, false).expect("plan");
         assert!(plan.memory_budget_derived);
         assert!(plan.memory_budget_bytes >= MIN_BUDGET_BYTES as u64);
         assert!(plan.threads >= 1 && plan.threads <= plan.resources.usable_cpus);
-        let set = plan_build(1 << 20, &scratch, &scratch, Some(64 << 20), false).expect("plan");
+        let set = plan_build(1 << 20, 0, &scratch, &scratch, Some(64 << 20), false).expect("plan");
         assert_eq!(set.memory_budget_bytes, 64 << 20);
         assert!(!set.memory_budget_derived);
     }

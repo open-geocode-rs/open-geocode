@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     builder::report::CandidateIssue,
-    record::{OsmObjectType, Record, SourceProvenance, StreetRecord},
+    record::{ObjectType, Record, SourceProvenance, StreetRecord},
 };
 
 use super::{
@@ -53,7 +53,7 @@ pub(crate) fn emit_street(
             name,
             geometry: built.geometry,
             representative_point: built.representative_point,
-            source: SourceProvenance::osm(OsmObjectType::Way, way_id),
+            source: SourceProvenance::osm(ObjectType::Way, way_id),
         })
     });
     match record {
@@ -63,7 +63,7 @@ pub(crate) fn emit_street(
         }
         None => out.reject(
             CandidateIssue::StreetUnresolvedGeometry,
-            OsmObjectType::Way,
+            ObjectType::Way,
             way_id,
             tags,
             Some(&BTreeMap::new()),

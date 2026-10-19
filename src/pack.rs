@@ -738,7 +738,7 @@ mod tests {
 
     use crate::{
         record::{
-            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
+            AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
             point_geometry,
         },
         search::{TextSearchOptions, TextSearcher},
@@ -765,7 +765,7 @@ mod tests {
             },
             geometry: point_geometry(-79.0, 43.0),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
         })
     }
 

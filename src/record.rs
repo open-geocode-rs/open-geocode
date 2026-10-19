@@ -392,7 +392,7 @@ pub fn point_geometry(lon: f64, lat: f64) -> Geometry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceProvenance {
     pub dataset: String,
-    pub object_type: OsmObjectType,
+    pub object_type: ObjectType,
     pub object_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<BTreeMap<String, String>>,
@@ -426,11 +426,14 @@ pub struct RejectedRecord {
     Hash,
     utoipa::ToSchema,
 )]
+/// What a record's source object is: an OSM node, way or relation, or a row
+/// of an imported address dataset such as OpenAddresses.
 #[serde(rename_all = "snake_case")]
-pub enum OsmObjectType {
+pub enum ObjectType {
     Node,
     Way,
     Relation,
+    Row,
 }
 
 impl Record {
@@ -555,7 +558,11 @@ impl AddressRecord {
     }
 
     pub fn id(&self) -> String {
-        labels::osm_record_id(self.source.object_type, self.source.object_id)
+        labels::record_id(
+            &self.source.dataset,
+            self.source.object_type,
+            self.source.object_id,
+        )
     }
 
     pub fn name(&self) -> String {
@@ -603,7 +610,7 @@ impl Serialize for InterpolationRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let anchor_ids = self
             .anchor_node_ids
-            .map(|node_id| labels::osm_record_id(OsmObjectType::Node, node_id));
+            .map(|node_id| labels::osm_record_id(ObjectType::Node, node_id));
         let mut state = serializer.serialize_struct("InterpolationRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
@@ -620,7 +627,11 @@ impl Serialize for InterpolationRecord {
 
 impl StreetRecord {
     pub fn id(&self) -> String {
-        labels::osm_record_id(self.source.object_type, self.source.object_id)
+        labels::record_id(
+            &self.source.dataset,
+            self.source.object_type,
+            self.source.object_id,
+        )
     }
 
     pub fn label(&self) -> String {
@@ -699,7 +710,11 @@ impl Serialize for PlaceRecord {
 
 impl PoiRecord {
     pub fn id(&self) -> String {
-        labels::osm_record_id(self.source.object_type, self.source.object_id)
+        labels::record_id(
+            &self.source.dataset,
+            self.source.object_type,
+            self.source.object_id,
+        )
     }
 
     pub fn label(&self) -> String {
@@ -742,7 +757,17 @@ fn serialize_alt_names<S: SerializeStruct>(
 pub const OSM_DATASET: &str = "osm";
 
 impl SourceProvenance {
-    pub fn osm(object_type: OsmObjectType, object_id: i64) -> Self {
+    /// Row `row` of an imported address dataset.
+    pub fn imported(dataset: impl Into<String>, row: i64) -> Self {
+        Self {
+            dataset: dataset.into(),
+            object_type: ObjectType::Row,
+            object_id: row,
+            tags: None,
+        }
+    }
+
+    pub fn osm(object_type: ObjectType, object_id: i64) -> Self {
         Self {
             dataset: OSM_DATASET.to_string(),
             object_type,
@@ -752,7 +777,7 @@ impl SourceProvenance {
     }
 
     pub fn osm_with_tags(
-        object_type: OsmObjectType,
+        object_type: ObjectType,
         object_id: i64,
         tags: BTreeMap<String, String>,
     ) -> Self {

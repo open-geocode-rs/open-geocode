@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::{
     builder::report::CandidateIssue,
     record::{
-        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, OsmObjectType,
+        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, ObjectType,
         Record, SourceProvenance,
     },
     util::text::normalize_for_compare,
@@ -153,7 +153,7 @@ fn interpolation_record_from_segment(
         anchor_node_ids: [low_anchor.node_id, high_anchor.node_id],
         geometry: built.geometry,
         representative_point: built.representative_point,
-        source: SourceProvenance::osm(OsmObjectType::Way, way_id),
+        source: SourceProvenance::osm(ObjectType::Way, way_id),
     })
 }
 
@@ -349,7 +349,7 @@ fn reject_interpolation(
 ) {
     out.reject(
         issue,
-        OsmObjectType::Way,
+        ObjectType::Way,
         way_id,
         tags,
         Some(tags),

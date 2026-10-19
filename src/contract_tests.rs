@@ -23,7 +23,7 @@ use crate::{
     pack::{RecordId, Writer},
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
-        InterpolationRecord, LocationPrecision, OsmObjectType, PlaceLayer, PlaceRecord, PoiRecord,
+        InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
         Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
@@ -463,7 +463,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                         name: name.to_string(),
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-79.0, 43.0),
-                        source: SourceProvenance::osm(OsmObjectType::Relation, id),
+                        source: SourceProvenance::osm(ObjectType::Relation, id),
                     },
                 ),
                 None,
@@ -509,7 +509,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 address: king.clone(),
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Point,
-                source: SourceProvenance::osm(OsmObjectType::Node, 10),
+                source: SourceProvenance::osm(ObjectType::Node, 10),
             }
             .into(),
             context.clone(),
@@ -527,7 +527,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 }),
                 geometry: point_geometry(-79.005, 43.0),
                 location_precision: LocationPrecision::Centroid,
-                source: SourceProvenance::osm(OsmObjectType::Way, 11),
+                source: SourceProvenance::osm(ObjectType::Way, 11),
             }
             .into(),
             context.clone(),
@@ -540,7 +540,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 name: "King Street".to_string(),
                 geometry: line(-79.0, 43.0, -79.0, 43.001),
                 representative_point: [-79.0, 43.0005],
-                source: SourceProvenance::osm(OsmObjectType::Way, 12),
+                source: SourceProvenance::osm(ObjectType::Way, 12),
             }
             .into(),
             context.clone(),
@@ -566,7 +566,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 anchor_node_ids: [2, 98],
                 geometry: line(-79.01, 43.0, -79.01, 43.001),
                 representative_point: [-79.01, 43.0005],
-                source: SourceProvenance::osm(OsmObjectType::Way, 13),
+                source: SourceProvenance::osm(ObjectType::Way, 13),
             }
             .into(),
             context.clone(),

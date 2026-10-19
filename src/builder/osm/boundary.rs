@@ -13,7 +13,7 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Layer, OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
+        Layer, ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
     },
     util::text::normalize_for_compare,
 };
@@ -101,7 +101,7 @@ struct AcceptedBoundary {
     /// `None` for a place drawn as an area.
     admin_level: Option<u8>,
     inferred_country_record_id: Option<RecordId>,
-    source_object_type: OsmObjectType,
+    source_object_type: ObjectType,
     source_object_id: i64,
     bounds: Rect<f64>,
     shape: AreaShape,
@@ -131,12 +131,16 @@ struct BuiltBoundary {
     /// reads in some countries.
     designation: Option<String>,
     inferred_country_code: Option<String>,
+    /// The `ISO3166-2` code of a boundary below its country, upper case:
+    /// `CA-ON`. Kept whatever tier the boundary is ranked at, which for a
+    /// country with many levels need not be the region tier.
+    subdivision_code: Option<String>,
     geometry: MultiPolygon<f64>,
     representative_point: [f64; 2],
 }
 
 struct BoundaryCandidate {
-    source_object_type: OsmObjectType,
+    source_object_type: ObjectType,
     source_object_id: i64,
     boundary: BuiltBoundary,
 }
@@ -241,6 +245,33 @@ impl BoundarySet {
             ))
         });
         boundaries.chain(countries).collect()
+    }
+
+    /// What the boundaries cover: the countries whose own boundary is
+    /// whole, and the regions of the others. A country boundary assembles only
+    /// from every one of its ways, so an extract of one province has the
+    /// province but not its country.
+    pub(crate) fn coverage(&self) -> crate::builder::addresses::Coverage {
+        let mut coverage = crate::builder::addresses::Coverage::default();
+        for candidate in &self.candidates {
+            let boundary = &candidate.boundary;
+            if boundary.layer == PlaceLayer::Country
+                && let Some(code) = &boundary.inferred_country_code
+            {
+                coverage.countries.insert(code.to_ascii_uppercase());
+            }
+            if let Some(code) = &boundary.subdivision_code {
+                coverage.subdivisions.insert(code.clone());
+            }
+        }
+        let whole = coverage.countries.clone();
+        coverage.subdivisions.retain(|code| {
+            !code
+                .split('-')
+                .next()
+                .is_some_and(|country| whole.contains(country))
+        });
+        coverage
     }
 
     /// The country code of each country record, by record id: the country
@@ -523,7 +554,7 @@ pub(crate) fn build_boundaries(
         }
         if let Some(boundary) = boundary_from_way(way) {
             candidates.push(BoundaryCandidate {
-                source_object_type: OsmObjectType::Way,
+                source_object_type: ObjectType::Way,
                 source_object_id: way.object_id,
                 boundary,
             });
@@ -535,7 +566,7 @@ pub(crate) fn build_boundaries(
         }
         if let Some(boundary) = boundary_from_relation(stub, member_lines) {
             candidates.push(BoundaryCandidate {
-                source_object_type: OsmObjectType::Relation,
+                source_object_type: ObjectType::Relation,
                 source_object_id: stub.object_id,
                 boundary,
             });
@@ -609,6 +640,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
         designation,
     } = area_parts(&way.tags)?;
     let inferred_country_code = country_code_from_tags(&way.tags, layer);
+    let subdivision_code = subdivision_code_from_tags(&way.tags, layer);
     let closed = ends(&way.vertices).is_some_and(|(first, last)| first == last);
     if way.vertices.len() < 4 || !closed {
         return None;
@@ -628,6 +660,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
         place_layer,
         designation,
         inferred_country_code,
+        subdivision_code,
         geometry,
         representative_point,
     })
@@ -647,6 +680,7 @@ fn boundary_from_relation(
         designation,
     } = area_parts(&stub.tags)?;
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
+    let subdivision_code = subdivision_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
@@ -677,6 +711,7 @@ fn boundary_from_relation(
         place_layer,
         designation,
         inferred_country_code,
+        subdivision_code,
         geometry,
         representative_point,
     })
@@ -875,6 +910,17 @@ fn country_code_from_tags(tags: &BTreeMap<String, String>, layer: PlaceLayer) ->
     }
 
     None
+}
+
+fn subdivision_code_from_tags(
+    tags: &BTreeMap<String, String>,
+    layer: PlaceLayer,
+) -> Option<String> {
+    (layer != PlaceLayer::Country)
+        .then(|| tags.cleaned("ISO3166-2"))
+        .flatten()
+        .filter(|code| code.contains('-'))
+        .map(|code| code.to_ascii_uppercase())
 }
 
 fn country_name_from_code(code: &str) -> &str {
@@ -1416,11 +1462,12 @@ fn same_text(left: &str, right: &str) -> bool {
     normalize_for_compare(left) == normalize_for_compare(right)
 }
 
-fn source_type_rank(object_type: OsmObjectType) -> u8 {
+fn source_type_rank(object_type: ObjectType) -> u8 {
     match object_type {
-        OsmObjectType::Relation => 0,
-        OsmObjectType::Way => 1,
-        OsmObjectType::Node => 2,
+        ObjectType::Relation => 0,
+        ObjectType::Way => 1,
+        ObjectType::Node => 2,
+        ObjectType::Row => 3,
     }
 }
 
@@ -1569,6 +1616,7 @@ mod tests {
             place_layer: None,
             designation: None,
             inferred_country_code: None,
+            subdivision_code: None,
             representative_point: representative_point(&geometry).expect("point"),
             geometry,
         }
@@ -1790,6 +1838,16 @@ mod tests {
         assert_eq!(layers[&4], PlaceLayer::Region);
     }
 
+    #[test]
+    fn keeps_the_subdivision_code_of_a_province_ranked_below_the_region_tier() {
+        let tags = BTreeMap::from([("ISO3166-2".to_string(), "ca-on".to_string())]);
+        assert_eq!(
+            subdivision_code_from_tags(&tags, PlaceLayer::SubRegion).as_deref(),
+            Some("CA-ON")
+        );
+        assert_eq!(subdivision_code_from_tags(&tags, PlaceLayer::Country), None);
+    }
+
     /// Ten levels for nine tiers, as a Pack of Canada with every level from 2
     /// to 11 has: the deepest two share the innermost tier.
     #[test]
@@ -1881,7 +1939,7 @@ mod tests {
             ]);
             let geometry = MultiPolygon::new(vec![Polygon::new(ring, Vec::new())]);
             candidates.push(BoundaryCandidate {
-                source_object_type: OsmObjectType::Relation,
+                source_object_type: ObjectType::Relation,
                 source_object_id: index as i64 + 1,
                 boundary: BuiltBoundary {
                     layer: admin_level_layer(level).expect("layer"),
@@ -1894,6 +1952,7 @@ mod tests {
                     inferred_country_code: country
                         .map(str::to_ascii_uppercase)
                         .or_else(|| (level <= 2).then(|| "AU".to_string())),
+                    subdivision_code: None,
                     representative_point: representative_point(&geometry).expect("point"),
                     geometry,
                 },
@@ -2077,7 +2136,7 @@ mod tests {
             name: name.to_string(),
             admin_level: Some(8),
             inferred_country_record_id: None,
-            source_object_type: OsmObjectType::Relation,
+            source_object_type: ObjectType::Relation,
             source_object_id: record_id as i64,
             area: geometry.unsigned_area(),
             bounds: geometry.bounding_rect().expect("bounds"),

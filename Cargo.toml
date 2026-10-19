@@ -39,6 +39,8 @@ csv = "1.3"
 dirs = { version = "7.0.0", optional = true }
 # The parser's Pack dictionaries, memory-mapped like the text index.
 fst = "0.4"
+# Reads gzipped address files, the form OpenAddresses publishes.
+flate2 = "1.1"
 geo = "0.33"
 geojson = "1.0"
 indicatif = "0.17"
@@ -72,8 +74,9 @@ tower-http = { version = "0.6", features = ["fs"] }
 # The Unicode Script property: which characters the parser reads as a
 # script written without spaces.
 unicode-script = "0.5.7"
-# Downloads extracts and checks for newer ones in the interactive `og` interface.
-ureq = { version = "3.4.2", optional = true }
+# Downloads OpenAddresses data for a build, and extracts in the interactive `og`
+# interface.
+ureq = { version = "3.4.2", features = ["json"] }
 utoipa = { version = "6.0.0", features = ["axum_extras", "preserve_order"] }
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
@@ -101,7 +104,6 @@ tui = [
     "dep:md-5",
     "dep:ratatui",
     "dep:signal-hook",
-    "dep:ureq",
 ]
 
 [[bin]]

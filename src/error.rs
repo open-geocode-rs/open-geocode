@@ -107,6 +107,10 @@ pub enum Error {
     #[error("{0}")]
     OutOfResources(String),
 
+    /// A download the build needs failed.
+    #[error("fetching {url} failed: {message}")]
+    Fetch { url: String, message: String },
+
     /// The input extract is not in the layout the build reads.
     #[error("{0}")]
     BadInput(String),

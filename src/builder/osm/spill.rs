@@ -13,9 +13,8 @@ use crate::{
     extsort::Spill,
     record::{
         AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
-        InterpolationRange, InterpolationRecord, Layer, LocationPrecision, OsmObjectType,
-        PlaceRecord, PoiRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord,
-        point_geometry,
+        InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceRecord,
+        PoiRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     util::codec::{
         get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64, put_i64,
@@ -195,7 +194,8 @@ const ADDRESS_GROUP_CELL_DEGREES: f64 = 0.02;
 pub(crate) struct PendingAddress {
     /// The group key, then the number key.
     pub order: Vec<u8>,
-    /// Length of the group key at the start of `order`.
+    /// Length of the start of `order` its group shares: its street's key,
+    /// or in house order its house's.
     pub group_len: usize,
     pub seq: u64,
     pub record: Record,
@@ -237,9 +237,50 @@ impl PendingAddress {
         })
     }
 
-    /// Whether `other` is on the same street, in the same cell.
+    /// Sorted by house instead: the street as search spells it, the number
+    /// and the unit, OSM before imported rows. The rows of one house come out
+    /// together, so an imported row that repeats an OSM address is seen
+    /// beside it whatever else either one states (OSM addresses seldom state
+    /// the city and postcode imported rows do). No cell: one house on both
+    /// sides of a cell edge is still one house, and distance tells apart the
+    /// towns that share a street name.
+    pub(super) fn house(record: AddressRecord, seq: u64) -> Result<Self> {
+        let mut order = Vec::new();
+        let address = &record.address;
+        put_order_text(
+            &mut order,
+            address
+                .subject()
+                .and_then(crate::text_index::street_search_text)
+                .as_deref(),
+        );
+        let base = crate::text_index::base_house_number(&address.number).unwrap_or(u32::MAX);
+        order.extend_from_slice(&base.to_be_bytes());
+        let normalized =
+            |value: Option<&str>| value.and_then(crate::text_index::normalize_index_text);
+        put_order_text(&mut order, normalized(Some(&address.number)).as_deref());
+        put_order_text(&mut order, normalized(address.unit.as_deref()).as_deref());
+        let group_len = order.len();
+        order.push(u8::from(record.source.object_type == ObjectType::Row));
+        Ok(Self {
+            order,
+            group_len,
+            seq,
+            record: Record::Address(record),
+        })
+    }
+
+    /// Whether `other` is in the same group: on the same street in the same
+    /// cell, or in house order the same house.
     pub(super) fn same_group(&self, other: &Self) -> bool {
         self.order[..self.group_len] == other.order[..other.group_len]
+    }
+
+    pub(super) fn into_address(self) -> AddressRecord {
+        match self.record {
+            Record::Address(record) => record,
+            _ => unreachable!("a pending address holds an address"),
+        }
     }
 }
 
@@ -622,18 +663,26 @@ fn decode_precision(input: &mut &[u8]) -> Result<LocationPrecision> {
 
 fn encode_source(out: &mut Vec<u8>, source: &SourceProvenance) {
     out.push(match source.object_type {
-        OsmObjectType::Node => 0,
-        OsmObjectType::Way => 1,
-        OsmObjectType::Relation => 2,
+        ObjectType::Node => 0,
+        ObjectType::Way => 1,
+        ObjectType::Relation => 2,
+        ObjectType::Row => 3,
     });
     put_i64(out, source.object_id);
+    if source.object_type == ObjectType::Row {
+        put_str(out, &source.dataset);
+    }
 }
 
 fn decode_source(input: &mut &[u8]) -> Result<SourceProvenance> {
     let object_type = match get_u8(input)? {
-        0 => OsmObjectType::Node,
-        1 => OsmObjectType::Way,
-        2 => OsmObjectType::Relation,
+        0 => ObjectType::Node,
+        1 => ObjectType::Way,
+        2 => ObjectType::Relation,
+        3 => {
+            let row = get_i64(input)?;
+            return Ok(SourceProvenance::imported(get_string(input)?, row));
+        }
         _ => return Err(Error::Decode("unknown spilled object type")),
     };
     Ok(SourceProvenance::osm(object_type, get_i64(input)?))
@@ -781,7 +830,7 @@ mod tests {
                 coordinates: vec![vec![-79.0, 43.0].into(), vec![300.0, 43.1].into()],
             }),
             representative_point: [-79.0, 43.05],
-            source: SourceProvenance::osm(OsmObjectType::Way, 13),
+            source: SourceProvenance::osm(ObjectType::Way, 13),
         });
         let mut out = Vec::new();
         PendingRecord {
@@ -835,14 +884,14 @@ mod tests {
                 },
                 geometry: point_geometry(-79.38321234567, 43.653),
                 location_precision: LocationPrecision::Centroid,
-                source: SourceProvenance::osm(OsmObjectType::Way, 12),
+                source: SourceProvenance::osm(ObjectType::Way, 12),
             }),
             Record::Street(StreetRecord {
                 alt_names: Vec::new(),
                 name: "King Street".into(),
                 geometry: line.clone(),
                 representative_point: [-79.0, 43.05],
-                source: SourceProvenance::osm(OsmObjectType::Way, 13),
+                source: SourceProvenance::osm(ObjectType::Way, 13),
             }),
             Record::Interpolation(InterpolationRecord {
                 address: InterpolationAddressComponents {
@@ -862,7 +911,7 @@ mod tests {
                 anchor_node_ids: [1, 2],
                 geometry: line,
                 representative_point: [-79.0, 43.05],
-                source: SourceProvenance::osm(OsmObjectType::Way, 14),
+                source: SourceProvenance::osm(ObjectType::Way, 14),
             }),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".into(),
@@ -876,7 +925,7 @@ mod tests {
                     name: "Annex".into(),
                     place_type: "suburb".into(),
                     geometry: point_geometry(-79.4, 43.67),
-                    source: SourceProvenance::osm(OsmObjectType::Node, 15),
+                    source: SourceProvenance::osm(ObjectType::Node, 15),
                 },
             ),
             Record::Poi(PoiRecord {
@@ -896,7 +945,7 @@ mod tests {
                 }),
                 geometry: point_geometry(-79.38, 43.65),
                 location_precision: LocationPrecision::Centroid,
-                source: SourceProvenance::osm(OsmObjectType::Way, 16),
+                source: SourceProvenance::osm(ObjectType::Way, 16),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -905,7 +954,7 @@ mod tests {
                 address: None,
                 geometry: point_geometry(-79.36, 43.67),
                 location_precision: LocationPrecision::Point,
-                source: SourceProvenance::osm(OsmObjectType::Node, 17),
+                source: SourceProvenance::osm(ObjectType::Node, 17),
             }),
         ];
         for (seq, record) in records.into_iter().enumerate() {

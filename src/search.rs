@@ -29,7 +29,7 @@ use crate::{
         types::{Label, Tagged},
     },
     record::{
-        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, OsmObjectType,
+        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
         PlaceLayer, PoiRecord, Record,
     },
     spatial_index,
@@ -1440,10 +1440,11 @@ impl TieBreak {
             None => 4,
         };
         let source = match record.source.object_type {
-            Some(OsmObjectType::Node) => 0,
-            Some(OsmObjectType::Way) => 1,
-            Some(OsmObjectType::Relation) => 2,
-            None => 3,
+            Some(ObjectType::Node) => 0,
+            Some(ObjectType::Way) => 1,
+            Some(ObjectType::Relation) => 2,
+            Some(ObjectType::Row) => 3,
+            None => 4,
         };
         Self {
             extra_label_tokens,
@@ -1828,7 +1829,7 @@ mod tests {
         pack::Writer,
         record::{
             AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
-            OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
+            ObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
         },
         text_index::PostcodeAreas,
     };
@@ -1845,7 +1846,7 @@ mod tests {
             address_record("osm:node:1", "", "342", "Prince Albert Street", None, None);
         prince.geometry = point_geometry(-75.6, 45.4);
         let mut way = address_record("osm:node:9", "", "342", "Albert Street", None, None);
-        way.source.object_type = OsmObjectType::Way;
+        way.source.object_type = ObjectType::Way;
         for record in [
             prince,
             way,
@@ -2032,7 +2033,7 @@ mod tests {
                             name: name.to_string(),
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
-                            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                            source: SourceProvenance::osm(ObjectType::Node, object_id),
                         },
                     ),
                     None,
@@ -2089,7 +2090,7 @@ mod tests {
                         name: "Muskoka Lakes Township".to_string(),
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-79.5, 45.1),
-                        source: SourceProvenance::osm(OsmObjectType::Relation, 1),
+                        source: SourceProvenance::osm(ObjectType::Relation, 1),
                     },
                 ),
                 None,
@@ -2111,7 +2112,7 @@ mod tests {
             address,
             geometry: point_geometry(-79.5, 45.1),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
         };
         writer
             .write(
@@ -2677,7 +2678,7 @@ mod tests {
                     anchor_node_ids: [2, 98],
                     geometry: queen_street_line(),
                     representative_point: [-79.0, 43.0005],
-                    source: SourceProvenance::osm(OsmObjectType::Way, 20),
+                    source: SourceProvenance::osm(ObjectType::Way, 20),
                 }
                 .into(),
                 None,
@@ -2747,7 +2748,7 @@ mod tests {
                             name: name.to_string(),
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
-                            source: SourceProvenance::osm(OsmObjectType::Relation, object_id),
+                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
                         },
                     ),
                     None,
@@ -2797,7 +2798,7 @@ mod tests {
                     anchor_node_ids: [100, 200],
                     geometry: queen_street_line(),
                     representative_point: [-79.0, 43.0005],
-                    source: SourceProvenance::osm(OsmObjectType::Way, 20),
+                    source: SourceProvenance::osm(ObjectType::Way, 20),
                 }
                 .into(),
                 in_locality(toronto),
@@ -3000,7 +3001,7 @@ mod tests {
                     anchor_node_ids: [1, 99],
                     geometry: queen_street_line(),
                     representative_point: [-79.0, 43.0005],
-                    source: SourceProvenance::osm(OsmObjectType::Way, 20),
+                    source: SourceProvenance::osm(ObjectType::Way, 20),
                 }
                 .into(),
                 None,
@@ -3135,7 +3136,7 @@ mod tests {
                     address: Some(dental),
                     geometry: point_geometry(-79.41, 43.68),
                     location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(OsmObjectType::Node, 1),
+                    source: SourceProvenance::osm(ObjectType::Node, 1),
                 }
                 .into(),
                 None,
@@ -3412,7 +3413,7 @@ mod tests {
                         name: "Huron East".to_string(),
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-81.4, 43.5),
-                        source: SourceProvenance::osm(OsmObjectType::Relation, 1),
+                        source: SourceProvenance::osm(ObjectType::Relation, 1),
                     },
                 ),
                 None,
@@ -3476,7 +3477,7 @@ mod tests {
                             name: name.to_string(),
                             place_type: "boundary".to_string(),
                             geometry: point_geometry(174.7, -36.8),
-                            source: SourceProvenance::osm(OsmObjectType::Relation, object_id),
+                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
                         },
                     ),
                     None,
@@ -3567,7 +3568,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance {
                 dataset: "osm".to_string(),
-                object_type: OsmObjectType::Node,
+                object_type: ObjectType::Node,
                 object_id,
                 tags: Some(BTreeMap::new()),
             },
@@ -3586,7 +3587,7 @@ mod tests {
             representative_point: [-79.0, 43.0],
             source: SourceProvenance {
                 dataset: "osm".to_string(),
-                object_type: OsmObjectType::Way,
+                object_type: ObjectType::Way,
                 object_id,
                 tags: Some(BTreeMap::new()),
             },

@@ -2488,7 +2488,7 @@ mod tests {
             },
             geometry: crate::record::point_geometry(0.0, 0.0),
             location_precision: crate::record::LocationPrecision::Point,
-            source: crate::record::SourceProvenance::osm(crate::record::OsmObjectType::Node, 1),
+            source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
         })
     }
 

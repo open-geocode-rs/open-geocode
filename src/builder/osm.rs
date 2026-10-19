@@ -69,6 +69,7 @@ use rayon::prelude::*;
 use crate::{
     alloc,
     builder::{
+        addresses::{self, AddressSource},
         plan::{BuildPlan, plan_build},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
         report::{BUILD_REPORT_SCHEMA_VERSION, BuilderReport, ReportInput, SorterReport},
@@ -125,6 +126,11 @@ pub struct BuildOsmOptions {
     /// Set to stop the build: it then fails with
     /// [`crate::builder::BuildCancelled`] and publishes nothing.
     pub cancel: Arc<AtomicBool>,
+    /// Address points to add to the inputs' own, such as OpenAddresses.
+    pub addresses: Option<Arc<dyn AddressSource>>,
+    /// How many addresses `addresses` is expected to add, for the plan to
+    /// size disk by; 0 when not known before they are fetched.
+    pub imported_rows: u64,
 }
 
 impl Default for BuildOsmOptions {
@@ -138,6 +144,8 @@ impl Default for BuildOsmOptions {
             input_sources: Vec::new(),
             observer: Arc::new(TerminalObserver::new()),
             cancel: Arc::new(AtomicBool::new(false)),
+            addresses: None,
+            imported_rows: 0,
         }
     }
 }
@@ -153,6 +161,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("force", &self.force)
             .field("input_sources", &self.input_sources)
             .field("cancel", &self.cancel)
+            .field("addresses", &self.addresses)
             .finish_non_exhaustive()
     }
 }
@@ -179,6 +188,7 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     // together.
     plan_build(
         total_input_bytes(&options.inputs)?,
+        options.imported_rows,
         scratch,
         &options.pack,
         options.memory_budget_bytes,
@@ -460,6 +470,51 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     progress.finish(BuildStage::Boundaries);
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
 
+    // Addresses from outside OSM join the OSM ones before they are ordered.
+    // The source is asked only now, knowing the countries the Pack covers.
+    let phase = Instant::now();
+    let files = match &options.addresses {
+        Some(source) => source.files(&boundaries.coverage())?,
+        None => Vec::new(),
+    };
+    let import_bytes = files
+        .iter()
+        .map(|file| std::fs::metadata(&file.path).map(|metadata| metadata.len()))
+        .sum::<std::io::Result<u64>>()?;
+    // A source can cover more than the extracts: a country's file for a Pack
+    // of one province. Rows outside every extract's stated bounds are left
+    // out; an extract that states none keeps every row.
+    let extracts = options
+        .inputs
+        .iter()
+        .map(|input| pbf::header_bbox(input))
+        .collect::<Result<Option<Vec<_>>>>()?;
+    progress.start(BuildStage::ImportAddresses, Some(import_bytes))?;
+    for file in &files {
+        let imported = addresses::read_file(file, |record| {
+            progress.check()?;
+            let inside = point_lon_lat(&record.geometry).is_some_and(|[lon, lat]| {
+                extracts.as_ref().is_none_or(|boxes| {
+                    boxes
+                        .iter()
+                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
+                })
+            });
+            if !inside {
+                return Ok(Some("outside_extract"));
+            }
+            build.push(Record::Address(record), None)?;
+            Ok(None)
+        })?;
+        progress.advance(imported.bytes);
+        if !build.report.datasets.contains(&imported.dataset) {
+            build.report.datasets.push(imported.dataset.clone());
+        }
+        build.report.imports.push(imported);
+    }
+    progress.finish(BuildStage::ImportAddresses);
+    build.report.phases.address_import_ms = phase.elapsed().as_millis();
+
     let phase = Instant::now();
     let Build {
         mut report,
@@ -470,10 +525,16 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         mut seq,
         ..
     } = build;
+    let address_stats = addresses.stats();
+    let addresses = if files.is_empty() {
+        addresses
+    } else {
+        drop_repeated_houses(addresses, &scratch, &memory, budget, &mut report)?
+    };
     // Each street's addresses join the records as one run, in number order,
     // placed in the Hilbert order by its first address: the run stays whole
-    // for the record store to share what its addresses state.
-    let address_stats = addresses.stats();
+    // for the record store and the text index to share what its addresses
+    // state.
     let mut anchor = None;
     let mut previous: Option<PendingAddress> = None;
     for address in addresses.finish()? {
@@ -672,6 +733,66 @@ impl Build {
             self.records.push(pending)
         }
     }
+}
+
+/// An imported address within this distance of an earlier address of the
+/// same house (street, number and unit) repeats it. Sources place one house a
+/// few metres apart, at the door, the parcel or the building's middle.
+const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
+
+/// The addresses again, without the imported rows that repeat an address
+/// the Pack already has, OSM ones first: read in house order, then sorted
+/// back into street groups. Each dropped row is counted on its file.
+fn drop_repeated_houses(
+    addresses: ExternalSorter<PendingAddress>,
+    scratch: &Arc<crate::extsort::Scratch>,
+    memory: &Arc<Budget>,
+    budget: usize,
+    report: &mut BuilderReport,
+) -> Result<ExternalSorter<PendingAddress>> {
+    let mut houses = ExternalSorter::new(scratch, "houses", memory, budget);
+    for address in addresses.finish()? {
+        let address = address?;
+        let seq = address.seq;
+        houses.push(PendingAddress::house(address.into_address(), seq)?)?;
+    }
+    let mut grouped = ExternalSorter::new(scratch, "addresses-kept", memory, budget);
+    let mut house: Option<PendingAddress> = None;
+    let mut kept: Vec<[f64; 2]> = Vec::new();
+    for address in houses.finish()? {
+        let address = address?;
+        if house
+            .as_ref()
+            .is_none_or(|house| !house.same_group(&address))
+        {
+            kept.clear();
+        }
+        let point = address.record.display_point().ok_or_else(|| {
+            Error::BadGeometry(format!(
+                "record {} has no display point",
+                address.record.id()
+            ))
+        })?;
+        let repeated = kept.iter().any(|[lon, lat]| {
+            crate::spatial_index::haversine_m(*lon, *lat, point[0], point[1])
+                <= REPEATED_HOUSE_RADIUS_M
+        });
+        let record = address.clone().into_address();
+        if repeated && record.source.object_type == crate::record::ObjectType::Row {
+            if let Some(import) = report
+                .imports
+                .iter_mut()
+                .find(|import| import.dataset == record.source.dataset)
+            {
+                import.duplicates += 1;
+            }
+        } else {
+            kept.push(point);
+            grouped.push(PendingAddress::new(record, address.seq)?)?;
+        }
+        house = Some(address);
+    }
+    Ok(grouped)
 }
 
 fn request_nodes(
@@ -1125,6 +1246,90 @@ mod tests {
             ..BuildOsmOptions::default()
         })
         .expect("build")
+    }
+
+    /// Hands out fixed files, keeping the countries it was asked for.
+    #[derive(Debug, Default)]
+    struct RecordingSource {
+        files: Vec<addresses::AddressFile>,
+        asked: std::sync::Mutex<Vec<addresses::Coverage>>,
+    }
+
+    impl AddressSource for RecordingSource {
+        fn files(&self, coverage: &addresses::Coverage) -> Result<Vec<addresses::AddressFile>> {
+            self.asked.lock().expect("lock").push(coverage.clone());
+            Ok(self.files.clone())
+        }
+    }
+
+    #[test]
+    fn imports_addresses_and_leaves_out_the_ones_osm_has() {
+        let dir = temp_dir("imported");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let csv = dir.join("addresses.csv");
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.40005,43.60003,10,KING ST,Toronto,M5V 1A1\n\
+             -79.4003,43.6003,16,King Street,Toronto,M5V 1A1\n\
+             -79.40031,43.60031,16,King Street,,\n\
+             -79.45,43.65,3,Queen Street,Toronto,\n\
+             -79.45,43.65,,Queen Street,Toronto,\n",
+        )
+        .expect("csv");
+        let source = Arc::new(RecordingSource {
+            files: vec![addresses::AddressFile {
+                dataset: "openaddresses:test".to_string(),
+                path: csv,
+            }],
+            ..RecordingSource::default()
+        });
+        let report = build_osm_pack(BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::clone(&source) as Arc<dyn AddressSource>),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        assert_eq!(
+            *source.asked.lock().expect("lock"),
+            vec![addresses::Coverage {
+                countries: Default::default(),
+                subdivisions: std::collections::BTreeSet::from(["CA-ON".to_string()]),
+            }],
+            "asked once, for the province: the extract has no Canada boundary"
+        );
+        let imported = &report.imports[0];
+        assert_eq!((imported.rows, imported.accepted), (5, 4));
+        assert_eq!(imported.rejected.get("missing_number"), Some(&1));
+        assert_eq!(
+            imported.duplicates, 2,
+            "10 King St repeats the OSM address, the second 16 the first"
+        );
+        assert!(report.datasets.contains(&"openaddresses:test".to_string()));
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let top = |query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 1,
+                    layer: None,
+                    countries: Vec::new(),
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(top("16 King Street"), vec!["openaddresses:test:row:2"]);
+        assert_eq!(top("10 King Street"), vec!["osm:node:1"]);
+        assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

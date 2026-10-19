@@ -36,7 +36,7 @@ use crate::{
         LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
         ReverseProperties, Version,
     },
-    record::{Layer, OsmObjectType},
+    record::{Layer, ObjectType},
     records::Source,
 };
 
@@ -96,7 +96,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Context,
         ContextArea,
         Source,
-        OsmObjectType,
+        ObjectType,
         // Only ever reached through a parameter, so it needs naming here or
         // it is left out of the components and the `$ref` dangles.
         Layer,

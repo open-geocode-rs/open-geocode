@@ -575,7 +575,7 @@ mod router_tests {
     use super::*;
     use crate::pack::Writer;
     use crate::record::{
-        AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, SourceProvenance,
+        AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
         point_geometry,
     };
 
@@ -604,7 +604,7 @@ mod router_tests {
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance {
                         dataset: "osm".to_string(),
-                        object_type: OsmObjectType::Node,
+                        object_type: ObjectType::Node,
                         object_id: 1,
                         tags: Some(BTreeMap::new()),
                     },

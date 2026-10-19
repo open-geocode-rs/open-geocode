@@ -923,7 +923,7 @@ mod tests {
     use crate::{
         record::{
             AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
-            OsmObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
+            ObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
         },
         records,
     };
@@ -972,7 +972,7 @@ mod tests {
             },
             geometry: point_geometry(lon, lat),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
         })
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
                     ],
                 }),
                 representative_point: [lon, 43.0005],
-                source: SourceProvenance::osm(OsmObjectType::Way, object_id),
+                source: SourceProvenance::osm(ObjectType::Way, object_id),
             })
         };
         let (reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);

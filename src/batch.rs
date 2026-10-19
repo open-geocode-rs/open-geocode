@@ -991,8 +991,8 @@ mod tests {
         use crate::{
             pack::Writer,
             record::{
-                AddressComponents, AddressRecord, LocationPrecision, OsmObjectType,
-                SourceProvenance, point_geometry,
+                AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
+                point_geometry,
             },
         };
 
@@ -1019,7 +1019,7 @@ mod tests {
                         },
                         geometry: point_geometry(lon, 43.6),
                         location_precision: LocationPrecision::Point,
-                        source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                        source: SourceProvenance::osm(ObjectType::Node, object_id),
                     }
                     .into(),
                     None,

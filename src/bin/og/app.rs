@@ -399,7 +399,7 @@ impl App {
     fn replan(&mut self) {
         let pack = self.pack_dir();
         self.plan = Some(
-            plan_build(self.input_bytes(), &pack, &pack, None, true)
+            plan_build(self.input_bytes(), 0, &pack, &pack, None, true)
                 .map_err(|error| format!("{error:#}")),
         );
     }

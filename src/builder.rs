@@ -1,3 +1,4 @@
+pub mod addresses;
 pub mod osm;
 pub mod plan;
 pub mod progress;

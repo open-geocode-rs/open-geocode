@@ -12,7 +12,7 @@ use osmpbf::{Element, PrimitiveBlock, RelMemberType};
 
 use crate::{
     builder::report::CandidateIssue,
-    record::{LocationPrecision, OsmObjectType},
+    record::{LocationPrecision, ObjectType},
 };
 
 use super::{
@@ -127,7 +127,7 @@ fn scan_node(
     if is_poi(&all_tags) {
         emit_poi(
             PoiCandidate {
-                object_type: OsmObjectType::Node,
+                object_type: ObjectType::Node,
                 object_id,
                 lat,
                 lon,
@@ -139,7 +139,7 @@ fn scan_node(
     } else if let Some(tags) = address {
         emit_address(
             AddressCandidate {
-                object_type: OsmObjectType::Node,
+                object_type: ObjectType::Node,
                 object_id,
                 lat,
                 lon,
@@ -166,7 +166,7 @@ fn node_address_tags(
     if has_interpolation_tag(&tags) {
         out.reject(
             CandidateIssue::InterpolationUnsupportedObject,
-            OsmObjectType::Node,
+            ObjectType::Node,
             object_id,
             all_tags,
             Some(&tags),
@@ -178,7 +178,7 @@ fn node_address_tags(
     if let Err(issue) = validate_address_tags(&tags) {
         out.reject(
             issue,
-            OsmObjectType::Node,
+            ObjectType::Node,
             object_id,
             all_tags,
             Some(&tags),
@@ -220,7 +220,7 @@ fn scan_way<'a>(
             if refs().is_empty() {
                 output.emitted.reject(
                     CandidateIssue::StreetUnresolvedGeometry,
-                    OsmObjectType::Way,
+                    ObjectType::Way,
                     object_id,
                     &all_tags,
                     Some(&BTreeMap::new()),
@@ -234,7 +234,7 @@ fn scan_way<'a>(
         } else {
             output.emitted.reject_in_report(
                 missing_street_name_issue(&all_tags),
-                OsmObjectType::Way,
+                ObjectType::Way,
                 object_id,
                 &all_tags,
                 None,
@@ -248,7 +248,7 @@ fn scan_way<'a>(
         if refs().is_empty() {
             output.emitted.reject(
                 CandidateIssue::InterpolationWayWithoutNodes,
-                OsmObjectType::Way,
+                ObjectType::Way,
                 object_id,
                 &all_tags,
                 Some(&tags),
@@ -265,7 +265,7 @@ fn scan_way<'a>(
     } else if let Err(issue) = validate_address_tags(&tags) {
         output.emitted.reject(
             issue,
-            OsmObjectType::Way,
+            ObjectType::Way,
             object_id,
             &all_tags,
             Some(&tags),
@@ -286,7 +286,7 @@ fn scan_way<'a>(
     if refs().is_empty() {
         output.emitted.reject(
             CandidateIssue::WayWithoutResolvedNodes,
-            OsmObjectType::Way,
+            ObjectType::Way,
             object_id,
             &all_tags,
             None,
@@ -340,7 +340,7 @@ fn scan_relation(
     };
     output.emitted.reject(
         issue,
-        OsmObjectType::Relation,
+        ObjectType::Relation,
         object_id,
         &all_tags,
         Some(&tags),

@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     builder::{osm::LOCALITY_KEYS, plan::BuildPlan},
     parse::lattice::train::Report,
-    record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
+    record::{AddressRecord, LocationPrecision, ObjectType, PlaceLayer, PoiRecord},
     resources::Resources,
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 19;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 20;
 
 /// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -53,6 +53,9 @@ pub struct BuilderReport {
     pub output: PackOutputReport,
     /// The address parser trained on the Pack's records.
     pub parser_training: Report,
+    /// Address files added from outside OSM, such as OpenAddresses, one
+    /// entry per file.
+    pub imports: Vec<crate::builder::addresses::ImportReport>,
     /// Ways and relations libpostal's admin level table names for the
     /// input's countries that the input lacks: rules that apply to nothing.
     pub unmatched_admin_level_ids: Vec<String>,
@@ -331,7 +334,7 @@ pub struct AcceptedRecordSample {
     pub id: String,
     pub label: String,
     pub source_id: String,
-    pub object_type: OsmObjectType,
+    pub object_type: ObjectType,
     pub object_id: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_fields: Vec<String>,
@@ -359,7 +362,7 @@ pub struct RejectionSample {
     pub reason: String,
     pub bucket: String,
     pub note: String,
-    pub object_type: OsmObjectType,
+    pub object_type: ObjectType,
     pub object_id: i64,
     pub source_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -440,7 +443,10 @@ pub struct PhaseTimings {
     pub feature_emission_ms: u128,
     /// Build admin boundary polygons.
     pub boundary_build_ms: u128,
-    /// Order every address by street and number.
+    /// Fetch and read address files from outside OSM.
+    pub address_import_ms: u128,
+    /// Order every address by street and number, and drop the imported
+    /// ones that repeat another.
     pub address_order_ms: u128,
     /// Write places, postcodes and boundaries.
     pub context_record_write_ms: u128,
@@ -757,7 +763,7 @@ impl BuilderReport {
     pub(crate) fn reject_with_context(
         &mut self,
         issue: CandidateIssue,
-        object_type: OsmObjectType,
+        object_type: ObjectType,
         object_id: i64,
         all_tags: &BTreeMap<String, String>,
         addr_tags: Option<&BTreeMap<String, String>>,
@@ -803,7 +809,7 @@ impl BuilderReport {
     fn audit_rejection(
         &mut self,
         issue: CandidateIssue,
-        object_type: OsmObjectType,
+        object_type: ObjectType,
         all_tags: &BTreeMap<String, String>,
         addr_tags: &BTreeMap<String, String>,
     ) {
@@ -837,7 +843,7 @@ impl BuilderReport {
         *audit.by_shape.entry(shape.to_string()).or_default() += 1;
         *audit
             .by_object_type
-            .entry(object_type_name(object_type).to_string())
+            .entry(crate::labels::object_type_name(object_type).to_string())
             .or_default() += 1;
 
         for key in addr_tags.keys() {
@@ -864,7 +870,7 @@ impl BuilderReport {
     fn triage_rejection(
         &mut self,
         issue: CandidateIssue,
-        object_type: OsmObjectType,
+        object_type: ObjectType,
         object_id: i64,
         all_tags: &BTreeMap<String, String>,
         layer_hint: Option<&str>,
@@ -914,8 +920,11 @@ impl BuilderReport {
     }
 }
 
-fn source_id(object_type: OsmObjectType, object_id: i64) -> String {
-    format!("osm:{}:{object_id}", object_type_name(object_type))
+fn source_id(object_type: ObjectType, object_id: i64) -> String {
+    format!(
+        "osm:{}:{object_id}",
+        crate::labels::object_type_name(object_type)
+    )
 }
 
 fn count_option(value: Option<&str>, present: &mut u64, missing: &mut u64) {
@@ -1235,14 +1244,6 @@ fn feature_contexts(tags: &BTreeMap<String, String>) -> impl Iterator<Item = &'s
     contexts.into_iter()
 }
 
-fn object_type_name(object_type: OsmObjectType) -> &'static str {
-    match object_type {
-        OsmObjectType::Node => "node",
-        OsmObjectType::Way => "way",
-        OsmObjectType::Relation => "relation",
-    }
-}
-
 const POI_CONTEXT_KEYS: &[&str] = &[
     "aeroway",
     "amenity",
@@ -1281,7 +1282,7 @@ mod tests {
             for report in [&mut sequential, worker] {
                 report.reject_with_context(
                     CandidateIssue::StreetMissingName,
-                    OsmObjectType::Way,
+                    ObjectType::Way,
                     object_id,
                     &tags,
                     None,
@@ -1412,7 +1413,7 @@ mod tests {
 
         report.reject_with_context(
             CandidateIssue::MissingHouseNumber,
-            OsmObjectType::Way,
+            ObjectType::Way,
             77,
             &all_tags,
             Some(&addr_tags),
@@ -1464,7 +1465,7 @@ mod tests {
 
         report.reject_with_context(
             CandidateIssue::StreetMissingName,
-            OsmObjectType::Way,
+            ObjectType::Way,
             42,
             &tags,
             None,
@@ -1511,7 +1512,7 @@ mod tests {
 
         report.reject_with_context(
             CandidateIssue::StreetMissingName,
-            OsmObjectType::Way,
+            ObjectType::Way,
             99,
             &tags,
             None,
@@ -1553,7 +1554,7 @@ mod tests {
         for object_id in 0..10 {
             report.reject_with_context(
                 CandidateIssue::StreetMissingName,
-                OsmObjectType::Way,
+                ObjectType::Way,
                 object_id,
                 &tags,
                 None,
@@ -1603,7 +1604,7 @@ mod tests {
             },
             geometry: point_geometry(-79.3832, 43.6532),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
         }
     }
 }

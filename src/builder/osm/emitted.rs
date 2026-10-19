@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
-    record::{OsmObjectType, Record, RejectedRecord, SourceProvenance},
+    record::{ObjectType, Record, RejectedRecord, SourceProvenance},
 };
 
 use super::postcode::PostcodeAccumulator;
@@ -24,7 +24,7 @@ impl Emitted {
     pub(crate) fn reject(
         &mut self,
         issue: CandidateIssue,
-        object_type: OsmObjectType,
+        object_type: ObjectType,
         object_id: i64,
         tags: &BTreeMap<String, String>,
         addr_tags: Option<&BTreeMap<String, String>>,
@@ -50,7 +50,7 @@ impl Emitted {
     pub(crate) fn reject_in_report(
         &mut self,
         issue: CandidateIssue,
-        object_type: OsmObjectType,
+        object_type: ObjectType,
         object_id: i64,
         tags: &BTreeMap<String, String>,
         addr_tags: Option<&BTreeMap<String, String>>,

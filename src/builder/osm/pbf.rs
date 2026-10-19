@@ -142,6 +142,31 @@ pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
     }
 }
 
+/// The bounding box the extract's header states, `[min_lon, min_lat, max_lon,
+/// max_lat]`; Geofabrik sets it to the bounds of the extract's polygon.
+pub(crate) fn header_bbox(input: &Path) -> Result<Option<[f64; 4]>> {
+    let file = File::open(input).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: input.to_path_buf(),
+        source,
+    })?;
+    let mut blobs = BlobReader::new(BufReader::new(file));
+    let Some(blob) = blobs.next() else {
+        return Ok(None);
+    };
+    match blob?.decode()? {
+        BlobDecode::OsmHeader(header) => Ok(header.bbox().map(|bbox| {
+            [
+                bbox.left,
+                bbox.bottom.min(bbox.top),
+                bbox.right,
+                bbox.bottom.max(bbox.top),
+            ]
+        })),
+        BlobDecode::OsmData(_) | BlobDecode::Unknown(_) => Ok(None),
+    }
+}
+
 pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
     Ok(fs::metadata(input)?.len())
 }

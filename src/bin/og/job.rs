@@ -305,6 +305,15 @@ fn build_step(stage: BuildStage) -> Step {
                 "and placing postcode centroids.",
             ],
         ),
+        BuildStage::ImportAddresses => (
+            "Imported",
+            "Importing",
+            "addresses",
+            [
+                "Adding OpenAddresses points to the OSM addresses,",
+                "leaving out the ones OSM already has.",
+            ],
+        ),
         BuildStage::ContextRecords => (
             "Wrote",
             "Writing",

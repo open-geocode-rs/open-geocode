@@ -1,5 +1,5 @@
 use crate::record::{
-    AddressComponents, InterpolationAddressComponents, InterpolationRange, OsmObjectType,
+    AddressComponents, InterpolationAddressComponents, InterpolationRange, OSM_DATASET, ObjectType,
 };
 
 pub fn address_name(components: &AddressComponents) -> String {
@@ -121,8 +121,14 @@ pub fn interpolation_label(
     .join(", ")
 }
 
-pub fn osm_record_id(object_type: OsmObjectType, object_id: i64) -> String {
-    format!("osm:{}:{object_id}", osm_object_type_name(object_type))
+pub fn osm_record_id(object_type: ObjectType, object_id: i64) -> String {
+    record_id(OSM_DATASET, object_type, object_id)
+}
+
+/// "osm:node:1", or for a row of an imported dataset
+/// "openaddresses:nz/countrywide:row:7".
+pub fn record_id(dataset: &str, object_type: ObjectType, object_id: i64) -> String {
+    format!("{dataset}:{}:{object_id}", object_type_name(object_type))
 }
 
 pub fn derived_postcode_id(postcode: &str) -> String {
@@ -143,22 +149,19 @@ pub fn interpolation_record_id(way_id: i64, low_node_id: i64, high_node_id: i64)
     format!("osm:way:{way_id}:interp:{low_node_id}-{high_node_id}")
 }
 
-pub(crate) fn place_record_id(
-    object_type: OsmObjectType,
-    object_id: i64,
-    place_type: &str,
-) -> String {
+pub(crate) fn place_record_id(object_type: ObjectType, object_id: i64, place_type: &str) -> String {
     match place_type.strip_prefix("derived_country:") {
         Some(code) => derived_country_id(code),
         None => osm_record_id(object_type, object_id),
     }
 }
 
-pub fn osm_object_type_name(object_type: OsmObjectType) -> &'static str {
+pub fn object_type_name(object_type: ObjectType) -> &'static str {
     match object_type {
-        OsmObjectType::Node => "node",
-        OsmObjectType::Way => "way",
-        OsmObjectType::Relation => "relation",
+        ObjectType::Node => "node",
+        ObjectType::Way => "way",
+        ObjectType::Relation => "relation",
+        ObjectType::Row => "row",
     }
 }
 

@@ -21,7 +21,7 @@ use utoipa::ToSchema;
 use crate::{
     labels,
     pack::{Reader, RecordId, Source, Summary},
-    record::{AddressComponents, InterpolationAddressComponents, Layer, OsmObjectType, PlaceLayer},
+    record::{AddressComponents, InterpolationAddressComponents, Layer, ObjectType, PlaceLayer},
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
     search::TextSearchHit,
@@ -225,8 +225,8 @@ impl Accuracy {
             records::PointPrecision::Estimated => Self::Interpolated,
             records::PointPrecision::RepresentativePoint => Self::Street,
             records::PointPrecision::Centroid => match source.object_type {
-                Some(OsmObjectType::Way | OsmObjectType::Relation) => Self::Centroid,
-                Some(OsmObjectType::Node) | None => Self::Approximate,
+                Some(ObjectType::Way | ObjectType::Relation) => Self::Centroid,
+                Some(ObjectType::Node | ObjectType::Row) | None => Self::Approximate,
             },
         }
     }
@@ -775,7 +775,7 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
                 p.common
                     .source
                     .object_type
-                    .map(|kind| labels::osm_object_type_name(kind).to_string())
+                    .map(|kind| labels::object_type_name(kind).to_string())
             }),
         ),
         (
@@ -799,7 +799,7 @@ mod tests {
 
     use super::*;
 
-    fn source(object_type: Option<OsmObjectType>) -> Source {
+    fn source(object_type: Option<ObjectType>) -> Source {
         Source {
             dataset: "osm".to_string(),
             object_type,
@@ -811,8 +811,8 @@ mod tests {
 
     #[test]
     fn accuracy_says_how_the_point_relates_to_the_thing() {
-        let node = source(Some(OsmObjectType::Node));
-        let way = source(Some(OsmObjectType::Way));
+        let node = source(Some(ObjectType::Node));
+        let way = source(Some(ObjectType::Way));
         let derived = source(None);
         for (precision, source, accuracy) in [
             (records::PointPrecision::Point, &node, Accuracy::Rooftop),

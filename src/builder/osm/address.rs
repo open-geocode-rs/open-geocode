@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::{
     builder::report::CandidateIssue,
     record::{
-        AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, Record,
-        SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, LocationPrecision, ObjectType, Record, SourceProvenance,
+        point_geometry,
     },
     util::text::collapse_whitespace,
 };
@@ -13,7 +13,7 @@ use super::{emitted::Emitted, tags::OsmTags};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AddressCandidate {
-    pub object_type: OsmObjectType,
+    pub object_type: ObjectType,
     pub object_id: i64,
     pub lat: f64,
     pub lon: f64,
@@ -145,7 +145,7 @@ mod tests {
 
     fn candidate(tags: &[(&str, &str)]) -> AddressCandidate {
         AddressCandidate {
-            object_type: OsmObjectType::Node,
+            object_type: ObjectType::Node,
             object_id: 42,
             lat: 43.6532,
             lon: -79.3832,
@@ -180,7 +180,7 @@ mod tests {
             }
             other => panic!("expected Point, got {}", other.type_name()),
         }
-        assert_eq!(record.source.object_type, OsmObjectType::Node);
+        assert_eq!(record.source.object_type, ObjectType::Node);
         assert_eq!(record.source.tags, None);
     }
 
@@ -314,7 +314,7 @@ mod tests {
         let mut out = Emitted::default();
         out.reject(
             CandidateIssue::MissingHouseNumber,
-            OsmObjectType::Way,
+            ObjectType::Way,
             42,
             &tags,
             Some(&tags),

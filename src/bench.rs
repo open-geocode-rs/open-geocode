@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     builder::report::{BuilderReport, PhaseTimings, ScratchReport, Throughput},
     pack::{AUDIT_DIR, BUILD_REPORT_FILE, Manifest, Reader},
-    record::{Layer, OsmObjectType, Record},
+    record::{Layer, ObjectType, Record},
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     text_index::normalize_index_text,
@@ -126,7 +126,7 @@ pub struct AccuracyReport {
 /// The OSM object a query case should find.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpectedObject {
-    pub osm_type: OsmObjectType,
+    pub osm_type: ObjectType,
     pub osm_id: i64,
 }
 
@@ -617,7 +617,7 @@ mod tests {
         context::AdminContextTuple,
         pack::{RecordContext, Writer},
         record::{
-            AddressComponents, AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer,
+            AddressComponents, AddressRecord, LocationPrecision, ObjectType, PlaceLayer,
             PlaceRecord, PoiRecord, SourceProvenance, point_geometry,
         },
     };
@@ -639,7 +639,7 @@ mod tests {
                             name: name.to_string(),
                             place_type: "admin_level:8".to_string(),
                             geometry: point_geometry(-79.4, 43.6),
-                            source: SourceProvenance::osm(OsmObjectType::Relation, object_id),
+                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
                         },
                     ),
                     None,
@@ -693,7 +693,7 @@ mod tests {
                 address: None,
                 geometry: point_geometry(-79.4, 43.6),
                 location_precision: LocationPrecision::Point,
-                source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                source: SourceProvenance::osm(ObjectType::Node, object_id),
             };
             writer.write(&poi.into(), context).expect("POI");
         }
@@ -746,7 +746,7 @@ mod tests {
             limit: Some(5),
             layer: None,
             expect: Some(ExpectedObject {
-                osm_type: OsmObjectType::Way,
+                osm_type: ObjectType::Way,
                 osm_id: 13,
             }),
         });
@@ -857,7 +857,7 @@ mod tests {
                     },
                     geometry: point_geometry(-79.4, 43.6),
                     location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(OsmObjectType::Node, 1),
+                    source: SourceProvenance::osm(ObjectType::Node, 1),
                 }
                 .into(),
                 None,

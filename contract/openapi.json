@@ -323,11 +323,13 @@
         ],
         "type": "object"
       },
-      "OsmObjectType": {
+      "ObjectType": {
+        "description": "What a record's source object is: an OSM node, way or relation, or a row\nof an imported address dataset such as OpenAddresses.",
         "enum": [
           "node",
           "way",
-          "relation"
+          "relation",
+          "row"
         ],
         "type": "string"
       },
@@ -504,7 +506,7 @@
             "type": "integer"
           },
           "object_type": {
-            "$ref": "#/components/schemas/OsmObjectType"
+            "$ref": "#/components/schemas/ObjectType"
           },
           "record_count": {
             "format": "int64",

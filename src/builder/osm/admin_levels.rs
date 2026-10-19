@@ -15,7 +15,7 @@ use std::{
     sync::OnceLock,
 };
 
-use crate::record::{OsmObjectType, PlaceLayer};
+use crate::record::{ObjectType, PlaceLayer};
 
 const TABLE: &str = include_str!("../../parse/lattice/data/admin_levels.tsv");
 
@@ -28,10 +28,10 @@ pub(super) type Verdict = Option<PlaceLayer>;
 pub(super) struct AdminLevels {
     levels: HashMap<(String, u8), Verdict>,
     designations: HashMap<(String, String), Verdict>,
-    ids: HashMap<(OsmObjectType, i64), (String, Verdict)>,
+    ids: HashMap<(ObjectType, i64), (String, Verdict)>,
     /// `(country, object, level, verdict)`: a boundary of `level` inside
     /// `object` is `verdict`.
-    within: Vec<(String, (OsmObjectType, i64), u8, Verdict)>,
+    within: Vec<(String, (ObjectType, i64), u8, Verdict)>,
 }
 
 /// The table, read once.
@@ -114,7 +114,7 @@ impl AdminLevels {
     pub(super) fn verdict(
         &self,
         boundary: Boundary<'_>,
-        mut inside: impl FnMut((OsmObjectType, i64)) -> bool,
+        mut inside: impl FnMut((ObjectType, i64)) -> bool,
     ) -> Option<Verdict> {
         if let Some((_, verdict)) = self.ids.get(&boundary.object) {
             return Some(*verdict);
@@ -143,7 +143,7 @@ impl AdminLevels {
     pub(super) fn within_objects<'a>(
         &'a self,
         countries: &'a BTreeSet<String>,
-    ) -> impl Iterator<Item = (OsmObjectType, i64)> + 'a {
+    ) -> impl Iterator<Item = (ObjectType, i64)> + 'a {
         self.within
             .iter()
             .filter(|(country, ..)| countries.contains(country))
@@ -157,11 +157,11 @@ impl AdminLevels {
     pub(super) fn listed_areas<'a>(
         &'a self,
         countries: &'a BTreeSet<String>,
-    ) -> impl Iterator<Item = (OsmObjectType, i64)> + 'a {
+    ) -> impl Iterator<Item = (ObjectType, i64)> + 'a {
         self.ids
             .iter()
             .filter(|(object, (country, _))| {
-                countries.contains(country) && object.0 != OsmObjectType::Node
+                countries.contains(country) && object.0 != ObjectType::Node
             })
             .map(|(object, _)| *object)
             .chain(self.within_objects(countries))
@@ -171,7 +171,7 @@ impl AdminLevels {
 /// What one boundary is, as the table reads it.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Boundary<'a> {
-    pub object: (OsmObjectType, i64),
+    pub object: (ObjectType, i64),
     /// Lower-case country code.
     pub country: Option<&'a str>,
     pub admin_level: Option<u8>,
@@ -196,25 +196,20 @@ fn verdict(component: &str) -> Option<Verdict> {
     })
 }
 
-fn object(key: &str) -> Option<(OsmObjectType, i64)> {
+fn object(key: &str) -> Option<(ObjectType, i64)> {
     let (kind, id) = key.split_once(':')?;
     let kind = match kind {
-        "node" => OsmObjectType::Node,
-        "way" => OsmObjectType::Way,
-        "relation" => OsmObjectType::Relation,
+        "node" => ObjectType::Node,
+        "way" => ObjectType::Way,
+        "relation" => ObjectType::Relation,
         _ => return None,
     };
     Some((kind, id.parse().ok()?))
 }
 
 /// Writes an object as the table does: `relation:65606`.
-pub(super) fn object_key((kind, id): (OsmObjectType, i64)) -> String {
-    let kind = match kind {
-        OsmObjectType::Node => "node",
-        OsmObjectType::Way => "way",
-        OsmObjectType::Relation => "relation",
-    };
-    format!("{kind}:{id}")
+pub(super) fn object_key((kind, id): (ObjectType, i64)) -> String {
+    format!("{}:{id}", crate::labels::object_type_name(kind))
 }
 
 #[cfg(test)]
@@ -223,7 +218,7 @@ mod tests {
 
     fn boundary(country: &str, level: u8) -> Boundary<'_> {
         Boundary {
-            object: (OsmObjectType::Relation, 1),
+            object: (ObjectType::Relation, 1),
             country: Some(country),
             admin_level: Some(level),
             designation: None,
@@ -254,7 +249,7 @@ mod tests {
         let table = admin_levels();
         // London is a city whatever its level.
         let london = Boundary {
-            object: (OsmObjectType::Relation, 65606),
+            object: (ObjectType::Relation, 65606),
             ..boundary("gb", 5)
         };
         assert_eq!(
@@ -262,7 +257,7 @@ mod tests {
             Some(Some(PlaceLayer::Locality))
         );
         // A level 10 inside Berlin is a neighbourhood.
-        let berlin = (OsmObjectType::Relation, 62422);
+        let berlin = (ObjectType::Relation, 62422);
         assert_eq!(
             table.verdict(boundary("de", 10), |object| object == berlin),
             Some(Some(PlaceLayer::Neighbourhood))
@@ -275,9 +270,6 @@ mod tests {
             table.verdict(unitary, |_| false),
             Some(Some(PlaceLayer::District))
         );
-        assert_eq!(
-            object_key((OsmObjectType::Relation, 65606)),
-            "relation:65606"
-        );
+        assert_eq!(object_key((ObjectType::Relation, 65606)), "relation:65606");
     }
 }
