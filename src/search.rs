@@ -1729,9 +1729,11 @@ impl QueryPlan {
         })
     }
 
-    /// The postcode the first postcode part names.
+    /// The postcode the last postcode part names. A postcode given apart
+    /// from the query follows the parts parsed from it, so it wins over a
+    /// house number read as a postcode ("6011 highland lakes road").
     fn postcode(&self) -> QueryPostcode {
-        let Some(part) = self.context.iter().find(|part| part.is_postcode()) else {
+        let Some(part) = self.context.iter().rev().find(|part| part.is_postcode()) else {
             return QueryPostcode::default();
         };
         let words = &part.words;
