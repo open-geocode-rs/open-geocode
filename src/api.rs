@@ -21,7 +21,7 @@ use utoipa::ToSchema;
 use crate::{
     labels,
     pack::{Reader, RecordId, Source, Summary},
-    record::{AddressComponents, InterpolationAddressComponents, Layer, OsmObjectType},
+    record::{AddressComponents, InterpolationAddressComponents, Layer, OsmObjectType, PlaceLayer},
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
     search::TextSearchHit,
@@ -326,16 +326,29 @@ fn stated(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The areas a record lies in, one per level: the admin areas most specific
+/// The areas a record lies in, one per tier: the admin areas most specific
 /// first, then the place area.
+///
+/// The `sub` tiers carry the levels a country maps between the conventional
+/// ones. Germany mapping three `state_district` levels used to mean two of
+/// them were dropped from every German address; they are now the district
+/// and its subdistrict. The field is absent where a country does not map
+/// that depth, as every field here already is, so a reader of the
+/// conventional tiers alone is unaffected.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Context {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub neighbourhood: Option<ContextArea>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sublocality: Option<ContextArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub locality: Option<ContextArea>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub subdistrict: Option<ContextArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub district: Option<ContextArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subregion: Option<ContextArea>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<ContextArea>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,14 +447,17 @@ impl<'a> Contexts<'a> {
         let Some(context) = self.pack.boundary_context(record_id)? else {
             return Ok(Context::default());
         };
-        let tuple = context.admin_context;
+        let tuple = &context.admin_context;
         Ok(Context {
-            neighbourhood: self.area(tuple.neighbourhood_record_id)?,
-            locality: self.area(tuple.locality_record_id)?,
-            district: self.area(tuple.district_record_id)?,
-            region: self.area(tuple.region_record_id)?,
-            country: self.area(tuple.country_record_id)?,
-            place: self.area(tuple.place_record_id)?,
+            neighbourhood: self.area(tuple.get(PlaceLayer::Neighbourhood))?,
+            sublocality: self.area(tuple.get(PlaceLayer::SubLocality))?,
+            locality: self.area(tuple.get(PlaceLayer::Locality))?,
+            subdistrict: self.area(tuple.get(PlaceLayer::SubDistrict))?,
+            district: self.area(tuple.get(PlaceLayer::District))?,
+            subregion: self.area(tuple.get(PlaceLayer::SubRegion))?,
+            region: self.area(tuple.get(PlaceLayer::Region))?,
+            country: self.area(tuple.get(PlaceLayer::Country))?,
+            place: self.area(tuple.get(PlaceLayer::Place))?,
         })
     }
 

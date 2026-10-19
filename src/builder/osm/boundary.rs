@@ -12,7 +12,9 @@ use crate::{
     context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext},
     pack::RecordId,
     parse::lattice::CountryCode,
-    record::{OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry},
+    record::{
+        Layer, OsmObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
+    },
     util::text::normalize_for_compare,
 };
 
@@ -270,8 +272,12 @@ impl BoundarySet {
             .candidates
             .iter()
             .zip(boundary_record_ids)
+            // By tier group, not the exact tier: Japan maps a group of regions
+            // at 3 and its prefectures at 4, which are the region and its
+            // sub-region, and a group has to pair with the prefectures inside
+            // it.
             .filter(|(candidate, _)| {
-                candidate.boundary.layer == PlaceLayer::Region
+                candidate.boundary.layer.record_layer() == Layer::Region
                     && candidate.boundary.admin_level.is_some()
             })
             .map(|(candidate, record_id)| {
@@ -431,31 +437,35 @@ impl BoundaryIndex {
             }
         }
 
+        // One pass over the covering boundaries, keeping the best of each
+        // tier, rather than one filtering pass per tier: this runs for every
+        // record of the build, and a pass per tier allocated a vector for
+        // each of the ten even though all but two or three are empty.
         let mut flags = 0;
-        let mut tuple = AdminContextTuple::default();
-        for layer in [
-            PlaceLayer::Country,
-            PlaceLayer::Region,
-            PlaceLayer::District,
-            PlaceLayer::Locality,
-            PlaceLayer::Neighbourhood,
-            PlaceLayer::Place,
-        ] {
-            let layer_matches = covered
-                .iter()
-                .copied()
-                .filter(|boundary| boundary.layer == layer)
-                .collect::<Vec<_>>();
-            if layer_matches.len() > 1 {
-                flags |= CONTEXT_FLAG_AMBIGUOUS_ADMIN;
+        let mut best: [Option<&AcceptedBoundary>; PlaceLayer::ALL.len()] = Default::default();
+        for boundary in &covered {
+            let slot = &mut best[boundary.layer as usize];
+            match slot {
+                Some(held) => {
+                    flags |= CONTEXT_FLAG_AMBIGUOUS_ADMIN;
+                    if compare_boundary(boundary.layer, boundary, held, source_context).is_lt() {
+                        *slot = Some(boundary);
+                    }
+                }
+                None => *slot = Some(boundary),
             }
-            let Some(best) = choose_boundary(layer, &layer_matches, source_context) else {
-                continue;
-            };
-            set_tuple_layer(&mut tuple, layer, best.record_id);
-            if layer == PlaceLayer::Region && tuple.country_record_id.is_none() {
-                tuple.country_record_id = best.inferred_country_record_id;
-            }
+        }
+
+        let mut tuple = AdminContextTuple::from_tiers(
+            PlaceLayer::ALL
+                .into_iter()
+                .filter_map(|tier| Some((tier, best[tier as usize]?.record_id))),
+        );
+        if tuple.country_record_id().is_none()
+            && let Some(country) = best[PlaceLayer::Region as usize]
+                .and_then(|region| region.inferred_country_record_id)
+        {
+            tuple.set(PlaceLayer::Country, country);
         }
 
         RecordContext {
@@ -865,6 +875,10 @@ fn country_name_from_code(code: &str) -> &str {
     }
 }
 
+/// The levels that are areas of the Pack at all. Outside it an `admin_level`
+/// is a supranational union (1) or past anything OSM ranks (12 and up).
+const RANKED_ADMIN_LEVELS: std::ops::RangeInclusive<u8> = 0..=11;
+
 /// The provisional layer for an admin level, before containment is known.
 ///
 /// `admin_level` is not comparable between countries: Australia puts its
@@ -873,29 +887,29 @@ fn country_name_from_code(code: &str) -> &str {
 /// fixed numbers to fixed layers therefore drops whole layers in some
 /// countries, so this is only a starting guess that
 /// [`assign_layers_by_containment`] corrects once the set is known.
+///
+/// An off-convention level has no guess to give. It is held at the innermost
+/// tier, which is where it would end up if nothing else placed it, and
+/// [`assign_layers_by_containment`] moves it to a tier of its own.
 fn admin_level_layer(admin_level: u8) -> Option<PlaceLayer> {
-    if let Some(layer) = conventional_admin_layer(admin_level) {
-        return Some(layer);
+    if !RANKED_ADMIN_LEVELS.contains(&admin_level) {
+        return None;
     }
-    // Off-convention levels are kept so that [`assign_layers_by_containment`]
-    // can place them. Without this an Australian extract has no locality layer
-    // at all, because every suburb sits at level 9. The provisional layer is
-    // the innermost one, so a level that finds no free slot stays there.
-    match admin_level {
-        3..=11 => Some(PlaceLayer::Neighbourhood),
-        _ => None,
-    }
+    Some(conventional_admin_layer(admin_level).unwrap_or(PlaceLayer::SubNeighbourhood))
+}
+
+/// What one level of a country wants: the tier, and whether that is stated
+/// by libpostal's table or the level's own `place` tags rather than only the
+/// convention for the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Want {
+    layer: Option<PlaceLayer>,
+    stated: bool,
 }
 
 /// Layers that admin boundaries are ranked into, outermost first. `Place` is
 /// left out: it belongs to place nodes, not to administrative boundaries.
-const ADMIN_LAYER_ORDER: [PlaceLayer; 5] = [
-    PlaceLayer::Country,
-    PlaceLayer::Region,
-    PlaceLayer::District,
-    PlaceLayer::Locality,
-    PlaceLayer::Neighbourhood,
-];
+const ADMIN_LAYER_ORDER: [PlaceLayer; 9] = PlaceLayer::ADMIN;
 
 /// Boundaries of one level and country whose `place` tag names a layer: at
 /// least this many...
@@ -948,62 +962,121 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
         .zip(&keep)
         .filter_map(|(country, keep)| keep.then_some(country))
         .collect::<Vec<_>>();
-    let mut verdicts = verdicts
+    let verdicts = verdicts
         .into_iter()
         .filter(|verdict| !matches!(verdict, Some(None)))
         .map(Option::flatten)
         .collect::<Vec<_>>();
-    fill_locality_from_suburbs(candidates, &countries, &mut verdicts);
     let tagged = tagged_level_layers(candidates, &countries);
 
-    // Layers each country already fills with a listed, tagged or
-    // conventional level, and the off-convention levels waiting for a slot.
-    let mut filled: BTreeMap<Option<String>, BTreeSet<PlaceLayer>> = BTreeMap::new();
-    let mut unconventional: BTreeMap<Option<String>, BTreeSet<u8>> = BTreeMap::new();
+    // What each country's levels want, before any of them compete. A level
+    // the table names, whose boundaries tag what they are, or that follows
+    // the convention has a preference; the rest have none and take whatever
+    // their depth earns them.
+    let mut wanted: BTreeMap<Option<String>, BTreeMap<u8, Want>> = BTreeMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let country = countries[index].clone();
-        // A place area keeps the layer its `place` tag names.
         let Some(level) = candidate.boundary.admin_level else {
             continue;
         };
-        match verdicts[index]
-            .or_else(|| tagged.get(&(country.clone(), level)).copied())
-            .or_else(|| conventional_admin_layer(level))
+        let country = countries[index].clone();
+        // Whether the tier is stated -- by the table or by the level's own
+        // tags -- or only the convention for the number. A stated tier
+        // outranks a conventional one when the two want the same place.
+        let stated = verdicts[index].or_else(|| tagged.get(&(country.clone(), level)).copied());
+        let want = Want {
+            layer: stated.or_else(|| conventional_admin_layer(level)),
+            stated: stated.is_some(),
+        };
+        let slot = wanted
+            .entry(country)
+            .or_default()
+            .entry(level)
+            .or_insert(want);
+        // One level, one tier: a level whose boundaries disagree keeps the
+        // outermost reading, so neighbouring boundaries stay in one tier.
+        if let (Some(have), Some(layer)) = (slot.layer, want.layer)
+            && layer < have
         {
-            Some(layer) => {
-                filled.entry(country).or_default().insert(layer);
-            }
-            None => {
-                unconventional.entry(country).or_default().insert(level);
-            }
+            *slot = want;
         }
     }
 
-    // Walk each country's spare levels outermost first, handing each the next
-    // empty layer below the deepest filled one it sits under.
-    let mut promoted: BTreeMap<(Option<String>, u8), PlaceLayer> = BTreeMap::new();
-    for (country, levels) in &unconventional {
-        let country_filled = filled.get(country).cloned().unwrap_or_default();
-        for &level in levels {
-            // The innermost filled layer this level nests inside.
-            let parent_depth = ADMIN_LAYER_ORDER
-                .iter()
-                .enumerate()
-                .filter(|(_, layer)| {
-                    country_filled.contains(layer)
-                        && conventional_admin_layer_depth(layer).is_some_and(|depth| depth < level)
-                })
-                .map(|(index, _)| index)
-                .max();
-            // The first empty layer below it, so a promoted level never
-            // displaces a filled one.
-            let slot = ADMIN_LAYER_ORDER
-                .iter()
-                .skip(parent_depth.map_or(0, |depth| depth + 1))
-                .find(|layer| !country_filled.contains(layer))
-                .copied()
-                .unwrap_or(PlaceLayer::Neighbourhood);
-            promoted.insert((country.clone(), level), slot);
+    // Hand each country's levels a tier, outermost level first, never going
+    // back up. A level takes the tier it wants when that tier is still free
+    // and no deeper level has already passed it; otherwise it takes the next
+    // free tier below the last one handed out.
+    //
+    // There is no slot to compete for any more: with a sub-tier under each
+    // conventional one there are eight, which covers the deepest hierarchy
+    // the table maps (Germany's nine levels, three of them state_district).
+    // A country deeper than that runs out at the innermost tier, where the
+    // chain keeps the outermost of the pair rather than dropping it.
+    const LOCALITY_AT: usize = 5;
+    let mut assigned: BTreeMap<(Option<String>, u8), PlaceLayer> = BTreeMap::new();
+    for (country, levels) in &wanted {
+        // One level of each country anchors the locality tier, the tier an
+        // address query matches a town on. It is the outermost level the
+        // table calls a city, else the outermost below the district --
+        // Australia's level 9 is tagged a suburb and is still the town an
+        // address names, and without an anchor an Australian Pack answers no
+        // structured query at all.
+        let anchor = levels
+            .iter()
+            .find(|(_, want)| want.layer == Some(PlaceLayer::Locality))
+            .or_else(|| {
+                levels
+                    .iter()
+                    .find(|(_, want)| want.layer.is_none_or(|layer| layer > PlaceLayer::District))
+            })
+            .map(|(level, _)| *level);
+        let anchor_index = anchor.and_then(|level| levels.keys().position(|at| *at == level));
+
+        let mut next = 0usize;
+        for (index, (&level, want)) in levels.iter().enumerate() {
+            // Keep one tier for each level still to come, so an outer level's
+            // preference cannot eat the ladder and strand the rest at the
+            // innermost tier. Taiwan calls its level 4 a city, which alone
+            // would spend six tiers before its five deeper levels are placed.
+            let cap = ADMIN_LAYER_ORDER.len() - 1 - (levels.len() - index - 1);
+            let at = if Some(index) == anchor_index {
+                next.max(LOCALITY_AT.min(cap))
+            } else {
+                let at = match want.layer {
+                    // Respect the preference only when it does not go
+                    // backwards; a country that maps two levels onto one
+                    // conventional tier puts the second in its sub-tier.
+                    Some(layer) => ADMIN_LAYER_ORDER
+                        .iter()
+                        .position(|tier| *tier == layer)
+                        .unwrap_or(next)
+                        .max(next),
+                    None => next,
+                };
+                // Yield a tier for every deeper level wanting this one or
+                // shallower, so the innermost of them keeps the tier they all
+                // name. Australia calls both its 9 and its 10 a suburb; 10 is
+                // the neighbourhood and 9 the sub-locality above it, where
+                // before one of the two was dropped.
+                let contested = levels
+                    .values()
+                    .skip(index + 1)
+                    .filter_map(|want| want.layer)
+                    .filter_map(|layer| ADMIN_LAYER_ORDER.iter().position(|tier| *tier == layer))
+                    .filter(|wanted| *wanted <= at)
+                    .count();
+                let at = next.max(at - contested.min(at));
+                // Leave the anchor room to reach the locality tier: an outer
+                // level that settles too deep would push it past its own.
+                let at = match anchor_index {
+                    Some(anchor) if index < anchor => {
+                        at.min(next.max(LOCALITY_AT.saturating_sub(anchor - index)))
+                    }
+                    _ => at,
+                };
+                if at > cap { cap.max(next) } else { at }
+            };
+            assigned.insert((country.clone(), level), ADMIN_LAYER_ORDER[at]);
+            next = at + 1;
         }
     }
 
@@ -1011,58 +1084,11 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
         let Some(level) = candidate.boundary.admin_level else {
             continue;
         };
-        let key = (countries[index].clone(), level);
-        if let Some(layer) = verdicts[index]
-            .or_else(|| tagged.get(&key).copied())
-            .or_else(|| promoted.get(&key).copied())
-        {
-            candidate.boundary.layer = layer;
-        } else if let Some(layer) = conventional_admin_layer(key.1) {
-            candidate.boundary.layer = layer;
+        if let Some(layer) = assigned.get(&(countries[index].clone(), level)) {
+            candidate.boundary.layer = *layer;
         }
     }
     unmatched
-}
-
-/// The locality layer is the place an address names. Where libpostal's
-/// table gives a country's boundaries no city but names suburbs (Australia's
-/// postal localities are suburbs at level 9, and libpostal's generator lets
-/// them stand in for cities), the outermost level of them takes it.
-fn fill_locality_from_suburbs(
-    candidates: &[BoundaryCandidate],
-    countries: &[Option<String>],
-    verdicts: &mut [Option<PlaceLayer>],
-) {
-    let mut has_locality = BTreeSet::new();
-    let mut suburb_levels = BTreeMap::<Option<String>, u8>::new();
-    for ((candidate, country), verdict) in candidates.iter().zip(countries).zip(verdicts.iter()) {
-        // A level the table is silent on keeps its conventional layer.
-        let layer = verdict.or_else(|| {
-            candidate
-                .boundary
-                .admin_level
-                .and_then(conventional_admin_layer)
-        });
-        match (layer, candidate.boundary.admin_level) {
-            (Some(PlaceLayer::Locality), _) => {
-                has_locality.insert(country.clone());
-            }
-            (Some(PlaceLayer::Neighbourhood), Some(level)) if verdict.is_some() => {
-                let outermost = suburb_levels.entry(country.clone()).or_insert(level);
-                *outermost = (*outermost).min(level);
-            }
-            _ => {}
-        }
-    }
-    for ((candidate, country), verdict) in candidates.iter().zip(countries).zip(verdicts.iter_mut())
-    {
-        if !has_locality.contains(country)
-            && *verdict == Some(PlaceLayer::Neighbourhood)
-            && candidate.boundary.admin_level == suburb_levels.get(country).copied()
-        {
-            *verdict = Some(PlaceLayer::Locality);
-        }
-    }
 }
 
 /// What libpostal's admin table says of each boundary (see
@@ -1169,19 +1195,6 @@ fn conventional_admin_layer(admin_level: u8) -> Option<PlaceLayer> {
     }
 }
 
-/// The admin level a layer conventionally corresponds to, for comparing an
-/// off-convention level against the layers around it.
-fn conventional_admin_layer_depth(layer: &PlaceLayer) -> Option<u8> {
-    match layer {
-        PlaceLayer::Country => Some(2),
-        PlaceLayer::Region => Some(4),
-        PlaceLayer::District => Some(6),
-        PlaceLayer::Locality => Some(8),
-        PlaceLayer::Neighbourhood => Some(10),
-        PlaceLayer::Place => None,
-    }
-}
-
 /// `ISO3166-1:alpha2` is only tagged on country boundaries, so every other
 /// boundary takes the country code of a country boundary that covers its
 /// representative point.
@@ -1211,12 +1224,23 @@ fn country_of_each_boundary(candidates: &[BoundaryCandidate]) -> Vec<Option<Stri
         })
         .collect::<Vec<_>>();
 
-    // With no more than one country in the extract there is nothing to tell
-    // apart, so skip the point-in-polygon work entirely and group as one.
-    let distinct = country_boundaries
-        .iter()
-        .map(|(_, code)| code.as_str())
-        .collect::<BTreeSet<_>>();
+    // A Geofabrik sub-national extract holds no level 2 boundary at all, so
+    // there is no country polygon to read a code off. The codes the other
+    // boundaries carry (from `ISO3166-2`) are then the only ones there are,
+    // and without them every boundary groups as `None` and libpostal's table
+    // is skipped for the whole extract -- the country's levels all fall back
+    // to the convention, which is wrong wherever the country departs from it.
+    let distinct = if country_boundaries.is_empty() {
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.boundary.inferred_country_code.as_deref())
+            .collect::<BTreeSet<_>>()
+    } else {
+        country_boundaries
+            .iter()
+            .map(|(_, code)| code.as_str())
+            .collect::<BTreeSet<_>>()
+    };
     if distinct.len() <= 1 {
         let only = distinct.into_iter().next().map(str::to_string);
         return candidates.iter().map(|_| only.clone()).collect();
@@ -1245,17 +1269,6 @@ const COUNTRY_ADMIN_LEVEL: u8 = 2;
 
 fn representative_point(geometry: &MultiPolygon<f64>) -> Option<[f64; 2]> {
     geometry.centroid().map(|point| [point.x(), point.y()])
-}
-
-fn choose_boundary<'a>(
-    layer: PlaceLayer,
-    boundaries: &[&'a AcceptedBoundary],
-    source_context: SourceContext<'_>,
-) -> Option<&'a AcceptedBoundary> {
-    boundaries
-        .iter()
-        .copied()
-        .min_by(|left, right| compare_boundary(layer, left, right, source_context))
 }
 
 fn compare_boundary(
@@ -1295,24 +1308,15 @@ fn source_value_for_layer<'a>(
     layer: PlaceLayer,
     source_context: SourceContext<'a>,
 ) -> Option<&'a str> {
+    // A sub-tier is a subdivision of the tier above and the source address
+    // states it in the same field, so both read one value.
     match layer {
         PlaceLayer::Country => source_context.country,
-        PlaceLayer::Region => source_context.region,
-        PlaceLayer::District => source_context.district,
-        PlaceLayer::Locality => source_context.locality,
-        PlaceLayer::Neighbourhood => source_context.neighbourhood,
+        PlaceLayer::Region | PlaceLayer::SubRegion => source_context.region,
+        PlaceLayer::District | PlaceLayer::SubDistrict => source_context.district,
+        PlaceLayer::Locality | PlaceLayer::SubLocality => source_context.locality,
+        PlaceLayer::Neighbourhood | PlaceLayer::SubNeighbourhood => source_context.neighbourhood,
         PlaceLayer::Place => source_context.place,
-    }
-}
-
-fn set_tuple_layer(tuple: &mut AdminContextTuple, layer: PlaceLayer, record_id: RecordId) {
-    match layer {
-        PlaceLayer::Country => tuple.country_record_id = Some(record_id),
-        PlaceLayer::Region => tuple.region_record_id = Some(record_id),
-        PlaceLayer::District => tuple.district_record_id = Some(record_id),
-        PlaceLayer::Locality => tuple.locality_record_id = Some(record_id),
-        PlaceLayer::Neighbourhood => tuple.neighbourhood_record_id = Some(record_id),
-        PlaceLayer::Place => tuple.place_record_id = Some(record_id),
     }
 }
 
@@ -1352,7 +1356,7 @@ mod tests {
 
         let assignment = index.context_for_point(-79.5, 43.5, SourceContext::default());
 
-        assert_eq!(assignment.admin_context.locality_record_id, Some(1));
+        assert_eq!(assignment.admin_context.locality_record_id(), Some(1));
         assert_eq!(assignment.flags, 0);
     }
 
@@ -1364,8 +1368,34 @@ mod tests {
 
         let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
 
-        assert_eq!(assignment.admin_context.locality_record_id, Some(10));
+        assert_eq!(assignment.admin_context.locality_record_id(), Some(10));
         assert_eq!(assignment.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);
+    }
+
+    /// The ACT as it really is: a district at 7 and a suburb at 9, nested.
+    /// A point in both must carry both -- the suburb reached no context at
+    /// all while only the conventional tiers were looked for, so every
+    /// Canberra address named its district and lost its suburb.
+    #[test]
+    fn a_point_carries_every_tier_it_lies_in() {
+        let district = square_boundary(
+            1,
+            "Canberra Central",
+            PlaceLayer::Locality,
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        let suburb = square_boundary(2, "Dickson", PlaceLayer::SubLocality, -0.5, -0.5, 0.5, 0.5);
+        let index = BoundaryIndex::new(vec![district, suburb]);
+
+        let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+
+        let tuple = &assignment.admin_context;
+        assert_eq!(tuple.get(PlaceLayer::Locality), Some(1), "the district");
+        assert_eq!(tuple.get(PlaceLayer::SubLocality), Some(2), "the suburb");
+        assert_eq!(tuple.entries().len(), 2, "both, not one: {tuple:?}");
     }
 
     /// Australia puts its suburbs at level 9 and uses no level 8, so without
@@ -1377,6 +1407,20 @@ mod tests {
         assert_eq!(layers[&9], PlaceLayer::Locality, "level 9 fills locality");
         assert_eq!(layers[&4], PlaceLayer::Region, "conventional levels keep");
         assert_eq!(layers[&6], PlaceLayer::District);
+    }
+
+    /// The ACT's real shape: a district at 7, suburbs at 9, nothing at 6 or
+    /// 8. Two spare levels in one country must take two layers -- before the
+    /// filled set was updated as each was placed, both asked for the same one
+    /// and the second fell to the innermost layer, leaving an address there
+    /// with a neighbourhood and no locality.
+    #[test]
+    fn two_spare_levels_take_two_layers() {
+        let layers = layers_for_levels(&[2, 4, 7, 9]);
+        assert_eq!(layers[&4], PlaceLayer::Region);
+        assert_eq!(layers[&7], PlaceLayer::Locality, "7 takes the first free");
+        assert_eq!(layers[&9], PlaceLayer::Neighbourhood, "9 takes the next");
+        assert_ne!(layers[&7], layers[&9], "two levels, two layers");
     }
 
     /// Germany fills 8, 9 and 10, so the conventional levels must keep their
@@ -1420,8 +1464,12 @@ mod tests {
         assert_eq!(layers[&4], PlaceLayer::Region);
         assert_eq!(layers[&6], PlaceLayer::District);
         assert_eq!(layers[&7], PlaceLayer::Locality, "tagged cities");
-        assert_eq!(layers[&8], PlaceLayer::Neighbourhood, "tagged wards");
+        // The wards sit below the locality and above the level 10
+        // neighbourhoods. Both were the neighbourhood tier while there was
+        // one for them to share, which dropped whichever lost the race.
+        assert_eq!(layers[&8], PlaceLayer::SubLocality, "tagged wards");
         assert_eq!(layers[&10], PlaceLayer::Neighbourhood);
+        assert_ne!(layers[&8], layers[&10], "one tier each");
     }
 
     /// Too few tagged boundaries, or tags that disagree, leave a level to
@@ -1439,6 +1487,128 @@ mod tests {
         assert_eq!(layers[&10], PlaceLayer::Neighbourhood, "split tags");
     }
 
+    /// Every country whose levels include a town must fill the locality
+    /// tier: that is the tier an address query matches a town on, so a
+    /// country that fills none answers no structured query.
+    ///
+    /// The countries the table gives no town at all (the UAE is a country
+    /// and its emirates, nothing below) are left out: no ranking can invent
+    /// a tier the source data does not describe.
+    ///
+    /// This is a smoke test over the whole table, not a check that each
+    /// country's tiers are the right ones -- only a fixture with ground
+    /// truth can say that.
+    #[test]
+    fn every_country_in_the_table_fills_locality() {
+        let mut empty = Vec::new();
+        for (country, levels) in admin_levels().levels_by_country() {
+            if levels.len() < 2 || !admin_levels().names_a_locality(&country) {
+                continue;
+            }
+            let layers = layers_for_levels_in(Some(&country), &levels);
+            if !layers.values().any(|layer| *layer == PlaceLayer::Locality) {
+                empty.push(format!("{country} {levels:?} -> {layers:?}"));
+            }
+        }
+        assert!(
+            empty.is_empty(),
+            "{} of the table's countries fill no locality:\n  {}",
+            empty.len(),
+            empty.join("\n  ")
+        );
+    }
+
+    /// The same, for a sub-national extract: a Geofabrik state download holds
+    /// no level 2 boundary, so the country is known only from the region's
+    /// ISO3166-2 tag. Without that fallback the whole table is skipped and
+    /// every level of the extract falls back on the convention.
+    #[test]
+    fn every_country_fills_locality_without_a_country_boundary() {
+        let mut empty = Vec::new();
+        for (country, levels) in admin_levels().levels_by_country() {
+            let levels = levels
+                .into_iter()
+                .filter(|level| *level > COUNTRY_ADMIN_LEVEL)
+                .collect::<Vec<_>>();
+            if levels.len() < 2 || !admin_levels().names_a_locality(&country) {
+                continue;
+            }
+            let layers = layers_for_levels_in(Some(&country), &levels);
+            if !layers.values().any(|layer| *layer == PlaceLayer::Locality) {
+                empty.push(format!("{country} {levels:?} -> {layers:?}"));
+            }
+        }
+        assert!(
+            empty.is_empty(),
+            "{} countries fill no locality without a country boundary:\n  {}",
+            empty.len(),
+            empty.join("\n  ")
+        );
+    }
+
+    /// Two levels of one country must never share a layer: the deeper one is
+    /// then dropped to the innermost layer and the slot it wanted stays
+    /// empty.
+    #[test]
+    fn every_country_gives_each_level_its_own_layer() {
+        let mut clashes = Vec::new();
+        for (country, levels) in admin_levels().levels_by_country() {
+            if levels.len() < 2 || !admin_levels().names_a_locality(&country) {
+                continue;
+            }
+            let layers = layers_for_levels_in(Some(&country), &levels);
+            let mut seen: BTreeMap<PlaceLayer, u8> = BTreeMap::new();
+            for (level, layer) in &layers {
+                if let Some(first) = seen.insert(*layer, *level) {
+                    clashes.push(format!("{country}: {first} and {level} both {layer:?}"));
+                }
+            }
+        }
+        assert!(
+            clashes.is_empty(),
+            "{} level clashes:\n  {}",
+            clashes.len(),
+            clashes.join("\n  ")
+        );
+    }
+
+    /// The claim this change exists for: a country deeper than the
+    /// conventional five keeps every level, each in a tier of its own.
+    /// Germany maps nine, three of them `state_district` and two
+    /// `city_district`; with five tiers four of the nine were dropped from
+    /// every German address.
+    #[test]
+    fn a_deep_country_keeps_every_level() {
+        let layers = layers_for_levels_in(Some("de"), &[2, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(layers.len(), 9, "nine levels");
+        let tiers = layers.values().collect::<BTreeSet<_>>();
+        assert_eq!(tiers.len(), 9, "nine tiers, nothing dropped: {layers:?}");
+        assert_eq!(layers[&8], PlaceLayer::Locality, "the city stays the city");
+        assert_eq!(layers[&2], PlaceLayer::Country);
+        assert_eq!(layers[&4], PlaceLayer::Region);
+    }
+
+    /// Every country of the table keeps each of its levels in its own tier.
+    /// Unsatisfiable while there were five, which is why the levels that
+    /// lost the race were dropped rather than ranked.
+    #[test]
+    fn no_country_drops_a_level() {
+        let mut dropped = Vec::new();
+        for (country, levels) in admin_levels().levels_by_country() {
+            let layers = layers_for_levels_in(Some(&country), &levels);
+            let tiers = layers.values().collect::<BTreeSet<_>>();
+            if tiers.len() != layers.len() {
+                dropped.push(format!("{country} {levels:?} -> {layers:?}"));
+            }
+        }
+        assert!(
+            dropped.is_empty(),
+            "{} countries drop a level:\n  {}",
+            dropped.len(),
+            dropped.join("\n  ")
+        );
+    }
+
     /// Builds one candidate per level inside a shared country boundary and
     /// returns the layer each one ends up in.
     fn layers_for_levels(levels: &[u8]) -> BTreeMap<u8, PlaceLayer> {
@@ -1450,9 +1620,27 @@ mod tests {
         )
     }
 
+    /// Like [`layers_for_levels`], in a named country, so the table's
+    /// per-country rows apply. Every boundary carries the code, which is what
+    /// an extract with no level 2 boundary has to fall back on.
+    fn layers_for_levels_in(country: Option<&str>, levels: &[u8]) -> BTreeMap<u8, PlaceLayer> {
+        let tagged = levels
+            .iter()
+            .map(|level| (*level, None, 1))
+            .collect::<Vec<_>>();
+        layers_for_tagged_levels_in(country, &tagged)
+    }
+
     /// Like [`layers_for_levels`], with `count` boundaries of each level and
     /// `place` tag layer. Every boundary of a level must end in one layer.
     fn layers_for_tagged_levels(
+        levels: &[(u8, Option<PlaceLayer>, usize)],
+    ) -> BTreeMap<u8, PlaceLayer> {
+        layers_for_tagged_levels_in(None, levels)
+    }
+
+    fn layers_for_tagged_levels_in(
+        country: Option<&str>,
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
         let mut candidates = Vec::new();
@@ -1484,7 +1672,9 @@ mod tests {
                     alt_names: Vec::new(),
                     place_layer,
                     designation: None,
-                    inferred_country_code: (level <= 2).then(|| "AU".to_string()),
+                    inferred_country_code: country
+                        .map(str::to_ascii_uppercase)
+                        .or_else(|| (level <= 2).then(|| "AU".to_string())),
                     representative_point: representative_point(&geometry).expect("point"),
                     geometry,
                 },
@@ -1510,8 +1700,8 @@ mod tests {
 
         let assignment = index.context_for_point(-79.0, 43.0, SourceContext::default());
 
-        assert_eq!(assignment.admin_context.country_record_id, Some(7));
-        assert_eq!(assignment.admin_context.region_record_id, Some(20));
+        assert_eq!(assignment.admin_context.country_record_id(), Some(7));
+        assert_eq!(assignment.admin_context.region_record_id(), Some(20));
     }
 
     #[test]
@@ -1622,8 +1812,8 @@ mod tests {
 
         let index = set.into_index(&[5], &HashMap::from([("CA".to_string(), 4)]));
         let context = index.context_for_point(-75.0, 45.0, SourceContext::default());
-        assert_eq!(context.admin_context.region_record_id, Some(5));
-        assert_eq!(context.admin_context.country_record_id, Some(4));
+        assert_eq!(context.admin_context.region_record_id(), Some(5));
+        assert_eq!(context.admin_context.country_record_id(), Some(4));
     }
 
     #[test]

@@ -121,8 +121,8 @@ fn indexed_area_names<'a>(
     context: &RecordContext,
     names: &'a HashMap<RecordId, Vec<String>>,
 ) -> impl Iterator<Item = &'a str> {
-    let tuple = context.admin_context;
-    let large = [tuple.country_record_id, tuple.place_record_id];
+    let tuple = &context.admin_context;
+    let large = [tuple.country_record_id(), tuple.place_record_id()];
     context
         .admin_context
         .parent_record_ids()
@@ -563,8 +563,8 @@ impl Reader {
     /// Toronto is a district with no locality over its core.
     pub fn locality(&self, record_id: RecordId) -> Result<Option<String>> {
         let Some(area_id) = self.boundary_context(record_id)?.and_then(|context| {
-            let tuple = context.admin_context;
-            tuple.locality_record_id.or(tuple.district_record_id)
+            let tuple = &context.admin_context;
+            tuple.locality_record_id().or(tuple.district_record_id())
         }) else {
             return Ok(None);
         };
@@ -688,7 +688,7 @@ impl BatchPreparer {
                 // boundary has none and no country filter finds it.
                 let country = context
                     .as_ref()
-                    .and_then(|context| context.admin_context.country_record_id)
+                    .and_then(|context| context.admin_context.country_record_id())
                     .and_then(|id| self.country_codes.get(&id))
                     .map(CountryCode::as_str);
                 Ok(PreparedRecord {

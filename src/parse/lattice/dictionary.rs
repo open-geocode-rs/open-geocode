@@ -683,14 +683,7 @@ impl RecordNames {
             }
             Record::Place(layer, place) => {
                 names.place = true;
-                let (field, level) = match layer {
-                    PlaceLayer::Country => (Field::Country, level::COUNTRY),
-                    PlaceLayer::Region => (Field::Region, level::REGION),
-                    PlaceLayer::District => (Field::Locality, level::DISTRICT),
-                    PlaceLayer::Locality => (Field::Locality, level::LOCALITY),
-                    PlaceLayer::Neighbourhood => (Field::Locality, level::NEIGHBOURHOOD),
-                    PlaceLayer::Place => (Field::Locality, level::PLACE),
-                };
+                let (field, level) = field_and_level(*layer);
                 for name in record.names() {
                     names.add(field, Some(name), level);
                 }
@@ -860,9 +853,9 @@ impl Builder {
 
     /// Count one written record: its own names, and its admin areas.
     pub fn add(&mut self, names: RecordNames, context: Option<&RecordContext>) {
-        let tuple = context.map(|context| context.admin_context);
+        let tuple = context.map(|context| &context.admin_context);
         let country = tuple
-            .and_then(|tuple| tuple.country_record_id)
+            .and_then(|tuple| tuple.country_record_id())
             .and_then(|id| self.country_codes.get(&id).copied())
             .or(names.country);
         for (field, name, level) in names.names {
@@ -873,26 +866,21 @@ impl Builder {
         let Some(tuple) = tuple else {
             return;
         };
-        self.contexts.insert(tuple);
+        self.contexts.insert(tuple.clone());
         let groups = tuple
-            .region_record_id
+            .region_record_id()
             .and_then(|region| self.region_groups.get(&region))
             .into_iter()
             .flatten()
             .map(|group| (Field::Region, level::REGION, Some(*group)))
             .collect::<Vec<_>>();
-        for (field, level, area) in groups.into_iter().chain([
-            (Field::Country, level::COUNTRY, tuple.country_record_id),
-            (Field::Region, level::REGION, tuple.region_record_id),
-            (Field::Locality, level::DISTRICT, tuple.district_record_id),
-            (Field::Locality, level::LOCALITY, tuple.locality_record_id),
-            (
-                Field::Locality,
-                level::NEIGHBOURHOOD,
-                tuple.neighbourhood_record_id,
-            ),
-            (Field::Locality, level::PLACE, tuple.place_record_id),
-        ]) {
+        // Walked rather than listed per tier, so a tier added to the chain is
+        // indexed without a second place to remember.
+        let tiers = tuple.entries().iter().map(|entry| {
+            let (field, level) = field_and_level(entry.tier);
+            (field, level, Some(entry.record_id))
+        });
+        for (field, level, area) in groups.into_iter().chain(tiers) {
             if let Some(area) = area {
                 self.areas
                     .entry(area)
@@ -1131,7 +1119,7 @@ impl Builder {
         // A record lies in the groups of its region as well.
         for context in &contexts {
             let groups = context
-                .region_record_id
+                .region_record_id()
                 .and_then(|region| region_groups.get(&region))
                 .into_iter()
                 .flatten()
@@ -1407,6 +1395,24 @@ pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
         .collect()
 }
 
+/// The dictionary field and level bit a context tier is indexed under.
+///
+/// A sub-tier is indexed at the level of the tier it divides: a query naming
+/// a district still has to match a country whose districts are mapped one
+/// level deeper, which is most of them.
+fn field_and_level(tier: PlaceLayer) -> (Field, u8) {
+    match tier {
+        PlaceLayer::Country => (Field::Country, level::COUNTRY),
+        PlaceLayer::Region | PlaceLayer::SubRegion => (Field::Region, level::REGION),
+        PlaceLayer::District | PlaceLayer::SubDistrict => (Field::Locality, level::DISTRICT),
+        PlaceLayer::Locality | PlaceLayer::SubLocality => (Field::Locality, level::LOCALITY),
+        PlaceLayer::Neighbourhood | PlaceLayer::SubNeighbourhood => {
+            (Field::Locality, level::NEIGHBOURHOOD)
+        }
+        PlaceLayer::Place => (Field::Locality, level::PLACE),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1570,10 +1576,7 @@ mod tests {
     fn every_name_of_an_area_counts_the_records_in_it() {
         let mut builder = Builder::default();
         let context = RecordContext {
-            admin_context: crate::pack::AdminContextTuple {
-                locality_record_id: Some(9),
-                ..Default::default()
-            },
+            admin_context: crate::pack::AdminContextTuple::from_tiers([(PlaceLayer::Locality, 9)]),
             flags: 0,
         };
         for _ in 0..3 {
@@ -1622,11 +1625,10 @@ mod tests {
     fn aliases_and_nesting_come_from_the_areas_records_lie_in() {
         let mut builder = Builder::default();
         let context = |region: RecordId, locality: RecordId| RecordContext {
-            admin_context: AdminContextTuple {
-                region_record_id: Some(region),
-                locality_record_id: Some(locality),
-                ..Default::default()
-            },
+            admin_context: AdminContextTuple::from_tiers([
+                (PlaceLayer::Region, region),
+                (PlaceLayer::Locality, locality),
+            ]),
             flags: 0,
         };
         for (region, locality) in [(1, 2), (3, 4), (3, 5)] {

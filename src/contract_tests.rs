@@ -485,12 +485,11 @@ fn write_pack(dir: &PathBuf) -> Ids {
         .collect(),
     );
     let context = Some(RecordContext {
-        admin_context: AdminContextTuple {
-            country_record_id: Some(country),
-            region_record_id: Some(region),
-            locality_record_id: Some(locality),
-            ..AdminContextTuple::default()
-        },
+        admin_context: AdminContextTuple::from_tiers([
+            (PlaceLayer::Country, country),
+            (PlaceLayer::Region, region),
+            (PlaceLayer::Locality, locality),
+        ]),
         flags: 0,
     });
     let king = AddressComponents {
@@ -513,7 +512,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 source: SourceProvenance::osm(OsmObjectType::Node, 10),
             }
             .into(),
-            context,
+            context.clone(),
         )
         .expect("address");
     writer
@@ -531,7 +530,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 source: SourceProvenance::osm(OsmObjectType::Way, 11),
             }
             .into(),
-            context,
+            context.clone(),
         )
         .expect("poi");
     writer
@@ -544,7 +543,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 source: SourceProvenance::osm(OsmObjectType::Way, 12),
             }
             .into(),
-            context,
+            context.clone(),
         )
         .expect("street");
     writer
@@ -570,7 +569,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 source: SourceProvenance::osm(OsmObjectType::Way, 13),
             }
             .into(),
-            context,
+            context.clone(),
         )
         .expect("interpolation");
     writer.finish().expect("finish");

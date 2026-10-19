@@ -110,7 +110,7 @@
         "type": "object"
       },
       "Context": {
-        "description": "The areas a record lies in, one per level: the admin areas most specific\nfirst, then the place area.",
+        "description": "The areas a record lies in, one per tier: the admin areas most specific\nfirst, then the place area.\n\nThe `sub` tiers carry the levels a country maps between the conventional\nones. Germany mapping three `state_district` levels used to mean two of\nthem were dropped from every German address; they are now the district\nand its subdistrict. The field is absent where a country does not map\nthat depth, as every field here already is, so a reader of the\nconventional tiers alone is unaffected.",
         "properties": {
           "country": {
             "$ref": "#/components/schemas/ContextArea"
@@ -129,6 +129,15 @@
             "description": "A named area outside the admin levels, mostly an island. It can be\nsmaller than a locality or larger than a region (Honshu)."
           },
           "region": {
+            "$ref": "#/components/schemas/ContextArea"
+          },
+          "subdistrict": {
+            "$ref": "#/components/schemas/ContextArea"
+          },
+          "sublocality": {
+            "$ref": "#/components/schemas/ContextArea"
+          },
+          "subregion": {
             "$ref": "#/components/schemas/ContextArea"
           }
         },

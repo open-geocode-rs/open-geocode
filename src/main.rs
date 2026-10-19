@@ -741,12 +741,12 @@ fn boundary_context_json(reader: &Reader, record_id: RecordId) -> Result<Value> 
     {
         let tuple = context.admin_context;
         for (key, value) in [
-            ("country", tuple.country_record_id),
-            ("region", tuple.region_record_id),
-            ("district", tuple.district_record_id),
-            ("locality", tuple.locality_record_id),
-            ("neighbourhood", tuple.neighbourhood_record_id),
-            ("place", tuple.place_record_id),
+            ("country", tuple.country_record_id()),
+            ("region", tuple.region_record_id()),
+            ("district", tuple.district_record_id()),
+            ("locality", tuple.locality_record_id()),
+            ("neighbourhood", tuple.neighbourhood_record_id()),
+            ("place", tuple.place_record_id()),
         ] {
             if let Some(parent_id) = value
                 && let Some(record) = reader.context_record(parent_id)?

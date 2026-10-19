@@ -2034,13 +2034,13 @@ impl<'a> Renderer<'a> {
         // names (a city drawn only as a district, a kreisfreie Stadt); a
         // district between the record's locality and its region is written
         // on the region side.
-        let (locality, district) = match tuple.locality_record_id {
+        let (locality, district) = match tuple.locality_record_id() {
             Some(locality) => (
                 self.admin_name(Some(locality), Field::Locality, random)?,
-                self.admin_name(tuple.district_record_id, Field::Locality, random)?,
+                self.admin_name(tuple.district_record_id(), Field::Locality, random)?,
             ),
             None => (
-                self.admin_name(tuple.district_record_id, Field::Locality, random)?,
+                self.admin_name(tuple.district_record_id(), Field::Locality, random)?,
                 None,
             ),
         };
@@ -2048,7 +2048,7 @@ impl<'a> Renderer<'a> {
         // locality: "Gütersloh" is a city as well as its Kreis, and a query
         // naming it means the city, as libpostal's data labels such names.
         let district = district.filter(|district| !self.names_a_locality(words(district).as_ref()));
-        let mut region = self.admin_name(tuple.region_record_id, Field::Region, random)?;
+        let mut region = self.admin_name(tuple.region_record_id(), Field::Region, random)?;
         // A city that is a region of its own (Berlin, Hamburg) is the
         // locality of the records in it that lie in no other.
         let locality = match locality {
@@ -2059,7 +2059,7 @@ impl<'a> Renderer<'a> {
             }
             locality => locality,
         };
-        if let Some(group) = self.region_group(tuple.region_record_id, random)? {
+        if let Some(group) = self.region_group(tuple.region_record_id(), random)? {
             region = Some(match region {
                 Some(region) if random.chance(REGION_AND_GROUP_SHARE) => {
                     if group.chars().next().is_some_and(is_unspaced) {
@@ -2071,7 +2071,7 @@ impl<'a> Renderer<'a> {
                 _ => group,
             });
         }
-        let countries = self.names(tuple.country_record_id)?;
+        let countries = self.names(tuple.country_record_id())?;
         let country_code = countries
             .first()
             .and_then(|name| normalize_index_text(name))
@@ -2081,8 +2081,8 @@ impl<'a> Renderer<'a> {
         Ok(Areas {
             locality,
             district,
-            island: self.name(tuple.place_record_id, random)?,
-            suburb: self.name(tuple.neighbourhood_record_id, random)?,
+            island: self.name(tuple.place_record_id(), random)?,
+            suburb: self.name(tuple.neighbourhood_record_id(), random)?,
             region,
             country,
             country_code,

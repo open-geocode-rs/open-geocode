@@ -84,6 +84,33 @@ impl AdminLevels {
     /// own id, its level inside another boundary (`inside` tells whether it
     /// lies in a given object), its designation, its level. `None` when the
     /// table says nothing of it.
+    /// Every country the table lists, with the levels it names and what it
+    /// calls each. For tests that must cover the whole table rather than the
+    /// handful of countries a fixture reaches.
+    #[cfg(test)]
+    pub(super) fn levels_by_country(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut by: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+        for ((country, level), verdict) in &self.levels {
+            if verdict.is_some() {
+                by.entry(country.clone()).or_default().push(*level);
+            }
+        }
+        for levels in by.values_mut() {
+            levels.sort_unstable();
+        }
+        by
+    }
+
+    /// Whether the table gives `country` a level it calls a town: a country
+    /// it describes only down to its regions (the UAE and its emirates) has
+    /// no locality tier to fill, and no ranking can invent one.
+    #[cfg(test)]
+    pub(super) fn names_a_locality(&self, country: &str) -> bool {
+        self.levels
+            .iter()
+            .any(|((at, _), verdict)| at == country && *verdict == Some(PlaceLayer::Locality))
+    }
+
     pub(super) fn verdict(
         &self,
         boundary: Boundary<'_>,

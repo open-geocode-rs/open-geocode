@@ -682,12 +682,12 @@ impl TextSearcher {
         {
             let tuple = context.admin_context;
             for (layer, record_id) in [
-                ("country", tuple.country_record_id),
-                ("region", tuple.region_record_id),
-                ("district", tuple.district_record_id),
-                ("locality", tuple.locality_record_id),
-                ("neighbourhood", tuple.neighbourhood_record_id),
-                ("place", tuple.place_record_id),
+                ("country", tuple.country_record_id()),
+                ("region", tuple.region_record_id()),
+                ("district", tuple.district_record_id()),
+                ("locality", tuple.locality_record_id()),
+                ("neighbourhood", tuple.neighbourhood_record_id()),
+                ("place", tuple.place_record_id()),
             ] {
                 if let Some(record_id) = record_id
                     && let Some(record) = self.pack.context_record(record_id)?
@@ -1951,10 +1951,7 @@ mod tests {
         let toronto = locality("Toronto", 101);
         let in_locality = |record_id| {
             Some(RecordContext {
-                admin_context: AdminContextTuple {
-                    locality_record_id: Some(record_id),
-                    ..AdminContextTuple::default()
-                },
+                admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, record_id)]),
                 flags: 0,
             })
         };
@@ -2012,10 +2009,7 @@ mod tests {
                 .collect(),
         );
         let in_township = Some(RecordContext {
-            admin_context: AdminContextTuple {
-                locality_record_id: Some(township),
-                ..AdminContextTuple::default()
-            },
+            admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, township)]),
             flags: 0,
         });
         let poi = |object_id, name: &str, address| PoiRecord {
@@ -2680,10 +2674,7 @@ mod tests {
         );
         let in_locality = |record_id| {
             Some(RecordContext {
-                admin_context: AdminContextTuple {
-                    locality_record_id: Some(record_id),
-                    ..AdminContextTuple::default()
-                },
+                admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, record_id)]),
                 flags: 0,
             })
         };
@@ -3276,10 +3267,10 @@ mod tests {
                 )
                 .into(),
                 Some(RecordContext {
-                    admin_context: AdminContextTuple {
-                        locality_record_id: Some(huron_east),
-                        ..AdminContextTuple::default()
-                    },
+                    admin_context: AdminContextTuple::from_tiers([(
+                        PlaceLayer::Locality,
+                        huron_east,
+                    )]),
                     flags: 0,
                 }),
             )

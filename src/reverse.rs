@@ -570,10 +570,10 @@ mod tests {
             .write(
                 &address.into(),
                 Some(RecordContext {
-                    admin_context: AdminContextTuple {
-                        locality_record_id: Some(locality_id),
-                        ..AdminContextTuple::default()
-                    },
+                    admin_context: AdminContextTuple::from_tiers([(
+                        PlaceLayer::Locality,
+                        locality_id,
+                    )]),
                     flags: 0,
                 }),
             )

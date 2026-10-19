@@ -499,7 +499,7 @@ pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture
         let name = normalize_index_text(&poi.name).unwrap_or_default();
         let tuple = context.admin_context;
         let mut areas = Vec::new();
-        for area_id in [tuple.locality_record_id, tuple.district_record_id]
+        for area_id in [tuple.locality_record_id(), tuple.district_record_id()]
             .into_iter()
             .flatten()
         {
@@ -659,23 +659,27 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let in_area = |locality, district| {
+        let in_area = |locality: Option<crate::pack::RecordId>,
+                       district: Option<crate::pack::RecordId>| {
             Some(RecordContext {
-                admin_context: AdminContextTuple {
-                    locality_record_id: locality,
-                    district_record_id: district,
-                    ..AdminContextTuple::default()
-                },
+                admin_context: AdminContextTuple::from_tiers(
+                    [
+                        locality.map(|id| (PlaceLayer::Locality, id)),
+                        district.map(|id| (PlaceLayer::District, id)),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                ),
                 flags: 0,
             })
         };
         let downtown = in_area(None, Some(toronto));
         for (object_id, name, context) in [
             // Two in Toronto share a name: neither can be expected.
-            (10, "Tim Hortons", downtown),
-            (11, "TIM  HORTONS", downtown),
+            (10, "Tim Hortons", downtown.clone()),
+            (11, "TIM  HORTONS", downtown.clone()),
             (12, "Tim Hortons", in_area(Some(hamilton), None)),
-            (13, "Riverdale Farm", downtown),
+            (13, "Riverdale Farm", downtown.clone()),
             // No locality to query it with.
             (14, "Lonely Cabin", None),
             // Unique in North York, but "Ali Baba, Toronto" would find both.

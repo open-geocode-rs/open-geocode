@@ -699,7 +699,8 @@ fn write_ordered(
                             .map(|pending| {
                                 let located = record_context(index, &pending.record);
                                 let country = located
-                                    .and_then(|context| context.admin_context.country_record_id);
+                                    .as_ref()
+                                    .and_then(|context| context.admin_context.country_record_id());
                                 let context: Option<RecordContext> = match pending.origin {
                                     Some(_) => None,
                                     None => located,
@@ -1169,9 +1170,9 @@ mod tests {
                 .expect("context")
                 .name
         };
-        assert_eq!(name(context.admin_context.locality_record_id), "Toronto");
-        assert_eq!(name(context.admin_context.region_record_id), "Ontario");
-        assert_eq!(name(context.admin_context.country_record_id), "Canada");
+        assert_eq!(name(context.admin_context.locality_record_id()), "Toronto");
+        assert_eq!(name(context.admin_context.region_record_id()), "Ontario");
+        assert_eq!(name(context.admin_context.country_record_id()), "Canada");
 
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let hits = searcher
@@ -1456,8 +1457,8 @@ mod tests {
             .expect("context")
             .expect("address context")
             .admin_context;
-        assert_eq!(context.place_record_id, Some(island));
-        assert_eq!(context.neighbourhood_record_id, Some(suburb));
+        assert_eq!(context.place_record_id(), Some(island));
+        assert_eq!(context.neighbourhood_record_id(), Some(suburb));
 
         let tagger = crate::parse::lattice::LatticeTagger::open(&dir.join("pack")).expect("tagger");
         use crate::parse::lattice::dictionary::Field;

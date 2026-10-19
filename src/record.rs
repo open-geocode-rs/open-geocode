@@ -177,31 +177,101 @@ impl Layer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A tier of the admin hierarchy, outermost first.
+///
+/// The tiers between the conventional ones (`SubRegion`, `SubDistrict`,
+/// `SubLocality`) exist because a country's hierarchy is deeper than the
+/// conventional five. Germany maps nine admin levels, three of them
+/// `state_district` and two `city_district`; with one tier each those
+/// collapse and all but one boundary of each is dropped from every German
+/// address. The names follow the commercial geocoders, which hit the same
+/// wall and answered it the same way: HERE and AWS prefix `sub`, TomTom
+/// counts `secondary`/`tertiary`, Google numbers `administrative_area_level_N`
+/// up to 7 and `sublocality_level_N` up to 5.
+///
+/// Ordering is the hierarchy, outermost to innermost, and is relied on: a
+/// chain is sorted by it. `Place` sorts last because it is no admin tier at
+/// all -- an island can be smaller than a locality or larger than a region.
+/// The discriminants are the Pack's on-disk encoding of a context tier, so a
+/// variant may not be reordered or renumbered without a `CONTEXT_VERSION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
 pub enum PlaceLayer {
-    Country,
-    Region,
-    District,
-    Place,
-    Locality,
-    Neighbourhood,
+    Country = 0,
+    Region = 1,
+    SubRegion = 2,
+    District = 3,
+    SubDistrict = 4,
+    Locality = 5,
+    SubLocality = 6,
+    Neighbourhood = 7,
+    SubNeighbourhood = 8,
+    Place = 9,
 }
 
 impl PlaceLayer {
+    pub const ALL: [PlaceLayer; 10] = [
+        PlaceLayer::Country,
+        PlaceLayer::Region,
+        PlaceLayer::SubRegion,
+        PlaceLayer::District,
+        PlaceLayer::SubDistrict,
+        PlaceLayer::Locality,
+        PlaceLayer::SubLocality,
+        PlaceLayer::Neighbourhood,
+        PlaceLayer::SubNeighbourhood,
+        PlaceLayer::Place,
+    ];
+}
+
+impl PlaceLayer {
+    /// Every admin tier, outermost first. `Place` is left out: it belongs to
+    /// place areas, not to the admin hierarchy.
+    pub const ADMIN: [PlaceLayer; 9] = [
+        PlaceLayer::Country,
+        PlaceLayer::Region,
+        PlaceLayer::SubRegion,
+        PlaceLayer::District,
+        PlaceLayer::SubDistrict,
+        PlaceLayer::Locality,
+        PlaceLayer::SubLocality,
+        PlaceLayer::Neighbourhood,
+        PlaceLayer::SubNeighbourhood,
+    ];
+
     pub const fn as_str(self) -> &'static str {
-        Layer::from_place(self).as_str()
+        match self {
+            PlaceLayer::SubRegion => "subregion",
+            PlaceLayer::SubDistrict => "subdistrict",
+            PlaceLayer::SubLocality => "sublocality",
+            PlaceLayer::SubNeighbourhood => "subneighbourhood",
+            other => Layer::from_place(other).as_str(),
+        }
+    }
+
+    /// The record layer a tier is stored as. The tiers [`Layer`] has no
+    /// variant for are stored as the conventional tier above them, which is
+    /// what they are a subdivision of.
+    pub const fn record_layer(self) -> Layer {
+        Layer::from_place(self)
     }
 }
 
 impl Layer {
+    /// The record layer a place tier is stored and searched as. A `Sub` tier
+    /// has no [`Layer`] of its own: it is a subdivision of the tier above and
+    /// is searched as one, so a query for a district still matches a
+    /// subdistrict. The tier itself is kept on the context entry, which is
+    /// what the response reports.
     pub const fn from_place(layer: PlaceLayer) -> Self {
         match layer {
             PlaceLayer::Country => Layer::Country,
-            PlaceLayer::Region => Layer::Region,
-            PlaceLayer::District => Layer::District,
+            PlaceLayer::Region | PlaceLayer::SubRegion => Layer::Region,
+            PlaceLayer::District | PlaceLayer::SubDistrict => Layer::District,
             PlaceLayer::Place => Layer::Place,
-            PlaceLayer::Locality => Layer::Locality,
-            PlaceLayer::Neighbourhood => Layer::Neighbourhood,
+            PlaceLayer::Locality | PlaceLayer::SubLocality => Layer::Locality,
+            PlaceLayer::Neighbourhood | PlaceLayer::SubNeighbourhood => Layer::Neighbourhood,
         }
     }
 }
