@@ -107,7 +107,7 @@ mod platform {
 
     use super::Resources;
 
-    pub fn probe() -> Resources {
+    pub(super) fn probe() -> Resources {
         let (usable_cpus, cpu_limit) = cpus();
         let mut resources = Resources {
             usable_cpus,
@@ -116,6 +116,7 @@ mod platform {
         };
         let mut status = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            // SAFETY: MEMORYSTATUSEX is plain integers, valid all zero.
             ..unsafe { std::mem::zeroed() }
         };
         // SAFETY: `status` is a MEMORYSTATUSEX with its length set.
@@ -182,6 +183,7 @@ mod platform {
 
     /// The memory limit of the Job object this process is in, if any.
     fn job_memory_limit() -> Option<u64> {
+        // SAFETY: the limit information is plain integers, valid all zero.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: as in `cpus`.
         let queried = unsafe {
@@ -209,6 +211,7 @@ mod platform {
 
     /// Bytes this process has committed.
     fn private_bytes() -> u64 {
+        // SAFETY: the counters are plain integers, valid all zero.
         let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
         counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         // SAFETY: the EX counters start with the plain ones, and `cb` says
@@ -227,7 +230,7 @@ mod platform {
         }
     }
 
-    pub fn free_disk(path: &Path) -> Option<u64> {
+    pub(super) fn free_disk(path: &Path) -> Option<u64> {
         let wide = path
             .as_os_str()
             .encode_wide()
@@ -246,7 +249,7 @@ mod platform {
         read.then_some(free)
     }
 
-    pub fn same_volume(left: &Path, right: &Path) -> bool {
+    pub(super) fn same_volume(left: &Path, right: &Path) -> bool {
         // The drive or share each path starts with.
         let root = |path: &Path| {
             path.components()
@@ -256,7 +259,7 @@ mod platform {
         root(left) == root(right)
     }
 
-    pub fn opt_out_of_power_throttling() {
+    pub(super) fn opt_out_of_power_throttling() {
         let state = PROCESS_POWER_THROTTLING_STATE {
             Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
