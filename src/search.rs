@@ -32,7 +32,7 @@ use crate::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
         PlaceLayer, PoiRecord, Record,
     },
-    spatial_index,
+    spatial_index::{self, haversine_m},
     text_index::{
         Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
         RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms, base_house_number,
@@ -140,6 +140,14 @@ const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 /// their leading characters (a Canadian FSA, a US sectional centre, the start
 /// of a UK outward code).
 const POSTCODE_AREA_CHARS: usize = 3;
+/// How a hit's distance from the named postcode ranks it: hits in the same
+/// band tie on it and are ranked by what comes after.
+const POSTCODE_NEARNESS_BANDS_M: [f64; 8] = [
+    1_000.0, 2_000.0, 5_000.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0, 200_000.0,
+];
+/// Records of one postcode looked up for a query; a code is shared by at most
+/// a few countries.
+const POSTCODE_RECORD_LIMIT: usize = 16;
 /// Hits ranked per requested hit: the text index keeps this window of the
 /// best ranked records (see [`RankKey`]), and ties within it are broken by
 /// [`TieBreak`].
@@ -629,7 +637,7 @@ impl TextSearcher {
             house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
             number_text: plan.house_number.as_ref().map(|number| number.text.clone()),
             numbered: plan.house_number.is_some(),
-            postcode: plan.postcode(),
+            postcode: self.query_postcode(plan)?,
         };
         let mut hits = Vec::new();
         if pass == Pass::Street
@@ -780,6 +788,47 @@ impl TextSearcher {
         Ok(in_area.unwrap_or(true))
     }
 
+    /// The postcode `plan` names, with the points of the Pack's records of
+    /// it, so hits can be ranked and judged by how far they lie from it.
+    fn query_postcode(&self, plan: &QueryPlan) -> Result<QueryPostcode> {
+        let mut postcode = plan.postcode();
+        if postcode.forms.is_empty() {
+            return Ok(postcode);
+        }
+        let terms = unique_strings(
+            std::iter::once(postcode.exact.clone())
+                .chain(postcode.forms.iter().cloned())
+                .collect(),
+        );
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, self.layer_query(Layer::Postcode.as_str())),
+            (
+                Occur::Must,
+                Box::new(BooleanQuery::new(
+                    terms
+                        .iter()
+                        .map(|term| {
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(
+                                    Term::from_field_text(self.fields.postcode_exact, term),
+                                    IndexRecordOption::Basic,
+                                )) as Box<dyn Query>,
+                            )
+                        })
+                        .collect(),
+                )),
+            ),
+        ]);
+        let searcher = self.reader.searcher();
+        for (_, doc) in searcher.search(&query, &TopDocs::with_limit(POSTCODE_RECORD_LIMIT))? {
+            let (record_id, _) = self.document_records(&searcher, doc)?;
+            let (_, lon, lat) = self.pack.records().point(record_id)?;
+            postcode.points.push([lon, lat]);
+        }
+        Ok(postcode)
+    }
+
     fn build_autocomplete_query(
         &self,
         query_text: &str,
@@ -860,6 +909,7 @@ impl TextSearcher {
                 &TopDocs::with_limit(window).tweak_score(RankKeys {
                     ranking,
                     columns: &self.columns,
+                    pack: &self.pack,
                 }),
             )?
         } else {
@@ -1343,6 +1393,7 @@ impl RankKey {
 struct RankKeys<'a> {
     ranking: &'a Ranking,
     columns: &'a HashMap<SegmentId, SegmentColumns>,
+    pack: &'a Arc<pack::Reader>,
 }
 
 struct SegmentRankKeys {
@@ -1350,6 +1401,45 @@ struct SegmentRankKeys {
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     postcode: Option<(StrColumn, Vec<Vec<Range<u64>>>)>,
+    nearness: Option<PostcodeNearness>,
+}
+
+/// Ranks a matched record by its distance from the records of the postcode a
+/// query names, when the record does not have that postcode itself. The first
+/// address of a street group stands for all of it: they share a street, their
+/// areas and the postcode nearest them.
+struct PostcodeNearness {
+    record_id: Column<u64>,
+    pack: Arc<pack::Reader>,
+    postcode: QueryPostcode,
+    /// The agreement of a record whose postcode is the named one in full.
+    full_agreement: u8,
+}
+
+impl PostcodeNearness {
+    fn fit(&self, doc: DocId, agreement: u8) -> u8 {
+        if agreement >= self.full_agreement {
+            return u8::MAX;
+        }
+        // Beyond the last band (a code shared with another country) only
+        // the agreement ranks, as without the postcode's records.
+        let Some(distance) = self
+            .record_id
+            .first(doc)
+            .and_then(|record_id| self.pack.records().point(record_id).ok())
+            .and_then(|(_, lon, lat)| self.postcode.distance_m(lon, lat))
+            .filter(|distance| {
+                *distance <= POSTCODE_NEARNESS_BANDS_M[POSTCODE_NEARNESS_BANDS_M.len() - 1]
+            })
+        else {
+            return agreement;
+        };
+        let band = POSTCODE_NEARNESS_BANDS_M
+            .iter()
+            .filter(|band| distance > **band)
+            .count();
+        u8::MAX - 1 - band as u8
+    }
 }
 
 impl ScoreTweaker<RankKey> for RankKeys<'_> {
@@ -1368,11 +1458,26 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             }
             _ => None,
         };
+        let nearness = (!self.ranking.postcode.points.is_empty()).then(|| PostcodeNearness {
+            record_id: columns.record_id.clone(),
+            pack: Arc::clone(self.pack),
+            postcode: self.ranking.postcode.clone(),
+            full_agreement: self
+                .ranking
+                .postcode
+                .forms
+                .iter()
+                .map(|form| form.chars().count())
+                .min()
+                .unwrap_or(0)
+                .min(u8::MAX.into()) as u8,
+        });
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             postcode,
+            nearness,
         })
     }
 }
@@ -1392,6 +1497,9 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
                 .map(|ord| QueryPostcode::agreement_of_ord(ranges, ord))
                 .max()
                 .unwrap_or(0);
+        }
+        if let Some(nearness) = &self.nearness {
+            key.postcode_agreement = nearness.fit(doc, key.postcode_agreement);
         }
         key
     }
@@ -1509,9 +1617,23 @@ struct QueryPostcode {
     /// Compacted forms of the postcode part: all of it, and from its first
     /// word with a digit when other words lead ("on m5c 2a1" is "m5c2a1").
     forms: Vec<String>,
+    /// The part as the postcode field indexes it ("m5v 1a1").
+    exact: String,
+    /// Points of the Pack's records of the postcode, found by
+    /// [`TextSearcher::query_postcode`].
+    points: Vec<[f64; 2]>,
 }
 
 impl QueryPostcode {
+    /// How far a point lies from the nearest record of the postcode, when the
+    /// Pack has one.
+    fn distance_m(&self, lon: f64, lat: f64) -> Option<f64> {
+        self.points
+            .iter()
+            .map(|[point_lon, point_lat]| haversine_m(lon, lat, *point_lon, *point_lat))
+            .min_by(f64::total_cmp)
+    }
+
     fn agreement(&self, postcode: &str) -> u8 {
         self.forms
             .iter()
@@ -1738,6 +1860,8 @@ impl QueryPlan {
             .unwrap_or_default();
         QueryPostcode {
             forms: unique_strings(vec![words.concat(), words[first_digit..].concat()]),
+            exact: words.join(" "),
+            points: Vec::new(),
         }
     }
 }
@@ -1920,6 +2044,72 @@ mod tests {
             geocode(&searcher, "10 King Street", None, Some("M5V")).as_deref(),
             Some("osm:node:1")
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_ranks_hits_by_distance_from_the_named_postcode() {
+        let temp_dir = temp_pack_path("geocode-postcode-distance");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut write_postcode = |postcode: &str, lon: f64| {
+            writer
+                .write(
+                    &PostcodeRecord {
+                        postcode: postcode.to_string(),
+                        geometry: point_geometry(lon, 43.0),
+                        source: DerivedSourceProvenance::osm_address_records(5),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("postcode");
+        };
+        // A rural address lies about 12 km from the record of its postcode,
+        // too far for the postcode nearest it to stand in for its own.
+        write_postcode("3902", -76.15);
+        for id in 1..=12 {
+            write_postcode("3000", -90.0 - id as f64 + 0.001);
+        }
+        for id in 1..=12 {
+            let town = format!("Town {id}");
+            let mut record = address_record(
+                &format!("osm:node:{id}"),
+                "",
+                "10",
+                "King Street",
+                Some(&town),
+                None,
+            );
+            record.geometry = point_geometry(-90.0 - id as f64, 43.0);
+            writer.write(&record.into(), None).expect("address");
+        }
+        let mut rural = address_record(
+            "osm:node:99",
+            "",
+            "10",
+            "King Street",
+            Some("Bairnsdale"),
+            None,
+        );
+        rural.geometry = point_geometry(-76.0, 43.0);
+        writer.write(&rural.into(), None).expect("address");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        let hit = searcher
+            .geocode_address(AddressGeocodeOptions {
+                address: "10 King Street".to_string(),
+                locality: None,
+                region: None,
+                postcode: Some("3902".to_string()),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+            })
+            .expect("geocode")
+            .map(|hit| hit.hit.record.id);
+        assert_eq!(hit.as_deref(), Some("osm:node:99"));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
