@@ -2,7 +2,7 @@
 
 ## G-NAF (Geoscape Geocoded National Address File)
 
-The `tas-gnaf-*.json` answer keys derive from the **Geoscape Geocoded National
+The `tas-gnaf-*.json` and `act-gnaf-*.json` answer keys derive from the **Geoscape Geocoded National
 Address File (G-NAF)**, August 2026 release, GDA2020, PSV distribution.
 
 Incorporates or developed using G-NAF © Geoscape Australia, licensed by the
@@ -31,9 +31,22 @@ The Pack under test is built from a Geofabrik Tasmania extract.
 | G-NAF release | AUG 2026, GDA2020, PSV |
 | G-NAF archive | 1,854,931,188 bytes |
 | Tasmania PBF | `tasmania-latest.osm.pbf`, 53,990,757 bytes |
+| ACT PBF | `australian-capital-territory-latest.osm.pbf`, 19,229,525 bytes |
 | Tasmania PBF sha256 | `25c2ba70433431f6dabce4bc8a56bb5dd65d0f3f7105f5815febb63efc29334f` |
 | PBF retrieved | 2026-10-12T03:40:28Z |
 | Sample seed | 2026 |
+
+## The ACT key
+
+The ACT answers the question Tasmania cannot: what a Pack does where OSM
+carries no boundary at the level the country's table calls a city. Canberra's
+suburbs sit at `admin_level` 9 and its districts at 7, so an extract has
+nothing at 8. 27,214 ACT addresses qualify; 2,000 are the dev key and 8,000
+the holdout, drawn with the same seed.
+
+`STREET_TYPE_CODE` already holds the full word (`CIRCUIT`), and
+`Authority_Code_STREET_TYPE_AUT` maps that to an abbreviation, which is the
+wrong direction for a query a person would type. The key uses the code.
 
 ## Regenerating
 
