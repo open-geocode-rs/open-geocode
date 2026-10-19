@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    builder::plan::BuildPlan,
+    builder::{osm::LOCALITY_KEYS, plan::BuildPlan},
     parse::lattice::train::Report,
     record::{AddressRecord, LocationPrecision, OsmObjectType, PlaceLayer, PoiRecord},
     resources::Resources,
@@ -1184,7 +1184,7 @@ fn missing_housenumber_shape(addr_tags: &BTreeMap<String, String>) -> &'static s
 
     let has_street = addr_tags.contains_key("addr:street");
     let has_place = addr_tags.contains_key("addr:place");
-    let has_city = addr_tags.contains_key("addr:city");
+    let has_city = LOCALITY_KEYS.iter().any(|key| addr_tags.contains_key(*key));
     let has_postcode = addr_tags.contains_key("addr:postcode");
 
     match (has_street, has_place, has_city, has_postcode) {
@@ -1201,7 +1201,7 @@ fn missing_housenumber_shape(addr_tags: &BTreeMap<String, String>) -> &'static s
 fn missing_street_or_place_shape(addr_tags: &BTreeMap<String, String>) -> &'static str {
     let has_house_number = addr_tags.contains_key("addr:housenumber");
     let has_unit = addr_tags.contains_key("addr:unit");
-    let has_city = addr_tags.contains_key("addr:city");
+    let has_city = LOCALITY_KEYS.iter().any(|key| addr_tags.contains_key(*key));
     let has_postcode = addr_tags.contains_key("addr:postcode");
 
     match (has_house_number, has_unit, has_city, has_postcode) {

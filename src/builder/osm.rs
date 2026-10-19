@@ -32,6 +32,7 @@
 //! ```
 
 mod address;
+pub(crate) use address::LOCALITY_KEYS;
 mod admin_levels;
 mod boundary;
 mod containment;

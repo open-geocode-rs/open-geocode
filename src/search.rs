@@ -29,7 +29,8 @@ use crate::{
         types::{Label, Tagged},
     },
     record::{
-        AddressComponents, DERIVED_FROM_ADDRESS_RECORDS, Layer, OsmObjectType, PoiRecord, Record,
+        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, OsmObjectType,
+        PlaceLayer, PoiRecord, Record,
     },
     spatial_index,
     text_index::{
@@ -657,89 +658,78 @@ impl TextSearcher {
         let desired_region = normalized_for_match(options.region.as_deref());
         let desired_locality = normalized_for_match(options.locality.as_deref());
         let desired_postcode = options.postcode.as_deref().and_then(compact_postcode);
-        if desired_region.is_none() && desired_locality.is_none() && desired_postcode.is_none() {
-            return Ok(true);
-        }
-
         if let Some(desired) = &desired_postcode
             && !self.hit_in_postcode(hit, desired)?
         {
             return Ok(false);
         }
+        if desired_region.is_none() && desired_locality.is_none() {
+            return Ok(true);
+        }
+        let areas = self.areas_of(hit.record_id)?;
+        Ok(
+            desired_region.is_none_or(|region| areas.regions.contains(&region))
+                && desired_locality.is_none_or(|locality| areas.localities.contains(&locality)),
+        )
+    }
 
-        // A community inside a larger municipality (Seaforth in Huron East) has
-        // no boundary of its own, but the record can state it.
-        let locality_stated = match &desired_locality {
-            Some(locality) => self.record_states_locality(hit.record_id, locality)?,
-            None => false,
-        };
-        let desired_locality = desired_locality.filter(|_| !locality_stated);
-        let Some(context) = self.pack.boundary_context(hit.record_id)? else {
-            return Ok(desired_region.is_none() && desired_locality.is_none());
-        };
-
-        let mut admin_labels = Vec::new();
-        {
-            let tuple = context.admin_context;
-            for (layer, record_id) in [
-                ("country", tuple.country_record_id()),
-                ("region", tuple.region_record_id()),
-                ("district", tuple.district_record_id()),
-                ("locality", tuple.locality_record_id()),
-                ("neighbourhood", tuple.neighbourhood_record_id()),
-                ("place", tuple.place_record_id()),
-            ] {
-                if let Some(record_id) = record_id
-                    && let Some(record) = self.pack.context_record(record_id)?
+    /// Every name a record lies in: what its own address states and every
+    /// area of its chain, whatever tier the chain ranks it. A community
+    /// inside a larger municipality (Seaforth in Huron East) or a suburb
+    /// mapped only as a point (Grey Lynn in Auckland) has no boundary of its
+    /// own, but the address can state it.
+    fn areas_of(&self, record_id: RecordId) -> Result<RecordAreas> {
+        let mut areas = RecordAreas::default();
+        match self.pack.records().record(record_id)? {
+            Record::Address(AddressRecord { address, .. })
+            | Record::Poi(PoiRecord {
+                address: Some(address),
+                ..
+            }) => {
+                areas.add_region(address.region.as_deref());
+                for name in [&address.locality, &address.place].into_iter().flatten() {
+                    areas.add_locality(name);
+                }
+                for name in &address.areas {
+                    areas.add_locality(name);
+                }
+            }
+            Record::Interpolation(record) => {
+                areas.add_region(record.address.region.as_deref());
+                for name in [&record.address.locality, &record.address.place]
+                    .into_iter()
+                    .flatten()
                 {
-                    admin_labels.push((
-                        layer,
-                        normalized_for_match(Some(&record.label)),
-                        normalized_for_match(Some(&record.name)),
-                    ));
+                    areas.add_locality(name);
+                }
+            }
+            _ => {}
+        }
+        let Some(context) = self.pack.boundary_context(record_id)? else {
+            return Ok(areas);
+        };
+        for entry in context.admin_context.entries() {
+            let region = entry
+                .tiers
+                .iter()
+                .any(|tier| matches!(tier, PlaceLayer::Region | PlaceLayer::SubRegion));
+            let below_region = entry.tiers.iter().any(|tier| tier > PlaceLayer::SubRegion);
+            if !(region || below_region) {
+                continue;
+            }
+            let Some(record) = self.pack.context_record(entry.record_id)? else {
+                continue;
+            };
+            for name in [&record.label, &record.name] {
+                if region {
+                    areas.add_region(Some(name));
+                }
+                if below_region {
+                    areas.add_locality(name);
                 }
             }
         }
-
-        if let Some(region) = desired_region
-            && !admin_labels.iter().any(|(layer, label, name)| {
-                *layer == "region"
-                    && (label.as_deref() == Some(region.as_str())
-                        || name.as_deref() == Some(region.as_str()))
-            })
-        {
-            return Ok(false);
-        }
-
-        if let Some(locality) = desired_locality {
-            let locality_layers = ["district", "locality", "neighbourhood", "place"];
-            if !admin_labels.iter().any(|(layer, label, name)| {
-                locality_layers.contains(layer)
-                    && (label.as_deref() == Some(locality.as_str())
-                        || name.as_deref() == Some(locality.as_str()))
-            }) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Whether the record's own address names `locality` (normalized) as its
-    /// `addr:city` or `addr:place`.
-    fn record_states_locality(&self, record_id: RecordId, locality: &str) -> Result<bool> {
-        let (city, place) = match self.pack.records().record(record_id)? {
-            Record::Address(record) => (record.address.locality, record.address.place),
-            Record::Poi(PoiRecord {
-                address: Some(address),
-                ..
-            }) => (address.locality, address.place),
-            Record::Interpolation(record) => (record.address.locality, record.address.place),
-            _ => return Ok(false),
-        };
-        Ok([city, place]
-            .iter()
-            .any(|name| normalized_for_match(name.as_deref()).as_deref() == Some(locality)))
+        Ok(areas)
     }
 
     /// Whether a hit can be in the requested (compacted) postcode.
@@ -1226,6 +1216,28 @@ impl TextSearcher {
 }
 
 /// A stated house number beside one no record states.
+/// The names a record lies in, normalized for matching: its regions, and the
+/// areas below them that a locality may name.
+#[derive(Debug, Default)]
+struct RecordAreas {
+    regions: Vec<String>,
+    localities: Vec<String>,
+}
+
+impl RecordAreas {
+    fn add_region(&mut self, name: Option<&str>) {
+        if let Some(name) = normalized_for_match(name) {
+            self.regions.push(name);
+        }
+    }
+
+    fn add_locality(&mut self, name: &str) {
+        if let Some(name) = normalized_for_match(Some(name)) {
+            self.localities.push(name);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Neighbour {
     record_id: RecordId,
@@ -3287,6 +3299,86 @@ mod tests {
         }
         assert_eq!(
             geocode(&searcher, "18 Main Street South", Some("Goderich"), None),
+            None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_accepts_any_area_the_record_lies_in() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("geocode-areas");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut area = |layer: PlaceLayer, name: &str, object_id: i64| {
+            writer
+                .write(
+                    &Record::Place(
+                        layer,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: name.to_string(),
+                            place_type: "boundary".to_string(),
+                            geometry: point_geometry(174.7, -36.8),
+                            source: SourceProvenance::osm(OsmObjectType::Relation, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("area")
+        };
+        let auckland = area(PlaceLayer::Locality, "Auckland", 1);
+        let dickson = area(PlaceLayer::SubLocality, "Dickson", 2);
+        // Grey Lynn is a point in OSM: no boundary holds the address, but
+        // the address states it.
+        let mut grey_lynn = address_record("osm:node:3", "", "123", "Crummer Road", None, None);
+        grey_lynn.address.areas = vec!["Grey Lynn".to_string()];
+        writer
+            .write(
+                &grey_lynn.into(),
+                Some(RecordContext {
+                    admin_context: AdminContextTuple::from_tiers([(
+                        PlaceLayer::Locality,
+                        auckland,
+                    )]),
+                    flags: 0,
+                }),
+            )
+            .expect("stated suburb");
+        // An ACT suburb is ranked below the locality.
+        writer
+            .write(
+                &address_record("osm:node:4", "", "38", "Archer Street", None, None).into(),
+                Some(RecordContext {
+                    admin_context: AdminContextTuple::from_tiers([(
+                        PlaceLayer::SubLocality,
+                        dickson,
+                    )]),
+                    flags: 0,
+                }),
+            )
+            .expect("sub-locality");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        for locality in ["Grey Lynn", "Auckland"] {
+            assert_eq!(
+                geocode(&searcher, "123 Crummer Road", Some(locality), None).as_deref(),
+                Some("osm:node:3"),
+                "{locality}"
+            );
+        }
+        assert_eq!(
+            geocode(&searcher, "38 Archer Street", Some("Dickson"), None).as_deref(),
+            Some("osm:node:4")
+        );
+        assert_eq!(
+            geocode(&searcher, "123 Crummer Road", Some("Ponsonby"), None),
             None
         );
         let _ = std::fs::remove_dir_all(temp_dir);

@@ -9,7 +9,9 @@ use crate::{
     util::text::normalize_for_compare,
 };
 
-use super::{emitted::Emitted, geometry::line_string_geometry, tags::OsmTags};
+use super::{
+    address::LOCALITY_KEYS, emitted::Emitted, geometry::line_string_geometry, tags::OsmTags,
+};
 
 /// A vertex of an interpolation way with the address tags of its node, which
 /// make it a numbered anchor.
@@ -262,7 +264,9 @@ fn segment_address(
     Ok(InterpolationAddressComponents {
         street,
         place,
-        locality: optional_context("addr:city", way_tags, start_tags, end_tags),
+        locality: LOCALITY_KEYS
+            .into_iter()
+            .find_map(|key| optional_context(key, way_tags, start_tags, end_tags)),
         region: optional_context("addr:state", way_tags, start_tags, end_tags),
         postcode: optional_context("addr:postcode", way_tags, start_tags, end_tags),
         country: optional_context("addr:country", way_tags, start_tags, end_tags),

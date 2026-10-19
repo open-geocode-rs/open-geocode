@@ -52,6 +52,11 @@ pub(crate) fn address_record_from_candidate(
     })
 }
 
+/// The keys that name the settlement an address is in, the first one stated
+/// winning. A rural address often names the small place it is in instead of
+/// a city: 237k of New Zealand's addresses state only an `addr:hamlet`.
+pub(crate) const LOCALITY_KEYS: [&str; 4] =
+    ["addr:city", "addr:town", "addr:village", "addr:hamlet"];
 /// The areas below the locality an address may state, outermost first.
 const AREA_KEYS: [&str; 3] = ["addr:suburb", "addr:quarter", "addr:neighbourhood"];
 /// The areas that place a house number when no street does: the Japanese
@@ -97,7 +102,7 @@ pub(crate) fn address_components(
         street,
         place,
         unit: tags.cleaned("addr:unit"),
-        locality: tags.cleaned("addr:city"),
+        locality: LOCALITY_KEYS.into_iter().find_map(|key| tags.cleaned(key)),
         areas,
         region: tags
             .cleaned("addr:state")
@@ -189,6 +194,28 @@ mod tests {
             address_record_from_candidate(&candidate(&[("addr:housenumber", "10")])),
             Err(CandidateIssue::MissingStreetOrPlace)
         );
+    }
+
+    #[test]
+    fn reads_the_locality_from_the_settlement_the_address_names() {
+        let locality = |tags: &[(&str, &str)]| {
+            let mut all = vec![("addr:housenumber", "12"), ("addr:street", "Ruru Road")];
+            all.extend_from_slice(tags);
+            address_record_from_candidate(&candidate(&all))
+                .expect("address")
+                .address
+                .locality
+        };
+        assert_eq!(
+            locality(&[("addr:hamlet", "Waimauku")]).as_deref(),
+            Some("Waimauku")
+        );
+        assert_eq!(
+            locality(&[("addr:city", "Auckland"), ("addr:hamlet", "Waimauku")]).as_deref(),
+            Some("Auckland")
+        );
+        // A suburb is an area of the locality, not the locality.
+        assert_eq!(locality(&[("addr:suburb", "Grey Lynn")]), None);
     }
 
     #[test]
