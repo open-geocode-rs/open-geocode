@@ -113,9 +113,6 @@ pub(crate) fn emit_poi(candidate: PoiCandidate, out: &mut Emitted) {
         source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
     };
     out.report.accept_poi(&record);
-    if let Some(address) = &record.address {
-        out.postcodes.accept(address, &record.geometry);
-    }
     out.records.push(Record::Poi(record));
 }
 
@@ -279,13 +276,11 @@ mod tests {
         assert_eq!(out.report.accepted.by_layer.get("poi"), Some(&1));
         assert_eq!(out.report.accepted.by_layer.get("address"), None);
         assert_eq!(out.report.accepted.pois_with_address, 1);
-        assert_eq!(out.postcodes.len(), 1, "its postcode still counts");
 
         let plain = emit(&[("name", "Riverdale Farm"), ("tourism", "attraction")]);
         let [Record::Poi(record)] = plain.records.as_slice() else {
             panic!("one POI record");
         };
         assert_eq!(record.address, None);
-        assert_eq!(plain.postcodes.len(), 0);
     }
 }

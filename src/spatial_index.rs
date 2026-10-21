@@ -959,6 +959,7 @@ mod tests {
 
     fn address(lon: f64, lat: f64, object_id: i64) -> Record {
         Record::Address(AddressRecord {
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: "10".to_string(),
@@ -1069,6 +1070,7 @@ mod tests {
             .map(|(index, [lon, lat])| {
                 Record::Postcode(PostcodeRecord {
                     postcode: format!("P{index}"),
+                    country: None,
                     geometry: point_geometry(*lon, *lat),
                     source: DerivedSourceProvenance::osm_address_records(1),
                 })
@@ -1132,6 +1134,7 @@ mod tests {
             address(-79.4, 43.6, 1),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".to_string(),
+                country: None,
                 geometry: point_geometry(-79.4, 43.6),
                 source: DerivedSourceProvenance::osm_address_records(1),
             }),

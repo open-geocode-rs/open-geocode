@@ -28,8 +28,10 @@
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
 //!                     (and category or place type) as a varint count and ids, and
-//!                     an address's areas follow its other fields the same way;
-//!                     a POI's address follows a presence byte
+//!                     an address's areas follow its other fields the same way,
+//!                     then its street's postcodes; a POI's address follows a
+//!                     presence byte; a postcode's country follows its code as
+//!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      line strings only: varint count, then zigzag deltas
 //!
 //! continued address (its bit set in `continued`; no tag, its precision and
@@ -44,9 +46,10 @@
 //!
 //! The builder writes the addresses of one street as a run, ordered by house
 //! number. An address that states the same street, place, areas, locality,
-//! region, postcode, country and admin context as the address before it in its
-//! block is written as a continuation of that run: only its number, unit, point
-//! and id, each as a small delta. The run's first address in the block, its
+//! region, postcode, country, street postcodes and admin context as the
+//! address before it in its block is written as a continuation of that run:
+//! only its number, unit, point and id, each as a small delta. The run's
+//! first address in the block, its
 //! anchor, holds every shared field, so any record decodes from its own block.
 //! A continued address has no start of its own: it is read on from its
 //! anchor, as its number and point are deltas along the run anyway.
@@ -79,6 +82,7 @@ use crate::{
     extsort::Scratch,
     memory::{Budget, Reservation},
     pack::RecordId,
+    parse::lattice::CountryCode,
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
@@ -349,6 +353,7 @@ pub struct Writer {
 #[derive(Debug)]
 struct AddressRun {
     shared: AddressComponents,
+    street_postcodes: Vec<String>,
     /// The imported dataset of the run, `None` for OSM addresses.
     dataset: Option<String>,
     context: Option<ContextRef>,
@@ -371,6 +376,7 @@ impl AddressRun {
             && shared.postcode == address.postcode
             && shared.country == address.country
             && shared.areas == address.areas
+            && self.street_postcodes == record.street_postcodes
     }
 }
 
@@ -561,6 +567,7 @@ impl Writer {
                 self.run = match record {
                     Record::Address(address) => Some(AddressRun {
                         shared: address.address.clone(),
+                        street_postcodes: address.street_postcodes.clone(),
                         dataset: imported_dataset(address).map(str::to_string),
                         context,
                         point,
@@ -627,7 +634,10 @@ impl Writer {
         }
 
         match record {
-            Record::Address(record) => self.put_address(out, &record.address)?,
+            Record::Address(record) => {
+                self.put_address(out, &record.address)?;
+                self.put_strings(out, &record.street_postcodes)?;
+            }
             Record::Poi(record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 put_u64(out, u64::from(self.strings.id(&record.category)?));
@@ -673,6 +683,10 @@ impl Writer {
                     )));
                 }
                 put_u64(out, u64::from(self.strings.id(&record.postcode)?));
+                put_u64(
+                    out,
+                    record.country.map_or(0, |country| country.to_u16().into()),
+                );
             }
             Record::Place(_, record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
@@ -977,6 +991,7 @@ impl Reader {
                 let address = self.entry_address(&entry, &mut fields)?;
                 Record::Address(AddressRecord {
                     address,
+                    street_postcodes: self.string_list(header.strings, &mut fields)?,
                     geometry: geometry(&mut fields)?,
                     location_precision,
                     source: header.provenance(&self.datasets)?,
@@ -1016,6 +1031,7 @@ impl Reader {
             }),
             Layer::Postcode => Record::Postcode(PostcodeRecord {
                 postcode: self.string_field(header.strings, &mut fields)?.to_string(),
+                country: country_field(&mut fields)?,
                 geometry: geometry(&mut fields)?,
                 source: DerivedSourceProvenance::osm_address_records(header.source_value),
             }),
@@ -1092,7 +1108,7 @@ impl Reader {
                 let postcode = self.string_field(header.strings, &mut fields)?;
                 stated = Address::postcode(postcode);
                 (
-                    crate::labels::derived_postcode_id(postcode),
+                    crate::labels::derived_postcode_id(country_field(&mut fields)?, postcode),
                     postcode.to_string(),
                     postcode.to_string(),
                 )
@@ -1142,6 +1158,22 @@ impl Reader {
             Layer::Postcode => Some(self.string_field(header.strings, &mut fields)?.to_string()),
             _ => None,
         })
+    }
+
+    /// The postcodes a record is in by its own data: the one it states, else
+    /// for an address the ones its street's addresses state. Empty when
+    /// neither says.
+    pub fn postcodes(&self, id: RecordId) -> Result<Vec<String>> {
+        let entry = self.body(id)?;
+        if entry.header.layer != Layer::Address {
+            return Ok(self.postcode(id)?.into_iter().collect());
+        }
+        let mut fields = entry.fields;
+        let address = self.address_components(entry.header.strings, &mut fields)?;
+        match address.postcode {
+            Some(postcode) => Ok(vec![postcode]),
+            None => self.string_list(entry.header.strings, &mut fields),
+        }
     }
 
     /// Whether a record is an explicit address: an address record or a POI
@@ -1639,6 +1671,7 @@ impl Reader {
         match header.layer {
             Layer::Address => {
                 self.address_components(header.strings, fields)?;
+                self.string_list(header.strings, fields)?;
             }
             Layer::Poi => {
                 self.poi_fields(header.strings, fields)?;
@@ -1652,6 +1685,7 @@ impl Reader {
             }
             Layer::Postcode => {
                 get_u32(fields)?;
+                country_field(fields)?;
             }
             _ => {
                 get_u32(fields)?;
@@ -1837,14 +1871,29 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     for _ in 0..present.count_ones() {
         get_u64(&mut body)?;
     }
-    let areas = get_u64(&mut body)?;
-    if areas > body.len() as u64 {
-        return Err(Error::Decode("string list is truncated"));
-    }
-    for _ in 0..areas {
-        get_u64(&mut body)?;
+    // Its areas, then its street's postcodes.
+    for _ in 0..2 {
+        let strings = get_u64(&mut body)?;
+        if strings > body.len() as u64 {
+            return Err(Error::Decode("string list is truncated"));
+        }
+        for _ in 0..strings {
+            get_u64(&mut body)?;
+        }
     }
     Ok(body)
+}
+
+/// A postcode record's country, 0 when unknown.
+fn country_field(fields: &mut &[u8]) -> Result<Option<CountryCode>> {
+    match get_u64(fields)? {
+        0 => Ok(None),
+        code => u16::try_from(code)
+            .ok()
+            .and_then(CountryCode::from_u16)
+            .map(Some)
+            .ok_or(Error::Decode("postcode country is not a country code")),
+    }
 }
 
 /// A record's header, the bytes of the fields it shares with its run's anchor
@@ -2013,6 +2062,7 @@ mod tests {
     fn sample_records() -> Vec<Record> {
         let mut records = vec![
             Record::Address(AddressRecord {
+                street_postcodes: Vec::new(),
                 address: AddressComponents {
                     areas: vec!["Old Toronto".into(), "Liberty Village".into()],
                     number: "10".into(),
@@ -2037,6 +2087,7 @@ mod tests {
             }),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V 1A1".into(),
+                country: None,
                 geometry: point_geometry(-79.0, 43.0),
                 source: DerivedSourceProvenance::osm_address_records(12),
             }),

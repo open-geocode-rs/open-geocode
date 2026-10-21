@@ -56,7 +56,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 8;
+pub const PACK_SCHEMA_VERSION: u32 = 9;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -255,8 +255,8 @@ impl Writer {
         self.dictionaries.set_region_groups(groups);
     }
 
-    /// Postcode centroids, so the records written after this that state no
-    /// postcode are ranked by the nearest one.
+    /// Postcode centroids, so the records written after this that have no
+    /// postcode of their own are ranked by the nearest one.
     pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {
         self.postcode_areas = Arc::new(areas);
     }
@@ -752,6 +752,7 @@ mod tests {
 
     fn address_record(object_id: i64, number: &str, street: &str) -> Record {
         Record::Address(AddressRecord {
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: number.to_string(),

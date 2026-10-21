@@ -5,8 +5,6 @@ use crate::{
     record::{ObjectType, Record, RejectedRecord, SourceProvenance},
 };
 
-use super::postcode::PostcodeAccumulator;
-
 /// Everything one worker produces for a batch of OSM objects. Workers run in
 /// parallel; their outputs are merged in input order.
 #[derive(Debug, Default)]
@@ -14,7 +12,6 @@ pub(crate) struct Emitted {
     pub report: BuilderReport,
     pub records: Vec<Record>,
     pub rejections: Vec<RejectedRecord>,
-    pub postcodes: PostcodeAccumulator,
 }
 
 impl Emitted {

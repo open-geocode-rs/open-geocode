@@ -442,7 +442,7 @@ pub struct CompletenessCounts {
     pub country: u64,
 }
 
-/// Wall-clock time per build phase, in order.
+/// Wall-clock time per build phase.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PhaseTimings {
     /// Pass 1: classify every OSM object.
@@ -457,12 +457,14 @@ pub struct PhaseTimings {
     pub boundary_build_ms: u128,
     /// Fetch and read address files from outside OSM.
     pub address_import_ms: u128,
-    /// Order every address by street and number, and drop the imported
-    /// ones that repeat another.
+    /// Order every address by street and number, drop the imported ones
+    /// that repeat another, lend each street's postcodes to its addresses
+    /// without one, and place each country's postcodes.
     pub address_order_ms: u128,
-    /// Write places, postcodes and boundaries.
+    /// Write places and boundaries.
     pub context_record_write_ms: u128,
-    /// Write addresses, interpolations and streets in Hilbert order.
+    /// Write addresses, POIs, interpolations, streets and postcodes in
+    /// Hilbert order.
     pub record_write_ms: u128,
     /// Finish the text and spatial indexes and write the Pack file.
     pub pack_seal_ms: u128,
@@ -1603,6 +1605,7 @@ mod tests {
     ) -> AddressRecord {
         let street = street.map(str::to_string);
         AddressRecord {
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: "10".to_string(),

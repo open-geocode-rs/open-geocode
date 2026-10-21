@@ -311,6 +311,7 @@ fn address(
         return Err("bad_coordinates");
     }
     Ok(AddressRecord {
+        street_postcodes: Vec::new(),
         address: AddressComponents {
             number,
             street: Some(street),

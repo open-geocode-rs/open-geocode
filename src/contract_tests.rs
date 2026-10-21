@@ -506,6 +506,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
     let address = writer
         .write(
             &AddressRecord {
+                street_postcodes: Vec::new(),
                 address: king.clone(),
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Point,

@@ -27,7 +27,6 @@ pub(crate) fn emit_address(candidate: AddressCandidate, out: &mut Emitted) {
         Ok(record) => {
             out.report
                 .accept_address_with_tags(&record, Some(&candidate.tags));
-            out.postcodes.accept(&record.address, &record.geometry);
             out.records.push(Record::Address(record));
         }
         Err(issue) => out.reject_in_report(
@@ -45,6 +44,7 @@ pub(crate) fn address_record_from_candidate(
     candidate: &AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
     Ok(AddressRecord {
+        street_postcodes: Vec::new(),
         address: address_components(&candidate.tags)?,
         geometry: point_geometry(candidate.lon, candidate.lat),
         location_precision: candidate.location_precision,
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_records_postcodes_and_report_counts() {
+    fn emits_records_and_report_counts() {
         let mut out = Emitted::default();
         emit_address(
             candidate(&[
@@ -282,7 +282,6 @@ mod tests {
         assert_eq!(out.report.accepted.node_addresses, 1);
         assert_eq!(out.report.rejected.total, 1);
         assert!(out.rejections.is_empty(), "invalid nodes are report-only");
-        assert_eq!(out.postcodes.len(), 1);
     }
 
     #[test]
