@@ -5,7 +5,12 @@ without reading the issue thread first, though [the design
 comment](https://github.com/open-geocode-rs/open-geocode/issues/36#issuecomment-6306470448) holds
 the research and the citation corrections behind it.
 
-Baseline for every number here is `a4f4431` with #32 and #33 merged.
+Baseline for every number here is `a4f4431` with #32 and #33 merged **as widened** — see step 0,
+both have open design requests on them and neither should land as currently written.
+
+The standing constraint on all of it: og is a global geocoder. A fix that works for AU, NZ and CA
+because those are the sets we test with most is not a fix. Every step below is judged on whether it
+holds for a planet file.
 
 ## Verification
 
@@ -31,7 +36,7 @@ Steps 1 and 2 need no data beyond the committed fixtures.
 
 ## Order
 
-0. Merge #32, then #33. Rebuild Packs. Re-baseline.
+0. Land #32 and #33 **widened to their review comments**. Rebuild Packs. Re-baseline.
 1. Run acceptance before the cut.
 2. Carry the parser's corrections into retrieval.
 3. Give places a prior. **Blocked on a data decision, see below.**
@@ -42,13 +47,38 @@ gold sets three PRs cite are not in this repo.
 
 ---
 
-## 0. Merge #32 and #33
+## 0. Land #32 and #33, widened
 
-Both verified together on `a4f4431`: fmt clean, clippy clean, 347 tests pass, no conflicts in
-either order. Merge #32 first (builder only), then #33 (bumps `TEXT_INDEX_SCHEMA_VERSION` 10 -> 11).
+Both pass CI as written and both are scoped too narrowly to ship. The design requests are on the
+PRs; the short version:
 
-Packs must be rebuilt. Re-run the dev key and record the numbers: everything below is measured
-against that, not against today's `main`.
+**#32** keys postcode accumulation by input file. That keys on how the Pack was assembled rather
+than on what a postcode means: a planet file or any multi-country extract still fuses AU and NZ
+"2110", and NSW + ACT as two files splits a shared code that should be one. The direction instead
+is to make a street's own addresses the evidence — give each street the set of postcodes its
+addresses use, let an address with no tag borrow its street's set, and keep the postcode dot as the
+fallback for when that set is empty, built per country with the country in the id
+(`derived:osm:postcode:nz:2110`).
+
+`postcode_agreement` (`src/search.rs:805-833`) already returns confirmed / contradicted / unknown,
+so in-list / mismatch / empty-list maps onto what exists. Mismatch should rank down via
+`RankKey.postcode_agreement` (`:1445`), not hard-drop.
+
+**#33** folds accents by NFD plus mark-stripping, which cannot touch a letter that has no mark:
+`ł`, `ø`, `ß`, `æ`, `đ`, `ı` all survive, so `Lodz` will not find `Łódź` nor `Strasse` `Straße`.
+The direction is CLDR: `Latin-ASCII` for Latin, script-to-Latin tables for the rest, which also
+replaces the hand-rolled kana/Cyrillic/Greek tables in `src/util/transliterate.rs`. Two keys per
+name — exact with accents, search in plain Latin — so exact spelling can still win ties, which one
+key makes impossible. NFC before folding, so `Wa\u0304naka` stops splitting into two words at the
+combining mark.
+
+`icu_normalizer` and `icu_properties` are already in `Cargo.lock` transitively via `url` <- `ureq`,
+so the CLDR route is close to free on build time.
+
+Both bump a schema version, so doing the fuller job now costs one Pack rebuild instead of two.
+
+Re-run the dev key after and record the numbers: everything below is measured against that, not
+against today's `main`.
 
 ---
 
@@ -140,6 +170,12 @@ local precedent, but it is hand-set — do not add a second hand-set weight tabl
 number to justify it. Simplest defensible thing: use `distance` only to order alternatives, not to
 scale scores.
 
+**Depends on step 0 and must be measured with it, not after it.** The fuzzy matcher runs on folded
+text, so a more aggressive fold makes edit distance strictly more permissive: `Latin-ASCII` plus two
+edits collides names that today's fold plus two edits keeps apart. The thresholds at
+`src/parse/lattice.rs:64-77` were tuned against the current fold and should be re-measured against
+the new one rather than assumed to carry over. The parse bench is the harness.
+
 ### Done when
 
 - `Taupo` finds Taupō the town, `Taupō` still does, and the Dunedin street does not displace it.
@@ -165,17 +201,29 @@ quarry of the same name today is BM25 IDF, `NAME_BOOST`, and `TieBreak::source`
 
 ### Blocked
 
-Pick a source before starting:
+The source has to be global and uniform, or the prior just moves the bias around — a signal that
+ranks US and European places well and leaves the rest on a default is worse than no signal, because
+it is wrong in a way that looks confident.
 
-- **GHS-UCDB** (CC BY 4.0, 11,422 urban centres, a vector table) with a radius-weighted GHS-POP
-  sample for the long tail. Better coverage where the prior earns its keep. Adds a build-time data
-  dependency. Do not ship the raster — it is 17.7 GB compressed; derive a scalar at build time.
-- **OSM `population` tag** plus `place_type` rank. Free, ships today, no new input. Weaker, and its
-  coverage is biased towards wealthy and urban regions.
+That rules out the OSM `population` tag on its own: its coverage follows mapper density, so it is
+thin exactly where ranking is hardest. It also rules out Nominatim's Wikipedia importance file as a
+primary signal — inbound-link counts track encyclopaedic coverage in large Wikipedias, which is a
+Western-language bias by construction. It is separately blocked on licence: the generator is GPLv2
+and no licence is stated for the output data.
 
-Nominatim's Wikipedia importance file is a third option and is deliberately **not** listed: its
-generator is GPLv2 and no licence is stated for the output data. That needs resolving with upstream
-before it goes near a Pack.
+The one globally uniform option is **GHSL** (JRC, CC BY 4.0), because it is modelled from satellite
+built-up surface rather than from who bothered to write it down:
+
+- **GHS-UCDB** R2024A — 11,422 urban centres as a vector table with population attributes, a few MB.
+  Point-in-polygon against a place node is correct by construction for everything it covers.
+- **GHS-POP** R2023A — 100 m raster, 17.7 GB compressed, for the long tail UCDB does not reach.
+  A single-cell sample at a place node is wrong by orders of magnitude (the node is often a town
+  hall), so it needs a radius-weighted sum keyed off `place=`, or a zonal sum over the boundary
+  relation where one exists.
+
+Open question is not which source but how much of the tail to buy: UCDB alone is cheap and covers
+cities, UCDB + GHS-POP covers villages and costs a build-time raster download. Decide that before
+starting; ship one quantised byte per place either way, never the input.
 
 ### Shape, once unblocked
 
@@ -195,6 +243,9 @@ it implicitly — importance is in `[0, 1]` against penalties of 0-3.
   unaffected by it.
 - Dev key improves, and POI accuracy does not regress — `pack bench` against
   `fixtures/queries/ontario-poi.json` is the guard, since the prior must not demote POIs.
+- A place with no prior at all is not systematically beaten by one that has it. This is the global
+  test: most of the planet's places will have no UCDB polygon, and the fallback must not read as
+  "unimportant".
 
 ---
 
