@@ -444,10 +444,11 @@ impl Dictionaries {
         keys
     }
 
-    /// The best name `dfa` accepts that starts with `prefix`: fewest edits,
-    /// then most used. The prefix keeps the walk to one branch of the FST:
-    /// without it, two edits reach every two-character start of every name.
-    pub fn fuzzy(&self, field: Field, dfa: &DFA, prefix: &str) -> Option<Match> {
+    /// The best name `dfa` accepts that starts with `prefix`, with its hit:
+    /// fewest edits, then most used. The prefix keeps the walk to one branch
+    /// of the FST: without it, two edits reach every two-character start of
+    /// every name.
+    pub fn fuzzy(&self, field: Field, dfa: &DFA, prefix: &str) -> Option<(String, Match)> {
         // No key holds the byte 0xFF, which UTF-8 never uses, so every key
         // with the prefix sorts below it.
         let mut upper = prefix.as_bytes().to_vec();
@@ -458,8 +459,8 @@ impl Dictionaries {
             .ge(prefix)
             .lt(upper)
             .into_stream();
-        let mut best: Option<Match> = None;
-        while let Some((_, value, state)) = stream.next() {
+        let mut best: Option<(Vec<u8>, Match)> = None;
+        while let Some((key, value, state)) = stream.next() {
             let Distance::Exact(distance) = dfa.distance(state) else {
                 continue;
             };
@@ -467,14 +468,14 @@ impl Dictionaries {
                 entry: Entry::decode(value),
                 distance,
             };
-            if best.is_none_or(|best| {
+            if best.as_ref().is_none_or(|(_, best)| {
                 (found.distance, std::cmp::Reverse(found.entry.count))
                     < (best.distance, std::cmp::Reverse(best.entry.count))
             }) {
-                best = Some(found);
+                best = Some((key.to_vec(), found));
             }
         }
-        best
+        best.map(|(key, hit)| (String::from_utf8_lossy(&key).into_owned(), hit))
     }
 
     /// The record ids of the areas named `key`; empty when it names none, or
@@ -1486,9 +1487,10 @@ mod tests {
         ]);
         let one = levenshtein_automata::LevenshteinAutomatonBuilder::new(1, true);
         let two = levenshtein_automata::LevenshteinAutomatonBuilder::new(2, true);
-        let hit = dictionaries
+        let (name, hit) = dictionaries
             .fuzzy(Field::Locality, &one.build_dfa("torontoo"), "t")
             .expect("one edit");
+        assert_eq!(name, "toronto");
         assert_eq!(
             hit,
             Match {
@@ -1497,7 +1499,7 @@ mod tests {
             }
         );
         // A transposition is one edit.
-        let hit = dictionaries
+        let (_, hit) = dictionaries
             .fuzzy(Field::Locality, &one.build_dfa("tornoto"), "t")
             .expect("transposed");
         assert_eq!(hit.distance, 1);
@@ -1508,7 +1510,7 @@ mod tests {
         );
         // Two edits reach both "torino" and "toronto" from "toroino"; the
         // nearer wins, then the more used.
-        let hit = dictionaries
+        let (_, hit) = dictionaries
             .fuzzy(Field::Locality, &two.build_dfa("torino"), "t")
             .expect("exact");
         assert_eq!(hit.distance, 0);

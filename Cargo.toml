@@ -72,6 +72,9 @@ signal-hook = { version = "0.3", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
 stable_deref_trait = "1.2"
 tantivy = "0.25.0"
+# The automaton trait Tantivy's term dictionaries walk, to find the terms a
+# query word may be a typo of. Tantivy's own fuzzy query has no prefix length.
+tantivy-fst = "0.5"
 thiserror = "2"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }
