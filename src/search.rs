@@ -667,22 +667,37 @@ impl TextSearcher {
                 )),
             ));
         }
-        let unplaced = plan
-            .unplaced
-            .iter()
-            .map(|word| {
-                let query = self.word_or_area_query(what(&word.text), &word.text, spellings, areas);
-                (Occur::Should, query)
-            })
-            .collect::<Vec<_>>();
+        let unplaced = |words: &mut dyn Iterator<Item = &Word>| {
+            words
+                .map(|word| {
+                    let query =
+                        self.word_or_area_query(what(&word.text), &word.text, spellings, areas);
+                    (Occur::Should, query)
+                })
+                .collect::<Vec<_>>()
+        };
         if plan.subject.is_empty() {
-            let floor = unplaced_floor(unplaced.len());
+            // A word that only describes a street ("road") names nothing: of
+            // "Ponsonby Road, Christchurch", any road in Christchurch would
+            // meet a floor it counted toward. It ranks, unless every word is
+            // one.
+            let (describing, naming): (Vec<_>, Vec<_>) = plan
+                .unplaced
+                .iter()
+                .partition(|word| self.describes_street(&word.text));
+            let (floored, ranked) = match naming.is_empty() {
+                true => (describing, Vec::new()),
+                false => (naming, describing),
+            };
+            let floored = unplaced(&mut floored.into_iter());
+            let floor = unplaced_floor(floored.len());
             clauses.push((
                 Occur::Must,
-                Box::new(BooleanQuery::with_minimum_required_clauses(unplaced, floor)),
+                Box::new(BooleanQuery::with_minimum_required_clauses(floored, floor)),
             ));
+            clauses.extend(unplaced(&mut ranked.into_iter()));
         } else {
-            clauses.extend(unplaced);
+            clauses.extend(unplaced(&mut plan.unplaced.iter()));
         }
         for part in &plan.context {
             let known = part
@@ -1335,11 +1350,14 @@ impl TextSearcher {
     /// contradicts the one the plan names. A pass that does not require the
     /// plan's localities still leaves out a hit that lies in other ones:
     /// "Ponsonby Road Christchurch" is not answered in Auckland. So does
-    /// every pass with the words `placed` (the localities of the best
-    /// reading the Pack knows) and the plan's unplaced words the Pack knows
-    /// as an area's: each is where the query says the record is, unless it
-    /// is a word of the record itself (see [`Self::in_loose_areas`]). Each
-    /// hit carries the [`Features`] of what found it.
+    /// every pass with the words of `placed` (the localities of the best
+    /// reading the Pack knows) the plan reads as a region or a country,
+    /// which only rank, and with the plan's unplaced words the Pack knows as
+    /// an area's: each is where the query says the record is, unless it is
+    /// a word of the record itself (see [`Self::in_loose_areas`]). A plan
+    /// with no subject is exempt: the parser placed none of its words, and
+    /// a few of them may go unmatched (see [`unplaced_floor`]). Each hit
+    /// carries the [`Features`] of what found it.
     #[allow(clippy::too_many_arguments)]
     fn search_plan(
         &self,
@@ -1397,16 +1415,18 @@ impl TextSearcher {
                 .filter_map(|part| StatedArea::known(part, &areas.known))
                 .collect()
         };
-        let own = localities
+        let relabelled = plan
+            .context
             .iter()
+            .filter(|part| !matches!(part.label, Label::Locality | Label::Postcode))
             .flat_map(|part| &part.words)
-            .collect::<HashSet<_>>();
-        let mut loose = self
-            .known_area_words(plan.unplaced.iter().map(|word| &word.text))?
-            .into_iter()
-            .chain(placed.iter().cloned())
-            .filter(|word| !own.contains(word))
-            .collect::<Vec<_>>();
+            .filter(|word| placed.contains(*word))
+            .cloned();
+        let unplaced = match plan.subject.is_empty() {
+            true => HashSet::new(),
+            false => self.known_area_words(plan.unplaced.iter().map(|word| &word.text))?,
+        };
+        let mut loose = unplaced.into_iter().chain(relabelled).collect::<Vec<_>>();
         loose.sort();
         loose.dedup();
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
@@ -4332,6 +4352,17 @@ mod tests {
             "osm:way:2"
         );
         assert_eq!(search("christchurch/other road/other", &[])[0], "osm:way:2");
+        // A word that only describes a street names no road of its own.
+        assert!(search("ponsonby/other road/other christchurch/locality", &[]).is_empty());
+        // A query the parser placed nothing in may leave a word unmatched,
+        // even one the best reading took for a locality.
+        assert_eq!(
+            search(
+                "ponsonby/other road/other christchurch/other",
+                &["christchurch"]
+            )[0],
+            "osm:way:1"
+        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
