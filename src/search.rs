@@ -341,7 +341,7 @@ impl TextSearcher {
             number_text: autocomplete_number(&tokens).map(str::to_string),
             ..Ranking::default()
         };
-        self.ranked_hits(&query, &ranking, limit)
+        self.ranked_hits(&query, &ranking, limit, &mut |_| Ok(true))
     }
 
     /// The house number, then what a record is and where. See
@@ -706,11 +706,9 @@ impl TextSearcher {
             hits.push(estimate);
         }
         let query = self.build_query(plan, pass, filters);
-        for hit in self.ranked_hits(&query, &ranking, limit)? {
-            if accept(plan, &ranking.postcode, &hit)? {
-                hits.push(hit);
-            }
-        }
+        hits.extend(self.ranked_hits(&query, &ranking, limit, &mut |hit| {
+            accept(plan, &ranking.postcode, hit)
+        })?);
         hits.truncate(limit);
         Ok(hits)
     }
@@ -947,8 +945,10 @@ impl TextSearcher {
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
 
-    /// The best `limit` hits, ranked by [`RankKey`] over every record the
-    /// query matches, and equal keys by [`TieBreak`].
+    /// The best `limit` hits that `accept` keeps, ranked by [`RankKey`] over
+    /// every record the query matches, and equal keys by [`TieBreak`].
+    /// Rejected before the cut, so the whole rank window can backfill a hit
+    /// that fails.
     ///
     /// An interpolation hit is placed at the house number along its range, and
     /// left out when the number falls between its steps.
@@ -957,6 +957,7 @@ impl TextSearcher {
         query: &dyn Query,
         ranking: &Ranking,
         limit: usize,
+        accept: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<Vec<TextSearchHit>> {
         let searcher = self.reader.searcher();
         let window = limit
@@ -970,7 +971,7 @@ impl TextSearcher {
             .collect::<HashSet<_>>();
         // When only the text score ranks, the key is the score, and the index
         // can skip the records that cannot make the window.
-        let mut top_docs = if ranking.numbered || !ranking.postcode.forms.is_empty() {
+        let top_docs = if ranking.numbered || !ranking.postcode.forms.is_empty() {
             searcher.search(
                 query,
                 &TopDocs::with_limit(window).tweak_score(RankKeys {
@@ -986,16 +987,16 @@ impl TextSearcher {
                 .map(|(text_score, doc)| (RankKey::text(text_score), doc))
                 .collect()
         };
-        // Without a house number no hit is left out, so only the hits that
-        // can still make the cut need hydrating: everything above the cutoff
-        // key plus whatever ties it.
-        if !ranking.numbered
-            && let Some((cutoff, _)) = top_docs.get(limit.saturating_sub(1)).cloned()
-        {
-            top_docs.retain(|(key, _)| *key >= cutoff);
-        }
+        // Without a house number no document is left out for its number, so
+        // once `limit` hits are kept only the documents that tie the last of
+        // them need hydrating. The cutoff is the last kept hit's, not the
+        // `limit`th document's: a rejected hit leaves its place to the next.
+        let mut cutoff = None;
         let mut hits = Vec::new();
         for (key, doc) in top_docs {
+            if cutoff.as_ref().is_some_and(|cutoff| key < *cutoff) {
+                break;
+            }
             let (first, count) = self.document_records(&searcher, doc)?;
             for record_id in self.hit_records(first, count, ranking)? {
                 let mut record = self.pack.record_summary(record_id)?;
@@ -1008,15 +1009,22 @@ impl TextSearcher {
                 if ranking.numbered && record.layer == Layer::Street.as_str() {
                     self.place_on_street_line(record_id, &mut record)?;
                 }
+                let hit = TextSearchHit {
+                    record_id,
+                    score: key.text_score,
+                    record,
+                };
+                if !accept(&hit)? {
+                    continue;
+                }
                 hits.push((
                     key.clone(),
-                    TieBreak::new(&record, &query_words, ranking),
-                    TextSearchHit {
-                        record_id,
-                        score: key.text_score,
-                        record,
-                    },
+                    TieBreak::new(&hit.record, &query_words, ranking),
+                    hit,
                 ));
+            }
+            if !ranking.numbered && cutoff.is_none() && hits.len() >= limit {
+                cutoff = Some(key);
             }
         }
         hits.sort_by(|(left_key, left_tie, _), (right_key, right_tie, _)| {
@@ -2085,6 +2093,9 @@ fn is_address_number_token(token: &str) -> bool {
 }
 
 #[cfg(test)]
+mod smoke;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -2138,7 +2149,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    fn geocode(
+    pub(super) fn geocode(
         searcher: &TextSearcher,
         address: &str,
         locality: Option<&str>,
@@ -2979,7 +2990,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
+    pub(super) fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
         searcher
             .search(TextSearchOptions {
                 query: query.to_string(),
@@ -3949,11 +3960,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    fn temp_pack_path(name: &str) -> std::path::PathBuf {
+    pub(super) fn temp_pack_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("open-geocode-{name}-{}", std::process::id()))
     }
 
-    fn address_record(
+    pub(super) fn address_record(
         id: &str,
         _label: &str,
         number: &str,
@@ -3988,7 +3999,7 @@ mod tests {
         }
     }
 
-    fn street_record(id: &str, label: &str) -> StreetRecord {
+    pub(super) fn street_record(id: &str, label: &str) -> StreetRecord {
         let object_id = id
             .strip_prefix("osm:way:")
             .and_then(|value| value.parse::<i64>().ok())
