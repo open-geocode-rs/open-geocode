@@ -425,6 +425,15 @@ impl Dictionaries {
         self.map(field).contains_key(key)
     }
 
+    /// Whether `key` says what kind of street or place a name is or which
+    /// way it runs ("road", "north", "oblast") rather than naming it: a
+    /// street type, a direction or a qualifier.
+    pub fn describes_street(&self, key: &str) -> bool {
+        self.contains(Field::StreetType, key)
+            || self.contains(Field::Directional, key)
+            || is_admin_type(key)
+    }
+
     /// Every name in `field`, in key order.
     pub fn keys(&self, field: Field) -> Vec<String> {
         let mut keys = Vec::with_capacity(self.len(field));
