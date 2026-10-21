@@ -251,11 +251,15 @@ const CORRECTED_BOOST: Score = 0.5;
 /// Words shorter than this are only matched as written: one edit turns most
 /// words of two or three letters into many others.
 const MIN_TYPO_CHARS: usize = 4;
-/// Words at least this long may be two edits from a record's, with their
-/// first two characters as written; shorter ones one edit, with their first.
-/// Photon's thresholds, the geocoder precedent. The first characters are the
-/// cost lever: they keep the walk of the term dictionary to one branch.
+/// Words at least this long may be two edits from a record's; shorter ones
+/// one edit. Photon's thresholds, the geocoder precedent.
 const LONG_TYPO_CHARS: usize = 7;
+/// The first characters of a word a typo keeps as written, as the parser's
+/// fuzzy lookup keeps them. The cost lever: they keep the walk of the term
+/// dictionary to one branch. One, not Photon's two for long words: a swap of
+/// the second and third letters ("Mcihael") is the commonest slip, one edit
+/// with transpositions counted as one, and two would rule it out.
+const TYPO_PREFIX_CHARS: usize = 1;
 /// The terms near one word kept per field, fewest edits then most documents
 /// first: a common short word has dozens of neighbours on a planet.
 const MAX_TYPO_TERMS: usize = 32;
@@ -3170,12 +3174,13 @@ impl Edits {
     }
 
     /// The edits `word` may be from a record's word in this tier, and how
-    /// many of its first characters must be as written: one edit and one
-    /// character for words of [`MIN_TYPO_CHARS`] to six, two of each for
-    /// longer ones. `None` when it is matched only as written: it is short,
-    /// or holds a digit. In a dense run of numbers every edit names another
-    /// real address ("12 Main St" is one edit from "13 Main St"), so a house
-    /// number, a postcode, a unit or a route number is never a typo.
+    /// many of its first characters must be as written: one edit for words
+    /// of [`MIN_TYPO_CHARS`] to six, two for longer ones, and
+    /// [`TYPO_PREFIX_CHARS`] characters for both. `None` when it is matched
+    /// only as written: it is short, or holds a digit. In a dense run of
+    /// numbers every edit names another real address ("12 Main St" is one
+    /// edit from "13 Main St"), so a house number, a postcode, a unit or a
+    /// route number is never a typo.
     fn allowed(self, word: &str) -> Option<(u8, usize)> {
         if self == Self::None || word.chars().any(char::is_numeric) {
             return None;
@@ -3184,9 +3189,9 @@ impl Edits {
         if chars < MIN_TYPO_CHARS {
             None
         } else if chars < LONG_TYPO_CHARS {
-            Some((1, 1))
+            Some((1, TYPO_PREFIX_CHARS))
         } else {
-            Some((self.most(), 2))
+            Some((self.most(), TYPO_PREFIX_CHARS))
         }
     }
 
@@ -5551,6 +5556,36 @@ mod tests {
         assert_eq!(
             geocode(&searcher, "99 King Street", None, Some("M5V 1A1")),
             None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_long_word_with_its_second_and_third_letters_swapped_is_one_typo() {
+        let temp_dir = temp_pack_path("search-swapped-letters");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "53", "Michael Jones Drive", None, None).into(),
+                None,
+            )
+            .expect("address");
+        writer
+            .write(
+                &address_record("osm:node:2", "", "53", "Morgan Jones Drive", None, None).into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert!(Edits::One.reaches("mcihael", "michael"));
+        assert_eq!(
+            top_ids(&searcher, "53 Mcihael Jones Drive")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:1")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
