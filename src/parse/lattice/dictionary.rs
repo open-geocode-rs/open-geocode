@@ -1237,6 +1237,27 @@ fn admin_types() -> &'static [(String, Attach)] {
     })
 }
 
+/// Whether `key` introduces a unit ("unit", "flat", "apt") rather than
+/// naming one: a word of the unit, staircase and entrance lists, never a
+/// unit value of the Pack's own records, which the unit dictionary also
+/// holds.
+pub fn designates_unit(key: &str) -> bool {
+    static DESIGNATORS: OnceLock<BTreeMap<String, Entry>> = OnceLock::new();
+    DESIGNATORS
+        .get_or_init(|| {
+            let mut designators = vocabulary(UNIT_WORDS);
+            for list in [
+                LIBPOSTAL_UNIT_TYPES,
+                LIBPOSTAL_STAIRCASES,
+                LIBPOSTAL_ENTRANCES,
+            ] {
+                designators.extend(vocabulary(list));
+            }
+            designators
+        })
+        .contains_key(key)
+}
+
 /// Whether `key` is a word of an admin area's type ("丁目", "chome", "kreis").
 pub(super) fn is_admin_type(key: &str) -> bool {
     admin_types().iter().any(|(phrase, _)| phrase == key)

@@ -27,7 +27,10 @@ use crate::{
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
-        lattice::{self, CountryCode, LatticeTagger, Tokens, automaton_builder},
+        lattice::{
+            self, CountryCode, LatticeTagger, Tokens, automaton_builder,
+            dictionary::designates_unit,
+        },
         types::{Label, Tagged},
     },
     record::{
@@ -3828,6 +3831,19 @@ impl QueryPlan {
                 )),
             }
         }
+        // A word the parser could not place, written just before the house
+        // number with a digit of its own, is the flat's ("G11" of
+        // "G11/40"): a street word holds no digit, and a number the parser
+        // would have read.
+        let unplaced_unit = runs
+            .iter()
+            .position(|(label, ..)| *label == Label::HouseNumber)
+            .and_then(|at| at.checked_sub(1))
+            .and_then(|before| match &runs[before] {
+                (Label::Other, words, _) => words.last().cloned(),
+                _ => None,
+            })
+            .filter(|word| word.chars().any(|character| character.is_ascii_digit()));
         for (label, words, corrected) in runs {
             match label {
                 Label::HouseNumber if plan.house_number.is_none() => {
@@ -3843,10 +3859,20 @@ impl QueryPlan {
                     }
                 }
                 Label::Unit => {
+                    // A flat named by a number, else by the word after its
+                    // designator ("B" of "Flat B"), else by a word that is
+                    // none ("G" of "G/9"). Libpostal's designators hold
+                    // letters too ("b" of some language), so a word after
+                    // one is the flat whatever it is.
                     if let Some(unit) = words
                         .iter()
                         .rev()
                         .find(|word| word.chars().any(|character| character.is_ascii_digit()))
+                        .or_else(|| match &words[..] {
+                            [only] => (!designates_unit(only)).then_some(only),
+                            [.., last] => Some(last),
+                            [] => None,
+                        })
                     {
                         plan.unit = Some(unit.clone());
                     }
@@ -3865,6 +3891,9 @@ impl QueryPlan {
             }
         }
         plan.context.extend(context.iter().cloned());
+        if plan.unit.is_none() && plan.house_number.is_some() {
+            plan.unit = unplaced_unit;
+        }
         if plan.house_number.is_some()
             && let Some(last) = street.last_mut()
         {
@@ -6361,6 +6390,35 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_unit_is_read_from_a_letter_or_a_word_glued_to_the_number() {
+        let unit = |text: &str| {
+            QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false)
+                .expect("plan")
+                .unit
+        };
+        assert_eq!(
+            unit("g/unit 9/house_number gore/street street/street").as_deref(),
+            Some("g")
+        );
+        assert_eq!(
+            unit("flat/unit b/unit 9/house_number gore/street street/street").as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            unit("g11/other 40/house_number rosedale/street road/street").as_deref(),
+            Some("g11")
+        );
+        assert_eq!(
+            unit("unit/unit 9/house_number gore/street street/street"),
+            None
+        );
+        assert_eq!(
+            unit("acme/other 40/house_number rosedale/street road/street"),
+            None
+        );
     }
 
     #[test]
