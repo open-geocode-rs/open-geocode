@@ -23,48 +23,6 @@
         }
       },
       "type": "Feature"
-    },
-    {
-      "geometry": {
-        "coordinates": [
-          -79.01,
-          43.0005
-        ],
-        "type": "Point"
-      },
-      "properties": {
-        "accuracy": "street",
-        "address": {
-          "locality": "Toronto",
-          "street": "Queen Street"
-        },
-        "context": {
-          "country": {
-            "id": "osm:relation:1",
-            "name": "Canada"
-          },
-          "locality": {
-            "id": "osm:relation:3",
-            "name": "Toronto"
-          },
-          "region": {
-            "id": "osm:relation:2",
-            "name": "Ontario"
-          }
-        },
-        "id": "osm:way:13:interp:2-98",
-        "label": "Queen Street 2-98 even, Toronto",
-        "layer": "interpolation",
-        "name": "Queen Street",
-        "record_id": 6,
-        "score": 0.8369882,
-        "source": {
-          "dataset": "osm",
-          "object_id": 13,
-          "object_type": "way"
-        }
-      },
-      "type": "Feature"
     }
   ],
   "geocoding": {

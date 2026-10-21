@@ -420,18 +420,45 @@ impl TextSearcher {
         // any of its words may name an area. So may one whose localities
         // matched nothing, and so may any word the parser could not place.
         let anywhere = plan.context.is_empty() || pass == Pass::Lenient;
+        // A word of a stated area is searched there already; the subject's
+        // own copy is a separate word ("Eden" of "Eden Road, Mount Eden")
+        // and standing in would let that area absorb it.
+        let stated = plan
+            .context
+            .iter()
+            .flat_map(|part| &part.words)
+            .collect::<HashSet<_>>();
+        let mut named = Vec::new();
+        let mut all_stand_in = true;
         for word in &plan.subject {
-            let query = if anywhere {
+            let stands_in = anywhere && !stated.contains(&word.text);
+            let query = if stands_in {
                 self.word_or_area_query(what(&word.text), &word.text)
             } else {
                 what(&word.text)
             };
+            if word.required {
+                all_stand_in &= stands_in;
+                named.push((Occur::Should, what(&word.text)));
+            }
             let occur = if word.required {
                 Occur::Must
             } else {
                 Occur::Should
             };
             clauses.push((occur, query));
+        }
+        // Areas may answer for some required words, never all: else any
+        // street in Mount Eden answers "10 Eden Road Mount Eden" read as one
+        // street name. Scored at zero, the words already rank above.
+        if all_stand_in && !named.is_empty() {
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    Box::new(BooleanQuery::new(named)),
+                    0.0,
+                )),
+            ));
         }
         let unplaced = plan
             .unplaced
