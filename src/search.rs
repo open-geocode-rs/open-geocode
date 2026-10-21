@@ -1281,7 +1281,9 @@ impl TextSearcher {
     /// exception: the later labellings' stricter passes run too, and the hits
     /// on the stronger [`Evidence`] answer ("10 Ellerslie Panmure" read with
     /// Panmure the locality finds an Ellerslie Road outside it; read as one
-    /// street name, Ellerslie Panmure Highway).
+    /// street name, Ellerslie Panmure Highway). So are hits that nothing
+    /// says lie in the postcode their reading states (see
+    /// [`Evidence::confirmed`]).
     ///
     /// A hit whose own postcode contradicts the one the query names is kept,
     /// after the hits that do not, but it does not end the search: a stated
@@ -1384,7 +1386,11 @@ impl TextSearcher {
                     )?;
                     contradicted.push((tier, reading, kept));
                     if !hits.is_empty() {
-                        return Ok(Some(hits));
+                        let confirmed = !plan.postcode_may_be_house_number()
+                            || hits
+                                .iter()
+                                .any(|hit| hit.features.postcode != Agreement::Unknown);
+                        return Ok(Some((hits, confirmed)));
                     }
                 }
                 Ok(None)
@@ -3195,20 +3201,35 @@ impl Pass {
 }
 
 /// How strongly a reading's hits answer the query: the pass that found them,
-/// then the parser's score of the reading. Compared in that order, never
-/// summed: the score is an unnormalised Viterbi path score on no scale shared
-/// with retrieval, so any weight joining the two would be made up. A stricter
+/// then whether anything confirms the postcode the reading states, then the
+/// parser's score of the reading. Compared in that order, never summed: the
+/// score is an unnormalised Viterbi path score on no scale shared with
+/// retrieval, so any weight joining the two would be made up. A stricter
 /// pass outweighs any score; the score decides only between readings found
-/// by the same pass.
+/// by the same pass and as confirmed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Evidence {
     pass: Pass,
+    /// A hit agrees with the postcode the reading states, or it states none.
+    /// A number read as a postcode that nothing says the hits are in may be
+    /// their house number: "3010 Coast Road, Barrytown" is the house 3010,
+    /// not any house in a postcode 3010 no Barrytown record states.
+    confirmed: bool,
     score: f32,
 }
 
 impl Evidence {
     fn outweighs(self, other: Self) -> bool {
-        self.pass < other.pass || (self.pass == other.pass && self.score > other.score)
+        self.pass < other.pass
+            || (self.pass == other.pass
+                && (self.confirmed, self.score) > (other.confirmed, other.score))
+    }
+
+    /// Whether a later reading, which scores no higher, may still outweigh
+    /// it: in a stricter pass, or in the same pass with its postcode
+    /// confirmed.
+    fn open(self) -> bool {
+        self.pass == Pass::Lenient || !self.confirmed
     }
 }
 
@@ -3216,31 +3237,38 @@ impl Evidence {
 /// `None` when no reading finds any. `scores` are the readings' parser
 /// scores, best first, and `search` runs one pass over one reading.
 ///
-/// Readings run in turn, each through the passes until one finds hits. Hits
-/// from [`Pass::Strict`] or [`Pass::Street`] end the search. After hits from
-/// [`Pass::Lenient`] the later readings run only their stricter passes: a
-/// later reading scores no higher, so nothing else could outweigh them. That
-/// bounds the extra work to two passes over each remaining reading.
+/// Readings run in turn, each through the passes until one finds hits;
+/// `search` also says whether they confirm the reading's postcode (see
+/// [`Evidence::confirmed`]). Confirmed hits from [`Pass::Strict`] or
+/// [`Pass::Street`] end the search. After others the later readings run
+/// only the passes that could outweigh them: a later reading scores no
+/// higher, so only a stricter pass, or a confirmed one at the same pass,
+/// could. That bounds the extra work to a few passes over each remaining
+/// reading.
 fn choose_reading<T>(
     scores: &[f32],
-    mut search: impl FnMut(usize, Pass) -> Result<Option<T>>,
+    mut search: impl FnMut(usize, Pass) -> Result<Option<(T, bool)>>,
 ) -> Result<Option<(usize, T)>> {
     let mut best = None::<(Evidence, usize, T)>;
     for (reading, &score) in scores.iter().enumerate() {
-        if best
-            .as_ref()
-            .is_some_and(|(held, ..)| held.pass != Pass::Lenient)
-        {
+        if best.as_ref().is_some_and(|(held, ..)| !held.open()) {
             break;
         }
         for pass in Pass::ALL {
-            if best.as_ref().is_some_and(|(held, ..)| pass >= held.pass) {
+            if best
+                .as_ref()
+                .is_some_and(|(held, ..)| pass > held.pass || (pass == held.pass && held.confirmed))
+            {
                 break;
             }
-            let Some(hits) = search(reading, pass)? else {
+            let Some((hits, confirmed)) = search(reading, pass)? else {
                 continue;
             };
-            let evidence = Evidence { pass, score };
+            let evidence = Evidence {
+                pass,
+                confirmed,
+                score,
+            };
             if best
                 .as_ref()
                 .is_none_or(|(held, ..)| evidence.outweighs(*held))
@@ -4017,6 +4045,17 @@ impl QueryPlan {
             }),
             ..self.clone()
         })
+    }
+
+    /// Whether a plan with no house number reads as its postcode a word that
+    /// could be one: "3010" of "3010 Coast Road" is a postcode in one
+    /// reading and the house in another. "A1A 9Z9" never is.
+    fn postcode_may_be_house_number(&self) -> bool {
+        self.house_number.is_none()
+            && self.context.iter().any(|part| {
+                part.is_postcode()
+                    && matches!(part.words.as_slice(), [word] if HouseNumber::parse(word).is_some())
+            })
     }
 
     /// The postcode the last postcode part names. A postcode given apart
@@ -6419,6 +6458,26 @@ mod tests {
             unit("acme/other 40/house_number rosedale/street road/street"),
             None
         );
+    }
+
+    #[test]
+    fn a_reading_whose_postcode_nothing_confirms_yields_to_one_confirmed() {
+        let mut searched = Vec::new();
+        let mut search = |confirms: bool| {
+            searched.clear();
+            choose_reading(&[2.0, 1.0], |reading, pass| {
+                searched.push((reading, pass));
+                Ok(Some((reading, reading == 1 || confirms)))
+            })
+            .expect("chosen")
+            .map(|(reading, _)| reading)
+        };
+        // "3010" read as a postcode no hit is known to be in, then as the
+        // house number: the house wins.
+        assert_eq!(search(false), Some(1));
+        // A confirmed postcode ends the search at the first reading.
+        assert_eq!(search(true), Some(0));
+        assert_eq!(searched, [(0, Pass::Strict)]);
     }
 
     #[test]
