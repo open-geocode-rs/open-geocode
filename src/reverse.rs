@@ -622,6 +622,7 @@ mod tests {
                     geometry: point_geometry(-79.0, 43.0),
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 40),
+                    prominence: Default::default(),
                 }
                 .into(),
                 None,
@@ -637,6 +638,7 @@ mod tests {
                     geometry: point_geometry(-79.0, 43.00005),
                     location_precision: LocationPrecision::Centroid,
                     source: SourceProvenance::osm(ObjectType::Way, 41),
+                    prominence: Default::default(),
                 }
                 .into(),
                 None,

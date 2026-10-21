@@ -76,6 +76,42 @@ pub struct PoiRecord {
     pub geometry: Geometry,
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
+    pub prominence: Prominence,
+}
+
+/// How widely a POI is known, read from its own OSM tags alone: whether
+/// mappers linked it to Wikidata or Wikipedia, and in how many languages
+/// they named it. A museum of a city is linked and named in a dozen
+/// languages; a corner shop of the same name in neither. It breaks ties
+/// between POIs only (see the search's tie-break), never against another
+/// layer, and needs no data beyond the extract.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct Prominence {
+    /// It carries `wikidata=` or `wikipedia=`.
+    pub linked: bool,
+    /// The languages of its `name:<lang>` tags, `ja`, `ja-Hira` and `ja_rm`
+    /// counted once, up to [`Prominence::MAX_LANGUAGES`].
+    pub languages: u8,
+}
+
+impl Prominence {
+    /// Languages counted at most: the Pack stores the count in seven bits,
+    /// and past a few dozen a name is everywhere already.
+    pub const MAX_LANGUAGES: u8 = 127;
+
+    /// One byte: the languages, then whether it is linked.
+    pub fn to_byte(self) -> u8 {
+        self.languages.min(Self::MAX_LANGUAGES) << 1 | u8::from(self.linked)
+    }
+
+    pub const fn from_byte(byte: u8) -> Self {
+        Self {
+            linked: byte & 1 != 0,
+            languages: byte >> 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -773,7 +809,7 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 9)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 10)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -787,6 +823,11 @@ impl Serialize for PoiRecord {
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("location_precision", &self.location_precision)?;
         state.serialize_field("source", &self.source)?;
+        if self.prominence == Prominence::default() {
+            state.skip_field("prominence")?;
+        } else {
+            state.serialize_field("prominence", &self.prominence)?;
+        }
         state.end()
     }
 }

@@ -698,6 +698,7 @@ mod tests {
                 geometry: point_geometry(-79.4, 43.6),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, object_id),
+                prominence: Default::default(),
             };
             writer.write(&poi.into(), context).expect("POI");
         }

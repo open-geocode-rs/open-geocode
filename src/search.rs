@@ -32,7 +32,7 @@ use crate::{
     },
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
-        PlaceLayer, PoiRecord, Record, place_rank,
+        PlaceLayer, PoiRecord, Prominence, Record, place_rank,
     },
     records::{dequantize, quantize},
     spatial_index::{self, haversine_m},
@@ -1832,12 +1832,22 @@ impl TextSearcher {
                     .place_type(record_id)?
                     .as_deref()
                     .and_then(place_rank);
+                let prominence = records.prominence(record_id)?;
                 if hit.record.layer != Layer::Poi.as_str() || ranking.sought.is_empty() {
                     placed += 1;
                 }
                 hits.push((
                     key.clone(),
-                    TieBreak::new(&hit.record, rank, disputed, &query_words, ranking),
+                    TieBreak::new(
+                        &hit.record,
+                        Prior {
+                            place_rank: rank,
+                            prominence,
+                            disputed,
+                        },
+                        &query_words,
+                        ranking,
+                    ),
                     hit,
                 ));
             }
@@ -2752,6 +2762,14 @@ struct TieBreak {
     /// the words and the areas a query states reaches it, so a size prior
     /// never outweighs what the query says.
     place_rank: u8,
+    /// Every other record before a POI, then the POI its OSM tags show
+    /// better known first: linked to Wikidata or Wikipedia, then named in
+    /// more languages (see [`Prominence`]). Only POIs that tie on all the
+    /// query states and on the caller's focus reach it. It is no measure of
+    /// an address or a place, so `None` keeps it from ever ordering one
+    /// against a POI by prominence; at so full a tie an address before a
+    /// POI is what [`TextSearcher::demoted`] says anyway.
+    poi: Option<std::cmp::Reverse<Prominence>>,
     /// Exact points before centroids before estimates before line midpoints.
     precision: u8,
     /// Nodes before ways before relations, then the lower id.
@@ -2760,13 +2778,7 @@ struct TieBreak {
 }
 
 impl TieBreak {
-    fn new(
-        record: &Summary,
-        place_rank: Option<u8>,
-        disputed: bool,
-        query_words: &HashSet<&str>,
-        ranking: &Ranking,
-    ) -> Self {
+    fn new(record: &Summary, prior: Prior, query_words: &HashSet<&str>, ranking: &Ranking) -> Self {
         let label = search_key(&record.label).unwrap_or_default();
         let label_words = label.split_whitespace().collect::<HashSet<_>>();
         let extra_label_tokens = label
@@ -2811,13 +2823,24 @@ impl TieBreak {
             missing_query_words,
             inexact_query_words,
             focus_band,
-            disputed,
-            place_rank: place_rank.unwrap_or(u8::MAX),
+            disputed: prior.disputed,
+            place_rank: prior.place_rank.unwrap_or(u8::MAX),
+            poi: prior.prominence.map(std::cmp::Reverse),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
         }
     }
+}
+
+/// What the Pack knows of a record apart from the query, for [`TieBreak`].
+#[derive(Debug, Clone, Copy)]
+struct Prior {
+    /// See [`place_rank`].
+    place_rank: Option<u8>,
+    /// A POI's, `None` for the other layers.
+    prominence: Option<Prominence>,
+    disputed: bool,
 }
 
 /// How a record answers the unit the query names: 0 the flat it names, 1
@@ -4460,6 +4483,7 @@ mod tests {
             geometry: point_geometry(-79.5, 45.1),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
         };
         writer
             .write(
@@ -4547,6 +4571,7 @@ mod tests {
             geometry: point_geometry(lon, 43.0005),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
         };
         for record in [
             poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
@@ -4604,6 +4629,97 @@ mod tests {
         // Name-only POI queries rank as they did: the street lacks a word.
         assert_eq!(layers("Walmer Road Bakery")[0].0, "osm:node:12");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Two cafes of one name the query cannot tell apart: the one its tags
+    /// show better known first, never ahead of an address it ties with.
+    #[test]
+    fn equal_pois_prefer_the_better_known() {
+        let temp_dir = temp_pack_path("search-poi-prominence");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let cafe = |object_id, prominence| PoiRecord {
+            alt_names: Vec::new(),
+            name: "Blue Door".to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(-79.0, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence,
+        };
+        for record in [
+            cafe(1, Prominence::default()),
+            cafe(
+                2,
+                Prominence {
+                    linked: false,
+                    languages: 3,
+                },
+            ),
+            cafe(
+                3,
+                Prominence {
+                    linked: true,
+                    languages: 1,
+                },
+            ),
+        ] {
+            writer.write(&record.into(), None).expect("cafe");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            top_ids(&searcher, "Blue Door"),
+            ["osm:node:3", "osm:node:2", "osm:node:1"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        // At a full tie a record of another layer stays ahead of a POI,
+        // however well known.
+        let first = TieBreak::new(
+            &street_summary(),
+            Prior {
+                place_rank: None,
+                prominence: None,
+                disputed: false,
+            },
+            &HashSet::new(),
+            &Ranking::default(),
+        );
+        let known = TieBreak::new(
+            &street_summary(),
+            Prior {
+                place_rank: None,
+                prominence: Some(Prominence {
+                    linked: true,
+                    languages: 40,
+                }),
+                disputed: false,
+            },
+            &HashSet::new(),
+            &Ranking::default(),
+        );
+        assert!(first < known);
+    }
+
+    fn street_summary() -> Summary {
+        Summary {
+            id: "osm:way:1".to_string(),
+            layer: "street".to_string(),
+            name: "Blue Door".to_string(),
+            label: "Blue Door".to_string(),
+            address: Address::default(),
+            category: None,
+            point: None,
+            source: Source {
+                dataset: "osm".to_string(),
+                object_type: Some(ObjectType::Way),
+                object_id: Some(1),
+                derived_from: None,
+                record_count: None,
+            },
+        }
     }
 
     #[test]
@@ -5652,6 +5768,7 @@ mod tests {
                     geometry: point_geometry(-79.41, 43.68),
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 1),
+                    prominence: Default::default(),
                 }
                 .into(),
                 None,

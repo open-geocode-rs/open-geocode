@@ -549,6 +549,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 geometry: point_geometry(-79.005, 43.0),
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 11),
+                prominence: Default::default(),
             }
             .into(),
             context.clone(),

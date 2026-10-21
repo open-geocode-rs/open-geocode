@@ -15,7 +15,8 @@ use crate::{
     record::{
         AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceRecord,
-        PoiRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord, point_geometry,
+        PoiRecord, PostcodeRecord, Prominence, Record, SourceProvenance, StreetRecord,
+        point_geometry,
     },
     util::codec::{
         get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64, put_i64,
@@ -521,6 +522,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
                 None => out.push(0),
             }
             encode_precision(out, record.location_precision);
+            out.push(record.prominence.to_byte());
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -594,6 +596,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 _ => Some(decode_address(input)?),
             },
             location_precision: decode_precision(input)?,
+            prominence: Prominence::from_byte(get_u8(input)?),
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -990,6 +993,7 @@ mod tests {
                 geometry: point_geometry(-79.38, 43.65),
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 16),
+                prominence: Default::default(),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -999,6 +1003,7 @@ mod tests {
                 geometry: point_geometry(-79.36, 43.67),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 17),
+                prominence: Default::default(),
             }),
         ];
         for (seq, record) in records.into_iter().enumerate() {

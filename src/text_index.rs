@@ -1463,6 +1463,7 @@ mod tests {
             geometry: point_geometry(-79.38, 43.65),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, 5),
+            prominence: Default::default(),
         };
 
         let projected = Document::from_record(

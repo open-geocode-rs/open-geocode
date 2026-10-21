@@ -1577,6 +1577,7 @@ mod tests {
             geometry: crate::record::point_geometry(0.0, 0.0),
             location_precision: crate::record::LocationPrecision::Point,
             source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
+            prominence: Default::default(),
         });
         assert_eq!(
             named(&RecordNames::of(&poi)),

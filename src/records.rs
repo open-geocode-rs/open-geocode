@@ -29,7 +29,8 @@
 //!                     a street's, place's or POI's alternate names follow its name
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
-//!                     then its street's postcodes; a POI's address follows a
+//!                     then its street's postcodes; a POI's prominence follows
+//!                     its names as one byte, then its address after a
 //!                     presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      line strings only: varint count, then zigzag deltas
@@ -90,8 +91,8 @@ use crate::{
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Record,
-        SourceProvenance, StreetRecord, point_geometry,
+        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord,
+        Prominence, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     util::codec::{
         get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
@@ -656,6 +657,7 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 put_u64(out, u64::from(self.strings.id(&record.category)?));
                 self.put_strings(out, &record.alt_names)?;
+                out.push(record.prominence.to_byte());
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -1015,16 +1017,16 @@ impl Reader {
                 })
             }
             Layer::Poi => {
-                let (name, category, alt_names, address) =
-                    self.poi_fields(header.strings, &mut fields)?;
+                let poi = self.poi_fields(header.strings, &mut fields)?;
                 Record::Poi(PoiRecord {
-                    name: name.to_string(),
-                    alt_names,
-                    category: category.to_string(),
-                    address,
+                    name: poi.name.to_string(),
+                    alt_names: poi.alt_names,
+                    category: poi.category.to_string(),
+                    address: poi.address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
                     source: header.provenance(&self.datasets)?,
+                    prominence: poi.prominence,
                 })
             }
             Layer::Interpolation => {
@@ -1087,17 +1089,16 @@ impl Reader {
                 )
             }
             Layer::Poi => {
-                let (name, poi_category, _, address) =
-                    self.poi_fields(header.strings, &mut fields)?;
+                let poi = self.poi_fields(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.object()?;
-                category = Some(poi_category.to_string());
-                if let Some(address) = &address {
+                category = Some(poi.category.to_string());
+                if let Some(address) = &poi.address {
                     stated = Address::from(address);
                 }
                 (
                     crate::labels::osm_record_id(object_type, object_id),
-                    name.to_string(),
-                    crate::labels::poi_label(name, address.as_ref(), None),
+                    poi.name.to_string(),
+                    crate::labels::poi_label(poi.name, poi.address.as_ref(), None),
                 )
             }
             Layer::Interpolation => {
@@ -1165,7 +1166,7 @@ impl Reader {
             }
             Layer::Poi => self
                 .poi_fields(header.strings, &mut fields)?
-                .3
+                .address
                 .and_then(|address| address.postcode),
             Layer::Interpolation => {
                 self.interpolation_fields(header.strings, &mut fields)?
@@ -1175,6 +1176,18 @@ impl Reader {
             Layer::Postcode => Some(self.string_field(header.strings, &mut fields)?.to_string()),
             _ => None,
         })
+    }
+
+    /// A POI's prominence; none for the other layers. Reads no geometry.
+    pub fn prominence(&self, id: RecordId) -> Result<Option<Prominence>> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        if header.layer != Layer::Poi {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.poi_fields(header.strings, &mut fields)?.prominence,
+        ))
     }
 
     /// A place's `place_type`; none for the other layers. Reads no geometry.
@@ -1219,6 +1232,7 @@ impl Reader {
                 for _ in 0..get_u64(&mut fields)? {
                     get_u32(&mut fields)?;
                 }
+                get_u8(&mut fields)?;
                 get_u8(&mut fields)? != 0
             }
             _ => false,
@@ -1234,8 +1248,8 @@ impl Reader {
         let (name, alt_names) = match header.layer {
             Layer::Address | Layer::Interpolation | Layer::Postcode => return Ok(Vec::new()),
             Layer::Poi => {
-                let (name, _, alt_names, _) = self.poi_fields(strings, &mut fields)?;
-                (name, alt_names)
+                let poi = self.poi_fields(strings, &mut fields)?;
+                (poi.name, poi.alt_names)
             }
             Layer::Street => {
                 let name = self.string_field(strings, &mut fields)?;
@@ -1656,19 +1670,22 @@ impl Reader {
         })
     }
 
-    fn poi_fields(
-        &self,
-        strings: StringSegment,
-        fields: &mut &[u8],
-    ) -> Result<(&str, &str, Vec<String>, Option<AddressComponents>)> {
+    fn poi_fields(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<PoiFields<'_>> {
         let name = self.string_field(strings, fields)?;
         let category = self.string_field(strings, fields)?;
         let alt_names = self.string_list(strings, fields)?;
+        let prominence = Prominence::from_byte(get_u8(fields)?);
         let address = match get_u8(fields)? {
             0 => None,
             _ => Some(self.address_components(strings, fields)?),
         };
-        Ok((name, category, alt_names, address))
+        Ok(PoiFields {
+            name,
+            category,
+            alt_names,
+            prominence,
+            address,
+        })
     }
 
     fn interpolation_fields(
@@ -1760,6 +1777,15 @@ impl Reader {
         }
         Ok(points)
     }
+}
+
+/// What a POI's body holds before its geometry.
+struct PoiFields<'a> {
+    name: &'a str,
+    category: &'a str,
+    alt_names: Vec<String>,
+    prominence: Prominence,
+    address: Option<AddressComponents>,
 }
 
 /// One block of the store, as [`Reader::block`] finds it.
@@ -2168,6 +2194,10 @@ mod tests {
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 6),
+                prominence: Prominence {
+                    linked: true,
+                    languages: 12,
+                },
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -2177,6 +2207,7 @@ mod tests {
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 7),
+                prominence: Default::default(),
             }),
         ];
         for layer in [
