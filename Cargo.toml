@@ -43,6 +43,10 @@ fst = "0.4"
 flate2 = "1.1"
 geo = "0.33"
 geojson = "1.0"
+# NFC and NFKC of search keys, and the General_Category that tells a mark,
+# already in the tree through ureq's url.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_properties = "2.3"
 indicatif = "0.17"
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"

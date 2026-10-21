@@ -17,7 +17,8 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use super::fixture::TaggedRow;
 use crate::{
     parse::types::{Label, Tagged},
-    text_index::{STREET_TYPE_ABBREVIATIONS, is_street_type, normalize_index_text},
+    text_index::{STREET_TYPE_ABBREVIATIONS, is_street_type},
+    util::fold::search_key,
 };
 
 /// The seed every messy row's random draws derive from.
@@ -69,7 +70,7 @@ impl Variant {
 ///    abbreviated to its usual abbreviation in the text index's table
 ///    ([`STREET_TYPE_ABBREVIATIONS`], read backwards: `street` becomes `st`),
 ///    and fused when the token before it in its part is also a street token
-///    (`manosquer straße` becomes the single token `manosquerstraße`, labelled
+///    (`manosquer strasse` becomes the single token `manosquerstrasse`, labelled
 ///    `street`). When the coin's pick is impossible for the word the other is
 ///    used, and when neither is the word is left alone.
 /// 3. Exactly one typo goes into one token of five or more characters, all of
@@ -117,7 +118,7 @@ pub fn messy(row: &TaggedRow) -> TaggedRow {
     debug_assert!(
         tokens
             .iter()
-            .all(|tagged| normalize_index_text(&tagged.token).as_deref() == Some(&tagged.token)),
+            .all(|tagged| search_key(&tagged.token).as_deref() == Some(&tagged.token)),
         "a messy token is not normalized"
     );
     TaggedRow {
@@ -144,7 +145,6 @@ fn parts(row: &TaggedRow) -> Vec<Vec<Tagged>> {
 /// have no abbreviation in the table.
 const OTHER_STREET_TYPES: &[&str] = &[
     // German.
-    "straße",
     "strasse",
     "weg",
     "platz",
@@ -157,7 +157,6 @@ const OTHER_STREET_TYPES: &[&str] = &[
     // French.
     "rue",
     "chemin",
-    "allée",
     "impasse",
     "route",
     "quai",
@@ -322,7 +321,7 @@ mod tests {
         }
     }
 
-    const LINE: &str = "de\tde\tmanosquer/street straße/street 12/house_number , 80331/postcode münchen/locality , deutschland/country";
+    const LINE: &str = "de\tde\tmanosquer/street strasse/street 12/house_number , 80331/postcode munchen/locality , deutschland/country";
 
     #[test]
     fn as_is_keeps_the_commas_and_stripped_drops_them() {
@@ -332,7 +331,7 @@ mod tests {
         assert_eq!(stripped.tokens, gold.tokens);
         assert_eq!(
             stripped.query(),
-            "manosquer straße 12 80331 münchen deutschland"
+            "manosquer strasse 12 80331 munchen deutschland"
         );
     }
 
@@ -406,14 +405,14 @@ mod tests {
             // First in its part: "avenue" can only be abbreviated.
             let out = messy(&row(&format!("fr{index}\tfr\tavenue/street foch/street")));
             assert_eq!(tokens(&out), ["ave", "foch"]);
-            // No abbreviation: "straße" can only be fused, and the fused
+            // No abbreviation: "strasse" can only be fused, and the fused
             // token is the row's one typo candidate.
             let out = messy(&row(&format!(
-                "de{index}\tde\tmanosquer/street straße/street"
+                "de{index}\tde\tmanosquer/street strasse/street"
             )));
             assert_eq!(out.tokens.len(), 1);
             assert!(
-                one_typo_apart("manosquerstraße", &out.tokens[0].token),
+                one_typo_apart("manosquerstrasse", &out.tokens[0].token),
                 "{out:?}"
             );
             // Neither: "rue" first and unabbreviated stays.
@@ -485,6 +484,6 @@ mod tests {
         assert_eq!(abbreviation("street"), Some("st"));
         assert_eq!(abbreviation("avenue"), Some("ave"));
         assert_eq!(abbreviation("trail"), Some("trl"));
-        assert_eq!(abbreviation("straße"), None);
+        assert_eq!(abbreviation("strasse"), None);
     }
 }

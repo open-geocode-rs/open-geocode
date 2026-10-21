@@ -31,7 +31,7 @@ fixtures/parse/
 
 A gold row is `lang<TAB>cc<TAB>fields`, with the fields separated by single spaces.
 A field is `token/label`, or a bare `,` that marks where the corpus separated two parts of the address (its `SEP` and `FSEP`).
-A token is the source text normalized with `normalize_index_text` until a second pass changes nothing: lowercased, with every run of non-alphanumeric characters a space, so a token never holds `,`, `/` or whitespace.
+A token is the source text as og's search key writes it (`src/util/fold.rs`): NFKC, lowercased, Latin letters in ASCII by CLDR's Latin-ASCII, with every run of characters that are not letters, digits or marks a space, so a token never holds `,`, `/` or whitespace.
 A label is one of og's eight: `house_number`, `unit`, `street`, `locality`, `region`, `postcode`, `country`, `other`.
 
 A predictions file has one row per gold row, in the same order and format, with the variant's tokens and libpostal's labels.
@@ -71,10 +71,10 @@ In order:
 1. The parts are shuffled into a uniformly random order, and the tokens of a part keep their order.
 2. Each street-labelled token that is a street-type word is abbreviated or fused onto the token before it, on a fair coin.
    Abbreviating uses the street-type table of `src/text_index.rs` read backwards, a word's first abbreviation there being its usual one (`street` to `st`, `avenue` to `ave`).
-   Fusing joins the word onto the token before it in its part when that token is also a street token (`manosquer straße` to `manosquerstraße`).
+   Fusing joins the word onto the token before it in its part when that token is also a street token (`manosquer strasse` to `manosquerstrasse`).
    The fused token is one gold token labelled `street`, so a messy row can have fewer tokens than its gold row.
    When the coin's pick is impossible for the word, the other is used, and when neither is, the word stays.
-   The street-type words are those of the text index table and its street-type list, plus German, French and Russian ones listed in `variant.rs` (`straße`, `weg`, `rue`, `chemin`, `улица`, `проспект` and others), which have no abbreviation and can only be fused.
+   The street-type words are those of the text index table and its street-type list, plus German, French and Russian ones listed in `variant.rs` (`strasse`, `weg`, `rue`, `chemin`, `улица`, `проспект` and others), which have no abbreviation and can only be fused.
 3. Exactly one typo goes into one token of five or more characters, all alphabetic, when the row has one: a substitution, a deletion or a transposition of two adjacent different characters, each kind equally likely, at a uniform position.
    A substitution draws a different letter from `a-z` for a Latin letter, from `а-я` for a Cyrillic one, and otherwise from the token's other characters.
    A substitution or transposition with no possible choice becomes a deletion.

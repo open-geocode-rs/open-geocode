@@ -37,9 +37,9 @@ use crate::{
         AREA_POSTCODE_FIELD, Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD,
         POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms,
         base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
-        flat_number_term, is_numeric_token, normalize_index_text, open_text_index,
-        street_search_text,
+        flat_number_term, is_numeric_token, open_text_index, street_search_text,
     },
+    util::fold::{exact_key, search_key},
 };
 
 pub struct TextSearcher {
@@ -328,7 +328,7 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        let Some(query_text) = normalize_index_text(options.query.trim()) else {
+        let Some(query_text) = search_key(options.query.trim()) else {
             return Ok(Vec::new());
         };
         if query_text
@@ -349,7 +349,7 @@ impl TextSearcher {
         };
         let tokens = autocomplete_query_tokens(&query_text);
         let ranking = Ranking {
-            query_words: query_text.split_whitespace().map(str::to_string).collect(),
+            query_words: QueryWords::new(&options.query),
             number_text: autocomplete_number(&tokens).map(str::to_string),
             ..Ranking::default()
         };
@@ -728,12 +728,10 @@ impl TextSearcher {
             });
         };
         let first_query = first_plan.text();
-        let query_words: HashSet<String> = normalize_index_text(query_text)
-            .iter()
-            .flat_map(|text| text.split_whitespace())
-            .map(str::to_string)
-            .chain(context.iter().flat_map(|part| part.words.iter().cloned()))
-            .collect();
+        let mut query_words = QueryWords::new(query_text);
+        query_words
+            .search
+            .extend(context.iter().flat_map(|part| part.words.iter().cloned()));
         let mut contradicting = Contradicting::default();
         for plan in plans {
             let text = plan.text();
@@ -767,7 +765,7 @@ impl TextSearcher {
         &self,
         plan: &QueryPlan,
         pass: Pass,
-        query_words: &HashSet<String>,
+        query_words: &QueryWords,
         filters: Filters<'_>,
         limit: usize,
         accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
@@ -1098,6 +1096,7 @@ impl TextSearcher {
             .max(limit);
         let query_words = ranking
             .query_words
+            .search
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
@@ -1802,6 +1801,10 @@ struct TieBreak {
     /// one document and so one score, though only some state the unit the
     /// query names.
     missing_query_words: usize,
+    /// Query words the label does not spell as the query does: a query that
+    /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
+    /// finds, and one that writes "Taupo" for Taupo first.
+    inexact_query_words: usize,
     /// Larger places first (see [`place_rank`]), then every other record:
     /// "Richmond" is the town before a locality of that name. Only a tie on
     /// the words and the areas a query states reaches it, so a size prior
@@ -1821,7 +1824,7 @@ impl TieBreak {
         query_words: &HashSet<&str>,
         ranking: &Ranking,
     ) -> Self {
-        let label = normalize_index_text(&record.label).unwrap_or_default();
+        let label = search_key(&record.label).unwrap_or_default();
         let label_words = label.split_whitespace().collect::<HashSet<_>>();
         let extra_label_tokens = label
             .split_whitespace()
@@ -1830,6 +1833,14 @@ impl TieBreak {
         let missing_query_words = query_words
             .iter()
             .filter(|word| !label_words.contains(*word))
+            .count();
+        let exact_label = exact_key(&record.label).unwrap_or_default();
+        let exact_label_words = exact_label.split_whitespace().collect::<HashSet<_>>();
+        let inexact_query_words = ranking
+            .query_words
+            .exact
+            .iter()
+            .filter(|word| !exact_label_words.contains(word.as_str()))
             .count();
         let precision = match record.point.map(|point| point.precision) {
             Some(PointPrecision::Point) => 0,
@@ -1852,18 +1863,14 @@ impl TieBreak {
                 .address
                 .housenumber
                 .as_deref()
-                .and_then(normalize_index_text)
+                .and_then(search_key)
                 .is_some_and(|written| {
                     [&ranking.number_text, &ranking.flat_text]
                         .into_iter()
                         .flatten()
                         .any(|text| *text == written)
                 });
-        let stated = record
-            .address
-            .unit
-            .as_deref()
-            .and_then(normalize_index_text);
+        let stated = record.address.unit.as_deref().and_then(search_key);
         let unit = match (ranking.unit.as_deref(), stated.as_deref()) {
             _ if as_written => 0,
             (Some(sought), Some(stated))
@@ -1878,6 +1885,7 @@ impl TieBreak {
             unit,
             extra_label_tokens,
             missing_query_words,
+            inexact_query_words,
             place_rank: place_rank.unwrap_or(u8::MAX),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
@@ -1933,9 +1941,7 @@ impl Pass {
 /// What [`TextSearcher::ranked_hits`] ranks by besides the text score.
 #[derive(Debug, Clone, Default)]
 struct Ranking {
-    /// The query's words as written, before abbreviations were expanded, to
-    /// compare with records' own labels.
-    query_words: HashSet<String>,
+    query_words: QueryWords,
     /// Whether the query asks for a house number.
     numbered: bool,
     /// The house number, when interpolation ranges can estimate it.
@@ -1989,6 +1995,32 @@ impl Contradicting {
     fn alone(mut self, limit: usize) -> Option<(String, Vec<TextSearchHit>)> {
         self.hits.truncate(limit);
         Some((self.query?, self.hits))
+    }
+}
+
+/// The query's words as written, before abbreviations were expanded, to
+/// compare with records' own labels.
+#[derive(Debug, Clone, Default)]
+struct QueryWords {
+    /// As [`search_key`] writes them, and the words of the structured
+    /// context.
+    search: HashSet<String>,
+    /// As [`exact_key`] writes them.
+    exact: HashSet<String>,
+}
+
+impl QueryWords {
+    fn new(query: &str) -> Self {
+        let words = |key: Option<String>| {
+            key.iter()
+                .flat_map(|text| text.split_whitespace())
+                .map(str::to_string)
+                .collect()
+        };
+        Self {
+            search: words(search_key(query)),
+            exact: words(exact_key(query)),
+        }
     }
 }
 
@@ -2439,7 +2471,7 @@ impl HouseNumber {
 }
 
 fn normalized_for_match(value: Option<&str>) -> Option<String> {
-    normalize_index_text(value?.trim())
+    search_key(value?.trim())
 }
 
 fn unique_strings(values: Vec<String>) -> Vec<String> {

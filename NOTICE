@@ -318,9 +318,10 @@ written by Colin Plumb in 1993, no copyright is claimed.
 This code is in the public domain; do with it what you wish.
 
 ========================================================================
-Unicode Character Database (Unihan)
+Unicode Character Database (Unihan) and Unicode CLDR
 https://www.unicode.org/
 Numeral values (src/parse/lattice/data/numerals.tsv)
+Latin-ASCII transform (src/parse/lattice/data/latin_ascii.tsv)
 ========================================================================
 
 UNICODE LICENSE V3

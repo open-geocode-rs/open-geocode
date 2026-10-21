@@ -104,11 +104,7 @@ fn hits_of_readings(
     query: &str,
     keeps: impl Fn(&Tagged) -> bool,
 ) -> Vec<(String, Vec<String>)> {
-    let query_words = normalize_index_text(query)
-        .iter()
-        .flat_map(|text| text.split_whitespace())
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
+    let query_words = QueryWords::new(query);
     let mut readings = Vec::new();
     for parsed in searcher.tagger.parse(query) {
         if !parsed.pieces.iter().any(&keeps) {
@@ -499,6 +495,7 @@ fn a_query_of_unplaced_words_needs_most_of_them() {
     }
     writer.finish().expect("finish");
     let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+    // Plan words are search keys, as the parser writes them.
     let plan = |words: &[&str]| QueryPlan {
         unplaced: words.iter().map(|word| word.to_string()).collect(),
         ..QueryPlan::default()
@@ -521,12 +518,12 @@ fn a_query_of_unplaced_words_needs_most_of_them() {
     // Two of three: the full match first, the one missing a word next, and
     // never the one with only "ulica".
     assert_eq!(
-        ids(&plan(&["ulica", "marszałka", "piłsudskiego"])),
+        ids(&plan(&["ulica", "marszalka", "pilsudskiego"])),
         vec!["osm:way:1", "osm:way:2"]
     );
-    assert_eq!(ids(&plan(&["marszałka"])).len(), 2);
-    assert_eq!(ids(&plan(&["ulica", "kościuszki"])).len(), 3);
-    assert!(ids(&plan(&["ulica", "kościuszki", "wolności"])).is_empty());
+    assert_eq!(ids(&plan(&["marszalka"])).len(), 2);
+    assert_eq!(ids(&plan(&["ulica", "kosciuszki"])).len(), 3);
+    assert!(ids(&plan(&["ulica", "kosciuszki", "wolnosci"])).is_empty());
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 

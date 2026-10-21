@@ -52,8 +52,10 @@ use crate::{
     parse::types::Label,
     record::{AddressComponents, Layer, PlaceLayer, Record},
     resources::Resources,
-    text_index::normalize_index_text,
-    util::codec::{get_string, get_u8, get_u64, put_str, put_u64},
+    util::{
+        codec::{get_string, get_u8, get_u64, put_str, put_u64},
+        fold::search_key,
+    },
 };
 
 /// `CC<TAB>template` rows, `ZZ` the default.
@@ -2079,7 +2081,7 @@ impl<'a> Renderer<'a> {
         let countries = self.names(tuple.country_record_id())?;
         let country_code = countries
             .first()
-            .and_then(|name| normalize_index_text(name))
+            .and_then(|name| search_key(name))
             .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
             .and_then(|entry| entry.country);
         let country = pick_name(&countries, random).map(str::to_string);

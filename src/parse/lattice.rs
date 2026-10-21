@@ -46,6 +46,7 @@ use crate::{
     container::Container,
     pack::resolve_pack_path,
     text_index::{expand_address_abbreviations, expand_final_direction},
+    util::fold::{Piece, search_key, search_pieces},
 };
 
 /// The longest span looked up as one name.
@@ -121,7 +122,7 @@ impl fmt::Display for CountryCode {
     }
 }
 
-/// A query split into the words `normalize_index_text` produces, with where
+/// A query split into the words [`search_key`] produces, with where
 /// punctuation that separates fields (a comma, a semicolon, a line break)
 /// stood between them, and which words punctuation joins to the word before
 /// ("993.5", "1/2", "306-1333"). Commas are a feature of the parse, never its
@@ -138,37 +139,29 @@ pub struct Tokens {
 
 impl Tokens {
     /// Split raw query text. Joined by single spaces the words are exactly
-    /// `normalize_index_text` of the text.
+    /// [`search_key`] of the text.
     pub fn new(text: &str) -> Self {
         let mut tokens = Self::default();
-        let mut word = String::new();
         let mut pending_break = false;
         // What stood between the last word and this one, while it can still
         // be a joiner.
         let mut gap = Gap::None;
-        for character in text.chars() {
-            if character.is_alphanumeric() {
-                for folded in character.to_lowercase() {
-                    word.push(folded);
-                }
-                continue;
-            }
-            if !word.is_empty() {
-                tokens.push(std::mem::take(&mut word), pending_break, gap.joiner());
+        search_pieces(text, |piece| match piece {
+            Piece::Word(word) => {
+                tokens.push(word.to_string(), pending_break, gap.joiner());
                 pending_break = false;
                 gap = Gap::None;
             }
-            gap = match gap {
-                Gap::None if JOINERS.contains(&character) => Gap::Joiner(character),
-                _ => Gap::Other,
-            };
-            if FIELD_BREAKS.contains(&character) && !tokens.words.is_empty() {
-                pending_break = true;
+            Piece::Gap(character) => {
+                gap = match gap {
+                    Gap::None if JOINERS.contains(&character) => Gap::Joiner(character),
+                    _ => Gap::Other,
+                };
+                if FIELD_BREAKS.contains(&character) && !tokens.words.is_empty() {
+                    pending_break = true;
+                }
             }
-        }
-        if !word.is_empty() {
-            tokens.push(word, pending_break, gap.joiner());
-        }
+        });
         tokens
     }
 
@@ -234,18 +227,6 @@ fn is_neutral(word: &str) -> bool {
         })
 }
 
-/// `word` with the fullwidth forms of ASCII characters ("１", "ａ") written as
-/// ASCII, as compatibility normalization (NFKC) folds them, so a number typed
-/// through an input method is the number a name is stored with.
-fn fold_width(word: &str) -> String {
-    word.chars()
-        .map(|character| match u32::from(character) {
-            code @ 0xFF01..=0xFF5E => char::from_u32(code - 0xFEE0).unwrap_or(character),
-            _ => character,
-        })
-        .collect()
-}
-
 /// `character<TAB>value` rows of the ideographs that are numerals, from the
 /// Unihan kPrimaryNumeric property (Unicode License V3, see
 /// `NOTICE`), vendored.
@@ -303,7 +284,7 @@ pub fn mask_numerals(key: &str) -> Option<String> {
 /// ("とうきょう たからづかげきじょう") is found by the units of a query that
 /// writes it.
 pub fn dictionary_key(name: &str) -> Option<String> {
-    let normalized = crate::text_index::normalize_index_text(name)?;
+    let normalized = search_key(name)?;
     let words = normalized.split(' ').collect::<Vec<_>>();
     let units = Units::of(&Tokens::from_words(&words));
     Some(units.key(0, units.len()))
@@ -312,11 +293,10 @@ pub fn dictionary_key(name: &str) -> Option<String> {
 /// The units a lattice is built on: the tokens of a [`Tokens`], except that
 /// a token holding characters of a script written without spaces is split
 /// into one unit per such character and one per run of other characters
-/// ("丸の内2" is "丸", "の", "内", "2"), and fullwidth forms are folded to
-/// ASCII ([`fold_width`]). Units written with no space between them, or with
-/// only a space between a character of such a script and another or a digit
-/// (see [`is_neutral`]), are *glued*: they join without a space in a
-/// dictionary key, so "東京都千代田区", "東京都 千代田区" and
+/// ("丸の内2" is "丸", "の", "内", "2"). Units written with no space between
+/// them, or with only a space between a character of such a script and
+/// another or a digit (see [`is_neutral`]), are *glued*: they join without a
+/// space in a dictionary key, so "東京都千代田区", "東京都 千代田区" and
 /// "東 京 都 千 代 田 区" are the same units with the same keys, and so are
 /// "5番2号" and "5 番 2 号".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -339,9 +319,8 @@ impl Units {
             glued: Vec::with_capacity(tokens.len()),
         };
         for (index, word) in tokens.words.iter().enumerate() {
-            let word = fold_width(word);
             if !word.chars().any(is_unspaced) {
-                units.push(tokens, index, word, true);
+                units.push(tokens, index, word.clone(), true);
                 continue;
             }
             let mut first = true;
@@ -1375,5 +1354,41 @@ impl CountryVotes {
     }
 }
 
+#[cfg(test)]
+mod smoke {
+    use super::{dictionary::Entry, *};
+
+    #[test]
+    fn a_plain_spelling_is_labelled_as_the_name_it_folds_to() {
+        let entry = |count| Entry {
+            count,
+            country: CountryCode::parse("PL"),
+            levels: 0,
+        };
+        let locality = dictionary_key("Łódź").expect("key");
+        let street = dictionary_key("Piotrkowska").expect("key");
+        let tagger = LatticeTagger::new(
+            Dictionaries::from_entries([
+                (Field::Locality, locality.as_str(), entry(700_000)),
+                (Field::Street, street.as_str(), entry(300)),
+            ]),
+            Weights::built_in(),
+        );
+        let labels = |query: &str| {
+            tagger
+                .tag(query)
+                .into_iter()
+                .map(|tagged| (tagged.token, tagged.label))
+                .collect::<Vec<_>>()
+        };
+        let accented = labels("Piotrkowska 12, Łódź");
+        assert_eq!(
+            accented.last(),
+            Some(&("lodz".to_string(), Label::Locality))
+        );
+        assert_eq!(labels("Piotrkowska 12, Lodz"), accented);
+        assert_eq!(labels("ＰＩＯＴＲＫＯＷＳＫＡ １２, ŁÓDŹ"), accented);
+    }
+}
 #[cfg(test)]
 mod tests;

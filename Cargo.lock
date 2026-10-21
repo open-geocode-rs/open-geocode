@@ -1892,6 +1892,8 @@ dependencies = [
  "fst",
  "geo",
  "geojson",
+ "icu_normalizer",
+ "icu_properties",
  "indicatif",
  "levenshtein_automata",
  "libc",
