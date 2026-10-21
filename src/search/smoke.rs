@@ -85,7 +85,7 @@ fn explain(searcher: &TextSearcher, query: &str) -> String {
                 .map(|piece| format!("{}/{:?}", piece.token, piece.label))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let plan = QueryPlan::from_tagged(&parsed.pieces, &[], |word| {
+            let plan = QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, &[], |word| {
                 searcher.tagger.dictionaries().describes_street(word)
             });
             format!("{tokens}\n  {plan:?}")
@@ -110,7 +110,7 @@ fn hits_of_readings(
         if !parsed.pieces.iter().any(&keeps) {
             continue;
         }
-        let plan = QueryPlan::from_tagged(&parsed.pieces, &[], |word| {
+        let plan = QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, &[], |word| {
             searcher.tagger.dictionaries().describes_street(word)
         })
         .expect("plan");
@@ -341,7 +341,7 @@ fn a_contradicting_direction_ranks_lower_and_a_street_of_list_words_stays_whole(
         .parse("North Road")
         .iter()
         .find_map(|parsed| {
-            QueryPlan::from_tagged(&parsed.pieces, &[], |word| {
+            QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, &[], |word| {
                 searcher.tagger.dictionaries().describes_street(word)
             })
             .filter(|plan| plan.subject.len() == 2)
@@ -497,7 +497,7 @@ fn a_query_of_unplaced_words_needs_most_of_them() {
     let searcher = TextSearcher::open(&temp_dir).expect("searcher");
     // Plan words are search keys, as the parser writes them.
     let plan = |words: &[&str]| QueryPlan {
-        unplaced: words.iter().map(|word| word.to_string()).collect(),
+        unplaced: Word::paired(words.iter().map(|word| word.to_string()).collect(), None),
         ..QueryPlan::default()
     };
     let ids = |plan: &QueryPlan| {
@@ -788,5 +788,194 @@ mod postcode {
             "contradicted everywhere, still found"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Typo tiers: exact first, then one edit, then two, never a number.
+mod typo_tiers {
+    use crate::record::{ObjectType, PlaceLayer, PlaceRecord, SourceProvenance};
+
+    use super::*;
+
+    /// The typo tiers asked for on this thread since the last call.
+    fn tiers_asked() -> usize {
+        TYPO_TIERS.with(|tiers| tiers.replace(0))
+    }
+
+    fn place(writer: &mut Writer, name: &str, place_type: &str, object_id: i64) -> RecordId {
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Locality,
+                    PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: name.to_string(),
+                        place_type: place_type.to_string(),
+                        geometry: point_geometry(175.0, -40.0),
+                        source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                    },
+                ),
+                None,
+            )
+            .expect("place")
+    }
+
+    /// Wellington with Lambton Quay and a Lampton Quay one edit from it,
+    /// the town of Taupō, and Dunedin with a Taupo Street, a Main Street
+    /// with only number 13 on it, a King Street and a Lambton Quay.
+    fn new_zealand(name: &str) -> (std::path::PathBuf, TextSearcher) {
+        let temp_dir = temp_pack_path(name);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let wellington = place(&mut writer, "Wellington", "city", 100);
+        let dunedin = place(&mut writer, "Dunedin", "city", 101);
+        place(&mut writer, "Taupō", "town", 102);
+        writer.set_context_names(
+            [
+                (wellington, vec!["Wellington".to_string()]),
+                (dunedin, vec!["Dunedin".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        for (id, name, area) in [
+            ("osm:way:1", "Lambton Quay", wellington),
+            ("osm:way:2", "Lampton Quay", wellington),
+            ("osm:way:3", "Taupo Street", dunedin),
+            ("osm:way:4", "Main Street", dunedin),
+            ("osm:way:5", "King Street", dunedin),
+            ("osm:way:6", "Lambton Quay", dunedin),
+        ] {
+            writer
+                .write(&street(id, name, [170.5, -45.9]).into(), in_locality(area))
+                .expect("street");
+        }
+        let mut thirteen = address_record("osm:node:13", "", "13", "Main Street", None, None);
+        thirteen.geometry = point_geometry(170.5, -45.9);
+        writer
+            .write(&thirteen.into(), in_locality(dunedin))
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        (temp_dir, searcher)
+    }
+
+    #[test]
+    fn a_macron_is_no_typo_and_the_town_outranks_the_street() {
+        let (temp_dir, searcher) = new_zealand("smoke-typo-taupo");
+        for query in ["Taupo", "Taupō"] {
+            let hits = search_ids(&searcher, query);
+            assert_eq!(
+                hits.first().map(String::as_str),
+                Some("osm:relation:102"),
+                "{query}: {hits:?}\n{}",
+                explain(&searcher, query)
+            );
+            assert_eq!(tiers_asked(), 0, "{query} is spelt as the Pack spells it");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_misspelt_street_is_found_in_a_typo_tier() {
+        let (temp_dir, searcher) = new_zealand("smoke-typo-lambton");
+        let query = "Lamton Quay Wellington";
+        let hits = search_ids(&searcher, query);
+        assert_eq!(
+            hits.first().map(String::as_str),
+            Some("osm:way:1"),
+            "{hits:?}\n{}",
+            explain(&searcher, query)
+        );
+        assert!(tiers_asked() > 0);
+        let parsed = &searcher.tagger.parse(query)[0];
+        let plan = QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, &[], |word| {
+            searcher.tagger.dictionaries().describes_street(word)
+        })
+        .expect("plan");
+        assert_eq!(
+            (
+                plan.subject[0].text.as_str(),
+                plan.subject[0].corrected.as_deref()
+            ),
+            ("lamton", Some("lambton")),
+            "the parser's reading rides along with the word as written"
+        );
+        // A misspelt place the parser read as one the Pack knows is that
+        // place, required as any known place is.
+        let query = "Lamton Quay Welington";
+        assert_eq!(
+            search_ids(&searcher, query),
+            ["osm:way:1", "osm:way:2"],
+            "{}",
+            explain(&searcher, query)
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn the_spelling_as_written_ranks_above_its_neighbour() {
+        let (temp_dir, searcher) = new_zealand("smoke-typo-exact-first");
+        // Exact: the neighbour one edit away is never searched for.
+        assert_eq!(
+            search_ids(&searcher, "Lambton Quay Wellington"),
+            ["osm:way:1"]
+        );
+        assert_eq!(tiers_asked(), 0);
+        // A typo in another word searches the typo tier, where "lambton"
+        // also reaches "lampton", but as written ranks first.
+        let query = "Lambton Quau Wellington";
+        assert_eq!(
+            search_ids(&searcher, query),
+            ["osm:way:1", "osm:way:2"],
+            "{}",
+            explain(&searcher, query)
+        );
+        assert!(tiers_asked() > 0);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_house_number_is_never_a_typo() {
+        let (temp_dir, searcher) = new_zealand("smoke-typo-number");
+        let hits = search_ids(&searcher, "12 Main St");
+        assert!(!hits.contains(&"osm:node:13".to_string()), "{hits:?}");
+        assert!(
+            geocode_row(&searcher, "12 Main St", Some("Dunedin"), None, None).as_deref()
+                != Some("osm:node:13")
+        );
+        assert_eq!(
+            search_ids(&searcher, "13 Main St")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:13")
+        );
+        for edits in Edits::TIERS {
+            for word in ["12", "13a", "m5v", "sh1", "route66"] {
+                assert_eq!(edits.allowed(word), None, "{word}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_word_under_four_letters_is_matched_only_as_written() {
+        let (temp_dir, searcher) = new_zealand("smoke-typo-short");
+        assert_eq!(search_ids(&searcher, "Kng"), Vec::<String>::new());
+        assert_eq!(
+            search_ids(&searcher, "Kinh").first().map(String::as_str),
+            Some("osm:way:5"),
+            "four letters may have one edit"
+        );
+        for edits in Edits::TIERS {
+            assert_eq!(edits.allowed("kng"), None);
+        }
+        assert_eq!(Edits::One.allowed("taupo"), Some((1, 1)));
+        assert_eq!(Edits::Two.allowed("taupo"), Some((1, 1)));
+        assert_eq!(Edits::One.allowed("lambton"), Some((1, 2)));
+        assert_eq!(Edits::Two.allowed("lambton"), Some((2, 2)));
+        assert!(!Edits::Two.reaches("lambton", "kambton"), "prefix two");
+        assert!(Edits::Two.reaches("lambton", "lamtno"));
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
