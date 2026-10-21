@@ -638,6 +638,11 @@ impl Document {
         let mut builder = ProjectionBuilder::new(record_id, "address");
         if let Some(subject) = address.address.subject() {
             builder.name_for_search(subject);
+            // Its name is its number and street ("10 Queen Street"), so of
+            // documents a street's words match alike the street comes first.
+            if let Some(words) = &mut builder.projected.name_words {
+                *words += 1;
+            }
         }
         builder.address_parts(&address.address);
         builder.projected.units.extend(address.address.unit.clone());
