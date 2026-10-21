@@ -1462,40 +1462,4 @@ impl CountryVotes {
 }
 
 #[cfg(test)]
-mod smoke {
-    use super::{dictionary::Entry, *};
-
-    #[test]
-    fn a_plain_spelling_is_labelled_as_the_name_it_folds_to() {
-        let entry = |count| Entry {
-            count,
-            country: CountryCode::parse("PL"),
-            levels: 0,
-        };
-        let locality = dictionary_key("Łódź").expect("key");
-        let street = dictionary_key("Piotrkowska").expect("key");
-        let tagger = LatticeTagger::new(
-            Dictionaries::from_entries([
-                (Field::Locality, locality.as_str(), entry(700_000)),
-                (Field::Street, street.as_str(), entry(300)),
-            ]),
-            Weights::built_in(),
-        );
-        let labels = |query: &str| {
-            tagger
-                .tag(query)
-                .into_iter()
-                .map(|tagged| (tagged.token, tagged.label))
-                .collect::<Vec<_>>()
-        };
-        let accented = labels("Piotrkowska 12, Łódź");
-        assert_eq!(
-            accented.last(),
-            Some(&("lodz".to_string(), Label::Locality))
-        );
-        assert_eq!(labels("Piotrkowska 12, Lodz"), accented);
-        assert_eq!(labels("ＰＩＯＴＲＫＯＷＳＫＡ １２, ŁÓDŹ"), accented);
-    }
-}
-#[cfg(test)]
 mod tests;

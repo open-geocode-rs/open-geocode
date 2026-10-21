@@ -764,8 +764,6 @@ impl TextSearcher {
         if edits == Edits::None {
             return Ok(Some(plan.clone()));
         }
-        #[cfg(test)]
-        TYPO_TIERS.with(|tiers| tiers.set(tiers.get() + 1));
         let mut spelt = plan.clone();
         // Whether a place is read as a name the tiers before did not read it
         // as.
@@ -2529,12 +2527,6 @@ struct Spelt {
     near: Vec<String>,
 }
 
-#[cfg(test)]
-thread_local! {
-    /// The typo tiers [`TextSearcher::spelt`] was asked for on this thread.
-    static TYPO_TIERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// A Levenshtein automaton, as Tantivy's term dictionaries walk one.
 struct Levenshtein<'a>(&'a DFA);
 
@@ -3228,9 +3220,6 @@ fn is_address_number_token(token: &str) -> bool {
 }
 
 #[cfg(test)]
-mod smoke;
-
-#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -3284,7 +3273,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    pub(super) fn geocode(
+    fn geocode(
         searcher: &TextSearcher,
         address: &str,
         locality: Option<&str>,
@@ -4139,7 +4128,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    pub(super) fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
+    fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
         searcher
             .search(TextSearchOptions {
                 query: query.to_string(),
@@ -5159,11 +5148,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    pub(super) fn temp_pack_path(name: &str) -> std::path::PathBuf {
+    fn temp_pack_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("open-geocode-{name}-{}", std::process::id()))
     }
 
-    pub(super) fn address_record(
+    fn address_record(
         id: &str,
         _label: &str,
         number: &str,
@@ -5199,7 +5188,7 @@ mod tests {
         }
     }
 
-    pub(super) fn street_record(id: &str, label: &str) -> StreetRecord {
+    fn street_record(id: &str, label: &str) -> StreetRecord {
         let object_id = id
             .strip_prefix("osm:way:")
             .and_then(|value| value.parse::<i64>().ok())

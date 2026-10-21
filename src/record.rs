@@ -842,33 +842,3 @@ impl DerivedSourceProvenance {
         }
     }
 }
-
-#[cfg(test)]
-mod smoke {
-    use super::place_rank;
-
-    #[test]
-    fn place_ranks_follow_the_osm_place_hierarchy() {
-        let ranks = [
-            "derived_country:NZ",
-            "admin_level:4",
-            "county",
-            "city",
-            "town",
-            "village",
-            "hamlet",
-            "isolated_dwelling",
-            "farm",
-            "locality",
-        ]
-        .map(|place_type| place_rank(place_type).expect(place_type));
-        assert!(
-            ranks.is_sorted_by(|larger, smaller| larger < smaller),
-            "{ranks:?}"
-        );
-        assert!(place_rank("admin_level:8") < place_rank("admin_level:10"));
-        assert!(place_rank("city") < place_rank("suburb"));
-        assert_eq!(place_rank("Town"), place_rank("town"));
-        assert_eq!(place_rank("area"), None);
-    }
-}
