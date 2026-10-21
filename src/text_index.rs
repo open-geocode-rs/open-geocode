@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 12;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
 /// Postcode data within this radius describes where a record is: a record
 /// with no postcode of its own is ranked by the nearest postcode centroid
 /// within it, and the batch check compares the postcode areas within it.
