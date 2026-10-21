@@ -3,7 +3,8 @@
 //! A build asks its [`AddressSource`] for files once it knows which countries
 //! the Pack covers, then reads each one into the same street groups as the
 //! OSM addresses. An imported address that repeats an OSM one (same street,
-//! number and unit, close by) is dropped: the Pack keeps one record per house.
+//! number and unit, close by) is dropped: the Pack keeps one record per house,
+//! and marks it disputed when the two disagree on where it is.
 //!
 //! Two layouts are read, either one gzipped or not:
 //!
@@ -90,9 +91,14 @@ pub struct ImportReport {
     pub accepted: u64,
     /// Rows left out, by reason.
     pub rejected: BTreeMap<String, u64>,
-    /// Accepted rows dropped for repeating an address the Pack already has:
-    /// an OSM one, or one an earlier row or file stated.
+    /// Accepted rows dropped for repeating an address the Pack already has,
+    /// an OSM one or one an earlier row or file stated, close to where it
+    /// lies.
     pub duplicates: u64,
+    /// Accepted rows dropped for naming a house the Pack already has, but
+    /// farther from it than sources placing one house disagree. The house
+    /// kept is marked disputed.
+    pub disputes: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -311,6 +317,7 @@ fn address(
         return Err("bad_coordinates");
     }
     Ok(AddressRecord {
+        disputed: false,
         street_postcodes: Vec::new(),
         address: AddressComponents {
             number,

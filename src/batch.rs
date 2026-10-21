@@ -1021,6 +1021,7 @@ mod tests {
             writer
                 .write(
                     &AddressRecord {
+                        disputed: false,
                         street_postcodes: Vec::new(),
                         address: AddressComponents {
                             areas: Vec::new(),

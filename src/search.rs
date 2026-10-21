@@ -1566,15 +1566,15 @@ impl TextSearcher {
                 if !accept(&hit)? {
                     continue;
                 }
-                let rank = self
-                    .pack
-                    .records()
+                let records = self.pack.records();
+                let rank = records
                     .place_type(record_id)?
                     .as_deref()
                     .and_then(place_rank);
+                let disputed = records.header(record_id)?.disputed;
                 hits.push((
                     key.clone(),
-                    TieBreak::new(&hit.record, rank, &query_words, ranking),
+                    TieBreak::new(&hit.record, rank, disputed, &query_words, ranking),
                     hit,
                 ));
             }
@@ -2223,6 +2223,10 @@ struct TieBreak {
     /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
     /// finds, and one that writes "Taupo" for Taupo first.
     inexact_query_words: usize,
+    /// An address no other source disagrees on first: where two sources
+    /// placed one house far apart, its point may be wrong (see
+    /// [`AddressRecord::disputed`]).
+    disputed: bool,
     /// Larger places first (see [`place_rank`]), then every other record:
     /// "Richmond" is the town before a locality of that name. Only a tie on
     /// the words and the areas a query states reaches it, so a size prior
@@ -2239,6 +2243,7 @@ impl TieBreak {
     fn new(
         record: &Summary,
         place_rank: Option<u8>,
+        disputed: bool,
         query_words: &HashSet<&str>,
         ranking: &Ranking,
     ) -> Self {
@@ -2304,6 +2309,7 @@ impl TieBreak {
             extra_label_tokens,
             missing_query_words,
             inexact_query_words,
+            disputed,
             place_rank: place_rank.unwrap_or(u8::MAX),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
@@ -3270,6 +3276,29 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["osm:node:5", "osm:node:7", "osm:way:9"]);
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn equal_hits_prefer_an_address_no_source_disputes() {
+        let temp_dir = temp_pack_path("search-disputed");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut disputed = address_record("osm:node:5", "", "342", "Albert Street", None, None);
+        disputed.disputed = true;
+        for record in [
+            disputed,
+            address_record("osm:node:7", "", "342", "Albert Street", None, None),
+        ] {
+            writer.write(&record.into(), None).expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            top_ids(&searcher, "342 Albert Street"),
+            vec!["osm:node:7", "osm:node:5"]
+        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -5165,6 +5194,7 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(1);
         AddressRecord {
+            disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),

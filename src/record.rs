@@ -27,6 +27,9 @@ pub struct AddressRecord {
     pub geometry: Geometry,
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
+    /// Whether another source places the same house farther from this point
+    /// than sources placing one house ever disagree: the point may be wrong.
+    pub disputed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -583,7 +586,7 @@ impl AddressRecord {
 
 impl Serialize for AddressRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("AddressRecord", 7)?;
+        let mut state = serializer.serialize_struct("AddressRecord", 8)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
@@ -591,6 +594,11 @@ impl Serialize for AddressRecord {
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("location_precision", &self.location_precision)?;
         state.serialize_field("source", &self.source)?;
+        if self.disputed {
+            state.serialize_field("disputed", &true)?;
+        } else {
+            state.skip_field("disputed")?;
+        }
         state.end()
     }
 }

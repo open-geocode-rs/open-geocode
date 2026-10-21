@@ -665,6 +665,7 @@ mod tests {
 
     fn address_record() -> AddressRecord {
         AddressRecord {
+            disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),

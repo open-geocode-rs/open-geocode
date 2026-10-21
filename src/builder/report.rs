@@ -10,7 +10,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 21;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 22;
 
 /// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -1605,6 +1605,7 @@ mod tests {
     ) -> AddressRecord {
         let street = street.map(str::to_string);
         AddressRecord {
+            disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),

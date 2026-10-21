@@ -1237,6 +1237,7 @@ mod tests {
     #[test]
     fn projects_address_fields_for_search() {
         let record = AddressRecord {
+            disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),

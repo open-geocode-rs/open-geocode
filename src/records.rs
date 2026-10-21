@@ -13,8 +13,8 @@
 //! records/index    record_count u64, then (block_count + 1) u64 block offsets
 //! records/blocks   blocks: base_lon i32 | base_lat i32 | start width u8 (2 or 4)
 //!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
-//!                  u64, each when its flag is set | the start (u16 or u32) of
-//!                  each body that is not continued | bodies
+//!                  u64, disputed u64, each when its flag is set | the start (u16
+//!                  or u32) of each body that is not continued | bodies
 //! records/datasets count varint, then each imported dataset's name
 //! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
@@ -36,6 +36,10 @@
 //!
 //! continued address (its bit set in `continued`; no tag, its precision and
 //! source kind are in the block's bitmaps)
+//!
+//! An address another source placed elsewhere (see
+//! [`AddressRecord::disputed`]) has its bit set in `disputed`, continued or
+//! not: a bit per slot costs nothing in the many blocks with none.
 //!       dlon, dlat    zigzag varints from the record before it
 //!       source        zigzag OSM object id delta from the record before it
 //!       number        varint: value << 2 | unit (1) | text (1); a plain number's
@@ -99,7 +103,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 7;
+pub const RECORDS_VERSION: u32 = 8;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -114,6 +118,7 @@ const BLOCK_HEADER_BYTES: usize = 18;
 const BLOCK_CENTROIDS: u8 = 1;
 const BLOCK_WAYS: u8 = 2;
 const BLOCK_RELATIONS: u8 = 4;
+const BLOCK_DISPUTED: u8 = 8;
 
 const TAG_LAYER_MASK: u8 = 0x0f;
 const TAG_CENTROID: u8 = 0x10;
@@ -217,6 +222,8 @@ pub struct Header {
     pub lon_e7: i32,
     pub lat_e7: i32,
     pub context: Option<ContextRef>,
+    /// See [`AddressRecord::disputed`].
+    pub disputed: bool,
     centroid: bool,
     line: bool,
     source_kind: SourceKind,
@@ -339,6 +346,7 @@ pub struct Writer {
     centroids: u64,
     ways: u64,
     relations: u64,
+    disputed: u64,
     block_base: (i32, i32),
     record_count: u64,
     strings: StringTable,
@@ -478,6 +486,7 @@ impl Writer {
             centroids: 0,
             ways: 0,
             relations: 0,
+            disputed: 0,
             block_base: (0, 0),
             record_count: 0,
             strings: StringTable {
@@ -539,6 +548,11 @@ impl Writer {
         let mut body = std::mem::take(&mut self.body);
         body.clear();
         let slot = 1u64 << self.block_slots;
+        if let Record::Address(address) = record
+            && address.disputed
+        {
+            self.disputed |= slot;
+        }
         match record {
             Record::Address(address)
                 if self
@@ -807,6 +821,7 @@ impl Writer {
             (BLOCK_CENTROIDS, self.centroids),
             (BLOCK_WAYS, self.ways),
             (BLOCK_RELATIONS, self.relations),
+            (BLOCK_DISPUTED, self.disputed),
         ];
         let flags = bitmaps
             .iter()
@@ -834,6 +849,7 @@ impl Writer {
         self.centroids = 0;
         self.ways = 0;
         self.relations = 0;
+        self.disputed = 0;
         Ok(())
     }
 
@@ -995,6 +1011,7 @@ impl Reader {
                     geometry: geometry(&mut fields)?,
                     location_precision,
                     source: header.provenance(&self.datasets)?,
+                    disputed: header.disputed,
                 })
             }
             Layer::Poi => {
@@ -1350,6 +1367,7 @@ impl Reader {
         let centroids = bitmap(BLOCK_CENTROIDS)?;
         let ways = bitmap(BLOCK_WAYS)?;
         let relations = bitmap(BLOCK_RELATIONS)?;
+        let disputed = bitmap(BLOCK_DISPUTED)?;
         let mask = low_slots(count);
         if continued & !mask != 0 || continued & 1 != 0 {
             return Err(Error::Decode("record block marks a slot it does not have"));
@@ -1371,6 +1389,7 @@ impl Reader {
             centroids,
             ways,
             relations,
+            disputed,
             starts: &bytes[at..bodies_start],
             bodies: &bytes[bodies_start..],
         })
@@ -1506,8 +1525,10 @@ impl Reader {
     fn body(&self, id: RecordId) -> Result<Entry<'_>> {
         let (block, slot) = self.locate(id)?;
         let strings = self.segment(id);
+        let disputed = block.disputed & 1 << slot != 0;
         if !block.is_continued(slot) {
-            let (header, fields) = plain_header(block.base, strings, block.plain_body(slot)?)?;
+            let (mut header, fields) = plain_header(block.base, strings, block.plain_body(slot)?)?;
+            header.disputed = disputed;
             return Ok(Entry {
                 header,
                 fields,
@@ -1549,6 +1570,7 @@ impl Reader {
                 lon_e7: point.0,
                 lat_e7: point.1,
                 context: anchor_header.context,
+                disputed,
                 centroid: block.centroids & 1 << slot != 0,
                 line: false,
                 // A run is all OSM or all of one imported dataset.
@@ -1752,6 +1774,8 @@ struct Block<'a> {
     centroids: u64,
     ways: u64,
     relations: u64,
+    /// Of every slot: a disputed address.
+    disputed: u64,
     /// Where each slot that is not continued starts in `bodies`.
     starts: &'a [u8],
     bodies: &'a [u8],
@@ -1984,6 +2008,7 @@ fn plain_header(
             lon_e7,
             lat_e7,
             context,
+            disputed: false,
             centroid: tag & TAG_CENTROID != 0,
             line: tag & TAG_LINE != 0,
             source_kind,
@@ -2075,6 +2100,7 @@ mod tests {
     fn sample_records() -> Vec<Record> {
         let mut records = vec![
             Record::Address(AddressRecord {
+                disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
                     areas: vec!["Old Toronto".into(), "Liberty Village".into()],
@@ -2433,6 +2459,8 @@ mod tests {
                     },
                     1_000_000 - index_i64 * 37,
                 );
+                // Anchors and continued addresses both carry their mark.
+                address.disputed = index % 7 == 3;
                 if index == 70 {
                     // A different postcode breaks the run; the next continues
                     // the new one.

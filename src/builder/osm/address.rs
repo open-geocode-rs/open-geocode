@@ -44,6 +44,7 @@ pub(crate) fn address_record_from_candidate(
     candidate: &AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
     Ok(AddressRecord {
+        disputed: false,
         street_postcodes: Vec::new(),
         address: address_components(&candidate.tags)?,
         geometry: point_geometry(candidate.lon, candidate.lat),

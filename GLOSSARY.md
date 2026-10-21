@@ -20,6 +20,11 @@ _Avoid_: type, category
 The size class the source gave a place (city, town, village, hamlet, or an administrative level), which breaks ties between places of the same name.
 _Avoid_: importance, population
 
+**Disputed address**:
+An address that another source places farther away than sources placing one house disagree, though not so far it could be another house.
+The Pack keeps one record of it, at OSM's point when OSM has it, and ranks and rates it below an address no source disputes.
+_Avoid_: duplicate, conflict
+
 **Street postcodes**:
 The postcodes the other addresses of a street state, lent to an address of that street that states none.
 _Avoid_: inferred postcode

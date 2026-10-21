@@ -1696,6 +1696,7 @@ mod tests {
     fn words_many_units_are_written_with_are_unit_words() {
         let address = |unit: &str| {
             Record::Address(crate::record::AddressRecord {
+                disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
                     areas: Vec::new(),
@@ -1745,6 +1746,7 @@ mod tests {
     #[test]
     fn records_name_their_streets_areas_and_country() {
         let names = RecordNames::of(&Record::Address(crate::record::AddressRecord {
+            disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: vec!["Liberty Village".into()],

@@ -505,6 +505,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
             encode_address(out, &record.address);
             put_strs(out, &record.street_postcodes);
             encode_precision(out, record.location_precision);
+            out.push(u8::from(record.disputed));
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -580,6 +581,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
             address: decode_address(input)?,
             street_postcodes: get_strings(input)?,
             location_precision: decode_precision(input)?,
+            disputed: get_u8(input)? != 0,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -910,6 +912,7 @@ mod tests {
         });
         let records = [
             Record::Address(AddressRecord {
+                disputed: false,
                 street_postcodes: vec!["M5V 1A1".into(), "M5V 2B2".into()],
                 address: AddressComponents {
                     areas: Vec::new(),

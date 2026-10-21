@@ -89,7 +89,7 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{OSM_DATASET, Record, RejectedRecord},
+    record::{AddressComponents, AddressRecord, OSM_DATASET, ObjectType, Record, RejectedRecord},
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
@@ -859,9 +859,39 @@ impl<'a> AddressRuns<'a> {
 /// few metres apart, at the door, the parcel or the building's middle.
 const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 
+/// An imported address farther than [`REPEATED_HOUSE_RADIUS_M`] from a kept
+/// address of the same house, but within this, still names that house: the
+/// sources disagree on where it is. Below half the 2 km street-group cell, so
+/// it never joins what the cell grid keeps apart as two runs of one street,
+/// and far below the spacing of the places a street name repeats in (two
+/// villages' Hauptstrasse, a rural road crossing a county line where the
+/// numbers start over). A large rural parcel's centroid lies a few hundred
+/// metres from its house; a row geocoded to the wrong end of a street or to
+/// another town does not, and is kept as the house it says it is.
+const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
+
+/// An address kept so far in one house group.
+struct KeptHouse {
+    point: [f64; 2],
+    /// Where in the group's buffer it waits.
+    at: usize,
+}
+
 /// The addresses again, without the imported rows that repeat an address
 /// the Pack already has, OSM ones first: read in house order, then sorted
 /// back into street groups. Each dropped row is counted on its file.
+///
+/// One record answers for one house. A row within
+/// [`REPEATED_HOUSE_RADIUS_M`] of a kept address of its house agrees with it
+/// and is dropped. One beyond that, but within [`DISPUTED_HOUSE_RADIUS_M`] of
+/// a kept address it does not contradict, is dropped too: the kept address
+/// keeps its point, OSM's when OSM has the house, and is marked
+/// [`AddressRecord::disputed`]. Only a row farther still, or one stating
+/// another postcode, locality or area than every kept address near it, is a
+/// house of its own. Two houses of one street name and number lie apart by
+/// the distance between the places that repeat the name, which the radius
+/// stays below; where they lie closer, the postcode or the locality tells
+/// them apart.
 fn drop_repeated_houses(
     addresses: ExternalSorter<PendingAddress>,
     scratch: &Arc<crate::extsort::Scratch>,
@@ -876,14 +906,26 @@ fn drop_repeated_houses(
         houses.push(PendingAddress::house(address.into_address(), seq)?)
     })?;
     let mut grouped = ExternalSorter::new(scratch, "addresses-kept", memory, budget);
-    let mut house: Option<PendingAddress> = None;
-    let mut kept: Vec<[f64; 2]> = Vec::new();
+    // A kept address is marked disputed only by the rows after it, so the
+    // house waits whole before it is passed on.
+    let mut house: Vec<(AddressRecord, u64)> = Vec::new();
+    let mut house_key: Option<PendingAddress> = None;
+    let mut kept: Vec<KeptHouse> = Vec::new();
+    let flush = |house: &mut Vec<(AddressRecord, u64)>,
+                 grouped: &mut ExternalSorter<PendingAddress>|
+     -> Result<()> {
+        for (record, seq) in house.drain(..) {
+            grouped.push(PendingAddress::new(record, seq)?)?;
+        }
+        Ok(())
+    };
     for address in houses.finish()? {
         let address = address?;
-        if house
+        if house_key
             .as_ref()
             .is_none_or(|house| !house.same_group(&address))
         {
+            flush(&mut house, &mut grouped)?;
             kept.clear();
         }
         let point = address.record.display_point().ok_or_else(|| {
@@ -892,26 +934,87 @@ fn drop_repeated_houses(
                 address.record.id()
             ))
         })?;
-        let repeated = kept.iter().any(|[lon, lat]| {
-            crate::spatial_index::haversine_m(*lon, *lat, point[0], point[1])
-                <= REPEATED_HOUSE_RADIUS_M
-        });
         let record = address.clone().into_address();
-        if repeated && record.source.object_type == crate::record::ObjectType::Row {
+        let imported = record.source.object_type == ObjectType::Row;
+        let distance = |kept: &KeptHouse| {
+            crate::spatial_index::haversine_m(kept.point[0], kept.point[1], point[0], point[1])
+        };
+        let repeated = imported
+            && kept
+                .iter()
+                .any(|kept| distance(kept) <= REPEATED_HOUSE_RADIUS_M);
+        let disputed = if imported && !repeated {
+            kept.iter()
+                .filter(|kept| {
+                    distance(kept) <= DISPUTED_HOUSE_RADIUS_M
+                        && !other_house(&house[kept.at].0, &record)
+                })
+                .min_by(|left, right| distance(left).total_cmp(&distance(right)))
+                .map(|kept| kept.at)
+        } else {
+            None
+        };
+        if repeated || disputed.is_some() {
+            if let Some(at) = disputed {
+                house[at].0.disputed = true;
+            }
             if let Some(import) = report
                 .imports
                 .iter_mut()
                 .find(|import| import.dataset == record.source.dataset)
             {
-                import.duplicates += 1;
+                if repeated {
+                    import.duplicates += 1;
+                } else {
+                    import.disputes += 1;
+                }
             }
         } else {
-            kept.push(point);
-            grouped.push(PendingAddress::new(record, address.seq)?)?;
+            kept.push(KeptHouse {
+                point,
+                at: house.len(),
+            });
+            house.push((record, address.seq));
         }
-        house = Some(address);
+        house_key = Some(address);
     }
+    flush(&mut house, &mut grouped)?;
     Ok(grouped)
+}
+
+/// Whether two addresses of one house key state where they are differently:
+/// both state a postcode, a locality or areas, and they differ. Then they are
+/// two houses, however close.
+fn other_house(kept: &AddressRecord, row: &AddressRecord) -> bool {
+    fn differ<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
+        left.zip(right).is_some_and(|(left, right)| left != right)
+    }
+    let postcode = |address: &AddressComponents| {
+        address
+            .postcode
+            .as_deref()
+            .and_then(crate::text_index::compact_postcode)
+    };
+    let locality = |address: &AddressComponents| {
+        address
+            .locality
+            .as_deref()
+            .and_then(crate::util::fold::search_key)
+    };
+    let areas = |address: &AddressComponents| {
+        Some(
+            address
+                .areas
+                .iter()
+                .filter_map(|area| crate::util::fold::search_key(area))
+                .collect::<Vec<_>>(),
+        )
+        .filter(|areas| !areas.is_empty())
+    };
+    let (kept, row) = (&kept.address, &row.address);
+    differ(postcode(kept), postcode(row))
+        || differ(locality(kept), locality(row))
+        || differ(areas(kept), areas(row))
 }
 
 fn request_nodes(
@@ -1448,6 +1551,70 @@ mod tests {
         assert_eq!(top("16 King Street"), vec!["openaddresses:test:row:2"]);
         assert_eq!(top("10 King Street"), vec!["osm:node:1"]);
         assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A row naming a house OSM has, placed a few hundred metres away, is
+    /// the same house in the wrong place: one record, OSM's, marked disputed.
+    /// Farther, or in another postcode, it is a house of its own.
+    #[test]
+    fn keeps_one_record_of_a_house_two_sources_place_apart() {
+        let dir = temp_dir("disputed");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let csv = dir.join("addresses.csv");
+        // OSM has 10 King Street, Toronto, M5V 1A1 at 43.60, -79.40.
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.40,43.604,10,King Street,Toronto,M5V 1A1\n\
+             -79.40,43.70,10,King Street,Toronto,\n\
+             -79.40,43.596,10,King Street,Toronto,K7L 1A1\n",
+        )
+        .expect("csv");
+        let report = build_osm_pack(BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                addresses::AddressFile {
+                    dataset: "openaddresses:test".to_string(),
+                    path: csv,
+                },
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let imported = &report.imports[0];
+        assert_eq!((imported.duplicates, imported.disputes), (0, 1));
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
+        let disputed = |id: &str| {
+            let record_id = reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"));
+            match reader.records().record(record_id).expect("record") {
+                Record::Address(address) => address.disputed,
+                other => panic!("{id} is an address: {other:?}"),
+            }
+        };
+        assert!(disputed("osm:node:1"), "OSM's point is kept, disputed");
+        assert_eq!(
+            reader
+                .find_by_source_id("openaddresses:test:row:1")
+                .expect("lookup"),
+            None,
+            "the row 445 m away is dropped"
+        );
+        assert!(
+            !disputed("openaddresses:test:row:2"),
+            "11 km away: another house"
+        );
+        assert!(
+            !disputed("openaddresses:test:row:3"),
+            "another postcode: another house"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
