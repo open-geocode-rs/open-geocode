@@ -925,13 +925,12 @@ impl<'a> AddressRuns<'a> {
 /// draws a road as a way per stretch between its junctions, so one road was
 /// as many answers as it has stretches, told apart only by their ids.
 ///
-/// Ways join within the locality they lie in, or the district where no
-/// locality covers them: one name is many streets across a country, and a
-/// road crossing a town line is a street in each town. Each street is
-/// labelled with where it is: its locality when that is a settlement (see
-/// `settled`), else its district, so a street in a city's ward or local
-/// board is named by the city. `area_names` are the names of each area,
-/// its own first.
+/// Ways join within the area their street is labelled with: the locality
+/// they lie in when that is a settlement (see `settled`), else its
+/// district, so a street in a city's ward or local board is named by the
+/// city and joins across the wards; else the locality. One name is many
+/// streets across a country, and a road crossing a town line is a street in
+/// each town. `area_names` are the names of each area, its own first.
 fn join_streets(
     streets: ExternalSorter<PendingStreet>,
     index: &BoundaryIndex,
@@ -950,17 +949,16 @@ fn join_streets(
                     let [lon, lat] = way.representative_point;
                     let context = index.context_for_point(lon, lat, Default::default());
                     let tuple = &context.admin_context;
-                    let (locality, district) =
-                        (tuple.locality_record_id(), tuple.district_record_id());
-                    let area = locality.or(district);
+                    let locality = tuple.locality_record_id();
+                    let area = locality
+                        .filter(|locality| settled.contains(locality))
+                        .or(tuple.district_record_id())
+                        .or(locality);
                     match areas.iter_mut().find(|(at, ..)| *at == area) {
                         Some((.., members)) => members.push(way),
                         None => {
-                            let named = locality
-                                .filter(|locality| settled.contains(locality))
-                                .or(district)
-                                .or(locality)
-                                .and_then(|area| area_names.get(&area)?.first().cloned());
+                            let named =
+                                area.and_then(|area| area_names.get(&area)?.first().cloned());
                             areas.push((area, named, vec![way]));
                         }
                     }
