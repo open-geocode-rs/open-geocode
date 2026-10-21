@@ -537,12 +537,12 @@ impl TextSearcher {
         pass: Pass,
         filters: Filters<'_>,
         areas: &AreaWords,
-    ) -> Box<dyn Query> {
+    ) -> Result<Box<dyn Query>> {
         let mut clauses = Vec::new();
         if let Some(number) = &plan.house_number {
             clauses.push((
                 Occur::Must,
-                self.house_number_query(number, plan.unit.as_deref(), pass),
+                self.house_number_query(number, plan.unit.as_deref(), pass)?,
             ));
         }
         clauses.extend(self.subject_clauses(plan, pass, areas));
@@ -562,7 +562,7 @@ impl TextSearcher {
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
-        Box::new(BooleanQuery::new(clauses))
+        Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
     /// The documents whose extent meets `bbox`, scored at zero like every
@@ -1180,23 +1180,42 @@ impl TextSearcher {
         number: &HouseNumber,
         unit: Option<&str>,
         pass: Pass,
-    ) -> Box<dyn Query> {
+    ) -> Result<Box<dyn Query>> {
+        let term = |text: &str| {
+            TermQuery::new(
+                Term::from_field_text(self.fields.address_number, text),
+                IndexRecordOption::Basic,
+            )
+        };
+        let mut stated = vec![
+            Box::new(BoostQuery::new(Box::new(term(&number.text)), NUMBER_BOOST)) as Box<dyn Query>,
+        ];
         // A named unit also finds its flat as written with it ("29/181"),
         // which the build keeps where the street could not say which side
-        // is the unit.
-        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = std::iter::once(number.text.clone())
-            .chain(unit.map(|unit| number.flat_text(unit)))
-            .map(|text| {
-                let stated = TermQuery::new(
-                    Term::from_field_text(self.fields.address_number, &text),
-                    IndexRecordOption::Basic,
-                );
-                (
-                    Occur::Should,
-                    Box::new(BoostQuery::new(Box::new(stated), NUMBER_BOOST)) as Box<dyn Query>,
-                )
-            })
-            .collect();
+        // is the unit. It scores what the house number does, never more: a
+        // flat's number is rarer than the house's, so its own score would
+        // rank a street with that flat above the street the query names
+        // ("Unit 2, 1 Balfour Street" answered on a Balfour Road with a
+        // 2/1). The unit chooses among the addresses of one street in the
+        // tie-break.
+        if let Some(unit) = unit {
+            let searcher = self.reader.searcher();
+            let documents = searcher.num_docs() as f32;
+            let found = searcher.doc_freq(&Term::from_field_text(
+                self.fields.address_number,
+                &number.text,
+            ))? as f32;
+            // BM25 of one term once in a document without field norms.
+            let idf = (1.0 + (documents - found + 0.5) / (found + 0.5)).ln();
+            stated.push(Box::new(ConstScoreQuery::new(
+                Box::new(term(&number.flat_text(unit))),
+                NUMBER_BOOST * idf,
+            )));
+        }
+        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Should,
+            Box::new(DisjunctionMaxQuery::new(stated)) as Box<dyn Query>,
+        )];
         if let Some(number) = number.plain() {
             let bound = |field| Bound::Included(Term::from_field_u64(field, number.into()));
             let in_range = BooleanQuery::intersection(vec![
@@ -1223,7 +1242,7 @@ impl TextSearcher {
                 )),
             ));
         }
-        Box::new(BooleanQuery::new(alternatives))
+        Ok(Box::new(BooleanQuery::new(alternatives)))
     }
 
     fn layer_query(&self, layer: &str) -> Box<dyn Query> {
@@ -1522,7 +1541,7 @@ impl TextSearcher {
         {
             candidates.push(estimate);
         }
-        let query = self.build_query(plan, pass, filters, &areas);
+        let query = self.build_query(plan, pass, filters, &areas)?;
         candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
         // Every stated locality, known or not, for what the hits rest on.
         let localities = localities
@@ -3685,6 +3704,9 @@ struct QueryPlan {
     /// The unit the query names by a number ("29" of "unit 29" or of
     /// "29/181" read as a unit), to find and rank the flat.
     unit: Option<String>,
+    /// The words that name [`Self::unit`] as written ("unit 602"), kept for
+    /// [`Self::text`]. They score nothing.
+    unit_words: Vec<String>,
     /// The words of what is sought, in order: its street's, or of a query
     /// with neither street nor unplaced words, its first place or its
     /// number.
@@ -3809,6 +3831,24 @@ fn unplaced_floor(count: usize) -> usize {
     }
 }
 
+/// The flat a run of unit words names: its word with a digit, else the word
+/// after its designator ("B" of "Flat B"), else a word that is none ("G" of
+/// "G/9"). Libpostal's designators hold letters too ("b" of some language),
+/// so a word after one is the flat whatever it is. `None` for a designator
+/// alone.
+fn named_unit(words: &[String]) -> Option<String> {
+    words
+        .iter()
+        .rev()
+        .find(|word| word.chars().any(|character| character.is_ascii_digit()))
+        .or_else(|| match words {
+            [only] => (!designates_unit(only)).then_some(only),
+            [.., last] => Some(last),
+            [] => None,
+        })
+        .cloned()
+}
+
 impl QueryPlan {
     /// Plan one labelling of a query's tokens, with `context` (the
     /// structured fields of a geocoded row) after the parts the labelling
@@ -3886,28 +3926,35 @@ impl QueryPlan {
                         street.extend(Word::paired(words, None));
                     }
                 }
-                Label::Unit => {
-                    // A flat named by a number, else by the word after its
-                    // designator ("B" of "Flat B"), else by a word that is
-                    // none ("G" of "G/9"). Libpostal's designators hold
-                    // letters too ("b" of some language), so a word after
-                    // one is the flat whatever it is.
-                    if let Some(unit) = words
-                        .iter()
-                        .rev()
-                        .find(|word| word.chars().any(|character| character.is_ascii_digit()))
-                        .or_else(|| match &words[..] {
-                            [only] => (!designates_unit(only)).then_some(only),
-                            [.., last] => Some(last),
-                            [] => None,
-                        })
-                    {
-                        plan.unit = Some(unit.clone());
+                // A named flat chooses among the addresses of one street in
+                // the tie-break and scores nothing: as words, "unit 2" would
+                // rank a street with many flats above the street the query
+                // names ("Unit 2, 1 Balfour Street" answered on Balfour Road).
+                Label::Unit => match named_unit(&words) {
+                    Some(unit) => {
+                        plan.unit = Some(unit);
+                        plan.unit_words.extend(words);
                     }
-                    plan.optional.extend(words);
-                }
+                    None => plan.optional.extend(words),
+                },
                 Label::HouseNumber => plan.optional.extend(words),
                 Label::Street => street.extend(expanded_run(&words, &corrected)),
+                // A run the parser could not place that opens with a unit
+                // designator and the flat after it ("unit 2", "suite 410")
+                // is that flat, whatever the parser read it as.
+                Label::Other
+                    if words.len() >= 2
+                        && plan.unit.is_none()
+                        && designates_unit(&words[0])
+                        && let Some(unit) = named_unit(&words[..2]) =>
+                {
+                    plan.unit = Some(unit);
+                    plan.unit_words.extend(words[..2].iter().cloned());
+                    let rest = corrected
+                        .as_ref()
+                        .map(|corrected| corrected.get(2..).unwrap_or_default().to_vec());
+                    plan.unplaced.extend(expanded_run(&words[2..], &rest));
+                }
                 Label::Other => plan.unplaced.extend(expanded_run(&words, &corrected)),
                 Label::Locality | Label::Region | Label::Postcode | Label::Country => {
                     plan.context.push(ContextPart {
@@ -4022,6 +4069,7 @@ impl QueryPlan {
             .chain(self.subject.iter().map(|word| word.text.as_str()))
             .chain(self.unplaced.iter().map(|word| word.text.as_str()))
             .chain(self.optional.iter().map(String::as_str))
+            .chain(self.unit_words.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
         std::iter::once(subject)
@@ -6506,15 +6554,23 @@ mod tests {
             plan("79/house_number wellington/street st/street w/street fl36/unit toronto/locality");
         assert_eq!(floor.house_number.as_ref().expect("number").text, "79");
         assert_eq!(subject(&floor), words(&["wellington", "street", "west"]));
-        assert_eq!(floor.optional, words(&["fl36"]));
+        assert_eq!(floor.unit.as_deref(), Some("fl36"));
+        assert!(floor.optional.is_empty());
         assert_eq!(floor.context, [part(Label::Locality, &["toronto"])]);
 
-        // Unit text only ranks, before or after the address.
+        // A named unit is the plan's flat, before or after the address, and
+        // scores nothing.
         let unit = plan(
             "unit/unit 602/unit 670/house_number king/street st/street w/street \
              toronto/locality on/region m5v/postcode 1m9/postcode",
         );
-        assert_eq!(unit.optional, words(&["unit", "602"]));
+        assert_eq!(unit.unit.as_deref(), Some("602"));
+        assert!(unit.optional.is_empty());
+        // So is a designator and flat the parser could not place.
+        let unplaced = plan("unit/other 2/other 1/house_number balfour/street street/street");
+        assert_eq!(unplaced.unit.as_deref(), Some("2"));
+        assert!(unplaced.unplaced.is_empty());
+        assert_eq!(subject(&unplaced), words(&["balfour", "street"]));
         assert_eq!(
             unit.context,
             [
