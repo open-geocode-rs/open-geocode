@@ -1144,6 +1144,19 @@ impl Reader {
         })
     }
 
+    /// A place's `place_type`; none for the other layers. Reads no geometry.
+    pub fn place_type(&self, id: RecordId) -> Result<Option<String>> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        if header.layer.place_layer().is_none() {
+            return Ok(None);
+        }
+        self.string_field(header.strings, &mut fields)?;
+        Ok(Some(
+            self.string_field(header.strings, &mut fields)?.to_string(),
+        ))
+    }
+
     /// Whether a record is an explicit address: an address record or a POI
     /// that carries one. Reads no strings.
     pub fn is_explicit_address(&self, id: RecordId) -> Result<bool> {

@@ -30,7 +30,7 @@ use crate::{
     },
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
-        PlaceLayer, PoiRecord, Record,
+        PlaceLayer, PoiRecord, Record, place_rank,
     },
     spatial_index::{self, haversine_m},
     text_index::{
@@ -1008,9 +1008,15 @@ impl TextSearcher {
                 if ranking.numbered && record.layer == Layer::Street.as_str() {
                     self.place_on_street_line(record_id, &mut record)?;
                 }
+                let rank = self
+                    .pack
+                    .records()
+                    .place_type(record_id)?
+                    .as_deref()
+                    .and_then(place_rank);
                 hits.push((
                     key.clone(),
-                    TieBreak::new(&record, &query_words, ranking),
+                    TieBreak::new(&record, rank, &query_words, ranking),
                     TextSearchHit {
                         record_id,
                         score: key.text_score,
@@ -1594,6 +1600,11 @@ struct TieBreak {
     /// one document and so one score, though only some state the unit the
     /// query names.
     missing_query_words: usize,
+    /// Larger places first (see [`place_rank`]), then every other record:
+    /// "Richmond" is the town before a locality of that name. Only a tie on
+    /// the words and the areas a query states reaches it, so a size prior
+    /// never outweighs what the query says.
+    place_rank: u8,
     /// Exact points before centroids before estimates before line midpoints.
     precision: u8,
     /// Nodes before ways before relations, then the lower id.
@@ -1602,7 +1613,12 @@ struct TieBreak {
 }
 
 impl TieBreak {
-    fn new(record: &Summary, query_words: &HashSet<&str>, ranking: &Ranking) -> Self {
+    fn new(
+        record: &Summary,
+        place_rank: Option<u8>,
+        query_words: &HashSet<&str>,
+        ranking: &Ranking,
+    ) -> Self {
         let label = normalize_index_text(&record.label).unwrap_or_default();
         let label_words = label.split_whitespace().collect::<HashSet<_>>();
         let extra_label_tokens = label
@@ -1660,6 +1676,7 @@ impl TieBreak {
             unit,
             extra_label_tokens,
             missing_query_words,
+            place_rank: place_rank.unwrap_or(u8::MAX),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
@@ -4005,5 +4022,185 @@ mod tests {
                 tags: Some(BTreeMap::new()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod smoke {
+    use std::collections::HashMap;
+
+    use crate::{
+        context::AdminContextTuple,
+        pack::{RecordContext, Writer},
+        record::{
+            LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord, Record,
+            SourceProvenance, point_geometry,
+        },
+    };
+
+    use super::*;
+
+    /// New Zealand with Tasman, Canterbury and Hawke's Bay: a Richmond town
+    /// in Tasman and a Richmond locality in Canterbury, a Hastings city in
+    /// Hawke's Bay and a Hastings hamlet in Tasman, a suburb and a quarry
+    /// named after them, and two bakeries. Every smaller place has the lower
+    /// node id, which alone used to break the tie its way.
+    fn write_pack(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("open-geocode-smoke-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = Writer::create(&dir).expect("writer");
+        let area = |writer: &mut Writer, layer, name: &str, level: u8, id| {
+            writer
+                .write(
+                    &Record::Place(
+                        layer,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: name.to_string(),
+                            place_type: format!("admin_level:{level}"),
+                            geometry: point_geometry(173.0, -41.0),
+                            source: SourceProvenance::osm(ObjectType::Relation, id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("area")
+        };
+        let country = area(&mut writer, PlaceLayer::Country, "New Zealand", 2, 1);
+        let tasman = area(&mut writer, PlaceLayer::Region, "Tasman", 4, 2);
+        let canterbury = area(&mut writer, PlaceLayer::Region, "Canterbury", 4, 3);
+        let hawkes_bay = area(&mut writer, PlaceLayer::Region, "Hawke's Bay", 4, 4);
+        writer.set_context_names(HashMap::from([
+            (country, vec!["New Zealand".to_string()]),
+            (tasman, vec!["Tasman".to_string()]),
+            (canterbury, vec!["Canterbury".to_string()]),
+            (hawkes_bay, vec!["Hawke's Bay".to_string()]),
+        ]));
+        let context = |region| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers([
+                    (PlaceLayer::Country, country),
+                    (PlaceLayer::Region, region),
+                ]),
+                flags: 0,
+            })
+        };
+        for (layer, name, place_type, id, region) in [
+            (PlaceLayer::Locality, "Richmond", "locality", 10, canterbury),
+            (PlaceLayer::Locality, "Richmond", "town", 11, tasman),
+            (PlaceLayer::Locality, "Hastings", "hamlet", 20, tasman),
+            (PlaceLayer::Locality, "Hastings", "city", 21, hawkes_bay),
+            (
+                PlaceLayer::Neighbourhood,
+                "Hastings Central",
+                "suburb",
+                22,
+                hawkes_bay,
+            ),
+        ] {
+            writer
+                .write(
+                    &Record::Place(
+                        layer,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: name.to_string(),
+                            place_type: place_type.to_string(),
+                            geometry: point_geometry(173.0, -41.0),
+                            source: SourceProvenance::osm(ObjectType::Node, id),
+                        },
+                    ),
+                    context(region),
+                )
+                .expect("place");
+        }
+        for (name, category, id) in [
+            ("Richmond Quarry", "landuse:quarry", 30),
+            ("Tasman Bakery", "shop:bakery", 41),
+            ("Tasman Bakery", "shop:bakery", 40),
+        ] {
+            writer
+                .write(
+                    &PoiRecord {
+                        alt_names: Vec::new(),
+                        name: name.to_string(),
+                        category: category.to_string(),
+                        address: None,
+                        geometry: point_geometry(173.0, -41.0),
+                        location_precision: LocationPrecision::Point,
+                        source: SourceProvenance::osm(ObjectType::Node, id),
+                    }
+                    .into(),
+                    context(tasman),
+                )
+                .expect("poi");
+        }
+        writer.finish().expect("finish");
+        dir
+    }
+
+    fn search(searcher: &TextSearcher, query: &str, layer: Option<&str>) -> Vec<String> {
+        searcher
+            .search(TextSearchOptions {
+                query: query.to_string(),
+                limit: 5,
+                layer: layer.map(str::to_string),
+                countries: Vec::new(),
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_name_alone_answers_the_larger_place() {
+        let dir = write_pack("place-rank");
+        let searcher = TextSearcher::open(&dir).expect("searcher");
+
+        let richmond = search(&searcher, "Richmond", None);
+        assert_eq!(richmond[0], "osm:node:11", "the town: {richmond:?}");
+        assert_eq!(
+            richmond[1], "osm:node:10",
+            "then the locality: {richmond:?}"
+        );
+        let hastings = search(&searcher, "Hastings", None);
+        assert_eq!(hastings[0], "osm:node:21", "the city: {hastings:?}");
+        assert_eq!(hastings[1], "osm:node:20", "then the hamlet: {hastings:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stated_area_outranks_the_larger_place() {
+        let dir = write_pack("place-rank-area");
+        let searcher = TextSearcher::open(&dir).expect("searcher");
+
+        for (query, expected) in [
+            ("Richmond Tasman", "osm:node:11"),
+            ("Richmond Canterbury", "osm:node:10"),
+            ("Hastings Hawke's Bay", "osm:node:21"),
+            ("Hastings Tasman", "osm:node:20"),
+        ] {
+            let hits = search(&searcher, query, None);
+            assert_eq!(
+                hits.first().map(String::as_str),
+                Some(expected),
+                "{query}: {hits:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn records_that_are_not_places_keep_their_order() {
+        let dir = write_pack("place-rank-poi");
+        let searcher = TextSearcher::open(&dir).expect("searcher");
+
+        assert_eq!(
+            search(&searcher, "Tasman Bakery", Some("poi")),
+            vec!["osm:node:40", "osm:node:41"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

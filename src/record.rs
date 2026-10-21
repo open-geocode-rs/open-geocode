@@ -694,6 +694,39 @@ impl PlaceRecord {
     }
 }
 
+/// How large a place of `place_type` is, smaller being larger: twice an
+/// `admin_level`, and each `place=` value at the rank of the admin unit it
+/// usually stands beside, as Nominatim's search ranks place them. One scale
+/// for every country, read from what mappers tagged. None for an area of
+/// unknown kind.
+pub fn place_rank(place_type: &str) -> Option<u8> {
+    if let Some(level) = place_type.strip_prefix("admin_level:") {
+        return level
+            .parse::<u8>()
+            .ok()
+            .map(|level| level.saturating_mul(2));
+    }
+    if place_type.starts_with("derived_country:") {
+        return Some(4);
+    }
+    Some(match place_type.to_ascii_lowercase().as_str() {
+        "country" => 4,
+        "state" | "province" | "region" => 8,
+        "county" | "district" => 12,
+        "municipality" => 14,
+        "city" => 16,
+        "island" => 17,
+        "town" | "borough" => 18,
+        "village" | "suburb" => 19,
+        "hamlet" | "quarter" | "islet" => 20,
+        "isolated_dwelling" => 22,
+        "farm" => 23,
+        "neighbourhood" => 24,
+        "locality" => 25,
+        _ => return None,
+    })
+}
+
 impl Serialize for PlaceRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("PlaceRecord", 7)?;
@@ -799,5 +832,35 @@ impl DerivedSourceProvenance {
             derived_from: DERIVED_FROM_ADDRESS_RECORDS.to_string(),
             record_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod smoke {
+    use super::place_rank;
+
+    #[test]
+    fn place_ranks_follow_the_osm_place_hierarchy() {
+        let ranks = [
+            "derived_country:NZ",
+            "admin_level:4",
+            "county",
+            "city",
+            "town",
+            "village",
+            "hamlet",
+            "isolated_dwelling",
+            "farm",
+            "locality",
+        ]
+        .map(|place_type| place_rank(place_type).expect(place_type));
+        assert!(
+            ranks.is_sorted_by(|larger, smaller| larger < smaller),
+            "{ranks:?}"
+        );
+        assert!(place_rank("admin_level:8") < place_rank("admin_level:10"));
+        assert!(place_rank("city") < place_rank("suburb"));
+        assert_eq!(place_rank("Town"), place_rank("town"));
+        assert_eq!(place_rank("area"), None);
     }
 }

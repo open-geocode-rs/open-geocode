@@ -451,6 +451,11 @@ struct BatchGeocodeArgs {
     #[arg(long)]
     layer: Option<String>,
 
+    /// ISO 3166-1 alpha-2 codes to answer from, comma-separated; default
+    /// every country the Pack covers.
+    #[arg(long = "country", value_delimiter = ',')]
+    countries: Vec<String>,
+
     /// Number of engine candidates to inspect per query. Use 0 for the engine default.
     #[arg(long, default_value_t = 10)]
     limit: usize,
@@ -966,6 +971,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         region_field,
         postcode_field,
         layer,
+        countries,
         limit,
         lat_column,
         lon_column,
@@ -996,6 +1002,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         region_field: region_field.map(Column::Named),
         postcode_field: postcode_field.map(Column::Named),
         layer,
+        countries,
         limit,
         lat_column,
         lon_column,
