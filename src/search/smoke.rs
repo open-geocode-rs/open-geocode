@@ -501,7 +501,12 @@ fn a_query_of_unplaced_words_needs_most_of_them() {
         ..QueryPlan::default()
     };
     let ids = |plan: &QueryPlan| {
-        let query = searcher.build_query(plan, Pass::Strict, Filters::default(), &HashSet::new());
+        let query = searcher.build_query(
+            plan,
+            Pass::Strict,
+            Filters::default(),
+            &AreaWords::default(),
+        );
         searcher
             .ranked_hits(&query, &Ranking::default(), 10, &mut |_| Ok(true))
             .expect("hits")
@@ -1310,6 +1315,229 @@ mod typo_tiers {
         assert_eq!(Edits::Two.allowed("lambton"), Some((2, 2)));
         assert!(!Edits::Two.reaches("lambton", "kambton"), "prefix two");
         assert!(Edits::Two.reaches("lambton", "lamtno"));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}
+
+/// Weights derived from the Pack's own counts in place of hand-set boosts.
+mod rarity_weights {
+    use crate::{
+        context::AdminContextTuple,
+        parse::lattice::CountryCode,
+        record::{
+            DerivedSourceProvenance, ObjectType, PlaceLayer, PlaceRecord, PostcodeRecord,
+            SourceProvenance,
+        },
+    };
+
+    use super::*;
+
+    /// A country boundary, and the context of a record in it.
+    fn country(
+        writer: &mut Writer,
+        codes: &mut HashMap<RecordId, CountryCode>,
+        code: &str,
+        object_id: i64,
+    ) -> pack::RecordContext {
+        let record_id = writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Country,
+                    PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: code.to_string(),
+                        place_type: "admin_level:2".to_string(),
+                        geometry: point_geometry(0.0, 0.0),
+                        source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                    },
+                ),
+                None,
+            )
+            .expect("country");
+        codes.insert(record_id, CountryCode::parse(code).expect("code"));
+        pack::RecordContext {
+            admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Country, record_id)]),
+            flags: 0,
+        }
+    }
+
+    /// The postcode record a build derives from `addresses` addresses.
+    fn postcode(code: &str, country: &str, addresses: u64) -> Record {
+        Record::Postcode(PostcodeRecord {
+            postcode: code.to_string(),
+            country: CountryCode::parse(country),
+            geometry: point_geometry(0.0, 0.0),
+            source: DerivedSourceProvenance::osm_address_records(addresses),
+        })
+    }
+
+    fn weights(searcher: &TextSearcher, term: &str) -> HashMap<String, Score> {
+        searcher
+            .postcode_weights(&[term.to_string()])
+            .expect("weights")
+            .terms
+            .remove(term)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(country, weight)| (country.expect("country").as_str().to_string(), weight))
+            .collect()
+    }
+
+    /// The counts of a build: a GB postcode is a street's side, a US ZIP
+    /// thousands of addresses, and AU and NZ both have a "2110", one street
+    /// in AU and half of NZ. Each country states 30,000 postcodes.
+    fn write_pack(name: &str) -> (std::path::PathBuf, TextSearcher) {
+        let temp_dir = temp_pack_path(name);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut codes = HashMap::new();
+        let contexts = [("GB", 1), ("US", 2), ("AU", 3), ("NZ", 4)]
+            .map(|(code, id)| (code, country(&mut writer, &mut codes, code, id)));
+        writer.set_country_codes(codes);
+        let context_of = |code: &str| {
+            contexts
+                .iter()
+                .find(|(country, _)| *country == code)
+                .map(|(_, context)| context.clone())
+        };
+        for (code, country, addresses) in [
+            ("SW1A 1AA", "GB", 15),
+            ("E1 6AN", "GB", 29_985),
+            ("10001", "US", 5_000),
+            ("10002", "US", 25_000),
+            ("2110", "AU", 1),
+            ("2000", "AU", 29_999),
+            ("2110", "NZ", 15_000),
+            ("1010", "NZ", 15_000),
+        ] {
+            writer
+                .write(&postcode(code, country, addresses), context_of(country))
+                .expect("postcode");
+        }
+        // The NZ address matches the query's "North" as well: a stronger
+        // text match, in a postcode that says little there.
+        for (object_id, street, country) in [
+            (10, "Wattle Street North", "NZ"),
+            (11, "Wattle Street", "AU"),
+        ] {
+            let mut record = address_record(
+                &format!("osm:node:{object_id}"),
+                "",
+                "10",
+                street,
+                None,
+                Some("2110"),
+            );
+            record.geometry = point_geometry(150.0, -35.0);
+            writer
+                .write(&record.into(), context_of(country))
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        (temp_dir, searcher)
+    }
+
+    #[test]
+    fn a_postcode_covering_few_addresses_weighs_more_than_one_covering_many() {
+        let (temp_dir, searcher) = write_pack("smoke-rarity-postcode");
+        let gb = weights(&searcher, "sw1a 1aa");
+        let us = weights(&searcher, "10001");
+        assert_eq!(gb.keys().collect::<Vec<_>>(), ["GB"]);
+        assert_eq!(us.keys().collect::<Vec<_>>(), ["US"]);
+        assert!(gb["GB"] > us["US"], "{gb:?} {us:?}");
+        // Both countries state as many postcodes, so the weights differ by
+        // the log of the counts alone: nothing configured per country.
+        assert!(
+            ((gb["GB"] - us["US"]) - (5_000f32 / 15.0).ln()).abs() < 1e-3,
+            "{gb:?} {us:?}"
+        );
+
+        // One code, two countries, two weights.
+        let shared = weights(&searcher, "2110");
+        assert!(shared["AU"] > shared["NZ"], "{shared:?}");
+        assert!(
+            ((shared["AU"] - shared["NZ"]) - 15_000f32.ln()).abs() < 1e-3,
+            "{shared:?}"
+        );
+        assert!(
+            weights(&searcher, "9999").is_empty(),
+            "no postcode, no weight"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Any one global boost gives the two "2110"s one weight, so the NZ
+    /// address, which also matches "North", wins. Weighed in its country,
+    /// the AU "2110" says far more.
+    #[test]
+    fn an_agreeing_rare_postcode_outranks_a_stronger_text_match_elsewhere() {
+        let (temp_dir, searcher) = write_pack("smoke-rarity-outranks");
+        let query = "10 Wattle Street North 2110";
+        assert_eq!(
+            search_ids(&searcher, "10 Wattle Street North")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:10"),
+            "without the postcode the NZ text match is stronger: {}",
+            explain(&searcher, "10 Wattle Street North")
+        );
+        assert_eq!(
+            search_ids(&searcher, query).first().map(String::as_str),
+            Some("osm:node:11"),
+            "{}",
+            explain(&searcher, query)
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// BM25's idf is the term-frequency `u` for words: a street word most
+    /// streets share weighs less than one only a few do.
+    #[test]
+    fn a_common_street_word_weighs_less_than_a_rare_one() {
+        let temp_dir = temp_pack_path("smoke-rarity-street-word");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &street("osm:way:1", "Kowhai Road", [174.7, -36.8]).into(),
+                None,
+            )
+            .expect("street");
+        for (id, name) in ["Totara", "Rimu", "Matai", "Miro", "Puriri", "Karaka"]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .write(
+                    &street(
+                        &format!("osm:way:{}", id + 2),
+                        &format!("{name} Road"),
+                        [174.8 + id as f64 * 0.01, -36.9],
+                    )
+                    .into(),
+                    None,
+                )
+                .expect("street");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let score = |query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 10,
+                    layer: None,
+                    countries: Vec::new(),
+                })
+                .expect("search")
+                .into_iter()
+                .find(|hit| hit.record.id == "osm:way:1")
+                .map(|hit| hit.score)
+                .unwrap_or_else(|| panic!("{}", explain(&searcher, query)))
+        };
+        let (rare, common) = (score("Kowhai"), score("Road"));
+        assert!(rare > common, "kowhai {rare}, road {common}");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
