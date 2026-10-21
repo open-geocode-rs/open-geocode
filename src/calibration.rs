@@ -222,6 +222,8 @@ fn row_examples(
             limit: ANSWERS_PER_QUERY,
             layer: None,
             countries: Vec::new(),
+            focus: None,
+            bbox: None,
         })?);
     }
     if let Some(prefix) = typed_prefix(row, rng) {
@@ -231,6 +233,8 @@ fn row_examples(
             limit: ANSWERS_PER_QUERY,
             layer: None,
             countries: Vec::new(),
+            focus: None,
+            bbox: None,
         })?);
     }
     Ok((queries, examples))
@@ -471,6 +475,8 @@ mod tests {
                 limit: 3,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         assert!(hits.iter().all(|hit| {

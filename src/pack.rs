@@ -867,6 +867,8 @@ mod tests {
                 limit: 1,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search")
             .first()
@@ -969,6 +971,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("existing searcher after publish");
         assert_eq!(hits[0].record.id, "osm:node:1");

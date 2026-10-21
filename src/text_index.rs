@@ -13,6 +13,7 @@ use std::{
 };
 
 use crate::error::{Error, Result};
+use geojson::GeometryValue;
 use rstar::{RTree, primitives::GeomWithData};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
@@ -33,6 +34,7 @@ use crate::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
         Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord,
     },
+    records::quantize,
     spatial_index::haversine_m,
     util::{fold::search_key, text::collapse_whitespace},
 };
@@ -64,6 +66,10 @@ pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
 pub(crate) const RANK_POSTCODE_FIELD: &str = "rank_postcode";
 pub(crate) const AREA_POSTCODE_FIELD: &str = "area_postcode";
 pub(crate) const COUNTRY_CODE_FIELD: &str = "country_code";
+pub(crate) const MIN_LON_FIELD: &str = "min_lon";
+pub(crate) const MIN_LAT_FIELD: &str = "min_lat";
+pub(crate) const MAX_LON_FIELD: &str = "max_lon";
+pub(crate) const MAX_LAT_FIELD: &str = "max_lat";
 pub(crate) const RECORD_COUNT_FIELD: &str = "record_count";
 /// Addresses one document holds at most, so finding a number in a group reads
 /// a bounded run of records.
@@ -130,6 +136,59 @@ pub struct Fields {
     /// case, so a Pack covering several countries can be searched one at a
     /// time. Exact, like `layer`: it is filtered on, never matched as text.
     pub country_code: Field,
+    /// The [`Extent`] of the records a document stands for, so a bounding
+    /// box narrows a search before it ranks, and a caller's location ranks
+    /// the documents near it into the window.
+    pub min_lon: Field,
+    pub min_lat: Field,
+    pub max_lon: Field,
+    pub max_lat: Field,
+}
+
+/// The smallest box holding a document's records, in 1e-7 degrees, the
+/// precision the record store keeps. A street group's covers each of its
+/// addresses, a street's its whole line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub min_lon: i32,
+    pub min_lat: i32,
+    pub max_lon: i32,
+    pub max_lat: i32,
+}
+
+impl Extent {
+    /// The extent of a record's geometry, `None` when it has no finite
+    /// coordinates in range.
+    pub fn of(record: &Record) -> Option<Self> {
+        let point = |lon: f64, lat: f64| {
+            let (lon, lat) = (quantize(lon).ok()?, quantize(lat).ok()?);
+            Some(Self {
+                min_lon: lon,
+                min_lat: lat,
+                max_lon: lon,
+                max_lat: lat,
+            })
+        };
+        match &record.geometry().value {
+            GeometryValue::LineString { coordinates } => coordinates
+                .iter()
+                .map(|position| point(position[0], position[1]))
+                .reduce(|left, right| Some(left?.union(right?)))
+                .flatten(),
+            _ => record
+                .display_point()
+                .and_then(|[lon, lat]| point(lon, lat)),
+        }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min_lon: self.min_lon.min(other.min_lon),
+            min_lat: self.min_lat.min(other.min_lat),
+            max_lon: self.max_lon.max(other.max_lon),
+            max_lat: self.max_lat.max(other.max_lat),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +230,7 @@ pub struct Document {
     pub area_postcode: Option<String>,
     /// The country the record lies in, from its admin context.
     pub country_code: Option<String>,
+    pub extent: Option<Extent>,
 }
 
 impl fmt::Debug for Writer {
@@ -264,6 +324,10 @@ impl Writer {
             && group.same_group(&document)
         {
             group.record_count += 1;
+            group.extent = match (group.extent, document.extent) {
+                (Some(group), Some(address)) => Some(group.union(address)),
+                (group, address) => group.or(address),
+            };
             group.address_numbers.extend(document.address_numbers);
             group.flat_numbers.extend(document.flat_numbers);
             group.units.extend(document.units);
@@ -358,6 +422,10 @@ impl Fields {
             rank_postcode: schema.get_field(RANK_POSTCODE_FIELD)?,
             area_postcode: schema.get_field(AREA_POSTCODE_FIELD)?,
             country_code: schema.get_field(COUNTRY_CODE_FIELD)?,
+            min_lon: schema.get_field(MIN_LON_FIELD)?,
+            min_lat: schema.get_field(MIN_LAT_FIELD)?,
+            max_lon: schema.get_field(MAX_LON_FIELD)?,
+            max_lat: schema.get_field(MAX_LAT_FIELD)?,
         })
     }
 
@@ -453,6 +521,12 @@ impl Fields {
         if let Some(country) = &projected.country_code {
             document.add_text(self.country_code, country);
         }
+        if let Some(extent) = projected.extent {
+            document.add_i64(self.min_lon, extent.min_lon.into());
+            document.add_i64(self.min_lat, extent.min_lat.into());
+            document.add_i64(self.max_lon, extent.max_lon.into());
+            document.add_i64(self.max_lat, extent.max_lat.into());
+        }
         document
     }
 }
@@ -501,6 +575,7 @@ impl Document {
         };
         let mut document = builder.build(context_names);
         document.country_code = country_code.map(str::to_string);
+        document.extent = Extent::of(record);
         if !matches!(record, Record::Place(..)) {
             document.rank_postcodes = match (document.postcode.as_deref(), record) {
                 (Some(postcode), _) => compact_postcode(postcode).into_iter().collect(),
@@ -718,6 +793,10 @@ fn build_schema() -> (Schema, Fields) {
         COUNTRY_CODE_FIELD,
         exact_string_options().set_fast(Some("raw")),
     );
+    let min_lon = builder.add_i64_field(MIN_LON_FIELD, FAST);
+    let min_lat = builder.add_i64_field(MIN_LAT_FIELD, FAST);
+    let max_lon = builder.add_i64_field(MAX_LON_FIELD, FAST);
+    let max_lat = builder.add_i64_field(MAX_LAT_FIELD, FAST);
     let schema = builder.build();
     let fields = Fields {
         record_id,
@@ -736,6 +815,10 @@ fn build_schema() -> (Schema, Fields) {
         rank_postcode,
         area_postcode,
         country_code,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
     };
     (schema, fields)
 }
@@ -797,6 +880,7 @@ impl ProjectionBuilder {
                 rank_postcodes: Vec::new(),
                 area_postcode: None,
                 country_code: None,
+                extent: None,
             },
             name_parts: Vec::new(),
             content_parts: Vec::new(),

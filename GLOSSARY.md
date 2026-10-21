@@ -74,6 +74,11 @@ How a record relates to a stated area or postcode: it agrees, it contradicts, or
 A contradicting locality removes the record; in search, a contradicting postcode ranks it last.
 _Avoid_: match, mismatch, verdict
 
+**Focus**:
+Where the caller says they are, a point that breaks ties between answers the query cannot tell apart, nearer first in widening distance bands.
+It never outranks a word of the query, and a stated area is never relaxed for it.
+_Avoid_: location bias, proximity boost
+
 **Evidence**:
 What makes one reading's answers outrank another's: the stricter pass that found them first, then the parser's confidence in the reading.
 _Avoid_: score (alone), confidence (alone)

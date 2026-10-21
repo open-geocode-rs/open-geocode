@@ -156,6 +156,8 @@ pub fn benchmark_geocode(options: GeocodeBenchmarkOptions) -> Result<GeocodeBenc
                 limit,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .with_context(|| format!("failed to search for {:?}", case.query))?;
 

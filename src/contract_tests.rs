@@ -277,6 +277,22 @@ async fn responses_match_the_committed_examples() {
     ] {
         assert_example(name, &get(&router, uri).await);
     }
+    // A caller's location ranks ties and a box filters: the street the
+    // box holds answers, and one wholly outside it does not.
+    let near = get(
+        &router,
+        "/search?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
+    )
+    .await;
+    assert_example("search-near", &near);
+    assert!(!near["features"].as_array().expect("features").is_empty());
+    let far = get(&router, "/search?q=King%20Street&bbox=10,10,11,11").await;
+    assert_eq!(far["features"], json!([]));
+    let (status, crossed) = get_error(&router, "/search?q=king&bbox=170,-10,-170,10").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(crossed["error_code"], "invalid_coordinate");
+    assert_eq!(crossed["invalid_params"][0]["name"], "bbox");
+
     let suggestions = get(&router, "/autocomplete?q=Quee").await;
     assert_example("autocomplete", &suggestions);
     assert!(

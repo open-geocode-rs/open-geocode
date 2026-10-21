@@ -113,6 +113,8 @@ impl Engine {
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
             countries: Vec::new(),
+            focus: None,
+            bbox: None,
         })?;
         let collection = api::forward_collection(&self.pack, query, hits)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;

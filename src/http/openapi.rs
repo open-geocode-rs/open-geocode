@@ -149,7 +149,8 @@ pub(crate) struct Problem {
 pub(crate) enum ErrorCode {
     /// `q` was empty, too long, or could not be parsed as a query.
     InvalidQuery,
-    /// `lon` or `lat` was missing or outside its range.
+    /// `lon` or `lat` was missing or outside its range, or `focus` or
+    /// `bbox` named a point outside it.
     InvalidCoordinate,
     /// `limit` was above the maximum for the route.
     LimitTooLarge,

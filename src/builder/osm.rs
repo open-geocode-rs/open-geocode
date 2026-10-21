@@ -1404,6 +1404,8 @@ mod tests {
                     limit: 20,
                     layer: None,
                     countries,
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
         };
@@ -1542,6 +1544,8 @@ mod tests {
                     limit: 1,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .into_iter()
@@ -1673,6 +1677,8 @@ mod tests {
                     limit: 1,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .into_iter()
@@ -1808,6 +1814,8 @@ mod tests {
                 limit: 1,
                 layer: Some("address".into()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         assert_eq!(hits[0].record.id, "osm:node:1");
@@ -1960,6 +1968,8 @@ mod tests {
                     limit: 1,
                     layer: Some(layer.into()),
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .first()
@@ -2210,6 +2220,8 @@ mod tests {
                     limit: 5,
                     layer: layer.map(str::to_string),
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
         };
@@ -2257,6 +2269,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
         assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);

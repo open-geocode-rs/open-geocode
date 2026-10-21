@@ -34,13 +34,14 @@ use crate::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
         PlaceLayer, PoiRecord, Record, place_rank,
     },
+    records::{dequantize, quantize},
     spatial_index::{self, haversine_m},
     text_index::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
-        INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD,
-        address_number_terms, base_house_number, compact_postcode, expand_address_abbreviations,
-        expand_final_direction, flat_number_term, is_numeric_token, open_text_index,
-        street_search_text,
+        INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD, MIN_LAT_FIELD, MIN_LON_FIELD,
+        POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms,
+        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
+        flat_number_term, is_numeric_token, open_text_index, street_search_text,
     },
     util::fold::{exact_key, search_key},
 };
@@ -77,9 +78,13 @@ struct SegmentColumns {
     rank_postcode: Option<StrColumn>,
     area_postcode: Option<StrColumn>,
     country_code: Option<StrColumn>,
+    min_lon: Column<i64>,
+    min_lat: Column<i64>,
+    max_lon: Column<i64>,
+    max_lat: Column<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextSearchOptions {
     pub query: String,
     pub limit: usize,
@@ -88,31 +93,72 @@ pub struct TextSearchOptions {
     /// Empty means every country the Pack covers. A Pack of one country
     /// needs none; one covering several is narrowed with it.
     pub countries: Vec<String>,
+    /// Where the caller is, `[lon, lat]`: of answers the query cannot tell
+    /// apart, the nearer first (see [`TieBreak::focus_band`]). It never
+    /// outranks what the query states.
+    pub focus: Option<[f64; 2]>,
+    /// Return only records inside this box.
+    pub bbox: Option<BoundingBox>,
+}
+
+/// A box of WGS84 degrees, west to east and south to north. It does not
+/// cross the antimeridian: a box that would is two boxes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundingBox {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+impl BoundingBox {
+    pub fn contains(&self, lon: f64, lat: f64) -> bool {
+        (self.min_lon..=self.max_lon).contains(&lon) && (self.min_lat..=self.max_lat).contains(&lat)
+    }
 }
 
 /// What narrows a search to part of the Pack, apart from the query itself.
-/// Both are exact terms on indexed fields, so they cost a term lookup and
-/// leave scoring alone: the index and its collection statistics stay whole,
-/// which is what keeps scores comparable across the countries in a Pack.
+/// Exact terms and ranges on indexed fields, so they cost a lookup and leave
+/// scoring alone: the index and its collection statistics stay whole, which
+/// is what keeps scores comparable across the countries in a Pack.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Filters<'a> {
     pub layer: Option<&'a str>,
     pub countries: &'a [String],
+    pub bbox: Option<BoundingBox>,
 }
 
 impl<'a> Filters<'a> {
-    fn new(layer: Option<&'a str>, countries: &'a [String]) -> Self {
-        Self { layer, countries }
+    fn new(layer: Option<&'a str>, countries: &'a [String], bbox: Option<BoundingBox>) -> Self {
+        Self {
+            layer,
+            countries,
+            bbox,
+        }
+    }
+
+    /// Whether a hit lies where the filters ask: inside the box, when there
+    /// is one. A document's extent only says some of its records may.
+    fn admit(&self, hit: &TextSearchHit) -> bool {
+        self.bbox.is_none_or(|bbox| {
+            hit.record
+                .point
+                .is_some_and(|point| bbox.contains(point.lon, point.lat))
+        })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextAutocompleteOptions {
     pub query: String,
     pub limit: usize,
     pub layer: Option<String>,
     /// Return only records in these countries; see [`TextSearchOptions`].
     pub countries: Vec<String>,
+    /// See [`TextSearchOptions::focus`].
+    pub focus: Option<[f64; 2]>,
+    /// See [`TextSearchOptions::bbox`].
+    pub bbox: Option<BoundingBox>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -250,6 +296,10 @@ impl TextSearcher {
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
                     area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
                     country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
+                    min_lon: fast_fields.i64(MIN_LON_FIELD)?,
+                    min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
+                    max_lon: fast_fields.i64(MAX_LON_FIELD)?,
+                    max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
                 },
             );
         }
@@ -315,7 +365,8 @@ impl TextSearcher {
         let (_, mut hits) = self.search_variants(
             query_text,
             &[],
-            Filters::new(options.layer.as_deref(), &options.countries),
+            Filters::new(options.layer.as_deref(), &options.countries, options.bbox),
+            options.focus,
             limit + 1,
             Parses::All,
             |_, _, _| Ok(true),
@@ -364,7 +415,8 @@ impl TextSearcher {
         let (query, mut hits) = self.search_variants(
             address,
             &context,
-            Filters::new(options.layer.as_deref(), &options.countries),
+            Filters::new(options.layer.as_deref(), &options.countries, None),
+            None,
             limit.max(2),
             // A weaker parse that reads the number as a unit or a word finds
             // what the query never asked for: another house, or a POI on the
@@ -427,11 +479,8 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        let Some(query) = self.build_autocomplete_query(
-            &query_text,
-            Filters::new(options.layer.as_deref(), &options.countries),
-        )?
-        else {
+        let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
+        let Some(query) = self.build_autocomplete_query(&query_text, filters)? else {
             return Ok(Vec::new());
         };
         let tokens = autocomplete_query_tokens(&query_text);
@@ -439,9 +488,12 @@ impl TextSearcher {
         let ranking = Ranking {
             query_words: QueryWords::new(&options.query),
             number_text: number.map(str::to_string),
+            focus: options.focus,
             ..Ranking::default()
         };
-        let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |_| Ok(true))?;
+        let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |hit| {
+            Ok(filters.admit(hit))
+        })?;
         let words = &tokens[usize::from(number.is_some())..];
         for hit in &mut hits {
             let features = &mut hit.features;
@@ -491,7 +543,48 @@ impl TextSearcher {
         if let Some(countries) = self.countries_query(filters.countries) {
             clauses.push((Occur::Must, countries));
         }
+        if let Some(bbox) = filters.bbox {
+            clauses.push((Occur::Must, self.bbox_query(bbox)));
+        }
         Box::new(BooleanQuery::new(clauses))
+    }
+
+    /// The documents whose extent meets `bbox`, scored at zero like every
+    /// filter.
+    fn bbox_query(&self, bbox: BoundingBox) -> Box<dyn Query> {
+        let degrees = |value: f64| i64::from(quantize(value).unwrap_or(0));
+        let range = |field, lower: Bound<i64>, upper: Bound<i64>| -> Box<dyn Query> {
+            Box::new(RangeQuery::new(
+                lower.map(|value| Term::from_field_i64(field, value)),
+                upper.map(|value| Term::from_field_i64(field, value)),
+            ))
+        };
+        let fields = &self.fields;
+        Box::new(ConstScoreQuery::new(
+            Box::new(BooleanQuery::intersection(vec![
+                range(
+                    fields.min_lon,
+                    Bound::Unbounded,
+                    Bound::Included(degrees(bbox.max_lon)),
+                ),
+                range(
+                    fields.max_lon,
+                    Bound::Included(degrees(bbox.min_lon)),
+                    Bound::Unbounded,
+                ),
+                range(
+                    fields.min_lat,
+                    Bound::Unbounded,
+                    Bound::Included(degrees(bbox.max_lat)),
+                ),
+                range(
+                    fields.max_lat,
+                    Bound::Included(degrees(bbox.min_lat)),
+                    Bound::Unbounded,
+                ),
+            ])),
+            0.0,
+        ))
     }
 
     /// What a record is and where. A required subject word must be a word
@@ -1104,11 +1197,13 @@ impl TextSearcher {
     /// and the later passes that find the right street would never run ("8
     /// High Street, Deloraine TAS 7304" answered with the 7018 High Street,
     /// 163 km away). Fails when the query has no words to search.
+    #[allow(clippy::too_many_arguments)]
     fn search_variants(
         &self,
         query_text: &str,
         context: &[ContextPart],
         filters: Filters<'_>,
+        focus: Option<[f64; 2]>,
         limit: usize,
         parses: Parses,
         mut accept: impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
@@ -1179,6 +1274,7 @@ impl TextSearcher {
                         edits,
                         &query_words,
                         filters,
+                        focus,
                         limit,
                         &mut accept,
                     )?;
@@ -1227,6 +1323,7 @@ impl TextSearcher {
         edits: Edits,
         query_words: &QueryWords,
         filters: Filters<'_>,
+        focus: Option<[f64; 2]>,
         limit: usize,
         accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(Vec<TextSearchHit>, Vec<TextSearchHit>)> {
@@ -1245,6 +1342,7 @@ impl TextSearcher {
             }),
             numbered: plan.house_number.is_some(),
             postcode: self.query_postcode(plan)?,
+            focus,
         };
         let localities = plan
             .context
@@ -1264,7 +1362,8 @@ impl TextSearcher {
                 .collect()
         };
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
-            Ok(self.area_agreement(hit, &stated)? != Some(false)
+            Ok(filters.admit(hit)
+                && self.area_agreement(hit, &stated)? != Some(false)
                 && accept(plan, &ranking.postcode, hit)?)
         };
         let mut candidates = Vec::new();
@@ -1619,6 +1718,9 @@ impl TextSearcher {
                 )) as Box<dyn Query>,
             ));
         }
+        if let Some(bbox) = filters.bbox {
+            subqueries.push((Occur::Must, self.bbox_query(bbox)));
+        }
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
@@ -1650,22 +1752,23 @@ impl TextSearcher {
             .collect::<HashSet<_>>();
         // When only the text score ranks, the key is the score, and the index
         // can skip the records that cannot make the window.
-        let top_docs = if ranking.numbered || !ranking.postcode.forms.is_empty() {
-            searcher.search(
-                query,
-                &TopDocs::with_limit(window).tweak_score(RankKeys {
-                    ranking,
-                    columns: &self.columns,
-                    pack: &self.pack,
-                }),
-            )?
-        } else {
-            searcher
-                .search(query, &TopDocs::with_limit(window))?
-                .into_iter()
-                .map(|(text_score, doc)| (RankKey::text(text_score), doc))
-                .collect()
-        };
+        let top_docs =
+            if ranking.numbered || !ranking.postcode.forms.is_empty() || ranking.focus.is_some() {
+                searcher.search(
+                    query,
+                    &TopDocs::with_limit(window).tweak_score(RankKeys {
+                        ranking,
+                        columns: &self.columns,
+                        pack: &self.pack,
+                    }),
+                )?
+            } else {
+                searcher
+                    .search(query, &TopDocs::with_limit(window))?
+                    .into_iter()
+                    .map(|(text_score, doc)| (RankKey::text(text_score), doc))
+                    .collect()
+            };
         // Without a house number no document is left out for its number, so
         // once `limit` hits are kept only the documents that tie the last of
         // them need hydrating. The cutoff is the last kept hit's, not the
@@ -1673,7 +1776,10 @@ impl TextSearcher {
         let mut cutoff = None;
         let mut hits = Vec::new();
         for (key, doc) in top_docs {
-            if cutoff.as_ref().is_some_and(|cutoff| key < *cutoff) {
+            if cutoff
+                .as_ref()
+                .is_some_and(|cutoff| key.cmp_evidence(cutoff).is_lt())
+            {
                 break;
             }
             let (first, count) = self.document_records(&searcher, doc)?;
@@ -1721,8 +1827,7 @@ impl TextSearcher {
         }
         hits.sort_by(|(left_key, left_tie, _), (right_key, right_tie, _)| {
             right_key
-                .partial_cmp(left_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .cmp_evidence(left_key)
                 .then_with(|| left_tie.cmp(right_tie))
         });
         hits.truncate(limit);
@@ -2178,6 +2283,12 @@ struct RankKey {
     postcode_agreement: u8,
     stated: bool,
     text_score: Score,
+    /// How near the caller's focus the document's extent lies, larger
+    /// nearer. It orders only the window the text index collects, so that
+    /// of many documents the query cannot tell apart the near ones make it;
+    /// the hits are ranked by [`Self::cmp_evidence`] and then by
+    /// [`TieBreak`], whose own focus band follows what the query states.
+    nearness: u8,
 }
 
 impl RankKey {
@@ -2188,7 +2299,82 @@ impl RankKey {
             postcode_agreement: 0,
             stated: true,
             text_score,
+            nearness: 0,
         }
+    }
+
+    /// The order of what the query states, leaving out the nearness.
+    fn cmp_evidence(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.house_level,
+            self.postcode_agreement,
+            self.stated,
+            self.text_score,
+        )
+            .partial_cmp(&(
+                other.house_level,
+                other.postcode_agreement,
+                other.stated,
+                other.text_score,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// How a caller's focus ranks a hit: hits in one band tie on it. The bands
+/// widen as they go, as nearness does: a town 30 km away is about as near as
+/// one 40 km away, while 1 km and 10 km are not. Within the first a caller
+/// is among the hits, and what follows the band (the size of a place, the
+/// precision of a point) decides. Beyond the last, focus says nothing.
+const FOCUS_BANDS_M: [f64; 11] = [
+    1_000.0,
+    2_000.0,
+    5_000.0,
+    10_000.0,
+    20_000.0,
+    50_000.0,
+    100_000.0,
+    200_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_000_000.0,
+];
+
+/// The first of [`FOCUS_BANDS_M`] a point `distance_m` from the focus lies
+/// within, smaller nearer; one past the last beyond it.
+fn focus_band(distance_m: f64) -> u8 {
+    FOCUS_BANDS_M
+        .iter()
+        .position(|band| distance_m <= *band)
+        .unwrap_or(FOCUS_BANDS_M.len()) as u8
+}
+
+/// The caller's focus, against the extents of a segment's documents.
+struct SegmentFocus {
+    focus: [f64; 2],
+    min_lon: Column<i64>,
+    min_lat: Column<i64>,
+    max_lon: Column<i64>,
+    max_lat: Column<i64>,
+}
+
+impl SegmentFocus {
+    /// [`RankKey::nearness`] of a document: the band of the point of its
+    /// extent nearest the focus, counted down from the nearest.
+    fn nearness(&self, doc: DocId) -> u8 {
+        let read = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
+        let (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) = (
+            read(&self.min_lon),
+            read(&self.min_lat),
+            read(&self.max_lon),
+            read(&self.max_lat),
+        ) else {
+            return 0;
+        };
+        let [lon, lat] = self.focus;
+        let lon = lon.clamp(dequantize(min_lon), dequantize(max_lon));
+        let lat = lat.clamp(dequantize(min_lat), dequantize(max_lat));
+        FOCUS_BANDS_M.len() as u8 - focus_band(haversine_m(self.focus[0], self.focus[1], lon, lat))
     }
 }
 
@@ -2206,6 +2392,7 @@ struct SegmentRankKeys {
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     postcode: Option<SegmentPostcodes>,
+    focus: Option<SegmentFocus>,
 }
 
 /// What a segment knows of each record's postcodes, read against the
@@ -2340,6 +2527,13 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             postcode,
+            focus: self.ranking.focus.map(|focus| SegmentFocus {
+                focus,
+                min_lon: columns.min_lon.clone(),
+                min_lat: columns.min_lat.clone(),
+                max_lon: columns.max_lon.clone(),
+                max_lat: columns.max_lat.clone(),
+            }),
         })
     }
 }
@@ -2355,6 +2549,9 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         }
         if let Some(postcode) = &self.postcode {
             key.postcode_agreement = postcode.rank(doc);
+        }
+        if let Some(focus) = &self.focus {
+            key.nearness = focus.nearness(doc);
         }
         key
     }
@@ -2381,6 +2578,11 @@ struct TieBreak {
     /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
     /// finds, and one that writes "Taupo" for Taupo first.
     inexact_query_words: usize,
+    /// Nearer the caller's focus first, by [`FOCUS_BANDS_M`]; all tie
+    /// without one. After every word of the query, so a caller's location
+    /// never outranks a better match, and every hit already lies in the
+    /// areas the query states.
+    focus_band: u8,
     /// An address no other source disagrees on first: where two sources
     /// placed one house far apart, its point may be wrong (see
     /// [`AddressRecord::disputed`]).
@@ -2437,11 +2639,18 @@ impl TieBreak {
             Some(ObjectType::Row) => 3,
             None => 4,
         };
+        let focus_band = ranking
+            .focus
+            .zip(record.point)
+            .map_or(0, |([lon, lat], point)| {
+                focus_band(haversine_m(lon, lat, point.lon, point.lat))
+            });
         Self {
             unit: unit_rank(record, ranking),
             extra_label_tokens,
             missing_query_words,
             inexact_query_words,
+            focus_band,
             disputed,
             place_rank: place_rank.unwrap_or(u8::MAX),
             precision,
@@ -2766,6 +2975,8 @@ struct Ranking {
     /// with its unit ("29" of "29 181").
     unit: Option<String>,
     postcode: QueryPostcode,
+    /// Where the caller is, `[lon, lat]`.
+    focus: Option<[f64; 2]>,
 }
 
 /// Hits whose own postcode contradicts the one their query names, kept
@@ -3461,6 +3672,8 @@ mod tests {
                 limit: 3,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         let ids = hits
@@ -3519,6 +3732,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
         };
@@ -3557,6 +3772,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
         assert!(suggestions.iter().all(|hit| hit.confidence.is_some()));
@@ -3578,6 +3795,135 @@ mod tests {
         .expect("copy");
         assert!(TextSearcher::open(&other).is_err());
         let _ = std::fs::remove_dir_all(other);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    fn search_near(
+        searcher: &TextSearcher,
+        query: &str,
+        limit: usize,
+        focus: Option<[f64; 2]>,
+        bbox: Option<BoundingBox>,
+    ) -> Vec<String> {
+        searcher
+            .search(TextSearchOptions {
+                query: query.to_string(),
+                limit,
+                layer: None,
+                countries: Vec::new(),
+                focus,
+                bbox,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_focus_breaks_ties_toward_the_caller_and_nothing_else() {
+        let temp_dir = temp_pack_path("search-focus");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // Forty streets of one name the query cannot tell apart, more than
+        // the rank window holds for one hit, the nearest written last.
+        for index in 1..=40 {
+            let mut street = street_record(&format!("osm:way:{index}"), "Mill Road");
+            let lon = -100.0 + f64::from(index);
+            street.geometry = point_geometry(lon, 45.0);
+            street.representative_point = [lon, 45.0];
+            writer.write(&street.into(), None).expect("street");
+        }
+        // The better match lies far away, the worse beside the caller.
+        let mut prince =
+            address_record("osm:node:1", "", "342", "Prince Albert Street", None, None);
+        prince.geometry = point_geometry(-60.0, 45.0);
+        writer.write(&prince.into(), None).expect("prince");
+        let mut albert = address_record("osm:node:2", "", "342", "Albert Street", None, None);
+        albert.geometry = point_geometry(-120.0, 45.0);
+        writer.write(&albert.into(), None).expect("albert");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            search_near(&searcher, "Mill Road", 1, Some([-60.001, 45.0]), None),
+            ["osm:way:40"],
+            "the nearest of the tied makes the window and ranks first"
+        );
+        assert_eq!(
+            search_near(&searcher, "Mill Road", 2, Some([-98.999, 45.0]), None),
+            ["osm:way:1", "osm:way:2"]
+        );
+        assert_eq!(
+            search_near(&searcher, "342 Albert Street", 2, Some([-60.0, 45.0]), None)[0],
+            "osm:node:2",
+            "a focus never outranks a better match"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_bounding_box_keeps_only_the_records_inside_it() {
+        let temp_dir = temp_pack_path("search-bbox");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // One street group whose addresses run across the box's east edge,
+        // and the same street name far away.
+        for number in 1..=6 {
+            let mut address = address_record(
+                &format!("osm:node:{number}"),
+                "",
+                &number.to_string(),
+                "Mill Road",
+                None,
+                None,
+            );
+            address.geometry = point_geometry(-79.0 + f64::from(number) * 0.001, 43.0);
+            writer.write(&address.into(), None).expect("address");
+        }
+        let mut far = address_record("osm:node:9", "", "2", "Mill Road", None, None);
+        far.geometry = point_geometry(10.0, 50.0);
+        writer.write(&far.into(), None).expect("far");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let bbox = BoundingBox {
+            min_lon: -79.0,
+            min_lat: 42.9,
+            max_lon: -78.9965,
+            max_lat: 43.1,
+        };
+
+        assert_eq!(
+            search_near(&searcher, "2 Mill Road", 5, None, None).len(),
+            2,
+            "unboxed, both houses 2 answer"
+        );
+        assert_eq!(
+            search_near(&searcher, "2 Mill Road", 5, None, Some(bbox)),
+            ["osm:node:2"]
+        );
+        assert!(
+            !search_near(&searcher, "5 Mill Road", 5, None, Some(bbox))
+                .contains(&"osm:node:5".to_string()),
+            "house 5 lies past the east edge, though its group's extent meets the box"
+        );
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "2 Mill".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: Some(bbox),
+            })
+            .expect("autocomplete");
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["osm:node:2"]
+        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -3984,6 +4330,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")[0]
                 .record
@@ -4018,6 +4366,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect_err("unparseable query");
         assert!(matches!(error, Error::UnparsableQuery { .. }));
@@ -4067,6 +4417,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
 
@@ -4110,6 +4462,8 @@ mod tests {
                 limit: 10,
                 layer: Some("street".to_string()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
 
@@ -4147,6 +4501,8 @@ mod tests {
                 limit: 5,
                 layer: Some("postcode".to_string()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
 
@@ -4200,6 +4556,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
 
@@ -4239,6 +4597,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
 
@@ -4280,6 +4640,8 @@ mod tests {
                 limit: 10,
                 layer: Some("street".to_string()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
 
@@ -4319,6 +4681,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("postcode autocomplete");
         let number_hits = searcher
@@ -4327,6 +4691,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("number autocomplete");
 
@@ -4366,6 +4732,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("number plus street autocomplete");
 
@@ -4406,6 +4774,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("blank autocomplete")
                 .is_empty()
@@ -4417,6 +4787,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("single character autocomplete")
                 .is_empty()
@@ -4428,6 +4800,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("two character autocomplete")
                 .is_empty()
@@ -4443,6 +4817,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search")
             .into_iter()
@@ -4548,6 +4924,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         assert_eq!(
@@ -4931,6 +5309,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .into_iter()
@@ -5266,6 +5646,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
         assert_eq!(
