@@ -177,7 +177,8 @@ fn fuzzy_lookup_corrects_long_unknown_words_only() {
         let info = features::TokenInfo::new(word, tagger.dictionaries());
         tagger.lookup(field, &mut SpanKey::new(word.to_string(), &[info]))
     };
-    let hit = lookup(Field::Locality, "torontoo").expect("one edit from toronto");
+    let (hit, name) = lookup(Field::Locality, "torontoo").expect("one edit from toronto");
+    assert_eq!(name.as_deref(), Some("toronto"));
     assert_eq!(hit.distance, 1);
     assert_eq!(hit.entry.country, Some(code("CA")));
     // Three letters are too short to correct.
