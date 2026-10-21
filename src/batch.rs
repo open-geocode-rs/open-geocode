@@ -1081,7 +1081,12 @@ mod tests {
         );
         let audit = read_csv(&root.join("audit.csv")).expect("audit");
         assert_eq!(audit.rows[1][2], "unresolved");
-        assert_eq!(audit.rows[2][6], "osm:node:1");
+        let id = audit
+            .headers
+            .iter()
+            .position(|header| header == "geocode_id")
+            .expect("id column");
+        assert_eq!(audit.rows[2][id], "osm:node:1");
 
         // A file without a header row, watched row by row, with no audit.
         struct Rows(std::sync::Mutex<Vec<(usize, Option<String>)>>);

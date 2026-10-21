@@ -1,6 +1,7 @@
 geocode_status
 geocode_query
 geocode_score
+geocode_confidence
 geocode_record_id
 geocode_id
 geocode_layer

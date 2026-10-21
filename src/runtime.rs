@@ -827,6 +827,10 @@ mod router_tests {
         let feature = &body["features"][0];
         assert_eq!(feature["properties"]["layer"], "address");
         assert_eq!(feature["geometry"]["coordinates"][0], -79.0);
+        assert!(
+            feature["properties"].get("confidence").is_none(),
+            "a Pack never calibrated rates no answer"
+        );
 
         // The same address in a postcode it is not in finds nothing. An empty
         // collection, not an error: the request was fine, the answer is that

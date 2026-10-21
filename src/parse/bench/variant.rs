@@ -197,7 +197,13 @@ fn add_typo(tokens: &mut [Tagged], rng: &mut Rng) {
     if eligible.is_empty() {
         return;
     }
-    let token = &mut tokens[eligible[rng.below(eligible.len())]].token;
+    typo(&mut tokens[eligible[rng.below(eligible.len())]].token, rng);
+}
+
+/// One substitution, deletion or transposition of two adjacent characters
+/// in `token`, picked uniformly, at a uniform position (see [`messy`]).
+/// `token` must not be empty.
+pub(crate) fn typo(token: &mut String, rng: &mut Rng) {
     let mut chars = token.chars().collect::<Vec<_>>();
     match rng.below(3) {
         0 => {
@@ -248,10 +254,11 @@ fn substitute(chars: &[char], original: char, rng: &mut Rng) -> Option<char> {
 
 /// SplitMix64: small, fast and fixed, so the variants never change with a
 /// dependency.
-struct Rng(u64);
+#[derive(Debug)]
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed)
     }
 
@@ -264,16 +271,16 @@ impl Rng {
     }
 
     /// A uniform index in `0..bound`; `bound` must be positive.
-    fn below(&mut self, bound: usize) -> usize {
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
         ((u128::from(self.next()) * bound as u128) >> 64) as usize
     }
 
-    fn coin(&mut self) -> bool {
+    pub(crate) fn coin(&mut self) -> bool {
         self.next() >> 63 == 1
     }
 
     /// Fisher-Yates.
-    fn shuffle<T>(&mut self, items: &mut [T]) {
+    pub(crate) fn shuffle<T>(&mut self, items: &mut [T]) {
         for index in (1..items.len()).rev() {
             items.swap(index, self.below(index + 1));
         }

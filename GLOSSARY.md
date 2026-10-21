@@ -81,3 +81,8 @@ _Avoid_: score (alone), confidence (alone)
 **Stand-in**:
 A word answering for something it does not name: a street for a house number no record states, or a subject word for an area the Pack does not know.
 _Avoid_: fallback
+
+**Confidence**:
+How often an answer like this one is the record its query asks for, from 0 to 1, comparable across queries.
+It is read from what search knew of the answer (its pass, typo tier, accuracy, agreement, and its margin over the next answer) by a model fit per Pack to held-out addresses; a Pack never calibrated gives none.
+_Avoid_: score, probability (alone)

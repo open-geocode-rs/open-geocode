@@ -3,8 +3,8 @@
 //!
 //! Every response is one GeoJSON FeatureCollection: a `geocoding` block that
 //! says what was asked, then one Feature per answer. Forward features carry a
-//! `score`, reverse features a `distance_m`, and nothing else differs. The
-//! types here are the only definition of that shape. The contract tests
+//! `score` and, from a calibrated Pack, a `confidence`; reverse features a
+//! `distance_m`; nothing else differs. The types here are the only definition of that shape. The contract tests
 //! compare real answers with the committed examples in
 //! `contract/responses/`, so a change to the shape lands with its examples.
 //!
@@ -179,9 +179,17 @@ pub struct ForwardProperties {
     /// It orders the features of one response and nothing else. It is not a
     /// probability, not a quality score, and not comparable between queries
     /// or between Packs — two answers' scores say nothing about each other.
-    /// To judge how good a single answer is, read `accuracy` and `layer`,
-    /// which mean the same thing in every response.
+    /// To judge how good a single answer is, read `confidence`, or
+    /// `accuracy` and `layer`, which mean the same thing in every response.
     pub score: f32,
+    /// The chance this answer is the address or place the query asks for,
+    /// from 0 to 1, comparable across queries: of the answers given 0.8,
+    /// about eight in ten are right. It is calibrated per Pack, by
+    /// `geocode calibrate` on held-out addresses, and is absent from every
+    /// answer of a Pack that has not been calibrated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 0, maximum = 1)]
+    pub confidence: Option<f32>,
 }
 
 /// A reverse feature's properties: the common fields, and how far the feature
@@ -515,6 +523,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
     let properties = ForwardProperties {
         common: common(contexts, hit.record_id, hit.record, accuracy)?,
         score: hit.score,
+        confidence: hit.confidence,
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }
@@ -708,6 +717,10 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
     };
     vec![
         ("score", field(&|p| Some(p.score.to_string()))),
+        (
+            "confidence",
+            field(&|p| p.confidence.map(|confidence| confidence.to_string())),
+        ),
         (
             "record_id",
             field(&|p| Some(p.common.record_id.to_string())),

@@ -306,6 +306,22 @@ impl Container {
         &self.sections
     }
 
+    /// What identifies the file's content, read from its table of contents
+    /// alone: every section's name, version and checksum. Two files share it
+    /// only when they hold the same sections, so what is fit to one Pack
+    /// (see [`crate::confidence`]) can tell it from another without reading
+    /// it.
+    pub fn fingerprint(&self) -> u64 {
+        let mut hasher = Xxh3::new();
+        for (name, info) in self.sections.iter() {
+            hasher.update(name.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&info.version.to_le_bytes());
+            hasher.update(&info.checksum.to_le_bytes());
+        }
+        hasher.digest()
+    }
+
     /// Check every section against its checksum. Reads the whole file, so it
     /// runs when a Pack is published or copied, not on every open.
     pub fn verify(&self) -> Result<()> {

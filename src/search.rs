@@ -22,7 +22,8 @@ use tantivy::{
 };
 
 use crate::{
-    api::Address,
+    api::{Accuracy, Address},
+    confidence::{self, Agreement, Features},
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
@@ -35,10 +36,11 @@ use crate::{
     },
     spatial_index::{self, haversine_m},
     text_index::{
-        AREA_POSTCODE_FIELD, Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD,
-        POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms,
-        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
-        flat_number_term, is_numeric_token, open_text_index, street_search_text,
+        AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
+        INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD,
+        address_number_terms, base_house_number, compact_postcode, expand_address_abbreviations,
+        expand_final_direction, flat_number_term, is_numeric_token, open_text_index,
+        street_search_text,
     },
     util::fold::{exact_key, search_key},
 };
@@ -53,6 +55,9 @@ pub struct TextSearcher {
     /// The fast fields ranking reads, per segment. The Pack's index never
     /// changes, so they are opened once rather than per query.
     columns: Arc<HashMap<SegmentId, SegmentColumns>>,
+    /// What rates each answer's confidence, when the Pack has been
+    /// calibrated.
+    confidence: Option<confidence::Model>,
 }
 
 impl fmt::Debug for TextSearcher {
@@ -71,6 +76,7 @@ struct SegmentColumns {
     interpolation_start: Column<u64>,
     rank_postcode: Option<StrColumn>,
     area_postcode: Option<StrColumn>,
+    country_code: Option<StrColumn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +120,13 @@ pub struct TextSearchHit {
     pub record_id: RecordId,
     pub score: Score,
     pub record: Summary,
+    /// What search knew of the answer when it gave it.
+    #[serde(skip)]
+    pub features: Features,
+    /// The chance the answer is the one asked for (see [`confidence`]),
+    /// `None` when the Pack has no fitted model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,9 +249,11 @@ impl TextSearcher {
                     interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
                     area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
+                    country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
                 },
             );
         }
+        let confidence = confidence::Model::load(&pack)?;
         Ok(Self {
             spatial,
             pack,
@@ -246,7 +261,43 @@ impl TextSearcher {
             fields,
             tagger,
             columns: Arc::new(columns),
+            confidence,
         })
+    }
+
+    /// Whether `word`, a search key, only describes a street (its type, a
+    /// direction or a qualifier), by the Pack's parser dictionaries.
+    pub fn describes_street(&self, word: &str) -> bool {
+        self.tagger.dictionaries().describes_street(word)
+    }
+
+    /// The Pack's confidence model, `None` when it has not been calibrated.
+    pub fn confidence_model(&self) -> Option<&confidence::Model> {
+        self.confidence.as_ref()
+    }
+
+    /// Rate each of `hits`, ranked best first, against the hit after it:
+    /// what [`Features`] search could not know of one hit alone, then the
+    /// confidence when the Pack has a model.
+    fn rate(&self, hits: &mut [TextSearchHit]) {
+        for index in 0..hits.len() {
+            let next = hits.get(index + 1).map(|next| next.score);
+            let hit = &mut hits[index];
+            hit.features.lower_rank = index > 0;
+            hit.features.margin = match next {
+                None => 1.0,
+                Some(_) if hit.score <= 0.0 => 0.0,
+                Some(next) => ((hit.score - next) / hit.score).clamp(0.0, 1.0),
+            };
+            hit.features.accuracy = hit
+                .record
+                .point
+                .map(|point| Accuracy::of(point.precision, &hit.record.source));
+            hit.confidence = self
+                .confidence
+                .as_ref()
+                .map(|model| model.rate(&hit.features));
+        }
     }
 
     pub fn search(&self, options: TextSearchOptions) -> Result<Vec<TextSearchHit>> {
@@ -260,14 +311,17 @@ impl TextSearcher {
             return Err(Error::EmptyQuery);
         }
 
-        let (_, hits) = self.search_variants(
+        // One hit past the limit, so the last one asked for has a margin.
+        let (_, mut hits) = self.search_variants(
             query_text,
             &[],
             Filters::new(options.layer.as_deref(), &options.countries),
-            limit,
+            limit + 1,
             Parses::All,
             |_, _, _| Ok(true),
         )?;
+        self.rate(&mut hits);
+        hits.truncate(limit);
         Ok(hits)
     }
 
@@ -306,11 +360,12 @@ impl TextSearcher {
             .iter()
             .filter_map(|part| StatedArea::known(part, &known))
             .collect::<Vec<_>>();
-        let (query, hits) = self.search_variants(
+        // Two at least, so the one answer given has a margin over the next.
+        let (query, mut hits) = self.search_variants(
             address,
             &context,
             Filters::new(options.layer.as_deref(), &options.countries),
-            limit,
+            limit.max(2),
             // A weaker parse that reads the number as a unit or a word finds
             // what the query never asked for: another house, or a POI on the
             // street. Search lists such hits; a geocoded row would give one.
@@ -347,6 +402,7 @@ impl TextSearcher {
                 Ok(hit.record.point.is_some() && !unnumbered_address && in_postcode && in_areas)
             },
         )?;
+        self.rate(&mut hits);
         Ok(hits
             .into_iter()
             .next()
@@ -379,12 +435,29 @@ impl TextSearcher {
             return Ok(Vec::new());
         };
         let tokens = autocomplete_query_tokens(&query_text);
+        let number = autocomplete_number(&tokens);
         let ranking = Ranking {
             query_words: QueryWords::new(&options.query),
-            number_text: autocomplete_number(&tokens).map(str::to_string),
+            number_text: number.map(str::to_string),
             ..Ranking::default()
         };
-        self.ranked_hits(&query, &ranking, limit, &mut |_| Ok(true))
+        let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |_| Ok(true))?;
+        let words = &tokens[usize::from(number.is_some())..];
+        for hit in &mut hits {
+            let features = &mut hit.features;
+            features.prefix = true;
+            features.number = number.map(|number| states_number(&hit.record, number, None));
+            // The last word may be cut short by the typing.
+            let label = label_words(&hit.record);
+            features.dropped_words = count(words.iter().enumerate().filter(|(index, word)| {
+                !label.iter().any(|label| {
+                    label == *word || (index + 1 == words.len() && label.starts_with(word.as_str()))
+                })
+            }));
+        }
+        self.rate(&mut hits);
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// The house number, then what a record is and where. See
@@ -1100,8 +1173,15 @@ impl TextSearcher {
                     if !pass.searches_anew(plan) {
                         continue;
                     }
-                    let (hits, kept) =
-                        self.search_plan(plan, pass, &query_words, filters, limit, &mut accept)?;
+                    let (hits, kept) = self.search_plan(
+                        plan,
+                        pass,
+                        edits,
+                        &query_words,
+                        filters,
+                        limit,
+                        &mut accept,
+                    )?;
                     contradicted.push((tier, reading, kept));
                     if !hits.is_empty() {
                         return Ok(Some(hits));
@@ -1137,11 +1217,14 @@ impl TextSearcher {
     /// `limit`, and apart from them the kept hits whose own postcode
     /// contradicts the one the plan names. A pass that does not require the
     /// plan's localities still leaves out a hit that lies in other ones:
-    /// "Ponsonby Road Christchurch" is not answered in Auckland.
+    /// "Ponsonby Road Christchurch" is not answered in Auckland. Each hit
+    /// carries the [`Features`] of what found it.
+    #[allow(clippy::too_many_arguments)]
     fn search_plan(
         &self,
         plan: &QueryPlan,
         pass: Pass,
+        edits: Edits,
         query_words: &QueryWords,
         filters: Filters<'_>,
         limit: usize,
@@ -1198,9 +1281,56 @@ impl TextSearcher {
         }
         let query = self.build_query(plan, pass, filters, &areas);
         candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
+        // Every stated locality, known or not, for what the hits rest on.
+        let localities = localities
+            .iter()
+            .map(|part| StatedArea::known(part, &areas.known))
+            .collect::<Vec<_>>();
+        let sought = plan
+            .subject
+            .iter()
+            .map(|word| (&word.text, &word.corrected))
+            .chain(
+                plan.unplaced
+                    .iter()
+                    .map(|word| (&word.text, &word.corrected)),
+            )
+            .collect::<Vec<_>>();
         let (mut hits, mut contradicted) = (Vec::new(), Vec::new());
-        for hit in candidates {
-            if self.postcode_agreement(&hit, &ranking.postcode)? == Some(false) {
+        for mut hit in candidates {
+            let postcode = self.postcode_agreement(&hit, &ranking.postcode)?;
+            let area = if localities.is_empty() {
+                Agreement::Unstated
+            } else if localities.iter().any(Option::is_none) {
+                Agreement::Unknown
+            } else {
+                let known = localities.iter().flatten().cloned().collect::<Vec<_>>();
+                agreement(self.area_agreement(&hit, &known)?)
+            };
+            let label = label_words(&hit.record);
+            let features = &mut hit.features;
+            features.pass = pass;
+            features.edits = edits.most();
+            features.postcode = match ranking.postcode.forms.is_empty() {
+                true => Agreement::Unstated,
+                false => agreement(postcode),
+            };
+            features.area = area;
+            features.number = plan.house_number.as_ref().map(|number| {
+                states_number(&hit.record, &number.text, ranking.flat_text.as_deref())
+            });
+            features.unit = plan
+                .unit
+                .as_ref()
+                .map(|_| unit_rank(&hit.record, &ranking) == 0);
+            features.dropped_words = count(sought.iter().filter(|(text, corrected)| {
+                !label.iter().any(|label| {
+                    label == *text
+                        || corrected.as_ref() == Some(label)
+                        || edits.reaches(text, label)
+                })
+            }));
+            if postcode == Some(false) {
                 contradicted.push(hit);
             } else {
                 hits.push(hit);
@@ -1547,6 +1677,7 @@ impl TextSearcher {
                 break;
             }
             let (first, count) = self.document_records(&searcher, doc)?;
+            let country = self.document_country(&searcher, doc)?;
             for record_id in self.hit_records(first, count, ranking)? {
                 let mut record = self.pack.record_summary(record_id)?;
                 if let Some(number) = ranking.house_number
@@ -1558,20 +1689,26 @@ impl TextSearcher {
                 if ranking.numbered && record.layer == Layer::Street.as_str() {
                     self.place_on_street_line(record_id, &mut record)?;
                 }
+                let records = self.pack.records();
+                let disputed = records.header(record_id)?.disputed;
                 let hit = TextSearchHit {
                     record_id,
                     score: key.text_score,
                     record,
+                    features: Features {
+                        country,
+                        disputed,
+                        ..Features::default()
+                    },
+                    confidence: None,
                 };
                 if !accept(&hit)? {
                     continue;
                 }
-                let records = self.pack.records();
                 let rank = records
                     .place_type(record_id)?
                     .as_deref()
                     .and_then(place_rank);
-                let disputed = records.header(record_id)?.disputed;
                 hits.push((
                     key.clone(),
                     TieBreak::new(&hit.record, rank, disputed, &query_words, ranking),
@@ -1590,6 +1727,25 @@ impl TextSearcher {
         });
         hits.truncate(limit);
         Ok(hits.into_iter().map(|(_, _, hit)| hit).collect())
+    }
+
+    /// The country the records of a document lie in.
+    fn document_country(
+        &self,
+        searcher: &Searcher,
+        doc: DocAddress,
+    ) -> Result<Option<CountryCode>> {
+        let columns = self.segment_columns(searcher, doc.segment_ord)?;
+        let Some(column) = &columns.country_code else {
+            return Ok(None);
+        };
+        let mut code = String::new();
+        for ord in column.term_ords(doc.doc_id) {
+            if column.ord_to_str(ord, &mut code)? {
+                return Ok(CountryCode::parse(&code));
+            }
+        }
+        Ok(None)
     }
 
     /// The first record a document stands for, and how many.
@@ -1967,6 +2123,8 @@ impl TextSearcher {
                     record_count: Some(2),
                 },
             },
+            features: Features::default(),
+            confidence: None,
         })
     }
 }
@@ -2279,33 +2437,8 @@ impl TieBreak {
             Some(ObjectType::Row) => 3,
             None => 4,
         };
-        // A flat kept as written ("2/10") is the one "2/10" names, though it
-        // states no unit.
-        let as_written = ranking.unit.is_some()
-            && record
-                .address
-                .housenumber
-                .as_deref()
-                .and_then(search_key)
-                .is_some_and(|written| {
-                    [&ranking.number_text, &ranking.flat_text]
-                        .into_iter()
-                        .flatten()
-                        .any(|text| *text == written)
-                });
-        let stated = record.address.unit.as_deref().and_then(search_key);
-        let unit = match (ranking.unit.as_deref(), stated.as_deref()) {
-            _ if as_written => 0,
-            (Some(sought), Some(stated))
-                if stated.split_whitespace().any(|word| word == sought) =>
-            {
-                0
-            }
-            (Some(_), None) | (None, None) => 1,
-            (_, Some(_)) => 2,
-        };
         Self {
-            unit,
+            unit: unit_rank(record, ranking),
             extra_label_tokens,
             missing_query_words,
             inexact_query_words,
@@ -2315,6 +2448,65 @@ impl TieBreak {
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
         }
+    }
+}
+
+/// How a record answers the unit the query names: 0 the flat it names, 1
+/// the building, 2 another flat (see [`TieBreak::unit`]).
+fn unit_rank(record: &Summary, ranking: &Ranking) -> u8 {
+    // A flat kept as written ("2/10") is the one "2/10" names, though it
+    // states no unit.
+    let as_written = ranking.unit.is_some()
+        && record
+            .address
+            .housenumber
+            .as_deref()
+            .and_then(search_key)
+            .is_some_and(|written| {
+                [&ranking.number_text, &ranking.flat_text]
+                    .into_iter()
+                    .flatten()
+                    .any(|text| *text == written)
+            });
+    let stated = record.address.unit.as_deref().and_then(search_key);
+    match (ranking.unit.as_deref(), stated.as_deref()) {
+        _ if as_written => 0,
+        (Some(sought), Some(stated)) if stated.split_whitespace().any(|word| word == sought) => 0,
+        (Some(_), None) | (None, None) => 1,
+        (_, Some(_)) => 2,
+    }
+}
+
+/// Whether a record states `number` as its house number, or `flat`, the
+/// flat the query names written with it.
+fn states_number(record: &Summary, number: &str, flat: Option<&str>) -> bool {
+    record
+        .address
+        .housenumber
+        .as_deref()
+        .and_then(search_key)
+        .is_some_and(|stated| stated == number || Some(stated.as_str()) == flat)
+}
+
+/// The words of a record's label, as search keys.
+fn label_words(record: &Summary) -> Vec<String> {
+    search_key(&record.label)
+        .iter()
+        .flat_map(|label| label.split_whitespace())
+        .map(str::to_string)
+        .collect()
+}
+
+fn count<T>(items: impl Iterator<Item = T>) -> u8 {
+    items.count().min(usize::from(u8::MAX)) as u8
+}
+
+/// An [`Agreement`] of a check that says yes, no, or nothing.
+fn agreement(agrees: Option<bool>) -> Agreement {
+    match agrees {
+        Some(true) => Agreement::Agrees,
+        Some(false) => Agreement::Contradicts,
+        None => Agreement::Unknown,
     }
 }
 
@@ -2331,9 +2523,10 @@ enum Parses {
 /// The retrieval passes of [`TextSearcher::search_variants`], in order,
 /// strictest first. The order is also how strongly a hit found by each
 /// answers the query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Pass {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Pass {
     /// The house number, stated or on a range, in every named locality.
+    #[default]
     Strict,
     /// The number between its stated neighbours, or a street standing in for
     /// it, still in every locality.
@@ -3299,6 +3492,92 @@ mod tests {
             top_ids(&searcher, "342 Albert Street"),
             vec!["osm:node:7", "osm:node:5"]
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn answers_carry_a_confidence_only_from_a_calibrated_pack() {
+        use crate::confidence::{FEATURES, Model};
+
+        let temp_dir = temp_pack_path("search-confidence");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for record in [
+            address_record("osm:node:1", "", "10", "King Street", None, Some("M5V 1A1")),
+            address_record("osm:node:2", "", "12", "King Street", None, Some("M5V 1A1")),
+        ] {
+            writer.write(&record.into(), None).expect("write");
+        }
+        writer
+            .write(&street_record("osm:way:9", "King Street").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let search = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                })
+                .expect("search")
+        };
+
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert!(searcher.confidence_model().is_none());
+        let hits = search(&searcher, "10 King Street");
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.confidence.is_none()));
+        let top = &hits[0].features;
+        assert_eq!(top.pass, Pass::Strict);
+        assert_eq!(top.number, Some(true));
+        assert_eq!(top.dropped_words, 0);
+        assert!(!top.lower_rank);
+
+        let pack = pack::Reader::open(&temp_dir).expect("pack");
+        let mut weights = [0.0; FEATURES];
+        weights[0] = 1.0;
+        Model::new(weights, std::collections::BTreeMap::new())
+            .save(&pack)
+            .expect("save");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        for query in ["10 King Street", "99 King Street", "King"] {
+            let hits = search(&searcher, query);
+            assert!(!hits.is_empty(), "{query}");
+            for hit in hits {
+                let confidence = hit
+                    .confidence
+                    .expect("a calibrated Pack rates every answer");
+                assert!((0.0..=1.0).contains(&confidence), "{query}: {confidence}");
+            }
+        }
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "10 King St".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+            })
+            .expect("autocomplete");
+        assert!(suggestions.iter().all(|hit| hit.confidence.is_some()));
+        assert!(suggestions.iter().all(|hit| hit.features.prefix));
+
+        // A model fit to another Pack is refused, not misread.
+        let other = temp_pack_path("search-confidence-other");
+        let _ = std::fs::remove_dir_all(&other);
+        let mut writer = Writer::create(&other).expect("writer");
+        writer
+            .write(&street_record("osm:way:9", "Queen Street").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let other_pack = pack::Reader::open(&other).expect("pack");
+        std::fs::copy(
+            confidence::Model::path(pack.path()),
+            confidence::Model::path(other_pack.path()),
+        )
+        .expect("copy");
+        assert!(TextSearcher::open(&other).is_err());
+        let _ = std::fs::remove_dir_all(other);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

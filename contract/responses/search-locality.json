@@ -10,6 +10,7 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "confidence": 0.76852477,
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",

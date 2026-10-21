@@ -10,6 +10,7 @@
       },
       "properties": {
         "accuracy": "street",
+        "confidence": 0.37754068,
         "context": {
           "country": {
             "id": "osm:relation:1",
@@ -53,6 +54,7 @@
           "postcode": "M5V 1A1",
           "street": "King Street"
         },
+        "confidence": 0.7413711,
         "context": {
           "country": {
             "id": "osm:relation:1",
@@ -97,6 +99,7 @@
           "street": "King Street"
         },
         "category": "shop:bakery",
+        "confidence": 0.4255575,
         "context": {
           "country": {
             "id": "osm:relation:1",

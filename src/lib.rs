@@ -3,6 +3,8 @@ pub mod api;
 pub mod batch;
 pub mod bench;
 pub mod builder;
+pub mod calibration;
+pub mod confidence;
 pub mod container;
 pub mod context;
 #[cfg(test)]

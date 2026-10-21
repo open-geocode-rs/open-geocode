@@ -38,7 +38,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 12;
 /// Postcode data within this radius describes where a record is: a record
 /// with no postcode of its own is ranked by the nearest postcode centroid
 /// within it, and the batch check compares the postcode areas within it.
@@ -713,7 +713,11 @@ fn build_schema() -> (Schema, Fields) {
         AREA_POSTCODE_FIELD,
         TextOptions::default().set_fast(Some("raw")),
     );
-    let country_code = builder.add_text_field(COUNTRY_CODE_FIELD, exact_string_options());
+    // Fast too: confidence is rated by the country an answer lies in.
+    let country_code = builder.add_text_field(
+        COUNTRY_CODE_FIELD,
+        exact_string_options().set_fast(Some("raw")),
+    );
     let schema = builder.build();
     let fields = Fields {
         record_id,

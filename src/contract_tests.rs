@@ -19,6 +19,7 @@ use tower::ServiceExt;
 
 use crate::{
     batch,
+    confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
     pack::{RecordId, Writer},
     record::{
@@ -250,6 +251,8 @@ async fn responses_match_the_committed_examples() {
         })
     );
     assert!(properties["score"].is_number());
+    let confidence = properties["confidence"].as_f64().expect("a confidence");
+    assert!((0.0..=1.0).contains(&confidence), "{confidence}");
     assert!(properties.get("distance_m").is_none());
 
     let poi = get(&router, "/search?q=Queen%20Bakery").await;
@@ -575,8 +578,21 @@ fn write_pack(dir: &PathBuf) -> Ids {
         )
         .expect("interpolation");
     writer.finish().expect("finish");
+    // Calibrated, so the examples show what a calibrated Pack answers. The
+    // weights are made up: the fit has its own tests.
+    let pack = crate::pack::Reader::open(dir).expect("pack");
+    Model::new(CONTRACT_WEIGHTS, Default::default())
+        .save(&pack)
+        .expect("confidence model");
     Ids { address }
 }
+
+/// A plausible model: an answer is likelier right on a strict pass, with
+/// its number, in its postcode and well clear of the next.
+const CONTRACT_WEIGHTS: [f64; FEATURES] = [
+    1.5, -1.0, -1.5, -0.8, -1.5, -1.0, -0.7, -2.0, -1.5, 0.8, -2.5, -0.2, 0.5, -2.0, -0.3, 1.0,
+    -1.5, 0.3, -0.3, -1.0, -0.6, 1.2, -1.5,
+];
 
 fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
     Geometry::new(GeometryValue::LineString {

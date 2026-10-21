@@ -15,6 +15,7 @@
           "postcode": "M5V 1A1",
           "street": "King Street"
         },
+        "confidence": 0.9890131,
         "context": {
           "country": {
             "id": "osm:relation:1",
