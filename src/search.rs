@@ -239,8 +239,8 @@ const NUMBER_BOOST: Score = 2.0;
 const MATCH_AGREEMENT: f64 = 0.95;
 /// A word that may name an area, where the query names none, counts for less
 /// there than in what a record is: "7 Lynn Place" is the street, not a place
-/// in the New Lynn suburb. Close scores between the two otherwise rank on
-/// how common each word happens to be in each field.
+/// in the New Lynn suburb. The share of the word's idf in what a record is
+/// (see [`TextSearcher::stand_in_weights`]).
 const AREA_STANDS_IN_BOOST: Score = 0.5;
 /// The word of the name the parser read a typo as counts for less than a
 /// word as written, and for more than the other terms near the typo, which
@@ -732,7 +732,8 @@ impl TextSearcher {
         clauses
     }
 
-    /// `what` a record is, or else the word in where it is, for less.
+    /// `what` a record is, or else the word in where it is, for less (see
+    /// [`AreaWords::stand_ins`]).
     fn word_or_area_query(
         &self,
         what: Box<dyn Query>,
@@ -740,13 +741,64 @@ impl TextSearcher {
         spellings: &Spellings,
         areas: &AreaWords,
     ) -> Box<dyn Query> {
-        Box::new(DisjunctionMaxQuery::new(vec![
+        let weight = areas.stand_ins.get(word).copied().unwrap_or_default();
+        let as_written = Box::new(TermQuery::new(
+            Term::from_field_text(self.fields.context_text, word),
+            IndexRecordOption::Basic,
+        ));
+        let mut alternatives: Vec<Box<dyn Query>> = vec![
             what,
-            Box::new(BoostQuery::new(
+            Box::new(ConstScoreQuery::new(as_written, weight)),
+            // A typo's neighbours still find the record, for nothing, as
+            // they do in what it is: the weight of a word no record holds
+            // is the largest there is.
+            Box::new(ConstScoreQuery::new(
                 self.area_query(word, spellings, areas),
-                AREA_STANDS_IN_BOOST,
+                0.0,
             )),
-        ]))
+        ];
+        if let Some(postcode) = self.postcode_query(word, &areas.postcodes) {
+            alternatives.push(Box::new(ConstScoreQuery::new(postcode, weight)));
+        }
+        Box::new(DisjunctionMaxQuery::new(alternatives))
+    }
+
+    /// What each subject and unplaced word of `plan` scores standing in for
+    /// an area: [`AREA_STANDS_IN_BOOST`] of its idf in the field a house
+    /// number's street is searched in, else in what a record is, or in where
+    /// records are when that is lower ("Toronto" names few streets). A word's
+    /// own BM25 in where records are would not do: "road" is rare among
+    /// area names and common among streets, so "47 Mill Road" would find
+    /// a Millton Park Road in a locality named Mill Road before Mill Road
+    /// itself. A word scores near its idf where it is asked for, so half of
+    /// it ranks the stand-in below.
+    fn stand_in_weights(&self, plan: &QueryPlan) -> Result<HashMap<String, Score>> {
+        let searcher = self.reader.searcher();
+        let field = if plan.house_number.is_some() {
+            self.fields.street_text
+        } else {
+            self.fields.content_text
+        };
+        let documents = searcher.num_docs() as f64;
+        let mut weights = HashMap::new();
+        for word in plan
+            .subject
+            .iter()
+            .map(|word| &word.text)
+            .chain(plan.unplaced.iter().map(|word| &word.text))
+        {
+            if weights.contains_key(word) {
+                continue;
+            }
+            let mut idf = f64::INFINITY;
+            for field in [field, self.fields.context_text] {
+                let found = searcher.doc_freq(&Term::from_field_text(field, word))? as f64;
+                // Tantivy's BM25 idf.
+                idf = idf.min((1.0 + (documents - found + 0.5) / (found + 0.5)).ln());
+            }
+            weights.insert(word.clone(), AREA_STANDS_IN_BOOST * idf as Score);
+        }
+        Ok(weights)
     }
 
     /// Every word of a locality part the Pack knows, in where a record is.
@@ -1419,6 +1471,7 @@ impl TextSearcher {
         let areas = AreaWords {
             known: self.known_area_words(localities.iter().flat_map(|part| &part.words))?,
             postcodes: self.postcode_weights(&plan.area_terms())?,
+            stand_ins: self.stand_in_weights(plan)?,
         };
         let stated = if pass.requires_locality() {
             Vec::new()
@@ -2876,6 +2929,14 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
 /// Secondary order for hits with equal ranks.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TieBreak {
+    /// Of a query for a house number, words of the street a record is on
+    /// that no query word names: "45 Lomond Crescent" is a flat of Lomond
+    /// Crescent before the house of a Ben Lomond Crescent. Before the unit,
+    /// which only chooses among the addresses of one street. A word an
+    /// abbreviation of the query stands for is named ("crescent" of
+    /// "cres"), and so is one its typo tier lets a query word match. Without a house number the street is no part of what is
+    /// sought: a POI is no worse for the street it is on.
+    extra_street_words: usize,
     /// The flat the query names, then the building, then its other flats:
     /// "19 Eros Place" is the house, not its flat 1, though a richer house
     /// label would lose on the words below. The unit is the one the plan
@@ -2966,7 +3027,37 @@ impl TieBreak {
             .map_or(0, |([lon, lat], point)| {
                 focus_band(haversine_m(lon, lat, point.lon, point.lat))
             });
+        let street = if !ranking.numbered {
+            None
+        } else if record.layer == Layer::Street.as_str() {
+            Some(record.name.as_str())
+        } else {
+            record
+                .address
+                .street
+                .as_deref()
+                .or(record.address.place.as_deref())
+        };
+        let extra_street_words = street
+            .and_then(search_key)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter(|word| {
+                !query_words.contains(word)
+                    && !query_words.iter().any(|query_word| {
+                        ranking.edits.reaches(query_word, word)
+                            || lattice::full_forms(query_word)
+                                .iter()
+                                .any(|form| form == word)
+                    })
+                    && !ranking
+                        .sought
+                        .iter()
+                        .any(|sought| sought.corrected.as_deref() == Some(*word))
+            })
+            .count();
         Self {
+            extra_street_words,
             unit: unit_rank(record, ranking),
             extra_name_words,
             missing_query_words,
@@ -3233,6 +3324,9 @@ struct AreaWords {
     /// [`TextSearcher::subject_clauses`]).
     known: HashSet<String>,
     postcodes: PostcodeWeights,
+    /// What each word of what is sought scores where it stands in for an
+    /// area (see [`TextSearcher::stand_in_weights`]).
+    stand_ins: HashMap<String, Score>,
 }
 
 /// What agreeing on a postcode weighs, by each term of a plan the postcode
@@ -5656,6 +5750,50 @@ mod tests {
                 .first()
                 .map(String::as_str),
             Some("osm:node:2")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn the_street_the_query_names_beats_one_with_more_words() {
+        let temp_dir = temp_pack_path("search-exact-street-name");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut flat = address_record("osm:node:1", "", "45", "Lomond Crescent", None, None);
+        flat.address.unit = Some("2".to_string());
+        let records = [
+            flat,
+            address_record("osm:node:2", "", "45", "Ben Lomond Crescent", None, None),
+            address_record("osm:node:3", "", "47", "Mill Road", None, None),
+            address_record(
+                "osm:node:4",
+                "",
+                "47",
+                "Millton Park Road",
+                Some("Mill Road"),
+                None,
+            ),
+        ];
+        for record in records {
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // A flat of the street named before the house of another street.
+        assert_eq!(
+            top_ids(&searcher, "45 Lomond Crescent")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:1")
+        );
+        // "mill" in the locality Mill Road stands in for less than in the
+        // street, though "road" names few areas and many streets.
+        assert_eq!(
+            top_ids(&searcher, "47 Mill Road")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:3")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
