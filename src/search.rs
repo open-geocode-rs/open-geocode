@@ -1247,6 +1247,17 @@ impl TextSearcher {
             });
         };
         let first_query = first_plan.text();
+        // Where the best reading says the record is holds in every reading:
+        // a later one that reads "Christchurch" of "Ponsonby Road
+        // Christchurch" as a region, which only ranks, must not answer with
+        // the Ponsonby Road in Auckland.
+        let placed = self.known_area_words(
+            first_plan
+                .context
+                .iter()
+                .filter(|part| part.label == Label::Locality)
+                .flat_map(|part| &part.words),
+        )?;
         let mut query_words = QueryWords::new(query_text);
         query_words
             .search
@@ -1279,6 +1290,7 @@ impl TextSearcher {
                     }
                     let (hits, kept) = self.search_plan(
                         plan,
+                        &placed,
                         pass,
                         edits,
                         &query_words,
@@ -1322,12 +1334,17 @@ impl TextSearcher {
     /// `limit`, and apart from them the kept hits whose own postcode
     /// contradicts the one the plan names. A pass that does not require the
     /// plan's localities still leaves out a hit that lies in other ones:
-    /// "Ponsonby Road Christchurch" is not answered in Auckland. Each hit
-    /// carries the [`Features`] of what found it.
+    /// "Ponsonby Road Christchurch" is not answered in Auckland. So does
+    /// every pass with the words `placed` (the localities of the best
+    /// reading the Pack knows) and the plan's unplaced words the Pack knows
+    /// as an area's: each is where the query says the record is, unless it
+    /// is a word of the record itself (see [`Self::in_loose_areas`]). Each
+    /// hit carries the [`Features`] of what found it.
     #[allow(clippy::too_many_arguments)]
     fn search_plan(
         &self,
         plan: &QueryPlan,
+        placed: &HashSet<String>,
         pass: Pass,
         edits: Edits,
         query_words: &QueryWords,
@@ -1380,9 +1397,22 @@ impl TextSearcher {
                 .filter_map(|part| StatedArea::known(part, &areas.known))
                 .collect()
         };
+        let own = localities
+            .iter()
+            .flat_map(|part| &part.words)
+            .collect::<HashSet<_>>();
+        let mut loose = self
+            .known_area_words(plan.unplaced.iter().map(|word| &word.text))?
+            .into_iter()
+            .chain(placed.iter().cloned())
+            .filter(|word| !own.contains(word))
+            .collect::<Vec<_>>();
+        loose.sort();
+        loose.dedup();
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
             Ok(filters.admit(hit)
                 && self.area_agreement(hit, &stated)? != Some(false)
+                && self.in_loose_areas(hit, &loose)?
                 && accept(plan, &ranking.postcode, hit)?)
         };
         let mut candidates = Vec::new();
@@ -1488,6 +1518,38 @@ impl TextSearcher {
             agreement = Some(true);
         }
         Ok(agreement)
+    }
+
+    /// Whether a hit lies where `words`, area words a query states without
+    /// requiring them, say: each word that is not a word of the hit itself
+    /// (its name or label: "Wellington" of "Wellington Road" is the street)
+    /// must be a word of an area it lies in, of any level, since the parser
+    /// may have read a locality as a region. A hit in no named area says
+    /// nothing either way.
+    fn in_loose_areas(&self, hit: &TextSearchHit, words: &[String]) -> Result<bool> {
+        let own = label_words(&hit.record)
+            .into_iter()
+            .chain(
+                search_key(&hit.record.name)
+                    .iter()
+                    .flat_map(|name| name.split_whitespace().map(str::to_string)),
+            )
+            .collect::<HashSet<_>>();
+        let elsewhere = words
+            .iter()
+            .filter(|word| !own.contains(*word))
+            .collect::<Vec<_>>();
+        if elsewhere.is_empty() {
+            return Ok(true);
+        }
+        let areas = self.areas_of(hit.record_id)?;
+        let names = areas
+            .localities
+            .iter()
+            .chain(&areas.regions)
+            .flat_map(|name| name.split_whitespace())
+            .collect::<HashSet<_>>();
+        Ok(names.is_empty() || elsewhere.iter().all(|word| names.contains(word.as_str())))
     }
 
     /// Every name a record lies in: what its own address states and every
@@ -4156,6 +4218,120 @@ mod tests {
             "the town, then the hamlet, before any road"
         );
         assert_eq!(top_ids(&searcher, "Queen Street")[0], "osm:way:202");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_known_area_word_places_the_record_in_every_reading() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("search-loose-areas");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut locality = |name: &str, object_id: i64| {
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: name.to_string(),
+                            place_type: "city".to_string(),
+                            geometry: point_geometry(-79.0, 43.0),
+                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("locality")
+        };
+        let auckland = locality("Auckland", 100);
+        let christchurch = locality("Christchurch", 101);
+        writer.set_context_names(
+            [
+                (auckland, vec!["Auckland".to_string()]),
+                (christchurch, vec!["Christchurch".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let within = |locality| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, locality)]),
+                flags: 0,
+            })
+        };
+        let in_auckland = within(auckland);
+        // So the Pack knows Christchurch as where a record is.
+        writer
+            .write(
+                &street_record("osm:way:3", "Riccarton Road").into(),
+                within(christchurch),
+            )
+            .expect("riccarton road");
+        writer
+            .write(
+                &street_record("osm:way:1", "Ponsonby Road").into(),
+                in_auckland.clone(),
+            )
+            .expect("ponsonby road");
+        writer
+            .write(
+                &street_record("osm:way:2", "Christchurch Road").into(),
+                in_auckland,
+            )
+            .expect("christchurch road");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        let search = |reading: &str, placed: &[&str]| {
+            let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], |word| {
+                searcher.describes_street(word)
+            })
+            .expect("plan");
+            let placed = placed.iter().map(|word| word.to_string()).collect();
+            let query = reading
+                .split_whitespace()
+                .filter_map(|pair| pair.split_once('/'))
+                .map(|(word, _)| word)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (hits, _) = searcher
+                .search_plan(
+                    &plan,
+                    &placed,
+                    Pass::Strict,
+                    Edits::None,
+                    &QueryWords::new(&query),
+                    Filters::default(),
+                    None,
+                    5,
+                    &mut |_, _, _| Ok(true),
+                )
+                .expect("search");
+            hits.into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+
+        // A region only ranks, so alone it places nothing; the best reading
+        // read the word as a locality, and that holds.
+        let as_region = "ponsonby/street road/street christchurch/region";
+        assert_eq!(search(as_region, &[]), ["osm:way:1"]);
+        assert!(search(as_region, &["christchurch"]).is_empty());
+        // A word no label placed is where the record is too, once the Pack
+        // knows it as an area's.
+        assert!(search("ponsonby/street road/street christchurch/other", &[]).is_empty());
+        // Unless it is a word of the record itself.
+        assert_eq!(
+            search("christchurch/street road/street", &["christchurch"])[0],
+            "osm:way:2"
+        );
+        assert_eq!(search("christchurch/other road/other", &[])[0], "osm:way:2");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
