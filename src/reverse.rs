@@ -265,7 +265,7 @@ impl PackReverseGeocoder {
 
         Ok(Some(GeocodeResult {
             match_kind: MatchKind::NearestStreet,
-            label: compose_label(&street.label(), context),
+            label: compose_label(&street.name, context),
             primary_record_id: Some(candidate.record_id),
             id: Some(street.id()),
             layer: Some("street".to_string()),
@@ -722,6 +722,7 @@ mod tests {
     fn street_record() -> StreetRecord {
         StreetRecord {
             alt_names: Vec::new(),
+            locality: None,
             name: "Queen Street".to_string(),
             geometry: line_geometry(),
             representative_point: [-79.0, 43.0005],

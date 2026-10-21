@@ -1,4 +1,4 @@
-use geojson::{Geometry, GeometryValue};
+use geojson::{Geometry, GeometryValue, Position};
 
 /// Longitude/latitude of a point geometry, or `None` if it is not a point or
 /// either coordinate is non-finite. This is the single canonical, strict
@@ -12,6 +12,30 @@ pub(crate) fn point_lon_lat(geometry: &Geometry) -> Option<[f64; 2]> {
         return None;
     };
     (lon.is_finite() && lat.is_finite()).then_some([*lon, *lat])
+}
+
+/// The lines of a line geometry: one for a line string, each of a multi line
+/// string (a street of several ways). `None` for any other geometry.
+pub(crate) fn line_parts(geometry: &Geometry) -> Option<Vec<&[Position]>> {
+    match &geometry.value {
+        GeometryValue::LineString { coordinates } => Some(vec![coordinates.as_slice()]),
+        GeometryValue::MultiLineString { coordinates } => {
+            Some(coordinates.iter().map(Vec::as_slice).collect())
+        }
+        _ => None,
+    }
+}
+
+/// A line geometry of `parts`: a line string for one, else a multi line
+/// string.
+pub(crate) fn line_geometry(mut parts: Vec<Vec<Position>>) -> Geometry {
+    Geometry::new(if parts.len() == 1 {
+        GeometryValue::LineString {
+            coordinates: parts.remove(0),
+        }
+    } else {
+        GeometryValue::MultiLineString { coordinates: parts }
+    })
 }
 
 #[cfg(test)]

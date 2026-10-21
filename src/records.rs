@@ -27,13 +27,15 @@
 //!                     dataset's index in `records/datasets`
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
+//!                     (a street's locality after them, behind a presence byte)
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
 //!                     its names as one byte, then its address after a
 //!                     presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
-//!       geometry      line strings only: varint count, then zigzag deltas
+//!       geometry      lines only: varint part count, then per part a varint
+//!                     point count and zigzag deltas, chained across parts
 //!
 //! continued address (its bit set in `continued`; no tag, its precision and
 //! source kind are in the block's bitmaps)
@@ -94,9 +96,12 @@ use crate::{
         LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord,
         Prominence, Record, SourceProvenance, StreetRecord, point_geometry,
     },
-    util::codec::{
-        get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
-        unzigzag, zigzag,
+    util::{
+        codec::{
+            get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
+            unzigzag, zigzag,
+        },
+        geo::{line_geometry, line_parts},
     },
 };
 
@@ -690,6 +695,7 @@ impl Writer {
             Record::Street(record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 self.put_strings(out, &record.alt_names)?;
+                self.put_optional_strings(out, &[record.locality.as_deref()])?;
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
@@ -711,13 +717,16 @@ impl Writer {
             }
         }
 
-        if let Some(line) = line {
-            put_u64(out, line.len() as u64);
+        if let Some(parts) = line {
+            put_u64(out, parts.len() as u64);
             let mut previous = point;
-            for position in line {
-                put_i64(out, i64::from(position.0) - i64::from(previous.0));
-                put_i64(out, i64::from(position.1) - i64::from(previous.1));
-                previous = position;
+            for part in parts {
+                put_u64(out, part.len() as u64);
+                for position in part {
+                    put_i64(out, i64::from(position.0) - i64::from(previous.0));
+                    put_i64(out, i64::from(position.1) - i64::from(previous.1));
+                    previous = position;
+                }
             }
         }
         Ok(())
@@ -1044,6 +1053,10 @@ impl Reader {
             Layer::Street => Record::Street(StreetRecord {
                 name: self.string_field(header.strings, &mut fields)?.to_string(),
                 alt_names: self.string_list(header.strings, &mut fields)?,
+                locality: {
+                    let [locality] = self.optional_strings(header.strings, &mut fields)?;
+                    locality
+                },
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance(&self.datasets)?,
@@ -1116,10 +1129,12 @@ impl Reader {
             Layer::Street => {
                 let (object_type, object_id) = header.object()?;
                 let name = self.string_field(header.strings, &mut fields)?.to_string();
+                self.string_list(header.strings, &mut fields)?;
+                let [locality] = self.optional_strings(header.strings, &mut fields)?;
                 (
                     crate::labels::osm_record_id(object_type, object_id),
                     name.clone(),
-                    name,
+                    crate::labels::street_label(&name, locality.as_deref()),
                 )
             }
             Layer::Postcode => {
@@ -1282,7 +1297,8 @@ impl Reader {
     }
 
     /// Line geometry as 1e-7 degree coordinates, `None` for point records.
-    pub fn line(&self, id: RecordId) -> Result<Option<Vec<[i32; 2]>>> {
+    /// The lines of a line record, one per part, `None` for a point record.
+    pub fn line(&self, id: RecordId) -> Result<Option<Vec<Vec<[i32; 2]>>>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
         if !header.line {
@@ -1734,6 +1750,7 @@ impl Reader {
             Layer::Street => {
                 get_u32(fields)?;
                 self.string_list(header.strings, fields)?;
+                self.optional_strings::<1>(header.strings, fields)?;
             }
             Layer::Postcode => {
                 get_u32(fields)?;
@@ -1752,30 +1769,44 @@ impl Reader {
         if !header.line {
             return Ok(point_geometry(header.lon(), header.lat()));
         }
-        let coordinates = self
+        let parts = self
             .line_points(header, fields)?
             .into_iter()
-            .map(|[lon, lat]| vec![dequantize(lon), dequantize(lat)].into())
+            .map(|part| {
+                part.into_iter()
+                    .map(|[lon, lat]| vec![dequantize(lon), dequantize(lat)].into())
+                    .collect()
+            })
             .collect();
-        Ok(Geometry::new(GeometryValue::LineString { coordinates }))
+        Ok(line_geometry(parts))
     }
 
-    fn line_points(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<[i32; 2]>> {
-        let count = usize::try_from(get_u64(fields)?)?;
-        if count < 2 || count > fields.len() {
+    fn line_points(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<Vec<[i32; 2]>>> {
+        let part_count = usize::try_from(get_u64(fields)?)?;
+        if part_count == 0 || part_count > fields.len() {
             return Err(Error::BadGeometry(format!(
-                "stored line geometry has an invalid point count {count}"
+                "stored line geometry has an invalid part count {part_count}"
             )));
         }
-        let mut points = Vec::with_capacity(count);
+        let mut parts = Vec::with_capacity(part_count);
         let mut previous = [header.lon_e7, header.lat_e7];
-        for _ in 0..count {
-            let lon = add_delta(previous[0], get_i64(fields)?)?;
-            let lat = add_delta(previous[1], get_i64(fields)?)?;
-            previous = [lon, lat];
-            points.push(previous);
+        for _ in 0..part_count {
+            let count = usize::try_from(get_u64(fields)?)?;
+            if count < 2 || count > fields.len() {
+                return Err(Error::BadGeometry(format!(
+                    "stored line geometry has an invalid point count {count}"
+                )));
+            }
+            let mut points = Vec::with_capacity(count);
+            for _ in 0..count {
+                let lon = add_delta(previous[0], get_i64(fields)?)?;
+                let lat = add_delta(previous[1], get_i64(fields)?)?;
+                previous = [lon, lat];
+                points.push(previous);
+            }
+            parts.push(points);
         }
-        Ok(points)
+        Ok(parts)
     }
 }
 
@@ -2062,18 +2093,32 @@ fn layer_code(layer: Layer) -> u8 {
         .expect("every layer has a code") as u8
 }
 
-/// Quantized vertices of a line geometry, `None` for points.
-fn line_coordinates(geometry: &Geometry) -> Result<Option<Vec<(i32, i32)>>> {
-    match &geometry.value {
-        GeometryValue::Point { .. } => Ok(None),
-        GeometryValue::LineString { coordinates } => {
-            if coordinates.len() < 2 {
+/// Quantized vertices of a line, one list per part.
+type LineVertices = Vec<Vec<(i32, i32)>>;
+
+/// The vertices of a line geometry, `None` for points.
+fn line_coordinates(geometry: &Geometry) -> Result<Option<LineVertices>> {
+    if let GeometryValue::Point { .. } = &geometry.value {
+        return Ok(None);
+    }
+    let Some(parts) = line_parts(geometry) else {
+        return Err(Error::BadGeometry(format!(
+            "unsupported stored record geometry: {}",
+            geometry.value.type_name()
+        )));
+    };
+    if parts.is_empty() {
+        return Err(Error::BadGeometry("line geometry has no parts".into()));
+    }
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.len() < 2 {
                 return Err(Error::BadGeometry(
                     "line geometry needs at least two positions".into(),
                 ));
             }
-            coordinates
-                .iter()
+            part.iter()
                 .map(|position| {
                     let [lon, lat, ..] = position.as_slice() else {
                         return Err(Error::BadGeometry(
@@ -2083,13 +2128,9 @@ fn line_coordinates(geometry: &Geometry) -> Result<Option<Vec<(i32, i32)>>> {
                     Ok((quantize(*lon)?, quantize(*lat)?))
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(Some)
-        }
-        other => Err(Error::BadGeometry(format!(
-            "unsupported stored record geometry: {}",
-            other.type_name()
-        ))),
-    }
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 pub(crate) fn quantize(value: f64) -> Result<i32> {
@@ -2145,6 +2186,7 @@ mod tests {
             }),
             Record::Street(StreetRecord {
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
+                locality: None,
                 name: "King Street".into(),
                 geometry: line(&[[-79.0, 43.0], [-79.001, 43.001], [-79.0015, 43.0]]),
                 representative_point: [-79.0, 43.0],
@@ -2332,11 +2374,11 @@ mod tests {
         assert_eq!(reader.line(0).expect("address line"), None);
         assert_eq!(
             reader.line(1).expect("street line"),
-            Some(vec![
+            Some(vec![vec![
                 [-790_000_000, 430_000_000],
                 [-790_010_000, 430_010_000],
                 [-790_015_000, 430_000_000]
-            ])
+            ]])
         );
     }
 

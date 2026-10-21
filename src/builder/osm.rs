@@ -89,11 +89,14 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{AddressComponents, AddressRecord, OSM_DATASET, ObjectType, Record, RejectedRecord},
+    record::{
+        AddressComponents, AddressRecord, OSM_DATASET, ObjectType, Record, RejectedRecord,
+        StreetRecord,
+    },
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
-    util::{geo::point_lon_lat, hilbert::hilbert_key},
+    util::{fold::search_key, geo::point_lon_lat, hilbert::hilbert_key},
 };
 use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_context};
 use emit::{FeatureOutput, emit_features};
@@ -102,7 +105,9 @@ use nodes::join_nodes;
 pub use pbf::replication_timestamp;
 use pbf::{for_each_block, input_bytes};
 use scan::scan_block;
-use spill::{NodeRequest, PendingAddress, PendingRecord, ResolvedRef, WayFeature, WayKind};
+use spill::{
+    NodeRequest, PendingAddress, PendingRecord, PendingStreet, ResolvedRef, WayFeature, WayKind,
+};
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -278,6 +283,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         audit: Audit::create(writer.generation())?,
         records: ExternalSorter::new(&scratch, "records", &memory, budget),
         addresses: ExternalSorter::new(&scratch, "addresses", &memory, budget),
+        streets: ExternalSorter::new(&scratch, "streets", &memory, budget),
         context_records: ExternalSorter::new(
             &scratch,
             "context-records",
@@ -518,6 +524,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         audit,
         mut records,
         addresses,
+        streets,
         context_records,
         mut seq,
         ..
@@ -531,6 +538,10 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     let mut boundary_ids = vec![0; boundaries.len()];
     let mut country_ids = HashMap::new();
     let first_id = writer.record_count();
+    // The areas that are settlements by their own tags, and the settlement
+    // points that may name the area they lie in.
+    let mut settled = HashSet::new();
+    let mut settlements = Vec::new();
     for (index, item) in context_records.finish()?.enumerate() {
         let item = item?;
         let record_id = first_id + index as u64;
@@ -541,13 +552,47 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             }
             None => {}
         }
+        if let Record::Place(_, place) = &item.record
+            && street::is_settlement(&place.place_type)
+        {
+            match item.origin {
+                Some(ContextOrigin::Boundary(_)) => {
+                    settled.insert(record_id);
+                }
+                Some(ContextOrigin::DerivedCountry(_)) => {}
+                None => {
+                    settlements.extend(search_key(&place.name).zip(point_lon_lat(&place.geometry)))
+                }
+            }
+        }
         ordered.write(&item)?;
     }
     let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
-    writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
+    let area_names = boundaries.context_names(&boundary_ids, &country_ids);
+    writer.set_context_names(area_names.clone());
     writer.set_country_codes(country_codes.clone());
     writer.set_region_groups(boundaries.region_groups(&boundary_ids));
     let index = boundaries.into_index(&boundary_ids, &country_ids);
+    // An admin area is a settlement too when a settlement of its name lies
+    // in it, as a town's boundary holds the town's point: Nominatim links
+    // the two the same way. A ward or a local board holds none of its name.
+    settled.extend(
+        settlements
+            .par_iter()
+            .filter_map(|(name, [lon, lat])| {
+                let locality = index
+                    .context_for_point(*lon, *lat, Default::default())
+                    .admin_context
+                    .locality_record_id()?;
+                area_names
+                    .get(&locality)?
+                    .iter()
+                    .any(|area| search_key(area).as_ref() == Some(name))
+                    .then_some(locality)
+            })
+            .collect::<Vec<_>>(),
+    );
+    drop(settlements);
     let context_count = ordered.written();
     let mut sample = Sampler::default();
     write_ordered(
@@ -560,6 +605,19 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         BuildStage::ContextRecords,
     )?;
     report.phases.context_record_write_ms = phase.elapsed().as_millis();
+
+    let phase = Instant::now();
+    let street_stats = streets.stats();
+    report.accepted.streets = join_streets(
+        streets,
+        &index,
+        &settled,
+        &area_names,
+        &mut records,
+        &mut seq,
+    )?;
+    drop(area_names);
+    report.phases.street_join_ms = phase.elapsed().as_millis();
 
     let phase = Instant::now();
     let address_stats = addresses.stats();
@@ -660,6 +718,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         ("node_requests", request_stats),
         ("resolved_nodes", resolved_stats),
         ("addresses", address_stats),
+        ("streets", street_stats),
         ("records", record_stats),
         ("context_records", context_stats),
     ] {
@@ -693,6 +752,9 @@ struct Build {
     /// Addresses, until every one is known and they can join `records` a
     /// street at a time.
     addresses: ExternalSorter<PendingAddress>,
+    /// The ways of streets, until every one is known and the ways of one
+    /// street can join (see [`join_streets`]).
+    streets: ExternalSorter<PendingStreet>,
     /// Places: everything a context tuple can point at.
     context_records: ExternalSorter<PendingRecord>,
     seq: u64,
@@ -722,6 +784,10 @@ impl Build {
             return self
                 .addresses
                 .push(PendingAddress::new(address, self.seq - 1)?);
+        }
+        if let Record::Street(street) = record {
+            self.seq += 1;
+            return self.streets.push(PendingStreet::new(street, self.seq - 1)?);
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
@@ -852,6 +918,97 @@ impl<'a> AddressRuns<'a> {
         }
         Ok(())
     }
+}
+
+/// The ways of each street name, joined into one street record per street
+/// of each area and pushed to `records`; how many streets that makes. OSM
+/// draws a road as a way per stretch between its junctions, so one road was
+/// as many answers as it has stretches, told apart only by their ids.
+///
+/// Ways join within the locality they lie in, or the district where no
+/// locality covers them: one name is many streets across a country, and a
+/// road crossing a town line is a street in each town. Each street is
+/// labelled with where it is: its locality when that is a settlement (see
+/// `settled`), else its district, so a street in a city's ward or local
+/// board is named by the city. `area_names` are the names of each area,
+/// its own first.
+fn join_streets(
+    streets: ExternalSorter<PendingStreet>,
+    index: &BoundaryIndex,
+    settled: &HashSet<RecordId>,
+    area_names: &HashMap<RecordId, Vec<String>>,
+    records: &mut ExternalSorter<PendingRecord>,
+    seq: &mut u64,
+) -> Result<u64> {
+    let mut count = 0;
+    let mut flush = |runs: &mut Vec<Vec<StreetRecord>>| -> Result<()> {
+        let joined = runs
+            .par_drain(..)
+            .flat_map_iter(|run| {
+                let mut areas = Vec::<(Option<RecordId>, Option<String>, Vec<StreetRecord>)>::new();
+                for way in run {
+                    let [lon, lat] = way.representative_point;
+                    let context = index.context_for_point(lon, lat, Default::default());
+                    let tuple = &context.admin_context;
+                    let (locality, district) =
+                        (tuple.locality_record_id(), tuple.district_record_id());
+                    let area = locality.or(district);
+                    match areas.iter_mut().find(|(at, ..)| *at == area) {
+                        Some((.., members)) => members.push(way),
+                        None => {
+                            let named = locality
+                                .filter(|locality| settled.contains(locality))
+                                .or(district)
+                                .or(locality)
+                                .and_then(|area| area_names.get(&area)?.first().cloned());
+                            areas.push((area, named, vec![way]));
+                        }
+                    }
+                }
+                areas.into_iter().flat_map(|(_, named, members)| {
+                    street::join_ways(members)
+                        .into_iter()
+                        .map(move |mut street| {
+                            street.locality.clone_from(&named);
+                            street
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        for street in joined {
+            let [lon, lat] = street.representative_point;
+            records.push(PendingRecord {
+                key: hilbert_key(quantize(lon)?, quantize(lat)?),
+                seq: *seq,
+                origin: None,
+                record: Record::Street(street),
+            })?;
+            *seq += 1;
+            count += 1;
+        }
+        Ok(())
+    };
+    // Whole names at a time, a batch of ways or so per parallel join.
+    let mut runs = Vec::<Vec<StreetRecord>>::new();
+    let mut ways = 0;
+    let mut name = None::<Vec<u8>>;
+    for pending in streets.finish()? {
+        let pending = pending?;
+        if name.as_deref() != Some(pending.name_key()) {
+            if ways >= WRITE_BATCH_RECORDS {
+                flush(&mut runs)?;
+                ways = 0;
+            }
+            name = Some(pending.name_key().to_vec());
+            runs.push(Vec::new());
+        }
+        ways += 1;
+        runs.last_mut()
+            .expect("a run was started")
+            .push(pending.into_street());
+    }
+    flush(&mut runs)?;
+    Ok(count)
 }
 
 /// An imported address within this distance of an earlier address of the
@@ -2290,6 +2447,108 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn joins_the_ways_of_a_street_and_labels_it_with_its_town() {
+        let dir = temp_dir("street-join");
+        let input = dir.join("streets.osm.pbf");
+        let square = |first: i64, low: f64, high: f64| {
+            [
+                node(first, low, low, &[]),
+                node(first + 1, low, high, &[]),
+                node(first + 2, high, high, &[]),
+                node(first + 3, high, low, &[]),
+            ]
+        };
+        let area =
+            |relation_id: i64, ways: i64, first: i64, level: &'static str, name: &'static str| {
+                (
+                    [
+                        way(ways, &[first, first + 1, first + 2], &[]),
+                        way(ways + 1, &[first + 2, first + 3, first], &[]),
+                    ],
+                    relation(
+                        relation_id,
+                        &[(ways, "outer"), (ways + 1, "outer")],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", level),
+                            ("name", name),
+                        ],
+                    ),
+                )
+            };
+        let road = |name: &'static str| [("highway", "residential"), ("name", name)];
+        let mut nodes = Vec::new();
+        nodes.extend(square(101, 0.0, 1.0));
+        nodes.extend(square(111, 0.1, 0.4));
+        nodes.extend(square(121, 0.6, 0.9));
+        nodes.extend([
+            // The town Kingston's point names the boundary it lies in; no
+            // point names the local board.
+            node(130, 0.75, 0.75, &[("place", "town"), ("name", "Kingston")]),
+            node(201, 0.2, 0.2, &[]),
+            node(202, 0.2, 0.201, &[]),
+            node(203, 0.2, 0.202, &[]),
+            node(204, 0.2005, 0.203, &[]),
+            node(205, 0.3, 0.3, &[]),
+            node(206, 0.3, 0.301, &[]),
+            node(211, 0.7, 0.7, &[]),
+            node(212, 0.7, 0.701, &[]),
+            node(213, 0.7, 0.702, &[]),
+        ]);
+        let (district_ways, district) = area(900, 500, 101, "6", "Auckland");
+        let (board_ways, board) = area(910, 510, 111, "8", "Waitematā");
+        let (town_ways, town) = area(920, 520, 121, "8", "Kingston");
+        let mut ways = Vec::new();
+        ways.extend(district_ways);
+        ways.extend(board_ways);
+        ways.extend(town_ways);
+        ways.extend([
+            // One road drawn as three ways, then a road of its name far off.
+            way(700, &[201, 202], &road("Ponsonby Road")),
+            way(701, &[202, 203], &road("Ponsonby Road")),
+            way(702, &[203, 204], &road("Ponsonby Road")),
+            way(703, &[205, 206], &road("Ponsonby Road")),
+            way(710, &[211, 212], &road("Main Street")),
+            way(711, &[212, 213], &road("Main Street")),
+        ]);
+        write_pbf(&input, &[nodes, ways, vec![district, board, town]]);
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.street_segments, 6);
+        assert_eq!(report.accepted.streets, 3);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut streets = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| {
+                (
+                    street["id"].as_str().expect("id").to_string(),
+                    street["label"].as_str().expect("label").to_string(),
+                    street["geometry"]["type"]
+                        .as_str()
+                        .expect("type")
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        streets.sort();
+        let street = |id: &str, label: &str, kind: &str| {
+            (id.to_string(), label.to_string(), kind.to_string())
+        };
+        assert_eq!(
+            streets,
+            vec![
+                street("osm:way:700", "Ponsonby Road, Auckland", "MultiLineString"),
+                street("osm:way:703", "Ponsonby Road, Auckland", "LineString"),
+                street("osm:way:710", "Main Street, Kingston", "MultiLineString"),
+            ],
+            "a street in a local board is named by its district, one in a town by the town"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub struct StreetRecord {
     pub name: String,
     /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
+    /// The town or city it lies in, which its label names: one name is
+    /// many streets across a country.
+    pub locality: Option<String>,
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
@@ -686,17 +689,20 @@ impl StreetRecord {
     }
 
     pub fn label(&self) -> String {
-        self.name.clone()
+        labels::street_label(&self.name, self.locality.as_deref())
     }
 }
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 7)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 8)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
         serialize_alt_names(&mut state, &self.alt_names)?;
+        if let Some(locality) = &self.locality {
+            state.serialize_field("locality", locality)?;
+        }
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
         state.serialize_field("source", &self.source)?;

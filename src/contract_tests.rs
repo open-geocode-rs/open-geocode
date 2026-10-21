@@ -559,6 +559,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
         .write(
             &StreetRecord {
                 alt_names: Vec::new(),
+                locality: None,
                 name: "King Street".to_string(),
                 geometry: line(-79.0, 43.0, -79.0, 43.001),
                 representative_point: [-79.0, 43.0005],

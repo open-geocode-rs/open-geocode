@@ -274,6 +274,9 @@ pub struct AcceptedCounts {
     pub way_centroid_addresses: u64,
     pub interpolation_ranges: u64,
     pub street_segments: u64,
+    /// Street records, the segments of each street joined into one.
+    #[serde(default)]
+    pub streets: u64,
     pub postcode_records: u64,
     pub place_nodes: u64,
     /// Places drawn as a closed way or a multipolygon, not admin boundaries.
@@ -463,6 +466,9 @@ pub struct PhaseTimings {
     pub address_order_ms: u128,
     /// Write places and boundaries.
     pub context_record_write_ms: u128,
+    /// Join the ways of each street into one street record.
+    #[serde(default)]
+    pub street_join_ms: u128,
     /// Write addresses, POIs, interpolations, streets and postcodes in
     /// Hilbert order.
     pub record_write_ms: u128,

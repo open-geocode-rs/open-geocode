@@ -13,7 +13,6 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use geojson::GeometryValue;
 use rstar::{RTree, primitives::GeomWithData};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
@@ -36,7 +35,7 @@ use crate::{
     },
     records::quantize,
     spatial_index::haversine_m,
-    util::{fold::search_key, text::collapse_whitespace},
+    util::{fold::search_key, geo::line_parts, text::collapse_whitespace},
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
@@ -178,13 +177,14 @@ impl Extent {
                 max_lat: lat,
             })
         };
-        match &record.geometry().value {
-            GeometryValue::LineString { coordinates } => coordinates
-                .iter()
+        match line_parts(record.geometry()) {
+            Some(parts) => parts
+                .into_iter()
+                .flatten()
                 .map(|position| point(position[0], position[1]))
                 .reduce(|left, right| Some(left?.union(right?)))
                 .flatten(),
-            _ => record
+            None => record
                 .display_point()
                 .and_then(|[lon, lat]| point(lon, lat)),
         }

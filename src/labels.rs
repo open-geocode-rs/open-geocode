@@ -58,6 +58,14 @@ pub fn poi_label(
     .join(", ")
 }
 
+/// "Ponsonby Road, Auckland": a street and the locality it lies in.
+pub fn street_label(name: &str, locality: Option<&str>) -> String {
+    match locality {
+        Some(locality) if !locality.is_empty() => format!("{name}, {locality}"),
+        _ => name.to_string(),
+    }
+}
+
 pub fn interpolation_name(components: &InterpolationAddressComponents) -> String {
     components
         .street

@@ -2417,7 +2417,7 @@ impl TextSearcher {
             0,
         )? {
             if seen.insert(candidate.record_id)
-                && street_search_text(&self.pack.records().summary(candidate.record_id)?.label)
+                && street_search_text(&self.pack.records().summary(candidate.record_id)?.name)
                     .as_deref()
                     == Some(street)
             {
@@ -6546,6 +6546,7 @@ mod tests {
             .unwrap_or(9);
         StreetRecord {
             alt_names: Vec::new(),
+            locality: None,
             name: label.to_string(),
             geometry: point_geometry(-79.0, 43.0),
             representative_point: [-79.0, 43.0],
