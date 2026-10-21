@@ -39,9 +39,10 @@ use crate::{
     text_index::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
         INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD, MIN_LAT_FIELD, MIN_LON_FIELD,
-        POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms,
-        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
-        flat_number_term, is_numeric_token, open_text_index, street_search_text,
+        NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
+        RECORD_COUNT_FIELD, address_number_terms, base_house_number, compact_postcode,
+        expand_address_abbreviations, expand_final_direction, flat_number_term, is_numeric_token,
+        open_text_index, street_search_text,
     },
     util::fold::{exact_key, search_key},
 };
@@ -82,6 +83,8 @@ struct SegmentColumns {
     min_lat: Column<i64>,
     max_lon: Column<i64>,
     max_lat: Column<i64>,
+    name_words: Column<u64>,
+    place_rank: Column<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,6 +307,8 @@ impl TextSearcher {
                     min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
                     max_lon: fast_fields.i64(MAX_LON_FIELD)?,
                     max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
+                    name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
+                    place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
                 },
             );
         }
@@ -1764,24 +1769,37 @@ impl TextSearcher {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
+        let ranked = || {
+            searcher.search(
+                query,
+                &TopDocs::with_limit(window).tweak_score(RankKeys {
+                    ranking,
+                    columns: &self.columns,
+                    pack: &self.pack,
+                }),
+            )
+        };
         // When only the text score ranks, the key is the score, and the index
-        // can skip the records that cannot make the window.
+        // can skip the records that cannot make the window. Unless the window
+        // ends inside a run of equal scores: then which of them made it is
+        // arbitrary, and the rest of the key must choose ("Richmond" the town
+        // among a hundred Richmond Roads).
         let top_docs =
             if ranking.numbered || !ranking.postcode.forms.is_empty() || ranking.focus.is_some() {
-                searcher.search(
-                    query,
-                    &TopDocs::with_limit(window).tweak_score(RankKeys {
-                        ranking,
-                        columns: &self.columns,
-                        pack: &self.pack,
-                    }),
-                )?
+                ranked()?
             } else {
-                searcher
-                    .search(query, &TopDocs::with_limit(window))?
-                    .into_iter()
-                    .map(|(text_score, doc)| (RankKey::text(text_score), doc))
-                    .collect()
+                let scored = searcher.search(query, &TopDocs::with_limit(window))?;
+                let cut_tie = scored.len() == window
+                    && window > 1
+                    && scored[window - 1].0 == scored[window - 2].0;
+                if cut_tie {
+                    ranked()?
+                } else {
+                    scored
+                        .into_iter()
+                        .map(|(text_score, doc)| (RankKey::text(text_score), doc))
+                        .collect()
+                }
             };
         // Without a house number no document is left out for its number, so
         // once `limit` hits are kept only the documents that tie the last of
@@ -2443,16 +2461,25 @@ struct Neighbour {
 /// hits the ones before it tie: whether it answers the house number itself
 /// (a stated number or an estimate) or only its street; how much of the
 /// postcode the query names it shares; whether its point is stated or
-/// estimated on a range; then how well its text matches. Every hit already
-/// lies in the localities its pass requires. Compared field by field, larger
-/// is better.
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+/// estimated on a range; how well its text matches; then, of records the
+/// text cannot tell apart, the one whose name has the fewest words, the
+/// larger place, and the one nearer the caller. Every hit already lies in
+/// the localities its pass requires. Larger is better.
+#[derive(Debug, Clone, PartialEq)]
 struct RankKey {
     house_level: bool,
     /// See [`QueryPostcode::rank`].
     postcode_agreement: u8,
     stated: bool,
     text_score: Score,
+    /// Words of the record's own name: of names a query matches alike, the
+    /// one it covers with fewest left over ("Richmond" before "Richmond
+    /// Road", "Queen Street" before "Upper Queen Street"). [`TieBreak`]
+    /// asks the same of the hits.
+    name_words: u8,
+    /// See [`place_rank`], smaller larger; [`u8::MAX`] for a record that is
+    /// no place.
+    place_rank: u8,
     /// How near the caller's focus the document's extent lies, larger
     /// nearer. It orders only the window the text index collects, so that
     /// of many documents the query cannot tell apart the near ones make it;
@@ -2469,11 +2496,14 @@ impl RankKey {
             postcode_agreement: 0,
             stated: true,
             text_score,
+            name_words: u8::MAX,
+            place_rank: u8::MAX,
             nearness: 0,
         }
     }
 
-    /// The order of what the query states, leaving out the nearness.
+    /// The order of what the query states, leaving out what only breaks
+    /// ties.
     fn cmp_evidence(&self, other: &Self) -> std::cmp::Ordering {
         (
             self.house_level,
@@ -2488,6 +2518,18 @@ impl RankKey {
                 other.text_score,
             ))
             .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for RankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp_evidence(other).then_with(|| {
+            (other.name_words, other.place_rank, self.nearness).cmp(&(
+                self.name_words,
+                self.place_rank,
+                other.nearness,
+            ))
+        }))
     }
 }
 
@@ -2561,6 +2603,8 @@ struct SegmentRankKeys {
     numbered: bool,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
+    name_words: Column<u64>,
+    place_rank: Column<u64>,
     postcode: Option<SegmentPostcodes>,
     focus: Option<SegmentFocus>,
 }
@@ -2696,6 +2740,8 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             numbered: self.ranking.numbered,
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
+            name_words: columns.name_words.clone(),
+            place_rank: columns.place_rank.clone(),
             postcode,
             focus: self.ranking.focus.map(|focus| SegmentFocus {
                 focus,
@@ -2713,6 +2759,10 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         // A numbered query matches a record by its stated number, by a range
         // that holds the number, or as a street that stands in for it.
         let mut key = RankKey::text(text_score);
+        let small =
+            |value: Option<u64>| value.map_or(u8::MAX, |value| value.min(u64::from(u8::MAX)) as u8);
+        key.name_words = small(self.name_words.first(doc));
+        key.place_rank = small(self.place_rank.first(doc));
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
             key.stated = false;
@@ -2736,10 +2786,11 @@ struct TieBreak {
     /// read, never a word of the house number ("7 Vialou Street" is no
     /// unit 7).
     unit: u8,
-    /// Words of the record's own label the query did not ask for, as both
-    /// were written: "342 Albert Street" beats "342 Prince Albert Street" for
-    /// the query "342 albert street".
-    extra_label_tokens: usize,
+    /// Words of the record's own name the query did not ask for: "342
+    /// Albert Street" beats "342 Prince Albert Street" for the query "342
+    /// albert street". The name, not the label, so where a record lies
+    /// never counts against it.
+    extra_name_words: usize,
     /// Query words the label lacks. The addresses of a street group share
     /// one document and so one score, though only some state the unit the
     /// query names.
@@ -2748,6 +2799,12 @@ struct TieBreak {
     /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
     /// finds, and one that writes "Taupo" for Taupo first.
     inexact_query_words: usize,
+    /// Larger places first (see [`place_rank`]), then every other record:
+    /// "Richmond" is the town before a locality of that name. Only a tie on
+    /// the words and the areas a query states reaches it, so a size prior
+    /// never outweighs what the query says. The text index keeps the
+    /// window by it too (see [`RankKey::place_rank`]).
+    place_rank: u8,
     /// Nearer the caller's focus first, by [`FOCUS_BANDS_M`]; all tie
     /// without one. After every word of the query, so a caller's location
     /// never outranks a better match, and every hit already lies in the
@@ -2757,11 +2814,6 @@ struct TieBreak {
     /// placed one house far apart, its point may be wrong (see
     /// [`AddressRecord::disputed`]).
     disputed: bool,
-    /// Larger places first (see [`place_rank`]), then every other record:
-    /// "Richmond" is the town before a locality of that name. Only a tie on
-    /// the words and the areas a query states reaches it, so a size prior
-    /// never outweighs what the query says.
-    place_rank: u8,
     /// Every other record before a POI, then the POI its OSM tags show
     /// better known first: linked to Wikidata or Wikipedia, then named in
     /// more languages (see [`Prominence`]). Only POIs that tie on all the
@@ -2781,7 +2833,8 @@ impl TieBreak {
     fn new(record: &Summary, prior: Prior, query_words: &HashSet<&str>, ranking: &Ranking) -> Self {
         let label = search_key(&record.label).unwrap_or_default();
         let label_words = label.split_whitespace().collect::<HashSet<_>>();
-        let extra_label_tokens = label
+        let extra_name_words = search_key(&record.name)
+            .unwrap_or_default()
             .split_whitespace()
             .filter(|word| !query_words.contains(word))
             .count();
@@ -2819,12 +2872,12 @@ impl TieBreak {
             });
         Self {
             unit: unit_rank(record, ranking),
-            extra_label_tokens,
+            extra_name_words,
             missing_query_words,
             inexact_query_words,
+            place_rank: prior.place_rank.unwrap_or(u8::MAX),
             focus_band,
             disputed: prior.disputed,
-            place_rank: prior.place_rank.unwrap_or(u8::MAX),
             poi: prior.prominence.map(std::cmp::Reverse),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
@@ -4049,6 +4102,60 @@ mod tests {
             "osm:node:2",
             "a focus never outranks a better match"
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn of_equal_scores_the_window_keeps_the_closest_name_then_the_larger_place() {
+        use crate::record::{PlaceLayer, PlaceRecord, Record};
+
+        let temp_dir = temp_pack_path("search-window-ties");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // More roads of the name than the rank window holds, written first,
+        // so a window that kept any of the tie would keep only roads.
+        for index in 1..=60 {
+            writer
+                .write(
+                    &street_record(&format!("osm:way:{index}"), "Richmond Road").into(),
+                    None,
+                )
+                .expect("road");
+        }
+        for (object_id, place_type) in [(101, "hamlet"), (102, "town")] {
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: "Richmond".to_string(),
+                            place_type: place_type.to_string(),
+                            geometry: point_geometry(-79.0, 43.0),
+                            source: SourceProvenance::osm(ObjectType::Node, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("place");
+        }
+        // A street known by a second name repeats a word of it, which must
+        // not score it over the street the query names.
+        let mut upper = street_record("osm:way:201", "Upper Queen Street");
+        upper.alt_names = vec!["Belgium Street".to_string()];
+        writer.write(&upper.into(), None).expect("upper");
+        writer
+            .write(&street_record("osm:way:202", "Queen Street").into(), None)
+            .expect("queen");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            top_ids(&searcher, "Richmond")[..2],
+            ["osm:node:102", "osm:node:101"],
+            "the town, then the hamlet, before any road"
+        );
+        assert_eq!(top_ids(&searcher, "Queen Street")[0], "osm:way:202");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -5521,12 +5628,12 @@ mod tests {
             "osm:node:1",
             "the postcode starts at its first word with a digit"
         );
-        // A postcode nobody shares prefers no one: the closest labels first,
-        // and again the record whose own postcode disagrees last.
-        assert_eq!(
-            top_ids(&searcher, "5 Main Street, Z9Z 9Z9"),
-            vec!["osm:node:2", "osm:node:3", "osm:node:1"]
-        );
+        // A postcode nobody shares, which this Pack's parser does not read
+        // as one, prefers no one: what a label states beyond the name is
+        // where the record lies, and counts neither way.
+        let mut ids = top_ids(&searcher, "5 Main Street, Z9Z 9Z9");
+        ids.sort();
+        assert_eq!(ids, vec!["osm:node:1", "osm:node:2", "osm:node:3"]);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

@@ -32,7 +32,7 @@ use crate::{
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
-        Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord,
+        Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord, place_rank,
     },
     records::quantize,
     spatial_index::haversine_m,
@@ -71,6 +71,8 @@ pub(crate) const MIN_LAT_FIELD: &str = "min_lat";
 pub(crate) const MAX_LON_FIELD: &str = "max_lon";
 pub(crate) const MAX_LAT_FIELD: &str = "max_lat";
 pub(crate) const RECORD_COUNT_FIELD: &str = "record_count";
+pub(crate) const NAME_WORDS_FIELD: &str = "name_words";
+pub(crate) const PLACE_RANK_FIELD: &str = "place_rank";
 /// Addresses one document holds at most, so finding a number in a group reads
 /// a bounded run of records.
 const MAX_GROUP_RECORDS: u64 = 1_024;
@@ -143,6 +145,13 @@ pub struct Fields {
     pub min_lat: Field,
     pub max_lon: Field,
     pub max_lat: Field,
+    /// The words of the record's own name, as the name field spells them,
+    /// so that of records a query scores alike the text index keeps the
+    /// ones whose name it covers with the fewest words left over.
+    pub name_words: Field,
+    /// The [`place_rank`] of a place, so that of places a query scores
+    /// alike the text index keeps the larger.
+    pub place_rank: Field,
 }
 
 /// The smallest box holding a document's records, in 1e-7 degrees, the
@@ -231,6 +240,10 @@ pub struct Document {
     /// The country the record lies in, from its admin context.
     pub country_code: Option<String>,
     pub extent: Option<Extent>,
+    /// Words of the record's own name (see [`Fields::name_words`]).
+    pub name_words: Option<u64>,
+    /// See [`Fields::place_rank`].
+    pub place_rank: Option<u8>,
 }
 
 impl fmt::Debug for Writer {
@@ -426,6 +439,8 @@ impl Fields {
             min_lat: schema.get_field(MIN_LAT_FIELD)?,
             max_lon: schema.get_field(MAX_LON_FIELD)?,
             max_lat: schema.get_field(MAX_LAT_FIELD)?,
+            name_words: schema.get_field(NAME_WORDS_FIELD)?,
+            place_rank: schema.get_field(PLACE_RANK_FIELD)?,
         })
     }
 
@@ -479,9 +494,14 @@ impl Fields {
             document.add_text(self.context_text, &projected.context_text);
         }
         add_text_if_present(&mut document, self.name_text, projected.name.as_deref());
-        for street in &projected.streets {
-            add_text_if_present(&mut document, self.street_text, Some(street));
-        }
+        // One value of each word, as the name and content fields are: a
+        // street known by several names ("Upper Queen Street", "Belgium
+        // Street") would else score its repeated words over a street of one.
+        add_text_if_present(
+            &mut document,
+            self.street_text,
+            unique_words(&projected.streets.join(" ")).as_deref(),
+        );
         let mut terms = BTreeSet::new();
         let mut lowest: Option<u32> = None;
         for number in &projected.address_numbers {
@@ -526,6 +546,12 @@ impl Fields {
             document.add_i64(self.min_lat, extent.min_lat.into());
             document.add_i64(self.max_lon, extent.max_lon.into());
             document.add_i64(self.max_lat, extent.max_lat.into());
+        }
+        if let Some(words) = projected.name_words {
+            document.add_u64(self.name_words, words);
+        }
+        if let Some(rank) = projected.place_rank {
+            document.add_u64(self.place_rank, rank.into());
         }
         document
     }
@@ -593,14 +619,16 @@ impl Document {
                     .map(str::to_string);
             }
         }
-        if let Record::Poi(_) = record {
-            // A POI repeats words across its name and address ("Walmer Road
-            // Parkette, 227 Walmer Road"). Without field norms every repeat
-            // would add to its score, so each word counts once: a POI must not
-            // outrank the address or place a query names on repetition alone.
-            document.name = document.name.as_deref().and_then(unique_words);
-            document.content_text = unique_words(&document.content_text).unwrap_or_default();
+        if let Record::Place(_, place) = record {
+            document.place_rank = place_rank(&place.place_type);
         }
+        // A record repeats words across its names and address ("Walmer Road
+        // Parkette, 227 Walmer Road", "Upper Queen Street" also named
+        // "Belgium Street"). Without field norms every repeat would add to
+        // its score, so each word counts once: a record must not outrank the
+        // one a query names on repetition alone.
+        document.name = document.name.as_deref().and_then(unique_words);
+        document.content_text = unique_words(&document.content_text).unwrap_or_default();
         document
     }
 
@@ -797,6 +825,8 @@ fn build_schema() -> (Schema, Fields) {
     let min_lat = builder.add_i64_field(MIN_LAT_FIELD, FAST);
     let max_lon = builder.add_i64_field(MAX_LON_FIELD, FAST);
     let max_lat = builder.add_i64_field(MAX_LAT_FIELD, FAST);
+    let name_words = builder.add_u64_field(NAME_WORDS_FIELD, FAST);
+    let place_rank = builder.add_u64_field(PLACE_RANK_FIELD, FAST);
     let schema = builder.build();
     let fields = Fields {
         record_id,
@@ -819,6 +849,8 @@ fn build_schema() -> (Schema, Fields) {
         min_lat,
         max_lon,
         max_lat,
+        name_words,
+        place_rank,
     };
     (schema, fields)
 }
@@ -881,6 +913,8 @@ impl ProjectionBuilder {
                 area_postcode: None,
                 country_code: None,
                 extent: None,
+                name_words: None,
+                place_rank: None,
             },
             name_parts: Vec::new(),
             content_parts: Vec::new(),
@@ -898,8 +932,13 @@ impl ProjectionBuilder {
         self.add_autocomplete_subject_text(value);
     }
 
+    /// A name of the record; the first is its own (see
+    /// [`Fields::name_words`]).
     fn name_for_search(&mut self, value: &str) {
         if let Some(text) = search_text(value) {
+            self.projected
+                .name_words
+                .get_or_insert(text.split_whitespace().count() as u64);
             self.name_parts.push(text);
         }
         self.add_content_text(value);
