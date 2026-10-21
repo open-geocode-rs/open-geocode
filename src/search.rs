@@ -689,7 +689,11 @@ impl TextSearcher {
     /// then anything in no other locality, with the named ones only ranking.
     /// The next labelling is searched only when every pass of the one before
     /// found nothing, so a reading that drops what the best one requires
-    /// never outranks it.
+    /// never outranks it. Hits found only with the localities ranking are the
+    /// exception: the later labellings' stricter passes run too, and the hits
+    /// on the stronger [`Evidence`] answer ("10 Ellerslie Panmure" read with
+    /// Panmure the locality finds an Ellerslie Road outside it; read as one
+    /// street name, Ellerslie Panmure Highway).
     ///
     /// A hit whose own postcode contradicts the one the query names is kept,
     /// after the hits that do not, but it does not end the search: a stated
@@ -707,12 +711,14 @@ impl TextSearcher {
         mut accept: impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut plans = Vec::<QueryPlan>::new();
+        let mut scores = Vec::<f32>::new();
         for parsed in self.tagger.parse(query_text) {
             if let Some(plan) = QueryPlan::from_tagged(&parsed.pieces, context, |word| {
                 self.tagger.dictionaries().describes_street(word)
             }) && !plans.contains(&plan)
             {
                 plans.push(plan);
+                scores.push(parsed.score);
             }
         }
         if parses == Parses::Numbered
@@ -720,7 +726,11 @@ impl TextSearcher {
                 .first()
                 .is_some_and(|plan| plan.house_number.is_some())
         {
-            plans.retain(|plan| plan.house_number.is_some());
+            (plans, scores) = plans
+                .into_iter()
+                .zip(scores)
+                .filter(|(plan, _)| plan.house_number.is_some())
+                .unzip();
         }
         let Some(first_plan) = plans.first() else {
             return Err(Error::UnparsableQuery {
@@ -732,28 +742,49 @@ impl TextSearcher {
         query_words
             .search
             .extend(context.iter().flat_map(|part| part.words.iter().cloned()));
-        let mut contradicting = Contradicting::default();
-        for plan in plans {
-            let text = plan.text();
-            let base = plan.with_base_house_number();
-            let variants = std::iter::once(plan).chain(base).collect::<Vec<_>>();
-            for pass in [Pass::Strict, Pass::Street, Pass::Lenient] {
-                for plan in &variants {
-                    if !pass.searches_anew(plan) {
-                        continue;
-                    }
-                    let (hits, contradicted) =
-                        self.search_plan(plan, pass, &query_words, filters, limit, &mut accept)?;
-                    contradicting.keep(&text, contradicted);
-                    if !hits.is_empty() {
-                        return Ok((text, contradicting.after(hits, limit)));
-                    }
+        let readings = plans
+            .into_iter()
+            .map(|plan| {
+                let text = plan.text();
+                let base = plan.with_base_house_number();
+                (text, std::iter::once(plan).chain(base).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        // Which readings' contradicting hits count is known only once one is
+        // chosen, so they wait here, in search order, with their reading.
+        let mut contradicted = Vec::<(usize, Vec<TextSearchHit>)>::new();
+        let chosen = choose_reading(&scores, |reading, pass| {
+            for plan in &readings[reading].1 {
+                if !pass.searches_anew(plan) {
+                    continue;
+                }
+                let (hits, kept) =
+                    self.search_plan(plan, pass, &query_words, filters, limit, &mut accept)?;
+                contradicted.push((reading, kept));
+                if !hits.is_empty() {
+                    return Ok(Some(hits));
                 }
             }
+            Ok(None)
+        })?;
+        // As if the readings had run in turn up to the chosen one: those
+        // after it ran only to be outweighed.
+        let last = chosen.as_ref().map_or(usize::MAX, |(reading, _)| *reading);
+        let mut contradicting = Contradicting::default();
+        for (reading, hits) in contradicted {
+            if reading <= last {
+                contradicting.keep(&readings[reading].0, hits);
+            }
         }
-        Ok(contradicting
-            .alone(limit)
-            .unwrap_or((first_query, Vec::new())))
+        Ok(match chosen {
+            Some((reading, hits)) => (
+                readings[reading].0.clone(),
+                contradicting.after(hits, limit),
+            ),
+            None => contradicting
+                .alone(limit)
+                .unwrap_or((first_query, Vec::new())),
+        })
     }
 
     /// The hits of one pass over one plan that `accept` keeps, at most
@@ -1904,8 +1935,10 @@ enum Parses {
     Numbered,
 }
 
-/// The retrieval passes of [`TextSearcher::search_variants`], in order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The retrieval passes of [`TextSearcher::search_variants`], in order,
+/// strictest first. The order is also how strongly a hit found by each
+/// answers the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Pass {
     /// The house number, stated or on a range, in every named locality.
     Strict,
@@ -1918,6 +1951,8 @@ enum Pass {
 }
 
 impl Pass {
+    const ALL: [Self; 3] = [Self::Strict, Self::Street, Self::Lenient];
+
     fn requires_locality(self) -> bool {
         self != Self::Lenient
     }
@@ -1936,6 +1971,65 @@ impl Pass {
             Self::Lenient => plan.context.iter().any(|part| !part.is_postcode()),
         }
     }
+}
+
+/// How strongly a reading's hits answer the query: the pass that found them,
+/// then the parser's score of the reading. Compared in that order, never
+/// summed: the score is an unnormalised Viterbi path score on no scale shared
+/// with retrieval, so any weight joining the two would be made up. A stricter
+/// pass outweighs any score; the score decides only between readings found
+/// by the same pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Evidence {
+    pass: Pass,
+    score: f32,
+}
+
+impl Evidence {
+    fn outweighs(self, other: Self) -> bool {
+        self.pass < other.pass || (self.pass == other.pass && self.score > other.score)
+    }
+}
+
+/// The reading whose hits rest on the strongest [`Evidence`], with its hits;
+/// `None` when no reading finds any. `scores` are the readings' parser
+/// scores, best first, and `search` runs one pass over one reading.
+///
+/// Readings run in turn, each through the passes until one finds hits. Hits
+/// from [`Pass::Strict`] or [`Pass::Street`] end the search. After hits from
+/// [`Pass::Lenient`] the later readings run only their stricter passes: a
+/// later reading scores no higher, so nothing else could outweigh them. That
+/// bounds the extra work to two passes over each remaining reading.
+fn choose_reading<T>(
+    scores: &[f32],
+    mut search: impl FnMut(usize, Pass) -> Result<Option<T>>,
+) -> Result<Option<(usize, T)>> {
+    let mut best = None::<(Evidence, usize, T)>;
+    for (reading, &score) in scores.iter().enumerate() {
+        if best
+            .as_ref()
+            .is_some_and(|(held, ..)| held.pass != Pass::Lenient)
+        {
+            break;
+        }
+        for pass in Pass::ALL {
+            if best.as_ref().is_some_and(|(held, ..)| pass >= held.pass) {
+                break;
+            }
+            let Some(hits) = search(reading, pass)? else {
+                continue;
+            };
+            let evidence = Evidence { pass, score };
+            if best
+                .as_ref()
+                .is_none_or(|(held, ..)| evidence.outweighs(*held))
+            {
+                best = Some((evidence, reading, hits));
+            }
+            break;
+        }
+    }
+    Ok(best.map(|(_, reading, hits)| (reading, hits)))
 }
 
 /// What [`TextSearcher::ranked_hits`] ranks by besides the text score.

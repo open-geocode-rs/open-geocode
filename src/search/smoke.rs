@@ -790,3 +790,183 @@ mod postcode {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// A reading found only with its localities ranking yields to a later one
+/// found in a stricter pass.
+mod reading_choice {
+    use super::*;
+
+    /// Ellerslie Panmure Highway in Auckland, an Ellerslie Road in no
+    /// locality, and a Panmure the Pack knows.
+    fn write_pack(name: &str) -> (std::path::PathBuf, TextSearcher) {
+        let temp_dir = temp_pack_path(name);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let auckland = locality(&mut writer, "Auckland", 100, [174.75, -36.85]);
+        let panmure = locality(&mut writer, "Panmure", 101, [174.86, -36.90]);
+        writer.set_context_names(
+            [
+                (auckland, vec!["Auckland".to_string()]),
+                (panmure, vec!["Panmure".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        writer
+            .write(
+                &street("osm:way:1", "Queens Road", [174.86, -36.90]).into(),
+                in_locality(panmure),
+            )
+            .expect("queens road");
+        let mut highway = address_record(
+            "osm:node:2",
+            "",
+            "10",
+            "Ellerslie Panmure Highway",
+            None,
+            None,
+        );
+        highway.geometry = point_geometry(174.81, -36.89);
+        writer
+            .write(&highway.into(), in_locality(auckland))
+            .expect("highway");
+        let mut road = address_record("osm:node:3", "", "10", "Ellerslie Road", None, None);
+        road.geometry = point_geometry(174.80, -36.90);
+        writer.write(&road.into(), None).expect("road");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        (temp_dir, searcher)
+    }
+
+    #[test]
+    fn a_later_reading_found_strictly_outweighs_a_lenient_first() {
+        let (temp_dir, searcher) = write_pack("smoke-reading-choice");
+        let query = "10 Ellerslie Panmure";
+        // The first reading takes Panmure for the locality and finds only
+        // the road outside it, with the locality ranking.
+        let parsed = searcher.tagger.parse(query);
+        assert!(
+            parsed[0]
+                .pieces
+                .iter()
+                .any(|piece| piece.token == "panmure" && piece.label == Label::Locality),
+            "{}",
+            explain(&searcher, query)
+        );
+        let readings = hits_of_readings(&searcher, query, |_| true);
+        assert_eq!(readings[0].1, vec!["osm:node:3"], "{readings:?}");
+
+        assert_eq!(
+            search_ids(&searcher, query).first().map(String::as_str),
+            Some("osm:node:2"),
+            "{}",
+            explain(&searcher, query)
+        );
+        let (text, hits) = searcher
+            .search_variants(
+                query,
+                &[],
+                Filters::default(),
+                10,
+                Parses::All,
+                |_, _, _| Ok(true),
+            )
+            .expect("search");
+        assert_eq!(hits[0].record.id, "osm:node:2");
+        assert!(
+            text.contains("panmure"),
+            "the street reading's text: {text}"
+        );
+        assert_eq!(
+            geocode_row(&searcher, query, None, None, None).as_deref(),
+            Some("osm:node:2")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The readings `choose_reading` picks and the passes it ran, with
+    /// `found` the first pass of each reading that finds hits.
+    fn choose(found: &[Option<Pass>]) -> (Option<usize>, Vec<(usize, Pass)>) {
+        let scores = (0..found.len())
+            .map(|reading| 3.0 - reading as f32)
+            .collect::<Vec<_>>();
+        let mut runs = Vec::new();
+        let chosen = choose_reading(&scores, |reading, pass| {
+            runs.push((reading, pass));
+            Ok(found[reading].filter(|first| pass >= *first).map(|_| ()))
+        })
+        .expect("choose");
+        (chosen.map(|(reading, ())| reading), runs)
+    }
+
+    #[test]
+    fn a_strict_first_reading_runs_no_other() {
+        use Pass::*;
+        assert_eq!(
+            choose(&[Some(Strict), Some(Strict), Some(Strict)]),
+            (Some(0), vec![(0, Strict)])
+        );
+        assert_eq!(
+            choose(&[Some(Street), Some(Strict), Some(Strict)]),
+            (Some(0), vec![(0, Strict), (0, Street)])
+        );
+    }
+
+    #[test]
+    fn a_lenient_first_reading_runs_only_the_stricter_passes_of_the_rest() {
+        use Pass::*;
+        assert_eq!(
+            choose(&[Some(Lenient), None, Some(Strict)]),
+            (
+                Some(2),
+                vec![
+                    (0, Strict),
+                    (0, Street),
+                    (0, Lenient),
+                    (1, Strict),
+                    (1, Street),
+                    (2, Strict),
+                ]
+            )
+        );
+        // A street pass outweighs it too, and ends the search.
+        assert_eq!(
+            choose(&[Some(Lenient), Some(Street), Some(Strict)]),
+            (
+                Some(1),
+                vec![
+                    (0, Strict),
+                    (0, Street),
+                    (0, Lenient),
+                    (1, Strict),
+                    (1, Street)
+                ]
+            )
+        );
+        // A later lenient reading never runs its lenient pass, nor wins.
+        assert_eq!(
+            choose(&[Some(Lenient), Some(Lenient), Some(Lenient)]),
+            (
+                Some(0),
+                vec![
+                    (0, Strict),
+                    (0, Street),
+                    (0, Lenient),
+                    (1, Strict),
+                    (1, Street),
+                    (2, Strict),
+                    (2, Street),
+                ]
+            )
+        );
+        assert_eq!(choose(&[None, None]).0, None);
+    }
+
+    #[test]
+    fn a_stricter_pass_outweighs_any_parser_score() {
+        let evidence = |pass, score| Evidence { pass, score };
+        assert!(evidence(Pass::Strict, -100.0).outweighs(evidence(Pass::Lenient, 100.0)));
+        assert!(evidence(Pass::Street, 1.0).outweighs(evidence(Pass::Street, 0.5)));
+        assert!(!evidence(Pass::Street, 1.0).outweighs(evidence(Pass::Street, 1.0)));
+    }
+}
