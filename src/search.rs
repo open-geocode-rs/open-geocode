@@ -269,6 +269,10 @@ const NEIGHBOUR_DOCUMENTS: usize = 256;
 /// while a point placed between addresses on two different streets of one
 /// name lies far from both.
 const NEIGHBOUR_STREET_RADIUS_M: f64 = 100.0;
+/// A POI this near an address stands at it: a building's entrances, its
+/// shops and its parcel lie within a lot's depth of its address point, the
+/// depth [`NEIGHBOUR_STREET_RADIUS_M`] allows an address from its street.
+const AT_ADDRESS_RADIUS_M: f64 = NEIGHBOUR_STREET_RADIUS_M;
 
 impl TextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
@@ -1343,6 +1347,16 @@ impl TextSearcher {
             numbered: plan.house_number.is_some(),
             postcode: self.query_postcode(plan)?,
             focus,
+            sought: plan
+                .subject
+                .iter()
+                .map(|word| Word {
+                    text: word.text.clone(),
+                    corrected: word.corrected.clone(),
+                })
+                .chain(plan.unplaced.iter().cloned())
+                .collect(),
+            edits,
         };
         let localities = plan
             .context
@@ -1773,8 +1787,11 @@ impl TextSearcher {
         // once `limit` hits are kept only the documents that tie the last of
         // them need hydrating. The cutoff is the last kept hit's, not the
         // `limit`th document's: a rejected hit leaves its place to the next.
+        // A POI may yet rank below an address or street after it (see
+        // [`Self::demoted`]), so it holds no place while one may.
         let mut cutoff = None;
         let mut hits = Vec::new();
+        let mut placed = 0;
         for (key, doc) in top_docs {
             if cutoff
                 .as_ref()
@@ -1815,23 +1832,166 @@ impl TextSearcher {
                     .place_type(record_id)?
                     .as_deref()
                     .and_then(place_rank);
+                if hit.record.layer != Layer::Poi.as_str() || ranking.sought.is_empty() {
+                    placed += 1;
+                }
                 hits.push((
                     key.clone(),
                     TieBreak::new(&hit.record, rank, disputed, &query_words, ranking),
                     hit,
                 ));
             }
-            if !ranking.numbered && cutoff.is_none() && hits.len() >= limit {
+            if !ranking.numbered && cutoff.is_none() && placed >= limit {
                 cutoff = Some(key);
             }
         }
-        hits.sort_by(|(left_key, left_tie, _), (right_key, right_tie, _)| {
-            right_key
-                .cmp_evidence(left_key)
-                .then_with(|| left_tie.cmp(right_tie))
-        });
+        let demoted = self.demoted(hits.iter().map(|(_, _, hit)| hit), ranking)?;
+        let mut hits = hits.into_iter().zip(demoted).collect::<Vec<_>>();
+        hits.sort_by(
+            |((left_key, left_tie, _), left_demoted),
+             ((right_key, right_tie, _), right_demoted)| {
+                left_demoted
+                    .cmp(right_demoted)
+                    .then_with(|| right_key.cmp_evidence(left_key))
+                    .then_with(|| left_tie.cmp(right_tie))
+            },
+        );
         hits.truncate(limit);
-        Ok(hits.into_iter().map(|(_, _, hit)| hit).collect())
+        Ok(hits.into_iter().map(|((_, _, hit), _)| hit).collect())
+    }
+
+    /// Whether each of `hits` is a POI ranked below every address, range and
+    /// street hit: addresses beat POIs when the query carries address
+    /// evidence. A hit carries it when the query asks for a house number,
+    /// or when the street it is on (or is) accounts for every word the
+    /// query seeks: the query names a street the Pack has. A query some of
+    /// whose words a street lacks may name a POI ("Queen's Quay Family
+    /// Medicine"), and its POIs rank as before.
+    ///
+    /// A POI that confirms such a hit is not demoted: the words of the query
+    /// the street lacks are all of its name, and it stands at the hit ("227
+    /// Walmer Road Parkette" is the park at 227 Walmer Road). One named only
+    /// by the street's own words confirms nothing ("Walmer Road Parkette"
+    /// for "Walmer Road").
+    fn demoted<'a>(
+        &self,
+        hits: impl Iterator<Item = &'a TextSearchHit> + Clone,
+        ranking: &Ranking,
+    ) -> Result<Vec<bool>> {
+        let anchors = hits
+            .clone()
+            .filter(|hit| {
+                [Layer::Address, Layer::Interpolation, Layer::Street]
+                    .iter()
+                    .any(|layer| hit.record.layer == layer.as_str())
+            })
+            .map(|hit| (hit, self.unaccounted(hit, ranking)))
+            .filter(|(_, unaccounted)| ranking.numbered || unaccounted.is_empty())
+            .collect::<Vec<_>>();
+        let mut demoted = Vec::new();
+        for hit in hits {
+            if anchors.is_empty() || hit.record.layer != Layer::Poi.as_str() {
+                demoted.push(false);
+                continue;
+            }
+            let names = self
+                .pack
+                .records()
+                .names(hit.record_id)?
+                .iter()
+                .filter_map(|name| search_key(name))
+                .flat_map(|name| {
+                    name.split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<HashSet<_>>();
+            let mut confirms = false;
+            for (anchor, unaccounted) in &anchors {
+                if !unaccounted.is_empty()
+                    && unaccounted.iter().all(|word| names.contains(*word))
+                    && self.stands_at(hit, anchor)?
+                {
+                    confirms = true;
+                    break;
+                }
+            }
+            demoted.push(!confirms);
+        }
+        Ok(demoted)
+    }
+
+    /// The words the query seeks that the street of `hit` lacks: its own
+    /// name for a street, else the street it states.
+    fn unaccounted<'a>(&self, hit: &TextSearchHit, ranking: &'a Ranking) -> Vec<&'a String> {
+        let street = if hit.record.layer == Layer::Street.as_str() {
+            Some(hit.record.name.as_str())
+        } else {
+            hit.record
+                .address
+                .street
+                .as_deref()
+                .or(hit.record.address.place.as_deref())
+        };
+        let words = street
+            .and_then(search_key)
+            .iter()
+            .flat_map(|street| street.split_whitespace())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        ranking
+            .sought
+            .iter()
+            .filter(|word| {
+                !words.iter().any(|street| {
+                    *street == word.text
+                        || word.corrected.as_ref() == Some(street)
+                        || ranking.edits.reaches(&word.text, street)
+                })
+            })
+            .map(|word| &word.text)
+            .collect()
+    }
+
+    /// Whether the POI `poi` stands at the address, range or street
+    /// `anchor`: it states the same street and number, or lies on that
+    /// street, or within [`AT_ADDRESS_RADIUS_M`] of the address.
+    fn stands_at(&self, poi: &TextSearchHit, anchor: &TextSearchHit) -> Result<bool> {
+        let street = |hit: &TextSearchHit| {
+            if hit.record.layer == Layer::Street.as_str() {
+                street_search_text(&hit.record.name)
+            } else {
+                hit.record
+                    .address
+                    .street
+                    .as_deref()
+                    .or(hit.record.address.place.as_deref())
+                    .and_then(street_search_text)
+            }
+        };
+        let number = |hit: &TextSearchHit| {
+            hit.record
+                .address
+                .housenumber
+                .as_deref()
+                .and_then(search_key)
+        };
+        let anchor_street = street(anchor);
+        if anchor_street.is_some()
+            && street(poi) == anchor_street
+            && (number(anchor).is_none() || number(poi) == number(anchor))
+        {
+            return Ok(true);
+        }
+        let (Some(at), Some(from)) = (poi.record.point, anchor.record.point) else {
+            return Ok(false);
+        };
+        match anchor_street {
+            Some(name) if anchor.record.layer == Layer::Street.as_str() => {
+                self.on_named_street([at.lon, at.lat], &name)
+            }
+            _ => Ok(haversine_m(at.lon, at.lat, from.lon, from.lat) <= AT_ADDRESS_RADIUS_M),
+        }
     }
 
     /// The country the records of a document lie in.
@@ -2832,8 +2992,9 @@ fn choose_reading<T>(
 /// query matches the same (tantivy#563), so no one query lets the spelling
 /// as written outrank a typo: a tier runs only when the ones before it kept
 /// nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Edits {
+    #[default]
     None,
     One,
     Two,
@@ -2977,6 +3138,12 @@ struct Ranking {
     postcode: QueryPostcode,
     /// Where the caller is, `[lon, lat]`.
     focus: Option<[f64; 2]>,
+    /// The words of what the query seeks, its subject and unplaced words,
+    /// and the typo tier they were matched in: what an address or street
+    /// must account for to rank above a POI (see
+    /// [`TextSearcher::demoted`]). Empty leaves POIs where they rank.
+    sought: Vec<Word>,
+    edits: Edits,
 }
 
 /// Hits whose own postcode contradicts the one their query names, kept
@@ -4343,6 +4510,99 @@ mod tests {
         assert_eq!(top("Walmer Road"), "osm:node:3");
         assert_eq!(top("Walmer Road Parkette"), "osm:node:4");
         assert_eq!(top("Fire Station, Muskoka Lakes Township"), "osm:node:2");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The `ontario-poi` cases on a Pack of one street: a POI named after
+    /// the street, a shop at one of its addresses and a park off it.
+    #[test]
+    fn addresses_rank_above_pois_unless_a_poi_confirms_the_address() {
+        let temp_dir = temp_pack_path("search-addresses-beat-pois");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut street = street_record("osm:way:1", "Walmer Road");
+        street.geometry = queen_street_line();
+        writer.write(&street.into(), None).expect("street");
+        writer
+            .write(
+                &address_record("osm:node:4", "", "4", "Walmer Road", Some("Toronto"), None).into(),
+                None,
+            )
+            .expect("address");
+        let poi = |object_id, name: &str, number: Option<&str>, lon: f64| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "shop:convenience".to_string(),
+            address: number.map(|number| {
+                address_record(
+                    "osm:node:0",
+                    "",
+                    number,
+                    "Walmer Road",
+                    Some("Toronto"),
+                    None,
+                )
+                .address
+            }),
+            geometry: point_geometry(lon, 43.0005),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+        };
+        for record in [
+            poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
+            poi(11, "Corner Store", Some("4"), -79.0),
+            poi(12, "Walmer Road Bakery", None, -79.3),
+        ] {
+            writer.write(&record.into(), None).expect("poi");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let layers = |query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| (hit.record.id, hit.record.layer))
+                .collect::<Vec<_>>()
+        };
+        let first_poi = |hits: &[(String, String)]| {
+            hits.iter()
+                .position(|(_, layer)| layer == "poi")
+                .unwrap_or(hits.len())
+        };
+        let last_address = |hits: &[(String, String)]| {
+            hits.iter()
+                .rposition(|(_, layer)| layer != "poi")
+                .expect("an address or street")
+        };
+
+        // The query names a street the Pack has: every POI follows it.
+        let street = layers("Walmer Road");
+        assert!(last_address(&street) < first_poi(&street), "{street:?}");
+        // A house number: the shop at number 4 follows the address.
+        let numbered = layers("4 Walmer Road");
+        assert_eq!(numbered[0].0, "osm:node:4", "{numbered:?}");
+        assert!(
+            last_address(&numbered) < first_poi(&numbered),
+            "{numbered:?}"
+        );
+        // The shop's own name confirms the address it stands at.
+        let confirmed = layers("Corner Store 4 Walmer Road");
+        assert!(
+            confirmed.iter().take(2).any(|(id, _)| id == "osm:node:11"),
+            "{confirmed:?}"
+        );
+        // A number only a POI states is the POI.
+        assert_eq!(layers("6 Walmer Road")[0].0, "osm:node:10");
+        // Name-only POI queries rank as they did: the street lacks a word.
+        assert_eq!(layers("Walmer Road Bakery")[0].0, "osm:node:12");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
