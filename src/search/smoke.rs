@@ -970,3 +970,129 @@ mod reading_choice {
         assert!(!evidence(Pass::Street, 1.0).outweighs(evidence(Pass::Street, 1.0)));
     }
 }
+
+/// A street word met only in where a record is does not answer for it.
+mod stand_in {
+    use super::*;
+
+    fn write_pack(name: &str, eden_road: bool) -> (std::path::PathBuf, TextSearcher) {
+        let temp_dir = temp_pack_path(name);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mount_eden = locality(&mut writer, "Mount Eden", 100, [174.76, -36.88]);
+        let terrace = locality(&mut writer, "Eden Terrace", 101, [174.75, -36.87]);
+        writer.set_context_names(
+            [
+                (mount_eden, vec!["Mount Eden".to_string()]),
+                (terrace, vec!["Eden Terrace".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        writer
+            .write(
+                &street("osm:way:1", "Valley Road", [174.76, -36.88]).into(),
+                in_locality(mount_eden),
+            )
+            .expect("valley road");
+        let mut valley = address_record("osm:node:2", "", "4", "Valley Road", None, None);
+        valley.geometry = point_geometry(174.761, -36.881);
+        writer
+            .write(&valley.into(), in_locality(mount_eden))
+            .expect("valley address");
+        if eden_road {
+            writer
+                .write(
+                    &street("osm:way:3", "Eden Road", [174.77, -36.89]).into(),
+                    in_locality(mount_eden),
+                )
+                .expect("eden road");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        (temp_dir, searcher)
+    }
+
+    #[test]
+    fn a_street_word_is_not_absorbed_by_the_area_the_query_states() {
+        for eden_road in [false, true] {
+            let (temp_dir, searcher) =
+                write_pack(&format!("smoke-stand-in-eden-{eden_road}"), eden_road);
+            let answer = eden_road.then(|| "osm:way:3".to_string());
+            for query in ["10 Eden Road Mount Eden", "10 Eden Road, Mount Eden"] {
+                assert_eq!(
+                    search_ids(&searcher, query).first(),
+                    answer.as_ref(),
+                    "{}",
+                    explain(&searcher, query)
+                );
+                assert_eq!(geocode_row(&searcher, query, None, None, None), answer);
+                // No reading, however it splits street from area, lets
+                // the area answer for "eden".
+                for (reading, ids) in hits_of_readings(&searcher, query, |_| true) {
+                    assert!(
+                        !ids.iter().any(|id| id == "osm:way:1" || id == "osm:node:2"),
+                        "{reading}: {ids:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                geocode_row(&searcher, "10 Eden Road", Some("Mount Eden"), None, None),
+                answer
+            );
+            let _ = std::fs::remove_dir_all(temp_dir);
+        }
+    }
+
+    #[test]
+    fn a_word_the_query_states_no_area_for_still_names_one() {
+        use crate::record::{LocationPrecision, ObjectType, PoiRecord, SourceProvenance};
+
+        let temp_dir = temp_pack_path("smoke-stand-in-riverdale");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let toronto = locality(&mut writer, "Toronto", 100, [-79.36, 43.67]);
+        writer.set_context_names(
+            [(toronto, vec!["Toronto".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        for (object_id, name) in [(1, "Riverdale Farm"), (2, "Riverdale Park")] {
+            let poi = PoiRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                category: "tourism:attraction".to_string(),
+                address: None,
+                geometry: point_geometry(-79.36, 43.67),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, object_id),
+            };
+            writer
+                .write(&poi.into(), in_locality(toronto))
+                .expect("poi");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let query = "Riverdale Farm Toronto";
+        assert_eq!(
+            search_ids(&searcher, query).first().map(String::as_str),
+            Some("osm:node:1"),
+            "{}",
+            explain(&searcher, query)
+        );
+        // Read with every word what the record is, "toronto" can only be
+        // found in where it is.
+        let readings = hits_of_readings(&searcher, query, |piece| {
+            piece.token == "toronto" && piece.label != Label::Locality
+        });
+        assert!(!readings.is_empty(), "{}", explain(&searcher, query));
+        for (reading, ids) in readings {
+            assert_eq!(
+                ids.first().map(String::as_str),
+                Some("osm:node:1"),
+                "{reading}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}
