@@ -34,11 +34,11 @@ use crate::{
         Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord,
     },
     spatial_index::haversine_m,
-    util::text::collapse_whitespace,
+    util::{fold::search_key, text::collapse_whitespace},
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 10;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
 /// Postcode data within this radius describes where a record is: a record
 /// that states no postcode is ranked by the nearest postcode centroid within
 /// it, and the batch check compares the postcode areas within it.
@@ -843,7 +843,7 @@ impl ProjectionBuilder {
     fn postcode(&mut self, value: &str) {
         self.projected.postcode = collapse_whitespace(value);
         self.add_content_text(value);
-        if let Some(normalized) = normalize_index_text(value) {
+        if let Some(normalized) = search_key(value) {
             for form in postcode_forms(&normalized) {
                 self.content_parts.push(form.clone());
                 self.autocomplete_subject_parts.push(form);
@@ -873,7 +873,7 @@ impl ProjectionBuilder {
     /// The postcode an address states: where it is, and a prefix to complete.
     fn add_optional_postcode_text(&mut self, value: Option<&str>) -> Option<String> {
         let cleaned = self.add_optional_postcode_for_search(value)?;
-        if let Some(normalized) = normalize_index_text(&cleaned) {
+        if let Some(normalized) = search_key(&cleaned) {
             self.autocomplete_subject_parts
                 .extend(postcode_forms(&normalized));
         }
@@ -882,7 +882,7 @@ impl ProjectionBuilder {
 
     fn add_optional_postcode_for_search(&mut self, value: Option<&str>) -> Option<String> {
         let cleaned = value.and_then(collapse_whitespace)?;
-        if let Some(normalized) = normalize_index_text(&cleaned) {
+        if let Some(normalized) = search_key(&cleaned) {
             self.context_parts.extend(postcode_forms(&normalized));
         }
         Some(cleaned)
@@ -895,7 +895,7 @@ impl ProjectionBuilder {
     }
 
     fn add_autocomplete_subject_text(&mut self, value: &str) {
-        if let Some(normalized) = normalize_index_text(value) {
+        if let Some(normalized) = search_key(value) {
             self.autocomplete_subject_parts.push(normalized);
         }
     }
@@ -945,30 +945,8 @@ fn add_normalized_text_if_present(
     field: Field,
     value: Option<&str>,
 ) {
-    if let Some(value) = value.and_then(normalize_index_text) {
+    if let Some(value) = value.and_then(search_key) {
         document.add_text(field, value);
-    }
-}
-
-pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
-    let mut normalized = String::with_capacity(value.len());
-    let mut previous_was_space = true;
-    for character in value.chars() {
-        if character.is_alphanumeric() {
-            for folded in character.to_lowercase() {
-                normalized.push(folded);
-            }
-            previous_was_space = false;
-        } else if !previous_was_space {
-            normalized.push(' ');
-            previous_was_space = true;
-        }
-    }
-    let normalized = normalized.trim().to_string();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
     }
 }
 
@@ -1110,18 +1088,18 @@ pub(crate) fn is_numeric_token(token: &str) -> bool {
 /// The terms a house number is indexed under: each value of a list ("12;14")
 /// is a number of its own, normalized ("407A" is "407a").
 pub(crate) fn address_number_terms(number: &str) -> impl Iterator<Item = String> + '_ {
-    number.split(';').filter_map(normalize_index_text)
+    number.split(';').filter_map(search_key)
 }
 
 /// The term a flat is also found under: its unit and number as a slash
 /// number writes them, "10 1367" for unit 10 of 1367 ("10/1367"). Only a unit
 /// of one word: "Flat 4" is written before no number.
 pub(crate) fn flat_number_term(number: &str, unit: Option<&str>) -> Option<String> {
-    let unit = normalize_index_text(unit?)?;
+    let unit = search_key(unit?)?;
     if unit.contains(' ') {
         return None;
     }
-    Some(format!("{unit} {}", normalize_index_text(number)?))
+    Some(format!("{unit} {}", search_key(number)?))
 }
 
 /// The digits a house number starts with: 407 of "407A", "407 1/2" and
@@ -1136,7 +1114,7 @@ pub(crate) fn base_house_number(number: &str) -> Option<u32> {
 
 /// A postcode normalized without spaces: "M5V 1A1" is "m5v1a1".
 pub(crate) fn compact_postcode(value: &str) -> Option<String> {
-    normalize_index_text(value.trim()).map(|value| value.split_whitespace().collect())
+    search_key(value.trim()).map(|value| value.split_whitespace().collect())
 }
 
 /// Postcode centroids, so a record that states no postcode can be ranked by
@@ -1197,12 +1175,12 @@ fn unit_vector(lon: f64, lat: f64) -> [f64; 3] {
 /// Text as the searchable fields index it: normalized, with address
 /// abbreviations expanded.
 fn search_text(value: &str) -> Option<String> {
-    normalize_index_text(value).map(|text| expand_address_abbreviations(&text))
+    search_key(value).map(|text| expand_address_abbreviations(&text))
 }
 
 /// Normalized words of `value`, each once, in order of first use.
 fn unique_words(value: &str) -> Option<String> {
-    let normalized = normalize_index_text(value)?;
+    let normalized = search_key(value)?;
     let mut seen = BTreeSet::new();
     Some(
         normalized

@@ -1,7 +1,7 @@
 //! The parser's dictionaries, written into the Pack at build time.
 //!
 //! Each field is one FST section, `parse/<field>`, mapping a name's
-//! [`dictionary_key`] (the `normalize_index_text` the search path uses,
+//! [`dictionary_key`] (the `search_key` the search path uses,
 //! glued as a query's units are) to how often the Pack uses it and the
 //! country it is used in most. Every name a record has counts: its `name`
 //! and its alternate names (`name:ja-Hira`, `name:en`, `alt_name`, ...). Street, locality, region

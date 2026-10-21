@@ -14,7 +14,7 @@ use std::{
     sync::OnceLock,
 };
 
-use crate::text_index::normalize_index_text;
+use crate::util::fold::search_key;
 
 const STREET_TYPES: &str = include_str!("data/street_types.txt");
 const DIRECTIONALS: &str = include_str!("data/directionals.txt");
@@ -191,7 +191,7 @@ fn phrases(list: &str) -> Vec<(&str, Vec<String>)> {
         }
         let forms = line
             .split('|')
-            .filter_map(normalize_index_text)
+            .filter_map(search_key)
             .filter(|form| !form.contains(' '))
             .collect::<Vec<_>>();
         if !forms.is_empty() {
@@ -211,7 +211,7 @@ mod tests {
         assert!(
             table
                 .spellings("hermann vom endt str")
-                .contains(&"hermann vom endt straße".to_string())
+                .contains(&"hermann vom endt strasse".to_string())
         );
         assert!(
             table
@@ -226,7 +226,7 @@ mod tests {
     fn a_glued_street_type_is_read_in_its_other_forms() {
         let table = abbreviations();
         let unglued = table.unglued("hauptstr");
-        assert!(unglued.contains(&"hauptstraße".to_string()), "{unglued:?}");
+        assert!(unglued.contains(&"hauptstrasse".to_string()), "{unglued:?}");
         assert!(table.unglued("str").is_empty());
     }
 
@@ -235,16 +235,19 @@ mod tests {
         let table = abbreviations();
         let spellings = table.spellings("lechwehr strasse");
         assert!(
-            spellings.contains(&"lechwehrstraße".to_string()),
+            spellings.contains(&"lechwehrstrasse".to_string()),
             "{spellings:?}"
         );
-        assert_eq!(table.split_glued("hauptstraße"), Some(("haupt", "straße")));
+        assert_eq!(
+            table.split_glued("hauptstrasse"),
+            Some(("haupt", "strasse"))
+        );
     }
 
     #[test]
     fn full_forms_have_their_abbreviations() {
         let table = abbreviations();
-        assert!(table.short_forms("straße").contains(&"str".to_string()));
+        assert!(table.short_forms("strasse").contains(&"str".to_string()));
         assert!(table.short_forms("toronto").is_empty());
     }
 }

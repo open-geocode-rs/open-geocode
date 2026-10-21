@@ -259,8 +259,7 @@ impl PendingAddress {
         );
         let base = crate::text_index::base_house_number(&address.number).unwrap_or(u32::MAX);
         order.extend_from_slice(&base.to_be_bytes());
-        let normalized =
-            |value: Option<&str>| value.and_then(crate::text_index::normalize_index_text);
+        let normalized = |value: Option<&str>| value.and_then(crate::util::fold::search_key);
         put_order_text(&mut order, normalized(Some(&address.number)).as_deref());
         put_order_text(&mut order, normalized(address.unit.as_deref()).as_deref());
         let group_len = order.len();

@@ -24,8 +24,9 @@ use crate::{
     parse::types::{Label, Tagged, Tagger},
     text_index::{
         base_house_number, direction_word, expand_address_abbreviations, expand_final_direction,
-        is_street_type, normalize_index_text,
+        is_street_type,
     },
+    util::fold::search_key,
 };
 
 /// The old comma-based query parser as a tagger.
@@ -34,7 +35,7 @@ pub struct LegacyTagger;
 
 impl Tagger for LegacyTagger {
     fn tag(&self, query: &str) -> Vec<Tagged> {
-        let tokens = normalize_index_text(query)
+        let tokens = search_key(query)
             .map(|text| text.split(' ').map(str::to_string).collect::<Vec<_>>())
             .unwrap_or_default();
         let labels = legacy_labels(query)
@@ -53,7 +54,7 @@ impl Tagger for LegacyTagger {
 fn legacy_labels(query: &str) -> Option<Vec<Label>> {
     let normalized_parts = query
         .split(',')
-        .filter_map(normalize_index_text)
+        .filter_map(search_key)
         .map(|part| part.split(' ').count())
         .collect::<Vec<_>>();
     // The variant the search tries first: normalized, abbreviations expanded
@@ -335,7 +336,7 @@ fn expand_query(query: &str) -> Option<String> {
         .split(',')
         .filter_map(|part| {
             let (number, rest) = join_fractional_house_number(part);
-            let rest = normalize_index_text(rest).map(|rest| expand_address_abbreviations(&rest));
+            let rest = search_key(rest).map(|rest| expand_address_abbreviations(&rest));
             match (number, rest) {
                 (Some(number), Some(rest)) => Some(format!("{number} {rest}")),
                 (number, rest) => number.or(rest),
