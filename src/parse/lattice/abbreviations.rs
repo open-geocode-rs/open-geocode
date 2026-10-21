@@ -125,6 +125,12 @@ impl Abbreviations {
         spellings
     }
 
+    /// The full forms a variant abbreviates, in any language, none when it
+    /// is no variant ("tce" is "terrace", "pl" "place", "platz" and more).
+    pub(super) fn full_forms(&self, word: &str) -> &[String] {
+        self.full.get(word).map_or(&[], Vec::as_slice)
+    }
+
     /// The variants a full form is abbreviated to, none when it has none.
     pub(super) fn short_forms(&self, word: &str) -> &[String] {
         self.short.get(word).map_or(&[], Vec::as_slice)
@@ -249,5 +255,8 @@ mod tests {
         let table = abbreviations();
         assert!(table.short_forms("strasse").contains(&"str".to_string()));
         assert!(table.short_forms("toronto").is_empty());
+        assert_eq!(table.full_forms("tce"), ["terrace"]);
+        assert!(table.full_forms("pl").contains(&"place".to_string()));
+        assert!(table.full_forms("terrace").is_empty());
     }
 }

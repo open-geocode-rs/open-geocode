@@ -624,6 +624,14 @@ pub(crate) fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuild
     BUILDERS[usize::from(edits - 1)].get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true))
 }
 
+/// The words a street-type or direction abbreviation stands for in any
+/// language libpostal lists, none when `word` is no abbreviation. A query
+/// word is searched in each of them besides itself, so a list too
+/// ambiguous to expand the indexed text by still finds the record.
+pub(crate) fn full_forms(word: &str) -> &'static [String] {
+    abbreviations::abbreviations().full_forms(word)
+}
+
 impl fmt::Debug for LatticeTagger {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

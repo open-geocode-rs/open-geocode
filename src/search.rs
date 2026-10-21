@@ -27,7 +27,7 @@ use crate::{
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
-        lattice::{CountryCode, LatticeTagger, Tokens, automaton_builder},
+        lattice::{self, CountryCode, LatticeTagger, Tokens, automaton_builder},
         types::{Label, Tagged},
     },
     record::{
@@ -40,9 +40,9 @@ use crate::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
         INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD, MIN_LAT_FIELD, MIN_LON_FIELD,
         NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
-        RECORD_COUNT_FIELD, address_number_terms, base_house_number, compact_postcode,
-        expand_address_abbreviations, expand_final_direction, flat_number_term, is_numeric_token,
-        open_text_index, street_search_text,
+        RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS, address_number_terms, base_house_number,
+        compact_postcode, expand_address_abbreviations, expand_final_direction, flat_number_term,
+        is_numeric_token, open_text_index, street_search_text,
     },
     util::fold::{exact_key, search_key},
 };
@@ -619,12 +619,21 @@ impl TextSearcher {
     ) -> Vec<(Occur, Box<dyn Query>)> {
         let mut clauses = Vec::new();
         let spellings = &plan.spellings;
-        let what = |word: &str| {
+        let as_written = |word: &str| {
             if plan.house_number.is_some() {
                 self.street_word_query(word, spellings)
             } else {
                 self.word_query(word, spellings)
             }
+        };
+        let what = |word: &str| -> Box<dyn Query> {
+            let forms = plan.full_forms(word);
+            if forms.is_empty() {
+                return as_written(word);
+            }
+            Box::new(DisjunctionMaxQuery::new(
+                std::iter::once(word).chain(forms).map(as_written).collect(),
+            ))
         };
         // A query the parser found no places in may still name one
         // ("Riverdale Farm Toronto" when the Pack does not know Toronto), so
@@ -2060,6 +2069,7 @@ impl TextSearcher {
                 !words.iter().any(|street| {
                     *street == word.text
                         || word.corrected.as_ref() == Some(street)
+                        || lattice::full_forms(&word.text).contains(street)
                         || ranking.edits.reaches(&word.text, street)
                 })
             })
@@ -3802,6 +3812,35 @@ impl QueryPlan {
             return None;
         }
         Some(plan)
+    }
+
+    /// The words a street-type or direction abbreviation of the plan stands
+    /// for, searched besides it: "tce" is "terrace" ("46 Highfield Tce" is a
+    /// terrace before a "Highfield Way"). Libpostal's lists, every language
+    /// alike: too ambiguous to rewrite the indexed text by ("pl" is "place"
+    /// and "platz"), so the query asks for each. None for a word the text
+    /// index expands, which it leaves as written on purpose ("St" before a
+    /// name is "Saint"), or for a form the plan already seeks: "st" of "12
+    /// St George Street" must not count the "street" again.
+    fn full_forms(&self, word: &str) -> Vec<&'static str> {
+        if STREET_TYPE_ABBREVIATIONS
+            .iter()
+            .any(|(abbreviation, _)| *abbreviation == word)
+        {
+            return Vec::new();
+        }
+        lattice::full_forms(word)
+            .iter()
+            .map(String::as_str)
+            .filter(|form| {
+                !self
+                    .subject
+                    .iter()
+                    .map(|word| &word.text)
+                    .chain(self.unplaced.iter().map(|word| &word.text))
+                    .any(|sought| sought == form)
+            })
+            .collect()
     }
 
     /// The words and context parts of the plan that are searched in where a
@@ -5586,6 +5625,37 @@ mod tests {
                 .first()
                 .map(String::as_str),
             Some("osm:node:1")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn an_abbreviated_street_type_ranks_the_street_of_that_type_first() {
+        let temp_dir = temp_pack_path("search-street-type-abbreviation");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, street) in [
+            ("osm:node:1", "Highfield Way"),
+            ("osm:node:2", "Highfield Terrace"),
+            ("osm:node:3", "Highfield Road"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", "46", street, None, None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // Libpostal's lists hold "tce", which the text index keeps as
+        // written.
+        assert_eq!(
+            top_ids(&searcher, "46 Highfield Tce")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:2")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
