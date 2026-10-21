@@ -31,14 +31,15 @@ pub enum BuildStage {
     NodeJoin,
     /// Turn ways into records. Measured in ways.
     AssembleWays,
-    /// Build the admin boundary polygons and postcode centroids. No measure.
+    /// Build the admin boundary polygons. No measure.
     Boundaries,
     /// Read address files from outside OSM, such as OpenAddresses, fetching
     /// them first when the source downloads. Measured in bytes of the files.
     ImportAddresses,
-    /// Write places, postcodes and boundaries. Measured in records.
+    /// Write places and boundaries. Measured in records.
     ContextRecords,
-    /// Write addresses, POIs, interpolations and streets. Measured in records.
+    /// Write addresses, POIs, interpolations, streets and postcodes. Measured
+    /// in records.
     Records,
     /// Finish the text and spatial indexes and write the Pack file. No
     /// measure.

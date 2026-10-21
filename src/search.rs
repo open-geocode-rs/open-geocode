@@ -34,10 +34,11 @@ use crate::{
     },
     spatial_index::{self, haversine_m},
     text_index::{
-        Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
-        RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms, base_house_number,
-        compact_postcode, expand_address_abbreviations, expand_final_direction, flat_number_term,
-        is_numeric_token, normalize_index_text, open_text_index, street_search_text,
+        AREA_POSTCODE_FIELD, Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD,
+        POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms,
+        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
+        flat_number_term, is_numeric_token, normalize_index_text, open_text_index,
+        street_search_text,
     },
 };
 
@@ -68,6 +69,7 @@ struct SegmentColumns {
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     rank_postcode: Option<StrColumn>,
+    area_postcode: Option<StrColumn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +204,7 @@ impl TextSearcher {
                     house_number: fast_fields.u64(HOUSE_NUMBER_FIELD)?,
                     interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
+                    area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
                 },
             );
         }
@@ -226,20 +229,13 @@ impl TextSearcher {
             return Err(Error::EmptyQuery);
         }
 
-        // A hit that contradicts a postcode the query states is not an answer
-        // to it, so it does not end the pass loop. Without this a stated house
-        // number in the wrong postcode wins the strict pass and returns alone,
-        // and the later passes that would have found the right street never
-        // run: "8 High Street, Deloraine TAS 7304" answered with the 7018 High
-        // Street, 163 km away. Only a stated postcode can reject, so queries
-        // that name none are unaffected.
         let (_, hits) = self.search_variants(
             query_text,
             &[],
             Filters::new(options.layer.as_deref(), &options.countries),
             limit,
             Parses::All,
-            |_, postcode, hit| self.hit_in_postcode(hit, postcode),
+            |_, _, _| Ok(true),
         )?;
         Ok(hits)
     }
@@ -289,6 +285,10 @@ impl TextSearcher {
             // street. Search lists such hits; a geocoded row would give one.
             Parses::Numbered,
             |plan, postcode, hit| {
+                // A geocoded row names its postcode as a field, so a hit
+                // outside it is no answer to the row, where in search it only
+                // ranks down.
+                //
                 // A street stands in for a house number it lacks, as in search;
                 // its `accuracy` says so. Refused, the query fell through to
                 // parses that matched another street ("10 Eruera Street" to
@@ -690,7 +690,13 @@ impl TextSearcher {
     /// The next labelling is searched only when every pass of the one before
     /// found nothing, so a reading that drops what the best one requires
     /// never outranks it.
-    /// Fails when the query has no words to search.
+    ///
+    /// A hit whose own postcode contradicts the one the query names is kept,
+    /// after the hits that do not, but it does not end the search: a stated
+    /// house number in the wrong postcode would win the strict pass alone,
+    /// and the later passes that find the right street would never run ("8
+    /// High Street, Deloraine TAS 7304" answered with the 7018 High Street,
+    /// 163 km away). Fails when the query has no words to search.
     fn search_variants(
         &self,
         query_text: &str,
@@ -728,6 +734,7 @@ impl TextSearcher {
             .map(str::to_string)
             .chain(context.iter().flat_map(|part| part.words.iter().cloned()))
             .collect();
+        let mut contradicting = Contradicting::default();
         for plan in plans {
             let text = plan.text();
             let base = plan.with_base_house_number();
@@ -737,21 +744,25 @@ impl TextSearcher {
                     if !pass.searches_anew(plan) {
                         continue;
                     }
-                    let hits =
+                    let (hits, contradicted) =
                         self.search_plan(plan, pass, &query_words, filters, limit, &mut accept)?;
+                    contradicting.keep(&text, contradicted);
                     if !hits.is_empty() {
-                        return Ok((text, hits));
+                        return Ok((text, contradicting.after(hits, limit)));
                     }
                 }
             }
         }
-        Ok((first_query, Vec::new()))
+        Ok(contradicting
+            .alone(limit)
+            .unwrap_or((first_query, Vec::new())))
     }
 
     /// The hits of one pass over one plan that `accept` keeps, at most
-    /// `limit`. A pass that does not require the plan's localities still
-    /// leaves out a hit that lies in other ones: "Ponsonby Road
-    /// Christchurch" is not answered in Auckland.
+    /// `limit`, and apart from them the kept hits whose own postcode
+    /// contradicts the one the plan names. A pass that does not require the
+    /// plan's localities still leaves out a hit that lies in other ones:
+    /// "Ponsonby Road Christchurch" is not answered in Auckland.
     fn search_plan(
         &self,
         plan: &QueryPlan,
@@ -760,7 +771,7 @@ impl TextSearcher {
         filters: Filters<'_>,
         limit: usize,
         accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
-    ) -> Result<Vec<TextSearchHit>> {
+    ) -> Result<(Vec<TextSearchHit>, Vec<TextSearchHit>)> {
         let ranking = Ranking {
             query_words: query_words.clone(),
             house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
@@ -795,7 +806,7 @@ impl TextSearcher {
             Ok(self.area_agreement(hit, &stated)? != Some(false)
                 && accept(plan, &ranking.postcode, hit)?)
         };
-        let mut hits = Vec::new();
+        let mut candidates = Vec::new();
         if pass == Pass::Street
             && filters
                 .layer
@@ -805,12 +816,21 @@ impl TextSearcher {
             && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking, &known)?
             && keep(&estimate)?
         {
-            hits.push(estimate);
+            candidates.push(estimate);
         }
         let query = self.build_query(plan, pass, filters, &known);
-        hits.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
+        candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
+        let (mut hits, mut contradicted) = (Vec::new(), Vec::new());
+        for hit in candidates {
+            if self.postcode_agreement(&hit, &ranking.postcode)? == Some(false) {
+                contradicted.push(hit);
+            } else {
+                hits.push(hit);
+            }
+        }
         hits.truncate(limit);
-        Ok(hits)
+        contradicted.truncate(limit);
+        Ok((hits, contradicted))
     }
 
     /// Whether a hit lies in the areas `stated` names, `None` when nothing
@@ -903,17 +923,13 @@ impl TextSearcher {
         Ok(areas)
     }
 
-    /// Whether a hit can be in the postcode the query names. A hit that
-    /// states a postcode must agree with it; either may be a prefix of the
-    /// other, so "M5V" matches "M5V 1A1". A hit without one is judged by the
-    /// postcode records around it.
-    fn hit_in_postcode(&self, hit: &TextSearchHit, postcode: &QueryPostcode) -> Result<bool> {
-        Ok(self.postcode_agreement(hit, postcode)?.unwrap_or(true))
-    }
-
-    /// Whether a hit is in the postcode the query names, `None` when nothing
-    /// says either way: the query names none, or the hit states none and no
-    /// postcode data lies around it.
+    /// Whether a hit is in the postcode the query names: confirmed when the
+    /// postcodes it is in by its own data (the one it states, else its
+    /// street's) hold it, contradicted when they do not, and else judged by
+    /// the postcode records around it. Either of two postcodes may be a
+    /// prefix of the other, so "M5V" matches "M5V 1A1". `None` when nothing
+    /// says either way: the query names none, or the hit has no postcode of
+    /// its own and no postcode data lies around it.
     fn postcode_agreement(
         &self,
         hit: &TextSearchHit,
@@ -922,13 +938,15 @@ impl TextSearcher {
         if postcode.forms.is_empty() {
             return Ok(None);
         }
-        if let Some(stated) = self.pack.records().postcode(hit.record_id)? {
-            return Ok(compact_postcode(&stated).map(|stated| {
-                postcode
-                    .forms
-                    .iter()
-                    .any(|form| stated.starts_with(form.as_str()) || form.starts_with(&stated))
-            }));
+        let own = self
+            .pack
+            .records()
+            .postcodes(hit.record_id)?
+            .iter()
+            .filter_map(|own| compact_postcode(own))
+            .collect::<Vec<_>>();
+        if !own.is_empty() {
+            return Ok(Some(own.iter().any(|own| postcode.holds(own))));
         }
         let Some(point) = hit.record.point else {
             return Ok(None);
@@ -1356,16 +1374,25 @@ impl TextSearcher {
         let mut higher = Vec::new();
         for (_, doc) in docs {
             let columns = self.segment_columns(&searcher, doc.segment_ord)?;
-            let mut postcode = String::new();
-            let postcode_agreement = match &columns.rank_postcode {
-                Some(column) => match column.term_ords(doc.doc_id).next() {
-                    Some(ord) if column.ord_to_str(ord, &mut postcode)? => {
-                        ranking.postcode.agreement(&postcode)
+            let postcodes = |column: &Option<StrColumn>| -> Result<Vec<String>> {
+                let Some(column) = column else {
+                    return Ok(Vec::new());
+                };
+                let mut postcodes = Vec::new();
+                for ord in column.term_ords(doc.doc_id) {
+                    let mut postcode = String::new();
+                    if column.ord_to_str(ord, &mut postcode)? {
+                        postcodes.push(postcode);
                     }
-                    _ => 0,
-                },
-                None => 0,
+                }
+                Ok(postcodes)
             };
+            let postcode_agreement = ranking.postcode.rank_of(
+                &postcodes(&columns.rank_postcode)?,
+                postcodes(&columns.area_postcode)?
+                    .first()
+                    .map(String::as_str),
+            );
             let mut consider = |record_id: RecordId, stated: &str| {
                 if let Some(base) = base_house_number(stated) {
                     let side = if base <= number {
@@ -1572,6 +1599,7 @@ struct Neighbour {
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 struct RankKey {
     house_level: bool,
+    /// See [`QueryPostcode::rank`].
     postcode_agreement: u8,
     stated: bool,
     text_score: Score,
@@ -1602,45 +1630,107 @@ struct SegmentRankKeys {
     numbered: bool,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
-    postcode: Option<(StrColumn, Vec<Vec<Range<u64>>>)>,
+    postcode: Option<SegmentPostcodes>,
+}
+
+/// What a segment knows of each record's postcodes, read against the
+/// postcode a query names.
+struct SegmentPostcodes {
+    own: Option<PostcodeColumn>,
+    area: Option<PostcodeColumn>,
     nearness: Option<PostcodeNearness>,
 }
 
-/// Ranks a matched record by its distance from the records of the postcode a
-/// query names, when the record does not have that postcode itself. The first
-/// address of a street group stands for all of it: they share a street, their
-/// areas and the postcode nearest them.
+impl SegmentPostcodes {
+    fn rank(&self, doc: DocId) -> u8 {
+        let own = self
+            .own
+            .as_ref()
+            .and_then(|own| own.read(own.column.term_ords(doc)));
+        let area = self
+            .area
+            .as_ref()
+            .and_then(|area| area.read(area.column.term_ords(doc).take(1)));
+        QueryPostcode::rank(own, area, || {
+            self.nearness
+                .as_ref()
+                .and_then(|nearness| nearness.band(doc))
+        })
+    }
+}
+
+/// A postcode column with, for the postcode a query names, the ordinals of
+/// the postcodes that share each of its prefixes and of the ones it holds.
+struct PostcodeColumn {
+    column: StrColumn,
+    prefixes: Vec<Vec<Range<u64>>>,
+    held: Vec<Range<u64>>,
+}
+
+impl PostcodeColumn {
+    fn new(column: &StrColumn, postcode: &QueryPostcode) -> io::Result<Self> {
+        let prefixes = postcode.ord_ranges(column)?;
+        let mut held = prefixes
+            .iter()
+            .filter_map(|form| form.last().cloned())
+            .collect::<Vec<_>>();
+        // A postcode shorter than the form is held when the form starts with
+        // it: "m5v" holds "m5v1a1".
+        let dictionary = column.dictionary();
+        for form in &postcode.forms {
+            for (index, character) in form.char_indices() {
+                let end = index + character.len_utf8();
+                if end < form.len()
+                    && let Some(ord) = dictionary.term_ord(&form.as_bytes()[..end])?
+                {
+                    held.push(ord..ord + 1);
+                }
+            }
+        }
+        Ok(Self {
+            column: column.clone(),
+            prefixes,
+            held,
+        })
+    }
+
+    /// Whether any of `ords` is held, and the longest prefix of the named
+    /// postcode any of them shares; `None` for no ords.
+    fn read(&self, ords: impl Iterator<Item = u64>) -> Option<(bool, u8)> {
+        ords.map(|ord| {
+            (
+                self.held.iter().any(|held| held.contains(&ord)),
+                QueryPostcode::agreement_of_ord(&self.prefixes, ord),
+            )
+        })
+        .reduce(|(left_held, left), (right_held, right)| (left_held || right_held, left.max(right)))
+    }
+}
+
+/// Ranks a matched record with no postcode of its own by its distance from
+/// the records of the postcode a query names. The first address of a street
+/// group stands for all of it: they share a street, their areas and the
+/// postcode nearest them.
 struct PostcodeNearness {
     record_id: Column<u64>,
     pack: Arc<pack::Reader>,
     postcode: QueryPostcode,
-    /// The agreement of a record whose postcode is the named one in full.
-    full_agreement: u8,
 }
 
 impl PostcodeNearness {
-    fn fit(&self, doc: DocId, agreement: u8) -> u8 {
-        if agreement >= self.full_agreement {
-            return u8::MAX;
-        }
-        // Beyond the last band (a code shared with another country) only
-        // the agreement ranks, as without the postcode's records.
-        let Some(distance) = self
+    /// The first of [`POSTCODE_NEARNESS_BANDS_M`] the record lies within.
+    /// Beyond the last (a code shared with another country) only the
+    /// nearest postcode centroid ranks, as without the postcode's records.
+    fn band(&self, doc: DocId) -> Option<u8> {
+        let distance = self
             .record_id
             .first(doc)
             .and_then(|record_id| self.pack.records().point(record_id).ok())
-            .and_then(|(_, lon, lat)| self.postcode.distance_m(lon, lat))
-            .filter(|distance| {
-                *distance <= POSTCODE_NEARNESS_BANDS_M[POSTCODE_NEARNESS_BANDS_M.len() - 1]
-            })
-        else {
-            return agreement;
-        };
-        let band = POSTCODE_NEARNESS_BANDS_M
+            .and_then(|(_, lon, lat)| self.postcode.distance_m(lon, lat))?;
+        POSTCODE_NEARNESS_BANDS_M
             .iter()
-            .filter(|band| distance > **band)
-            .count();
-        u8::MAX - 1 - band as u8
+            .position(|band| distance <= *band)
+            .map(|band| band as u8)
     }
 }
 
@@ -1651,35 +1741,30 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
         let columns = self.columns.get(&segment.segment_id()).ok_or_else(|| {
             tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
         })?;
-        let postcode = match (
-            &columns.rank_postcode,
-            self.ranking.postcode.forms.is_empty(),
-        ) {
-            (Some(column), false) => {
-                Some((column.clone(), self.ranking.postcode.ord_ranges(column)?))
-            }
-            _ => None,
+        let named = &self.ranking.postcode;
+        let column = |column: &Option<StrColumn>| {
+            column
+                .as_ref()
+                .map(|column| PostcodeColumn::new(column, named))
+                .transpose()
         };
-        let nearness = (!self.ranking.postcode.points.is_empty()).then(|| PostcodeNearness {
-            record_id: columns.record_id.clone(),
-            pack: Arc::clone(self.pack),
-            postcode: self.ranking.postcode.clone(),
-            full_agreement: self
-                .ranking
-                .postcode
-                .forms
-                .iter()
-                .map(|form| form.chars().count())
-                .min()
-                .unwrap_or(0)
-                .min(u8::MAX.into()) as u8,
-        });
+        let postcode = match named.forms.is_empty() {
+            true => None,
+            false => Some(SegmentPostcodes {
+                own: column(&columns.rank_postcode)?,
+                area: column(&columns.area_postcode)?,
+                nearness: (!named.points.is_empty()).then(|| PostcodeNearness {
+                    record_id: columns.record_id.clone(),
+                    pack: Arc::clone(self.pack),
+                    postcode: named.clone(),
+                }),
+            }),
+        };
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             postcode,
-            nearness,
         })
     }
 }
@@ -1693,15 +1778,8 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
             key.house_level = self.interpolation_start.first(doc).is_some();
             key.stated = false;
         }
-        if let Some((column, ranges)) = &self.postcode {
-            key.postcode_agreement = column
-                .term_ords(doc)
-                .map(|ord| QueryPostcode::agreement_of_ord(ranges, ord))
-                .max()
-                .unwrap_or(0);
-        }
-        if let Some(nearness) = &self.nearness {
-            key.postcode_agreement = nearness.fit(doc, key.postcode_agreement);
+        if let Some(postcode) = &self.postcode {
+            key.postcode_agreement = postcode.rank(doc);
         }
         key
     }
@@ -1873,10 +1951,51 @@ struct Ranking {
     postcode: QueryPostcode,
 }
 
-/// The postcode a query names, to rank records by how much of it their own
-/// postcode shares from its start: "M5C 2A1" agrees with "M5C 1B2" on three
-/// characters, with "M4C 1B2" on one. Longer agreement ranks first, whatever
-/// the country's postcode format.
+/// Hits whose own postcode contradicts the one their query names, kept
+/// across passes and readings: they answer a query only after every hit
+/// that does not.
+#[derive(Debug, Default)]
+struct Contradicting {
+    /// The reading that found the first of them.
+    query: Option<String>,
+    hits: Vec<TextSearchHit>,
+}
+
+impl Contradicting {
+    fn keep(&mut self, query: &str, hits: Vec<TextSearchHit>) {
+        for hit in hits {
+            if !self.hits.iter().any(|kept| kept.record.id == hit.record.id) {
+                self.query.get_or_insert_with(|| query.to_string());
+                self.hits.push(hit);
+            }
+        }
+    }
+
+    /// `hits`, then the contradicting hits they do not hold, at most `limit`.
+    fn after(self, mut hits: Vec<TextSearchHit>, limit: usize) -> Vec<TextSearchHit> {
+        for hit in self.hits {
+            if hits.len() >= limit {
+                break;
+            }
+            if !hits.iter().any(|held| held.record.id == hit.record.id) {
+                hits.push(hit);
+            }
+        }
+        hits
+    }
+
+    /// The contradicting hits alone, at most `limit`, with the reading that
+    /// found the first; `None` when there are none.
+    fn alone(mut self, limit: usize) -> Option<(String, Vec<TextSearchHit>)> {
+        self.hits.truncate(limit);
+        Some((self.query?, self.hits))
+    }
+}
+
+/// The postcode a query names, to rank records by whether their own
+/// postcodes hold it, and else by how much of it they share from its start:
+/// "M5C 2A1" agrees with "M5C 1B2" on three characters, with "M4C 1B2" on
+/// one. Longer agreement ranks first, whatever the country's postcode format.
 #[derive(Debug, Clone, Default)]
 struct QueryPostcode {
     /// Compacted forms of the postcode part: all of it, and from its first
@@ -1889,7 +2008,59 @@ struct QueryPostcode {
     points: Vec<[f64; 2]>,
 }
 
+/// How [`QueryPostcode::rank`] ranks a record its own postcodes place in the
+/// named postcode.
+const POSTCODE_HELD: u8 = u8::MAX;
+/// The least [`QueryPostcode::rank`] gives a record with no postcode of its
+/// own: one whose own postcodes contradict the named one ranks below.
+const POSTCODE_UNKNOWN: u8 = 128;
+
 impl QueryPostcode {
+    /// Whether `postcode`, compacted, is in the named one: either starts the
+    /// other.
+    fn holds(&self, postcode: &str) -> bool {
+        self.forms
+            .iter()
+            .any(|form| postcode.starts_with(form.as_str()) || form.starts_with(postcode))
+    }
+
+    /// A record's rank by the named postcode, larger is better. `own` is
+    /// whether the postcodes it is in by its own data hold the named one
+    /// and the longest prefix of it they share, `None` when it has none;
+    /// `area` the same of the postcode centroid nearest it. Its own
+    /// postcodes holding it come first and contradicting it last, by the
+    /// prefix they share: a mismatch ranks down, never out. Between them,
+    /// with none of its own, the nearest centroid holding it, then the
+    /// record's [`band`](PostcodeNearness::band) from the postcode's own
+    /// records, then the prefix the nearest centroid shares.
+    fn rank(
+        own: Option<(bool, u8)>,
+        area: Option<(bool, u8)>,
+        band: impl FnOnce() -> Option<u8>,
+    ) -> u8 {
+        let farthest_band = POSTCODE_HELD - 2 - (POSTCODE_NEARNESS_BANDS_M.len() - 1) as u8;
+        match (own, area) {
+            (Some((true, _)), _) => POSTCODE_HELD,
+            (Some((false, shared)), _) => shared.min(POSTCODE_UNKNOWN - 1),
+            (None, Some((true, _))) => POSTCODE_HELD - 1,
+            (None, area) => match band() {
+                Some(band) => POSTCODE_HELD - 2 - band,
+                None => POSTCODE_UNKNOWN
+                    .saturating_add(area.map_or(0, |(_, shared)| shared))
+                    .min(farthest_band - 1),
+            },
+        }
+    }
+
+    /// [`Self::rank`] of compacted postcodes, without the bands.
+    fn rank_of(&self, own: &[String], area: Option<&str>) -> u8 {
+        let read = |postcode: &str| (self.holds(postcode), self.agreement(postcode));
+        let own = own.iter().map(|postcode| read(postcode)).reduce(
+            |(left_held, left), (right_held, right)| (left_held || right_held, left.max(right)),
+        );
+        Self::rank(own, area.map(read), || None)
+    }
+
     /// How far a point lies from the nearest record of the postcode, when the
     /// Pack has one.
     fn distance_m(&self, lon: f64, lat: f64) -> Option<f64> {
@@ -2434,6 +2605,7 @@ mod tests {
                 .write(
                     &PostcodeRecord {
                         postcode: postcode.to_string(),
+                        country: None,
                         geometry: point_geometry(lon + 0.001, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(5),
                     }
@@ -2477,6 +2649,7 @@ mod tests {
                 .write(
                     &PostcodeRecord {
                         postcode: postcode.to_string(),
+                        country: None,
                         geometry: point_geometry(lon, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(5),
                     }
@@ -2546,6 +2719,7 @@ mod tests {
             .write(
                 &PostcodeRecord {
                     postcode: "K0J 1K0".to_string(),
+                    country: None,
                     geometry: point_geometry(-76.881, 45.631),
                     source: DerivedSourceProvenance::osm_address_records(5),
                 }
@@ -2588,6 +2762,7 @@ mod tests {
                 .write(
                     &PostcodeRecord {
                         postcode: code,
+                        country: None,
                         geometry: point_geometry(lon, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(1),
                     }
@@ -2912,6 +3087,7 @@ mod tests {
             .write(
                 &PostcodeRecord {
                     postcode: "M5V".to_string(),
+                    country: None,
                     geometry: point_geometry(-79.4, 43.6),
                     source: DerivedSourceProvenance::osm_address_records(2),
                 }
@@ -3537,20 +3713,19 @@ mod tests {
 
         // The index knows no "A1A 9Z9", but the record near "A1A 1A1" shares
         // its first three characters. The record that states "B2B 2B2"
-        // contradicts the query outright and is left out: it is not an answer
-        // to it, however little else matches.
+        // contradicts the query outright and ranks last: a mismatch ranks
+        // down, never out.
         assert_eq!(
             top_ids(&searcher, "5 Main Street, A1A 9Z9"),
-            vec!["osm:node:2", "osm:node:3"]
+            vec!["osm:node:2", "osm:node:3", "osm:node:1"]
         );
         assert_eq!(
             top_ids(&searcher, "5 Main Street, Toronto ON B2B 2B2")[0],
             "osm:node:1",
             "the postcode starts at its first word with a digit"
         );
-        // A code nobody shares prefers no one: the closest labels first. The
-        // parser leaves this one unplaced, so it rejects nothing either, and
-        // the record that states another postcode ranks last.
+        // A postcode nobody shares prefers no one: the closest labels first,
+        // and again the record whose own postcode disagrees last.
         assert_eq!(
             top_ids(&searcher, "5 Main Street, Z9Z 9Z9"),
             vec!["osm:node:2", "osm:node:3", "osm:node:1"]
@@ -3579,10 +3754,10 @@ mod tests {
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
-        let ids = top_ids(&searcher, "8 High Street, 7304");
-        assert!(
-            !ids.contains(&"osm:node:1".to_string()),
-            "the 7018 address answers no query for 7304: {ids:?}"
+        // The 7018 address still answers, after the street.
+        assert_eq!(
+            top_ids(&searcher, "8 High Street, 7304"),
+            vec!["osm:way:2", "osm:node:1"]
         );
         // A query that states no postcode still reaches it.
         assert!(top_ids(&searcher, "8 High Street").contains(&"osm:node:1".to_string()));
@@ -4253,6 +4428,7 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(1);
         AddressRecord {
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: number.to_string(),

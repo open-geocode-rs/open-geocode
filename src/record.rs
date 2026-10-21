@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use geojson::{Geometry, GeometryValue};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
-use crate::{labels, util::geo::point_lon_lat};
+use crate::{labels, parse::lattice::CountryCode, util::geo::point_lon_lat};
 
 /// One normalized geocoding record, as the builder emits it and the Pack
 /// stores it.
@@ -20,6 +20,10 @@ pub enum Record {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressRecord {
     pub address: AddressComponents,
+    /// For an address that states no postcode, the postcodes the other
+    /// addresses of its street state: the evidence of where it is. Empty when
+    /// it states one, or its street's addresses state none.
+    pub street_postcodes: Vec<String>,
     pub geometry: Geometry,
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
@@ -49,6 +53,9 @@ pub struct StreetRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostcodeRecord {
     pub postcode: String,
+    /// The country its addresses lie in. A code names a postcode only within
+    /// one country: AU and NZ both have a "2110".
+    pub country: Option<CountryCode>,
     pub geometry: Geometry,
     pub source: DerivedSourceProvenance,
 }
@@ -655,7 +662,7 @@ impl Serialize for StreetRecord {
 
 impl PostcodeRecord {
     pub fn id(&self) -> String {
-        labels::derived_postcode_id(&self.postcode)
+        labels::derived_postcode_id(self.country, &self.postcode)
     }
 
     pub fn name(&self) -> String {
@@ -669,11 +676,12 @@ impl PostcodeRecord {
 
 impl Serialize for PostcodeRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PostcodeRecord", 6)?;
+        let mut state = serializer.serialize_struct("PostcodeRecord", 7)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
         state.serialize_field("postcode", &self.postcode)?;
+        state.serialize_field("country", &self.country.as_ref().map(CountryCode::as_str))?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("source", &self.source)?;
         state.end()

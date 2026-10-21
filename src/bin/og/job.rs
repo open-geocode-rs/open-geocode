@@ -307,7 +307,7 @@ fn build_step(stage: BuildStage) -> Step {
             "admin areas",
             [
                 "Joining boundary pieces into the outlines of each area,",
-                "and placing postcode centroids.",
+                "from countries down to neighbourhoods.",
             ],
         ),
         BuildStage::ImportAddresses => (
@@ -324,7 +324,7 @@ fn build_step(stage: BuildStage) -> Step {
             "Writing",
             "context records",
             [
-                "Writing places, postcodes and admin areas, so every result",
+                "Writing places and admin areas, so every result",
                 "knows its city, region and country.",
             ],
         ),

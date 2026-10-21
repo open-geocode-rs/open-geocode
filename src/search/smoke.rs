@@ -123,14 +123,14 @@ fn hits_of_readings(
             if !pass.searches_anew(&plan) {
                 continue;
             }
-            let hits = searcher
+            let (hits, _) = searcher
                 .search_plan(
                     &plan,
                     pass,
                     &query_words,
                     Filters::default(),
                     10,
-                    &mut |_, postcode, hit| searcher.hit_in_postcode(hit, postcode),
+                    &mut |_, _, _| Ok(true),
                 )
                 .expect("search");
             if !hits.is_empty() {
@@ -705,6 +705,90 @@ mod place_rank {
         assert_eq!(
             search(&searcher, "Tasman Bakery", Some("poi")),
             vec!["osm:node:40", "osm:node:41"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A postcode the record contradicts ranks the record down, never out.
+mod postcode {
+    use crate::{
+        pack::Writer,
+        record::{
+            AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
+            point_geometry,
+        },
+    };
+
+    use super::*;
+
+    fn address(object_id: i64, lon: f64, postcode: Option<&str>, street: &[&str]) -> AddressRecord {
+        AddressRecord {
+            address: AddressComponents {
+                areas: Vec::new(),
+                number: "10".to_string(),
+                street: Some("King Street".to_string()),
+                place: None,
+                unit: None,
+                locality: None,
+                region: None,
+                postcode: postcode.map(str::to_string),
+                country: None,
+            },
+            street_postcodes: street.iter().map(|postcode| postcode.to_string()).collect(),
+            geometry: point_geometry(lon, -33.8),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+        }
+    }
+
+    fn ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
+        searcher
+            .search(TextSearchOptions {
+                query: query.to_string(),
+                limit: 10,
+                layer: None,
+                countries: Vec::new(),
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_contradicting_postcode_ranks_below_an_agreeing_one_and_stays() {
+        let dir = std::env::temp_dir().join(format!(
+            "open-geocode-smoke-postcode-rank-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut writer = Writer::create(&dir).expect("writer");
+        for record in [
+            address(1, 151.0, Some("2111"), &[]),
+            address(2, 151.1, Some("2110"), &[]),
+            // States none, but its street's addresses state 2110.
+            address(3, 151.2, None, &["2110"]),
+        ] {
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&dir).expect("searcher");
+
+        let agreeing = ids(&searcher, "10 King Street, 2110");
+        assert_eq!(agreeing.len(), 3, "nothing is dropped: {agreeing:?}");
+        assert_eq!(agreeing[2], "osm:node:1", "the 2111 address ranks last");
+        let mut first = agreeing[..2].to_vec();
+        first.sort();
+        assert_eq!(first, ["osm:node:2", "osm:node:3"]);
+
+        // The borrowed 2110 contradicts 2111 as a stated one does.
+        let other = ids(&searcher, "10 King Street, 2111");
+        assert_eq!(other.len(), 3, "{other:?}");
+        assert_eq!(other[0], "osm:node:1");
+        assert_eq!(
+            ids(&searcher, "10 King Street, 2999").len(),
+            3,
+            "contradicted everywhere, still found"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

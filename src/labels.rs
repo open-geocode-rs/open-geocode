@@ -1,5 +1,9 @@
-use crate::record::{
-    AddressComponents, InterpolationAddressComponents, InterpolationRange, OSM_DATASET, ObjectType,
+use crate::{
+    parse::lattice::CountryCode,
+    record::{
+        AddressComponents, InterpolationAddressComponents, InterpolationRange, OSM_DATASET,
+        ObjectType,
+    },
 };
 
 pub fn address_name(components: &AddressComponents) -> String {
@@ -131,8 +135,17 @@ pub fn record_id(dataset: &str, object_type: ObjectType, object_id: i64) -> Stri
     format!("{dataset}:{}:{object_id}", object_type_name(object_type))
 }
 
-pub fn derived_postcode_id(postcode: &str) -> String {
-    format!("derived:osm:postcode:{}", url_safe_id_component(postcode))
+/// "derived:osm:postcode:nz:2110": one postcode of one country. Without a
+/// known country, "derived:osm:postcode:2110".
+pub fn derived_postcode_id(country: Option<CountryCode>, postcode: &str) -> String {
+    let postcode = url_safe_id_component(postcode);
+    match country {
+        Some(country) => format!(
+            "derived:osm:postcode:{}:{postcode}",
+            country.as_str().to_ascii_lowercase()
+        ),
+        None => format!("derived:osm:postcode:{postcode}"),
+    }
 }
 
 pub fn derived_country_id(code: &str) -> String {

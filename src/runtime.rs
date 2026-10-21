@@ -595,6 +595,7 @@ mod router_tests {
         writer
             .write(
                 &AddressRecord {
+                    street_postcodes: Vec::new(),
                     address: AddressComponents {
                         areas: Vec::new(),
                         number: "10".to_string(),

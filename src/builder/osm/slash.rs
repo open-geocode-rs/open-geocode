@@ -289,6 +289,7 @@ mod tests {
 
     fn pending(id: i64, number: &str, street: &str, lat: f64) -> PendingAddress {
         let record = AddressRecord {
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 number: number.to_string(),
                 street: Some(street.to_string()),

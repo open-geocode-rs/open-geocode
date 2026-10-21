@@ -1021,6 +1021,7 @@ mod tests {
             writer
                 .write(
                     &AddressRecord {
+                        street_postcodes: Vec::new(),
                         address: AddressComponents {
                             areas: Vec::new(),
                             number: number.into(),
@@ -1310,6 +1311,7 @@ mod smoke {
                             postcode: None,
                             country: None,
                         },
+                        street_postcodes: Vec::new(),
                         geometry: point_geometry(lon, -36.0),
                         location_precision: LocationPrecision::Point,
                         source: SourceProvenance::osm(ObjectType::Node, object_id),

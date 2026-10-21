@@ -11,6 +11,7 @@ use geojson::{Geometry, GeometryValue};
 
 use crate::{
     extsort::Spill,
+    parse::lattice::CountryCode,
     record::{
         AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceRecord,
@@ -191,14 +192,17 @@ const ADDRESS_GROUP_CELL_DEGREES: f64 = 0.02;
 const CELL_KEY_LEN: usize = 16;
 
 /// An address waiting to be written with the rest of its street. Sorted by
-/// what it states but its number and unit, then by number, so the addresses
-/// of one street come out together and in order.
+/// its street, then by what it states but its number and unit, then by
+/// number, so the addresses of one street come out together and in order.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingAddress {
     /// The group key, then the number key.
     pub order: Vec<u8>,
-    /// Length of the start of `order` its group shares: its street's key,
-    /// or in house order its house's.
+    /// Length of the start of `order` its street shares in street order: the
+    /// cell and the street as search spells it. In house order, its group's.
+    pub street_len: usize,
+    /// Length of the start of `order` its group shares: its street's key and
+    /// everything else it states, or in house order its house's.
     pub group_len: usize,
     pub seq: u64,
     pub record: Record,
@@ -213,6 +217,17 @@ impl PendingAddress {
         order.extend_from_slice(&cell(lat).to_be_bytes());
         order.extend_from_slice(&cell(lon).to_be_bytes());
         let address = &record.address;
+        put_order_text(
+            &mut order,
+            address
+                .subject()
+                .and_then(crate::text_index::street_search_text)
+                .as_deref(),
+        );
+        let street_len = order.len();
+        // Addresses stating a postcode first: the street's postcodes are all
+        // known by the time its addresses without one come out.
+        order.push(u8::from(address.postcode.is_none()));
         for field in [
             &address.street,
             &address.place,
@@ -234,6 +249,7 @@ impl PendingAddress {
         put_order_text(&mut order, address.unit.as_deref());
         Ok(Self {
             order,
+            street_len,
             group_len,
             seq,
             record: Record::Address(record),
@@ -267,6 +283,7 @@ impl PendingAddress {
         order.push(u8::from(record.source.object_type == ObjectType::Row));
         Ok(Self {
             order,
+            street_len: group_len,
             group_len,
             seq,
             record: Record::Address(record),
@@ -324,6 +341,7 @@ impl Spill for PendingAddress {
     fn encode(&self, out: &mut Vec<u8>) {
         put_u64(out, self.order.len() as u64);
         out.extend_from_slice(&self.order);
+        put_u64(out, self.street_len as u64);
         put_u64(out, self.group_len as u64);
         put_u64(out, self.seq);
         encode_record(out, &self.record);
@@ -336,14 +354,16 @@ impl Spill for PendingAddress {
         }
         let (order, rest) = input.split_at(len);
         *input = rest;
+        let street_len = usize::try_from(get_u64(input)?)?;
         let group_len = usize::try_from(get_u64(input)?)?;
-        if group_len > len {
+        if street_len > group_len || group_len > len {
             return Err(Error::Decode(
                 "address group key is longer than its sort key",
             ));
         }
         Ok(Self {
             order: order.to_vec(),
+            street_len,
             group_len,
             seq: get_u64(input)?,
             record: decode_record(input)?,
@@ -414,7 +434,9 @@ fn tags_bytes(tags: &BTreeMap<String, String>) -> usize {
 
 fn record_heap_bytes(record: &Record) -> usize {
     let strings = match record {
-        Record::Address(record) => address_heap_bytes(&record.address),
+        Record::Address(record) => {
+            address_heap_bytes(&record.address) + strings_heap_bytes(&record.street_postcodes)
+        }
         Record::Poi(record) => {
             record.name.len()
                 + strings_heap_bytes(&record.alt_names)
@@ -482,6 +504,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
     match record {
         Record::Address(record) => {
             encode_address(out, &record.address);
+            put_strs(out, &record.street_postcodes);
             encode_precision(out, record.location_precision);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
@@ -532,6 +555,10 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
         }
         Record::Postcode(record) => {
             put_str(out, &record.postcode);
+            put_u64(
+                out,
+                record.country.map_or(0, |country| country.to_u16().into()),
+            );
             put_u64(out, record.source.record_count);
             encode_geometry(out, &record.geometry);
         }
@@ -552,6 +579,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
     Ok(match layer {
         Layer::Address => Record::Address(AddressRecord {
             address: decode_address(input)?,
+            street_postcodes: get_strings(input)?,
             location_precision: decode_precision(input)?,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
@@ -604,6 +632,9 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
         }),
         Layer::Postcode => Record::Postcode(PostcodeRecord {
             postcode: get_string(input)?,
+            country: u16::try_from(get_u64(input)?)
+                .ok()
+                .and_then(CountryCode::from_u16),
             source: DerivedSourceProvenance::osm_address_records(get_u64(input)?),
             geometry: decode_geometry(input)?,
         }),
@@ -880,6 +911,7 @@ mod tests {
         });
         let records = [
             Record::Address(AddressRecord {
+                street_postcodes: vec!["M5V 1A1".into(), "M5V 2B2".into()],
                 address: AddressComponents {
                     areas: Vec::new(),
                     number: "10".into(),
@@ -924,6 +956,7 @@ mod tests {
             }),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".into(),
+                country: CountryCode::parse("CA"),
                 geometry: point_geometry(-79.0, 43.0),
                 source: DerivedSourceProvenance::osm_address_records(3),
             }),
