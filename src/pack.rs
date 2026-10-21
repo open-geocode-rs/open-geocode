@@ -56,10 +56,12 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 9;
+pub const PACK_SCHEMA_VERSION: u32 = 10;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
+const POSTCODE_ADDRESSES_SECTION: &str = "postcode_addresses";
+const POSTCODE_ADDRESSES_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -82,6 +84,62 @@ pub struct SpatialManifest {
     pub line_count: u64,
     pub block_count: u64,
     pub context_point_count: u64,
+}
+
+/// How many addresses state a postcode, per country: what one postcode's
+/// addresses are a share of, so search weighs agreeing on a postcode by how
+/// few records it covers in its country. Summed from the postcode records as
+/// they are written, each counting the addresses it was derived from. `None`
+/// holds the postcodes no country holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostcodeAddresses(BTreeMap<Option<CountryCode>, u64>);
+
+/// Bytes of one [`PostcodeAddresses`] entry: the country as a `u16` (0 for
+/// none) and the count, little-endian.
+const POSTCODE_ADDRESSES_ENTRY_BYTES: usize = 10;
+
+impl PostcodeAddresses {
+    fn add(&mut self, country: Option<CountryCode>, addresses: u64) {
+        *self.0.entry(country).or_default() += addresses;
+    }
+
+    /// The addresses of `country` that state a postcode.
+    pub fn of(&self, country: Option<CountryCode>) -> u64 {
+        self.0.get(&country).copied().unwrap_or_default()
+    }
+
+    /// Every country some postcode is in.
+    pub fn countries(&self) -> impl Iterator<Item = CountryCode> + '_ {
+        self.0.keys().flatten().copied()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.0.len() * POSTCODE_ADDRESSES_ENTRY_BYTES);
+        for (country, addresses) in &self.0 {
+            bytes.extend_from_slice(&country.map_or(0, |country| country.to_u16()).to_le_bytes());
+            bytes.extend_from_slice(&addresses.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if !bytes.len().is_multiple_of(POSTCODE_ADDRESSES_ENTRY_BYTES) {
+            return Err(Error::Decode("postcode address counts are truncated"));
+        }
+        let mut counts = BTreeMap::new();
+        for entry in bytes.chunks_exact(POSTCODE_ADDRESSES_ENTRY_BYTES) {
+            let (country, addresses) = entry.split_at(2);
+            let country = match u16::from_le_bytes([country[0], country[1]]) {
+                0 => None,
+                code => Some(CountryCode::from_u16(code).ok_or(Error::Decode(
+                    "postcode address country is not a country code",
+                ))?),
+            };
+            let addresses = u64::from_le_bytes(addresses.try_into().expect("eight bytes"));
+            counts.insert(country, addresses);
+        }
+        Ok(Self(counts))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +203,7 @@ pub struct Writer {
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
     postcode_areas: Arc<PostcodeAreas>,
+    postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
 }
 
@@ -213,6 +272,7 @@ impl Writer {
             context_names: Arc::default(),
             country_codes: Arc::default(),
             postcode_areas: Arc::default(),
+            postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
         })
     }
@@ -320,6 +380,10 @@ impl Writer {
                 text_index::Prepared::Address(document) => self.text.add_address(document)?,
             }
             self.spatial.add(record_id, &record)?;
+            if let Record::Postcode(postcode) = &record {
+                self.postcode_addresses
+                    .add(postcode.country, postcode.source.record_count);
+            }
             *self.layer_counts.entry(record.layer()).or_default() += 1;
         }
         Ok(())
@@ -337,6 +401,7 @@ impl Writer {
             spatial,
             layer_counts,
             context_names,
+            postcode_addresses,
             dictionaries,
             ..
         } = self;
@@ -357,6 +422,11 @@ impl Writer {
         scratch.check_cancelled()?;
         dictionaries.finish(&mut pack, &context_names)?;
         drop(context_names);
+        pack.add(
+            POSTCODE_ADDRESSES_SECTION,
+            POSTCODE_ADDRESSES_VERSION,
+            &postcode_addresses.to_bytes(),
+        )?;
 
         let manifest = Manifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -460,6 +530,7 @@ pub struct Reader {
     manifest: Manifest,
     records: records::Reader,
     context: context::Reader,
+    postcode_addresses: PostcodeAddresses,
 }
 
 impl std::fmt::Debug for Reader {
@@ -489,12 +560,16 @@ impl Reader {
             return Err(Error::ManifestMismatch);
         }
         let context = context::Reader::open(&container)?;
+        let postcode_addresses = PostcodeAddresses::from_bytes(
+            &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
+        )?;
         Ok(Self {
             path,
             container,
             manifest,
             records,
             context,
+            postcode_addresses,
         })
     }
 
@@ -514,6 +589,11 @@ impl Reader {
     /// Check every section of the Pack file against its checksum.
     pub fn verify(&self) -> Result<()> {
         self.container.verify()
+    }
+
+    /// See [`PostcodeAddresses`].
+    pub fn postcode_addresses(&self) -> &PostcodeAddresses {
+        &self.postcode_addresses
     }
 
     pub fn records(&self) -> &records::Reader {

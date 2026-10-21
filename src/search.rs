@@ -26,7 +26,7 @@ use crate::{
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
-        lattice::{LatticeTagger, Tokens, automaton_builder},
+        lattice::{CountryCode, LatticeTagger, Tokens, automaton_builder},
         types::{Label, Tagged},
     },
     record::{
@@ -158,10 +158,23 @@ const RANK_WINDOW_FACTOR: usize = 3;
 const MAX_RANK_WINDOW: usize = 256;
 /// How much a word found in each field weighs; the content field holds every
 /// word of what a record is at weight 1, the context field every word of
-/// where it is.
+/// where it is. Not rarity weights: BM25's idf already weighs a word by how
+/// rare it is in each field, the `u` of [`MATCH_AGREEMENT`]. These set how
+/// much more often a true match agrees on a word of its name or number than
+/// on the rest of what it is, an `m` per field only an answer key could
+/// measure.
 const NAME_BOOST: Score = 5.5;
 const NUMBER_BOOST: Score = 2.0;
-const POSTCODE_BOOST: Score = 2.0;
+/// How often a true match agrees on a part it states: the `m` of a
+/// Fellegi-Sunter weight `ln(m / u)`, where `u` is how often a record at
+/// random agrees, which the Pack's own counts give per country. Measuring `m`
+/// per part needs an answer key, and none exists: every derived weight
+/// shares this one, so their order rests on `u` alone and `ln m` is one
+/// offset for them all. High, as a query and its record mostly write the
+/// same postcode; the misses are typos and stale codes. The log is natural,
+/// not base 2, so a weight adds to BM25's idf, itself a natural log of a
+/// rarity, on one scale.
+const MATCH_AGREEMENT: f64 = 0.95;
 /// A word that may name an area, where the query names none, counts for less
 /// there than in what a record is: "7 Lynn Place" is the street, not a place
 /// in the New Lynn suburb. Close scores between the two otherwise rank on
@@ -382,7 +395,7 @@ impl TextSearcher {
         plan: &QueryPlan,
         pass: Pass,
         filters: Filters<'_>,
-        known: &HashSet<String>,
+        areas: &AreaWords,
     ) -> Box<dyn Query> {
         let mut clauses = Vec::new();
         if let Some(number) = &plan.house_number {
@@ -391,7 +404,7 @@ impl TextSearcher {
                 self.house_number_query(number, plan.unit.as_deref(), pass),
             ));
         }
-        clauses.extend(self.subject_clauses(plan, pass, known));
+        clauses.extend(self.subject_clauses(plan, pass, areas));
         for word in &plan.optional {
             clauses.push((Occur::Should, self.word_query(word, &plan.spellings)));
         }
@@ -423,7 +436,7 @@ impl TextSearcher {
         &self,
         plan: &QueryPlan,
         pass: Pass,
-        known: &HashSet<String>,
+        areas: &AreaWords,
     ) -> Vec<(Occur, Box<dyn Query>)> {
         let mut clauses = Vec::new();
         let spellings = &plan.spellings;
@@ -452,7 +465,7 @@ impl TextSearcher {
         for word in &plan.subject {
             let stands_in = anywhere && !stated.contains(&word.text);
             let query = if stands_in {
-                self.word_or_area_query(what(&word.text), &word.text, spellings)
+                self.word_or_area_query(what(&word.text), &word.text, spellings, areas)
             } else {
                 what(&word.text)
             };
@@ -483,7 +496,7 @@ impl TextSearcher {
             .unplaced
             .iter()
             .map(|word| {
-                let query = self.word_or_area_query(what(&word.text), &word.text, spellings);
+                let query = self.word_or_area_query(what(&word.text), &word.text, spellings, areas);
                 (Occur::Should, query)
             })
             .collect::<Vec<_>>();
@@ -500,13 +513,16 @@ impl TextSearcher {
             let known = part
                 .words
                 .iter()
-                .filter(|word| known.contains(*word))
+                .filter(|word| areas.known.contains(*word))
                 .collect::<Vec<_>>();
             let clause =
                 if pass.requires_locality() && part.label == Label::Locality && !known.is_empty() {
                     (Occur::Must, self.locality_part_query(&known))
                 } else {
-                    (Occur::Should, self.context_part_query(part, spellings))
+                    (
+                        Occur::Should,
+                        self.context_part_query(part, spellings, areas),
+                    )
                 };
             clauses.push(clause);
         }
@@ -519,11 +535,12 @@ impl TextSearcher {
         what: Box<dyn Query>,
         word: &str,
         spellings: &Spellings,
+        areas: &AreaWords,
     ) -> Box<dyn Query> {
         Box::new(DisjunctionMaxQuery::new(vec![
             what,
             Box::new(BoostQuery::new(
-                self.area_query(word, spellings),
+                self.area_query(word, spellings, areas),
                 AREA_STANDS_IN_BOOST,
             )),
         ]))
@@ -560,21 +577,21 @@ impl TextSearcher {
 
     /// Any word of a context part in where a record is, or all of it as one
     /// postcode ("m6g 1b8").
-    fn context_part_query(&self, part: &ContextPart, spellings: &Spellings) -> Box<dyn Query> {
+    fn context_part_query(
+        &self,
+        part: &ContextPart,
+        spellings: &Spellings,
+        areas: &AreaWords,
+    ) -> Box<dyn Query> {
         let mut alternatives = part
             .words
             .iter()
-            .map(|word| (Occur::Should, self.area_query(word, spellings)))
+            .map(|word| (Occur::Should, self.area_query(word, spellings, areas)))
             .collect::<Vec<_>>();
-        if part.words.len() > 1 {
-            let postcode = TermQuery::new(
-                Term::from_field_text(self.fields.postcode_exact, &part.words.join(" ")),
-                IndexRecordOption::Basic,
-            );
-            alternatives.push((
-                Occur::Should,
-                Box::new(BoostQuery::new(Box::new(postcode), POSTCODE_BOOST)),
-            ));
+        if part.words.len() > 1
+            && let Some(postcode) = self.postcode_query(&part.words.join(" "), &areas.postcodes)
+        {
+            alternatives.push((Occur::Should, postcode));
         }
         Box::new(BooleanQuery::new(alternatives))
     }
@@ -610,20 +627,67 @@ impl TextSearcher {
         )
     }
 
-    /// One word, in the fields that hold where a record is.
-    fn area_query(&self, word: &str, spellings: &Spellings) -> Box<dyn Query> {
-        self.fields_query(
+    /// One word, in the fields that hold where a record is: a word of its
+    /// areas, or its whole postcode.
+    fn area_query(&self, word: &str, spellings: &Spellings, areas: &AreaWords) -> Box<dyn Query> {
+        let context = self.spelt_query(
+            self.fields.context_text,
             word,
+            IndexRecordOption::WithFreqs,
             spellings,
-            &[
-                (self.fields.context_text, 1.0, IndexRecordOption::WithFreqs),
-                (
-                    self.fields.postcode_exact,
-                    POSTCODE_BOOST,
-                    IndexRecordOption::Basic,
-                ),
-            ],
-        )
+        );
+        let mut alternatives = vec![(Occur::Should, context)];
+        if let Some(postcode) = self.postcode_query(word, &areas.postcodes) {
+            alternatives.push((Occur::Should, postcode));
+        }
+        Box::new(BooleanQuery::new(alternatives))
+    }
+
+    /// The records that state `term` as their postcode, each scored what
+    /// agreeing on it weighs in its country (see [`PostcodeWeights`]).
+    /// `None` when the Pack holds no postcode of the term: nothing says how
+    /// rare it is.
+    fn postcode_query(&self, term: &str, postcodes: &PostcodeWeights) -> Option<Box<dyn Query>> {
+        let weights = postcodes
+            .terms
+            .get(term)
+            .filter(|weights| !weights.is_empty())?;
+        let country = |country: CountryCode| -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.country_code, country.as_str()),
+                IndexRecordOption::Basic,
+            ))
+        };
+        let clauses = weights
+            .iter()
+            .map(|&(in_country, weight)| {
+                let mut parts: Vec<(Occur, Box<dyn Query>)> = vec![(
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.postcode_exact, term),
+                        IndexRecordOption::Basic,
+                    )),
+                )];
+                match in_country {
+                    Some(in_country) => parts.push((Occur::Must, country(in_country))),
+                    // A record in a country is weighed by that country's
+                    // counts, never by those of the postcodes no country
+                    // holds.
+                    None => parts.extend(
+                        self.pack
+                            .postcode_addresses()
+                            .countries()
+                            .map(|other| (Occur::MustNot, country(other))),
+                    ),
+                }
+                let query: Box<dyn Query> = Box::new(ConstScoreQuery::new(
+                    Box::new(BooleanQuery::new(parts)),
+                    weight,
+                ));
+                (Occur::Should, query)
+            })
+            .collect();
+        Some(Box::new(BooleanQuery::new(clauses)))
     }
 
     fn area_term_query(&self, word: &str) -> Box<dyn Query> {
@@ -1106,13 +1170,16 @@ impl TextSearcher {
             .iter()
             .filter(|part| part.label == Label::Locality)
             .collect::<Vec<_>>();
-        let known = self.known_area_words(localities.iter().flat_map(|part| &part.words))?;
+        let areas = AreaWords {
+            known: self.known_area_words(localities.iter().flat_map(|part| &part.words))?,
+            postcodes: self.postcode_weights(&plan.area_terms())?,
+        };
         let stated = if pass.requires_locality() {
             Vec::new()
         } else {
             localities
                 .iter()
-                .filter_map(|part| StatedArea::known(part, &known))
+                .filter_map(|part| StatedArea::known(part, &areas.known))
                 .collect()
         };
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
@@ -1126,12 +1193,12 @@ impl TextSearcher {
                 .map(str::trim)
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str())
-            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking, &known)?
+            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking, &areas)?
             && keep(&estimate)?
         {
             candidates.push(estimate);
         }
-        let query = self.build_query(plan, pass, filters, &known);
+        let query = self.build_query(plan, pass, filters, &areas);
         candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
         let (mut hits, mut contradicted) = (Vec::new(), Vec::new());
         for hit in candidates {
@@ -1310,6 +1377,45 @@ impl TextSearcher {
                 .chain(postcode.forms.iter().cloned())
                 .collect(),
         );
+        for record_id in self.postcode_records(&terms)? {
+            let (_, lon, lat) = self.pack.records().point(record_id)?;
+            postcode.points.push([lon, lat]);
+        }
+        Ok(postcode)
+    }
+
+    /// What agreeing on each term of `terms` as a postcode weighs, in each
+    /// country the Pack holds a postcode of it in.
+    fn postcode_weights(&self, terms: &[String]) -> Result<PostcodeWeights> {
+        let mut weights = PostcodeWeights::default();
+        for term in terms {
+            if weights.terms.contains_key(term) {
+                continue;
+            }
+            let mut covered = HashMap::<Option<CountryCode>, u64>::new();
+            for record_id in self.postcode_records(std::slice::from_ref(term))? {
+                if let Record::Postcode(record) = self.pack.records().record(record_id)? {
+                    *covered.entry(record.country).or_default() += record.source.record_count;
+                }
+            }
+            let addresses = self.pack.postcode_addresses();
+            let by_country = covered
+                .into_iter()
+                .map(|(country, covered)| {
+                    (
+                        country,
+                        PostcodeWeights::agreement(covered, addresses.of(country)),
+                    )
+                })
+                .collect();
+            weights.terms.insert(term.clone(), by_country);
+        }
+        Ok(weights)
+    }
+
+    /// The Pack's postcode records of any of `terms`, as the postcode field
+    /// indexes them.
+    fn postcode_records(&self, terms: &[String]) -> Result<Vec<RecordId>> {
         let query = BooleanQuery::new(vec![
             (Occur::Must, self.layer_query(Layer::Postcode.as_str())),
             (
@@ -1331,12 +1437,11 @@ impl TextSearcher {
             ),
         ]);
         let searcher = self.reader.searcher();
-        for (_, doc) in searcher.search(&query, &TopDocs::with_limit(POSTCODE_RECORD_LIMIT))? {
-            let (record_id, _) = self.document_records(&searcher, doc)?;
-            let (_, lon, lat) = self.pack.records().point(record_id)?;
-            postcode.points.push([lon, lat]);
-        }
-        Ok(postcode)
+        searcher
+            .search(&query, &TopDocs::with_limit(POSTCODE_RECORD_LIMIT))?
+            .into_iter()
+            .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
+            .collect()
     }
 
     fn build_autocomplete_query(
@@ -1617,12 +1722,12 @@ impl TextSearcher {
         plan: &QueryPlan,
         pass: Pass,
         ranking: &Ranking,
-        known: &HashSet<String>,
+        areas: &AreaWords,
     ) -> Result<Option<TextSearchHit>> {
         let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
             return Ok(None);
         };
-        let (lower, higher) = self.neighbours(plan, pass, ranking, known, number)?;
+        let (lower, higher) = self.neighbours(plan, pass, ranking, areas, number)?;
         if lower.is_empty() {
             return Ok(None);
         }
@@ -1674,11 +1779,11 @@ impl TextSearcher {
         plan: &QueryPlan,
         pass: Pass,
         ranking: &Ranking,
-        known: &HashSet<String>,
+        areas: &AreaWords,
         number: u32,
     ) -> Result<(Vec<Neighbour>, Vec<Neighbour>)> {
         let searcher = self.reader.searcher();
-        let mut clauses = self.subject_clauses(plan, pass, known);
+        let mut clauses = self.subject_clauses(plan, pass, areas);
         clauses.push((Occur::Must, self.layer_query(Layer::Address.as_str())));
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
@@ -2380,6 +2485,41 @@ struct Spellings {
     words: HashMap<(Field, String), Spelt>,
 }
 
+/// What the Pack says of the words of a plan that may name where a record
+/// is.
+#[derive(Debug, Default)]
+struct AreaWords {
+    /// The words of its localities the Pack knows as a word of an area (see
+    /// [`TextSearcher::subject_clauses`]).
+    known: HashSet<String>,
+    postcodes: PostcodeWeights,
+}
+
+/// What agreeing on a postcode weighs, by each term of a plan the postcode
+/// field may index and each country the Pack holds a postcode of it in.
+/// Fellegi-Sunter: `ln(m / u)`, `u` the share of the country's addresses
+/// stating a postcode that state this one, `m` [`MATCH_AGREEMENT`]. One
+/// global weight cannot fit both a UK postcode, a street's side, and a US
+/// ZIP, thousands of addresses; the counts give each its own. Counted per
+/// country, not over the Pack, as a code names a postcode only within one
+/// (AU and NZ both have a "2110"), and a Pack covering more countries would
+/// otherwise make every postcode rarer.
+#[derive(Debug, Default)]
+struct PostcodeWeights {
+    terms: HashMap<String, Vec<(Option<CountryCode>, Score)>>,
+}
+
+impl PostcodeWeights {
+    /// What agreeing on a postcode `covered` of `addresses` addresses state
+    /// weighs. A postcode most addresses state says next to nothing, and
+    /// never counts against a record.
+    fn agreement(covered: u64, addresses: u64) -> Score {
+        let covered = covered.max(1) as f64;
+        let addresses = (addresses as f64).max(covered);
+        (MATCH_AGREEMENT * addresses / covered).ln().max(0.0) as Score
+    }
+}
+
 /// The terms of one field a query word may be a typo of.
 #[derive(Debug, Clone, PartialEq)]
 struct Spelt {
@@ -2930,6 +3070,24 @@ impl QueryPlan {
             return None;
         }
         Some(plan)
+    }
+
+    /// The words and context parts of the plan that are searched in where a
+    /// record is, so any may write a postcode: an unplaced word or one that
+    /// stands in for an area as much as a postcode part.
+    fn area_terms(&self) -> Vec<String> {
+        let words = self
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .chain(self.unplaced.iter().map(|word| word.text.clone()));
+        let parts = self.context.iter().flat_map(|part| {
+            part.words
+                .iter()
+                .cloned()
+                .chain((part.words.len() > 1).then(|| part.words.join(" ")))
+        });
+        unique_strings(words.chain(parts).collect())
     }
 
     /// The plan as text: the house number, the words it seeks, then each

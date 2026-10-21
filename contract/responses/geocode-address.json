@@ -34,7 +34,7 @@
         "layer": "address",
         "name": "10 King Street",
         "record_id": 3,
-        "score": 6.609153,
+        "score": 5.459071,
         "source": {
           "dataset": "osm",
           "object_id": 10,
