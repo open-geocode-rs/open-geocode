@@ -127,7 +127,7 @@ impl PostcodeAddresses {
             return Err(Error::Decode("postcode address counts are truncated"));
         }
         let mut counts = BTreeMap::new();
-        for entry in bytes.chunks_exact(POSTCODE_ADDRESSES_ENTRY_BYTES) {
+        for entry in bytes.as_chunks::<POSTCODE_ADDRESSES_ENTRY_BYTES>().0 {
             let (country, addresses) = entry.split_at(2);
             let country = match u16::from_le_bytes([country[0], country[1]]) {
                 0 => None,
