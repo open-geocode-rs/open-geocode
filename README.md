@@ -13,6 +13,11 @@ address-first location context. It turns OpenStreetMap PBF extracts into a
 single compact Pack file holding a memory-mapped record store, a Tantivy text
 index, and an H3-backed spatial index, with no database or search cluster to run.
 
+<img src="demo/recording/og-demo.gif" alt="Building the Luxembourg Pack in og, then geocoding a CSV of 4,000 addresses" width="100%">
+
+Building the Luxembourg Pack, then geocoding a CSV of 4,000 addresses:
+every row matched in about a second, p50 1.6 ms and p99 5.4 ms.
+
 ## Why open-geocode?
 
 Address data does not change minute to minute. You build it from an OSM extract
