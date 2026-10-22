@@ -1227,7 +1227,10 @@ fn read_input(
     }
     build.report.phases.boundary_member_scan_ms += phase.elapsed().as_millis();
 
-    // The scan has counted what the rest of the build holds.
+    // The scan has counted what the rest of the build holds, and the
+    // machine has moved since the build started.
+    let resources = Resources::probe();
+    passes.memory.sample(&resources);
     let accepted = &build.report.accepted;
     let counted = |layer: &str| accepted.by_layer.get(layer).copied().unwrap_or_default();
     plan.refine(&Scanned {
@@ -1244,12 +1247,12 @@ fn read_input(
         read_bytes: scanned_bytes,
         heap_bytes: alloc::live_bytes().map(|bytes| bytes as u64),
         tracked_bytes: passes.memory.used() as u64,
+        resources: resources.clone(),
     })?;
     for warning in plan.shortfalls.iter().chain(&plan.warnings) {
         passes.observer.warned(warning);
     }
     build.report.geometry_passes.kept_ways += kept.all;
-    passes.memory.sample(&plan.resources);
 
     // Pass 3: the coordinates of every marked node.
     let phase = Instant::now();

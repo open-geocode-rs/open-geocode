@@ -182,6 +182,9 @@ pub struct BuildPlan {
     /// a scratch file.
     pub locations_in_memory: bool,
     pub memory_needed_bytes: u64,
+    /// Memory the build can hold: what was available before it started, or
+    /// after the last scan, with what the build held then.
+    pub memory_free_bytes: u64,
     /// The most scratch held at once, over every stage.
     pub scratch_disk_needed_bytes: u64,
     /// The most scratch and Pack held at once, when both share a volume.
@@ -213,6 +216,8 @@ pub(crate) struct Scanned {
     pub heap_bytes: Option<u64>,
     /// Bytes the budget's buffers hold.
     pub tracked_bytes: u64,
+    /// What the process can use now.
+    pub resources: Resources,
 }
 
 impl BuildPlan {
@@ -220,7 +225,6 @@ impl BuildPlan {
     /// [`plan_build`] sized all of it from the input's size. Fails, unless
     /// forced, when the rest does not fit.
     pub(crate) fn refine(&mut self, scanned: &Scanned) -> Result<()> {
-        self.resources = Resources::probe();
         self.items = scanned
             .items
             .extrapolated(scanned.read_bytes, self.input_bytes);
@@ -237,8 +241,10 @@ impl BuildPlan {
         // what it holds now, and what the machine has free holds them beside
         // the boundary vertices the way pass is about to gather.
         let locations = self.items.needed_nodes * NODE_SLOT_BYTES;
+        let available = scanned.resources.available_memory_bytes;
         self.locations_in_memory = scanned.tracked_bytes + locations <= self.memory_budget_bytes
-            && locations + boundary <= self.resources.available_memory_bytes / 10 * 9;
+            && locations + boundary <= available / 10 * 9;
+        self.memory_free_bytes = available + scanned.heap_bytes.unwrap_or(scanned.tracked_bytes);
         self.size();
         self.check()
     }
@@ -306,7 +312,7 @@ impl BuildPlan {
         let mut needs = vec![(
             format!("memory ({counted})"),
             self.memory_needed_bytes,
-            Some(self.resources.available_memory_bytes),
+            Some(self.memory_free_bytes),
             "close other programs, pass a smaller --memory-budget-mb, or build a smaller extract",
         )];
         if resources::same_volume(&self.scratch_dir, &self.output_dir) {
@@ -401,6 +407,7 @@ fn preflight(
         threads,
         locations_in_memory: items.node_set_bytes + items.needed_nodes * NODE_SLOT_BYTES
             <= memory_budget_bytes,
+        memory_free_bytes: resources.available_memory_bytes,
         untracked_bytes: untracked_beside_boundaries(threads)
             + items.boundary_refs * BOUNDARY_VERTEX_BYTES,
         items,
@@ -564,6 +571,37 @@ mod tests {
         plan.size();
         let mapped = plan.scratch_disk_needed_bytes;
         assert!(mapped > in_memory, "{mapped} > {in_memory}");
+    }
+
+    #[test]
+    fn a_scan_that_counts_more_than_the_scratch_holds_stops_the_build() {
+        let dir = std::env::temp_dir();
+        let mut plan = BuildPlan {
+            scratch_dir: dir.clone(),
+            output_dir: dir,
+            scratch_budget_bytes: Some(1 << 30),
+            ..preflight(machine(28), 1 << 20, 0, None)
+        };
+        plan.check().expect("a small input fits");
+        let scanned = Scanned {
+            items: ItemCounts {
+                needed_nodes: 1_000,
+                records: 100_000_000,
+                addresses: 50_000_000,
+                ..ItemCounts::default()
+            },
+            read_bytes: 1 << 20,
+            heap_bytes: Some(1 << 30),
+            tracked_bytes: 1 << 20,
+            resources: machine(28),
+        };
+        let error = plan.clone().refine(&scanned).unwrap_err();
+        assert!(format!("{error:#}").contains("(counted)"), "{error:#}");
+        plan.forced = true;
+        plan.refine(&scanned).expect("forced");
+        assert!(plan.counted && plan.locations_in_memory);
+        assert_eq!(plan.shortfalls.len(), 1, "{:?}", plan.shortfalls);
+        assert_eq!(plan.memory_free_bytes, (28 << 30) + (1 << 30));
     }
 
     #[test]
