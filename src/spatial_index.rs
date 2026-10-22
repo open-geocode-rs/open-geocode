@@ -28,7 +28,6 @@ use std::{
     collections::BinaryHeap,
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -38,7 +37,7 @@ use serde::Serialize;
 
 use crate::{
     container::{self, Bytes, Container},
-    extsort::Scratch,
+    extsort::{Scratch, ScratchFile},
     pack::RecordId,
     record::{Layer, Record},
     records::{self, BLOCK_RECORDS, dequantize, quantize},
@@ -102,9 +101,8 @@ fn union(left: BoundingBox, right: BoundingBox) -> BoundingBox {
 /// sixteenth of the items and less, are held in memory.
 #[derive(Debug)]
 struct TreeWriter {
-    leaves: BufWriter<File>,
-    leaves_path: PathBuf,
-    ids: Option<(BufWriter<File>, PathBuf)>,
+    leaves: BufWriter<ScratchFile>,
+    ids: Option<BufWriter<ScratchFile>>,
     count: u64,
     widest_id: u64,
     parents: Vec<BoundingBox>,
@@ -113,19 +111,16 @@ struct TreeWriter {
 
 impl TreeWriter {
     fn create(scratch: &Arc<Scratch>, name: &str, with_ids: bool) -> Result<Self> {
-        let create = |suffix: &str| -> Result<(BufWriter<File>, PathBuf)> {
-            let path = scratch.path().join(format!("spatial-{name}-{suffix}.bin"));
-            let file = File::create(&path).map_err(|source| Error::IoPath {
-                action: "failed to create",
-                path: path.clone(),
-                source,
-            })?;
-            Ok((BufWriter::with_capacity(1 << 20, file), path))
+        let create = |suffix: &str| -> Result<BufWriter<ScratchFile>> {
+            let file = ScratchFile::create(
+                scratch,
+                "pack-spatial",
+                &format!("spatial-{name}-{suffix}.bin"),
+            )?;
+            Ok(BufWriter::with_capacity(1 << 20, file))
         };
-        let (leaves, leaves_path) = create("leaves")?;
         Ok(Self {
-            leaves,
-            leaves_path,
+            leaves: create("leaves")?,
             ids: with_ids.then(|| create("ids")).transpose()?,
             count: 0,
             widest_id: 0,
@@ -138,7 +133,7 @@ impl TreeWriter {
         for value in bbox {
             self.leaves.write_all(&value.to_le_bytes())?;
         }
-        if let Some((ids, _)) = &mut self.ids {
+        if let Some(ids) = &mut self.ids {
             ids.write_all(&id.to_le_bytes())?;
             self.widest_id = self.widest_id.max(id);
         }
@@ -176,7 +171,7 @@ impl TreeWriter {
         pack.begin(name, SPATIAL_VERSION)?;
         pack.write_all(&self.count.to_le_bytes())?;
         pack.write_all(&[id_width])?;
-        std::io::copy(&mut File::open(&self.leaves_path)?, pack)?;
+        std::io::copy(&mut File::open(self.leaves.get_ref().path())?, pack)?;
         for level in &levels {
             for bbox in level {
                 for value in bbox {
@@ -184,10 +179,9 @@ impl TreeWriter {
                 }
             }
         }
-        if let Some((mut ids, path)) = self.ids {
+        if let Some(mut ids) = self.ids.take() {
             ids.flush()?;
-            drop(ids);
-            let mut input = BufReader::new(File::open(&path)?);
+            let mut input = BufReader::new(File::open(ids.get_ref().path())?);
             let mut id = [0; 8];
             for _ in 0..self.count {
                 input.read_exact(&mut id)?;

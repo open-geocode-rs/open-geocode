@@ -1,55 +1,67 @@
 //! Disk-backed sorting and spooling for builds larger than memory.
 //!
-//! [`ExternalSorter`] buffers items until its fair share of the build
-//! [`Budget`] is used (or the shared pool runs out), sorts the buffer,
-//! and writes it to a run file in the build scratch directory. Reading merges
-//! every run with a k-way heap. When everything fits no run is written and the
-//! sort is an ordinary in-memory sort, so a city extract and a planet build
-//! share one code path.
+//! [`ExternalSorter`] buffers items until part of its fair share of the
+//! build [`Budget`] is used (or the shared pool runs out), then hands the
+//! buffer to a spill thread that sorts it in place, codes and compresses it
+//! in parallel and writes it as a run, while the producer fills the next
+//! buffer. Reading merges every run in one pass when memory allows (see
+//! [`merge`]). When everything fits no run is written and the sort is an
+//! ordinary in-memory sort, so a city extract and a planet build share one
+//! code path.
 //!
 //! [`Spool`] is the unsorted sibling: an append-only scratch file replayed in
 //! write order, once or, closed into a [`SpoolFile`], as often as needed.
-//! [`IndexedSpool`] is read back by index, in any order.
+//! [`IndexedSpool`] is read back by index, in any order, so it is not
+//! compressed.
+//!
+//! Every byte is reserved in the [`Scratch`] ledger before it is written;
+//! see [`scratch`] for what happens when it runs out.
+
+mod block;
+mod merge;
+mod scratch;
 
 use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
+    fs::File,
+    io::{BufWriter, Write},
     marker::PhantomData,
-    path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
     },
+    thread::JoinHandle,
+    time::Instant,
 };
 
-use crate::error::{Error, Result};
 use rayon::prelude::*;
 
+pub use crate::util::codec::Delta;
 use crate::{
-    builder::BuildCancelled,
+    error::{Error, Result},
     memory::{Budget, Reservation, Spillable},
-    resources,
-    util::codec::{get_u64, put_u64},
+    util::codec::{get_delta, get_u64, put_delta, put_u64},
 };
+use block::{
+    BLOCK_BYTES, Block, Cursor, Failure, Frame, MIN_BLOCK_BYTES, Prefetch, Run, RunWriter, Stream,
+};
+pub use merge::Merge;
+pub use scratch::{IoTimes, Owner, Scratch, ScratchFile, Shortfall, Traffic};
 
 const IO_BUFFER_BYTES: usize = 1 << 20;
-/// Runs merged at once. Beyond this, runs are merged in rounds so the number of
-/// open files and read buffers stays bounded.
-const MAX_MERGE_FAN_IN: usize = 64;
 /// When the shared pool is full, a sorter spills only once its buffer holds at
 /// least this fraction of its share; smaller runs would cost more than they free.
 const MIN_RUN_FRACTION: usize = 16;
 /// Smallest buffer growth step, in items.
 const MIN_CAPACITY: usize = 1_024;
-/// Smallest read buffer per run during a merge.
-const MIN_MERGE_BUFFER_BYTES: usize = 64 << 10;
-/// Items a merge round writes between two checks of whether the build goes
-/// on.
+/// Items a merge writes between two checks of whether the build goes on.
 const CHECK_EVERY_ITEMS: usize = 1 << 16;
 
 /// A value that can be written to and read back from scratch files.
+///
+/// Sorted values must be totally ordered: values that compare equal must be
+/// interchangeable, since runs are sorted in place, not stably. A type
+/// whose key can tie carries a sequence number in its order.
 pub trait Spill: Sized {
     fn encode(&self, out: &mut Vec<u8>);
     fn decode(input: &mut &[u8]) -> Result<Self>;
@@ -58,116 +70,18 @@ pub trait Spill: Sized {
     fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
     }
-}
-
-/// Build scratch directory. Removed with everything in it when dropped.
-///
-/// Scratch files are never synced: a build that stops starts over, so only
-/// the published Pack is made durable. On Windows they are marked temporary
-/// while what was spilled fits the page cache the build leaves free (see
-/// [`Scratch::set_cache_bytes`]): the lazy writer then keeps them in memory
-/// instead of writing them out, which pays while they fit, but past that it
-/// would push the Pack and the input out of the cache.
-#[derive(Debug)]
-pub struct Scratch {
-    path: PathBuf,
-    next_file: AtomicU64,
-    spilled_bytes: AtomicU64,
-    /// Spilled bytes up to which new files are marked temporary.
-    cache_bytes: AtomicU64,
-    /// Set to stop the build this scratch serves.
-    cancel: OnceLock<Arc<AtomicBool>>,
-}
-
-impl Scratch {
-    pub fn create(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
-        let path = path.into();
-        fs::create_dir_all(&path).map_err(|source| Error::IoPath {
-            action: "failed to create scratch directory",
-            path: path.clone(),
-            source,
-        })?;
-        Ok(Arc::new(Self {
-            path,
-            next_file: AtomicU64::new(0),
-            spilled_bytes: AtomicU64::new(0),
-            cache_bytes: AtomicU64::new(0),
-            cancel: OnceLock::new(),
-        }))
+    /// Encode after the value before it in the same scratch block, which
+    /// left `delta`. A type whose sort key leads with an integer or shares
+    /// prefixes with its neighbours codes the key against it
+    /// ([`put_delta`], [`crate::util::codec::put_front`]).
+    fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+        let _ = delta;
+        self.encode(out);
     }
-
-    /// Stop the work that holds this scratch once `cancel` is set: merges,
-    /// and the stages that check [`Scratch::check_cancelled`].
-    pub fn cancel_on(&self, cancel: Arc<AtomicBool>) {
-        let _ = self.cancel.set(cancel);
-    }
-
-    /// Fails with [`BuildCancelled`] once the flag given to
-    /// [`Scratch::cancel_on`] is set.
-    pub fn check_cancelled(&self) -> Result<()> {
-        if self
-            .cancel
-            .get()
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-        {
-            return Err(BuildCancelled.into());
-        }
-        Ok(())
-    }
-
-    /// Mark new scratch files temporary while fewer than `bytes` have been
-    /// spilled.
-    pub fn set_cache_bytes(&self, bytes: u64) {
-        self.cache_bytes.store(bytes, Ordering::Relaxed);
-    }
-
-    /// Fail with a clear message when about `bytes` more would not fit in
-    /// 90% of the scratch volume's free space, as DuckDB caps its spill,
-    /// instead of failing in the middle of a write.
-    pub fn check_room(&self, bytes: u64) -> Result<()> {
-        if let Some(free) = resources::free_disk(&self.path)
-            && bytes > free / 10 * 9
-        {
-            return Err(Error::OutOfResources(format!(
-                "scratch volume of {} has {} MiB free, and the build needs about {} MiB more; free space there or pass --scratch-dir on a larger volume",
-                self.path.display(),
-                free >> 20,
-                bytes >> 20
-            )));
-        }
-        Ok(())
-    }
-
-    /// Create a scratch file for writing.
-    fn create_file(&self, path: &Path) -> std::io::Result<File> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(windows)]
-        if self.spilled_bytes() < self.cache_bytes.load(Ordering::Relaxed) {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.attributes(windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY);
-        }
-        options.open(path)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Total bytes written to scratch files so far.
-    pub fn spilled_bytes(&self) -> u64 {
-        self.spilled_bytes.load(Ordering::Relaxed)
-    }
-
-    fn new_file(&self, label: &str) -> PathBuf {
-        let index = self.next_file.fetch_add(1, Ordering::Relaxed);
-        self.path.join(format!("{label}-{index:06}.bin"))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+    /// Decode what [`Spill::encode_after`] wrote.
+    fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+        let _ = delta;
+        Self::decode(input)
     }
 }
 
@@ -187,22 +101,37 @@ impl SortStats {
     }
 }
 
+/// How a sorter's share is split: the buffer it fills, the one being
+/// written (as much again) and the blocks that buffer is coded into.
+fn buffer_bytes(share: usize) -> usize {
+    (share / 8 * 3).max(1)
+}
+
+/// Raw bytes of a run's blocks for a sorter with `share` bytes.
+fn block_bytes(share: usize) -> usize {
+    (share / 32).clamp(MIN_BLOCK_BYTES, BLOCK_BYTES)
+}
+
 #[derive(Debug)]
 pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
     budget: Arc<Budget>,
-    label: &'static str,
-    /// The most bytes this sorter may buffer before it spills, whatever its
+    owner: Arc<Owner>,
+    /// The most bytes this sorter may hold before it spills, whatever its
     /// fair share of the pool.
     share_bytes: usize,
     /// Buffer capacity plus the heap bytes of buffered items.
     reservation: Spillable,
     buffer: Vec<T>,
-    runs: Vec<PathBuf>,
-    stats: SortStats,
+    /// Runs written on the producer's own thread (see
+    /// [`ExternalSorter::spill`]).
+    runs: Vec<Run>,
+    spiller: Option<Spiller<T>>,
+    items: u64,
+    runs_written: Arc<AtomicU64>,
 }
 
-impl<T: Spill + Ord + Send> ExternalSorter<T> {
+impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
     pub fn new(
         scratch: &Arc<Scratch>,
         label: &'static str,
@@ -212,12 +141,14 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
         Self {
             scratch: Arc::clone(scratch),
             budget: Arc::clone(budget),
-            label,
+            owner: scratch.owner(label),
             share_bytes: share_bytes.max(1),
             reservation: Spillable::new(budget),
             buffer: Vec::new(),
             runs: Vec::new(),
-            stats: SortStats::default(),
+            spiller: None,
+            items: 0,
+            runs_written: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -225,7 +156,7 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
         let heap = item
             .resident_bytes()
             .saturating_sub(std::mem::size_of::<T>());
-        let share = self.reservation.share(self.share_bytes);
+        let share = buffer_bytes(self.reservation.share(self.share_bytes));
         let (mut growth, mut needed) = self.needed(heap, share);
         let over_share = self.reservation.bytes() + needed > share;
         if over_share || !self.reservation.reservation().try_grow(needed) {
@@ -248,12 +179,12 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
             self.buffer.try_reserve_exact(growth).map_err(|_| {
                 Error::OutOfResources(format!(
                     "out of memory: the {} sorter cannot buffer one item after spilling",
-                    self.label
+                    self.owner.label()
                 ))
             })?;
         }
         self.buffer.push(item);
-        self.stats.items += 1;
+        self.items += 1;
         Ok(())
     }
 
@@ -275,14 +206,16 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
     }
 
     pub fn stats(&self) -> SortStats {
-        self.stats
+        SortStats {
+            items: self.items,
+            runs: self.runs_written.load(Ordering::Relaxed),
+        }
     }
 
-    /// Sorted items, ascending, with ties in insertion order.
+    /// Sorted items, ascending.
     pub fn finish(mut self) -> Result<Sorted<T>> {
-        if self.runs.is_empty() {
-            // Stable sort plus run-order tie-breaking keeps equal items in push order.
-            self.buffer.par_sort();
+        if self.runs.is_empty() && self.spiller.is_none() {
+            self.buffer.par_sort_unstable();
             let reservation =
                 std::mem::replace(&mut self.reservation, Spillable::new(&self.budget))
                     .into_reservation();
@@ -294,41 +227,215 @@ impl<T: Spill + Ord + Send> ExternalSorter<T> {
         // Once anything spilled, the tail is spilled too, so a finished sorter
         // holds only merge read buffers while later phases fill their own.
         self.spill()?;
-        let share = self.reservation.share(self.share_bytes);
-        while self.runs.len() > MAX_MERGE_FAN_IN {
-            let batch = self.runs.drain(..MAX_MERGE_FAN_IN).collect::<Vec<_>>();
-            let merged = self.scratch.new_file(self.label);
-            let mut writer = SpoolWriter::<T>::create(&self.scratch, &merged)?;
-            for (written, item) in Merge::<T>::open(&batch, &self.budget, share)?.enumerate() {
-                if written % CHECK_EVERY_ITEMS == 0 {
-                    self.scratch.check_cancelled()?;
-                }
-                writer.write(&item?)?;
-            }
-            writer.finish()?;
-            self.runs.insert(0, merged);
+        let mut runs = std::mem::take(&mut self.runs);
+        if let Some(spiller) = self.spiller.take() {
+            runs.extend(spiller.join()?);
         }
-        Ok(Sorted::Merge(Merge::open(&self.runs, &self.budget, share)?))
+        let share = self.reservation.share(self.share_bytes);
+        let fan_in = merge::fan_in(&runs, share);
+        let runs = merge::premerge::<T>(&self.scratch, &self.owner, &self.budget, runs, fan_in)?;
+        let passes = runs.iter().map(|run| run.depth).max().unwrap_or(0) + 1;
+        self.owner.merged(runs.len(), passes);
+        Ok(Sorted::Merge(Merge::open(
+            &self.scratch,
+            runs,
+            &self.budget,
+        )?))
     }
 
+    /// Hand the buffer to the spill thread, waiting while it still writes
+    /// the one before.
     fn spill(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        self.scratch.check_room(self.reservation.bytes() as u64)?;
-        self.buffer.par_sort();
-        let path = self.scratch.new_file(self.label);
-        let mut writer = SpoolWriter::create(&self.scratch, &path)?;
-        for item in self.buffer.drain(..) {
-            writer.write(&item)?;
+        let batch = Batch {
+            items: std::mem::take(&mut self.buffer),
+            reservation: self.reservation.reservation().take(),
+        };
+        let writer = RunSpill {
+            scratch: Arc::clone(&self.scratch),
+            owner: Arc::clone(&self.owner),
+            budget: Arc::clone(&self.budget),
+            share_bytes: self.reservation.share(self.share_bytes),
+            runs_written: Arc::clone(&self.runs_written),
+        };
+        if rayon::current_thread_index().is_some() {
+            // A pool worker waiting on the spill thread could leave that
+            // thread no worker to sort on: write here instead.
+            return writer.write(batch, &mut self.runs);
         }
-        writer.finish()?;
-        // Return the memory to the pool, not just the items.
-        self.buffer = Vec::new();
-        self.reservation.reservation().release_all();
-        self.runs.push(path);
-        self.stats.runs += 1;
+        let spiller = self.spiller.get_or_insert_with(|| Spiller::start(writer));
+        let started = Instant::now();
+        let sent = spiller.sender.as_ref().map(|sender| sender.send(batch));
+        self.scratch.add_spill_wait(started.elapsed());
+        if !matches!(sent, Some(Ok(()))) {
+            let spiller = self.spiller.take().expect("spiller");
+            return Err(spiller.join().err().unwrap_or_else(|| {
+                Error::Inconsistent(format!("the {} spill thread stopped", self.owner.label()))
+            }));
+        }
         Ok(())
+    }
+}
+
+/// A full buffer and the memory it holds until it is written.
+struct Batch<T> {
+    items: Vec<T>,
+    reservation: Reservation,
+}
+
+impl<T> std::fmt::Debug for Batch<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Batch")
+            .field("items", &self.items.len())
+            .field("bytes", &self.reservation.bytes())
+            .finish()
+    }
+}
+
+/// What a spill needs, on whichever thread it runs.
+struct RunSpill {
+    scratch: Arc<Scratch>,
+    owner: Arc<Owner>,
+    budget: Arc<Budget>,
+    share_bytes: usize,
+    runs_written: Arc<AtomicU64>,
+}
+
+impl RunSpill {
+    /// Sort `batch` in place and write it as a run. When the ledger refuses
+    /// it even at the highest level, the runs written at lower levels are
+    /// merged at this one, freeing what the higher level saves chunk by
+    /// chunk as they are read, and the run is written again.
+    fn write<T: Spill + Ord + Send + Sync>(
+        &self,
+        mut batch: Batch<T>,
+        runs: &mut Vec<Run>,
+    ) -> Result<()> {
+        batch.items.par_sort_unstable();
+        let block = block_bytes(self.share_bytes);
+        let wave = (self.share_bytes / 8 / (2 * block)).clamp(1, rayon::current_num_threads());
+        let mut blocks = Reservation::empty(&self.budget);
+        if !blocks.try_grow(wave * 2 * block) {
+            blocks.force_grow(2 * block);
+        }
+        let wave = (blocks.bytes() / (2 * block)).max(1);
+        loop {
+            match write_run(&self.scratch, &self.owner, &batch.items, block, wave) {
+                Ok(run) => {
+                    runs.push(run);
+                    self.runs_written.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(Failure::Full(shortfall)) => {
+                    let level = self.scratch.level();
+                    let (mut older, kept): (Vec<_>, Vec<_>) = std::mem::take(runs)
+                        .into_iter()
+                        .partition(|run| run.level < level);
+                    *runs = kept;
+                    if older.is_empty() {
+                        return Err(shortfall.into());
+                    }
+                    let fan_in = merge::fan_in(&older, self.share_bytes);
+                    while !older.is_empty() {
+                        let group = older.split_off(older.len().saturating_sub(fan_in));
+                        runs.push(merge::merge_into::<T>(
+                            &self.scratch,
+                            &self.owner,
+                            &self.budget,
+                            group,
+                        )?);
+                    }
+                }
+                Err(Failure::Error(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Code a sorted buffer into blocks of about `block` raw bytes, `wave` at a
+/// time compressed in parallel and written in order.
+fn write_run<T: Spill + Sync>(
+    scratch: &Arc<Scratch>,
+    owner: &Arc<Owner>,
+    items: &[T],
+    block: usize,
+    wave: usize,
+) -> std::result::Result<Run, Failure> {
+    let sample = &items[..items.len().min(64)];
+    let mut raw = Vec::new();
+    block::encode_block(sample, &mut raw);
+    let mut per_block = (block * sample.len() / raw.len().max(1)).max(1);
+    let mut writer = RunWriter::new(scratch, owner);
+    let mut position = 0;
+    while position < items.len() {
+        let end = items.len().min(position + per_block * wave);
+        let level = scratch.level();
+        let frames = items[position..end]
+            .par_chunks(per_block)
+            .map(|chunk| {
+                let mut raw = Vec::with_capacity(block + block / 4);
+                block::encode_block(chunk, &mut raw);
+                Frame::compress(raw, chunk.len(), level)
+            })
+            .collect::<Vec<_>>();
+        let (mut raw_bytes, mut count) = (0, 0);
+        for frame in frames {
+            let frame = frame?;
+            raw_bytes += frame.raw_len();
+            count += frame.items() as usize;
+            writer.write(frame)?;
+        }
+        per_block = (block * count / raw_bytes.max(1)).max(1);
+        position = end;
+    }
+    Ok(writer.finish())
+}
+
+/// The thread that writes a sorter's full buffers while the producer fills
+/// the next. The queue holds none: the producer waits while one is written,
+/// so at most two buffers, both reserved, exist at once.
+#[derive(Debug)]
+struct Spiller<T> {
+    sender: Option<SyncSender<Batch<T>>>,
+    thread: Option<JoinHandle<Result<Vec<Run>>>>,
+}
+
+impl<T: Spill + Ord + Send + Sync + 'static> Spiller<T> {
+    fn start(writer: RunSpill) -> Self {
+        let (sender, batches) = mpsc::sync_channel::<Batch<T>>(0);
+        let thread = std::thread::spawn(move || {
+            let mut runs = Vec::new();
+            for batch in batches {
+                writer.write(batch, &mut runs)?;
+            }
+            Ok(runs)
+        });
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    /// Wait for the last buffer to be written: every run, or why not.
+    fn join(mut self) -> Result<Vec<Run>> {
+        drop(self.sender.take());
+        self.thread
+            .take()
+            .expect("joined once")
+            .join()
+            .map_err(|_| Error::Inconsistent("a spill thread panicked".into()))?
+    }
+}
+
+impl<T> Drop for Spiller<T> {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -350,148 +457,43 @@ impl<T: Spill + Ord> Iterator for Sorted<T> {
     }
 }
 
-/// K-way merge over sorted run files.
-#[derive(Debug)]
-pub struct Merge<T> {
-    sources: Vec<SpoolReader<T>>,
-    heap: BinaryHeap<Reverse<HeapEntry<T>>>,
-    failed: bool,
-    /// Read buffers of the open runs.
-    _buffers: Reservation,
-}
-
-#[derive(Debug)]
-struct HeapEntry<T> {
-    item: T,
-    source: usize,
-}
-
-impl<T: Ord> PartialEq for HeapEntry<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-
-impl<T: Ord> Eq for HeapEntry<T> {}
-
-impl<T: Ord> PartialOrd for HeapEntry<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: Ord> Ord for HeapEntry<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.item
-            .cmp(&other.item)
-            .then_with(|| self.source.cmp(&other.source))
-    }
-}
-
-impl<T: Spill + Ord> Merge<T> {
-    /// Each run is read exactly once, so its file is deleted as soon as the
-    /// merge is dropped; at planet scale this frees scratch disk between phases.
-    /// Read buffers are sized so all of them fit the sorter's share, between
-    /// [`MIN_MERGE_BUFFER_BYTES`] and [`IO_BUFFER_BYTES`] each. They are needed
-    /// to make progress, so they are reserved even when the pool is full.
-    fn open(runs: &[PathBuf], budget: &Arc<Budget>, share_bytes: usize) -> Result<Self> {
-        let buffer_bytes =
-            (share_bytes / runs.len().max(1)).clamp(MIN_MERGE_BUFFER_BYTES, IO_BUFFER_BYTES);
-        let mut buffers = Reservation::empty(budget);
-        if !buffers.try_grow(runs.len() * buffer_bytes) {
-            buffers.force_grow(runs.len() * buffer_bytes);
-        }
-        let mut sources = runs
-            .iter()
-            .map(|path| {
-                let mut reader = SpoolReader::open(path, buffer_bytes)?;
-                reader.remove_on_drop = true;
-                Ok(reader)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut heap = BinaryHeap::with_capacity(sources.len());
-        for (source, input) in sources.iter_mut().enumerate() {
-            if let Some(item) = input.next() {
-                heap.push(Reverse(HeapEntry {
-                    item: item?,
-                    source,
-                }));
-            }
-        }
-        Ok(Self {
-            sources,
-            heap,
-            failed: false,
-            _buffers: buffers,
-        })
-    }
-}
-
-impl<T: Spill + Ord> Iterator for Merge<T> {
-    type Item = Result<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        let Reverse(entry) = self.heap.pop()?;
-        match self.sources[entry.source].next() {
-            Some(Ok(item)) => self.heap.push(Reverse(HeapEntry {
-                item,
-                source: entry.source,
-            })),
-            Some(Err(error)) => {
-                self.failed = true;
-                return Some(Err(error));
-            }
-            None => {}
-        }
-        Some(Ok(entry.item))
-    }
-}
-
 /// Append-only scratch file replayed in write order.
 #[derive(Debug)]
 pub struct Spool<T> {
-    writer: SpoolWriter<T>,
-    path: PathBuf,
+    scratch: Arc<Scratch>,
+    stream: Stream<T>,
 }
 
 impl<T: Spill> Spool<T> {
     pub fn create(scratch: &Arc<Scratch>, label: &str) -> Result<Self> {
-        let path = scratch.new_file(label);
         Ok(Self {
-            writer: SpoolWriter::create(scratch, &path)?,
-            path,
+            scratch: Arc::clone(scratch),
+            stream: Stream::new(scratch, &scratch.owner(label)),
         })
     }
 
     pub fn write(&mut self, item: &T) -> Result<()> {
-        self.writer.write(item)
+        Ok(self.stream.push(item)?)
     }
 
     /// Items written so far.
     pub fn written(&self) -> u64 {
-        self.writer.items
+        self.stream.items
     }
 
-    /// Close the spool and read it back from the start. The file is removed
-    /// once the reader is dropped.
+    /// Close the spool and read it back from the start. Each chunk of the
+    /// file is removed once read.
     pub fn into_reader(self) -> Result<SpoolReader<T>> {
-        self.writer.finish()?;
-        let mut reader = SpoolReader::open(&self.path, IO_BUFFER_BYTES)?;
-        reader.remove_on_drop = true;
-        Ok(reader)
+        let run = self.stream.finish()?;
+        Ok(SpoolReader::new(&self.scratch, Cursor::consume(run)))
     }
 
     /// Close the spool to read it back as many times as needed. The file is
     /// removed once the [`SpoolFile`] is dropped.
     pub fn finish(self) -> Result<SpoolFile<T>> {
-        let items = self.writer.items;
-        self.writer.finish()?;
         Ok(SpoolFile {
-            path: self.path,
-            items,
+            run: self.stream.finish()?,
+            scratch: self.scratch,
             _marker: PhantomData,
         })
     }
@@ -500,78 +502,71 @@ impl<T: Spill> Spool<T> {
 /// A closed spool, read from the start by each [`SpoolFile::reader`].
 #[derive(Debug)]
 pub struct SpoolFile<T> {
-    path: PathBuf,
-    items: u64,
+    run: Run,
+    scratch: Arc<Scratch>,
     _marker: PhantomData<T>,
 }
 
 impl<T: Spill> SpoolFile<T> {
     pub fn reader(&self) -> Result<SpoolReader<T>> {
-        SpoolReader::open(&self.path, IO_BUFFER_BYTES)
+        Ok(SpoolReader::new(&self.scratch, Cursor::keep(&self.run)))
     }
 
     /// Items the spool holds.
     pub fn len(&self) -> u64 {
-        self.items
+        self.run.items
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items == 0
+        self.run.items == 0
     }
 }
 
-impl<T> Drop for SpoolFile<T> {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
+/// A spool read in order, its blocks read and decompressed ahead.
 #[derive(Debug)]
-struct SpoolWriter<T> {
-    file: BufWriter<File>,
-    scratch: Arc<Scratch>,
-    buffer: Vec<u8>,
-    items: u64,
-    /// Bytes written so far.
-    bytes: u64,
+pub struct SpoolReader<T> {
+    prefetch: Prefetch,
+    block: Option<Block>,
+    done: bool,
     _marker: PhantomData<T>,
 }
 
-impl<T: Spill> SpoolWriter<T> {
-    fn create(scratch: &Arc<Scratch>, path: &Path) -> Result<Self> {
-        let file = scratch.create_file(path).map_err(|source| Error::IoPath {
-            action: "failed to create scratch file",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Ok(Self {
-            file: BufWriter::with_capacity(IO_BUFFER_BYTES, file),
-            scratch: Arc::clone(scratch),
-            buffer: Vec::new(),
-            items: 0,
-            bytes: 0,
+impl<T: Spill> SpoolReader<T> {
+    fn new(scratch: &Arc<Scratch>, cursor: Cursor) -> Self {
+        Self {
+            prefetch: Prefetch::start(scratch, vec![cursor], 1),
+            block: None,
+            done: false,
             _marker: PhantomData,
-        })
+        }
     }
+}
 
-    fn write(&mut self, item: &T) -> Result<()> {
-        self.buffer.clear();
-        item.encode(&mut self.buffer);
-        let mut prefix = Vec::with_capacity(10);
-        put_u64(&mut prefix, self.buffer.len() as u64);
-        self.file.write_all(&prefix)?;
-        self.file.write_all(&self.buffer)?;
-        let bytes = (prefix.len() + self.buffer.len()) as u64;
-        self.scratch
-            .spilled_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-        self.items += 1;
-        self.bytes += bytes;
-        Ok(())
-    }
+impl<T: Spill> Iterator for SpoolReader<T> {
+    type Item = Result<T>;
 
-    fn finish(mut self) -> Result<()> {
-        Ok(self.file.flush()?)
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.done {
+            if let Some(block) = &mut self.block {
+                match block.next() {
+                    Some(Ok(item)) => return Some(Ok(item)),
+                    Some(Err(error)) => {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                    None => self.block = None,
+                }
+            }
+            match self.prefetch.next(0) {
+                Ok(Some(block)) => self.block = Some(block),
+                Ok(None) => self.done = true,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -579,50 +574,72 @@ impl<T: Spill> SpoolWriter<T> {
 /// often as needed.
 #[derive(Debug)]
 pub struct IndexedSpool<T> {
-    writer: SpoolWriter<T>,
-    path: PathBuf,
+    file: BufWriter<ScratchFile>,
+    bytes: u64,
     offsets: Vec<u64>,
+    buffer: Vec<u8>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Spill> IndexedSpool<T> {
     pub fn create(scratch: &Arc<Scratch>, label: &str) -> Result<Self> {
         let path = scratch.new_file(label);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::Decode("scratch file name is not UTF-8"))?;
         Ok(Self {
-            writer: SpoolWriter::create(scratch, &path)?,
-            path,
+            file: BufWriter::with_capacity(
+                IO_BUFFER_BYTES,
+                ScratchFile::create(scratch, label, name)?,
+            ),
+            bytes: 0,
             offsets: Vec::new(),
+            buffer: Vec::new(),
+            _marker: PhantomData,
         })
     }
 
     pub fn write(&mut self, item: &T) -> Result<()> {
-        self.offsets.push(self.writer.bytes);
-        self.writer.write(item)
+        self.offsets.push(self.bytes);
+        self.buffer.clear();
+        item.encode(&mut self.buffer);
+        let mut prefix = Vec::with_capacity(10);
+        put_u64(&mut prefix, self.buffer.len() as u64);
+        self.file.write_all(&prefix)?;
+        self.file.write_all(&self.buffer)?;
+        self.bytes += (prefix.len() + self.buffer.len()) as u64;
+        Ok(())
     }
 
     /// Bytes written so far.
     pub fn bytes(&self) -> u64 {
-        self.writer.bytes
+        self.bytes
     }
 
     /// Close the file and map it to read items by index. The file is
     /// removed once the [`IndexedSpoolFile`] is dropped.
     pub fn finish(self) -> Result<IndexedSpoolFile<T>> {
-        self.writer.finish()?;
-        let file = File::open(&self.path).map_err(|source| Error::IoPath {
+        let file = self
+            .file
+            .into_inner()
+            .map_err(|error| Error::Io(error.into_error()))?;
+        let path = file.path().to_path_buf();
+        let read = File::open(&path).map_err(|source| Error::IoPath {
             action: "failed to open scratch file",
-            path: self.path.clone(),
+            path: path.clone(),
             source,
         })?;
         // SAFETY: the scratch file is this build's own and is not written
         // again while mapped.
-        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| Error::IoPath {
+        let map = unsafe { memmap2::Mmap::map(&read) }.map_err(|source| Error::IoPath {
             action: "failed to map scratch file",
-            path: self.path.clone(),
+            path,
             source,
         })?;
         Ok(IndexedSpoolFile {
             map: Some(map),
-            path: self.path,
+            file,
             offsets: self.offsets,
             _marker: PhantomData,
         })
@@ -634,7 +651,7 @@ impl<T: Spill> IndexedSpool<T> {
 pub struct IndexedSpoolFile<T> {
     /// Taken before the file is removed: Windows cannot remove a mapped file.
     map: Option<memmap2::Mmap>,
-    path: PathBuf,
+    file: ScratchFile,
     offsets: Vec<u64>,
     _marker: PhantomData<T>,
 }
@@ -656,23 +673,21 @@ impl<T: Spill> IndexedSpoolFile<T> {
     /// Item `index`, decoded.
     pub fn get(&self, index: usize) -> Result<T> {
         let bytes = self.map.as_deref().unwrap_or_default();
+        let truncated = || Error::BadScratch {
+            path: self.file.path().to_path_buf(),
+            detail: "truncated",
+        };
         let mut input = usize::try_from(self.offsets[index])
             .ok()
             .and_then(|offset| bytes.get(offset..))
-            .ok_or(Error::BadScratch {
-                path: self.path.clone(),
-                detail: "truncated",
-            })?;
+            .ok_or_else(truncated)?;
         let len = usize::try_from(get_u64(&mut input)?)
             .map_err(|_| Error::Decode("scratch item too large"))?;
-        let mut item = input.get(..len).ok_or(Error::BadScratch {
-            path: self.path.clone(),
-            detail: "truncated",
-        })?;
+        let mut item = input.get(..len).ok_or_else(truncated)?;
         let value = T::decode(&mut item)?;
         if !item.is_empty() {
             return Err(Error::BadScratch {
-                path: self.path.clone(),
+                path: self.file.path().to_path_buf(),
                 detail: "item has trailing bytes",
             });
         }
@@ -683,124 +698,42 @@ impl<T: Spill> IndexedSpoolFile<T> {
 impl<T> Drop for IndexedSpoolFile<T> {
     fn drop(&mut self) {
         drop(self.map.take());
-        let _ = fs::remove_file(&self.path);
     }
 }
 
-#[derive(Debug)]
-pub struct SpoolReader<T> {
-    file: BufReader<File>,
-    path: PathBuf,
-    buffer: Vec<u8>,
-    remove_on_drop: bool,
-    _marker: PhantomData<T>,
-}
-
-impl<T: Spill> SpoolReader<T> {
-    fn open(path: &Path, buffer_bytes: usize) -> Result<Self> {
-        let file = File::open(path).map_err(|source| Error::IoPath {
-            action: "failed to open scratch file",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Ok(Self {
-            file: BufReader::with_capacity(buffer_bytes, file),
-            path: path.to_path_buf(),
-            buffer: Vec::new(),
-            remove_on_drop: false,
-            _marker: PhantomData,
-        })
-    }
-
-    fn read_item(&mut self) -> Result<Option<T>> {
-        let Some(len) = self.read_len()? else {
-            return Ok(None);
-        };
-        self.buffer.clear();
-        self.buffer.try_reserve_exact(len).map_err(|_| {
-            Error::OutOfResources(format!(
-                "scratch item of {len} bytes in {} does not fit in memory",
-                self.path.display()
-            ))
-        })?;
-        self.buffer.resize(len, 0);
-        self.file
-            .read_exact(&mut self.buffer)
-            .map_err(|_| Error::BadScratch {
-                path: self.path.clone(),
-                detail: "truncated",
-            })?;
-        let mut input = self.buffer.as_slice();
-        let item = T::decode(&mut input)?;
-        if !input.is_empty() {
-            return Err(Error::BadScratch {
-                path: self.path.clone(),
-                detail: "item has trailing bytes",
-            });
-        }
-        Ok(Some(item))
-    }
-
-    /// Length prefix of the next item, or `None` at a clean end of file.
-    fn read_len(&mut self) -> Result<Option<usize>> {
-        let mut prefix = [0u8; 10];
-        let mut used = 0;
-        loop {
-            let mut byte = [0u8; 1];
-            if self.file.read(&mut byte)? == 0 {
-                if used == 0 {
-                    return Ok(None);
-                }
-                return Err(Error::BadScratch {
-                    path: self.path.clone(),
-                    detail: "truncated length prefix",
-                });
-            }
-            prefix[used] = byte[0];
-            used += 1;
-            if byte[0] & 0x80 == 0 {
-                break;
-            }
-            if used == prefix.len() {
-                return Err(Error::BadScratch {
-                    path: self.path.clone(),
-                    detail: "invalid length prefix",
-                });
-            }
-        }
-        let len = get_u64(&mut &prefix[..used])?;
-        Ok(Some(
-            usize::try_from(len).map_err(|_| Error::Decode("scratch item too large"))?,
-        ))
-    }
-}
-
-impl<T: Spill> Iterator for SpoolReader<T> {
-    type Item = Result<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.read_item().transpose()
-    }
-}
-
-impl<T> Drop for SpoolReader<T> {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
+/// Unsigned tuples, the first value coded against the one before: it leads
+/// the sort.
 macro_rules! spill_tuple_of_unsigned {
-    ($($name:ident: $ty:ty),+) => {
-        impl Spill for ($($ty,)+) {
+    ($first:ident: $first_ty:ty, $($name:ident: $ty:ty),+) => {
+        impl Spill for ($first_ty, $($ty,)+) {
             fn encode(&self, out: &mut Vec<u8>) {
-                let ($($name,)+) = *self;
+                let ($first, $($name,)+) = *self;
+                put_u64(out, u64::from($first));
                 $(put_u64(out, u64::from($name));)+
             }
 
             fn decode(input: &mut &[u8]) -> Result<Self> {
-                Ok(($(<$ty>::try_from(get_u64(input)?).map_err(|_| $crate::error::Error::Decode("scratch value out of range"))?,)+))
+                Ok((
+                    <$first_ty>::try_from(get_u64(input)?)
+                        .map_err(|_| Error::Decode("scratch value out of range"))?,
+                    $(<$ty>::try_from(get_u64(input)?)
+                        .map_err(|_| Error::Decode("scratch value out of range"))?,)+
+                ))
+            }
+
+            fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+                let ($first, $($name,)+) = *self;
+                put_delta(out, delta, u64::from($first) as i64);
+                $(put_u64(out, u64::from($name));)+
+            }
+
+            fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+                Ok((
+                    <$first_ty>::try_from(get_delta(input, delta)? as u64)
+                        .map_err(|_| Error::Decode("scratch value out of range"))?,
+                    $(<$ty>::try_from(get_u64(input)?)
+                        .map_err(|_| Error::Decode("scratch value out of range"))?,)+
+                ))
             }
         }
     };
@@ -811,7 +744,10 @@ spill_tuple_of_unsigned!(a: u64, b: u8, c: u64);
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::util::codec::{get_string, put_str};
 
     fn scratch(name: &str) -> Arc<Scratch> {
         Scratch::create(std::env::temp_dir().join(format!(
@@ -833,6 +769,14 @@ mod tests {
             .collect()
     }
 
+    fn sorted<T: Spill + Ord>(sorted: Sorted<T>) -> Vec<T> {
+        sorted.collect::<Result<Vec<_>>>().expect("items")
+    }
+
+    fn files(scratch: &Scratch) -> usize {
+        fs::read_dir(scratch.path()).expect("scratch").count()
+    }
+
     #[test]
     fn in_memory_sort_writes_no_runs() {
         let scratch = scratch("memory");
@@ -842,11 +786,7 @@ mod tests {
             sorter.push(*item).expect("push");
         }
         assert_eq!(sorter.stats().runs, 0);
-        let sorted = sorter
-            .finish()
-            .expect("finish")
-            .collect::<Result<Vec<_>>>()
-            .expect("items");
+        let sorted = sorted(sorter.finish().expect("finish"));
         let mut expected = input;
         expected.sort();
         assert_eq!(sorted, expected);
@@ -854,25 +794,126 @@ mod tests {
     }
 
     #[test]
-    fn tiny_budget_spills_many_runs_and_merges_in_rounds() {
+    fn a_tiny_share_spills_many_runs_and_merges_them_twice() {
         let scratch = scratch("spill");
-        // Each item counts 16 bytes, so this spills every 50 items: 400 runs,
-        // more than one merge round.
-        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 50 * 16);
-        let input = pseudo_random(20_000);
+        let item = std::mem::size_of::<(u64, u64)>();
+        // Buffers of a few hundred items: well over a hundred runs, and a
+        // share that reads only a few at once.
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 400 * item);
+        let input = pseudo_random(50_000);
         for item in &input {
             sorter.push(*item).expect("push");
         }
-        assert!(sorter.stats().runs as usize > MAX_MERGE_FAN_IN);
-        let sorted = sorter
-            .finish()
-            .expect("finish")
+        let sorted = {
+            let finished = sorter.finish().expect("finish");
+            let runs = scratch.owner("pairs").traffic().runs;
+            assert!(runs > 100, "{runs} runs");
+            sorted(finished)
+        };
+        let mut expected = input;
+        expected.sort();
+        assert_eq!(sorted, expected);
+        let traffic = scratch.owner("pairs").traffic();
+        assert!(traffic.merge_passes >= 2, "{traffic:?}");
+        assert_eq!(traffic.live_bytes, 0);
+        assert_eq!(files(&scratch), 0);
+    }
+
+    #[test]
+    fn many_runs_merge_in_one_pass_when_their_buffers_fit() {
+        let scratch = scratch("one-pass");
+        let budget = Budget::unlimited();
+        let owner = scratch.owner("pairs");
+        let input = pseudo_random(50_000);
+        let runs = input
+            .chunks(250)
+            .map(|chunk| {
+                let mut chunk = chunk.to_vec();
+                chunk.sort();
+                write_run(&scratch, &owner, &chunk, MIN_BLOCK_BYTES, 1).expect("run")
+            })
+            .collect::<Vec<_>>();
+        let fan_in = merge::fan_in(&runs, 64 << 20);
+        assert!(fan_in > runs.len());
+        let runs = merge::premerge::<(u64, u64)>(&scratch, &owner, &budget, runs, fan_in)
+            .expect("premerge");
+        assert_eq!(runs.len(), 200);
+        let merged = Merge::<(u64, u64)>::open(&scratch, runs, &budget)
+            .expect("merge")
             .collect::<Result<Vec<_>>>()
             .expect("items");
         let mut expected = input;
         expected.sort();
-        assert_eq!(sorted, expected);
-        assert!(scratch.spilled_bytes() > 0);
+        assert_eq!(merged, expected);
+        let traffic = owner.traffic();
+        assert_eq!(traffic.merges, 0);
+        assert_eq!(traffic.items_read, 50_000);
+        assert_eq!(traffic.live_bytes, 0);
+        assert_eq!(files(&scratch), 0);
+    }
+
+    #[test]
+    fn a_capped_fan_in_merges_the_smallest_runs_first() {
+        let scratch = scratch("capped");
+        let budget = Budget::unlimited();
+        let owner = scratch.owner("pairs");
+        let input = pseudo_random(30_000);
+        let runs = input
+            .chunks(1_000)
+            .map(|chunk| {
+                let mut chunk = chunk.to_vec();
+                chunk.sort();
+                write_run(&scratch, &owner, &chunk, MIN_BLOCK_BYTES, 1).expect("run")
+            })
+            .collect::<Vec<_>>();
+        // Three runs at once: 30 runs merge 2 first, then 3 at a time.
+        let share = 3 * runs
+            .iter()
+            .map(Run::read_bytes)
+            .max()
+            .expect("runs")
+            .max(64 << 10);
+        let fan_in = merge::fan_in(&runs, share);
+        assert_eq!(fan_in, 3);
+        let runs = merge::premerge::<(u64, u64)>(&scratch, &owner, &budget, runs, fan_in)
+            .expect("premerge");
+        assert_eq!(runs.len(), 3);
+        let traffic = owner.traffic();
+        assert_eq!(traffic.merges, 14);
+        assert_eq!(traffic.max_fan_in, 3);
+        let merged = Merge::<(u64, u64)>::open(&scratch, runs, &budget)
+            .expect("merge")
+            .collect::<Result<Vec<_>>>()
+            .expect("items");
+        let mut expected = input;
+        expected.sort();
+        assert_eq!(merged, expected);
+        assert_eq!(owner.traffic().live_bytes, 0);
+        assert_eq!(files(&scratch), 0);
+    }
+
+    #[test]
+    fn a_run_is_removed_as_soon_as_it_is_exhausted() {
+        let scratch = scratch("exhausted");
+        let budget = Budget::unlimited();
+        let owner = scratch.owner("pairs");
+        let low = (0..100u64).map(|key| (key, 0)).collect::<Vec<_>>();
+        // Many blocks, more than are read ahead.
+        let high = (1_000..60_000u64).map(|key| (key, 0)).collect::<Vec<_>>();
+        let runs = [&low, &high, &high]
+            .into_iter()
+            .map(|items| write_run(&scratch, &owner, items, MIN_BLOCK_BYTES, 1).expect("run"))
+            .collect::<Vec<_>>();
+        assert_eq!(files(&scratch), 3);
+        let mut merge = Merge::<(u64, u64)>::open(&scratch, runs, &budget).expect("merge");
+        for _ in 0..100 {
+            merge.next().expect("item").expect("item");
+        }
+        // The low run's last item came out: its file went with it.
+        assert_eq!(files(&scratch), 2);
+        assert_eq!(merge.count(), 2 * 59_000);
+        assert_eq!(files(&scratch), 0);
+        assert_eq!(scratch.live_bytes(), 0);
     }
 
     #[test]
@@ -896,19 +937,8 @@ mod tests {
         );
         assert!(first.stats().runs > 0 && second.stats().runs > 0);
         let first = first.finish().expect("finish");
-        // A spilled sorter writes its tail out: only read buffers stay reserved.
-        assert_eq!(
-            budget.used(),
-            first_runs_buffers(&first) + second.reservation.bytes()
-        );
-        let mut merged = first.collect::<Result<Vec<_>>>().expect("first");
-        merged.extend(
-            second
-                .finish()
-                .expect("finish")
-                .collect::<Result<Vec<_>>>()
-                .expect("second"),
-        );
+        let mut merged = sorted(first);
+        merged.extend(sorted(second.finish().expect("finish")));
         merged.sort();
         let mut expected = input;
         expected.sort();
@@ -916,97 +946,105 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    fn first_runs_buffers<T>(sorted: &Sorted<T>) -> usize {
-        match sorted {
-            Sorted::Memory(..) => 0,
-            Sorted::Merge(merge) => merge._buffers.bytes(),
-        }
-    }
-
     #[test]
-    fn run_files_are_removed_once_merged() {
-        let scratch = scratch("cleanup");
-        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 10 * 16);
-        for item in pseudo_random(1_000) {
+    fn a_finished_spilled_sorter_holds_only_read_buffers() {
+        let scratch = scratch("finished");
+        let budget = Budget::unlimited();
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &budget, 10_000);
+        for item in pseudo_random(20_000) {
             sorter.push(item).expect("push");
         }
-        let files = || fs::read_dir(scratch.path()).expect("scratch").count();
-        assert!(files() > 0);
-        let sorted = sorter.finish().expect("finish");
-        assert_eq!(sorted.count(), 1_000);
-        assert_eq!(files(), 0);
+        let finished = sorter.finish().expect("finish");
+        match &finished {
+            Sorted::Merge(merge) => assert_eq!(budget.used(), merge.buffer_bytes()),
+            Sorted::Memory(..) => panic!("spilled"),
+        }
+        assert_eq!(finished.count(), 20_000);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
-    fn equal_keys_keep_insertion_order_across_runs() {
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        struct Keyed {
-            key: u64,
-            payload: u64,
-        }
-        impl PartialOrd for Keyed {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for Keyed {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.key.cmp(&other.key)
-            }
-        }
-        impl Spill for Keyed {
-            fn encode(&self, out: &mut Vec<u8>) {
-                put_u64(out, self.key);
-                put_u64(out, self.payload);
-            }
-            fn decode(input: &mut &[u8]) -> Result<Self> {
-                Ok(Self {
-                    key: get_u64(input)?,
-                    payload: get_u64(input)?,
-                })
-            }
-        }
-
-        let scratch = scratch("stable");
-        let mut sorter = ExternalSorter::new(
-            &scratch,
-            "keyed",
-            &Budget::unlimited(),
-            7 * std::mem::size_of::<Keyed>(),
+    fn runs_are_compressed_and_their_keys_delta_coded() {
+        let scratch = scratch("compressed");
+        let owner = scratch.owner("pairs");
+        let items = (0..100_000u64)
+            .map(|index| (1_000_000_000 + index * 3, index % 7))
+            .collect::<Vec<_>>();
+        let run = write_run(&scratch, &owner, &items, BLOCK_BYTES, 4).expect("run");
+        let traffic = owner.traffic();
+        // Plain varints take 5 + 1 bytes an item; deltas 1 + 1, but for the
+        // first of each block.
+        assert!(
+            traffic.raw_written_bytes <= 2 * 100_000 + 4 * 8,
+            "{traffic:?}"
         );
-        for payload in 0..1_000 {
-            sorter
-                .push(Keyed {
-                    key: payload % 3,
-                    payload,
-                })
-                .expect("push");
-        }
-        let sorted = sorter
-            .finish()
-            .expect("finish")
+        assert!(
+            traffic.written_bytes * 4 < traffic.raw_written_bytes,
+            "{traffic:?}"
+        );
+        assert_eq!(run.items, 100_000);
+        assert_eq!(scratch.spilled_bytes(), traffic.written_bytes);
+        let back = Merge::<(u64, u64)>::open(&scratch, vec![run], &Budget::unlimited())
+            .expect("merge")
             .collect::<Result<Vec<_>>>()
             .expect("items");
-        for pair in sorted.windows(2) {
-            if pair[0].key == pair[1].key {
-                assert!(pair[0].payload < pair[1].payload);
-            }
-        }
+        assert_eq!(back, items);
+        assert_eq!(owner.traffic().raw_read_bytes, traffic.raw_written_bytes);
     }
 
     #[test]
     fn spool_replays_in_write_order_and_cleans_up() {
         let scratch = scratch("spool");
         let mut spool = Spool::create(&scratch, "items").expect("spool");
+        let items = pseudo_random(200_000);
+        for item in &items {
+            spool.write(item).expect("write");
+        }
+        assert_eq!(spool.written(), 200_000);
+        let back = spool
+            .into_reader()
+            .expect("reader")
+            .collect::<Result<Vec<_>>>()
+            .expect("items");
+        assert_eq!(back, items);
+        assert_eq!(files(&scratch), 0);
+        assert_eq!(scratch.live_bytes(), 0);
+    }
+
+    #[test]
+    fn a_spool_file_reads_back_as_often_as_needed() {
+        let scratch = scratch("spool-file");
+        let mut spool = Spool::create(&scratch, "items").expect("spool");
         for item in [(3u64, 1u64), (1, 2), (2, 3)] {
             spool.write(&item).expect("write");
         }
-        assert_eq!(spool.written(), 3);
-        let reader = spool.into_reader().expect("reader");
-        let path = reader.path.clone();
-        let items = reader.collect::<Result<Vec<_>>>().expect("items");
-        assert_eq!(items, vec![(3, 1), (1, 2), (2, 3)]);
-        assert!(!path.exists());
+        let file = spool.finish().expect("finish");
+        for _ in 0..2 {
+            let items = file
+                .reader()
+                .expect("reader")
+                .collect::<Result<Vec<_>>>()
+                .expect("items");
+            assert_eq!(items, vec![(3, 1), (1, 2), (2, 3)]);
+        }
+        assert_eq!(file.len(), 3);
+        drop(file);
+        assert_eq!(files(&scratch), 0);
+    }
+
+    #[test]
+    fn an_indexed_spool_reads_any_item_and_counts_its_disk() {
+        let scratch = scratch("indexed");
+        let mut spool = IndexedSpool::create(&scratch, "indexed").expect("spool");
+        for item in pseudo_random(1_000) {
+            spool.write(&item).expect("write");
+        }
+        let file = spool.finish().expect("finish");
+        assert_eq!(file.get(999).expect("item"), pseudo_random(1_000)[999]);
+        assert_eq!(scratch.live_bytes(), file.bytes());
+        drop(file);
+        assert_eq!(scratch.live_bytes(), 0);
+        assert_eq!(files(&scratch), 0);
     }
 
     #[test]
@@ -1018,5 +1056,207 @@ mod tests {
         drop(spool);
         drop(scratch);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_ledger_refuses_past_its_budget_and_says_what_is_live() {
+        let scratch = scratch("ledger");
+        scratch.set_budget(Some(10 << 20));
+        scratch.set_stage("write records");
+        let records = scratch.owner("records");
+        let text = scratch.owner("text-index");
+        scratch.reserve(&records, 6 << 20).expect("fits");
+        scratch.reserve(&text, 3 << 20).expect("fits");
+        let refused = scratch
+            .reserve(&records, 2 << 20)
+            .expect_err("over budget")
+            .message;
+        for part in [
+            "stage write records",
+            "records needs 2 MiB",
+            "9 MiB is live",
+            "records 6 MiB",
+            "text-index 3 MiB",
+            "scratch budget of 10 MiB",
+            "it would fit in 11 MiB",
+        ] {
+            assert!(refused.contains(part), "{part:?} not in {refused}");
+        }
+        scratch.release(&records, 6 << 20);
+        assert_eq!(scratch.peak_bytes(), 9 << 20);
+        assert_eq!(scratch.peak_owners().get("records"), Some(&(6 << 20)));
+        scratch.reserve(&records, 2 << 20).expect("fits once freed");
+        assert_eq!(records.traffic().peak_bytes, 6 << 20);
+    }
+
+    #[test]
+    fn levels_rise_step_by_step_to_the_highest() {
+        let scratch = scratch("levels");
+        assert_eq!(scratch.level(), 1);
+        let mut seen = vec![scratch.level()];
+        while scratch.raise_level(scratch.level()) {
+            seen.push(scratch.level());
+        }
+        assert_eq!(seen, [1, 3, 6, 9]);
+        // A writer that saw an older level does not lower it.
+        assert!(scratch.raise_level(1));
+        assert_eq!(scratch.level(), 9);
+    }
+
+    #[test]
+    fn a_watched_directory_counts_and_can_fail_the_next_reservation() {
+        let scratch = scratch("watched");
+        let directory = scratch.path().join("text");
+        fs::create_dir_all(directory.join("segment")).expect("dir");
+        fs::write(directory.join("meta.json"), vec![0; 1_000]).expect("file");
+        fs::write(directory.join("segment").join("a.idx"), vec![0; 3_000]).expect("file");
+        scratch.watch("text-index", &directory);
+        assert_eq!(scratch.live_bytes(), 4_000);
+        scratch.set_budget(Some(4_500));
+        assert!(scratch.reserve(&scratch.owner("records"), 1_000).is_err());
+        fs::remove_dir_all(&directory).expect("remove");
+        scratch.unwatch(&directory);
+        assert_eq!(scratch.live_bytes(), 0);
+        scratch
+            .reserve(&scratch.owner("records"), 1_000)
+            .expect("fits");
+    }
+
+    /// Text compressing better at higher zstd levels than at level 1.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Line {
+        key: u64,
+        text: String,
+    }
+
+    impl Spill for Line {
+        fn encode(&self, out: &mut Vec<u8>) {
+            put_u64(out, self.key);
+            put_str(out, &self.text);
+        }
+
+        fn decode(input: &mut &[u8]) -> Result<Self> {
+            Ok(Self {
+                key: get_u64(input)?,
+                text: get_string(input)?,
+            })
+        }
+
+        fn resident_bytes(&self) -> usize {
+            std::mem::size_of::<Self>() + self.text.capacity()
+        }
+    }
+
+    fn lines(first: u64, count: u64) -> Vec<Line> {
+        const WORDS: [&str; 12] = [
+            "king", "street", "west", "avenue", "north", "road", "toronto", "ontario", "lane",
+            "drive", "court", "place",
+        ];
+        let mut state = first.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (first..first + count)
+            .map(|key| {
+                let text = (0..12)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        WORDS[(state % WORDS.len() as u64) as usize]
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Line { key, text }
+            })
+            .collect()
+    }
+
+    fn spill(scratch: &Arc<Scratch>, label: &str) -> RunSpill {
+        RunSpill {
+            scratch: Arc::clone(scratch),
+            owner: scratch.owner(label),
+            budget: Budget::unlimited(),
+            share_bytes: 64 << 20,
+            runs_written: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn batch(items: Vec<Line>) -> Batch<Line> {
+        Batch {
+            items,
+            reservation: Reservation::empty(&Budget::unlimited()),
+        }
+    }
+
+    /// Bytes `items` take as one run at `level`.
+    fn run_bytes(items: &[Line], level: i32) -> u64 {
+        let scratch = scratch("measure");
+        while scratch.level() < level {
+            scratch.raise_level(scratch.level());
+        }
+        let owner = scratch.owner("measure");
+        let block = block_bytes(64 << 20);
+        let wave = ((64 << 20) / 8 / (2 * block)).clamp(1, rayon::current_num_threads());
+        write_run(&scratch, &owner, items, block, wave)
+            .expect("run")
+            .bytes
+    }
+
+    #[test]
+    fn a_full_ledger_compresses_harder_then_merges_older_runs_at_that_level() {
+        let older = [lines(0, 4_000), lines(10_000, 4_000)];
+        let newer = lines(20_000, 30_000);
+        let older_fast = older.iter().map(|run| run_bytes(run, 1)).sum::<u64>();
+        let older_small = run_bytes(&older.concat(), 9);
+        let newer_small = run_bytes(&newer, 9);
+        let saved = older_fast - older_small;
+        // Room for the merged older runs while they are merged, but for the
+        // newer run only once the merge has saved its bytes.
+        let room = newer_small - saved / 2;
+        assert!(saved > 0 && room >= older_small + older_small / 10 && room < newer_small);
+
+        let scratch = scratch("degrade");
+        let writer = spill(&scratch, "lines");
+        let mut runs = Vec::new();
+        for run in &older {
+            writer
+                .write(batch(run.clone()), &mut runs)
+                .expect("older run");
+        }
+        assert!(runs.iter().all(|run| run.level == 1));
+        scratch.set_budget(Some(scratch.live_bytes() + room));
+        writer
+            .write(batch(newer.clone()), &mut runs)
+            .expect("fits after the merge");
+        assert_eq!(scratch.level(), 9);
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.level == 9));
+        let traffic = scratch.owner("lines").traffic();
+        assert_eq!(traffic.merges, 1);
+        let mut expected = older.concat();
+        expected.extend(newer);
+        let merged = Merge::<Line>::open(&scratch, runs, &Budget::unlimited())
+            .expect("merge")
+            .collect::<Result<Vec<_>>>()
+            .expect("items");
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn a_full_ledger_fails_early_with_what_would_fit() {
+        let scratch = scratch("full");
+        scratch.set_stage("scan OSM objects");
+        scratch.set_budget(Some(16 << 10));
+        let mut sorter = ExternalSorter::new(&scratch, "lines", &Budget::unlimited(), 1 << 20);
+        let failed = lines(0, 20_000)
+            .into_iter()
+            .try_for_each(|line| sorter.push(line))
+            .and_then(|()| sorter.finish().map(drop));
+        let Err(Error::OutOfResources(message)) = failed else {
+            panic!("expected the ledger to stop the sort, got {failed:?}");
+        };
+        assert!(message.contains("stage scan OSM objects"), "{message}");
+        assert!(message.contains("lines needs"), "{message}");
+        assert!(message.contains("--scratch-budget-mb"), "{message}");
+        assert_eq!(scratch.level(), 9);
+        assert_eq!(scratch.live_bytes(), 0);
     }
 }

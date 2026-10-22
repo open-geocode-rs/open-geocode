@@ -1115,6 +1115,7 @@ impl App {
                 inputs,
                 pack,
                 memory_budget_bytes: None,
+                scratch_budget_bytes: None,
                 force: self.force,
                 openaddresses: self.openaddresses && self.openaddresses_data().is_some(),
             },

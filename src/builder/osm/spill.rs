@@ -20,8 +20,9 @@ use crate::{
     },
     util::{
         codec::{
-            get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64,
-            put_i64, put_opt_str, put_str, put_tags, put_u64,
+            Delta, get_bytes, get_delta, get_front, get_i32, get_i64, get_opt_string, get_string,
+            get_tags, get_u8, get_u32, get_u64, put_bytes, put_delta, put_front, put_i64,
+            put_opt_str, put_str, put_tags, put_u64,
         },
         geo::line_parts,
     },
@@ -375,32 +376,47 @@ impl Ord for PendingStreet {
     }
 }
 
-impl Spill for PendingStreet {
-    fn encode(&self, out: &mut Vec<u8>) {
-        put_u64(out, self.order.len() as u64);
-        out.extend_from_slice(&self.order);
+impl PendingStreet {
+    fn encode_rest(&self, out: &mut Vec<u8>) {
         put_u64(out, self.name_len as u64);
         put_u64(out, self.seq);
         encode_record(out, &self.record);
     }
 
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        let len = usize::try_from(get_u64(input)?)?;
-        if input.len() < len {
-            return Err(Error::Decode("street sort key is truncated"));
-        }
-        let (order, rest) = input.split_at(len);
-        *input = rest;
+    fn decode_rest(order: Vec<u8>, input: &mut &[u8]) -> Result<Self> {
         let name_len = usize::try_from(get_u64(input)?)?;
-        if name_len > len {
+        if name_len > order.len() {
             return Err(Error::Decode("street name key is longer than its sort key"));
         }
         Ok(Self {
-            order: order.to_vec(),
+            order,
             name_len,
             seq: get_u64(input)?,
             record: decode_record(input)?,
         })
+    }
+}
+
+impl Spill for PendingStreet {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_bytes(out, &self.order);
+        self.encode_rest(out);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let order = get_bytes(input)?.to_vec();
+        Self::decode_rest(order, input)
+    }
+
+    /// Ways of one name sort together, so their keys share the name.
+    fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+        put_front(out, delta, &self.order);
+        self.encode_rest(out);
+    }
+
+    fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+        let order = get_front(input, delta)?.to_vec();
+        Self::decode_rest(order, input)
     }
 
     fn resident_bytes(&self) -> usize {
@@ -435,37 +451,53 @@ impl Ord for PendingAddress {
     }
 }
 
-impl Spill for PendingAddress {
-    fn encode(&self, out: &mut Vec<u8>) {
-        put_u64(out, self.order.len() as u64);
-        out.extend_from_slice(&self.order);
+impl PendingAddress {
+    fn encode_rest(&self, out: &mut Vec<u8>) {
         put_u64(out, self.street_len as u64);
         put_u64(out, self.group_len as u64);
         put_u64(out, self.seq);
         encode_record(out, &self.record);
     }
 
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        let len = usize::try_from(get_u64(input)?)?;
-        if input.len() < len {
-            return Err(Error::Decode("address sort key is truncated"));
-        }
-        let (order, rest) = input.split_at(len);
-        *input = rest;
+    fn decode_rest(order: Vec<u8>, input: &mut &[u8]) -> Result<Self> {
         let street_len = usize::try_from(get_u64(input)?)?;
         let group_len = usize::try_from(get_u64(input)?)?;
-        if street_len > group_len || group_len > len {
+        if street_len > group_len || group_len > order.len() {
             return Err(Error::Decode(
                 "address group key is longer than its sort key",
             ));
         }
         Ok(Self {
-            order: order.to_vec(),
+            order,
             street_len,
             group_len,
             seq: get_u64(input)?,
             record: decode_record(input)?,
         })
+    }
+}
+
+impl Spill for PendingAddress {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_bytes(out, &self.order);
+        self.encode_rest(out);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let order = get_bytes(input)?.to_vec();
+        Self::decode_rest(order, input)
+    }
+
+    /// The addresses of one street sort together, so their keys share the
+    /// cell, the street and most of what else they state.
+    fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+        put_front(out, delta, &self.order);
+        self.encode_rest(out);
+    }
+
+    fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+        let order = get_front(input, delta)?.to_vec();
+        Self::decode_rest(order, input)
     }
 
     fn resident_bytes(&self) -> usize {
@@ -487,9 +519,8 @@ impl Ord for PendingRecord {
     }
 }
 
-impl Spill for PendingRecord {
-    fn encode(&self, out: &mut Vec<u8>) {
-        put_u64(out, self.key);
+impl PendingRecord {
+    fn encode_rest(&self, out: &mut Vec<u8>) {
         put_u64(out, self.seq);
         match &self.origin {
             None => out.push(0),
@@ -505,9 +536,9 @@ impl Spill for PendingRecord {
         encode_record(out, &self.record);
     }
 
-    fn decode(input: &mut &[u8]) -> Result<Self> {
+    fn decode_rest(key: u64, input: &mut &[u8]) -> Result<Self> {
         Ok(Self {
-            key: get_u64(input)?,
+            key,
             seq: get_u64(input)?,
             origin: match get_u8(input)? {
                 0 => None,
@@ -517,6 +548,28 @@ impl Spill for PendingRecord {
             },
             record: decode_record(input)?,
         })
+    }
+}
+
+impl Spill for PendingRecord {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.key);
+        self.encode_rest(out);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        Self::decode_rest(get_u64(input)?, input)
+    }
+
+    /// Records sort along the Hilbert curve, so neighbouring keys differ by
+    /// little.
+    fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+        put_delta(out, delta, self.key as i64);
+        self.encode_rest(out);
+    }
+
+    fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+        Self::decode_rest(get_delta(input, delta)? as u64, input)
     }
 
     fn resident_bytes(&self) -> usize {

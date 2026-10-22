@@ -74,7 +74,6 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufWriter, Write},
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -86,7 +85,7 @@ use serde_json::{Value, json};
 use crate::{
     api::Address,
     container::{self, Bytes, Container},
-    extsort::Scratch,
+    extsort::{Scratch, ScratchFile},
     memory::{Budget, Reservation},
     pack::RecordId,
     parse::lattice::CountryCode,
@@ -336,12 +335,10 @@ impl Header {
 
 #[derive(Debug)]
 pub struct Writer {
-    blocks: BufWriter<File>,
-    blocks_path: PathBuf,
+    blocks: BufWriter<ScratchFile>,
     blocks_len: u64,
     /// Start of every block, streamed to scratch.
-    block_offsets: BufWriter<File>,
-    block_offsets_path: PathBuf,
+    block_offsets: BufWriter<ScratchFile>,
     /// Bodies of the open block, where each one that is not continued
     /// starts, and its slots so far.
     block: Vec<u8>,
@@ -423,10 +420,8 @@ struct StringTable {
     segments: Vec<(u64, u64)>,
     count: u64,
     bytes_len: u64,
-    bytes: BufWriter<File>,
-    bytes_path: PathBuf,
-    ends: BufWriter<File>,
-    ends_path: PathBuf,
+    bytes: BufWriter<ScratchFile>,
+    ends: BufWriter<ScratchFile>,
 }
 
 impl StringTable {
@@ -465,26 +460,16 @@ impl StringTable {
 
 impl Writer {
     pub fn create(scratch: &Arc<Scratch>, budget: &Arc<Budget>) -> Result<Self> {
-        let blocks_path = scratch.path().join("records-blocks.bin");
-        let block_offsets_path = scratch.path().join("records-block-offsets.bin");
-        let bytes_path = scratch.path().join("records-strings.bin");
-        let ends_path = scratch.path().join("records-string-ends.bin");
-        let create = |path: &PathBuf| -> Result<BufWriter<File>> {
+        let create = |name: &str| -> Result<BufWriter<ScratchFile>> {
             Ok(BufWriter::with_capacity(
                 1 << 20,
-                File::create(path).map_err(|source| Error::IoPath {
-                    action: "failed to create",
-                    path: path.clone(),
-                    source,
-                })?,
+                ScratchFile::create(scratch, "pack-records", name)?,
             ))
         };
         Ok(Self {
-            blocks: create(&blocks_path)?,
-            blocks_path,
+            blocks: create("records-blocks.bin")?,
             blocks_len: 0,
-            block_offsets: create(&block_offsets_path)?,
-            block_offsets_path,
+            block_offsets: create("records-block-offsets.bin")?,
             block: Vec::new(),
             block_starts: Vec::new(),
             block_slots: 0,
@@ -503,10 +488,8 @@ impl Writer {
                 segments: Vec::new(),
                 count: 0,
                 bytes_len: 0,
-                bytes: create(&bytes_path)?,
-                bytes_path,
-                ends: create(&ends_path)?,
-                ends_path,
+                bytes: create("records-strings.bin")?,
+                ends: create("records-string-ends.bin")?,
             },
             body: Vec::new(),
             run: None,
@@ -874,11 +857,15 @@ impl Writer {
 
         pack.begin(SECTION_INDEX, RECORDS_VERSION)?;
         pack.write_all(&self.record_count.to_le_bytes())?;
-        std::io::copy(&mut File::open(&self.block_offsets_path)?, pack)?;
+        std::io::copy(&mut File::open(self.block_offsets.get_ref().path())?, pack)?;
         pack.write_all(&self.blocks_len.to_le_bytes())?;
         pack.end()?;
 
-        pack.add_file(SECTION_BLOCKS, RECORDS_VERSION, &self.blocks_path)?;
+        pack.add_file(
+            SECTION_BLOCKS,
+            RECORDS_VERSION,
+            self.blocks.get_ref().path(),
+        )?;
 
         let mut datasets = Vec::new();
         put_u64(&mut datasets, self.datasets.len() as u64);
@@ -895,8 +882,8 @@ impl Writer {
             pack.write_all(&first_string.to_le_bytes())?;
         }
         pack.write_all(&strings.count.to_le_bytes())?;
-        std::io::copy(&mut File::open(&strings.ends_path)?, pack)?;
-        std::io::copy(&mut File::open(&strings.bytes_path)?, pack)?;
+        std::io::copy(&mut File::open(strings.ends.get_ref().path())?, pack)?;
+        std::io::copy(&mut File::open(strings.bytes.get_ref().path())?, pack)?;
         pack.end()
     }
 }

@@ -1272,6 +1272,9 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(span(status, DIM)),
     ];
+    if let Some(live) = progress.live.lock().expect("live lock").as_ref() {
+        lines.push(Line::from(span(format!("   {live}"), DIM)));
+    }
     if app.show_logs {
         lines.push(Line::raw(""));
         lines.push(Line::from(span(format!("   {}", step.explain[0]), DIM)));

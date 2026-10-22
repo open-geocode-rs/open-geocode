@@ -16,8 +16,8 @@ use std::{
 use anyhow::{Context, Result};
 use open_geocode::{
     builder::{
-        BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, StageUnit, build_planned_osm_pack,
-        plan_osm_build,
+        BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, LiveStage, StageUnit,
+        build_planned_osm_pack, plan_osm_build,
     },
     openaddresses::OpenAddresses,
 };
@@ -67,6 +67,8 @@ pub(crate) struct Progress {
     pub plan: Mutex<Option<BuildPlan>>,
     /// What the build warned about, in order.
     pub warnings: Mutex<Vec<String>>,
+    /// The running stage's throughput and what bounds it, as measured.
+    pub live: Mutex<Option<String>>,
 }
 
 impl Progress {
@@ -78,6 +80,7 @@ impl Progress {
             started: Instant::now(),
             plan: Mutex::new(None),
             warnings: Mutex::new(Vec::new()),
+            live: Mutex::new(None),
         })
     }
 
@@ -127,6 +130,9 @@ pub(crate) struct BuildRequest {
     /// Memory for the build's buffers; derived from what the machine can
     /// give when not set.
     pub memory_budget_bytes: Option<usize>,
+    /// The most scratch disk the build may hold at once; the scratch
+    /// volume's free space caps it either way.
+    pub scratch_budget_bytes: Option<u64>,
     /// Build even when the plan finds too little memory or disk.
     pub force: bool,
     /// Add the OpenAddresses points of the countries the Pack covers.
@@ -138,6 +144,8 @@ pub(crate) struct Built {
     pub pack: PackInfo,
     /// The build itself, without the download.
     pub build_secs: f64,
+    /// What each stage cost, as a table.
+    pub costs: String,
 }
 
 pub(crate) struct BuildJob {
@@ -402,6 +410,10 @@ impl BuildObserver for Observer {
             .expect("warnings lock")
             .push(message.to_string());
     }
+
+    fn measured(&self, live: &LiveStage) {
+        *self.progress.live.lock().expect("live lock") = (!live.finished).then(|| live.summary());
+    }
 }
 
 fn run(
@@ -457,6 +469,7 @@ fn run(
             .collect(),
         pack: request.pack.clone(),
         memory_budget_bytes: request.memory_budget_bytes,
+        scratch_budget_bytes: request.scratch_budget_bytes,
         force: request.force,
         input_sources: request
             .inputs
@@ -527,5 +540,9 @@ fn run(
             openaddresses: request.openaddresses,
         })?;
     }
-    Ok(Built { pack, build_secs })
+    Ok(Built {
+        pack,
+        build_secs,
+        costs: report.stage_table(),
+    })
 }

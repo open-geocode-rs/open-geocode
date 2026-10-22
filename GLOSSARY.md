@@ -91,3 +91,19 @@ _Avoid_: fallback
 How often an answer like this one is the record its query asks for, from 0 to 1, comparable across queries.
 It is read from what search knew of the answer (its pass, typo tier, accuracy, agreement, and its margin over the next answer) by a model fit per Pack to held-out addresses; a Pack never calibrated gives none.
 _Avoid_: score, probability (alone)
+
+## Building
+
+**Scratch**:
+The files a build writes beside the Pack and removes once it is done with them: sorted runs, spools and the Pack's sections before they are copied in.
+Every byte is counted as it is written, by the sorter, spool or writer that owns it.
+_Avoid_: temp files, spill (alone)
+
+**Scratch budget**:
+The most scratch a build may hold on disk at once, set with `--scratch-budget-mb` and never above what the scratch volume has free.
+Near it the build compresses its scratch harder and merges older runs to free space; past it the build stops early, naming the stage, what each owner holds and what would fit.
+_Avoid_: disk limit, quota
+
+**Bound**:
+The resource that held a build stage back, judged from what the stage measured: CPU, reading (the input or scratch), writing scratch, or waiting on something else.
+_Avoid_: bottleneck (alone)

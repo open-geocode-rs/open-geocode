@@ -127,6 +127,9 @@ pub struct BuildOsmOptions {
     pub memory_budget_bytes: Option<usize>,
     /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
+    /// The most scratch disk the build may hold at once. The scratch
+    /// volume's free space caps it whether set or not.
+    pub scratch_budget_bytes: Option<u64>,
     /// Build even when the pre-flight check finds too little memory or disk.
     pub force: bool,
     /// What the inputs are, for example region ids, kept in the build
@@ -152,6 +155,7 @@ impl Default for BuildOsmOptions {
             pack: PathBuf::new(),
             memory_budget_bytes: None,
             scratch_dir: None,
+            scratch_budget_bytes: None,
             force: false,
             input_sources: Vec::new(),
             observer: Arc::new(TerminalObserver::new()),
@@ -170,6 +174,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("pack", &self.pack)
             .field("memory_budget_bytes", &self.memory_budget_bytes)
             .field("scratch_dir", &self.scratch_dir)
+            .field("scratch_budget_bytes", &self.scratch_budget_bytes)
             .field("force", &self.force)
             .field("input_sources", &self.input_sources)
             .field("cancel", &self.cancel)
@@ -257,11 +262,13 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             scratch_dir: options.scratch_dir.clone(),
             memory: Arc::clone(&memory),
             text_index_memory_bytes: (budget / 2).max(1),
+            scratch_budget_bytes: options.scratch_budget_bytes,
         },
     )?;
     let scratch = Arc::clone(writer.scratch());
     scratch.cancel_on(Arc::clone(&options.cancel));
-    let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel));
+    let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel))
+        .metered(&scratch, &memory);
     // Spill files stay in the page cache while they fit in a quarter of what
     // the build leaves free: the rest keeps the Pack and the input it
     // rereads, and dirty pages the lazy writer holds back are not free.
@@ -511,6 +518,9 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             Ok(None)
         })?;
         progress.advance(imported.bytes);
+        progress
+            .input(&file.path)
+            .add(imported.bytes, std::time::Duration::ZERO);
         if !build.report.datasets.contains(&imported.dataset) {
             build.report.datasets.push(imported.dataset.clone());
         }
@@ -682,7 +692,6 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     report.phases.record_write_ms = phase.elapsed().as_millis();
 
     let phase = Instant::now();
-    report.scratch.spilled_bytes = scratch.spilled_bytes();
     report.scratch.peak_tracked_bytes = memory.peak() as u64;
     progress.start(BuildStage::Indexes, None)?;
     let (mut sealed, mut stats) = writer.seal()?;
@@ -708,8 +717,15 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             .sections
             .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
     }
+    report.scratch.spilled_bytes = scratch.spilled_bytes();
+    report.scratch.budget_bytes = scratch.budget();
+    report.scratch.peak_live_bytes = scratch.peak_bytes();
+    report.scratch.peak_owners = scratch.peak_owners();
+    report.scratch.zstd_level = scratch.level();
+    report.scratch.spills = scratch.traffic();
     drop(scratch);
     progress.finish(BuildStage::Parser);
+    report.stages = progress.stages();
     progress.check()?;
     report.parser_training = training;
     report.phases.parser_training_ms = phase.elapsed().as_millis();
@@ -2566,6 +2582,39 @@ mod tests {
             .count();
         assert!(spilling_sorters >= 4, "{:?}", spilled.scratch);
         assert!(spilled.scratch.spilled_bytes > 0);
+        // Every scratch byte was counted and returned: the peak names its
+        // owners, nothing is left live, and the Pack writer's files count.
+        let ledger = &spilled.scratch;
+        assert!(ledger.peak_live_bytes > 0 && !ledger.peak_owners.is_empty());
+        assert!(ledger.spills.values().all(|spill| spill.live_bytes == 0));
+        for owner in ["records", "pack-records", "pack-spatial", "pack-text"] {
+            let spill = &ledger.spills[owner];
+            assert!(spill.written_bytes > 0, "{owner}: {spill:?}");
+        }
+        let records = &ledger.spills["records"];
+        // Every run written, merged ones too, is read back once.
+        assert_eq!(records.items_read, records.items_written);
+        assert!(records.merge_passes >= 1);
+        // Each stage that ran is in the report, in order.
+        let stages = spilled
+            .stages
+            .iter()
+            .map(|stage| stage.stage.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            BuildStage::ALL
+                .iter()
+                .map(|stage| stage.description())
+                .collect::<Vec<_>>()
+        );
+        let scan = &spilled.stages[0];
+        assert_eq!(
+            scan.inputs.values().map(|read| read.bytes).sum::<u64>(),
+            spilled.input_bytes
+        );
+        assert_eq!(scan.units, spilled.input_bytes);
+        assert!(scan.wall_ms <= spilled.phases.total_ms as u64);
         assert_eq!(in_memory.accepted, spilled.accepted);
         assert_eq!(in_memory.rejected, spilled.rejected);
         assert_eq!(in_memory.triage, spilled.triage);
@@ -2586,6 +2635,29 @@ mod tests {
                 spilled.boundary_context(id).expect("spilled context")
             );
         }
+    }
+
+    #[test]
+    fn a_build_past_its_scratch_budget_stops_early_and_says_why() {
+        let dir = temp_dir("scratch-budget");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town_with_pois());
+        let failed = build_osm_pack(BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            memory_budget_bytes: Some(4),
+            scratch_budget_bytes: Some(1),
+            ..BuildOsmOptions::default()
+        });
+        let Err(Error::OutOfResources(message)) = failed else {
+            panic!("expected the scratch budget to stop the build, got {failed:?}");
+        };
+        assert!(
+            message.contains("scratch disk is full in stage scan OSM objects"),
+            "{message}"
+        );
+        assert!(message.contains("--scratch-budget-mb"), "{message}");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

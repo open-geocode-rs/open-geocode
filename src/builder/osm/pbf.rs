@@ -2,14 +2,15 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
     path::Path,
-    sync::mpsc,
+    sync::{Arc, mpsc},
+    time::Instant,
 };
 
 use crate::error::{Error, Result};
 use osmpbf::{Blob, BlobDecode, BlobReader, ByteOffset, PrimitiveBlock};
 use rayon::prelude::*;
 
-use crate::builder::progress::{BuildStage, Progress};
+use crate::builder::progress::{BuildStage, InputCounter, Progress};
 
 const READ_BUFFER_BYTES: usize = 4 << 20;
 /// Blobs decoded per parallel batch, per worker thread.
@@ -51,6 +52,7 @@ where
         ProgressReader {
             inner: file,
             progress: offsets.is_none().then(|| progress.clone()),
+            read: progress.input(input),
         },
     );
     let mut blobs = BlobReader::new_seekable(reader)?;
@@ -171,14 +173,19 @@ pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
     Ok(fs::metadata(input)?.len())
 }
 
+/// Counts what is read from the input, and the time it takes, for the
+/// build report; and advances the stage when it is measured in bytes.
 struct ProgressReader<R> {
     inner: R,
     progress: Option<Progress>,
+    read: Arc<InputCounter>,
 }
 
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let started = Instant::now();
         let bytes_read = self.inner.read(buffer)?;
+        self.read.add(bytes_read as u64, started.elapsed());
         if let Some(progress) = &self.progress {
             progress.advance(bytes_read as u64);
         }
