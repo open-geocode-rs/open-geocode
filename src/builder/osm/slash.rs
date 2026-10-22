@@ -14,12 +14,7 @@
 //! missing number is placed between its neighbours. Every other reading keeps
 //! the number as written.
 
-use crate::{
-    builder::report::SlashNumberCounts,
-    error::Result,
-    record::{AddressRecord, Record},
-    spatial_index::haversine_m,
-};
+use crate::{builder::report::SlashNumberCounts, error::Result, spatial_index::haversine_m};
 
 use super::spill::PendingAddress;
 
@@ -84,17 +79,6 @@ fn leading_number(value: &str) -> Option<u32> {
         return None;
     }
     value[..digits].parse().ok()
-}
-
-fn address(pending: &PendingAddress) -> &AddressRecord {
-    match &pending.record {
-        Record::Address(record) => record,
-        _ => unreachable!("a pending address holds an address"),
-    }
-}
-
-fn point(pending: &PendingAddress) -> Option<[f64; 2]> {
-    pending.record.display_point()
 }
 
 fn fit(slash: Slash<'_>, at: [f64; 2], plain: &[(u32, [f64; 2])]) -> Fit {
@@ -171,10 +155,7 @@ impl Votes {
 
 /// Read the slash numbers of one grid cell's addresses, given in street
 /// order, and leave them in street order again.
-pub(super) fn read_cell(
-    cell: &mut Vec<PendingAddress>,
-    counts: &mut SlashNumberCounts,
-) -> Result<()> {
+pub(super) fn read_cell(cell: &mut [PendingAddress], counts: &mut SlashNumberCounts) -> Result<()> {
     let mut groups = Vec::new();
     let mut start = 0;
     for index in 1..=cell.len() {
@@ -190,7 +171,7 @@ pub(super) fn read_cell(
     for (group_index, group) in groups.iter().enumerate() {
         if !cell[group.clone()]
             .iter()
-            .any(|pending| parse_slash(&address(pending).address.number).is_some())
+            .any(|pending| parse_slash(pending.fields().number).is_some())
         {
             continue;
         }
@@ -198,19 +179,17 @@ pub(super) fn read_cell(
             .iter()
             .filter_map(|pending| {
                 Some((
-                    leading_number(address(pending).address.number.trim())?,
-                    point(pending)?,
+                    leading_number(pending.fields().number.trim())?,
+                    pending.point,
                 ))
             })
             .collect::<Vec<_>>();
         for index in group.clone() {
-            let Some(slash) = parse_slash(&address(&cell[index]).address.number) else {
+            let fields = cell[index].fields();
+            let Some(slash) = parse_slash(fields.number) else {
                 continue;
             };
-            let found = match point(&cell[index]) {
-                Some(at) => fit(slash, at, &plain),
-                None => Fit::Alone,
-            };
+            let found = fit(slash, cell[index].point, &plain);
             street_votes[group_index].add(found);
             cell_votes.add(found);
             fits[index] = Some((group_index, found));
@@ -235,15 +214,16 @@ pub(super) fn read_cell(
         match reading {
             Some(Reading::UnitFirst) => {
                 counts.unit_first += 1;
-                let Record::Address(record) = &mut cell[index].record else {
-                    unreachable!("a pending address holds an address");
-                };
+                let mut address = cell[index].address();
                 let Slash { unit, number, .. } =
-                    parse_slash(&record.address.number).expect("a slash number");
+                    parse_slash(&address.number).expect("a slash number");
                 let (unit, number) = (unit.to_string(), number.to_string());
                 // An `addr:unit` tag names the flat as its mapper wrote it.
-                record.address.unit.get_or_insert(unit);
-                record.address.number = number;
+                address.unit.get_or_insert(unit);
+                address.number = number;
+                // The sort key holds the number, so a flat now sorts with
+                // its building.
+                cell[index] = cell[index].restated(&address);
                 changed = true;
             }
             Some(Reading::NumberFirst) => counts.number_first += 1,
@@ -251,12 +231,6 @@ pub(super) fn read_cell(
         }
     }
     if changed {
-        // The sort key holds the number, so a flat now sorts with its building.
-        let pending = std::mem::take(cell);
-        for address in pending {
-            let seq = address.seq;
-            cell.push(PendingAddress::new(address.into_address(), seq)?);
-        }
         cell.sort();
     }
     Ok(())
@@ -285,7 +259,9 @@ pub(super) fn read_slash_numbers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{AddressComponents, LocationPrecision, ObjectType, SourceProvenance};
+    use crate::record::{
+        AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
+    };
 
     fn pending(id: i64, number: &str, street: &str, lat: f64) -> PendingAddress {
         let record = AddressRecord {
@@ -308,7 +284,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, id),
         };
-        PendingAddress::new(record, id as u64).expect("pending")
+        PendingAddress::new(record, id as u64, 0).expect("pending")
     }
 
     /// Read one cell of `(number, street, lat)` and return each address's
@@ -325,8 +301,8 @@ mod tests {
         let numbers = cell
             .iter()
             .map(|pending| {
-                let address = &address(pending).address;
-                (address.number.clone(), address.unit.clone())
+                let address = pending.address();
+                (address.number, address.unit)
             })
             .collect();
         (numbers, counts)
@@ -443,15 +419,14 @@ mod tests {
             pending(1, "1367", "Eruera Street", -38.1383),
             pending(2, "10/1367", "Eruera Street", -38.1382),
         ];
-        let Record::Address(record) = &mut cell[1].record else {
-            unreachable!()
-        };
-        record.address.unit = Some("Flat 10".to_string());
+        let mut address = cell[1].address();
+        address.unit = Some("Flat 10".to_string());
+        cell[1] = cell[1].restated(&address);
         cell.sort();
         read_cell(&mut cell, &mut SlashNumberCounts::default()).expect("read");
         let units = cell
             .iter()
-            .map(|pending| address(pending).address.unit.clone())
+            .map(|pending| pending.address().unit)
             .collect::<Vec<_>>();
         assert!(units.contains(&Some("Flat 10".to_string())), "{units:?}");
     }
