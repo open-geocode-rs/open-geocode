@@ -1,16 +1,14 @@
 use std::collections::BTreeMap;
 
-use geojson::Geometry;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{
     parse::lattice::CountryCode,
-    record::{AddressComponents, DerivedSourceProvenance, PostcodeRecord, Record, point_geometry},
+    record::{DerivedSourceProvenance, PostcodeRecord, point_geometry},
     spatial_index::haversine_m,
-    util::geo::point_lon_lat,
 };
 
-use super::spill::PendingAddress;
+use super::spill::Fields;
 
 /// Member points kept per postcode. The kept points are the ones with the lowest
 /// hashes, so the sample is the same whatever order addresses come in, and the
@@ -33,17 +31,15 @@ struct Group {
 }
 
 impl Accumulator {
-    /// Count an accepted address in `country`.
+    /// Count an accepted address stating `postcode` at `point` in
+    /// `country`.
     pub(crate) fn accept(
         &mut self,
         country: Option<CountryCode>,
-        address: &AddressComponents,
-        geometry: &Geometry,
+        postcode: Option<&str>,
+        [lon, lat]: [f64; 2],
     ) {
-        let Some(postcode) = address.postcode.as_deref().and_then(clean_postcode) else {
-            return;
-        };
-        let Some([lon, lat]) = point_lon_lat(geometry) else {
+        let Some(postcode) = postcode.and_then(clean_postcode) else {
             return;
         };
         let group = self.groups.entry((country, postcode)).or_default();
@@ -73,28 +69,25 @@ pub(crate) struct Street {
 }
 
 impl Street {
-    pub(crate) fn lend(&mut self, pending: &mut PendingAddress) {
-        let key = &pending.order[..pending.street_len];
+    /// The postcodes lent to `address`, on the street of `key`: none when
+    /// it states one, names no street, or its street states none.
+    pub(crate) fn lend(&mut self, key: &[u8], address: &Fields<'_>) -> Option<&[String]> {
         if self.key != key {
             self.key = key.to_vec();
             self.postcodes.clear();
         }
-        let Record::Address(record) = &mut pending.record else {
-            unreachable!("a pending address holds an address");
-        };
         // No street, no street to borrow from: the key is the cell alone.
-        if record.address.subject().is_none() {
-            return;
-        }
-        match &record.address.postcode {
+        address.subject()?;
+        match address.postcode {
             Some(postcode) => {
                 if let Some(postcode) = clean_postcode(postcode)
                     && let Err(at) = self.postcodes.binary_search(&postcode)
                 {
                     self.postcodes.insert(at, postcode);
                 }
+                None
             }
-            None => record.street_postcodes.clone_from(&self.postcodes),
+            None => (!self.postcodes.is_empty()).then_some(&self.postcodes[..]),
         }
     }
 }
@@ -174,8 +167,8 @@ mod tests {
     #[test]
     fn derives_postcode_record_from_accepted_addresses() {
         let mut accumulator = Accumulator::default();
-        accumulator.accept(None, &address("m5v 2t6"), &point_geometry(-79.4, 43.6));
-        accumulator.accept(None, &address("M5V   2T6"), &point_geometry(-79.2, 43.8));
+        accumulator.accept(None, Some("m5v 2t6"), [-79.4, 43.6]);
+        accumulator.accept(None, Some("M5V   2T6"), [-79.2, 43.8]);
 
         assert_eq!(accumulator.len(), 1);
         let record = accumulator.into_records().next().expect("record");
@@ -204,7 +197,7 @@ mod tests {
                 ordered.reverse();
             }
             for (lon, lat) in ordered {
-                accumulator.accept(None, &address("M5V 2T6"), &point_geometry(lon, lat));
+                accumulator.accept(None, Some("M5V 2T6"), [lon, lat]);
             }
             let record = accumulator.into_records().next().expect("record");
             assert_eq!(record.source.record_count, 10);
@@ -224,11 +217,7 @@ mod tests {
     fn keeps_a_bounded_sample_per_postcode() {
         let mut accumulator = Accumulator::default();
         for step in 0..100 {
-            accumulator.accept(
-                None,
-                &address("M5V 2T6"),
-                &point_geometry(-79.0 + step as f64 * 0.001, 43.0),
-            );
+            accumulator.accept(None, Some("M5V 2T6"), [-79.0 + step as f64 * 0.001, 43.0]);
         }
         let group = &accumulator.groups[&(None, "M5V 2T6".to_string())];
         assert_eq!(group.sample.len(), SAMPLE_POINTS);
@@ -238,19 +227,5 @@ mod tests {
     #[test]
     fn skips_placeholder_postcodes_without_letters_or_numbers() {
         assert_eq!(clean_postcode("---"), None);
-    }
-
-    fn address(postcode: &str) -> AddressComponents {
-        AddressComponents {
-            areas: Vec::new(),
-            number: "1".to_string(),
-            street: Some("King Street".to_string()),
-            place: None,
-            unit: None,
-            locality: None,
-            region: None,
-            postcode: Some(postcode.to_string()),
-            country: None,
-        }
     }
 }

@@ -39,6 +39,7 @@
 mod address;
 pub(crate) use address::LOCALITY_KEYS;
 mod admin_levels;
+mod book;
 mod boundary;
 mod containment;
 mod emit;
@@ -83,7 +84,7 @@ use crate::{
             SorterReport,
         },
     },
-    extsort::{ExternalSorter, Scratch, Spool},
+    extsort::{ExternalSorter, Scratch, Sorted, Spool},
     memory::Budget,
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, REJECTIONS_FILE, RecordContext, RecordId, Writer,
@@ -94,18 +95,16 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{
-        AddressComponents, AddressRecord, OSM_DATASET, ObjectType, Record, RejectedRecord,
-        StreetRecord,
-    },
+    record::{OSM_DATASET, ObjectType, Record, RejectedRecord, StreetRecord},
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
     util::{fold::search_key, geo::point_lon_lat, hilbert::hilbert_key},
 };
+use book::{Book, BookFile};
 use boundary::{
-    BoundaryIndex, BoundaryRelationStub, BoundaryWay, ContextOrigin, Vertex, build_boundaries,
-    record_context,
+    BoundaryIndex, BoundaryRelationStub, BoundaryWay, ContextOrigin, SourceContext, Vertex,
+    build_boundaries, record_context,
 };
 use emitted::Emitted;
 pub(crate) use locations::{
@@ -116,7 +115,10 @@ use locations::{NodeSet, Slots};
 use pbf::for_each_block;
 pub use pbf::replication_timestamp;
 use scan::scan_block;
-use spill::{PendingAddress, PendingRecord, PendingStreet, WayKind};
+use spill::{
+    Body, Datasets, House, PendingAddress, PendingRecord, PendingStreet, PlacedAddress, Postcodes,
+    WayKind,
+};
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -312,6 +314,7 @@ pub fn build_planned_osm_pack(
             &memory,
             (budget / 16).max(1),
         ),
+        datasets: Datasets::default(),
         seq: 0,
     };
     build.report.scratch.memory_budget_bytes = plan.memory_budget_bytes;
@@ -442,8 +445,8 @@ pub fn build_planned_osm_pack(
         addresses,
         streets,
         context_records,
+        datasets,
         mut seq,
-        ..
     } = build;
 
     // Context records first: once their ids are known, the boundary index can
@@ -468,7 +471,8 @@ pub fn build_planned_osm_pack(
             }
             None => {}
         }
-        if let Record::Place(_, place) = &item.record
+        if let Body::Record(record) = &item.body
+            && let Record::Place(_, place) = record.as_ref()
             && street::is_settlement(&place.place_type)
         {
             match item.origin {
@@ -517,6 +521,7 @@ pub fn build_planned_osm_pack(
         ordered.into_reader()?,
         context_count,
         &index,
+        None,
         &progress,
         BuildStage::ContextRecords,
     )?;
@@ -540,29 +545,58 @@ pub fn build_planned_osm_pack(
     // Slash numbers are read before imported rows are matched against OSM
     // ones, so an OSM flat "10/1367" repeats an imported 1367 unit 10.
     let mut slash_numbers = SlashNumberCounts::default();
-    let addresses = if files.is_empty() {
-        addresses
+    let lent = Book::create(&scratch, "street-postcodes")?;
+    let (postcodes, book, lent) = if files.is_empty() {
+        let mut runs = AddressRuns::new(
+            &mut records,
+            &mut seq,
+            &index,
+            &country_codes,
+            lent,
+            Some(Book::create(&scratch, "address-book")?),
+        );
+        slash::read_slash_numbers(addresses.finish()?, &mut slash_numbers, |address| {
+            runs.push(address, None)
+        })?;
+        let (postcodes, lent, book) = runs.finish()?;
+        let book = book.expect("the addresses were written to the book");
+        (postcodes, book.finish()?, lent)
     } else {
-        drop_repeated_houses(
+        let (book, verdicts) = drop_repeated_houses(
             addresses,
             &scratch,
             &memory,
             budget,
+            &datasets,
             &mut report,
             &mut slash_numbers,
-        )?
-    };
-    let mut runs = AddressRuns::new(&mut records, &mut seq, &index, &country_codes);
-    if files.is_empty() {
-        slash::read_slash_numbers(addresses.finish()?, &mut slash_numbers, |address| {
-            runs.push(address)
-        })?;
-    } else {
-        for address in addresses.finish()? {
-            runs.push(address?)?;
+        )?;
+        let mut runs = AddressRuns::new(&mut records, &mut seq, &index, &country_codes, lent, None);
+        let mut verdicts = verdicts.peekable();
+        for (at, address) in book.items().enumerate() {
+            let (address, at) = (address?, at as u64);
+            let (mut dropped, mut disputed) = (false, false);
+            while let Some(verdict) =
+                verdicts.next_if(|verdict| !matches!(verdict, Ok((position, _)) if *position != at))
+            {
+                match verdict?.1 {
+                    DROPPED => dropped = true,
+                    DISPUTED => disputed = true,
+                    _ => return Err(Error::Decode("unknown house verdict")),
+                }
+            }
+            if !dropped {
+                runs.push(address, Some((at, disputed)))?;
+            }
         }
-    }
-    let postcodes = runs.finish()?;
+        let (postcodes, lent, _) = runs.finish()?;
+        (postcodes, book, lent)
+    };
+    let book = AddressBook {
+        addresses: book,
+        postcodes: lent.finish()?,
+        datasets,
+    };
     report.slash_numbers = slash_numbers;
     // Every address is placed, so each postcode's points are all known.
     let mut postcode_points = Vec::new();
@@ -576,7 +610,7 @@ pub fn build_planned_osm_pack(
             key: hilbert_key(quantize(lon)?, quantize(lat)?),
             seq,
             origin: None,
-            record: Record::Postcode(record),
+            body: Record::Postcode(record).into(),
         })?;
         seq += 1;
     }
@@ -591,10 +625,11 @@ pub fn build_planned_osm_pack(
         records.finish()?,
         record_stats.items,
         &index,
+        Some(&book),
         &progress,
         BuildStage::Records,
     )?;
-    drop(index);
+    drop((index, book));
     report.phases.record_write_ms = phase.elapsed().as_millis();
 
     let phase = Instant::now();
@@ -677,6 +712,8 @@ struct Build {
     streets: ExternalSorter<PendingStreet>,
     /// Places: everything a context tuple can point at.
     context_records: ExternalSorter<PendingRecord>,
+    /// The datasets of the imported addresses.
+    datasets: Datasets,
     seq: u64,
 }
 
@@ -700,10 +737,14 @@ impl Build {
 
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
         if let Record::Address(address) = record {
+            let dataset = match address.source.object_type {
+                ObjectType::Row => self.datasets.id(&address.source.dataset),
+                _ => 0,
+            };
             self.seq += 1;
             return self
                 .addresses
-                .push(PendingAddress::new(address, self.seq - 1)?);
+                .push(PendingAddress::new(address, self.seq - 1, dataset)?);
         }
         if let Record::Street(street) = record {
             self.seq += 1;
@@ -712,14 +753,15 @@ impl Build {
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
         })?;
+        let context = record.layer().is_context();
         let pending = PendingRecord {
             key: hilbert_key(quantize(lon)?, quantize(lat)?),
             seq: self.seq,
             origin,
-            record,
+            body: record.into(),
         };
         self.seq += 1;
-        if pending.record.layer().is_context() {
+        if context {
             self.context_records.push(pending)
         } else {
             self.records.push(pending)
@@ -731,7 +773,8 @@ impl Build {
 /// group placed in the Hilbert order by its first address, so the group
 /// stays one run for the record store and the text index to share what its
 /// addresses state; lent its street's postcodes when it states none; and
-/// counted toward its postcode's point in the country it lies in.
+/// counted toward its postcode's point in the country it lies in. The record
+/// sorter takes where each waits in the address book, not the address.
 struct AddressRuns<'a> {
     records: &'a mut ExternalSorter<PendingRecord>,
     seq: &'a mut u64,
@@ -739,7 +782,16 @@ struct AddressRuns<'a> {
     country_codes: &'a HashMap<RecordId, CountryCode>,
     street: postcode::Street,
     postcodes: postcode::Accumulator,
-    batch: Vec<PendingAddress>,
+    /// The postcodes lent to each street, and the street key and position
+    /// of the last street's.
+    lent: Book<Postcodes>,
+    lent_street: Option<(Vec<u8>, u64)>,
+    /// Where the addresses not yet in an address book are written as they
+    /// are placed.
+    book: Option<Book<PendingAddress>>,
+    /// Each address, and where it is in the book and whether it is disputed
+    /// when it is already there.
+    batch: Vec<(PendingAddress, Option<(u64, bool)>)>,
     /// The group key of the last address placed, its Hilbert key, and the
     /// country it lies in.
     group: Option<(Vec<u8>, u64, Option<CountryCode>)>,
@@ -751,6 +803,8 @@ impl<'a> AddressRuns<'a> {
         seq: &'a mut u64,
         index: &'a BoundaryIndex,
         country_codes: &'a HashMap<RecordId, CountryCode>,
+        lent: Book<Postcodes>,
+        book: Option<Book<PendingAddress>>,
     ) -> Self {
         Self {
             records,
@@ -759,22 +813,35 @@ impl<'a> AddressRuns<'a> {
             country_codes,
             street: postcode::Street::default(),
             postcodes: postcode::Accumulator::default(),
+            lent,
+            lent_street: None,
+            book,
             batch: Vec::new(),
             group: None,
         }
     }
 
-    fn push(&mut self, address: PendingAddress) -> Result<()> {
-        self.batch.push(address);
+    /// Place `address`: `shelved` says where it is in the address book and
+    /// whether it is disputed, or it is written to this one's book.
+    fn push(&mut self, address: PendingAddress, shelved: Option<(u64, bool)>) -> Result<()> {
+        self.batch.push((address, shelved));
         if self.batch.len() == WRITE_BATCH_RECORDS {
             self.place_batch()?;
         }
         Ok(())
     }
 
-    fn finish(mut self) -> Result<postcode::Accumulator> {
+    /// The postcode points, the street postcodes lent, and the book the
+    /// addresses were written to, if they were.
+    fn finish(
+        mut self,
+    ) -> Result<(
+        postcode::Accumulator,
+        Book<Postcodes>,
+        Option<Book<PendingAddress>>,
+    )> {
         self.place_batch()?;
-        Ok(self.postcodes)
+        Ok((self.postcodes, self.lent, self.book))
     }
 
     fn place_batch(&mut self) -> Result<()> {
@@ -782,12 +849,12 @@ impl<'a> AddressRuns<'a> {
         let starts = batch
             .iter()
             .enumerate()
-            .map(|(at, address)| match at {
+            .map(|(at, (address, _))| match at {
                 0 => self
                     .group
                     .as_ref()
-                    .is_none_or(|(key, ..)| key[..] != address.order[..address.group_len]),
-                _ => !batch[at - 1].same_group(address),
+                    .is_none_or(|(key, ..)| key[..] != *address.group_key()),
+                _ => !batch[at - 1].0.same_group(address),
             })
             .collect::<Vec<_>>();
         // One lookup per group, not per address: a group is one street in
@@ -796,48 +863,133 @@ impl<'a> AddressRuns<'a> {
         let countries = batch
             .par_iter()
             .zip(&starts)
-            .map(|(address, start)| {
-                let Record::Address(record) = &address.record else {
-                    unreachable!("a pending address holds an address");
+            .map(|((address, _), start)| {
+                let fields = address.fields();
+                if !*start || fields.postcode.is_none() {
+                    return None;
+                }
+                let [lon, lat] = address.point;
+                let source = SourceContext {
+                    country: fields.country,
+                    region: fields.region,
+                    locality: fields.locality,
+                    neighbourhood: fields.areas.last().copied(),
+                    place: fields.place,
+                    ..SourceContext::default()
                 };
-                (*start && record.address.postcode.is_some())
-                    .then(|| record_context(self.index, &address.record))
-                    .flatten()
-                    .and_then(|context| context.admin_context.country_record_id())
-                    .and_then(|country| self.country_codes.get(&country).copied())
+                let context = self.index.context_for_point(lon, lat, source);
+                let country = context.admin_context.country_record_id()?;
+                self.country_codes.get(&country).copied()
             })
             .collect::<Vec<_>>();
-        for ((mut address, start), country) in batch.into_iter().zip(starts).zip(countries) {
+        for (((address, shelved), start), country) in batch.into_iter().zip(starts).zip(countries) {
             if start {
-                let [lon, lat] = address.record.display_point().ok_or_else(|| {
-                    Error::BadGeometry(format!(
-                        "record {} has no display point",
-                        address.record.id()
-                    ))
-                })?;
+                let [lon, lat] = address.point;
                 self.group = Some((
-                    address.order[..address.group_len].to_vec(),
+                    address.group_key().to_vec(),
                     hilbert_key(quantize(lon)?, quantize(lat)?),
                     country,
                 ));
             }
             let (_, key, country) = self.group.as_ref().expect("a group has a start");
-            self.street.lend(&mut address);
-            let Record::Address(record) = &address.record else {
-                unreachable!("a pending address holds an address");
+            let (key, country) = (*key, *country);
+            let fields = address.fields();
+            let postcodes = match self.street.lend(address.street_key(), &fields) {
+                Some(lent) => Some(match &self.lent_street {
+                    Some((street, at)) if street[..] == *address.street_key() => *at,
+                    _ => {
+                        let at = self.lent.push(Postcodes(lent.to_vec()))?;
+                        self.lent_street = Some((address.street_key().to_vec(), at));
+                        at
+                    }
+                }),
+                None => None,
             };
             self.postcodes
-                .accept(*country, &record.address, &record.geometry);
+                .accept(country, fields.postcode, address.point);
+            let (at, disputed) = match shelved {
+                Some(shelved) => shelved,
+                None => (
+                    self.book
+                        .as_mut()
+                        .expect("an address not in a book has one to go to")
+                        .push(address)?,
+                    false,
+                ),
+            };
             self.records.push(PendingRecord {
-                key: *key,
+                key,
                 seq: *self.seq,
                 origin: None,
-                record: address.record,
+                body: Body::Address(PlacedAddress {
+                    at,
+                    postcodes,
+                    disputed,
+                }),
             })?;
             *self.seq += 1;
         }
         Ok(())
     }
+}
+
+/// The addresses in street order and the postcodes lent to their streets,
+/// read back as the records standing for them are written.
+struct AddressBook {
+    addresses: BookFile<PendingAddress>,
+    postcodes: BookFile<Postcodes>,
+    datasets: Datasets,
+}
+
+impl AddressBook {
+    /// The records of `batch`, each address read from the book. A batch
+    /// comes in record order, where an address group is one run, so each
+    /// chunk it needs is read once.
+    fn records(&self, batch: Vec<PendingRecord>) -> Result<Vec<(Record, Option<ContextOrigin>)>> {
+        let mut address_chunks = Vec::new();
+        let mut postcode_chunks = Vec::new();
+        for pending in &batch {
+            if let Body::Address(placed) = &pending.body {
+                address_chunks.push(BookFile::<PendingAddress>::chunk_of(placed.at));
+                postcode_chunks.extend(placed.postcodes.map(BookFile::<Postcodes>::chunk_of));
+            }
+        }
+        let addresses = read_chunks(&self.addresses, address_chunks)?;
+        let postcodes = read_chunks(&self.postcodes, postcode_chunks)?;
+        batch
+            .into_par_iter()
+            .map(|pending| {
+                let record = match pending.body {
+                    Body::Record(record) => *record,
+                    Body::Address(placed) => {
+                        let chunk = &addresses[&BookFile::<PendingAddress>::chunk_of(placed.at)];
+                        let mut record =
+                            BookFile::pick(chunk, placed.at)?.record(&self.datasets)?;
+                        record.disputed = placed.disputed;
+                        if let Some(at) = placed.postcodes {
+                            let chunk = &postcodes[&BookFile::<Postcodes>::chunk_of(at)];
+                            record.street_postcodes = BookFile::pick(chunk, at)?.0.clone();
+                        }
+                        Record::Address(record)
+                    }
+                };
+                Ok((record, pending.origin))
+            })
+            .collect()
+    }
+}
+
+/// The chunks of `book` numbered in `chunks`, each read once.
+fn read_chunks<T: book::Entry + Send + Sync>(
+    book: &BookFile<T>,
+    mut chunks: Vec<usize>,
+) -> Result<HashMap<usize, Vec<T>>> {
+    chunks.sort_unstable();
+    chunks.dedup();
+    chunks
+        .into_par_iter()
+        .map(|index| Ok((index, book.chunk(index)?)))
+        .collect()
 }
 
 /// The ways of each street name, joined into one street record per street
@@ -899,7 +1051,7 @@ fn join_streets(
                 key: hilbert_key(quantize(lon)?, quantize(lat)?),
                 seq: *seq,
                 origin: None,
-                record: Record::Street(street),
+                body: Record::Street(street).into(),
             })?;
             *seq += 1;
             count += 1;
@@ -945,151 +1097,103 @@ const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 /// another town does not, and is kept as the house it says it is.
 const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
 
-/// An address kept so far in one house group.
-struct KeptHouse {
-    point: [f64; 2],
-    /// Where in the group's buffer it waits.
-    at: usize,
-}
+/// What finding repeated houses decided about an address: dropped, or kept
+/// and disputed. Sorted after its position in the address book.
+const DROPPED: u64 = 0;
+const DISPUTED: u64 = 1;
 
-/// The addresses again, without the imported rows that repeat an address
-/// the Pack already has, OSM ones first: read in house order, then sorted
-/// back into street groups. Each dropped row is counted on its file.
+/// Positions in the address book, each with what was decided about it.
+type Verdicts = Sorted<(u64, u64)>;
+
+/// The addresses in street order, with their slash numbers read, written
+/// to an address book; and, sorted by position in it, which of them are
+/// imported rows repeating an address the Pack already has, OSM ones
+/// first, and which kept ones a row disputes. The houses are found in house
+/// order, from a hash of each house and its point, not the address. Each
+/// dropped row is counted on its file.
 ///
 /// One record answers for one house. A row within
 /// [`REPEATED_HOUSE_RADIUS_M`] of a kept address of its house agrees with it
 /// and is dropped. One beyond that, but within [`DISPUTED_HOUSE_RADIUS_M`] of
 /// a kept address it does not contradict, is dropped too: the kept address
 /// keeps its point, OSM's when OSM has the house, and is marked
-/// [`AddressRecord::disputed`]. Only a row farther still, or one stating
-/// another postcode, locality or area than every kept address near it, is a
-/// house of its own. Two houses of one street name and number lie apart by
-/// the distance between the places that repeat the name, which the radius
-/// stays below; where they lie closer, the postcode or the locality tells
-/// them apart.
+/// [`crate::record::AddressRecord::disputed`]. Only a row farther still, or
+/// one stating another postcode, locality or area than every kept address
+/// near it, is a house of its own. Two houses of one street name and number
+/// lie apart by the distance between the places that repeat the name, which
+/// the radius stays below; where they lie closer, the postcode or the
+/// locality tells them apart.
 fn drop_repeated_houses(
     addresses: ExternalSorter<PendingAddress>,
-    scratch: &Arc<crate::extsort::Scratch>,
+    scratch: &Arc<Scratch>,
     memory: &Arc<Budget>,
     budget: usize,
+    datasets: &Datasets,
     report: &mut BuilderReport,
     slash_numbers: &mut SlashNumberCounts,
-) -> Result<ExternalSorter<PendingAddress>> {
-    let mut houses = ExternalSorter::new(scratch, "houses", memory, budget);
+) -> Result<(BookFile<PendingAddress>, Verdicts)> {
+    let mut book = Book::create(scratch, "address-book")?;
     slash::read_slash_numbers(addresses.finish()?, slash_numbers, |address| {
-        let seq = address.seq;
-        houses.push(PendingAddress::house(address.into_address(), seq)?)
+        book.push(address).map(drop)
     })?;
-    let mut grouped = ExternalSorter::new(scratch, "addresses-kept", memory, budget);
-    // A kept address is marked disputed only by the rows after it, so the
-    // house waits whole before it is passed on.
-    let mut house: Vec<(AddressRecord, u64)> = Vec::new();
-    let mut house_key: Option<PendingAddress> = None;
-    let mut kept: Vec<KeptHouse> = Vec::new();
-    let flush = |house: &mut Vec<(AddressRecord, u64)>,
-                 grouped: &mut ExternalSorter<PendingAddress>|
-     -> Result<()> {
-        for (record, seq) in house.drain(..) {
-            grouped.push(PendingAddress::new(record, seq)?)?;
-        }
-        Ok(())
-    };
-    for address in houses.finish()? {
-        let address = address?;
-        if house_key
-            .as_ref()
-            .is_none_or(|house| !house.same_group(&address))
-        {
-            flush(&mut house, &mut grouped)?;
+    let book = book.finish()?;
+    // Read from the book once the street order's runs are gone, so the
+    // houses never share the disk with them.
+    let mut houses = ExternalSorter::<House>::new(scratch, "houses", memory, budget);
+    for (at, address) in book.items().enumerate() {
+        houses.push(address?.house(at as u64))?;
+    }
+    let mut verdicts = ExternalSorter::new(scratch, "house-verdicts", memory, budget);
+    let mut kept: Vec<House> = Vec::new();
+    for house in houses.finish()? {
+        let house = house?;
+        if kept.first().is_some_and(|first| first.key != house.key) {
             kept.clear();
         }
-        let point = address.record.display_point().ok_or_else(|| {
-            Error::BadGeometry(format!(
-                "record {} has no display point",
-                address.record.id()
-            ))
-        })?;
-        let record = address.clone().into_address();
-        let imported = record.source.object_type == ObjectType::Row;
-        let distance = |kept: &KeptHouse| {
-            crate::spatial_index::haversine_m(kept.point[0], kept.point[1], point[0], point[1])
+        let distance = |kept: &House| {
+            crate::spatial_index::haversine_m(
+                kept.point[0],
+                kept.point[1],
+                house.point[0],
+                house.point[1],
+            )
         };
-        let repeated = imported
+        let repeated = house.imported
             && kept
                 .iter()
                 .any(|kept| distance(kept) <= REPEATED_HOUSE_RADIUS_M);
-        let disputed = if imported && !repeated {
+        let disputed = if house.imported && !repeated {
             kept.iter()
                 .filter(|kept| {
-                    distance(kept) <= DISPUTED_HOUSE_RADIUS_M
-                        && !other_house(&house[kept.at].0, &record)
+                    distance(kept) <= DISPUTED_HOUSE_RADIUS_M && !kept.other_house(&house)
                 })
                 .min_by(|left, right| distance(left).total_cmp(&distance(right)))
                 .map(|kept| kept.at)
         } else {
             None
         };
-        if repeated || disputed.is_some() {
-            if let Some(at) = disputed {
-                house[at].0.disputed = true;
-            }
-            if let Some(import) = report
-                .imports
-                .iter_mut()
-                .find(|import| import.dataset == record.source.dataset)
-            {
-                if repeated {
-                    import.duplicates += 1;
-                } else {
-                    import.disputes += 1;
-                }
-            }
-        } else {
-            kept.push(KeptHouse {
-                point,
-                at: house.len(),
-            });
-            house.push((record, address.seq));
+        if !repeated && disputed.is_none() {
+            kept.push(house);
+            continue;
         }
-        house_key = Some(address);
+        if let Some(at) = disputed {
+            verdicts.push((at, DISPUTED))?;
+        }
+        verdicts.push((house.at, DROPPED))?;
+        let dataset = datasets.name(house.dataset)?;
+        if let Some(import) = report
+            .imports
+            .iter_mut()
+            .find(|import| import.dataset == dataset)
+        {
+            if repeated {
+                import.duplicates += 1;
+            } else {
+                import.disputes += 1;
+            }
+        }
     }
-    flush(&mut house, &mut grouped)?;
-    Ok(grouped)
-}
-
-/// Whether two addresses of one house key state where they are differently:
-/// both state a postcode, a locality or areas, and they differ. Then they are
-/// two houses, however close.
-fn other_house(kept: &AddressRecord, row: &AddressRecord) -> bool {
-    fn differ<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
-        left.zip(right).is_some_and(|(left, right)| left != right)
-    }
-    let postcode = |address: &AddressComponents| {
-        address
-            .postcode
-            .as_deref()
-            .and_then(crate::text_index::compact_postcode)
-    };
-    let locality = |address: &AddressComponents| {
-        address
-            .locality
-            .as_deref()
-            .and_then(crate::util::fold::search_key)
-    };
-    let areas = |address: &AddressComponents| {
-        Some(
-            address
-                .areas
-                .iter()
-                .filter_map(|area| crate::util::fold::search_key(area))
-                .collect::<Vec<_>>(),
-        )
-        .filter(|areas| !areas.is_empty())
-    };
-    let (kept, row) = (&kept.address, &row.address);
-    differ(postcode(kept), postcode(row))
-        || differ(locality(kept), locality(row))
-        || differ(areas(kept), areas(row))
+    Ok((book, verdicts.finish()?))
 }
 
 /// Boundary geometry gathered across inputs, for the boundary stage.
@@ -1332,12 +1436,14 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
 /// offer each record to the parser's training sample under the country it
 /// lies in. Boundary and derived-country records describe context and get
 /// none, but are offered under the country their point lies in.
+#[allow(clippy::too_many_arguments)]
 fn write_ordered(
     writer: &mut Writer,
     sample: &mut Sampler,
     records: impl Iterator<Item = Result<PendingRecord>> + Send,
     total: u64,
     index: &BoundaryIndex,
+    book: Option<&AddressBook>,
     progress: &Progress,
     stage: BuildStage,
 ) -> Result<()> {
@@ -1355,19 +1461,31 @@ fn write_ordered(
                     .by_ref()
                     .take(WRITE_BATCH_RECORDS)
                     .collect::<Result<Vec<_>>>()
+                    .and_then(|batch| match book {
+                        Some(book) => book.records(batch),
+                        None => batch
+                            .into_iter()
+                            .map(|pending| match pending.body {
+                                Body::Record(record) => Ok((*record, pending.origin)),
+                                Body::Address(_) => Err(Error::Decode(
+                                    "a placed address is written without its address book",
+                                )),
+                            })
+                            .collect(),
+                    })
                     .and_then(|batch| {
                         let (batch, countries): (Vec<_>, Vec<_>) = batch
                             .into_par_iter()
-                            .map(|pending| {
-                                let located = record_context(index, &pending.record);
+                            .map(|(record, origin)| {
+                                let located = record_context(index, &record);
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
-                                let context: Option<RecordContext> = match pending.origin {
+                                let context: Option<RecordContext> = match origin {
                                     Some(_) => None,
                                     None => located,
                                 };
-                                ((pending.record, context), country)
+                                ((record, context), country)
                             })
                             .unzip();
                         preparer
@@ -2939,5 +3057,227 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::Cancelled));
         assert!(!dir.join("pack").join("CURRENT").exists());
+    }
+
+    /// Eruera Street with flats written "N/M", some addresses stating a
+    /// postcode, and a second street in another cell.
+    fn flats() -> Vec<Vec<TestElement>> {
+        let address = |id, lon, number: &'static str, postcode: Option<&'static str>| {
+            let mut tags = vec![
+                ("addr:housenumber", number),
+                ("addr:street", "Eruera Street"),
+            ];
+            if let Some(postcode) = postcode {
+                tags.push(("addr:postcode", postcode));
+            }
+            node(id, -38.1386, lon, &tags)
+        };
+        vec![vec![
+            node(1, -38.1388, 176.2580, &[]),
+            node(2, -38.1388, 176.2430, &[]),
+            way(
+                100,
+                &[1, 2],
+                &[("highway", "residential"), ("name", "Eruera Street")],
+            ),
+            address(10, 176.2570, "1000", Some("3010")),
+            address(11, 176.2510, "1182", None),
+            address(12, 176.2509, "2/1182", None),
+            address(13, 176.2456, "1345", Some("3015")),
+            address(14, 176.2451, "1367", None),
+            address(15, 176.24505, "10/1367", None),
+            address(16, 176.24506, "2/1367", None),
+            address(17, 176.2440, "1400", None),
+            node(
+                18,
+                -38.30,
+                176.30,
+                &[("addr:housenumber", "7"), ("addr:street", "Tui Road")],
+            ),
+        ]]
+    }
+
+    /// Rows over `flats`: repeats, disputes, other houses, slash numbers and
+    /// postcodes to lend, in two files.
+    fn flat_rows(dir: &Path) -> Vec<addresses::AddressFile> {
+        let first = dir.join("first.csv");
+        fs::write(
+            &first,
+            "LON,LAT,NUMBER,STREET,UNIT,CITY,POSTCODE\n\
+             176.24506,-38.13861,1367,Eruera Street,10,,\n\
+             176.2510,-38.1416,1182,Eruera Street,,Rotorua,\n\
+             176.2510,-38.1356,1182,Eruera Street,,,3999\n\
+             176.2440,-38.13862,1400,ERUERA ST,,,3015\n\
+             176.24401,-38.13863,1400,Eruera Street,,,\n\
+             176.2452,-38.1387,3/1345,Eruera Street,,,\n\
+             176.2453,-38.1387,1351,Eruera Street,,,\n\
+             176.2454,-38.1387,1353,Eruera Street,,Rotorua,3016\n\
+             176.30001,-38.30001,7,Tui Road,,,3020\n\
+             176.3003,-38.3003,9,Tui Road,,,\n\
+             176.80,-38.80,5,Kowhai Lane,,,\n",
+        )
+        .expect("csv");
+        let second = dir.join("second.csv");
+        fs::write(
+            &second,
+            "LON,LAT,NUMBER,STREET,UNIT,CITY,POSTCODE\n\
+             176.80002,-38.80001,5,Kowhai Lane,,,\n\
+             176.8001,-38.8001,6,Kowhai Lane,,,3030\n\
+             176.24506,-38.13861,1367,Eruera Street,2,,\n",
+        )
+        .expect("csv");
+        vec![
+            addresses::AddressFile {
+                dataset: "openaddresses:first".to_string(),
+                path: first,
+            },
+            addresses::AddressFile {
+                dataset: "openaddresses:second".to_string(),
+                path: second,
+            },
+        ]
+    }
+
+    /// Every record of the Pack `inputs` and `files` build into under
+    /// `root`, its context, and what the report counted.
+    fn pack_contents(
+        root: &Path,
+        inputs: &[&Path],
+        files: Vec<addresses::AddressFile>,
+        budget: Option<usize>,
+    ) -> Vec<String> {
+        let report = build_osm_pack(BuildOsmOptions {
+            inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
+            pack: root.to_path_buf(),
+            memory_budget_bytes: budget,
+            addresses: (!files.is_empty())
+                .then(|| Arc::new(addresses::AddressFiles(files)) as Arc<dyn AddressSource>),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let reader = Reader::open(root).expect("pack");
+        let mut imports = report.imports.clone();
+        for import in &mut imports {
+            import.path.clear();
+        }
+        let mut contents = vec![
+            format!("{:?}", report.accepted),
+            format!("{:?}", report.rejected),
+            format!("{:?}", report.triage),
+            format!("{:?}", report.quality),
+            format!("{:?}", report.geometry_resolution),
+            format!("{:?}", report.slash_numbers),
+            format!("{:?}", report.datasets),
+            format!("{imports:?}"),
+            format!(
+                "{:?}",
+                report
+                    .scratch
+                    .sorters
+                    .iter()
+                    .map(|(name, sorter)| (name.clone(), sorter.items))
+                    .collect::<Vec<_>>()
+            ),
+            format!("{:?}", reader.manifest().layer_counts),
+        ];
+        for id in 0..reader.manifest().record_count {
+            contents.push(format!(
+                "{} {:?} {:?}",
+                reader.record_json(id).expect("record"),
+                reader.records().record(id).expect("record"),
+                reader.boundary_context(id).expect("context")
+            ));
+        }
+        contents
+    }
+
+    /// Imported rows over OSM flats written "N/M": a row naming a flat by
+    /// its unit repeats the OSM flat once its slash number is read, rows
+    /// repeat each other across files, rows a few hundred metres off
+    /// dispute OSM's house, a row's slash number is read too, and only the
+    /// postcodes of the addresses kept are lent to their street. Spilling
+    /// every sorter builds the same Pack.
+    #[test]
+    fn imported_rows_repeat_dispute_and_lend_by_their_place_in_the_address_book() {
+        let dir = temp_dir("address-book");
+        let input = dir.join("flats.osm.pbf");
+        write_pbf(&input, &flats());
+        let files = flat_rows(&dir);
+        let in_memory = pack_contents(&dir.join("memory"), &[&input], files.clone(), None);
+        let spilled = pack_contents(&dir.join("spilled"), &[&input], files.clone(), Some(4));
+        assert_eq!(in_memory, spilled);
+
+        let report = build_osm_pack(BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(files))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let counts = report
+            .imports
+            .iter()
+            .map(|import| (import.dataset.as_str(), import.duplicates, import.disputes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            [
+                ("openaddresses:first", 4, 2),
+                ("openaddresses:second", 2, 0)
+            ]
+        );
+        assert_eq!(
+            report.slash_numbers,
+            SlashNumberCounts {
+                unit_first: 4,
+                ..SlashNumberCounts::default()
+            },
+            "three OSM flats and one imported"
+        );
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let address = |id: &str| {
+            let record_id = reader.find_by_source_id(id).expect("lookup")?;
+            match reader.records().record(record_id).expect("record") {
+                Record::Address(address) => Some(address),
+                other => panic!("{id} is an address: {other:?}"),
+            }
+        };
+        for dropped in [
+            // Unit 10 of 1367: OSM's "10/1367".
+            "openaddresses:first:row:1",
+            // 330 m from OSM's 1182, which states no locality or postcode.
+            "openaddresses:first:row:2",
+            "openaddresses:first:row:3",
+            "openaddresses:first:row:4",
+            "openaddresses:first:row:5",
+            "openaddresses:first:row:9",
+            "openaddresses:second:row:1",
+            "openaddresses:second:row:3",
+        ] {
+            assert!(address(dropped).is_none(), "{dropped} repeats a house");
+        }
+        assert!(address("osm:node:11").expect("1182").disputed);
+        assert!(!address("osm:node:14").expect("1367").disputed);
+        let flat = address("openaddresses:first:row:6").expect("3/1345");
+        assert_eq!(
+            (flat.address.number.as_str(), flat.address.unit.as_deref()),
+            ("1345", Some("3"))
+        );
+        assert_eq!(
+            address("osm:node:14").expect("1367").street_postcodes,
+            ["3010", "3015", "3016"],
+            "OSM's postcodes and the kept row's 3016"
+        );
+        for unlent in ["osm:node:18", "openaddresses:first:row:10"] {
+            assert!(
+                address(unlent)
+                    .expect("Tui Road")
+                    .street_postcodes
+                    .is_empty(),
+                "{unlent}: the row stating 3020 repeats OSM's 7 Tui Road"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 }

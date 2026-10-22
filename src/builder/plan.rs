@@ -53,16 +53,26 @@ const NODE_ID_SPACE: u64 = 14_300_000_000;
 /// estimates 100-200 B encoded; the top of it, since a record carries its
 /// names and tags.
 const RECORD_SPILL_BYTES: f64 = 200.0;
-/// Scratch bytes an address takes in the address sorter: 146 B measured on
-/// New Zealand's spill (spill study).
-const ADDRESS_SPILL_BYTES: f64 = 146.0;
+/// Scratch bytes an address takes in the address sorter: its street order
+/// key, which holds what it states, with its point and source. New
+/// Zealand's spill measured 146 B with a copy of the record beside the key;
+/// the key alone is 87.7 B on a million rows shaped like OpenAddresses' and
+/// 70.5 B on the test Packs' addresses.
+const ADDRESS_SPILL_BYTES: f64 = 88.0;
+/// Scratch bytes an address takes in the address book, which keeps it in
+/// street order until its record is written: 32.8 B on the same million
+/// rows, each key written as what it adds to the one before.
+const ADDRESS_BOOK_BYTES: f64 = 33.0;
+/// Scratch bytes an address takes in the records sorter, which carries its
+/// place in the address book: 19.5 B on the same rows.
+const PLACED_ADDRESS_BYTES: f64 = 20.0;
 /// Scratch bytes a street way takes in the street sorter: the spill study
 /// estimates 120-200 B.
 const STREET_SPILL_BYTES: f64 = 200.0;
-/// Scratch bytes an imported address takes beyond its address and record
-/// copies: the house and kept-address sorters each hold another copy of
-/// about 150 B while repeated houses are dropped (spill study).
-const IMPORTED_ROW_COPY_BYTES: f64 = 300.0;
+/// Scratch bytes an address takes in the house sorter while the imported
+/// rows that repeat a house are found: a hash of the house, its point and
+/// hashes of what tells two houses apart, 49.6 B on the same rows.
+const HOUSE_SPILL_BYTES: f64 = 50.0;
 /// Pack bytes per record: Germany's Pack was 2,666,692,193 B for 26,131,991
 /// records. The Writer's scratch holds about as much again until the seal.
 const PACK_BYTES_PER_RECORD: f64 = 102.0;
@@ -271,19 +281,26 @@ impl BuildPlan {
         };
         // Scratch held at the end of each stage that peaks: the way pass
         // (the records other than addresses and streets, the OSM addresses,
-        // the streets, mapped coordinates), address placement (every record
-        // and every address, and the imported rows' copies), the record
-        // write (records and the Writer's scratch) and the seal (the Writer's
-        // scratch, and the Pack it is copied into).
+        // the streets, mapped coordinates), address placement (every other
+        // record, beside the street order's runs, the address book written
+        // from them and the addresses placed, then with rows imported the
+        // book and the houses), the record write (the records, the book and
+        // the Writer's scratch) and the seal (the Writer's scratch, and the
+        // Pack it is copied into).
         let ways = (items.records as f64 - items.addresses as f64 - streets).max(0.0)
             * RECORD_SPILL_BYTES
             + items.addresses as f64 * ADDRESS_SPILL_BYTES
             + streets * STREET_SPILL_BYTES
             + locations;
-        let placement = records * RECORD_SPILL_BYTES
-            + addresses * ADDRESS_SPILL_BYTES
-            + items.imported_rows as f64 * IMPORTED_ROW_COPY_BYTES;
-        let write = records * RECORD_SPILL_BYTES + pack;
+        let others = (records - addresses).max(0.0) * RECORD_SPILL_BYTES;
+        let book = addresses * ADDRESS_BOOK_BYTES;
+        let houses = match items.imported_rows {
+            0 => 0.0,
+            _ => book + addresses * HOUSE_SPILL_BYTES,
+        };
+        let placement =
+            others + (addresses * (ADDRESS_SPILL_BYTES + PLACED_ADDRESS_BYTES) + book).max(houses);
+        let write = others + addresses * PLACED_ADDRESS_BYTES + book + pack;
         let scratch = ways.max(placement).max(write);
         self.scratch_disk_needed_bytes = scratch as u64;
         self.shared_disk_needed_bytes = scratch.max(2.0 * pack) as u64;
@@ -558,6 +575,16 @@ mod tests {
             counted.shared_disk_needed_bytes >> 30
         );
         assert!(counted.memory_needed_bytes < 28 << 30);
+
+        // And with OpenAddresses' 640 million rows, each sort carrying a
+        // compact key or a place in the address book, not the address.
+        counted.items.imported_rows = 640_000_000;
+        counted.size();
+        assert!(
+            counted.shared_disk_needed_bytes < disk / 10 * 7,
+            "{} GiB",
+            counted.shared_disk_needed_bytes >> 30
+        );
     }
 
     #[test]
