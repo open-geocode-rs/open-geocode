@@ -1,8 +1,7 @@
 //! Scratch-file types for the streaming build.
 //!
-//! The build never holds all features in memory: way features go to a spool,
-//! node references and resolved coordinates go through external sorts, and
-//! finished records wait in Hilbert-ordered sorters until they are written.
+//! The build never holds all records in memory: finished records wait in
+//! Hilbert-ordered sorters until they are written.
 
 use std::collections::BTreeMap;
 
@@ -20,8 +19,8 @@ use crate::{
     },
     util::{
         codec::{
-            get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64,
-            put_i64, put_opt_str, put_str, put_tags, put_u64,
+            get_i64, get_opt_string, get_string, get_u8, get_u32, get_u64, put_i64, put_opt_str,
+            put_str, put_u64,
         },
         geo::line_parts,
     },
@@ -30,100 +29,6 @@ use crate::{
 use super::boundary::ContextOrigin;
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
-
-/// "Way `owner` needs node `node_id` at position `pos`." Sorted by node id so
-/// it can be joined against the node section of the PBF, which is sorted too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct NodeRequest {
-    pub node_id: i64,
-    pub owner: u64,
-    pub pos: u32,
-    pub want_tags: bool,
-}
-
-impl Spill for NodeRequest {
-    fn encode(&self, out: &mut Vec<u8>) {
-        put_i64(out, self.node_id);
-        put_u64(out, self.owner);
-        put_u64(out, u64::from(self.pos));
-        out.push(u8::from(self.want_tags));
-    }
-
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        Ok(Self {
-            node_id: get_i64(input)?,
-            owner: get_u64(input)?,
-            pos: get_u32(input)?,
-            want_tags: get_u8(input)? != 0,
-        })
-    }
-}
-
-/// A node coordinate attached to the way position that asked for it. Sorted
-/// by owner and position, each way's vertices come back contiguous and in
-/// order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ResolvedRef {
-    pub owner: u64,
-    pub pos: u32,
-    pub node_id: i64,
-    pub lat_e7: i32,
-    pub lon_e7: i32,
-    /// Address tags of the node, for interpolation anchors.
-    pub tags: Option<BTreeMap<String, String>>,
-}
-
-impl ResolvedRef {
-    pub(crate) fn lat(&self) -> f64 {
-        osm_degrees(self.lat_e7)
-    }
-
-    pub(crate) fn lon(&self) -> f64 {
-        osm_degrees(self.lon_e7)
-    }
-}
-
-/// Degrees from a 1e-7 fixed-point PBF coordinate, computed the way `osmpbf`
-/// computes `lat()`/`lon()` (via nanodegrees), so a coordinate read through the
-/// node join is bit-identical to one read from the node itself.
-fn osm_degrees(value: i32) -> f64 {
-    1e-9 * (i64::from(value) * 100) as f64
-}
-
-impl Spill for ResolvedRef {
-    fn encode(&self, out: &mut Vec<u8>) {
-        put_u64(out, self.owner);
-        put_u64(out, u64::from(self.pos));
-        put_i64(out, self.node_id);
-        put_i64(out, i64::from(self.lat_e7));
-        put_i64(out, i64::from(self.lon_e7));
-        match &self.tags {
-            Some(tags) => {
-                out.push(1);
-                put_tags(out, tags);
-            }
-            None => out.push(0),
-        }
-    }
-
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        Ok(Self {
-            owner: get_u64(input)?,
-            pos: get_u32(input)?,
-            node_id: get_i64(input)?,
-            lat_e7: get_i32(input)?,
-            lon_e7: get_i32(input)?,
-            tags: match get_u8(input)? {
-                0 => None,
-                _ => Some(get_tags(input)?),
-            },
-        })
-    }
-
-    fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.tags.as_ref().map_or(0, tags_bytes)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WayKind {
@@ -134,45 +39,13 @@ pub(crate) enum WayKind {
     Poi,
 }
 
-/// A way kept by the scan, without its node list: the node references travel
-/// separately through the node join.
+/// A way kept by the scan, without its node list: the way pass reads that
+/// again from the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WayFeature {
     pub kind: WayKind,
     pub way_id: i64,
-    pub node_count: u32,
     pub tags: BTreeMap<String, String>,
-}
-
-impl Spill for WayFeature {
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.push(match self.kind {
-            WayKind::Address => 0,
-            WayKind::Street => 1,
-            WayKind::Interpolation => 2,
-            WayKind::Boundary => 3,
-            WayKind::Poi => 4,
-        });
-        put_i64(out, self.way_id);
-        put_u64(out, u64::from(self.node_count));
-        put_tags(out, &self.tags);
-    }
-
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        Ok(Self {
-            kind: match get_u8(input)? {
-                0 => WayKind::Address,
-                1 => WayKind::Street,
-                2 => WayKind::Interpolation,
-                3 => WayKind::Boundary,
-                4 => WayKind::Poi,
-                _ => return Err(Error::Decode("unknown way feature kind")),
-            },
-            way_id: get_i64(input)?,
-            node_count: get_u32(input)?,
-            tags: get_tags(input)?,
-        })
-    }
 }
 
 /// A finished record waiting for its final position. `key` is the Hilbert
@@ -522,12 +395,6 @@ impl Spill for PendingRecord {
     fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>() + record_heap_bytes(&self.record)
     }
-}
-
-fn tags_bytes(tags: &BTreeMap<String, String>) -> usize {
-    tags.iter()
-        .map(|(key, value)| key.len() + value.len() + 64)
-        .sum()
 }
 
 fn record_heap_bytes(record: &Record) -> usize {
@@ -967,30 +834,6 @@ mod tests {
         let mut input = out.as_slice();
         assert_eq!(&T::decode(&mut input).expect("decode"), value);
         assert!(input.is_empty());
-    }
-
-    #[test]
-    fn round_trips_scratch_types() {
-        round_trip(&NodeRequest {
-            node_id: -5,
-            owner: 7,
-            pos: 3,
-            want_tags: true,
-        });
-        round_trip(&ResolvedRef {
-            owner: 1,
-            pos: 2,
-            node_id: 3,
-            lat_e7: 436_532_000,
-            lon_e7: -793_832_000,
-            tags: Some(BTreeMap::from([("addr:housenumber".into(), "10".into())])),
-        });
-        round_trip(&WayFeature {
-            kind: WayKind::Interpolation,
-            way_id: 9,
-            node_count: 4,
-            tags: BTreeMap::from([("addr:interpolation".into(), "odd".into())]),
-        });
     }
 
     #[test]

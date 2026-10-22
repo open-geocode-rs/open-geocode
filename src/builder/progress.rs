@@ -26,10 +26,11 @@ pub enum BuildStage {
     /// Pass 2: read the ways boundary relations are made of. Measured in
     /// blocks of the input.
     BoundaryMembers,
-    /// Pass 3: join node coordinates onto way references. Measured in blocks
-    /// of the input.
+    /// Pass 3: store the coordinates of the nodes ways need. Measured in
+    /// blocks of the input.
     NodeJoin,
-    /// Turn ways into records. Measured in ways.
+    /// Pass 4: read the kept ways again and turn them into records. Measured
+    /// in blocks of the input.
     AssembleWays,
     /// Build the admin boundary polygons. No measure.
     Boundaries,
@@ -53,7 +54,6 @@ pub enum BuildStage {
 pub enum StageUnit {
     Bytes,
     Blocks,
-    Ways,
     Records,
     /// The stage has no measure: only its time is known.
     None,
@@ -76,8 +76,7 @@ impl BuildStage {
     pub const fn unit(self) -> StageUnit {
         match self {
             Self::Scan | Self::ImportAddresses => StageUnit::Bytes,
-            Self::BoundaryMembers | Self::NodeJoin => StageUnit::Blocks,
-            Self::AssembleWays => StageUnit::Ways,
+            Self::BoundaryMembers | Self::NodeJoin | Self::AssembleWays => StageUnit::Blocks,
             Self::ContextRecords | Self::Records => StageUnit::Records,
             Self::Boundaries | Self::Indexes | Self::Parser => StageUnit::None,
         }
@@ -88,7 +87,7 @@ impl BuildStage {
         match self {
             Self::Scan => "scan OSM objects",
             Self::BoundaryMembers => "read boundary member ways",
-            Self::NodeJoin => "join node coordinates",
+            Self::NodeJoin => "store node coordinates",
             Self::AssembleWays => "assemble ways",
             Self::Boundaries => "build admin boundaries",
             Self::ImportAddresses => "import addresses",

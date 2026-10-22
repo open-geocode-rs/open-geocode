@@ -2,7 +2,11 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
     path::Path,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
 };
 
 use crate::error::{Error, Result};
@@ -21,7 +25,8 @@ const BLOBS_PER_THREAD: usize = 4;
 ///
 /// Memory stays bounded: one batch of blobs is decoded at a time while the
 /// next is read. The stage is measured in bytes when the whole file is read
-/// and in blocks when only `offsets` are.
+/// and in blocks when only `offsets` are. Returns the bytes read from the
+/// file, which on a disk-bound input is what a pass costs.
 pub(crate) fn for_each_block<T, M, S>(
     input: &Path,
     progress: &Progress,
@@ -29,7 +34,7 @@ pub(crate) fn for_each_block<T, M, S>(
     offsets: Option<&[u64]>,
     map: M,
     mut sink: S,
-) -> Result<()>
+) -> Result<u64>
 where
     T: Send,
     M: Fn(u64, PrimitiveBlock) -> Result<T> + Sync,
@@ -46,11 +51,13 @@ where
         path: input.to_path_buf(),
         source,
     })?;
+    let read_bytes = Arc::new(AtomicU64::new(0));
     let reader = BufReader::with_capacity(
         READ_BUFFER_BYTES,
         ProgressReader {
             inner: file,
             progress: offsets.is_none().then(|| progress.clone()),
+            read_bytes: Arc::clone(&read_bytes),
         },
     );
     let mut blobs = BlobReader::new_seekable(reader)?;
@@ -119,7 +126,7 @@ where
         Ok(())
     })?;
     progress.finish(stage);
-    Ok(())
+    Ok(read_bytes.load(Ordering::Relaxed))
 }
 
 /// When the extract's data was taken from OpenStreetMap, as its header
@@ -174,11 +181,14 @@ pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
 struct ProgressReader<R> {
     inner: R,
     progress: Option<Progress>,
+    read_bytes: Arc<AtomicU64>,
 }
 
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let bytes_read = self.inner.read(buffer)?;
+        self.read_bytes
+            .fetch_add(bytes_read as u64, Ordering::Relaxed);
         if let Some(progress) = &self.progress {
             progress.advance(bytes_read as u64);
         }

@@ -45,6 +45,7 @@ pub struct BuilderReport {
     pub quality: AcceptedQualityReport,
     pub triage: RejectionTriageReport,
     pub geometry_resolution: GeometryResolutionCounts,
+    pub geometry_passes: GeometryPassReport,
     pub completeness: CompletenessCounts,
     pub phases: PhaseTimings,
     pub throughput: Throughput,
@@ -437,6 +438,49 @@ pub struct GeometryResolutionCounts {
     pub resolved_node_refs: u64,
 }
 
+/// What the passes that give ways their geometry held and read, over every
+/// input.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GeometryPassReport {
+    /// Ways the scan kept for their geometry.
+    pub kept_ways: u64,
+    /// Vertices of boundary ways and boundary relation members.
+    pub boundary_refs: u64,
+    /// Distinct nodes kept ways and member ways reference.
+    pub needed_nodes: u64,
+    /// Needed nodes the inputs have: one stored coordinate each.
+    pub stored_nodes: u64,
+    /// Nodes whose address tags interpolation ways read.
+    pub tagged_nodes: u64,
+    /// Most bytes one input's node id bitmap and rank index held.
+    pub peak_node_set_bytes: u64,
+    /// Most bytes one input's coordinates held.
+    pub peak_location_bytes: u64,
+    /// Coordinate bytes held in scratch files instead of memory, over every
+    /// input.
+    pub mapped_location_bytes: u64,
+    /// PBF bytes each pass read: the scan reads every byte, the others only
+    /// the blocks they need.
+    pub scan_read_bytes: u64,
+    pub boundary_member_read_bytes: u64,
+    pub node_read_bytes: u64,
+    pub way_read_bytes: u64,
+}
+
+impl GeometryPassReport {
+    pub(crate) fn add(&mut self, stored: &crate::builder::osm::LoadStats) {
+        self.needed_nodes += stored.needed;
+        self.stored_nodes += stored.stored;
+        self.tagged_nodes += stored.tagged;
+        self.peak_node_set_bytes = self.peak_node_set_bytes.max(stored.set_bytes);
+        self.peak_location_bytes = self.peak_location_bytes.max(stored.location_bytes);
+        if stored.mapped {
+            self.mapped_location_bytes += stored.location_bytes;
+        }
+        self.node_read_bytes += stored.read_bytes;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CompletenessCounts {
     pub city: u64,
@@ -452,9 +496,9 @@ pub struct PhaseTimings {
     pub scan_ms: u128,
     /// Pass 2: read the ways that make up boundary relations.
     pub boundary_member_scan_ms: u128,
-    /// Pass 3: join node coordinates onto way references.
+    /// Pass 3: store the coordinates of the nodes ways need.
     pub node_join_ms: u128,
-    /// Assemble way geometry into records.
+    /// Pass 4: read the kept ways again and turn them into records.
     pub feature_emission_ms: u128,
     /// Build admin boundary polygons.
     pub boundary_build_ms: u128,

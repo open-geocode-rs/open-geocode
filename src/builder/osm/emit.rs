@@ -1,32 +1,30 @@
-//! Assemble way geometry from the joined coordinates and emit records.
+//! The way pass: read the way blocks again, give each kept way its nodes'
+//! coordinates from the node store, and emit its records.
 //!
-//! Way features (in owner order) and resolved coordinates (sorted by owner and
-//! position) are read in lockstep, so each way's vertices arrive together.
-//! Chunks of ways are assembled in parallel and merged in order.
+//! Each block is assembled on its own, so blocks run in parallel and their
+//! records are merged in file order, the order the scan kept the ways in.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 
-use crate::error::Result;
-use rayon::prelude::*;
+use osmpbf::{Element, PrimitiveBlock};
 
 use crate::{
     builder::report::CandidateIssue,
-    extsort::{Sorted, SpoolReader},
     record::{LocationPrecision, ObjectType},
 };
 
 use super::{
-    address::{AddressCandidate, emit_address},
+    address::{AddressCandidate, collect_clean_tags, emit_address},
     boundary::{BoundaryWay, Vertex},
     emitted::Emitted,
     geometry::centroid,
     interpolation::{InterpolationNode, emit_interpolation},
+    locations::{Location, Locations},
     poi::{PoiCandidate, emit_poi},
-    spill::{ResolvedRef, WayFeature, WayKind},
+    scan::way_features,
+    spill::{WayFeature, WayKind},
     street::emit_street,
 };
-
-const FEATURES_PER_CHUNK: usize = 16_384;
 
 #[derive(Debug, Default)]
 pub(crate) struct FeatureOutput {
@@ -34,80 +32,111 @@ pub(crate) struct FeatureOutput {
     pub boundary_ways: Vec<BoundaryWay>,
 }
 
-/// Emit every way feature, then return the resolved vertices of the remaining
-/// owners (boundary relation members, numbered after the features).
-pub(crate) fn emit_features(
-    features: SpoolReader<WayFeature>,
-    resolved: Sorted<ResolvedRef>,
-    mut sink: impl FnMut(FeatureOutput) -> Result<()>,
-) -> Result<HashMap<u64, Vec<Vertex>>> {
-    // One thread reads features and joins them to their coordinates while
-    // this one emits the chunk before and hands it to the sink, so neither
-    // waits on the other.
-    std::thread::scope(|scope| -> Result<HashMap<u64, Vec<Vertex>>> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
-        let reader = scope.spawn(move || -> Result<HashMap<u64, Vec<Vertex>>> {
-            let mut resolved = resolved.peekable();
-            let mut owner = 0u64;
-            let mut features = features.peekable();
-            while features.peek().is_some() {
-                let mut chunk = Vec::with_capacity(FEATURES_PER_CHUNK);
-                for feature in features.by_ref().take(FEATURES_PER_CHUNK) {
-                    let mut refs = Vec::new();
-                    while let Some(next) = resolved
-                        .next_if(|next| next.as_ref().map_or(true, |next| next.owner <= owner))
-                    {
-                        refs.push(next?);
-                    }
-                    chunk.push((feature?, refs));
-                    owner += 1;
-                }
-                if sender.send(chunk).is_err() {
-                    return Ok(HashMap::new());
-                }
-            }
-            drop(sender);
-            // What is left are the boundary member ways, past every feature.
-            let mut members: HashMap<u64, Vec<Vertex>> = HashMap::new();
-            for item in resolved {
-                let item = item?;
-                members.entry(item.owner).or_default().push(Vertex {
-                    node_id: item.node_id,
-                    lat: item.lat(),
-                    lon: item.lon(),
-                });
-            }
-            Ok(members)
-        });
-        for chunk in receiver {
-            let outputs = chunk
-                .into_par_iter()
-                .map(|(feature, refs)| {
-                    let mut output = FeatureOutput::default();
-                    emit_feature(feature, refs, &mut output);
-                    output
-                })
-                .collect::<Vec<_>>();
-            for output in outputs {
-                sink(output)?;
-            }
-        }
-        reader.join().expect("feature reader panicked")
-    })
+/// One node of a way, with its address tags when the way reads them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WayNode {
+    pub id: i64,
+    pub location: Location,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
-fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut FeatureOutput) {
-    // Positions are unique per way, so every vertex resolved iff the counts match.
-    let complete = refs.len() == feature.node_count as usize;
+/// What one way block gave.
+#[derive(Debug, Default)]
+pub(crate) struct Assembled {
+    pub output: FeatureOutput,
+    /// Boundary relation member ways, in file order: each with its vertices
+    /// when every one is stored, and how many are.
+    pub members: Vec<(i64, Option<Vec<Vertex>>, u64)>,
+    /// Node references of the block's kept ways that have coordinates.
+    pub resolved: u64,
+}
+
+/// The nodes of `refs`, when `locations` has every one, and how many it has.
+fn resolve(refs: &[i64], locations: &Locations, tags: bool) -> (Option<Vec<WayNode>>, u64) {
+    let mut found = 0;
+    let mut nodes = Some(Vec::with_capacity(refs.len()));
+    for id in refs {
+        match locations.get(*id) {
+            Some(location) => {
+                found += 1;
+                if let Some(nodes) = &mut nodes {
+                    nodes.push(WayNode {
+                        id: *id,
+                        location,
+                        tags: if tags {
+                            locations.tags(*id).cloned()
+                        } else {
+                            None
+                        },
+                    });
+                }
+            }
+            None => nodes = None,
+        }
+    }
+    (nodes, found)
+}
+
+/// Emit the kept ways of `block` and gather the vertices of the boundary
+/// relation members among its ways (`members`).
+pub(crate) fn assemble(
+    block: &PrimitiveBlock,
+    locations: &Locations,
+    members: &HashSet<i64>,
+) -> Assembled {
+    let mut assembled = Assembled::default();
+    for element in block.elements() {
+        let Element::Way(way) = element else {
+            continue;
+        };
+        let refs = std::cell::OnceCell::new();
+        let refs = || {
+            refs.get_or_init(|| way.refs().collect::<Vec<_>>())
+                .as_slice()
+        };
+        let tags = collect_clean_tags(way.tags());
+        if !tags.is_empty() {
+            for (feature, way_refs) in way_features(way.id(), tags, refs) {
+                let (nodes, found) =
+                    resolve(&way_refs, locations, feature.kind == WayKind::Interpolation);
+                assembled.resolved += found;
+                emit_feature(feature, nodes, &mut assembled.output);
+            }
+        }
+        if members.contains(&way.id()) {
+            let (nodes, found) = resolve(refs(), locations, false);
+            let vertices = nodes.map(|nodes| nodes.iter().map(vertex).collect());
+            assembled.members.push((way.id(), vertices, found));
+        }
+    }
+    assembled
+}
+
+fn vertex(node: &WayNode) -> Vertex {
+    Vertex {
+        node_id: node.id,
+        lat: node.location.lat(),
+        lon: node.location.lon(),
+    }
+}
+
+/// Emit the records of a kept way whose nodes are `nodes`, `None` when any
+/// lacks coordinates.
+pub(crate) fn emit_feature(
+    feature: WayFeature,
+    nodes: Option<Vec<WayNode>>,
+    output: &mut FeatureOutput,
+) {
     let out = &mut output.emitted;
-    let points = || {
-        refs.iter()
-            .map(|node| (node.lat(), node.lon()))
+    let points = |nodes: &[WayNode]| {
+        nodes
+            .iter()
+            .map(|node| (node.location.lat(), node.location.lon()))
             .collect::<Vec<_>>()
     };
     match feature.kind {
         WayKind::Address => {
-            let center = if complete { centroid(&points()) } else { None };
+            let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
             match center {
                 Some((lat, lon)) => emit_address(
                     AddressCandidate {
@@ -131,7 +160,7 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
             }
         }
         WayKind::Poi => {
-            let center = if complete { centroid(&points()) } else { None };
+            let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
             match center {
                 Some((lat, lon)) => emit_poi(
                     PoiCandidate {
@@ -155,16 +184,17 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
             }
         }
         WayKind::Street => {
-            let points = complete.then(points);
+            let points = nodes.as_deref().map(points);
             emit_street(feature.way_id, &feature.tags, points.as_deref(), out);
         }
         WayKind::Interpolation => {
-            let nodes = complete.then(|| {
-                refs.into_iter()
+            let nodes = nodes.map(|nodes| {
+                nodes
+                    .into_iter()
                     .map(|node| InterpolationNode {
-                        node_id: node.node_id,
-                        lat: node.lat(),
-                        lon: node.lon(),
+                        node_id: node.id,
+                        lat: node.location.lat(),
+                        lon: node.location.lon(),
                         addr_tags: node.tags,
                     })
                     .collect::<Vec<_>>()
@@ -172,18 +202,11 @@ fn emit_feature(feature: WayFeature, refs: Vec<ResolvedRef>, output: &mut Featur
             emit_interpolation(feature.way_id, &feature.tags, nodes.as_deref(), out);
         }
         WayKind::Boundary => {
-            if complete {
+            if let Some(nodes) = nodes {
                 output.boundary_ways.push(BoundaryWay {
                     object_id: feature.way_id,
                     tags: feature.tags,
-                    vertices: refs
-                        .iter()
-                        .map(|node| Vertex {
-                            node_id: node.node_id,
-                            lat: node.lat(),
-                            lon: node.lon(),
-                        })
-                        .collect(),
+                    vertices: nodes.iter().map(vertex).collect(),
                 });
             }
         }

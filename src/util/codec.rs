@@ -40,6 +40,7 @@ pub(crate) fn put_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn put_tags(out: &mut Vec<u8>, tags: &BTreeMap<String, String>) {
     put_u64(out, tags.len() as u64);
     for (key, value) in tags {
@@ -84,6 +85,7 @@ pub(crate) fn get_i64(input: &mut &[u8]) -> Result<i64> {
     Ok(unzigzag(get_u64(input)?))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn get_i32(input: &mut &[u8]) -> Result<i32> {
     i32::try_from(get_i64(input)?).map_err(|_| Error::Decode("varint does not fit in i32"))
 }
@@ -116,6 +118,7 @@ pub(crate) fn get_opt_string(input: &mut &[u8]) -> Result<Option<String>> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn get_tags(input: &mut &[u8]) -> Result<BTreeMap<String, String>> {
     let count = get_u64(input)?;
     let mut tags = BTreeMap::new();

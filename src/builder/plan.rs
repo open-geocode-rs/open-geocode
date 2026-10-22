@@ -1,64 +1,198 @@
-//! Sizing a build to the machine before it starts.
+//! Sizing a build to the machine, before it starts and again once its input
+//! is counted.
 //!
-//! [`plan_build`] probes what the process can use ([`Resources`]), derives
-//! the memory budget and the worker threads from it, and estimates from the
-//! input's size the memory, scratch disk and output disk the build needs.
-//! Like Planetiler's resource check, it stops before any work when one does
-//! not fit, naming each shortfall and how to fix it, unless forced; within
-//! 10% of a limit it warns. The estimates are upper bounds measured on
-//! builds of Germany and Japan, not a model of every input.
+//! A build is planned twice. [`plan_build`] runs before any work, knowing
+//! only the machine ([`Resources`]) and the inputs' sizes: it keeps every
+//! CPU, sizes the memory budget from the memory available less the heap the
+//! build holds outside it, and checks memory and disk against item counts
+//! estimated from the input's size. [`BuildPlan::refine`] runs again after
+//! each input's scan, when the items are counted: how many node coordinates
+//! the ways need, how many records, addresses and streets the build will
+//! spill, how many boundary vertices it holds. It decides whether the node
+//! coordinates stay in memory and checks the rest of the build against the
+//! scratch disk. Both stop the build, unless forced, when it does not fit,
+//! naming each shortfall and how to fix it, like Planetiler's resource
+//! check; within 10% of a limit they warn.
+//!
+//! Every cost is per item, not per PBF byte: a PBF byte of Germany holds four
+//! times the node references of a byte of Canada, so no ratio of input bytes
+//! fits both. Only the estimate before the scan reads counts from bytes, at
+//! the densest input measured, so it errs towards needing more.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    memory::{MIN_BUDGET_BYTES, derived_budget},
+    builder::osm::{NODE_SET_CHUNK_BYTES, NODE_SET_TABLE_BYTES, NODE_SLOT_BYTES},
+    error::{Error, Result},
+    memory::{MAX_DERIVED_BUDGET_BYTES, MIN_BUDGET_BYTES},
     resources::{self, Resources},
 };
 
-/// Scratch bytes a build writes per input byte, at most, less what its budget
-/// holds in memory: Germany (4.9 GB of PBF) spilled 15.0 GB with a 1 GiB
-/// budget and 9.8 GB with 6.2 GiB, Japan 1.5 GB of 2.6 GB with 1 GiB.
-const SCRATCH_PER_INPUT: f64 = 3.2;
-/// Pack bytes per input byte: Germany 0.55, Japan 0.25.
-const PACK_PER_INPUT: f64 = 0.6;
+// Item densities of Germany, the densest input measured, from its build
+// report (2026-10): 4,861,056,214 B of PBF.
+const GERMANY_INPUT_BYTES: f64 = 4_861_056_214.0;
+/// Node references of kept ways and boundary members; distinct needed nodes
+/// are fewer, so this bounds them.
+const GERMANY_NODE_REFS: f64 = 163_300_658.0;
+const GERMANY_KEPT_WAYS: f64 = 21_178_798.0;
+const GERMANY_RECORDS: f64 = 26_131_991.0;
+const GERMANY_ADDRESSES: f64 = 19_719_186.0;
+const GERMANY_STREETS: f64 = 4_103_850.0;
+/// Boundary vertices per input byte. Never measured: the spill study's
+/// upper estimate of the planet's boundary heap, 15 GB, at
+/// [`BOUNDARY_VERTEX_BYTES`] a vertex over 95.4 GB of PBF. The refined plan
+/// counts them.
+const BOUNDARY_REFS_PER_INPUT_BYTE: f64 = 0.0025;
+/// Node ids OSM had handed out by October 2026 (planet statistics): the
+/// bitmap of a large input spans them all.
+const NODE_ID_SPACE: u64 = 14_300_000_000;
+
+/// Scratch bytes a record takes in the records sorter: the spill study
+/// estimates 100-200 B encoded; the top of it, since a record carries its
+/// names and tags.
+const RECORD_SPILL_BYTES: f64 = 200.0;
+/// Scratch bytes an address takes in the address sorter: 146 B measured on
+/// New Zealand's spill (spill study).
+const ADDRESS_SPILL_BYTES: f64 = 146.0;
+/// Scratch bytes a street way takes in the street sorter: the spill study
+/// estimates 120-200 B.
+const STREET_SPILL_BYTES: f64 = 200.0;
+/// Scratch bytes an imported address takes beyond its address and record
+/// copies: the house and kept-address sorters each hold another copy of
+/// about 150 B while repeated houses are dropped (spill study).
+const IMPORTED_ROW_COPY_BYTES: f64 = 300.0;
+/// Pack bytes per record: Germany's Pack was 2,666,692,193 B for 26,131,991
+/// records. The Writer's scratch holds about as much again until the seal.
+const PACK_BYTES_PER_RECORD: f64 = 102.0;
 /// Pack bytes an imported address adds at most: an anchor of a run, its house
 /// number term and its share of a block box. Most continue a run, at about 9 B.
-const PACK_PER_IMPORTED_ROW: u64 = 25;
-/// Scratch bytes an imported address takes at most: it is spilled about 150 B
-/// at a time by the address, house, kept-address and record sorters.
-const SCRATCH_PER_IMPORTED_ROW: u64 = 600;
-/// Heap a build holds outside its budget per input byte: boundary
-/// geometry, maps of ways and members, the training sample. Germany held
-/// about 1.6 GB beyond its 0.9 GB tracked peak.
-const UNTRACKED_PER_INPUT: f64 = 0.35;
+const PACK_BYTES_PER_IMPORTED_ROW: f64 = 25.0;
+
 /// Heap one worker thread holds outside the budget at most: a batch of PBF
 /// blobs decoded, and what they emit.
 const WORKER_BYTES: u64 = 64 << 20;
-/// Heap a build holds outside its budget besides its workers'.
-fn untracked_base(input_bytes: u64) -> u64 {
-    (input_bytes as f64 * UNTRACKED_PER_INPUT) as u64
-}
+/// Heap a build holds outside the budget besides its workers' and its
+/// boundaries': maps of member ways, relation stubs, the training sample.
+/// Germany held 1.6 GB beyond its tracked peak with 24 workers, which take
+/// 1.5 GB of it; this doubles the rest.
+const BASE_UNTRACKED_BYTES: u64 = 256 << 20;
+/// Heap a boundary vertex holds from the way pass through the boundary
+/// stage: 24 B as a vertex of its way, the assembled ring's 16 B point, and
+/// the containment index's copy. Estimated from the types; never measured.
+const BOUNDARY_VERTEX_BYTES: u64 = 64;
+/// Share of the memory left beside the heap outside the budget that the
+/// derived budget takes. The rest is page cache: the input the passes
+/// reread, and the node coordinates when they are mapped from scratch.
+const BUDGET_PERCENT: u64 = 75;
 /// Within this share of a limit, the check warns.
 const WARN_SHARE: f64 = 0.1;
 
-/// The sizes a build runs with and what the pre-flight check found.
+/// What a build holds and spills, counted after the scan or estimated from
+/// the input's size before it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ItemCounts {
+    /// Distinct nodes the ways need: one coordinate slot each.
+    pub needed_nodes: u64,
+    /// Bytes of the bitmap that marks them and its rank index.
+    pub node_set_bytes: u64,
+    pub kept_ways: u64,
+    /// Records from OSM, addresses and streets included.
+    pub records: u64,
+    pub addresses: u64,
+    pub streets: u64,
+    /// Vertices of boundary ways and boundary relation members.
+    pub boundary_refs: u64,
+    /// Addresses from outside OSM; 0 when not known before they are read.
+    pub imported_rows: u64,
+}
+
+impl ItemCounts {
+    /// The counts of an input of `input_bytes` at Germany's density.
+    fn estimate(input_bytes: u64, imported_rows: u64) -> Self {
+        let at = |germany: f64| (input_bytes as f64 * germany / GERMANY_INPUT_BYTES) as u64;
+        let needed_nodes = at(GERMANY_NODE_REFS);
+        Self {
+            needed_nodes,
+            node_set_bytes: node_set_bytes(needed_nodes),
+            kept_ways: at(GERMANY_KEPT_WAYS),
+            records: at(GERMANY_RECORDS),
+            addresses: at(GERMANY_ADDRESSES),
+            streets: at(GERMANY_STREETS),
+            boundary_refs: (input_bytes as f64 * BOUNDARY_REFS_PER_INPUT_BYTE) as u64,
+            imported_rows,
+        }
+    }
+
+    /// These counts with the OSM ones of the inputs not yet read
+    /// extrapolated from the share read: `read_bytes` of `input_bytes`. The
+    /// node store is per input, so its counts are this input's.
+    fn extrapolated(&self, read_bytes: u64, input_bytes: u64) -> Self {
+        if read_bytes == 0 || read_bytes >= input_bytes {
+            return self.clone();
+        }
+        let scale = |count: u64| (count as f64 * input_bytes as f64 / read_bytes as f64) as u64;
+        Self {
+            records: scale(self.records),
+            addresses: scale(self.addresses),
+            streets: scale(self.streets),
+            kept_ways: scale(self.kept_ways),
+            boundary_refs: scale(self.boundary_refs),
+            ..self.clone()
+        }
+    }
+}
+
+/// Bytes of a node set holding `needed` nodes: a chunk per 65,536 ids, at
+/// most one per needed node, never more than the id space has.
+fn node_set_bytes(needed: u64) -> u64 {
+    let chunks = needed.min(NODE_ID_SPACE.div_ceil(65_536));
+    NODE_SET_TABLE_BYTES + chunks * NODE_SET_CHUNK_BYTES
+}
+
+/// The sizes a build runs with and what the checks found.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BuildPlan {
     pub resources: Resources,
+    /// The memory budget: every buffer the build tracks, the node store and
+    /// the sorters included.
     pub memory_budget_bytes: u64,
     /// Whether the budget was derived from the memory available, not set.
     pub memory_budget_derived: bool,
-    /// Worker threads: the usable CPUs, fewer when the memory left beside
-    /// the budget cannot hold a worker's buffers for each.
+    /// The most one sorter may hold. Sorting and indexing in buffers far
+    /// larger than the CPU caches cost more than the spill they save: Germany
+    /// with a 6.2 GiB budget scanned, joined and wrote records slower than
+    /// with 1 GiB. The rest of the budget serves the node store.
+    pub sorter_bytes: u64,
+    /// Worker threads: every usable CPU.
     pub threads: usize,
+    /// The items the needs below are sized for.
+    pub items: ItemCounts,
+    /// Whether `items` were counted by a scan, not estimated from the
+    /// inputs' size.
+    pub counted: bool,
+    pub input_bytes: u64,
+    /// Heap the build is expected to hold outside its budget at its peak.
+    pub untracked_bytes: u64,
+    /// Heap outside the budget measured after the last scan; 0 when the
+    /// allocator does not count.
+    pub measured_untracked_bytes: u64,
+    /// Whether the node coordinates fit in memory; else they are mapped from
+    /// a scratch file.
+    pub locations_in_memory: bool,
     pub memory_needed_bytes: u64,
+    /// The most scratch held at once, over every stage.
     pub scratch_disk_needed_bytes: u64,
+    /// The most scratch and Pack held at once, when both share a volume.
+    pub shared_disk_needed_bytes: u64,
     pub scratch_disk_free_bytes: Option<u64>,
+    /// The scratch the build was given, when it was given a cap.
+    pub scratch_budget_bytes: Option<u64>,
     pub output_disk_needed_bytes: u64,
     pub output_disk_free_bytes: Option<u64>,
+    pub scratch_dir: PathBuf,
+    pub output_dir: PathBuf,
     /// Needs within 10% of what is free.
     pub warnings: Vec<String>,
     /// Needs past what is free, each with how to fix it. A plan has any only
@@ -68,121 +202,243 @@ pub struct BuildPlan {
     pub forced: bool,
 }
 
+/// What a build looks like after an input's scan: the items counted so far,
+/// and the heap it holds.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Scanned {
+    pub items: ItemCounts,
+    /// Input bytes whose items `items` counts.
+    pub read_bytes: u64,
+    /// Bytes the heap holds; `None` when the allocator does not count.
+    pub heap_bytes: Option<u64>,
+    /// Bytes the budget's buffers hold.
+    pub tracked_bytes: u64,
+}
+
 impl BuildPlan {
-    /// Heap the build is expected to hold outside its budget.
-    pub fn untracked_bytes(&self, input_bytes: u64) -> u64 {
-        untracked_bytes(input_bytes, self.threads)
+    /// Size the rest of the build from what the scan of an input counted, as
+    /// [`plan_build`] sized all of it from the input's size. Fails, unless
+    /// forced, when the rest does not fit.
+    pub(crate) fn refine(&mut self, scanned: &Scanned) -> Result<()> {
+        self.resources = Resources::probe();
+        self.items = scanned
+            .items
+            .extrapolated(scanned.read_bytes, self.input_bytes);
+        self.counted = true;
+        self.measured_untracked_bytes = scanned
+            .heap_bytes
+            .map_or(0, |heap| heap.saturating_sub(scanned.tracked_bytes));
+        let boundary = self.items.boundary_refs * BOUNDARY_VERTEX_BYTES;
+        self.untracked_bytes = self
+            .measured_untracked_bytes
+            .max(untracked_beside_boundaries(self.threads))
+            + boundary;
+        // The coordinates stay in memory when the budget holds them beside
+        // what it holds now, and what the machine has free holds them beside
+        // the boundary vertices the way pass is about to gather.
+        let locations = self.items.needed_nodes * NODE_SLOT_BYTES;
+        self.locations_in_memory = scanned.tracked_bytes + locations <= self.memory_budget_bytes
+            && locations + boundary <= self.resources.available_memory_bytes / 10 * 9;
+        self.size();
+        self.check()
+    }
+
+    /// Set the needs from `items`.
+    fn size(&mut self) {
+        let items = &self.items;
+        // The least budget the build runs on, or the one it was given.
+        let least_budget = if self.memory_budget_derived {
+            MIN_BUDGET_BYTES as u64
+        } else {
+            self.memory_budget_bytes
+        };
+        self.memory_needed_bytes = least_budget + items.node_set_bytes + self.untracked_bytes;
+        let records = (items.records + items.imported_rows) as f64;
+        let addresses = (items.addresses + items.imported_rows) as f64;
+        let streets = items.streets as f64;
+        let pack = items.records as f64 * PACK_BYTES_PER_RECORD
+            + items.imported_rows as f64 * PACK_BYTES_PER_IMPORTED_ROW;
+        let locations = if self.locations_in_memory {
+            0.0
+        } else {
+            (items.needed_nodes * NODE_SLOT_BYTES) as f64
+        };
+        // Scratch held at the end of each stage that peaks: the way pass
+        // (the records other than addresses and streets, the OSM addresses,
+        // the streets, mapped coordinates), address placement (every record
+        // and every address, and the imported rows' copies), the record
+        // write (records and the Writer's scratch) and the seal (the Writer's
+        // scratch, and the Pack it is copied into).
+        let ways = (items.records as f64 - items.addresses as f64 - streets).max(0.0)
+            * RECORD_SPILL_BYTES
+            + items.addresses as f64 * ADDRESS_SPILL_BYTES
+            + streets * STREET_SPILL_BYTES
+            + locations;
+        let placement = records * RECORD_SPILL_BYTES
+            + addresses * ADDRESS_SPILL_BYTES
+            + items.imported_rows as f64 * IMPORTED_ROW_COPY_BYTES;
+        let write = records * RECORD_SPILL_BYTES + pack;
+        let scratch = ways.max(placement).max(write);
+        self.scratch_disk_needed_bytes = scratch as u64;
+        self.shared_disk_needed_bytes = scratch.max(2.0 * pack) as u64;
+        self.output_disk_needed_bytes = pack as u64;
+    }
+
+    /// Check the needs against what is free, failing unless forced.
+    fn check(&mut self) -> Result<()> {
+        self.warnings.clear();
+        self.scratch_disk_free_bytes = resources::free_disk(&self.scratch_dir);
+        self.output_disk_free_bytes = resources::free_disk(&self.output_dir);
+        let counted = if self.counted {
+            "counted"
+        } else {
+            "estimated from the input's size"
+        };
+        let scratch_free = match (self.scratch_disk_free_bytes, self.scratch_budget_bytes) {
+            (Some(free), Some(budget)) => Some(free.min(budget)),
+            (free, budget) => free.or(budget),
+        };
+        let scratch_fix = if self.scratch_budget_bytes.is_some() {
+            "free space there, raise --scratch-budget-mb, or pass --scratch-dir on another volume"
+        } else {
+            "free space there or pass --scratch-dir on another volume"
+        };
+        let mut needs = vec![(
+            format!("memory ({counted})"),
+            self.memory_needed_bytes,
+            Some(self.resources.available_memory_bytes),
+            "close other programs, pass a smaller --memory-budget-mb, or build a smaller extract",
+        )];
+        if resources::same_volume(&self.scratch_dir, &self.output_dir) {
+            needs.push((
+                format!(
+                    "disk for scratch and Pack at {} ({counted})",
+                    self.scratch_dir.display()
+                ),
+                self.shared_disk_needed_bytes,
+                scratch_free,
+                scratch_fix,
+            ));
+        } else {
+            needs.push((
+                format!("scratch disk at {} ({counted})", self.scratch_dir.display()),
+                self.scratch_disk_needed_bytes,
+                scratch_free,
+                scratch_fix,
+            ));
+            needs.push((
+                format!("Pack disk at {} ({counted})", self.output_dir.display()),
+                self.output_disk_needed_bytes,
+                self.output_disk_free_bytes,
+                "free space there",
+            ));
+        }
+        let mut shortfalls = Vec::new();
+        for (what, needed, free, fix) in needs {
+            let Some(free) = free else {
+                continue;
+            };
+            if needed > free {
+                shortfalls.push(format!(
+                    "{what}: needs about {} MiB, {} MiB free; {fix}",
+                    needed >> 20,
+                    free >> 20
+                ));
+            } else if needed as f64 > free as f64 * (1.0 - WARN_SHARE) {
+                self.warnings.push(format!(
+                    "{what}: needs about {} MiB of the {} MiB free",
+                    needed >> 20,
+                    free >> 20
+                ));
+            }
+        }
+        if !shortfalls.is_empty() && !self.forced {
+            return Err(Error::OutOfResources(format!(
+                "insufficient resources for this build, pass --force to build anyway:\n  {}",
+                shortfalls.join("\n  ")
+            )));
+        }
+        self.shortfalls = shortfalls;
+        Ok(())
     }
 }
 
-fn untracked_bytes(input_bytes: u64, threads: usize) -> u64 {
-    untracked_base(input_bytes) + threads as u64 * WORKER_BYTES
+fn untracked_beside_boundaries(threads: usize) -> u64 {
+    BASE_UNTRACKED_BYTES + threads as u64 * WORKER_BYTES
 }
 
-/// The budget and the worker threads of a build of `input_bytes` on
-/// `resources`. The workers' buffers lie outside the pool, so as LLVM sizes
-/// link jobs by memory, there are no more workers than the memory left
-/// beside the budget holds.
-fn sizes(
-    resources: &Resources,
-    input_bytes: u64,
-    budget_override: Option<usize>,
-) -> (usize, usize) {
-    let cpus = resources.usable_cpus.max(1);
-    let budget = budget_override
-        .unwrap_or_else(|| derived_budget(resources, untracked_bytes(input_bytes, cpus)));
-    let beside = resources
+/// The budget of a build on `resources` with `threads` workers: a share of
+/// the memory left beside the heap it holds outside the budget, at least
+/// [`MIN_BUDGET_BYTES`]. Boundary heap is not set aside: before the scan it
+/// is a guess, and the budget's heap ceiling makes tracked buffers spill as
+/// it grows.
+fn derived_budget(resources: &Resources, threads: usize) -> u64 {
+    let usable = resources
         .available_memory_bytes
-        .saturating_sub(budget as u64 + untracked_base(input_bytes));
-    let threads = cpus.min((beside / WORKER_BYTES).max(1) as usize);
-    (budget, threads)
+        .saturating_sub(untracked_beside_boundaries(threads));
+    u64::try_from(u128::from(usable) * u128::from(BUDGET_PERCENT) / 100)
+        .unwrap_or(u64::MAX)
+        .max(MIN_BUDGET_BYTES as u64)
+}
+
+/// The plan before any work, on `resources`.
+fn preflight(
+    resources: Resources,
+    input_bytes: u64,
+    imported_rows: u64,
+    budget_override: Option<usize>,
+) -> BuildPlan {
+    let threads = resources.usable_cpus.max(1);
+    let memory_budget_bytes = budget_override.map_or_else(
+        || derived_budget(&resources, threads),
+        |budget| budget as u64,
+    );
+    let items = ItemCounts::estimate(input_bytes, imported_rows);
+    let mut plan = BuildPlan {
+        memory_budget_bytes,
+        memory_budget_derived: budget_override.is_none(),
+        sorter_bytes: memory_budget_bytes.min(MAX_DERIVED_BUDGET_BYTES as u64),
+        threads,
+        locations_in_memory: items.node_set_bytes + items.needed_nodes * NODE_SLOT_BYTES
+            <= memory_budget_bytes,
+        untracked_bytes: untracked_beside_boundaries(threads)
+            + items.boundary_refs * BOUNDARY_VERTEX_BYTES,
+        items,
+        input_bytes,
+        resources,
+        ..BuildPlan::default()
+    };
+    plan.size();
+    plan
 }
 
 /// Plan a build of `input_bytes` of PBF and `imported_rows` addresses from
-/// outside OSM (0 when not known) that spills to `scratch` and writes its Pack
-/// under `output`, with the budget `budget_override` when one is given.
-/// Fails, unless `force`, when memory or disk falls short.
+/// outside OSM (0 when not known) that spills to `scratch`, at most
+/// `scratch_budget` bytes when given, and writes its Pack under `output`,
+/// with the budget `budget_override` when one is given. Fails, unless
+/// `force`, when memory or disk falls short of the estimate.
 pub fn plan_build(
     input_bytes: u64,
     imported_rows: u64,
     scratch: &Path,
     output: &Path,
     budget_override: Option<usize>,
+    scratch_budget: Option<u64>,
     force: bool,
 ) -> Result<BuildPlan> {
-    let resources = Resources::probe();
-    let (budget, threads) = sizes(&resources, input_bytes, budget_override);
     let mut plan = BuildPlan {
-        memory_budget_bytes: budget as u64,
-        memory_budget_derived: budget_override.is_none(),
-        threads,
-        // The least budget the build runs on, or the one it was given.
-        memory_needed_bytes: budget_override.unwrap_or(MIN_BUDGET_BYTES) as u64
-            + untracked_bytes(input_bytes, threads),
-        scratch_disk_needed_bytes: ((input_bytes as f64 * SCRATCH_PER_INPUT) as u64)
-            .saturating_sub(budget as u64)
-            + imported_rows * SCRATCH_PER_IMPORTED_ROW,
-        scratch_disk_free_bytes: resources::free_disk(scratch),
-        output_disk_needed_bytes: (input_bytes as f64 * PACK_PER_INPUT) as u64
-            + imported_rows * PACK_PER_IMPORTED_ROW,
-        output_disk_free_bytes: resources::free_disk(output),
-        resources,
+        scratch_budget_bytes: scratch_budget,
+        scratch_dir: scratch.to_path_buf(),
+        output_dir: output.to_path_buf(),
         forced: force,
-        ..BuildPlan::default()
+        ..preflight(
+            Resources::probe(),
+            input_bytes,
+            imported_rows,
+            budget_override,
+        )
     };
-    let mut shortfalls = Vec::new();
-    let mut check = |what: String, needed: u64, free: Option<u64>, fix: &str| {
-        let Some(free) = free else {
-            return;
-        };
-        if needed > free {
-            shortfalls.push(format!(
-                "{what}: needs about {} MiB, {} MiB free; {fix}",
-                needed >> 20,
-                free >> 20
-            ));
-        } else if needed as f64 > free as f64 * (1.0 - WARN_SHARE) {
-            plan.warnings.push(format!(
-                "{what}: needs about {} MiB of the {} MiB free",
-                needed >> 20,
-                free >> 20
-            ));
-        }
-    };
-    check(
-        "memory".to_string(),
-        plan.memory_needed_bytes,
-        Some(plan.resources.available_memory_bytes),
-        "close other programs, pass a smaller --memory-budget-mb, or build a smaller extract",
-    );
-    if resources::same_volume(scratch, output) {
-        check(
-            format!("disk for scratch and Pack at {}", scratch.display()),
-            plan.scratch_disk_needed_bytes + plan.output_disk_needed_bytes,
-            plan.scratch_disk_free_bytes,
-            "free space there or pass --scratch-dir on another volume",
-        );
-    } else {
-        check(
-            format!("scratch disk at {}", scratch.display()),
-            plan.scratch_disk_needed_bytes,
-            plan.scratch_disk_free_bytes,
-            "free space there or pass --scratch-dir on a larger volume",
-        );
-        check(
-            format!("Pack disk at {}", output.display()),
-            plan.output_disk_needed_bytes,
-            plan.output_disk_free_bytes,
-            "free space there",
-        );
-    }
-    if !shortfalls.is_empty() && !force {
-        return Err(Error::OutOfResources(format!(
-            "insufficient resources for this build, pass --force to build anyway:\n  {}",
-            shortfalls.join("\n  ")
-        )));
-    }
-    plan.shortfalls = shortfalls;
+    plan.check()?;
     Ok(plan)
 }
 
@@ -190,47 +446,136 @@ pub fn plan_build(
 mod tests {
     use super::*;
 
+    fn machine(available_gib: u64) -> Resources {
+        Resources {
+            usable_cpus: 24,
+            total_memory_bytes: 32 << 30,
+            available_memory_bytes: available_gib << 30,
+            ..Resources::default()
+        }
+    }
+
     #[test]
     fn a_build_that_cannot_fit_stops_unless_forced() {
         let scratch = std::env::temp_dir();
-        let error = plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, false).unwrap_err();
+        let error = plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, None, false).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("--force"), "{message}");
         assert!(message.contains("memory"), "{message}");
         assert!(message.contains("disk"), "{message}");
-        let plan = plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, true).expect("forced");
+        let plan =
+            plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, None, true).expect("forced");
         assert!(plan.forced);
         assert_eq!(plan.shortfalls.len(), 2, "{:?}", plan.shortfalls);
     }
 
     #[test]
-    fn a_small_build_gets_a_derived_budget() {
+    fn a_scratch_budget_caps_the_disk_a_build_may_use() {
         let scratch = std::env::temp_dir();
-        let plan = plan_build(1 << 20, 0, &scratch, &scratch, None, false).expect("plan");
+        let error =
+            plan_build(1 << 30, 0, &scratch, &scratch, None, Some(1 << 20), false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--scratch-budget-mb"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_small_build_gets_a_derived_budget_and_every_cpu() {
+        let scratch = std::env::temp_dir();
+        let plan = plan_build(1 << 20, 0, &scratch, &scratch, None, None, false).expect("plan");
         assert!(plan.memory_budget_derived);
         assert!(plan.memory_budget_bytes >= MIN_BUDGET_BYTES as u64);
-        assert!(plan.threads >= 1 && plan.threads <= plan.resources.usable_cpus);
-        let set = plan_build(1 << 20, 0, &scratch, &scratch, Some(64 << 20), false).expect("plan");
+        assert_eq!(plan.threads, plan.resources.usable_cpus.max(1));
+        assert!(plan.sorter_bytes <= MAX_DERIVED_BUDGET_BYTES as u64);
+        let set =
+            plan_build(1 << 20, 0, &scratch, &scratch, Some(64 << 20), None, false).expect("plan");
         assert_eq!(set.memory_budget_bytes, 64 << 20);
+        assert_eq!(set.sorter_bytes, 64 << 20);
         assert!(!set.memory_budget_derived);
     }
 
     #[test]
-    fn workers_are_as_many_as_the_memory_beside_the_budget_holds() {
-        let machine = |gib: u64| Resources {
-            usable_cpus: 24,
-            total_memory_bytes: 32 << 30,
-            available_memory_bytes: gib << 30,
-            ..Resources::default()
+    fn the_budget_is_what_the_machine_leaves_and_never_costs_a_worker() {
+        // 28 GiB available on 24 CPUs: 1.75 GiB for the workers and the
+        // base heap, three quarters of the rest for the budget.
+        assert_eq!(
+            derived_budget(&machine(28), 24),
+            ((28u64 << 30) - (1792 << 20)) / 4 * 3
+        );
+        let small = preflight(machine(1), 1 << 30, 0, None);
+        assert_eq!(small.memory_budget_bytes, MIN_BUDGET_BYTES as u64);
+        assert_eq!(small.threads, 24);
+    }
+
+    #[test]
+    fn the_planet_fits_this_machine_before_and_after_its_scan() {
+        // Planet 2026-10: 95.4 GB of PBF; 32 GB of RAM, about 28 GiB
+        // available; 233 GB of scratch on the Pack's volume.
+        let disk = 233_000_000_000;
+        let planet = preflight(machine(28), 95_380_942_829, 0, None);
+        assert_eq!(planet.threads, 24);
+        assert!(planet.memory_budget_bytes > 16 << 30);
+        // Germany's density reads 3.2 billion references, against the
+        // planet's 1.75 billion, so the estimate errs high and still fits.
+        assert!(planet.items.needed_nodes > 3_000_000_000);
+        assert!(!planet.locations_in_memory);
+        assert!(
+            planet.shared_disk_needed_bytes < disk / 10 * 9,
+            "{} GiB",
+            planet.shared_disk_needed_bytes >> 30
+        );
+        assert!(
+            planet.memory_needed_bytes < 28 << 30,
+            "{} GiB",
+            planet.memory_needed_bytes >> 30
+        );
+
+        // After the scan, at the spill study's planet counts.
+        let mut counted = planet.clone();
+        counted.items = ItemCounts {
+            needed_nodes: 1_600_000_000,
+            node_set_bytes: node_set_bytes(1_600_000_000),
+            kept_ways: 165_000_000,
+            records: 280_000_000,
+            addresses: 190_000_000,
+            streets: 56_400_000,
+            boundary_refs: 150_000_000,
+            imported_rows: 0,
         };
-        // Germany on this machine: the largest derived budget and every CPU.
-        let germany = 4_861_056_214;
-        assert_eq!(sizes(&machine(16), germany, None), (1 << 30, 24));
-        // A small machine: a smaller budget and fewer workers.
-        let (budget, threads) = sizes(&machine(3), germany, None);
-        assert_eq!(budget, MIN_BUDGET_BYTES);
-        assert!((1..24).contains(&threads), "{threads}");
-        // A budget that takes the memory leaves one worker.
-        assert_eq!(sizes(&machine(4), 0, Some(4 << 30)), (4 << 30, 1));
+        counted.locations_in_memory = true;
+        counted.size();
+        assert!(
+            counted.shared_disk_needed_bytes < 100_000_000_000,
+            "{} GiB",
+            counted.shared_disk_needed_bytes >> 30
+        );
+        assert!(counted.memory_needed_bytes < 28 << 30);
+    }
+
+    #[test]
+    fn coordinates_mapped_from_disk_count_as_scratch() {
+        let mut plan = preflight(machine(28), 200_000_000, 0, None);
+        plan.items.needed_nodes = 1_000_000_000;
+        plan.locations_in_memory = true;
+        plan.size();
+        let in_memory = plan.scratch_disk_needed_bytes;
+        plan.locations_in_memory = false;
+        plan.size();
+        let mapped = plan.scratch_disk_needed_bytes;
+        assert!(mapped > in_memory, "{mapped} > {in_memory}");
+    }
+
+    #[test]
+    fn counts_of_inputs_not_yet_read_are_extrapolated() {
+        let read = ItemCounts {
+            needed_nodes: 10,
+            records: 100,
+            addresses: 50,
+            ..ItemCounts::default()
+        };
+        let all = read.extrapolated(1_000, 3_000);
+        assert_eq!((all.records, all.addresses), (300, 150));
+        assert_eq!(all.needed_nodes, 10, "the node store is per input");
     }
 }

@@ -284,12 +284,12 @@ fn build_step(stage: BuildStage) -> Step {
             ],
         ),
         BuildStage::NodeJoin => (
-            "Joined",
-            "Joining",
+            "Stored",
+            "Storing",
             "node coordinates",
             [
-                "Giving every street and building the coordinates of its points.",
-                "Data larger than the memory budget spills to disk; that is normal.",
+                "Keeping the coordinates of the points streets and buildings are drawn with.",
+                "When memory cannot hold them they go to a scratch file; that is normal.",
             ],
         ),
         BuildStage::AssembleWays => (
@@ -359,7 +359,6 @@ fn build_step(stage: BuildStage) -> Step {
     let unit = match stage.unit() {
         StageUnit::Bytes => Unit::Bytes,
         StageUnit::Blocks => Unit::Count("blocks"),
-        StageUnit::Ways => Unit::Count("ways"),
         StageUnit::Records => Unit::Count("records"),
         StageUnit::None => Unit::None,
     };

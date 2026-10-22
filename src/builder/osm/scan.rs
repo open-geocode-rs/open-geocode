@@ -4,7 +4,9 @@
 //! carries its own coordinates. Ways that need geometry become [`WayFeature`]s plus
 //! their node references; boundary relations are kept as stubs. Each block is
 //! classified independently, so blocks are processed in parallel and merged in
-//! file order.
+//! file order. The way pass classifies the ways again ([`way_features`])
+//! rather than keeping them between the passes: a reread of the way blocks
+//! costs less than writing every kept way's tags to scratch and back.
 
 use std::{cell::OnceCell, collections::BTreeMap};
 
@@ -75,10 +77,16 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                 let tags = collect_clean_tags(way.tags());
                 if !tags.is_empty() {
                     let refs = OnceCell::new();
-                    scan_way(&mut output, way.id(), tags, || {
-                        refs.get_or_init(|| way.refs().collect::<Vec<_>>())
-                            .as_slice()
-                    });
+                    scan_way(
+                        &mut output.ways,
+                        Some(&mut output.emitted),
+                        way.id(),
+                        tags,
+                        || {
+                            refs.get_or_init(|| way.refs().collect::<Vec<_>>())
+                                .as_slice()
+                        },
+                    );
                 }
             }
             Element::Relation(relation) => {
@@ -189,50 +197,60 @@ fn node_address_tags(
     Some(tags)
 }
 
+/// The features a way with `all_tags` (not empty) becomes, as the scan
+/// classifies it, without counting what it rejects again.
+pub(crate) fn way_features<'a>(
+    object_id: i64,
+    all_tags: BTreeMap<String, String>,
+    refs: impl Fn() -> &'a [i64],
+) -> Vec<(WayFeature, Vec<i64>)> {
+    let mut ways = Vec::new();
+    scan_way(&mut ways, None, object_id, all_tags, refs);
+    ways
+}
+
 /// `refs` decodes the node list on first use; most tagged ways are not kept.
+/// Rejections go to `out` when given.
 fn scan_way<'a>(
-    output: &mut ScanOutput,
+    ways: &mut Vec<(WayFeature, Vec<i64>)>,
+    mut out: Option<&mut Emitted>,
     object_id: i64,
     all_tags: BTreeMap<String, String>,
     refs: impl Fn() -> &'a [i64],
 ) {
     let feature = |kind, tags| {
-        let refs = refs();
         (
             WayFeature {
                 kind,
                 way_id: object_id,
-                node_count: refs.len() as u32,
                 tags,
             },
-            refs.to_vec(),
+            refs().to_vec(),
         )
     };
 
     if has_area_tags(&all_tags) && !refs().is_empty() {
-        output
-            .ways
-            .push(feature(WayKind::Boundary, boundary_tags(&all_tags)));
+        ways.push(feature(WayKind::Boundary, boundary_tags(&all_tags)));
     }
 
     if has_highway_tag(&all_tags) {
         if street_name(&all_tags).is_some() {
             if refs().is_empty() {
-                output.emitted.reject(
-                    CandidateIssue::StreetUnresolvedGeometry,
-                    ObjectType::Way,
-                    object_id,
-                    &all_tags,
-                    Some(&BTreeMap::new()),
-                    Some("street"),
-                );
+                if let Some(out) = out.as_deref_mut() {
+                    out.reject(
+                        CandidateIssue::StreetUnresolvedGeometry,
+                        ObjectType::Way,
+                        object_id,
+                        &all_tags,
+                        Some(&BTreeMap::new()),
+                        Some("street"),
+                    );
+                }
             } else {
-                output
-                    .ways
-                    .push(feature(WayKind::Street, street_tags(&all_tags)));
+                ways.push(feature(WayKind::Street, street_tags(&all_tags)));
             }
-        } else {
-            output.emitted.reject_in_report(
+        } else if let Some(out) = out.as_deref_mut() {
+            out.reject_in_report(
                 missing_street_name_issue(&all_tags),
                 ObjectType::Way,
                 object_id,
@@ -246,16 +264,18 @@ fn scan_way<'a>(
     let tags = collect_addr_tags_from_map(&all_tags);
     if has_interpolation_tag(&tags) {
         if refs().is_empty() {
-            output.emitted.reject(
-                CandidateIssue::InterpolationWayWithoutNodes,
-                ObjectType::Way,
-                object_id,
-                &all_tags,
-                Some(&tags),
-                Some("interpolation"),
-            );
+            if let Some(out) = out.as_deref_mut() {
+                out.reject(
+                    CandidateIssue::InterpolationWayWithoutNodes,
+                    ObjectType::Way,
+                    object_id,
+                    &all_tags,
+                    Some(&tags),
+                    Some("interpolation"),
+                );
+            }
         } else {
-            output.ways.push(feature(WayKind::Interpolation, tags));
+            ways.push(feature(WayKind::Interpolation, tags));
         }
         return;
     }
@@ -263,14 +283,16 @@ fn scan_way<'a>(
     let address = if tags.is_empty() {
         None
     } else if let Err(issue) = validate_address_tags(&tags) {
-        output.emitted.reject(
-            issue,
-            ObjectType::Way,
-            object_id,
-            &all_tags,
-            Some(&tags),
-            Some("address"),
-        );
+        if let Some(out) = out.as_deref_mut() {
+            out.reject(
+                issue,
+                ObjectType::Way,
+                object_id,
+                &all_tags,
+                Some(&tags),
+                Some("address"),
+            );
+        }
         None
     } else {
         Some(tags)
@@ -284,17 +306,19 @@ fn scan_way<'a>(
         return;
     };
     if refs().is_empty() {
-        output.emitted.reject(
-            CandidateIssue::WayWithoutResolvedNodes,
-            ObjectType::Way,
-            object_id,
-            &all_tags,
-            None,
-            Some(layer_hint),
-        );
+        if let Some(out) = out {
+            out.reject(
+                CandidateIssue::WayWithoutResolvedNodes,
+                ObjectType::Way,
+                object_id,
+                &all_tags,
+                None,
+                Some(layer_hint),
+            );
+        }
         return;
     }
-    output.ways.push(feature(kind, tags));
+    ways.push(feature(kind, tags));
 }
 
 /// Whether a relation's members draw its area: an admin boundary, or a
