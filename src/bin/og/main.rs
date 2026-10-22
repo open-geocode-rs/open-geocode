@@ -132,8 +132,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = Home::locate()?;
     // A build is a long run no user seems to wait on; it should not be
-    // moved to efficiency cores.
+    // moved to efficiency cores, nor slow what the user works in meanwhile.
     resources::opt_out_of_power_throttling();
+    resources::yield_to_interactive_programs();
     match cli.command {
         Some(Command::Build {
             regions,

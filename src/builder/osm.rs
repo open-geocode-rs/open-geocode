@@ -96,10 +96,10 @@ use crate::{
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
     },
     extsort::{
-        ExternalSorter, RunState, Scratch, ScratchFile, Sorted, SorterState, Spill, Spool,
-        SpoolFile,
+        ExternalSorter, IndexedSpool, RunState, Scratch, ScratchFile, Sorted, SorterState, Spill,
+        Spool, SpoolFile,
     },
-    memory::Budget,
+    memory::{Budget, Reservation},
     pack::{
         AUDIT_DIR, BUILD_REPORT_FILE, BuildStats, Generation, REJECTIONS_FILE, RecordContext,
         RecordId, SCRATCH_POINTER_FILE, SealedPack, Sealing, Writer, WriterOptions,
@@ -116,8 +116,9 @@ use crate::{
     util::{fold::search_key, geo::point_lon_lat, hilbert::hilbert_key},
 };
 use book::{Book, BookFile};
+pub(crate) use boundary::BOUNDARY_SHAPE_BYTES_PER_COORD;
 use boundary::{
-    BoundaryIndex, BoundaryRelationStub, BoundarySet, BoundaryWay, ContextOrigin, SetItem,
+    BoundaryCandidate, BoundaryIndex, BoundaryRelationStub, BoundarySet, ContextOrigin, SetItem,
     SourceContext, Vertex, build_boundaries, record_context,
 };
 use checkpoint::{
@@ -366,6 +367,9 @@ struct Run<'a> {
     /// The boundary set as saved, until the record write: what the context
     /// index is derived from again.
     boundaries_saved: Option<SpoolFile<SetItem>>,
+    /// The boundary shapes' hold on the memory budget, for as long as they
+    /// are held: they cannot spill.
+    boundary_memory: Option<Reservation>,
     imports: Option<Vec<AddressFile>>,
     contexts: Option<Contexts>,
     /// The addresses in street order, when imported rows are matched
@@ -508,6 +512,7 @@ impl<'a> Run<'a> {
             input: None,
             boundaries: None,
             boundaries_saved: None,
+            boundary_memory: None,
             imports: None,
             contexts: None,
             address_book: None,
@@ -729,6 +734,7 @@ impl<'a> Run<'a> {
         if let Some(saved) = &state.boundaries {
             let saved = SpoolFile::restore(&scratch, saved)?;
             let boundaries = BoundarySet::load(&saved)?;
+            run.boundary_memory = Some(Reservation::forced(&run.memory, boundaries.shape_bytes()));
             match &state.contexts {
                 Some(contexts) => {
                     run.contexts = Some(Contexts::derive(
@@ -1024,10 +1030,11 @@ impl<'a> Run<'a> {
             .ok_or_else(|| missing("the node store"))?;
         input.kept_blobs.sort_unstable();
         input.kept_blobs.dedup();
-        let mut input_members: HashMap<i64, Option<Vec<Vertex>>> = HashMap::new();
+        // Boundary geometry goes to the input's spool alone: held in memory
+        // across a planet's inputs it would outgrow any budget.
+        let mut input_members = HashSet::new();
         let mut part = Vec::new();
         let build = &mut self.build;
-        let geometry = &mut self.geometry;
         let read = for_each_block(
             &self.options.inputs[index],
             &self.progress,
@@ -1038,30 +1045,22 @@ impl<'a> Run<'a> {
                 let resolution = &mut build.report.geometry_resolution;
                 resolution.resolved_node_refs += assembled.resolved;
                 for (way_id, line, found) in assembled.members {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        input_members.entry(way_id)
-                    {
+                    if input_members.insert(way_id) {
                         resolution.resolved_node_refs += found;
-                        part.push(GeometryItem::Member(way_id, line.clone()));
-                        entry.insert(line);
+                        part.push(GeometryItem::Member(way_id, line));
                     }
                 }
                 part.extend(
                     assembled
                         .output
                         .boundary_ways
-                        .iter()
-                        .cloned()
+                        .into_iter()
                         .map(GeometryItem::Way),
                 );
-                geometry
-                    .boundary_ways
-                    .extend(assembled.output.boundary_ways);
                 build.absorb(assembled.output.emitted)
             },
         )?;
         self.build.report.geometry_passes.way_read_bytes += read;
-        self.geometry.member_vertices.extend(input_members);
         self.build.report.phases.feature_emission_ms += phase.elapsed().as_millis();
         drop(input);
         self.save_geometry(part)
@@ -1087,36 +1086,52 @@ impl<'a> Run<'a> {
         let Geometry {
             relations,
             boundary_feature_ids,
-            boundary_ways,
-            member_vertices,
         } = std::mem::take(&mut self.geometry);
-        // Boundary features that were incomplete have no entry in
-        // `boundary_ways` and resolve to `None`, like an incomplete member.
-        let mut member_lines: HashMap<i64, Option<&[Vertex]>> = boundary_feature_ids
-            .iter()
-            .map(|way_id| (*way_id, None))
-            .collect();
-        for way in &boundary_ways {
-            member_lines.insert(way.object_id, Some(way.vertices.as_slice()));
+        drop(boundary_feature_ids);
+        // Every boundary way's and member way's vertices go to one scratch
+        // file read back by way id, so only the ids stay in memory. A way
+        // with no line (a missing node, or a feature that was incomplete)
+        // has none, as a relation needing it then has no shape.
+        let mut lines = IndexedSpool::<GeometryItem>::create(&self.scratch, "boundary-lines")?;
+        let mut line_at = HashMap::<i64, usize>::new();
+        let mut candidates = Vec::new();
+        for part in &self.geometry_saved {
+            for item in part.reader()? {
+                let (way_id, line) = match item? {
+                    GeometryItem::Way(way) => {
+                        candidates.extend(BoundaryCandidate::of_way(&way));
+                        (way.object_id, Some(way.vertices))
+                    }
+                    GeometryItem::Member(way_id, line) => (way_id, line),
+                    GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
+                };
+                line_at.insert(way_id, line_at.len());
+                lines.write(&GeometryItem::Member(way_id, line))?;
+            }
         }
-        for (way_id, line) in &member_vertices {
-            member_lines.insert(*way_id, line.as_deref());
-        }
+        let lines = lines.finish()?;
+        let member_line = |way_id: i64| -> Result<Option<Vec<Vertex>>> {
+            let Some(&at) = line_at.get(&way_id) else {
+                return Ok(None);
+            };
+            match lines.get(at)? {
+                GeometryItem::Member(_, line) => Ok(line),
+                _ => Err(Error::Decode("a boundary line file holds only lines")),
+            }
+        };
         let progress = &self.progress;
-        let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines, || {
-            progress.check()
-        })?;
+        let boundaries =
+            build_boundaries(candidates, &relations, member_line, || progress.check())?;
+        // The shapes stay in memory through the build, so they count against
+        // the budget: the sorters spill sooner instead of the build growing
+        // past it.
+        self.boundary_memory = Some(Reservation::forced(&self.memory, boundaries.shape_bytes()));
         self.build
             .report
             .unmatched_admin_level_ids
             .extend_from_slice(boundaries.unmatched_admin_ids());
-        drop(member_lines);
-        drop((
-            boundary_ways,
-            member_vertices,
-            relations,
-            boundary_feature_ids,
-        ));
+        drop(line_at);
+        drop(relations);
         for (origin, record) in boundaries.place_records(&mut self.build.report) {
             self.build.push(record, Some(origin))?;
         }
@@ -2370,10 +2385,6 @@ struct Geometry {
     /// Boundary ways kept by the scan. When one is also a relation member,
     /// its vertices are reused instead of being read a second time.
     boundary_feature_ids: HashSet<i64>,
-    boundary_ways: Vec<BoundaryWay>,
-    /// Relation member ways by id: their vertices, `None` when a node is
-    /// missing.
-    member_vertices: HashMap<i64, Option<Vec<Vertex>>>,
 }
 
 impl Geometry {
@@ -2385,10 +2396,9 @@ impl Geometry {
                 GeometryItem::Feature(way_id) => {
                     self.boundary_feature_ids.insert(way_id);
                 }
-                GeometryItem::Way(way) => self.boundary_ways.push(way),
-                GeometryItem::Member(way_id, line) => {
-                    self.member_vertices.insert(way_id, line);
-                }
+                // Their vertices stay on disk, in the input's spool, until
+                // the boundary stage reads them.
+                GeometryItem::Way(_) | GeometryItem::Member(..) => {}
             }
         }
         Ok(())
@@ -3044,6 +3054,9 @@ mod tests {
             inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
             pack: root.to_path_buf(),
             memory_budget_bytes,
+            // A budget small enough to spill everything cannot also hold the
+            // node set and the boundary shapes the plan sets inside it.
+            force: memory_budget_bytes.is_some(),
             ..BuildOsmOptions::default()
         })
         .expect("build")
@@ -4332,6 +4345,7 @@ mod tests {
             inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
             pack: root.to_path_buf(),
             memory_budget_bytes: budget,
+            force: budget.is_some(),
             addresses: (!files.is_empty())
                 .then(|| Arc::new(addresses::AddressFiles(files)) as Arc<dyn AddressSource>),
             ..BuildOsmOptions::default()
@@ -4523,6 +4537,7 @@ mod tests {
             let dir = temp_dir("resume");
             let options = BuildOsmOptions {
                 memory_budget_bytes: budget,
+                force: budget.is_some(),
                 ..resumable_inputs(&dir)
             };
             let whole = build_osm_pack(BuildOsmOptions {

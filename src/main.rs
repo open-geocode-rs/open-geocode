@@ -564,6 +564,7 @@ async fn main() -> Result<()> {
             address_files,
         }) => {
             resources::opt_out_of_power_throttling();
+            resources::yield_to_interactive_programs();
             let addresses = address_sources(&pack, openaddresses, &address_files)?;
             let options = BuildOsmOptions {
                 inputs,

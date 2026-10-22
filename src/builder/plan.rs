@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    builder::osm::{NODE_SET_CHUNK_BYTES, NODE_SET_TABLE_BYTES, NODE_SLOT_BYTES},
+    builder::osm::{
+        BOUNDARY_SHAPE_BYTES_PER_COORD, NODE_SET_CHUNK_BYTES, NODE_SET_TABLE_BYTES, NODE_SLOT_BYTES,
+    },
     error::{Error, Result},
     memory::{MAX_DERIVED_BUDGET_BYTES, MIN_BUDGET_BYTES},
     resources::{self, Resources},
@@ -42,7 +44,7 @@ const GERMANY_ADDRESSES: f64 = 19_719_186.0;
 const GERMANY_STREETS: f64 = 4_103_850.0;
 /// Boundary vertices per input byte. Never measured: the spill study's
 /// upper estimate of the planet's boundary heap, 15 GB, at
-/// [`BOUNDARY_VERTEX_BYTES`] a vertex over 95.4 GB of PBF. The refined plan
+/// 64 B a vertex over 95.4 GB of PBF. The refined plan
 /// counts them.
 const BOUNDARY_REFS_PER_INPUT_BYTE: f64 = 0.0025;
 /// Node ids OSM had handed out by October 2026 (planet statistics): the
@@ -88,10 +90,10 @@ const WORKER_BYTES: u64 = 64 << 20;
 /// Germany held 1.6 GB beyond its tracked peak with 24 workers, which take
 /// 1.5 GB of it; this doubles the rest.
 const BASE_UNTRACKED_BYTES: u64 = 256 << 20;
-/// Heap a boundary vertex holds from the way pass through the boundary
-/// stage: 24 B as a vertex of its way, the assembled ring's 16 B point, and
-/// the containment index's copy. Estimated from the types; never measured.
-const BOUNDARY_VERTEX_BYTES: u64 = 64;
+/// Heap a boundary vertex holds: only its shape's, inside the memory budget.
+/// The ways' vertices stay on disk until the boundary stage reads them back
+/// by way id.
+const BOUNDARY_VERTEX_BYTES: u64 = BOUNDARY_SHAPE_BYTES_PER_COORD as u64;
 /// Share of the memory left beside the heap outside the budget that the
 /// derived budget takes. The rest is page cache: the input the passes
 /// reread, and the node coordinates when they are mapped from scratch.
@@ -192,6 +194,10 @@ pub struct BuildPlan {
     /// a scratch file.
     pub locations_in_memory: bool,
     pub memory_needed_bytes: u64,
+    /// What the memory budget must hold beside the sorters' least: the node
+    /// set and the boundary shapes.
+    #[serde(default)]
+    pub budget_needed_bytes: u64,
     /// Memory the build can hold: what was available before it started, or
     /// after the last scan, with what the build held then.
     pub memory_free_bytes: u64,
@@ -249,8 +255,7 @@ impl BuildPlan {
         let boundary = self.items.boundary_refs * BOUNDARY_VERTEX_BYTES;
         self.untracked_bytes = self
             .measured_untracked_bytes
-            .max(untracked_beside_boundaries(self.threads))
-            + boundary;
+            .max(untracked_beside_boundaries(self.threads));
         // The coordinates stay in memory when the budget holds them beside
         // what it holds now, and what the machine has free holds them beside
         // the boundary vertices the way pass is about to gather.
@@ -272,7 +277,13 @@ impl BuildPlan {
         } else {
             self.memory_budget_bytes
         };
-        self.memory_needed_bytes = least_budget + items.node_set_bytes + self.untracked_bytes;
+        // The node set and the boundary shapes are held inside the budget,
+        // beside the least the sorters need, so the budget is all the build
+        // holds beside the heap no budget tracks.
+        self.memory_needed_bytes = least_budget + self.untracked_bytes;
+        self.budget_needed_bytes = items.node_set_bytes
+            + items.boundary_refs * BOUNDARY_VERTEX_BYTES
+            + MIN_BUDGET_BYTES as u64;
         let records = (items.records + items.imported_rows) as f64;
         let addresses = (items.addresses + items.imported_rows) as f64;
         let streets = items.streets as f64;
@@ -366,6 +377,25 @@ impl BuildPlan {
                 "free space there",
             ));
         }
+        // The node set and the boundary shapes live inside the budget. Before
+        // a scan their size is a guess from the input's size, so it warns;
+        // counted, a budget that cannot hold them stops the build.
+        let budget_need = (
+            format!("memory budget for the node set and boundary shapes ({counted})"),
+            self.budget_needed_bytes,
+            Some(self.memory_budget_bytes),
+            "raise --memory-budget-mb",
+        );
+        if self.counted {
+            needs.push(budget_need);
+        } else if budget_need.1 > self.memory_budget_bytes {
+            self.warnings.push(format!(
+                "{}: needs about {} MiB of a {} MiB budget; counted after the first scan",
+                budget_need.0,
+                budget_need.1 >> 20,
+                self.memory_budget_bytes >> 20
+            ));
+        }
         let mut shortfalls = Vec::new();
         for (what, needed, free, fix) in needs {
             let Some(free) = free else {
@@ -435,8 +465,7 @@ fn preflight(
         locations_in_memory: items.node_set_bytes + items.needed_nodes * NODE_SLOT_BYTES
             <= memory_budget_bytes,
         memory_free_bytes: resources.available_memory_bytes,
-        untracked_bytes: untracked_beside_boundaries(threads)
-            + items.boundary_refs * BOUNDARY_VERTEX_BYTES,
+        untracked_bytes: untracked_beside_boundaries(threads),
         items,
         input_bytes,
         resources,
@@ -521,12 +550,20 @@ mod tests {
         let error = plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, None, false).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("--force"), "{message}");
-        assert!(message.contains("memory"), "{message}");
         assert!(message.contains("disk"), "{message}");
         let plan =
             plan_build(u64::MAX / 8, 0, &scratch, &scratch, None, None, true).expect("forced");
         assert!(plan.forced);
-        assert_eq!(plan.shortfalls.len(), 2, "{:?}", plan.shortfalls);
+        assert_eq!(plan.shortfalls.len(), 1, "{:?}", plan.shortfalls);
+        // Before a scan, what the budget must hold is a guess from the
+        // input's size: it warns, and only a count stops the build.
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("node set and boundary shapes")),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     #[test]

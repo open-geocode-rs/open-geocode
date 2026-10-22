@@ -164,7 +164,32 @@ pub(crate) struct BoundarySet {
     unmatched_admin_ids: Vec<String>,
 }
 
+impl BoundaryCandidate {
+    /// The candidate a closed boundary or place way makes, if any.
+    pub(crate) fn of_way(way: &BoundaryWay) -> Option<Self> {
+        Some(Self {
+            source_object_type: ObjectType::Way,
+            source_object_id: way.object_id,
+            boundary: boundary_from_way(way)?,
+        })
+    }
+}
+
 impl BoundarySet {
+    /// Heap the boundaries' shapes hold, for the memory budget: they stay
+    /// in memory through the build, as the index records find their areas
+    /// in.
+    pub(crate) fn shape_bytes(&self) -> usize {
+        use geo::CoordsIter;
+        self.candidates
+            .iter()
+            .map(|candidate| {
+                candidate.boundary.geometry.coords_count() * BOUNDARY_SHAPE_BYTES_PER_COORD
+                    + std::mem::size_of::<BoundaryCandidate>()
+            })
+            .sum()
+    }
+
     /// The objects libpostal's admin table names that the input lacks: a
     /// rule for an id OSM no longer has applies to nothing.
     pub(crate) fn unmatched_admin_ids(&self) -> &[String] {
@@ -539,34 +564,23 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
         .collect()
 }
 
-/// Build boundary polygons from resolved boundary ways and relations.
-/// `member_lines` holds the resolved vertices of every relation member way,
-/// `None` when a member could not be fully resolved. `check` is asked every
-/// [`CHECK_EVERY`] boundaries whether to go on, and its error is returned.
+/// Build boundary polygons from the candidates of the boundary ways
+/// ([`BoundaryCandidate::of_way`], made as a build streams the ways from
+/// disk) and from the relations. `member_line` gives a relation member way's
+/// vertices, `None` when it was not kept or a node of it is missing. `check`
+/// is asked every [`CHECK_EVERY`] boundaries whether to go on, and its error
+/// is returned.
 pub(crate) fn build_boundaries(
-    ways: &[BoundaryWay],
+    mut candidates: Vec<BoundaryCandidate>,
     relations: &[BoundaryRelationStub],
-    member_lines: &HashMap<i64, Option<&[Vertex]>>,
+    member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
     check: impl Fn() -> crate::error::Result<()>,
 ) -> crate::error::Result<BoundarySet> {
-    let mut candidates = Vec::new();
-    for (index, way) in ways.iter().enumerate() {
-        if index % CHECK_EVERY == 0 {
-            check()?;
-        }
-        if let Some(boundary) = boundary_from_way(way) {
-            candidates.push(BoundaryCandidate {
-                source_object_type: ObjectType::Way,
-                source_object_id: way.object_id,
-                boundary,
-            });
-        }
-    }
     for (index, stub) in relations.iter().enumerate() {
         if index % CHECK_EVERY == 0 {
             check()?;
         }
-        if let Some(boundary) = boundary_from_relation(stub, member_lines) {
+        if let Some(boundary) = boundary_from_relation(stub, &member_line)? {
             candidates.push(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
                 source_object_id: stub.object_id,
@@ -588,6 +602,10 @@ pub(crate) fn build_boundaries(
 
 /// Boundaries assembled between two checks of whether the build goes on.
 const CHECK_EVERY: usize = 256;
+
+/// Heap a boundary shape holds per coordinate: the coordinate itself (two
+/// f64) and, once indexed, the prepared shape's segment index beside it.
+pub(crate) const BOUNDARY_SHAPE_BYTES_PER_COORD: usize = 48;
 
 /// Region boundaries whose ISO 3166-2 code names a country that has no
 /// country boundary in the input get a derived country record.
@@ -670,9 +688,9 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
 
 fn boundary_from_relation(
     stub: &BoundaryRelationStub,
-    member_lines: &HashMap<i64, Option<&[Vertex]>>,
-) -> Option<BuiltBoundary> {
-    let AreaParts {
+    member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
+) -> crate::error::Result<Option<BuiltBoundary>> {
+    let Some(AreaParts {
         layer,
         admin_level,
         place_type,
@@ -680,17 +698,18 @@ fn boundary_from_relation(
         alt_names,
         place_layer,
         designation,
-    } = area_parts(&stub.tags)?;
+    }) = area_parts(&stub.tags)
+    else {
+        return Ok(None);
+    };
     let inferred_country_code = country_code_from_tags(&stub.tags, layer);
     let subdivision_code = subdivision_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
-        let line = member_lines
-            .get(&member.way_id)
-            .copied()
-            .flatten()?
-            .to_vec();
+        let Some(line) = member_line(member.way_id)? else {
+            return Ok(None);
+        };
         match member.role {
             BoundaryMemberRole::Outer => outer_segments.push(line),
             BoundaryMemberRole::Inner => inner_segments.push(line),
@@ -699,12 +718,16 @@ fn boundary_from_relation(
 
     let outer_rings = stitch_rings(outer_segments);
     if outer_rings.is_empty() {
-        return None;
+        return Ok(None);
     }
     let inner_rings = stitch_rings(inner_segments);
-    let geometry = multipolygon_from_rings(outer_rings, inner_rings)?;
-    let representative_point = representative_point(&geometry)?;
-    Some(BuiltBoundary {
+    let Some(geometry) = multipolygon_from_rings(outer_rings, inner_rings) else {
+        return Ok(None);
+    };
+    let Some(representative_point) = representative_point(&geometry) else {
+        return Ok(None);
+    };
+    Ok(Some(BuiltBoundary {
         layer,
         admin_level,
         place_type,
@@ -716,7 +739,7 @@ fn boundary_from_relation(
         subdivision_code,
         geometry,
         representative_point,
-    })
+    }))
 }
 
 fn multipolygon_from_rings(
@@ -2240,7 +2263,13 @@ mod tests {
             square(2, "3", "関東地方", None, 4.0),
             square(3, "4", "千葉県", None, 1.0),
         ];
-        let set = build_boundaries(&ways, &[], &HashMap::new(), || Ok(())).expect("boundaries");
+        let set = build_boundaries(
+            ways.iter().filter_map(BoundaryCandidate::of_way).collect(),
+            &[],
+            |_| Ok(None),
+            || Ok(()),
+        )
+        .expect("boundaries");
         let groups = set.region_groups(&[100, 101, 102]);
         assert_eq!(groups, HashMap::from([(102, vec![101])]));
     }
@@ -2297,11 +2326,9 @@ mod tests {
             },
         ];
 
-        let member_lines = member_lines
-            .iter()
-            .map(|(way_id, line): (&i64, &Option<Vec<Vertex>>)| (*way_id, line.as_deref()))
-            .collect();
-        let set = build_boundaries(&[], &relations, &member_lines, || Ok(())).expect("boundaries");
+        let member_line = |way_id: i64| Ok(member_lines.get(&way_id).cloned().flatten());
+        let set =
+            build_boundaries(Vec::new(), &relations, member_line, || Ok(())).expect("boundaries");
         assert_eq!(
             set.len(),
             1,

@@ -110,6 +110,13 @@ pub fn opt_out_of_power_throttling() {
     platform::opt_out_of_power_throttling();
 }
 
+/// Run below the programs a person works in, so a build left running in
+/// the background takes only the CPU they leave idle. Their typing and
+/// browsing come first; the build still gets every idle core.
+pub fn yield_to_interactive_programs() {
+    platform::yield_to_interactive_programs();
+}
+
 #[cfg(windows)]
 mod platform {
     use std::{os::windows::ffi::OsStrExt, path::Path};
@@ -128,11 +135,12 @@ mod platform {
             ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX},
             SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
             Threading::{
-                ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetCurrentProcess,
-                GetCurrentThreadId, GetProcessAffinityMask, GetProcessTimes, GetThreadTimes,
-                OpenThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ALL_PROCESSOR_GROUPS, BELOW_NORMAL_PRIORITY_CLASS, GetActiveProcessorCount,
+                GetCurrentProcess, GetCurrentThreadId, GetProcessAffinityMask, GetProcessTimes,
+                GetThreadTimes, OpenThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                 PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-                ProcessPowerThrottling, SetProcessInformation, THREAD_QUERY_LIMITED_INFORMATION,
+                ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+                THREAD_QUERY_LIMITED_INFORMATION,
             },
         },
     };
@@ -354,6 +362,14 @@ mod platform {
                 .map(|part| part.as_os_str().to_ascii_lowercase())
         };
         root(left) == root(right)
+    }
+
+    pub(super) fn yield_to_interactive_programs() {
+        // SAFETY: the pseudo handle of this process, and a priority class
+        // the call takes. Failure leaves the normal priority.
+        unsafe {
+            SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        }
     }
 
     pub(super) fn opt_out_of_power_throttling() {
@@ -592,6 +608,14 @@ mod platform {
     }
 
     pub(super) fn opt_out_of_power_throttling() {}
+
+    pub(super) fn yield_to_interactive_programs() {
+        // SAFETY: setpriority reads no memory. Failure leaves the niceness
+        // the process started with.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+        }
+    }
 }
 
 #[cfg(test)]
