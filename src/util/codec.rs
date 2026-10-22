@@ -5,8 +5,6 @@
 //! report truncation as an error instead of panicking, because Pack bytes come
 //! from disk.
 
-use std::collections::BTreeMap;
-
 use crate::error::{Error, Result};
 
 pub(crate) fn put_u64(out: &mut Vec<u8>, mut value: u64) {
@@ -37,15 +35,6 @@ pub(crate) fn put_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
             put_str(out, value);
         }
         None => out.push(0),
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn put_tags(out: &mut Vec<u8>, tags: &BTreeMap<String, String>) {
-    put_u64(out, tags.len() as u64);
-    for (key, value) in tags {
-        put_str(out, key);
-        put_str(out, value);
     }
 }
 
@@ -85,11 +74,6 @@ pub(crate) fn get_i64(input: &mut &[u8]) -> Result<i64> {
     Ok(unzigzag(get_u64(input)?))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn get_i32(input: &mut &[u8]) -> Result<i32> {
-    i32::try_from(get_i64(input)?).map_err(|_| Error::Decode("varint does not fit in i32"))
-}
-
 pub(crate) fn get_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
     let len = usize::try_from(get_u64(input)?)
         .map_err(|_| Error::Decode("length does not fit in usize"))?;
@@ -116,18 +100,6 @@ pub(crate) fn get_opt_string(input: &mut &[u8]) -> Result<Option<String>> {
         1 => get_string(input).map(Some),
         _ => Err(Error::Decode("invalid option tag")),
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn get_tags(input: &mut &[u8]) -> Result<BTreeMap<String, String>> {
-    let count = get_u64(input)?;
-    let mut tags = BTreeMap::new();
-    for _ in 0..count {
-        let key = get_string(input)?;
-        let value = get_string(input)?;
-        tags.insert(key, value);
-    }
-    Ok(tags)
 }
 
 pub(crate) fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {

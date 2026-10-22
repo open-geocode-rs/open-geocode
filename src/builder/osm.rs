@@ -45,8 +45,6 @@ mod emit;
 mod emitted;
 mod geometry;
 mod interpolation;
-#[cfg(test)]
-mod join;
 mod locations;
 mod pbf;
 mod place;
@@ -330,11 +328,6 @@ pub fn build_planned_osm_pack(
     // Each input is read on its own: the node pass stores coordinates in id
     // order, and ids ascend only within one sorted PBF.
     for input in &options.inputs {
-        #[cfg(test)]
-        if join::enabled() {
-            join::read_input(input, &mut build, &mut geometry, &passes, budget)?;
-            continue;
-        }
         scanned_bytes += pbf::input_bytes(input)?;
         read_input(
             input,
@@ -2702,65 +2695,6 @@ mod tests {
                 memory.boundary_context(id).expect("memory context"),
                 spilled.boundary_context(id).expect("spilled context")
             );
-        }
-    }
-
-    /// The Pack `inputs` build into under `root`, read through the node
-    /// join when `by_join`: every record, its context, and what the report
-    /// counted.
-    fn pack_contents(
-        root: &Path,
-        inputs: &[&Path],
-        budget: Option<usize>,
-        by_join: bool,
-    ) -> Vec<String> {
-        join::set(by_join);
-        let report = build_all(root, inputs, budget);
-        join::set(false);
-        let reader = Reader::open(root).expect("pack");
-        let mut contents = vec![
-            format!("{:?}", report.accepted),
-            format!("{:?}", report.rejected),
-            format!("{:?}", report.triage),
-            format!("{:?}", report.quality),
-            format!("{:?}", report.geometry_resolution),
-        ];
-        for id in 0..reader.manifest().record_count {
-            contents.push(format!(
-                "{} {:?}",
-                reader.record_json(id).expect("record"),
-                reader.boundary_context(id).expect("context")
-            ));
-        }
-        contents
-    }
-
-    #[test]
-    fn the_node_store_builds_what_the_node_join_built() {
-        let dir = temp_dir("join");
-        let mut inputs = Vec::new();
-        for (name, blocks) in [
-            ("town", town()),
-            ("pois", town_with_pois()),
-            ("other", other_country()),
-        ] {
-            let input = dir.join(format!("{name}.osm.pbf"));
-            write_pbf(&input, &blocks);
-            inputs.push(input);
-        }
-        let cases: Vec<(Vec<&Path>, Option<usize>)> = vec![
-            (vec![&inputs[0]], None),
-            (vec![&inputs[1]], None),
-            (vec![&inputs[2]], None),
-            (vec![&inputs[0], &inputs[2]], None),
-            // Coordinates mapped from a scratch file, every sorter spilling.
-            (vec![&inputs[1]], Some(4)),
-        ];
-        for (case, (inputs, budget)) in cases.into_iter().enumerate() {
-            let joined = pack_contents(&dir.join(format!("join-{case}")), &inputs, budget, true);
-            let stored = pack_contents(&dir.join(format!("store-{case}")), &inputs, budget, false);
-            assert!(joined.len() > 5, "case {case} built records");
-            assert_eq!(joined, stored, "case {case}");
         }
     }
 
