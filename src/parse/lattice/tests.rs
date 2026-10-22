@@ -77,8 +77,7 @@ fn tokens_are_the_index_words_with_the_field_breaks_between_them() {
     );
     assert_eq!(
         tokens.words.join(" "),
-        crate::text_index::normalize_index_text("Unit 602, 670 King St. W;Toronto\nON M5V-1M9")
-            .unwrap()
+        crate::util::fold::search_key("Unit 602, 670 King St. W;Toronto\nON M5V-1M9").unwrap()
     );
     // A break before the first word is no break.
     assert_eq!(Tokens::new(", toronto").breaks, [false]);
@@ -178,7 +177,8 @@ fn fuzzy_lookup_corrects_long_unknown_words_only() {
         let info = features::TokenInfo::new(word, tagger.dictionaries());
         tagger.lookup(field, &mut SpanKey::new(word.to_string(), &[info]))
     };
-    let hit = lookup(Field::Locality, "torontoo").expect("one edit from toronto");
+    let (hit, name) = lookup(Field::Locality, "torontoo").expect("one edit from toronto");
+    assert_eq!(name.as_deref(), Some("toronto"));
     assert_eq!(hit.distance, 1);
     assert_eq!(hit.entry.country, Some(code("CA")));
     // Three letters are too short to correct.
@@ -534,7 +534,9 @@ fn spaced_and_unspaced_writing_are_the_same_units_and_labels() {
         Weights::built_in(),
     );
     // Han, hiragana, katakana (fullwidth and halfwidth), Thai, Lao, Khmer
-    // and Myanmar, each with digits before and after its characters.
+    // and Myanmar, each with digits before and after its characters. A mark
+    // that is no letter (the Khmer coeng, the Myanmar asat) continues the
+    // word before it, so a spaced form keeps it on its letter.
     for forms in [
         &[
             "愛知県名古屋市中区栄4丁目5番2号",
@@ -549,8 +551,8 @@ fn spaced_and_unspaced_writing_are_the_same_units_and_labels() {
         &["ｱﾆﾒｲﾄ2", "ｱ ﾆ ﾒ ｲ ﾄ 2"],
         &["ถนนสุขุมวิท 15", "ถ น น ส ุ ข ุ ม ว ิ ท 15"],
         &["ນະຄອນຫຼວງວຽງຈັນ 3", "ນ ະ ຄ ອ ນ ຫ ຼ ວ ງ ວ ຽ ງ ຈ ັ ນ 3"],
-        &["ភ្នំពេញ 12", "ភ ្ ន ំ ព េ ញ 12"],
-        &["ရန်ကုန် 7", "ရ န ် က ု န ် 7"],
+        &["ភ្នំពេញ 12", "ភ្ ន ំ ព េ ញ 12"],
+        &["ရန်ကုန် 7", "ရ န် က ု န် 7"],
     ] {
         let expected = unit_shape(forms[0]);
         let pieces = |text: &str| {
@@ -723,7 +725,7 @@ fn every_token_of_the_normalized_query_gets_one_label_in_order() {
         "Unit 602, 670 King St. W;Toronto\nON M5V-1M9",
         "กรุงเทพมหานคร 10200",
     ] {
-        let normalized = crate::text_index::normalize_index_text(query).unwrap();
+        let normalized = crate::util::fold::search_key(query).unwrap();
         let tagged = tagger.tag(query);
         assert_eq!(
             tagged

@@ -11,14 +11,19 @@ use geojson::{Geometry, GeometryValue};
 
 use crate::{
     extsort::Spill,
+    parse::lattice::CountryCode,
     record::{
         AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceRecord,
-        PoiRecord, PostcodeRecord, Record, SourceProvenance, StreetRecord, point_geometry,
+        PoiRecord, PostcodeRecord, Prominence, Record, SourceProvenance, StreetRecord,
+        point_geometry,
     },
-    util::codec::{
-        get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64, put_i64,
-        put_opt_str, put_str, put_tags, put_u64,
+    util::{
+        codec::{
+            get_i32, get_i64, get_opt_string, get_string, get_tags, get_u8, get_u32, get_u64,
+            put_i64, put_opt_str, put_str, put_tags, put_u64,
+        },
+        geo::line_parts,
     },
 };
 
@@ -191,14 +196,17 @@ const ADDRESS_GROUP_CELL_DEGREES: f64 = 0.02;
 const CELL_KEY_LEN: usize = 16;
 
 /// An address waiting to be written with the rest of its street. Sorted by
-/// what it states but its number and unit, then by number, so the addresses
-/// of one street come out together and in order.
+/// its street, then by what it states but its number and unit, then by
+/// number, so the addresses of one street come out together and in order.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingAddress {
     /// The group key, then the number key.
     pub order: Vec<u8>,
-    /// Length of the start of `order` its group shares: its street's key,
-    /// or in house order its house's.
+    /// Length of the start of `order` its street shares in street order: the
+    /// cell and the street as search spells it. In house order, its group's.
+    pub street_len: usize,
+    /// Length of the start of `order` its group shares: its street's key and
+    /// everything else it states, or in house order its house's.
     pub group_len: usize,
     pub seq: u64,
     pub record: Record,
@@ -213,6 +221,17 @@ impl PendingAddress {
         order.extend_from_slice(&cell(lat).to_be_bytes());
         order.extend_from_slice(&cell(lon).to_be_bytes());
         let address = &record.address;
+        put_order_text(
+            &mut order,
+            address
+                .subject()
+                .and_then(crate::text_index::street_search_text)
+                .as_deref(),
+        );
+        let street_len = order.len();
+        // Addresses stating a postcode first: the street's postcodes are all
+        // known by the time its addresses without one come out.
+        order.push(u8::from(address.postcode.is_none()));
         for field in [
             &address.street,
             &address.place,
@@ -234,6 +253,7 @@ impl PendingAddress {
         put_order_text(&mut order, address.unit.as_deref());
         Ok(Self {
             order,
+            street_len,
             group_len,
             seq,
             record: Record::Address(record),
@@ -259,14 +279,14 @@ impl PendingAddress {
         );
         let base = crate::text_index::base_house_number(&address.number).unwrap_or(u32::MAX);
         order.extend_from_slice(&base.to_be_bytes());
-        let normalized =
-            |value: Option<&str>| value.and_then(crate::text_index::normalize_index_text);
+        let normalized = |value: Option<&str>| value.and_then(crate::util::fold::search_key);
         put_order_text(&mut order, normalized(Some(&address.number)).as_deref());
         put_order_text(&mut order, normalized(address.unit.as_deref()).as_deref());
         let group_len = order.len();
         order.push(u8::from(record.source.object_type == ObjectType::Row));
         Ok(Self {
             order,
+            street_len: group_len,
             group_len,
             seq,
             record: Record::Address(record),
@@ -290,6 +310,101 @@ impl PendingAddress {
             Record::Address(record) => record,
             _ => unreachable!("a pending address holds an address"),
         }
+    }
+}
+
+/// A way of a street waiting for the other ways of its name: sorted by the
+/// name as search spells it, then along the Hilbert curve, so every way of
+/// one name comes out together, the near ones close.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingStreet {
+    /// The name key, then the Hilbert key of its representative point.
+    pub order: Vec<u8>,
+    /// Length of the start of `order` its name takes.
+    pub name_len: usize,
+    pub seq: u64,
+    pub record: Record,
+}
+
+impl PendingStreet {
+    pub(super) fn new(record: StreetRecord, seq: u64) -> Result<Self> {
+        let mut order = Vec::new();
+        put_order_text(
+            &mut order,
+            crate::text_index::street_search_text(&record.name).as_deref(),
+        );
+        let name_len = order.len();
+        let [lon, lat] = record.representative_point;
+        let key = crate::util::hilbert::hilbert_key(
+            crate::records::quantize(lon)?,
+            crate::records::quantize(lat)?,
+        );
+        order.extend_from_slice(&key.to_be_bytes());
+        Ok(Self {
+            order,
+            name_len,
+            seq,
+            record: Record::Street(record),
+        })
+    }
+
+    /// Its name as search spells it, as the sort key holds it.
+    pub(super) fn name_key(&self) -> &[u8] {
+        &self.order[..self.name_len]
+    }
+
+    pub(super) fn into_street(self) -> StreetRecord {
+        match self.record {
+            Record::Street(record) => record,
+            _ => unreachable!("a pending street holds a street"),
+        }
+    }
+}
+
+impl Eq for PendingStreet {}
+
+impl PartialOrd for PendingStreet {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingStreet {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.order, self.seq).cmp(&(&other.order, other.seq))
+    }
+}
+
+impl Spill for PendingStreet {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.order.len() as u64);
+        out.extend_from_slice(&self.order);
+        put_u64(out, self.name_len as u64);
+        put_u64(out, self.seq);
+        encode_record(out, &self.record);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let len = usize::try_from(get_u64(input)?)?;
+        if input.len() < len {
+            return Err(Error::Decode("street sort key is truncated"));
+        }
+        let (order, rest) = input.split_at(len);
+        *input = rest;
+        let name_len = usize::try_from(get_u64(input)?)?;
+        if name_len > len {
+            return Err(Error::Decode("street name key is longer than its sort key"));
+        }
+        Ok(Self {
+            order: order.to_vec(),
+            name_len,
+            seq: get_u64(input)?,
+            record: decode_record(input)?,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.order.capacity() + record_heap_bytes(&self.record)
     }
 }
 
@@ -324,6 +439,7 @@ impl Spill for PendingAddress {
     fn encode(&self, out: &mut Vec<u8>) {
         put_u64(out, self.order.len() as u64);
         out.extend_from_slice(&self.order);
+        put_u64(out, self.street_len as u64);
         put_u64(out, self.group_len as u64);
         put_u64(out, self.seq);
         encode_record(out, &self.record);
@@ -336,14 +452,16 @@ impl Spill for PendingAddress {
         }
         let (order, rest) = input.split_at(len);
         *input = rest;
+        let street_len = usize::try_from(get_u64(input)?)?;
         let group_len = usize::try_from(get_u64(input)?)?;
-        if group_len > len {
+        if street_len > group_len || group_len > len {
             return Err(Error::Decode(
                 "address group key is longer than its sort key",
             ));
         }
         Ok(Self {
             order: order.to_vec(),
+            street_len,
             group_len,
             seq: get_u64(input)?,
             record: decode_record(input)?,
@@ -414,7 +532,9 @@ fn tags_bytes(tags: &BTreeMap<String, String>) -> usize {
 
 fn record_heap_bytes(record: &Record) -> usize {
     let strings = match record {
-        Record::Address(record) => address_heap_bytes(&record.address),
+        Record::Address(record) => {
+            address_heap_bytes(&record.address) + strings_heap_bytes(&record.street_postcodes)
+        }
         Record::Poi(record) => {
             record.name.len()
                 + strings_heap_bytes(&record.alt_names)
@@ -422,16 +542,19 @@ fn record_heap_bytes(record: &Record) -> usize {
                 + record.address.as_ref().map_or(0, address_heap_bytes)
         }
         Record::Interpolation(_) => 96,
-        Record::Street(record) => record.name.len() + strings_heap_bytes(&record.alt_names),
+        Record::Street(record) => {
+            record.name.len()
+                + strings_heap_bytes(&record.alt_names)
+                + record.locality.as_ref().map_or(0, String::len)
+        }
         Record::Postcode(record) => record.postcode.len(),
         Record::Place(_, record) => {
             record.name.len() + strings_heap_bytes(&record.alt_names) + record.place_type.len()
         }
     };
-    let positions = match &record.geometry().value {
-        GeometryValue::LineString { coordinates } => coordinates.len() * 40,
-        _ => 40,
-    };
+    let positions = line_parts(record.geometry()).map_or(40, |parts| {
+        parts.iter().map(|part| part.len() * 40 + 24).sum::<usize>()
+    });
     strings + positions + 128
 }
 
@@ -482,7 +605,9 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
     match record {
         Record::Address(record) => {
             encode_address(out, &record.address);
+            put_strs(out, &record.street_postcodes);
             encode_precision(out, record.location_precision);
+            out.push(u8::from(record.disputed));
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -498,6 +623,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
                 None => out.push(0),
             }
             encode_precision(out, record.location_precision);
+            out.push(record.prominence.to_byte());
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -526,12 +652,17 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
         Record::Street(record) => {
             put_str(out, &record.name);
             put_strs(out, &record.alt_names);
+            put_opt_str(out, record.locality.as_deref());
             encode_point(out, record.representative_point);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
         Record::Postcode(record) => {
             put_str(out, &record.postcode);
+            put_u64(
+                out,
+                record.country.map_or(0, |country| country.to_u16().into()),
+            );
             put_u64(out, record.source.record_count);
             encode_geometry(out, &record.geometry);
         }
@@ -552,7 +683,9 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
     Ok(match layer {
         Layer::Address => Record::Address(AddressRecord {
             address: decode_address(input)?,
+            street_postcodes: get_strings(input)?,
             location_precision: decode_precision(input)?,
+            disputed: get_u8(input)? != 0,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -565,6 +698,7 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 _ => Some(decode_address(input)?),
             },
             location_precision: decode_precision(input)?,
+            prominence: Prominence::from_byte(get_u8(input)?),
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -598,12 +732,16 @@ fn decode_record(input: &mut &[u8]) -> Result<Record> {
         Layer::Street => Record::Street(StreetRecord {
             name: get_string(input)?,
             alt_names: get_strings(input)?,
+            locality: get_opt_string(input)?,
             representative_point: decode_point(input)?,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
         Layer::Postcode => Record::Postcode(PostcodeRecord {
             postcode: get_string(input)?,
+            country: u16::try_from(get_u64(input)?)
+                .ok()
+                .and_then(CountryCode::from_u16),
             source: DerivedSourceProvenance::osm_address_records(get_u64(input)?),
             geometry: decode_geometry(input)?,
         }),
@@ -749,6 +887,18 @@ fn encode_geometry(out: &mut Vec<u8>, geometry: &Geometry) {
             out.push(0);
             encode_point(out, [coordinates[0], coordinates[1]]);
         }
+        GeometryValue::MultiLineString { coordinates } => {
+            out.push(3);
+            put_u64(out, coordinates.len() as u64);
+            for part in coordinates {
+                encode_geometry(
+                    out,
+                    &Geometry::new(GeometryValue::LineString {
+                        coordinates: part.clone(),
+                    }),
+                );
+            }
+        }
         _ => unreachable!("builder records are points or lines"),
     }
 }
@@ -788,6 +938,19 @@ fn decode_geometry(input: &mut &[u8]) -> Result<Geometry> {
                 coordinates.push(decode_point(input)?.to_vec().into());
             }
             line(coordinates)
+        }
+        3 => {
+            let count = usize::try_from(get_u64(input)?)?;
+            let mut parts = Vec::with_capacity(count.min(input.len()));
+            for _ in 0..count {
+                match decode_geometry(input)?.value {
+                    GeometryValue::LineString { coordinates } => parts.push(coordinates),
+                    _ => return Err(Error::Decode("spilled line part is not a line")),
+                }
+            }
+            Ok(Geometry::new(GeometryValue::MultiLineString {
+                coordinates: parts,
+            }))
         }
         _ => Err(Error::Decode("unknown spilled geometry")),
     }
@@ -835,6 +998,7 @@ mod tests {
         let record = Record::Street(StreetRecord {
             alt_names: Vec::new(),
             name: "Edge Road".into(),
+            locality: None,
             geometry: Geometry::new(GeometryValue::LineString {
                 coordinates: vec![vec![-79.0, 43.0].into(), vec![300.0, 43.1].into()],
             }),
@@ -880,6 +1044,8 @@ mod tests {
         });
         let records = [
             Record::Address(AddressRecord {
+                disputed: false,
+                street_postcodes: vec!["M5V 1A1".into(), "M5V 2B2".into()],
                 address: AddressComponents {
                     areas: Vec::new(),
                     number: "10".into(),
@@ -898,9 +1064,24 @@ mod tests {
             Record::Street(StreetRecord {
                 alt_names: Vec::new(),
                 name: "King Street".into(),
+                locality: None,
                 geometry: line.clone(),
                 representative_point: [-79.0, 43.05],
                 source: SourceProvenance::osm(ObjectType::Way, 13),
+            }),
+            // The ways of one street, merged.
+            Record::Street(StreetRecord {
+                alt_names: vec!["Te Huarahi o King".into()],
+                name: "King Street".into(),
+                locality: Some("Toronto".into()),
+                geometry: Geometry::new(GeometryValue::MultiLineString {
+                    coordinates: vec![
+                        vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.1].into()],
+                        vec![vec![-79.0, 43.1].into(), vec![-79.1, 43.1].into()],
+                    ],
+                }),
+                representative_point: [-79.0, 43.05],
+                source: SourceProvenance::osm(ObjectType::Way, 16),
             }),
             Record::Interpolation(InterpolationRecord {
                 address: InterpolationAddressComponents {
@@ -924,6 +1105,7 @@ mod tests {
             }),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".into(),
+                country: CountryCode::parse("CA"),
                 geometry: point_geometry(-79.0, 43.0),
                 source: DerivedSourceProvenance::osm_address_records(3),
             }),
@@ -955,6 +1137,7 @@ mod tests {
                 geometry: point_geometry(-79.38, 43.65),
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 16),
+                prominence: Default::default(),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -964,6 +1147,7 @@ mod tests {
                 geometry: point_geometry(-79.36, 43.67),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 17),
+                prominence: Default::default(),
             }),
         ];
         for (seq, record) in records.into_iter().enumerate() {

@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::error::{Error, Result};
+use levenshtein_automata::{DFA, Distance, SINK_STATE};
 use serde::Serialize;
 use tantivy::{
     DocAddress, DocId, IndexReader, Score, Searcher, SegmentReader, Term,
@@ -21,24 +22,32 @@ use tantivy::{
 };
 
 use crate::{
-    api::Address,
+    api::{Accuracy, Address},
+    confidence::{self, Agreement, Features},
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
-        lattice::{LatticeTagger, Tokens},
+        lattice::{
+            self, CountryCode, LatticeTagger, Tokens, automaton_builder,
+            dictionary::designates_unit,
+        },
         types::{Label, Tagged},
     },
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
-        PlaceLayer, PoiRecord, Record,
+        PlaceLayer, PoiRecord, Prominence, Record, place_rank,
     },
+    records::{dequantize, quantize},
     spatial_index::{self, haversine_m},
     text_index::{
-        Fields, HOUSE_NUMBER_FIELD, INTERPOLATION_START_FIELD, POSTCODE_AREA_RADIUS_M,
-        RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, address_number_terms, base_house_number,
+        AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
+        INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD, MIN_LAT_FIELD, MIN_LON_FIELD,
+        NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
+        RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS, address_number_terms, base_house_number,
         compact_postcode, expand_address_abbreviations, expand_final_direction, flat_number_term,
-        is_numeric_token, normalize_index_text, open_text_index, street_search_text,
+        is_numeric_token, open_text_index, street_search_text,
     },
+    util::fold::{exact_key, search_key},
 };
 
 pub struct TextSearcher {
@@ -51,6 +60,9 @@ pub struct TextSearcher {
     /// The fast fields ranking reads, per segment. The Pack's index never
     /// changes, so they are opened once rather than per query.
     columns: Arc<HashMap<SegmentId, SegmentColumns>>,
+    /// What rates each answer's confidence, when the Pack has been
+    /// calibrated.
+    confidence: Option<confidence::Model>,
 }
 
 impl fmt::Debug for TextSearcher {
@@ -68,9 +80,17 @@ struct SegmentColumns {
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     rank_postcode: Option<StrColumn>,
+    area_postcode: Option<StrColumn>,
+    country_code: Option<StrColumn>,
+    min_lon: Column<i64>,
+    min_lat: Column<i64>,
+    max_lon: Column<i64>,
+    max_lat: Column<i64>,
+    name_words: Column<u64>,
+    place_rank: Column<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextSearchOptions {
     pub query: String,
     pub limit: usize,
@@ -79,31 +99,72 @@ pub struct TextSearchOptions {
     /// Empty means every country the Pack covers. A Pack of one country
     /// needs none; one covering several is narrowed with it.
     pub countries: Vec<String>,
+    /// Where the caller is, `[lon, lat]`: of answers the query cannot tell
+    /// apart, the nearer first (see [`TieBreak::focus_band`]). It never
+    /// outranks what the query states.
+    pub focus: Option<[f64; 2]>,
+    /// Return only records inside this box.
+    pub bbox: Option<BoundingBox>,
+}
+
+/// A box of WGS84 degrees, west to east and south to north. It does not
+/// cross the antimeridian: a box that would is two boxes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundingBox {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+impl BoundingBox {
+    pub fn contains(&self, lon: f64, lat: f64) -> bool {
+        (self.min_lon..=self.max_lon).contains(&lon) && (self.min_lat..=self.max_lat).contains(&lat)
+    }
 }
 
 /// What narrows a search to part of the Pack, apart from the query itself.
-/// Both are exact terms on indexed fields, so they cost a term lookup and
-/// leave scoring alone: the index and its collection statistics stay whole,
-/// which is what keeps scores comparable across the countries in a Pack.
+/// Exact terms and ranges on indexed fields, so they cost a lookup and leave
+/// scoring alone: the index and its collection statistics stay whole, which
+/// is what keeps scores comparable across the countries in a Pack.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Filters<'a> {
     pub layer: Option<&'a str>,
     pub countries: &'a [String],
+    pub bbox: Option<BoundingBox>,
 }
 
 impl<'a> Filters<'a> {
-    fn new(layer: Option<&'a str>, countries: &'a [String]) -> Self {
-        Self { layer, countries }
+    fn new(layer: Option<&'a str>, countries: &'a [String], bbox: Option<BoundingBox>) -> Self {
+        Self {
+            layer,
+            countries,
+            bbox,
+        }
+    }
+
+    /// Whether a hit lies where the filters ask: inside the box, when there
+    /// is one. A document's extent only says some of its records may.
+    fn admit(&self, hit: &TextSearchHit) -> bool {
+        self.bbox.is_none_or(|bbox| {
+            hit.record
+                .point
+                .is_some_and(|point| bbox.contains(point.lon, point.lat))
+        })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextAutocompleteOptions {
     pub query: String,
     pub limit: usize,
     pub layer: Option<String>,
     /// Return only records in these countries; see [`TextSearchOptions`].
     pub countries: Vec<String>,
+    /// See [`TextSearchOptions::focus`].
+    pub focus: Option<[f64; 2]>,
+    /// See [`TextSearchOptions::bbox`].
+    pub bbox: Option<BoundingBox>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -111,6 +172,13 @@ pub struct TextSearchHit {
     pub record_id: RecordId,
     pub score: Score,
     pub record: Summary,
+    /// What search knew of the answer when it gave it.
+    #[serde(skip)]
+    pub features: Features,
+    /// The chance the answer is the one asked for (see [`confidence`]),
+    /// `None` when the Pack has no fitted model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,15 +223,49 @@ const RANK_WINDOW_FACTOR: usize = 3;
 const MAX_RANK_WINDOW: usize = 256;
 /// How much a word found in each field weighs; the content field holds every
 /// word of what a record is at weight 1, the context field every word of
-/// where it is.
+/// where it is. Not rarity weights: BM25's idf already weighs a word by how
+/// rare it is in each field, the `u` of [`MATCH_AGREEMENT`]. These set how
+/// much more often a true match agrees on a word of its name or number than
+/// on the rest of what it is, an `m` per field only an answer key could
+/// measure.
 const NAME_BOOST: Score = 5.5;
 const NUMBER_BOOST: Score = 2.0;
-const POSTCODE_BOOST: Score = 2.0;
+/// How often a true match agrees on a part it states: the `m` of a
+/// Fellegi-Sunter weight `ln(m / u)`, where `u` is how often a record at
+/// random agrees, which the Pack's own counts give per country. Measuring `m`
+/// per part needs an answer key, and none exists: every derived weight
+/// shares this one, so their order rests on `u` alone and `ln m` is one
+/// offset for them all. High, as a query and its record mostly write the
+/// same postcode; the misses are typos and stale codes. The log is natural,
+/// not base 2, so a weight adds to BM25's idf, itself a natural log of a
+/// rarity, on one scale.
+const MATCH_AGREEMENT: f64 = 0.95;
 /// A word that may name an area, where the query names none, counts for less
 /// there than in what a record is: "7 Lynn Place" is the street, not a place
-/// in the New Lynn suburb. Close scores between the two otherwise rank on
-/// how common each word happens to be in each field.
+/// in the New Lynn suburb. The share of the word's idf in what a record is
+/// (see [`TextSearcher::stand_in_weights`]).
 const AREA_STANDS_IN_BOOST: Score = 0.5;
+/// The word of the name the parser read a typo as counts for less than a
+/// word as written, and for more than the other terms near the typo, which
+/// count nothing: Tantivy's fuzzy query scores every term it matches the
+/// same (tantivy#563), and a term's own BM25 would rank a rare neighbour of
+/// a word over the common word itself.
+const CORRECTED_BOOST: Score = 0.5;
+/// Words shorter than this are only matched as written: one edit turns most
+/// words of two or three letters into many others.
+const MIN_TYPO_CHARS: usize = 4;
+/// Words at least this long may be two edits from a record's; shorter ones
+/// one edit. Photon's thresholds, the geocoder precedent.
+const LONG_TYPO_CHARS: usize = 7;
+/// The first characters of a word a typo keeps as written, as the parser's
+/// fuzzy lookup keeps them. The cost lever: they keep the walk of the term
+/// dictionary to one branch. One, not Photon's two for long words: a swap of
+/// the second and third letters ("Mcihael") is the commonest slip, one edit
+/// with transpositions counted as one, and two would rule it out.
+const TYPO_PREFIX_CHARS: usize = 1;
+/// The terms near one word kept per field, fewest edits then most documents
+/// first: a common short word has dozens of neighbours on a planet.
+const MAX_TYPO_TERMS: usize = 32;
 /// Stated house numbers read on each side of one that no record states: a
 /// few, so the nearest of the same parity can be found and the numbers of a
 /// same-named street elsewhere passed over.
@@ -177,6 +279,10 @@ const NEIGHBOUR_DOCUMENTS: usize = 256;
 /// while a point placed between addresses on two different streets of one
 /// name lies far from both.
 const NEIGHBOUR_STREET_RADIUS_M: f64 = 100.0;
+/// A POI this near an address stands at it: a building's entrances, its
+/// shops and its parcel lie within a lot's depth of its address point, the
+/// depth [`NEIGHBOUR_STREET_RADIUS_M`] allows an address from its street.
+const AT_ADDRESS_RADIUS_M: f64 = NEIGHBOUR_STREET_RADIUS_M;
 
 impl TextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
@@ -202,9 +308,18 @@ impl TextSearcher {
                     house_number: fast_fields.u64(HOUSE_NUMBER_FIELD)?,
                     interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
+                    area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
+                    country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
+                    min_lon: fast_fields.i64(MIN_LON_FIELD)?,
+                    min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
+                    max_lon: fast_fields.i64(MAX_LON_FIELD)?,
+                    max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
+                    name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
+                    place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
                 },
             );
         }
+        let confidence = confidence::Model::load(&pack)?;
         Ok(Self {
             spatial,
             pack,
@@ -212,7 +327,43 @@ impl TextSearcher {
             fields,
             tagger,
             columns: Arc::new(columns),
+            confidence,
         })
+    }
+
+    /// Whether `word`, a search key, only describes a street (its type, a
+    /// direction or a qualifier), by the Pack's parser dictionaries.
+    pub fn describes_street(&self, word: &str) -> bool {
+        self.tagger.dictionaries().describes_street(word)
+    }
+
+    /// The Pack's confidence model, `None` when it has not been calibrated.
+    pub fn confidence_model(&self) -> Option<&confidence::Model> {
+        self.confidence.as_ref()
+    }
+
+    /// Rate each of `hits`, ranked best first, against the hit after it:
+    /// what [`Features`] search could not know of one hit alone, then the
+    /// confidence when the Pack has a model.
+    fn rate(&self, hits: &mut [TextSearchHit]) {
+        for index in 0..hits.len() {
+            let next = hits.get(index + 1).map(|next| next.score);
+            let hit = &mut hits[index];
+            hit.features.lower_rank = index > 0;
+            hit.features.margin = match next {
+                None => 1.0,
+                Some(_) if hit.score <= 0.0 => 0.0,
+                Some(next) => ((hit.score - next) / hit.score).clamp(0.0, 1.0),
+            };
+            hit.features.accuracy = hit
+                .record
+                .point
+                .map(|point| Accuracy::of(point.precision, &hit.record.source));
+            hit.confidence = self
+                .confidence
+                .as_ref()
+                .map(|model| model.rate(&hit.features));
+        }
     }
 
     pub fn search(&self, options: TextSearchOptions) -> Result<Vec<TextSearchHit>> {
@@ -226,21 +377,18 @@ impl TextSearcher {
             return Err(Error::EmptyQuery);
         }
 
-        // A hit that contradicts a postcode the query states is not an answer
-        // to it, so it does not end the pass loop. Without this a stated house
-        // number in the wrong postcode wins the strict pass and returns alone,
-        // and the later passes that would have found the right street never
-        // run: "8 High Street, Deloraine TAS 7304" answered with the 7018 High
-        // Street, 163 km away. Only a stated postcode can reject, so queries
-        // that name none are unaffected.
-        let (_, hits) = self.search_variants(
+        // One hit past the limit, so the last one asked for has a margin.
+        let (_, mut hits) = self.search_variants(
             query_text,
             &[],
-            Filters::new(options.layer.as_deref(), &options.countries),
-            limit,
+            Filters::new(options.layer.as_deref(), &options.countries, options.bbox),
+            options.focus,
+            limit + 1,
             Parses::All,
-            |_, postcode, hit| self.hit_in_postcode(hit, postcode),
+            |_, _, _| Ok(true),
         )?;
+        self.rate(&mut hits);
+        hits.truncate(limit);
         Ok(hits)
     }
 
@@ -270,16 +418,31 @@ impl TextSearcher {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        let (query, hits) = self.search_variants(
+        let areas = context
+            .iter()
+            .filter(|part| matches!(part.label, Label::Locality | Label::Region))
+            .collect::<Vec<_>>();
+        let known = self.known_area_words(areas.iter().flat_map(|part| &part.words))?;
+        let stated = areas
+            .iter()
+            .filter_map(|part| StatedArea::known(part, &known))
+            .collect::<Vec<_>>();
+        // Two at least, so the one answer given has a margin over the next.
+        let (query, mut hits) = self.search_variants(
             address,
             &context,
-            Filters::new(options.layer.as_deref(), &options.countries),
-            limit,
+            Filters::new(options.layer.as_deref(), &options.countries, None),
+            None,
+            limit.max(2),
             // A weaker parse that reads the number as a unit or a word finds
             // what the query never asked for: another house, or a POI on the
             // street. Search lists such hits; a geocoded row would give one.
             Parses::Numbered,
             |plan, postcode, hit| {
+                // A geocoded row names its postcode as a field, so a hit
+                // outside it is no answer to the row, where in search it only
+                // ranks down.
+                //
                 // A street stands in for a house number it lacks, as in search;
                 // its `accuracy` says so. Refused, the query fell through to
                 // parses that matched another street ("10 Eruera Street" to
@@ -298,12 +461,16 @@ impl TextSearcher {
                 // that is a house the query never named, given as exact.
                 let unnumbered_address =
                     plan.house_number.is_none() && hit.record.layer == Layer::Address.as_str();
-                Ok(hit.record.point.is_some()
-                    && !unnumbered_address
-                    && in_postcode
-                    && self.hit_matches_address_context(hit, &options)?)
+                // A row's stated area must be confirmed: a hit in no named
+                // area is not taken to be in it. A name the Pack has never
+                // heard of confirms nothing and rejects nothing.
+                let in_areas = self
+                    .area_agreement(hit, &stated)?
+                    .unwrap_or(stated.is_empty());
+                Ok(hit.record.point.is_some() && !unnumbered_address && in_postcode && in_areas)
             },
         )?;
+        self.rate(&mut hits);
         Ok(hits
             .into_iter()
             .next()
@@ -316,7 +483,7 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        let Some(query_text) = normalize_index_text(options.query.trim()) else {
+        let Some(query_text) = search_key(options.query.trim()) else {
             return Ok(Vec::new());
         };
         if query_text
@@ -328,36 +495,59 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        let Some(query) = self.build_autocomplete_query(
-            &query_text,
-            Filters::new(options.layer.as_deref(), &options.countries),
-        )?
-        else {
+        let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
+        let Some(query) = self.build_autocomplete_query(&query_text, filters)? else {
             return Ok(Vec::new());
         };
         let tokens = autocomplete_query_tokens(&query_text);
+        let number = autocomplete_number(&tokens);
         let ranking = Ranking {
-            query_words: query_text.split_whitespace().map(str::to_string).collect(),
-            number_text: autocomplete_number(&tokens).map(str::to_string),
+            query_words: QueryWords::new(&options.query),
+            number_text: number.map(str::to_string),
+            focus: options.focus,
             ..Ranking::default()
         };
-        self.ranked_hits(&query, &ranking, limit)
+        let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |hit| {
+            Ok(filters.admit(hit))
+        })?;
+        let words = &tokens[usize::from(number.is_some())..];
+        for hit in &mut hits {
+            let features = &mut hit.features;
+            features.prefix = true;
+            features.number = number.map(|number| states_number(&hit.record, number, None));
+            // The last word may be cut short by the typing.
+            let label = label_words(&hit.record);
+            features.dropped_words = count(words.iter().enumerate().filter(|(index, word)| {
+                !label.iter().any(|label| {
+                    label == *word || (index + 1 == words.len() && label.starts_with(word.as_str()))
+                })
+            }));
+        }
+        self.rate(&mut hits);
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// The house number, then what a record is and where. See
     /// [`Self::house_number_query`] for what `pass` lets stand in for the
-    /// number.
-    fn build_query(&self, plan: &QueryPlan, pass: Pass, filters: Filters<'_>) -> Box<dyn Query> {
+    /// number, and [`Self::subject_clauses`] for `known`.
+    fn build_query(
+        &self,
+        plan: &QueryPlan,
+        pass: Pass,
+        filters: Filters<'_>,
+        areas: &AreaWords,
+    ) -> Result<Box<dyn Query>> {
         let mut clauses = Vec::new();
         if let Some(number) = &plan.house_number {
             clauses.push((
                 Occur::Must,
-                self.house_number_query(number, plan.unit.as_deref(), pass),
+                self.house_number_query(number, plan.unit.as_deref(), pass)?,
             ));
         }
-        clauses.extend(self.subject_clauses(plan, pass));
+        clauses.extend(self.subject_clauses(plan, pass, areas));
         for word in &plan.optional {
-            clauses.push((Occur::Should, self.word_query(word)));
+            clauses.push((Occur::Should, self.word_query(word, &plan.spellings)));
         }
         if let Some(layer) = filters
             .layer
@@ -369,82 +559,306 @@ impl TextSearcher {
         if let Some(countries) = self.countries_query(filters.countries) {
             clauses.push((Occur::Must, countries));
         }
-        Box::new(BooleanQuery::new(clauses))
+        if let Some(bbox) = filters.bbox {
+            clauses.push((Occur::Must, self.bbox_query(bbox)));
+        }
+        Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
-    /// Every identifying word is required: of a record's street when the
-    /// query asks for a house number on it, else of what the record is. A
-    /// locality part is required of where it is unless `pass` is lenient. A
-    /// region or country part only ranks, since few records state the "ON"
-    /// a query may write, and so does a postcode part, since a record's tags
-    /// often state a different postcode than the one written.
-    fn subject_clauses(&self, plan: &QueryPlan, pass: Pass) -> Vec<(Occur, Box<dyn Query>)> {
+    /// The documents whose extent meets `bbox`, scored at zero like every
+    /// filter.
+    fn bbox_query(&self, bbox: BoundingBox) -> Box<dyn Query> {
+        let degrees = |value: f64| i64::from(quantize(value).unwrap_or(0));
+        let range = |field, lower: Bound<i64>, upper: Bound<i64>| -> Box<dyn Query> {
+            Box::new(RangeQuery::new(
+                lower.map(|value| Term::from_field_i64(field, value)),
+                upper.map(|value| Term::from_field_i64(field, value)),
+            ))
+        };
+        let fields = &self.fields;
+        Box::new(ConstScoreQuery::new(
+            Box::new(BooleanQuery::intersection(vec![
+                range(
+                    fields.min_lon,
+                    Bound::Unbounded,
+                    Bound::Included(degrees(bbox.max_lon)),
+                ),
+                range(
+                    fields.max_lon,
+                    Bound::Included(degrees(bbox.min_lon)),
+                    Bound::Unbounded,
+                ),
+                range(
+                    fields.min_lat,
+                    Bound::Unbounded,
+                    Bound::Included(degrees(bbox.max_lat)),
+                ),
+                range(
+                    fields.max_lat,
+                    Bound::Included(degrees(bbox.min_lat)),
+                    Bound::Unbounded,
+                ),
+            ])),
+            0.0,
+        ))
+    }
+
+    /// What a record is and where. A required subject word must be a word
+    /// of a record's street when the query asks for a house number on it,
+    /// else of what the record is; the other subject words and the unplaced
+    /// words only rank, unless the plan has no subject: then
+    /// [`unplaced_floor`] of its unplaced words must match. The words of a
+    /// locality part that `known` holds are required of where a record is
+    /// unless `pass` is lenient; one the Pack has never heard of only ranks,
+    /// since it cannot say a record is elsewhere. A region or country part
+    /// only ranks, since few records state the "ON" a query may write, and
+    /// so does a postcode part, since a record's tags often state a
+    /// different postcode than the one written.
+    fn subject_clauses(
+        &self,
+        plan: &QueryPlan,
+        pass: Pass,
+        areas: &AreaWords,
+    ) -> Vec<(Occur, Box<dyn Query>)> {
         let mut clauses = Vec::new();
+        let spellings = &plan.spellings;
+        let as_written = |word: &str| {
+            if plan.house_number.is_some() {
+                self.street_word_query(word, spellings)
+            } else {
+                self.word_query(word, spellings)
+            }
+        };
+        let what = |word: &str| -> Box<dyn Query> {
+            let forms = plan.full_forms(word);
+            if forms.is_empty() {
+                return as_written(word);
+            }
+            Box::new(DisjunctionMaxQuery::new(
+                std::iter::once(word).chain(forms).map(as_written).collect(),
+            ))
+        };
         // A query the parser found no places in may still name one
         // ("Riverdale Farm Toronto" when the Pack does not know Toronto), so
         // any of its words may name an area. So may one whose localities
-        // matched nothing.
+        // matched nothing, and so may any word the parser could not place.
         let anywhere = plan.context.is_empty() || pass == Pass::Lenient;
-        for word in &plan.required {
-            let what = if plan.house_number.is_some() {
-                self.street_word_query(word)
+        // A word of a stated area is searched there already; the subject's
+        // own copy is a separate word ("Eden" of "Eden Road, Mount Eden")
+        // and standing in would let that area absorb it.
+        let stated = plan
+            .context
+            .iter()
+            .flat_map(|part| &part.words)
+            .collect::<HashSet<_>>();
+        let mut named = Vec::new();
+        let mut all_stand_in = true;
+        for word in &plan.subject {
+            let stands_in = anywhere && !stated.contains(&word.text);
+            let query = if stands_in {
+                self.word_or_area_query(what(&word.text), &word.text, spellings, areas)
             } else {
-                self.word_query(word)
+                what(&word.text)
             };
-            let query = if anywhere {
-                Box::new(DisjunctionMaxQuery::new(vec![
-                    what,
-                    Box::new(BoostQuery::new(self.area_query(word), AREA_STANDS_IN_BOOST)),
-                ]))
+            if word.required {
+                all_stand_in &= stands_in;
+                named.push((Occur::Should, what(&word.text)));
+            }
+            let occur = if word.required {
+                Occur::Must
             } else {
-                what
+                Occur::Should
             };
-            clauses.push((Occur::Must, query));
+            clauses.push((occur, query));
+        }
+        // Areas may answer for some required words, never all: else any
+        // street in Mount Eden answers "10 Eden Road Mount Eden" read as one
+        // street name. Scored at zero, the words already rank above.
+        if all_stand_in && !named.is_empty() {
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    Box::new(BooleanQuery::new(named)),
+                    0.0,
+                )),
+            ));
+        }
+        let unplaced = |words: &mut dyn Iterator<Item = &Word>| {
+            words
+                .map(|word| {
+                    let query =
+                        self.word_or_area_query(what(&word.text), &word.text, spellings, areas);
+                    (Occur::Should, query)
+                })
+                .collect::<Vec<_>>()
+        };
+        if plan.subject.is_empty() {
+            // A word that only describes a street ("road") names nothing: of
+            // "Ponsonby Road, Christchurch", any road in Christchurch would
+            // meet a floor it counted toward. It ranks, unless every word is
+            // one.
+            let (describing, naming): (Vec<_>, Vec<_>) = plan
+                .unplaced
+                .iter()
+                .partition(|word| self.describes_street(&word.text));
+            let (floored, ranked) = match naming.is_empty() {
+                true => (describing, Vec::new()),
+                false => (naming, describing),
+            };
+            let floored = unplaced(&mut floored.into_iter());
+            let floor = unplaced_floor(floored.len());
+            clauses.push((
+                Occur::Must,
+                Box::new(BooleanQuery::with_minimum_required_clauses(floored, floor)),
+            ));
+            clauses.extend(unplaced(&mut ranked.into_iter()));
+        } else {
+            clauses.extend(unplaced(&mut plan.unplaced.iter()));
         }
         for part in &plan.context {
-            let clause = if pass.requires_locality() && part.label == Label::Locality {
-                (Occur::Must, self.locality_part_query(&part.words))
-            } else {
-                (Occur::Should, self.context_part_query(&part.words))
-            };
+            let known = part
+                .words
+                .iter()
+                .filter(|word| areas.known.contains(*word))
+                .collect::<Vec<_>>();
+            let clause =
+                if pass.requires_locality() && part.label == Label::Locality && !known.is_empty() {
+                    (Occur::Must, self.locality_part_query(&known))
+                } else {
+                    (
+                        Occur::Should,
+                        self.context_part_query(part, spellings, areas),
+                    )
+                };
             clauses.push(clause);
         }
         clauses
     }
 
-    /// Every word of a locality part, in where a record is.
-    fn locality_part_query(&self, part: &[String]) -> Box<dyn Query> {
+    /// `what` a record is, or else the word in where it is, for less (see
+    /// [`AreaWords::stand_ins`]).
+    fn word_or_area_query(
+        &self,
+        what: Box<dyn Query>,
+        word: &str,
+        spellings: &Spellings,
+        areas: &AreaWords,
+    ) -> Box<dyn Query> {
+        let weight = areas.stand_ins.get(word).copied().unwrap_or_default();
+        let as_written = Box::new(TermQuery::new(
+            Term::from_field_text(self.fields.context_text, word),
+            IndexRecordOption::Basic,
+        ));
+        let mut alternatives: Vec<Box<dyn Query>> = vec![
+            what,
+            Box::new(ConstScoreQuery::new(as_written, weight)),
+            // A typo's neighbours still find the record, for nothing, as
+            // they do in what it is: the weight of a word no record holds
+            // is the largest there is.
+            Box::new(ConstScoreQuery::new(
+                self.area_query(word, spellings, areas),
+                0.0,
+            )),
+        ];
+        if let Some(postcode) = self.postcode_query(word, &areas.postcodes) {
+            alternatives.push(Box::new(ConstScoreQuery::new(postcode, weight)));
+        }
+        Box::new(DisjunctionMaxQuery::new(alternatives))
+    }
+
+    /// What each subject and unplaced word of `plan` scores standing in for
+    /// an area: [`AREA_STANDS_IN_BOOST`] of its idf in the field a house
+    /// number's street is searched in, else in what a record is, or in where
+    /// records are when that is lower ("Toronto" names few streets). A word's
+    /// own BM25 in where records are would not do: "road" is rare among
+    /// area names and common among streets, so "47 Mill Road" would find
+    /// a Millton Park Road in a locality named Mill Road before Mill Road
+    /// itself. A word scores near its idf where it is asked for, so half of
+    /// it ranks the stand-in below.
+    fn stand_in_weights(&self, plan: &QueryPlan) -> Result<HashMap<String, Score>> {
+        let searcher = self.reader.searcher();
+        let field = if plan.house_number.is_some() {
+            self.fields.street_text
+        } else {
+            self.fields.content_text
+        };
+        let documents = searcher.num_docs() as f64;
+        let mut weights = HashMap::new();
+        for word in plan
+            .subject
+            .iter()
+            .map(|word| &word.text)
+            .chain(plan.unplaced.iter().map(|word| &word.text))
+        {
+            if weights.contains_key(word) {
+                continue;
+            }
+            let mut idf = f64::INFINITY;
+            for field in [field, self.fields.context_text] {
+                let found = searcher.doc_freq(&Term::from_field_text(field, word))? as f64;
+                // Tantivy's BM25 idf.
+                idf = idf.min((1.0 + (documents - found + 0.5) / (found + 0.5)).ln());
+            }
+            weights.insert(word.clone(), AREA_STANDS_IN_BOOST * idf as Score);
+        }
+        Ok(weights)
+    }
+
+    /// Every word of a locality part the Pack knows, in where a record is.
+    fn locality_part_query(&self, known: &[&String]) -> Box<dyn Query> {
         Box::new(BooleanQuery::new(
-            part.iter()
+            known
+                .iter()
                 .map(|word| (Occur::Must, self.area_term_query(word)))
                 .collect(),
         ))
     }
 
+    /// The words found in where some record is: those the Pack knows as a
+    /// word of an area. One no record's areas hold says nothing of where a
+    /// record is.
+    fn known_area_words<'a>(
+        &self,
+        words: impl IntoIterator<Item = &'a String>,
+    ) -> Result<HashSet<String>> {
+        let searcher = self.reader.searcher();
+        let mut known = HashSet::new();
+        for word in words {
+            if !known.contains(word)
+                && searcher.doc_freq(&Term::from_field_text(self.fields.context_text, word))? > 0
+            {
+                known.insert(word.clone());
+            }
+        }
+        Ok(known)
+    }
+
     /// Any word of a context part in where a record is, or all of it as one
     /// postcode ("m6g 1b8").
-    fn context_part_query(&self, part: &[String]) -> Box<dyn Query> {
+    fn context_part_query(
+        &self,
+        part: &ContextPart,
+        spellings: &Spellings,
+        areas: &AreaWords,
+    ) -> Box<dyn Query> {
         let mut alternatives = part
+            .words
             .iter()
-            .map(|word| (Occur::Should, self.area_query(word)))
+            .map(|word| (Occur::Should, self.area_query(word, spellings, areas)))
             .collect::<Vec<_>>();
-        if part.len() > 1 {
-            let postcode = TermQuery::new(
-                Term::from_field_text(self.fields.postcode_exact, &part.join(" ")),
-                IndexRecordOption::Basic,
-            );
-            alternatives.push((
-                Occur::Should,
-                Box::new(BoostQuery::new(Box::new(postcode), POSTCODE_BOOST)),
-            ));
+        if part.words.len() > 1
+            && let Some(postcode) = self.postcode_query(&part.words.join(" "), &areas.postcodes)
+        {
+            alternatives.push((Occur::Should, postcode));
         }
         Box::new(BooleanQuery::new(alternatives))
     }
 
     /// One word, in the fields that hold what a record is.
-    fn word_query(&self, word: &str) -> Box<dyn Query> {
+    fn word_query(&self, word: &str, spellings: &Spellings) -> Box<dyn Query> {
         self.fields_query(
             word,
+            spellings,
             &[
                 (
                     self.fields.name_text,
@@ -462,26 +876,76 @@ impl TextSearcher {
     }
 
     /// One word, in the street a record is on (or is).
-    fn street_word_query(&self, word: &str) -> Box<dyn Query> {
-        Box::new(TermQuery::new(
-            Term::from_field_text(self.fields.street_text, word),
+    fn street_word_query(&self, word: &str, spellings: &Spellings) -> Box<dyn Query> {
+        self.spelt_query(
+            self.fields.street_text,
+            word,
             IndexRecordOption::WithFreqs,
-        ))
+            spellings,
+        )
     }
 
-    /// One word, in the fields that hold where a record is.
-    fn area_query(&self, word: &str) -> Box<dyn Query> {
-        self.fields_query(
+    /// One word, in the fields that hold where a record is: a word of its
+    /// areas, or its whole postcode.
+    fn area_query(&self, word: &str, spellings: &Spellings, areas: &AreaWords) -> Box<dyn Query> {
+        let context = self.spelt_query(
+            self.fields.context_text,
             word,
-            &[
-                (self.fields.context_text, 1.0, IndexRecordOption::WithFreqs),
-                (
-                    self.fields.postcode_exact,
-                    POSTCODE_BOOST,
-                    IndexRecordOption::Basic,
-                ),
-            ],
-        )
+            IndexRecordOption::WithFreqs,
+            spellings,
+        );
+        let mut alternatives = vec![(Occur::Should, context)];
+        if let Some(postcode) = self.postcode_query(word, &areas.postcodes) {
+            alternatives.push((Occur::Should, postcode));
+        }
+        Box::new(BooleanQuery::new(alternatives))
+    }
+
+    /// The records that state `term` as their postcode, each scored what
+    /// agreeing on it weighs in its country (see [`PostcodeWeights`]).
+    /// `None` when the Pack holds no postcode of the term: nothing says how
+    /// rare it is.
+    fn postcode_query(&self, term: &str, postcodes: &PostcodeWeights) -> Option<Box<dyn Query>> {
+        let weights = postcodes
+            .terms
+            .get(term)
+            .filter(|weights| !weights.is_empty())?;
+        let country = |country: CountryCode| -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.country_code, country.as_str()),
+                IndexRecordOption::Basic,
+            ))
+        };
+        let clauses = weights
+            .iter()
+            .map(|&(in_country, weight)| {
+                let mut parts: Vec<(Occur, Box<dyn Query>)> = vec![(
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.postcode_exact, term),
+                        IndexRecordOption::Basic,
+                    )),
+                )];
+                match in_country {
+                    Some(in_country) => parts.push((Occur::Must, country(in_country))),
+                    // A record in a country is weighed by that country's
+                    // counts, never by those of the postcodes no country
+                    // holds.
+                    None => parts.extend(
+                        self.pack
+                            .postcode_addresses()
+                            .countries()
+                            .map(|other| (Occur::MustNot, country(other))),
+                    ),
+                }
+                let query: Box<dyn Query> = Box::new(ConstScoreQuery::new(
+                    Box::new(BooleanQuery::new(parts)),
+                    weight,
+                ));
+                (Occur::Should, query)
+            })
+            .collect();
+        Some(Box::new(BooleanQuery::new(clauses)))
     }
 
     fn area_term_query(&self, word: &str) -> Box<dyn Query> {
@@ -494,13 +958,14 @@ impl TextSearcher {
     fn fields_query(
         &self,
         word: &str,
+        spellings: &Spellings,
         fields: &[(Field, Score, IndexRecordOption)],
     ) -> Box<dyn Query> {
         Box::new(BooleanQuery::new(
             fields
                 .iter()
                 .map(|&(field, boost, option)| {
-                    let term = Box::new(TermQuery::new(Term::from_field_text(field, word), option));
+                    let term = self.spelt_query(field, word, option, spellings);
                     (
                         Occur::Should,
                         Box::new(BoostQuery::new(term, boost)) as Box<dyn Query>,
@@ -508,6 +973,203 @@ impl TextSearcher {
                 })
                 .collect(),
         ))
+    }
+
+    /// `word` in `field`, or a term `spellings` let it match instead, which
+    /// scores less (see [`CORRECTED_BOOST`]).
+    fn spelt_query(
+        &self,
+        field: Field,
+        word: &str,
+        option: IndexRecordOption,
+        spellings: &Spellings,
+    ) -> Box<dyn Query> {
+        let term = |text: &str, option| -> Box<dyn Query> {
+            Box::new(TermQuery::new(Term::from_field_text(field, text), option))
+        };
+        let Some(spelt) = spellings.words.get(&(field, word.to_string())) else {
+            return term(word, option);
+        };
+        let mut alternatives = vec![term(word, option)];
+        if let Some(corrected) = &spelt.corrected {
+            alternatives.push(Box::new(BoostQuery::new(
+                term(corrected, option),
+                CORRECTED_BOOST,
+            )));
+        }
+        if !spelt.near.is_empty() {
+            let near = spelt
+                .near
+                .iter()
+                .map(|text| (Occur::Should, term(text, IndexRecordOption::Basic)))
+                .collect();
+            alternatives.push(Box::new(ConstScoreQuery::new(
+                Box::new(BooleanQuery::new(near)),
+                0.0,
+            )));
+        }
+        Box::new(DisjunctionMaxQuery::new(alternatives))
+    }
+
+    /// `plan` as the typo tier `edits` searches it, `None` when the tier
+    /// would search nothing the tiers before it did not. Each word the tier
+    /// lets have a typo (see [`Edits::allowed`]) also matches the parser's
+    /// reading of it and the index terms that near it, in each field the
+    /// plan searches it in. A place the parser read as a typo of a name is
+    /// that name, so the Pack knows it, and requires and checks it as any
+    /// place it knows.
+    fn spelt(&self, plan: &QueryPlan, edits: Edits) -> Result<Option<QueryPlan>> {
+        if edits == Edits::None {
+            return Ok(Some(plan.clone()));
+        }
+        let mut spelt = plan.clone();
+        // Whether a place is read as a name the tiers before did not read it
+        // as.
+        let mut corrected = false;
+        for part in &mut spelt.context {
+            if let Some(words) = part.corrected.take()
+                && words.len() == part.words.len()
+                && part
+                    .words
+                    .iter()
+                    .zip(&words)
+                    .all(|(written, word)| written == word || edits.reaches(written, word))
+            {
+                corrected |= part.words.iter().zip(&words).any(|(written, word)| {
+                    written != word && (edits == Edits::One || !Edits::One.reaches(written, word))
+                });
+                part.words = words;
+            }
+        }
+        let subject_fields = if plan.house_number.is_some() {
+            vec![self.fields.street_text, self.fields.context_text]
+        } else {
+            vec![
+                self.fields.name_text,
+                self.fields.content_text,
+                self.fields.context_text,
+            ]
+        };
+        let context_fields = [self.fields.context_text];
+        let mut words = Vec::<(&str, Option<&str>, &[Field])>::new();
+        for word in &spelt.subject {
+            words.push((&word.text, word.corrected.as_deref(), &subject_fields));
+        }
+        for word in &spelt.unplaced {
+            words.push((&word.text, word.corrected.as_deref(), &subject_fields));
+        }
+        for part in spelt.context.iter().filter(|part| !part.is_postcode()) {
+            for word in &part.words {
+                words.push((word, None, &context_fields));
+            }
+        }
+        // The two-edit tier only differs from the one-edit tier in the words
+        // it lets have two.
+        if !words.iter().any(|(word, ..)| {
+            edits
+                .allowed(word)
+                .is_some_and(|(most, _)| most == edits.most())
+        }) {
+            return Ok(corrected.then_some(spelt));
+        }
+        let searcher = self.reader.searcher();
+        let mut spellings = Spellings::default();
+        for (word, correction, fields) in words {
+            let Some((most, prefix)) = edits.allowed(word) else {
+                continue;
+            };
+            let dfa = automaton_builder(most).build_dfa(word);
+            let prefix = &word[..word
+                .char_indices()
+                .nth(prefix)
+                .map_or(word.len(), |(at, _)| at)];
+            let correction = correction
+                .filter(|correction| {
+                    correction.starts_with(prefix)
+                        && matches!(dfa.eval(correction), Distance::Exact(_))
+                })
+                .map(str::to_string);
+            for &field in fields {
+                if spellings.words.contains_key(&(field, word.to_string())) {
+                    continue;
+                }
+                let near =
+                    self.near_terms(&searcher, field, word, &dfa, prefix, correction.as_deref())?;
+                if near.is_empty() && correction.is_none() {
+                    continue;
+                }
+                spellings.words.insert(
+                    (field, word.to_string()),
+                    Spelt {
+                        corrected: correction.clone(),
+                        near,
+                    },
+                );
+            }
+        }
+        if spellings.words.is_empty() && !corrected {
+            return Ok(None);
+        }
+        spelt.spellings = spellings;
+        Ok(Some(spelt))
+    }
+
+    /// The terms of `field` that `dfa` accepts and that start with
+    /// `prefix`, other than `word` and `corrected`: at most
+    /// [`MAX_TYPO_TERMS`], fewest edits then most documents first. Tantivy's
+    /// fuzzy query takes no prefix length, and its `new_prefix` matches the
+    /// word as a prefix, which at two edits misses matches (tantivy#3200).
+    /// A shared prefix leaves the edit distance as it is, so walking only
+    /// the prefix's range of the dictionary with the word's automaton is a
+    /// prefix length.
+    fn near_terms(
+        &self,
+        searcher: &Searcher,
+        field: Field,
+        word: &str,
+        dfa: &DFA,
+        prefix: &str,
+        corrected: Option<&str>,
+    ) -> Result<Vec<String>> {
+        // No term holds the byte 0xFF, which UTF-8 never uses, so every term
+        // with the prefix sorts below it.
+        let mut upper = prefix.as_bytes().to_vec();
+        upper.push(0xFF);
+        let mut found = HashMap::<Vec<u8>, (u8, u32)>::new();
+        for segment in searcher.segment_readers() {
+            let index = segment.inverted_index(field)?;
+            let mut terms = index
+                .terms()
+                .search(Levenshtein(dfa))
+                .ge(prefix)
+                .lt(&upper)
+                .into_stream()?;
+            while terms.advance() {
+                let term = terms.key();
+                if term == word.as_bytes() || Some(term) == corrected.map(str::as_bytes) {
+                    continue;
+                }
+                let Distance::Exact(distance) = dfa.eval(term) else {
+                    continue;
+                };
+                found.entry(term.to_vec()).or_insert((distance, 0)).1 += terms.value().doc_freq;
+            }
+        }
+        let mut found = found.into_iter().collect::<Vec<_>>();
+        found.sort_unstable_by(
+            |(left, (left_edits, left_docs)), (right, (right_edits, right_docs))| {
+                (left_edits, std::cmp::Reverse(left_docs), left).cmp(&(
+                    right_edits,
+                    std::cmp::Reverse(right_docs),
+                    right,
+                ))
+            },
+        );
+        Ok(found
+            .into_iter()
+            .take(MAX_TYPO_TERMS)
+            .filter_map(|(term, _)| String::from_utf8(term).ok())
+            .collect())
     }
 
     /// The house number a record states, or an interpolation range that
@@ -518,23 +1180,42 @@ impl TextSearcher {
         number: &HouseNumber,
         unit: Option<&str>,
         pass: Pass,
-    ) -> Box<dyn Query> {
+    ) -> Result<Box<dyn Query>> {
+        let term = |text: &str| {
+            TermQuery::new(
+                Term::from_field_text(self.fields.address_number, text),
+                IndexRecordOption::Basic,
+            )
+        };
+        let mut stated = vec![
+            Box::new(BoostQuery::new(Box::new(term(&number.text)), NUMBER_BOOST)) as Box<dyn Query>,
+        ];
         // A named unit also finds its flat as written with it ("29/181"),
         // which the build keeps where the street could not say which side
-        // is the unit.
-        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = std::iter::once(number.text.clone())
-            .chain(unit.map(|unit| number.flat_text(unit)))
-            .map(|text| {
-                let stated = TermQuery::new(
-                    Term::from_field_text(self.fields.address_number, &text),
-                    IndexRecordOption::Basic,
-                );
-                (
-                    Occur::Should,
-                    Box::new(BoostQuery::new(Box::new(stated), NUMBER_BOOST)) as Box<dyn Query>,
-                )
-            })
-            .collect();
+        // is the unit. It scores what the house number does, never more: a
+        // flat's number is rarer than the house's, so its own score would
+        // rank a street with that flat above the street the query names
+        // ("Unit 2, 1 Balfour Street" answered on a Balfour Road with a
+        // 2/1). The unit chooses among the addresses of one street in the
+        // tie-break.
+        if let Some(unit) = unit {
+            let searcher = self.reader.searcher();
+            let documents = searcher.num_docs() as f32;
+            let found = searcher.doc_freq(&Term::from_field_text(
+                self.fields.address_number,
+                &number.text,
+            ))? as f32;
+            // BM25 of one term once in a document without field norms.
+            let idf = (1.0 + (documents - found + 0.5) / (found + 0.5)).ln();
+            stated.push(Box::new(ConstScoreQuery::new(
+                Box::new(term(&number.flat_text(unit))),
+                NUMBER_BOOST * idf,
+            )));
+        }
+        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Should,
+            Box::new(DisjunctionMaxQuery::new(stated)) as Box<dyn Query>,
+        )];
         if let Some(number) = number.plain() {
             let bound = |field| Bound::Included(Term::from_field_u64(field, number.into()));
             let in_range = BooleanQuery::intersection(vec![
@@ -561,7 +1242,7 @@ impl TextSearcher {
                 )),
             ));
         }
-        Box::new(BooleanQuery::new(alternatives))
+        Ok(Box::new(BooleanQuery::new(alternatives)))
     }
 
     fn layer_query(&self, layer: &str) -> Box<dyn Query> {
@@ -606,25 +1287,51 @@ impl TextSearcher {
     /// [`Pass`] runs only when the ones before it found nothing: first the
     /// house number in the localities the plan names, then the number placed
     /// between its stated neighbours there or a street standing in for it,
-    /// then anything, with the localities only ranking. The next labelling is
-    /// searched only when every pass of the one before found nothing, so a
-    /// reading that drops what the best one requires never outranks it.
-    /// Fails when the query has no words to search.
+    /// then anything in no other locality, with the named ones only ranking.
+    /// The passes run in each typo tier in turn, exact first (see
+    /// [`Edits`]): a typo tier runs only when no labelling kept anything in
+    /// the tiers before it, so a query spelt as the Pack spells it searches no
+    /// typo, the street standing in for a number no record states wins over
+    /// the number on a street one edit away, and a labelling matched as
+    /// written outranks one matched only through a typo. Within a tier the
+    /// next labelling is searched only when every pass of the one before
+    /// found nothing, so a reading that drops what the best one requires
+    /// never outranks it. Hits found only with the localities ranking are the
+    /// exception: the later labellings' stricter passes run too, and the hits
+    /// on the stronger [`Evidence`] answer ("10 Ellerslie Panmure" read with
+    /// Panmure the locality finds an Ellerslie Road outside it; read as one
+    /// street name, Ellerslie Panmure Highway). So are hits that nothing
+    /// says lie in the postcode their reading states (see
+    /// [`Evidence::confirmed`]).
+    ///
+    /// A hit whose own postcode contradicts the one the query names is kept,
+    /// after the hits that do not, but it does not end the search: a stated
+    /// house number in the wrong postcode would win the strict pass alone,
+    /// and the later passes that find the right street would never run ("8
+    /// High Street, Deloraine TAS 7304" answered with the 7018 High Street,
+    /// 163 km away). Fails when the query has no words to search.
+    #[allow(clippy::too_many_arguments)]
     fn search_variants(
         &self,
         query_text: &str,
         context: &[ContextPart],
         filters: Filters<'_>,
+        focus: Option<[f64; 2]>,
         limit: usize,
         parses: Parses,
         mut accept: impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut plans = Vec::<QueryPlan>::new();
+        let mut scores = Vec::<f32>::new();
         for parsed in self.tagger.parse(query_text) {
-            if let Some(plan) = QueryPlan::from_tagged(&parsed.pieces, context)
+            if let Some(plan) =
+                QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, context, |word| {
+                    self.tagger.dictionaries().describes_street(word)
+                })
                 && !plans.contains(&plan)
             {
                 plans.push(plan);
+                scores.push(parsed.score);
             }
         }
         if parses == Parses::Numbered
@@ -632,7 +1339,11 @@ impl TextSearcher {
                 .first()
                 .is_some_and(|plan| plan.house_number.is_some())
         {
-            plans.retain(|plan| plan.house_number.is_some());
+            (plans, scores) = plans
+                .into_iter()
+                .zip(scores)
+                .filter(|(plan, _)| plan.house_number.is_some())
+                .unzip();
         }
         let Some(first_plan) = plans.first() else {
             return Err(Error::UnparsableQuery {
@@ -640,43 +1351,119 @@ impl TextSearcher {
             });
         };
         let first_query = first_plan.text();
-        let query_words: HashSet<String> = normalize_index_text(query_text)
-            .iter()
-            .flat_map(|text| text.split_whitespace())
-            .map(str::to_string)
-            .chain(context.iter().flat_map(|part| part.words.iter().cloned()))
-            .collect();
-        for plan in plans {
-            let text = plan.text();
-            let base = plan.with_base_house_number();
-            let variants = std::iter::once(plan).chain(base).collect::<Vec<_>>();
-            for pass in [Pass::Strict, Pass::Street, Pass::Lenient] {
-                for plan in &variants {
+        // Where the best reading says the record is holds in every reading:
+        // a later one that reads "Christchurch" of "Ponsonby Road
+        // Christchurch" as a region, which only ranks, must not answer with
+        // the Ponsonby Road in Auckland.
+        let placed = self.known_area_words(
+            first_plan
+                .context
+                .iter()
+                .filter(|part| part.label == Label::Locality)
+                .flat_map(|part| &part.words),
+        )?;
+        let mut query_words = QueryWords::new(query_text);
+        query_words
+            .search
+            .extend(context.iter().flat_map(|part| part.words.iter().cloned()));
+        let readings = plans
+            .into_iter()
+            .map(|plan| (plan.text(), plan))
+            .collect::<Vec<_>>();
+        // Which readings' contradicting hits count is known only once one is
+        // chosen, so they wait here, in search order, with their tier and
+        // reading.
+        let mut contradicted = Vec::<(usize, usize, Vec<TextSearchHit>)>::new();
+        for (tier, edits) in Edits::TIERS.into_iter().enumerate() {
+            // Spelt only when searched: a typo tier walks the term
+            // dictionaries, and most readings never run in it.
+            let mut variants = vec![None::<Vec<QueryPlan>>; readings.len()];
+            let chosen = choose_reading(&scores, |reading, pass| {
+                if variants[reading].is_none() {
+                    variants[reading] = Some(match self.spelt(&readings[reading].1, edits)? {
+                        Some(plan) => {
+                            let base = plan.with_base_house_number();
+                            std::iter::once(plan).chain(base).collect()
+                        }
+                        None => Vec::new(),
+                    });
+                }
+                for plan in variants[reading].iter().flatten() {
                     if !pass.searches_anew(plan) {
                         continue;
                     }
-                    let hits =
-                        self.search_plan(plan, pass, &query_words, filters, limit, &mut accept)?;
+                    let (hits, kept) = self.search_plan(
+                        plan,
+                        &placed,
+                        pass,
+                        edits,
+                        &query_words,
+                        filters,
+                        focus,
+                        limit,
+                        &mut accept,
+                    )?;
+                    contradicted.push((tier, reading, kept));
                     if !hits.is_empty() {
-                        return Ok((text, hits));
+                        let confirmed = !plan.postcode_may_be_house_number()
+                            || hits
+                                .iter()
+                                .any(|hit| hit.features.postcode != Agreement::Unknown);
+                        return Ok(Some((hits, confirmed)));
                     }
                 }
+                Ok(None)
+            })?;
+            if let Some((reading, hits)) = chosen {
+                // As if the readings had run in turn up to the chosen one:
+                // those after it ran only to be outweighed.
+                let mut contradicting = Contradicting::default();
+                for (searched_tier, searched, hits) in contradicted {
+                    if searched_tier < tier || searched <= reading {
+                        contradicting.keep(&readings[searched].0, hits);
+                    }
+                }
+                return Ok((
+                    readings[reading].0.clone(),
+                    contradicting.after(hits, limit),
+                ));
             }
         }
-        Ok((first_query, Vec::new()))
+        let mut contradicting = Contradicting::default();
+        for (_, reading, hits) in contradicted {
+            contradicting.keep(&readings[reading].0, hits);
+        }
+        Ok(contradicting
+            .alone(limit)
+            .unwrap_or((first_query, Vec::new())))
     }
 
     /// The hits of one pass over one plan that `accept` keeps, at most
-    /// `limit`.
+    /// `limit`, and apart from them the kept hits whose own postcode
+    /// contradicts the one the plan names. A pass that does not require the
+    /// plan's localities still leaves out a hit that lies in other ones:
+    /// "Ponsonby Road Christchurch" is not answered in Auckland. So does
+    /// every pass with the words of `placed` (the localities of the best
+    /// reading the Pack knows) the plan reads as a region or a country,
+    /// which only rank, and with the plan's unplaced words the Pack knows as
+    /// an area's: each is where the query says the record is, unless it is
+    /// a word of the record itself (see [`Self::in_loose_areas`]). A plan
+    /// with no subject is exempt: the parser placed none of its words, and
+    /// a few of them may go unmatched (see [`unplaced_floor`]). Each hit
+    /// carries the [`Features`] of what found it.
+    #[allow(clippy::too_many_arguments)]
     fn search_plan(
         &self,
         plan: &QueryPlan,
+        placed: &HashSet<String>,
         pass: Pass,
-        query_words: &HashSet<String>,
+        edits: Edits,
+        query_words: &QueryWords,
         filters: Filters<'_>,
+        focus: Option<[f64; 2]>,
         limit: usize,
         accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
-    ) -> Result<Vec<TextSearchHit>> {
+    ) -> Result<(Vec<TextSearchHit>, Vec<TextSearchHit>)> {
         let ranking = Ranking {
             query_words: query_words.clone(),
             house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
@@ -692,44 +1479,191 @@ impl TextSearcher {
             }),
             numbered: plan.house_number.is_some(),
             postcode: self.query_postcode(plan)?,
+            focus,
+            sought: plan
+                .subject
+                .iter()
+                .map(|word| Word {
+                    text: word.text.clone(),
+                    corrected: word.corrected.clone(),
+                })
+                .chain(plan.unplaced.iter().cloned())
+                .collect(),
+            edits,
         };
-        let mut hits = Vec::new();
+        let localities = plan
+            .context
+            .iter()
+            .filter(|part| part.label == Label::Locality)
+            .collect::<Vec<_>>();
+        let areas = AreaWords {
+            known: self.known_area_words(localities.iter().flat_map(|part| &part.words))?,
+            postcodes: self.postcode_weights(&plan.area_terms())?,
+            stand_ins: self.stand_in_weights(plan)?,
+        };
+        let stated = if pass.requires_locality() {
+            Vec::new()
+        } else {
+            localities
+                .iter()
+                .filter_map(|part| StatedArea::known(part, &areas.known))
+                .collect()
+        };
+        let relabelled = plan
+            .context
+            .iter()
+            .filter(|part| !matches!(part.label, Label::Locality | Label::Postcode))
+            .flat_map(|part| &part.words)
+            .filter(|word| placed.contains(*word))
+            .cloned();
+        let unplaced = match plan.subject.is_empty() {
+            true => HashSet::new(),
+            false => self.known_area_words(plan.unplaced.iter().map(|word| &word.text))?,
+        };
+        let mut loose = unplaced.into_iter().chain(relabelled).collect::<Vec<_>>();
+        loose.sort();
+        loose.dedup();
+        let mut keep = |hit: &TextSearchHit| -> Result<bool> {
+            Ok(filters.admit(hit)
+                && self.area_agreement(hit, &stated)? != Some(false)
+                && self.in_loose_areas(hit, &loose)?
+                && accept(plan, &ranking.postcode, hit)?)
+        };
+        let mut candidates = Vec::new();
         if pass == Pass::Street
             && filters
                 .layer
                 .map(str::trim)
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str())
-            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking)?
-            && accept(plan, &ranking.postcode, &estimate)?
+            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking, &areas)?
+            && keep(&estimate)?
         {
-            hits.push(estimate);
+            candidates.push(estimate);
         }
-        let query = self.build_query(plan, pass, filters);
-        for hit in self.ranked_hits(&query, &ranking, limit)? {
-            if accept(plan, &ranking.postcode, &hit)? {
+        let query = self.build_query(plan, pass, filters, &areas)?;
+        candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
+        // Every stated locality, known or not, for what the hits rest on.
+        let localities = localities
+            .iter()
+            .map(|part| StatedArea::known(part, &areas.known))
+            .collect::<Vec<_>>();
+        let sought = plan
+            .subject
+            .iter()
+            .map(|word| (&word.text, &word.corrected))
+            .chain(
+                plan.unplaced
+                    .iter()
+                    .map(|word| (&word.text, &word.corrected)),
+            )
+            .collect::<Vec<_>>();
+        let (mut hits, mut contradicted) = (Vec::new(), Vec::new());
+        for mut hit in candidates {
+            let postcode = self.postcode_agreement(&hit, &ranking.postcode)?;
+            let area = if localities.is_empty() {
+                Agreement::Unstated
+            } else if localities.iter().any(Option::is_none) {
+                Agreement::Unknown
+            } else {
+                let known = localities.iter().flatten().cloned().collect::<Vec<_>>();
+                agreement(self.area_agreement(&hit, &known)?)
+            };
+            let label = label_words(&hit.record);
+            let features = &mut hit.features;
+            features.pass = pass;
+            features.edits = edits.most();
+            features.postcode = match ranking.postcode.forms.is_empty() {
+                true => Agreement::Unstated,
+                false => agreement(postcode),
+            };
+            features.area = area;
+            features.number = plan.house_number.as_ref().map(|number| {
+                states_number(&hit.record, &number.text, ranking.flat_text.as_deref())
+            });
+            features.unit = plan
+                .unit
+                .as_ref()
+                .map(|_| unit_rank(&hit.record, &ranking) == 0);
+            features.dropped_words = count(sought.iter().filter(|(text, corrected)| {
+                !label.iter().any(|label| {
+                    label == *text
+                        || corrected.as_ref() == Some(label)
+                        || edits.reaches(text, label)
+                })
+            }));
+            if postcode == Some(false) {
+                contradicted.push(hit);
+            } else {
                 hits.push(hit);
             }
         }
         hits.truncate(limit);
-        Ok(hits)
+        contradicted.truncate(limit);
+        Ok((hits, contradicted))
     }
 
-    fn hit_matches_address_context(
-        &self,
-        hit: &TextSearchHit,
-        options: &AddressGeocodeOptions,
-    ) -> Result<bool> {
-        let desired_region = normalized_for_match(options.region.as_deref());
-        let desired_locality = normalized_for_match(options.locality.as_deref());
-        if desired_region.is_none() && desired_locality.is_none() {
+    /// Whether a hit lies in the areas `stated` names, `None` when nothing
+    /// says either way: it names none, or the hit lies in no area of the
+    /// level of any it names. A hit agrees with a stated area when one name
+    /// of its areas of that level has every word of it.
+    fn area_agreement(&self, hit: &TextSearchHit, stated: &[StatedArea]) -> Result<Option<bool>> {
+        if stated.is_empty() {
+            return Ok(None);
+        }
+        let areas = self.areas_of(hit.record_id)?;
+        let mut agreement = None;
+        for area in stated {
+            let names = if area.label == Label::Region {
+                &areas.regions
+            } else {
+                &areas.localities
+            };
+            if names.is_empty() {
+                continue;
+            }
+            let agrees = names.iter().any(|name| {
+                let words = name.split_whitespace().collect::<HashSet<_>>();
+                area.words.iter().all(|word| words.contains(word.as_str()))
+            });
+            if !agrees {
+                return Ok(Some(false));
+            }
+            agreement = Some(true);
+        }
+        Ok(agreement)
+    }
+
+    /// Whether a hit lies where `words`, area words a query states without
+    /// requiring them, say: each word that is not a word of the hit itself
+    /// (its name or label: "Wellington" of "Wellington Road" is the street)
+    /// must be a word of an area it lies in, of any level, since the parser
+    /// may have read a locality as a region. A hit in no named area says
+    /// nothing either way.
+    fn in_loose_areas(&self, hit: &TextSearchHit, words: &[String]) -> Result<bool> {
+        let own = label_words(&hit.record)
+            .into_iter()
+            .chain(
+                search_key(&hit.record.name)
+                    .iter()
+                    .flat_map(|name| name.split_whitespace().map(str::to_string)),
+            )
+            .collect::<HashSet<_>>();
+        let elsewhere = words
+            .iter()
+            .filter(|word| !own.contains(*word))
+            .collect::<Vec<_>>();
+        if elsewhere.is_empty() {
             return Ok(true);
         }
         let areas = self.areas_of(hit.record_id)?;
-        Ok(
-            desired_region.is_none_or(|region| areas.regions.contains(&region))
-                && desired_locality.is_none_or(|locality| areas.localities.contains(&locality)),
-        )
+        let names = areas
+            .localities
+            .iter()
+            .chain(&areas.regions)
+            .flat_map(|name| name.split_whitespace())
+            .collect::<HashSet<_>>();
+        Ok(names.is_empty() || elsewhere.iter().all(|word| names.contains(word.as_str())))
     }
 
     /// Every name a record lies in: what its own address states and every
@@ -791,17 +1725,13 @@ impl TextSearcher {
         Ok(areas)
     }
 
-    /// Whether a hit can be in the postcode the query names. A hit that
-    /// states a postcode must agree with it; either may be a prefix of the
-    /// other, so "M5V" matches "M5V 1A1". A hit without one is judged by the
-    /// postcode records around it.
-    fn hit_in_postcode(&self, hit: &TextSearchHit, postcode: &QueryPostcode) -> Result<bool> {
-        Ok(self.postcode_agreement(hit, postcode)?.unwrap_or(true))
-    }
-
-    /// Whether a hit is in the postcode the query names, `None` when nothing
-    /// says either way: the query names none, or the hit states none and no
-    /// postcode data lies around it.
+    /// Whether a hit is in the postcode the query names: confirmed when the
+    /// postcodes it is in by its own data (the one it states, else its
+    /// street's) hold it, contradicted when they do not, and else judged by
+    /// the postcode records around it. Either of two postcodes may be a
+    /// prefix of the other, so "M5V" matches "M5V 1A1". `None` when nothing
+    /// says either way: the query names none, or the hit has no postcode of
+    /// its own and no postcode data lies around it.
     fn postcode_agreement(
         &self,
         hit: &TextSearchHit,
@@ -810,13 +1740,15 @@ impl TextSearcher {
         if postcode.forms.is_empty() {
             return Ok(None);
         }
-        if let Some(stated) = self.pack.records().postcode(hit.record_id)? {
-            return Ok(compact_postcode(&stated).map(|stated| {
-                postcode
-                    .forms
-                    .iter()
-                    .any(|form| stated.starts_with(form.as_str()) || form.starts_with(&stated))
-            }));
+        let own = self
+            .pack
+            .records()
+            .postcodes(hit.record_id)?
+            .iter()
+            .filter_map(|own| compact_postcode(own))
+            .collect::<Vec<_>>();
+        if !own.is_empty() {
+            return Ok(Some(own.iter().any(|own| postcode.holds(own))));
         }
         let Some(point) = hit.record.point else {
             return Ok(None);
@@ -867,6 +1799,45 @@ impl TextSearcher {
                 .chain(postcode.forms.iter().cloned())
                 .collect(),
         );
+        for record_id in self.postcode_records(&terms)? {
+            let (_, lon, lat) = self.pack.records().point(record_id)?;
+            postcode.points.push([lon, lat]);
+        }
+        Ok(postcode)
+    }
+
+    /// What agreeing on each term of `terms` as a postcode weighs, in each
+    /// country the Pack holds a postcode of it in.
+    fn postcode_weights(&self, terms: &[String]) -> Result<PostcodeWeights> {
+        let mut weights = PostcodeWeights::default();
+        for term in terms {
+            if weights.terms.contains_key(term) {
+                continue;
+            }
+            let mut covered = HashMap::<Option<CountryCode>, u64>::new();
+            for record_id in self.postcode_records(std::slice::from_ref(term))? {
+                if let Record::Postcode(record) = self.pack.records().record(record_id)? {
+                    *covered.entry(record.country).or_default() += record.source.record_count;
+                }
+            }
+            let addresses = self.pack.postcode_addresses();
+            let by_country = covered
+                .into_iter()
+                .map(|(country, covered)| {
+                    (
+                        country,
+                        PostcodeWeights::agreement(covered, addresses.of(country)),
+                    )
+                })
+                .collect();
+            weights.terms.insert(term.clone(), by_country);
+        }
+        Ok(weights)
+    }
+
+    /// The Pack's postcode records of any of `terms`, as the postcode field
+    /// indexes them.
+    fn postcode_records(&self, terms: &[String]) -> Result<Vec<RecordId>> {
         let query = BooleanQuery::new(vec![
             (Occur::Must, self.layer_query(Layer::Postcode.as_str())),
             (
@@ -888,12 +1859,11 @@ impl TextSearcher {
             ),
         ]);
         let searcher = self.reader.searcher();
-        for (_, doc) in searcher.search(&query, &TopDocs::with_limit(POSTCODE_RECORD_LIMIT))? {
-            let (record_id, _) = self.document_records(&searcher, doc)?;
-            let (_, lon, lat) = self.pack.records().point(record_id)?;
-            postcode.points.push([lon, lat]);
-        }
-        Ok(postcode)
+        searcher
+            .search(&query, &TopDocs::with_limit(POSTCODE_RECORD_LIMIT))?
+            .into_iter()
+            .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
+            .collect()
     }
 
     fn build_autocomplete_query(
@@ -943,12 +1913,17 @@ impl TextSearcher {
                 )) as Box<dyn Query>,
             ));
         }
+        if let Some(bbox) = filters.bbox {
+            subqueries.push((Occur::Must, self.bbox_query(bbox)));
+        }
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
 
-    /// The best `limit` hits, ranked by [`RankKey`] over every record the
-    /// query matches, and equal keys by [`TieBreak`].
+    /// The best `limit` hits that `accept` keeps, ranked by [`RankKey`] over
+    /// every record the query matches, and equal keys by [`TieBreak`].
+    /// Rejected before the cut, so the whole rank window can backfill a hit
+    /// that fails.
     ///
     /// An interpolation hit is placed at the house number along its range, and
     /// left out when the number falls between its steps.
@@ -957,6 +1932,7 @@ impl TextSearcher {
         query: &dyn Query,
         ranking: &Ranking,
         limit: usize,
+        accept: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<Vec<TextSearchHit>> {
         let searcher = self.reader.searcher();
         let window = limit
@@ -965,12 +1941,11 @@ impl TextSearcher {
             .max(limit);
         let query_words = ranking
             .query_words
+            .search
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        // When only the text score ranks, the key is the score, and the index
-        // can skip the records that cannot make the window.
-        let mut top_docs = if ranking.numbered || !ranking.postcode.forms.is_empty() {
+        let ranked = || {
             searcher.search(
                 query,
                 &TopDocs::with_limit(window).tweak_score(RankKeys {
@@ -978,25 +1953,48 @@ impl TextSearcher {
                     columns: &self.columns,
                     pack: &self.pack,
                 }),
-            )?
-        } else {
-            searcher
-                .search(query, &TopDocs::with_limit(window))?
-                .into_iter()
-                .map(|(text_score, doc)| (RankKey::text(text_score), doc))
-                .collect()
+            )
         };
-        // Without a house number no hit is left out, so only the hits that
-        // can still make the cut need hydrating: everything above the cutoff
-        // key plus whatever ties it.
-        if !ranking.numbered
-            && let Some((cutoff, _)) = top_docs.get(limit.saturating_sub(1)).cloned()
-        {
-            top_docs.retain(|(key, _)| *key >= cutoff);
-        }
+        // When only the text score ranks, the key is the score, and the index
+        // can skip the records that cannot make the window. Unless the window
+        // ends inside a run of equal scores: then which of them made it is
+        // arbitrary, and the rest of the key must choose ("Richmond" the town
+        // among a hundred Richmond Roads).
+        let top_docs =
+            if ranking.numbered || !ranking.postcode.forms.is_empty() || ranking.focus.is_some() {
+                ranked()?
+            } else {
+                let scored = searcher.search(query, &TopDocs::with_limit(window))?;
+                let cut_tie = scored.len() == window
+                    && window > 1
+                    && scored[window - 1].0 == scored[window - 2].0;
+                if cut_tie {
+                    ranked()?
+                } else {
+                    scored
+                        .into_iter()
+                        .map(|(text_score, doc)| (RankKey::text(text_score), doc))
+                        .collect()
+                }
+            };
+        // Without a house number no document is left out for its number, so
+        // once `limit` hits are kept only the documents that tie the last of
+        // them need hydrating. The cutoff is the last kept hit's, not the
+        // `limit`th document's: a rejected hit leaves its place to the next.
+        // A POI may yet rank below an address or street after it (see
+        // [`Self::demoted`]), so it holds no place while one may.
+        let mut cutoff = None;
         let mut hits = Vec::new();
+        let mut placed = 0;
         for (key, doc) in top_docs {
+            if cutoff
+                .as_ref()
+                .is_some_and(|cutoff| key.cmp_evidence(cutoff).is_lt())
+            {
+                break;
+            }
             let (first, count) = self.document_records(&searcher, doc)?;
+            let country = self.document_country(&searcher, doc)?;
             for record_id in self.hit_records(first, count, ranking)? {
                 let mut record = self.pack.record_summary(record_id)?;
                 if let Some(number) = ranking.house_number
@@ -1008,25 +2006,216 @@ impl TextSearcher {
                 if ranking.numbered && record.layer == Layer::Street.as_str() {
                     self.place_on_street_line(record_id, &mut record)?;
                 }
+                let records = self.pack.records();
+                let disputed = records.header(record_id)?.disputed;
+                let hit = TextSearchHit {
+                    record_id,
+                    score: key.text_score,
+                    record,
+                    features: Features {
+                        country,
+                        disputed,
+                        ..Features::default()
+                    },
+                    confidence: None,
+                };
+                if !accept(&hit)? {
+                    continue;
+                }
+                let rank = records
+                    .place_type(record_id)?
+                    .as_deref()
+                    .and_then(place_rank);
+                let prominence = records.prominence(record_id)?;
+                if hit.record.layer != Layer::Poi.as_str() || ranking.sought.is_empty() {
+                    placed += 1;
+                }
                 hits.push((
                     key.clone(),
-                    TieBreak::new(&record, &query_words, ranking),
-                    TextSearchHit {
-                        record_id,
-                        score: key.text_score,
-                        record,
-                    },
+                    TieBreak::new(
+                        &hit.record,
+                        Prior {
+                            place_rank: rank,
+                            prominence,
+                            disputed,
+                        },
+                        &query_words,
+                        ranking,
+                    ),
+                    hit,
                 ));
             }
+            if !ranking.numbered && cutoff.is_none() && placed >= limit {
+                cutoff = Some(key);
+            }
         }
-        hits.sort_by(|(left_key, left_tie, _), (right_key, right_tie, _)| {
-            right_key
-                .partial_cmp(left_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left_tie.cmp(right_tie))
-        });
+        let demoted = self.demoted(hits.iter().map(|(_, _, hit)| hit), ranking)?;
+        let mut hits = hits.into_iter().zip(demoted).collect::<Vec<_>>();
+        hits.sort_by(
+            |((left_key, left_tie, _), left_demoted),
+             ((right_key, right_tie, _), right_demoted)| {
+                left_demoted
+                    .cmp(right_demoted)
+                    .then_with(|| right_key.cmp_evidence(left_key))
+                    .then_with(|| left_tie.cmp(right_tie))
+            },
+        );
         hits.truncate(limit);
-        Ok(hits.into_iter().map(|(_, _, hit)| hit).collect())
+        Ok(hits.into_iter().map(|((_, _, hit), _)| hit).collect())
+    }
+
+    /// Whether each of `hits` is a POI ranked below every address, range and
+    /// street hit: addresses beat POIs when the query carries address
+    /// evidence. A hit carries it when the query asks for a house number,
+    /// or when the street it is on (or is) accounts for every word the
+    /// query seeks: the query names a street the Pack has. A query some of
+    /// whose words a street lacks may name a POI ("Queen's Quay Family
+    /// Medicine"), and its POIs rank as before.
+    ///
+    /// A POI that confirms such a hit is not demoted: the words of the query
+    /// the street lacks are all of its name, and it stands at the hit ("227
+    /// Walmer Road Parkette" is the park at 227 Walmer Road). One named only
+    /// by the street's own words confirms nothing ("Walmer Road Parkette"
+    /// for "Walmer Road").
+    fn demoted<'a>(
+        &self,
+        hits: impl Iterator<Item = &'a TextSearchHit> + Clone,
+        ranking: &Ranking,
+    ) -> Result<Vec<bool>> {
+        let anchors = hits
+            .clone()
+            .filter(|hit| {
+                [Layer::Address, Layer::Interpolation, Layer::Street]
+                    .iter()
+                    .any(|layer| hit.record.layer == layer.as_str())
+            })
+            .map(|hit| (hit, self.unaccounted(hit, ranking)))
+            .filter(|(_, unaccounted)| ranking.numbered || unaccounted.is_empty())
+            .collect::<Vec<_>>();
+        let mut demoted = Vec::new();
+        for hit in hits {
+            if anchors.is_empty() || hit.record.layer != Layer::Poi.as_str() {
+                demoted.push(false);
+                continue;
+            }
+            let names = self
+                .pack
+                .records()
+                .names(hit.record_id)?
+                .iter()
+                .filter_map(|name| search_key(name))
+                .flat_map(|name| {
+                    name.split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<HashSet<_>>();
+            let mut confirms = false;
+            for (anchor, unaccounted) in &anchors {
+                if !unaccounted.is_empty()
+                    && unaccounted.iter().all(|word| names.contains(*word))
+                    && self.stands_at(hit, anchor)?
+                {
+                    confirms = true;
+                    break;
+                }
+            }
+            demoted.push(!confirms);
+        }
+        Ok(demoted)
+    }
+
+    /// The words the query seeks that the street of `hit` lacks: its own
+    /// name for a street, else the street it states.
+    fn unaccounted<'a>(&self, hit: &TextSearchHit, ranking: &'a Ranking) -> Vec<&'a String> {
+        let street = if hit.record.layer == Layer::Street.as_str() {
+            Some(hit.record.name.as_str())
+        } else {
+            hit.record
+                .address
+                .street
+                .as_deref()
+                .or(hit.record.address.place.as_deref())
+        };
+        let words = street
+            .and_then(search_key)
+            .iter()
+            .flat_map(|street| street.split_whitespace())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        ranking
+            .sought
+            .iter()
+            .filter(|word| {
+                !words.iter().any(|street| {
+                    *street == word.text
+                        || word.corrected.as_ref() == Some(street)
+                        || lattice::full_forms(&word.text).contains(street)
+                        || ranking.edits.reaches(&word.text, street)
+                })
+            })
+            .map(|word| &word.text)
+            .collect()
+    }
+
+    /// Whether the POI `poi` stands at the address, range or street
+    /// `anchor`: it states the same street and number, or lies on that
+    /// street, or within [`AT_ADDRESS_RADIUS_M`] of the address.
+    fn stands_at(&self, poi: &TextSearchHit, anchor: &TextSearchHit) -> Result<bool> {
+        let street = |hit: &TextSearchHit| {
+            if hit.record.layer == Layer::Street.as_str() {
+                street_search_text(&hit.record.name)
+            } else {
+                hit.record
+                    .address
+                    .street
+                    .as_deref()
+                    .or(hit.record.address.place.as_deref())
+                    .and_then(street_search_text)
+            }
+        };
+        let number = |hit: &TextSearchHit| {
+            hit.record
+                .address
+                .housenumber
+                .as_deref()
+                .and_then(search_key)
+        };
+        let anchor_street = street(anchor);
+        if anchor_street.is_some()
+            && street(poi) == anchor_street
+            && (number(anchor).is_none() || number(poi) == number(anchor))
+        {
+            return Ok(true);
+        }
+        let (Some(at), Some(from)) = (poi.record.point, anchor.record.point) else {
+            return Ok(false);
+        };
+        match anchor_street {
+            Some(name) if anchor.record.layer == Layer::Street.as_str() => {
+                self.on_named_street([at.lon, at.lat], &name)
+            }
+            _ => Ok(haversine_m(at.lon, at.lat, from.lon, from.lat) <= AT_ADDRESS_RADIUS_M),
+        }
+    }
+
+    /// The country the records of a document lie in.
+    fn document_country(
+        &self,
+        searcher: &Searcher,
+        doc: DocAddress,
+    ) -> Result<Option<CountryCode>> {
+        let columns = self.segment_columns(searcher, doc.segment_ord)?;
+        let Some(column) = &columns.country_code else {
+            return Ok(None);
+        };
+        let mut code = String::new();
+        for ord in column.term_ords(doc.doc_id) {
+            if column.ord_to_str(ord, &mut code)? {
+                return Ok(CountryCode::parse(&code));
+            }
+        }
+        Ok(None)
     }
 
     /// The first record a document stands for, and how many.
@@ -1157,11 +2346,12 @@ impl TextSearcher {
         plan: &QueryPlan,
         pass: Pass,
         ranking: &Ranking,
+        areas: &AreaWords,
     ) -> Result<Option<TextSearchHit>> {
         let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
             return Ok(None);
         };
-        let (lower, higher) = self.neighbours(plan, pass, ranking, number)?;
+        let (lower, higher) = self.neighbours(plan, pass, ranking, areas, number)?;
         if lower.is_empty() {
             return Ok(None);
         }
@@ -1213,10 +2403,11 @@ impl TextSearcher {
         plan: &QueryPlan,
         pass: Pass,
         ranking: &Ranking,
+        areas: &AreaWords,
         number: u32,
     ) -> Result<(Vec<Neighbour>, Vec<Neighbour>)> {
         let searcher = self.reader.searcher();
-        let mut clauses = self.subject_clauses(plan, pass);
+        let mut clauses = self.subject_clauses(plan, pass, areas);
         clauses.push((Occur::Must, self.layer_query(Layer::Address.as_str())));
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
@@ -1226,16 +2417,25 @@ impl TextSearcher {
         let mut higher = Vec::new();
         for (_, doc) in docs {
             let columns = self.segment_columns(&searcher, doc.segment_ord)?;
-            let mut postcode = String::new();
-            let postcode_agreement = match &columns.rank_postcode {
-                Some(column) => match column.term_ords(doc.doc_id).next() {
-                    Some(ord) if column.ord_to_str(ord, &mut postcode)? => {
-                        ranking.postcode.agreement(&postcode)
+            let postcodes = |column: &Option<StrColumn>| -> Result<Vec<String>> {
+                let Some(column) = column else {
+                    return Ok(Vec::new());
+                };
+                let mut postcodes = Vec::new();
+                for ord in column.term_ords(doc.doc_id) {
+                    let mut postcode = String::new();
+                    if column.ord_to_str(ord, &mut postcode)? {
+                        postcodes.push(postcode);
                     }
-                    _ => 0,
-                },
-                None => 0,
+                }
+                Ok(postcodes)
             };
+            let postcode_agreement = ranking.postcode.rank_of(
+                &postcodes(&columns.rank_postcode)?,
+                postcodes(&columns.area_postcode)?
+                    .first()
+                    .map(String::as_str),
+            );
             let mut consider = |record_id: RecordId, stated: &str| {
                 if let Some(base) = base_house_number(stated) {
                     let side = if base <= number {
@@ -1332,7 +2532,7 @@ impl TextSearcher {
             0,
         )? {
             if seen.insert(candidate.record_id)
-                && street_search_text(&self.pack.records().summary(candidate.record_id)?.label)
+                && street_search_text(&self.pack.records().summary(candidate.record_id)?.name)
                     .as_deref()
                     == Some(street)
             {
@@ -1393,6 +2593,8 @@ impl TextSearcher {
                     record_count: Some(2),
                 },
             },
+            features: Features::default(),
+            confidence: None,
         })
     }
 }
@@ -1436,15 +2638,31 @@ struct Neighbour {
 /// hits the ones before it tie: whether it answers the house number itself
 /// (a stated number or an estimate) or only its street; how much of the
 /// postcode the query names it shares; whether its point is stated or
-/// estimated on a range; then how well its text matches. Every hit already
-/// lies in the localities its pass requires. Compared field by field, larger
-/// is better.
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+/// estimated on a range; how well its text matches; then, of records the
+/// text cannot tell apart, the one whose name has the fewest words, the
+/// larger place, and the one nearer the caller. Every hit already lies in
+/// the localities its pass requires. Larger is better.
+#[derive(Debug, Clone, PartialEq)]
 struct RankKey {
     house_level: bool,
+    /// See [`QueryPostcode::rank`].
     postcode_agreement: u8,
     stated: bool,
     text_score: Score,
+    /// Words of the record's own name: of names a query matches alike, the
+    /// one it covers with fewest left over ("Richmond" before "Richmond
+    /// Road", "Queen Street" before "Upper Queen Street"). [`TieBreak`]
+    /// asks the same of the hits.
+    name_words: u8,
+    /// See [`place_rank`], smaller larger; [`u8::MAX`] for a record that is
+    /// no place.
+    place_rank: u8,
+    /// How near the caller's focus the document's extent lies, larger
+    /// nearer. It orders only the window the text index collects, so that
+    /// of many documents the query cannot tell apart the near ones make it;
+    /// the hits are ranked by [`Self::cmp_evidence`] and then by
+    /// [`TieBreak`], whose own focus band follows what the query states.
+    nearness: u8,
 }
 
 impl RankKey {
@@ -1455,7 +2673,97 @@ impl RankKey {
             postcode_agreement: 0,
             stated: true,
             text_score,
+            name_words: u8::MAX,
+            place_rank: u8::MAX,
+            nearness: 0,
         }
+    }
+
+    /// The order of what the query states, leaving out what only breaks
+    /// ties.
+    fn cmp_evidence(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.house_level,
+            self.postcode_agreement,
+            self.stated,
+            self.text_score,
+        )
+            .partial_cmp(&(
+                other.house_level,
+                other.postcode_agreement,
+                other.stated,
+                other.text_score,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for RankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp_evidence(other).then_with(|| {
+            (other.name_words, other.place_rank, self.nearness).cmp(&(
+                self.name_words,
+                self.place_rank,
+                other.nearness,
+            ))
+        }))
+    }
+}
+
+/// How a caller's focus ranks a hit: hits in one band tie on it. The bands
+/// widen as they go, as nearness does: a town 30 km away is about as near as
+/// one 40 km away, while 1 km and 10 km are not. Within the first a caller
+/// is among the hits, and what follows the band (the size of a place, the
+/// precision of a point) decides. Beyond the last, focus says nothing.
+const FOCUS_BANDS_M: [f64; 11] = [
+    1_000.0,
+    2_000.0,
+    5_000.0,
+    10_000.0,
+    20_000.0,
+    50_000.0,
+    100_000.0,
+    200_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_000_000.0,
+];
+
+/// The first of [`FOCUS_BANDS_M`] a point `distance_m` from the focus lies
+/// within, smaller nearer; one past the last beyond it.
+fn focus_band(distance_m: f64) -> u8 {
+    FOCUS_BANDS_M
+        .iter()
+        .position(|band| distance_m <= *band)
+        .unwrap_or(FOCUS_BANDS_M.len()) as u8
+}
+
+/// The caller's focus, against the extents of a segment's documents.
+struct SegmentFocus {
+    focus: [f64; 2],
+    min_lon: Column<i64>,
+    min_lat: Column<i64>,
+    max_lon: Column<i64>,
+    max_lat: Column<i64>,
+}
+
+impl SegmentFocus {
+    /// [`RankKey::nearness`] of a document: the band of the point of its
+    /// extent nearest the focus, counted down from the nearest.
+    fn nearness(&self, doc: DocId) -> u8 {
+        let read = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
+        let (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) = (
+            read(&self.min_lon),
+            read(&self.min_lat),
+            read(&self.max_lon),
+            read(&self.max_lat),
+        ) else {
+            return 0;
+        };
+        let [lon, lat] = self.focus;
+        let lon = lon.clamp(dequantize(min_lon), dequantize(max_lon));
+        let lat = lat.clamp(dequantize(min_lat), dequantize(max_lat));
+        FOCUS_BANDS_M.len() as u8 - focus_band(haversine_m(self.focus[0], self.focus[1], lon, lat))
     }
 }
 
@@ -1472,45 +2780,110 @@ struct SegmentRankKeys {
     numbered: bool,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
-    postcode: Option<(StrColumn, Vec<Vec<Range<u64>>>)>,
+    name_words: Column<u64>,
+    place_rank: Column<u64>,
+    postcode: Option<SegmentPostcodes>,
+    focus: Option<SegmentFocus>,
+}
+
+/// What a segment knows of each record's postcodes, read against the
+/// postcode a query names.
+struct SegmentPostcodes {
+    own: Option<PostcodeColumn>,
+    area: Option<PostcodeColumn>,
     nearness: Option<PostcodeNearness>,
 }
 
-/// Ranks a matched record by its distance from the records of the postcode a
-/// query names, when the record does not have that postcode itself. The first
-/// address of a street group stands for all of it: they share a street, their
-/// areas and the postcode nearest them.
+impl SegmentPostcodes {
+    fn rank(&self, doc: DocId) -> u8 {
+        let own = self
+            .own
+            .as_ref()
+            .and_then(|own| own.read(own.column.term_ords(doc)));
+        let area = self
+            .area
+            .as_ref()
+            .and_then(|area| area.read(area.column.term_ords(doc).take(1)));
+        QueryPostcode::rank(own, area, || {
+            self.nearness
+                .as_ref()
+                .and_then(|nearness| nearness.band(doc))
+        })
+    }
+}
+
+/// A postcode column with, for the postcode a query names, the ordinals of
+/// the postcodes that share each of its prefixes and of the ones it holds.
+struct PostcodeColumn {
+    column: StrColumn,
+    prefixes: Vec<Vec<Range<u64>>>,
+    held: Vec<Range<u64>>,
+}
+
+impl PostcodeColumn {
+    fn new(column: &StrColumn, postcode: &QueryPostcode) -> io::Result<Self> {
+        let prefixes = postcode.ord_ranges(column)?;
+        let mut held = prefixes
+            .iter()
+            .filter_map(|form| form.last().cloned())
+            .collect::<Vec<_>>();
+        // A postcode shorter than the form is held when the form starts with
+        // it: "m5v" holds "m5v1a1".
+        let dictionary = column.dictionary();
+        for form in &postcode.forms {
+            for (index, character) in form.char_indices() {
+                let end = index + character.len_utf8();
+                if end < form.len()
+                    && let Some(ord) = dictionary.term_ord(&form.as_bytes()[..end])?
+                {
+                    held.push(ord..ord + 1);
+                }
+            }
+        }
+        Ok(Self {
+            column: column.clone(),
+            prefixes,
+            held,
+        })
+    }
+
+    /// Whether any of `ords` is held, and the longest prefix of the named
+    /// postcode any of them shares; `None` for no ords.
+    fn read(&self, ords: impl Iterator<Item = u64>) -> Option<(bool, u8)> {
+        ords.map(|ord| {
+            (
+                self.held.iter().any(|held| held.contains(&ord)),
+                QueryPostcode::agreement_of_ord(&self.prefixes, ord),
+            )
+        })
+        .reduce(|(left_held, left), (right_held, right)| (left_held || right_held, left.max(right)))
+    }
+}
+
+/// Ranks a matched record with no postcode of its own by its distance from
+/// the records of the postcode a query names. The first address of a street
+/// group stands for all of it: they share a street, their areas and the
+/// postcode nearest them.
 struct PostcodeNearness {
     record_id: Column<u64>,
     pack: Arc<pack::Reader>,
     postcode: QueryPostcode,
-    /// The agreement of a record whose postcode is the named one in full.
-    full_agreement: u8,
 }
 
 impl PostcodeNearness {
-    fn fit(&self, doc: DocId, agreement: u8) -> u8 {
-        if agreement >= self.full_agreement {
-            return u8::MAX;
-        }
-        // Beyond the last band (a code shared with another country) only
-        // the agreement ranks, as without the postcode's records.
-        let Some(distance) = self
+    /// The first of [`POSTCODE_NEARNESS_BANDS_M`] the record lies within.
+    /// Beyond the last (a code shared with another country) only the
+    /// nearest postcode centroid ranks, as without the postcode's records.
+    fn band(&self, doc: DocId) -> Option<u8> {
+        let distance = self
             .record_id
             .first(doc)
             .and_then(|record_id| self.pack.records().point(record_id).ok())
-            .and_then(|(_, lon, lat)| self.postcode.distance_m(lon, lat))
-            .filter(|distance| {
-                *distance <= POSTCODE_NEARNESS_BANDS_M[POSTCODE_NEARNESS_BANDS_M.len() - 1]
-            })
-        else {
-            return agreement;
-        };
-        let band = POSTCODE_NEARNESS_BANDS_M
+            .and_then(|(_, lon, lat)| self.postcode.distance_m(lon, lat))?;
+        POSTCODE_NEARNESS_BANDS_M
             .iter()
-            .filter(|band| distance > **band)
-            .count();
-        u8::MAX - 1 - band as u8
+            .position(|band| distance <= *band)
+            .map(|band| band as u8)
     }
 }
 
@@ -1521,35 +2894,39 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
         let columns = self.columns.get(&segment.segment_id()).ok_or_else(|| {
             tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
         })?;
-        let postcode = match (
-            &columns.rank_postcode,
-            self.ranking.postcode.forms.is_empty(),
-        ) {
-            (Some(column), false) => {
-                Some((column.clone(), self.ranking.postcode.ord_ranges(column)?))
-            }
-            _ => None,
+        let named = &self.ranking.postcode;
+        let column = |column: &Option<StrColumn>| {
+            column
+                .as_ref()
+                .map(|column| PostcodeColumn::new(column, named))
+                .transpose()
         };
-        let nearness = (!self.ranking.postcode.points.is_empty()).then(|| PostcodeNearness {
-            record_id: columns.record_id.clone(),
-            pack: Arc::clone(self.pack),
-            postcode: self.ranking.postcode.clone(),
-            full_agreement: self
-                .ranking
-                .postcode
-                .forms
-                .iter()
-                .map(|form| form.chars().count())
-                .min()
-                .unwrap_or(0)
-                .min(u8::MAX.into()) as u8,
-        });
+        let postcode = match named.forms.is_empty() {
+            true => None,
+            false => Some(SegmentPostcodes {
+                own: column(&columns.rank_postcode)?,
+                area: column(&columns.area_postcode)?,
+                nearness: (!named.points.is_empty()).then(|| PostcodeNearness {
+                    record_id: columns.record_id.clone(),
+                    pack: Arc::clone(self.pack),
+                    postcode: named.clone(),
+                }),
+            }),
+        };
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
+            name_words: columns.name_words.clone(),
+            place_rank: columns.place_rank.clone(),
             postcode,
-            nearness,
+            focus: self.ranking.focus.map(|focus| SegmentFocus {
+                focus,
+                min_lon: columns.min_lon.clone(),
+                min_lat: columns.min_lat.clone(),
+                max_lon: columns.max_lon.clone(),
+                max_lat: columns.max_lat.clone(),
+            }),
         })
     }
 }
@@ -1559,19 +2936,19 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         // A numbered query matches a record by its stated number, by a range
         // that holds the number, or as a street that stands in for it.
         let mut key = RankKey::text(text_score);
+        let small =
+            |value: Option<u64>| value.map_or(u8::MAX, |value| value.min(u64::from(u8::MAX)) as u8);
+        key.name_words = small(self.name_words.first(doc));
+        key.place_rank = small(self.place_rank.first(doc));
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
             key.stated = false;
         }
-        if let Some((column, ranges)) = &self.postcode {
-            key.postcode_agreement = column
-                .term_ords(doc)
-                .map(|ord| QueryPostcode::agreement_of_ord(ranges, ord))
-                .max()
-                .unwrap_or(0);
+        if let Some(postcode) = &self.postcode {
+            key.postcode_agreement = postcode.rank(doc);
         }
-        if let Some(nearness) = &self.nearness {
-            key.postcode_agreement = nearness.fit(doc, key.postcode_agreement);
+        if let Some(focus) = &self.focus {
+            key.nearness = focus.nearness(doc);
         }
         key
     }
@@ -1580,20 +2957,56 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
 /// Secondary order for hits with equal ranks.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TieBreak {
+    /// Of a query for a house number, words of the street a record is on
+    /// that no query word names: "45 Lomond Crescent" is a flat of Lomond
+    /// Crescent before the house of a Ben Lomond Crescent. Before the unit,
+    /// which only chooses among the addresses of one street. A word an
+    /// abbreviation of the query stands for is named ("crescent" of
+    /// "cres"), and so is one its typo tier lets a query word match. Without a house number the street is no part of what is
+    /// sought: a POI is no worse for the street it is on.
+    extra_street_words: usize,
     /// The flat the query names, then the building, then its other flats:
     /// "19 Eros Place" is the house, not its flat 1, though a richer house
     /// label would lose on the words below. The unit is the one the plan
     /// read, never a word of the house number ("7 Vialou Street" is no
     /// unit 7).
     unit: u8,
-    /// Words of the record's own label the query did not ask for, as both
-    /// were written: "342 Albert Street" beats "342 Prince Albert Street" for
-    /// the query "342 albert street".
-    extra_label_tokens: usize,
+    /// Words of the record's own name the query did not ask for: "342
+    /// Albert Street" beats "342 Prince Albert Street" for the query "342
+    /// albert street". The name, not the label, so where a record lies
+    /// never counts against it.
+    extra_name_words: usize,
     /// Query words the label lacks. The addresses of a street group share
     /// one document and so one score, though only some state the unit the
     /// query names.
     missing_query_words: usize,
+    /// Query words the label does not spell as the query does: a query that
+    /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
+    /// finds, and one that writes "Taupo" for Taupo first.
+    inexact_query_words: usize,
+    /// Larger places first (see [`place_rank`]), then every other record:
+    /// "Richmond" is the town before a locality of that name. Only a tie on
+    /// the words and the areas a query states reaches it, so a size prior
+    /// never outweighs what the query says. The text index keeps the
+    /// window by it too (see [`RankKey::place_rank`]).
+    place_rank: u8,
+    /// Nearer the caller's focus first, by [`FOCUS_BANDS_M`]; all tie
+    /// without one. After every word of the query, so a caller's location
+    /// never outranks a better match, and every hit already lies in the
+    /// areas the query states.
+    focus_band: u8,
+    /// An address no other source disagrees on first: where two sources
+    /// placed one house far apart, its point may be wrong (see
+    /// [`AddressRecord::disputed`]).
+    disputed: bool,
+    /// Every other record before a POI, then the POI its OSM tags show
+    /// better known first: linked to Wikidata or Wikipedia, then named in
+    /// more languages (see [`Prominence`]). Only POIs that tie on all the
+    /// query states and on the caller's focus reach it. It is no measure of
+    /// an address or a place, so `None` keeps it from ever ordering one
+    /// against a POI by prominence; at so full a tie an address before a
+    /// POI is what [`TextSearcher::demoted`] says anyway.
+    poi: Option<std::cmp::Reverse<Prominence>>,
     /// Exact points before centroids before estimates before line midpoints.
     precision: u8,
     /// Nodes before ways before relations, then the lower id.
@@ -1602,16 +3015,25 @@ struct TieBreak {
 }
 
 impl TieBreak {
-    fn new(record: &Summary, query_words: &HashSet<&str>, ranking: &Ranking) -> Self {
-        let label = normalize_index_text(&record.label).unwrap_or_default();
+    fn new(record: &Summary, prior: Prior, query_words: &HashSet<&str>, ranking: &Ranking) -> Self {
+        let label = search_key(&record.label).unwrap_or_default();
         let label_words = label.split_whitespace().collect::<HashSet<_>>();
-        let extra_label_tokens = label
+        let extra_name_words = search_key(&record.name)
+            .unwrap_or_default()
             .split_whitespace()
             .filter(|word| !query_words.contains(word))
             .count();
         let missing_query_words = query_words
             .iter()
             .filter(|word| !label_words.contains(*word))
+            .count();
+        let exact_label = exact_key(&record.label).unwrap_or_default();
+        let exact_label_words = exact_label.split_whitespace().collect::<HashSet<_>>();
+        let inexact_query_words = ranking
+            .query_words
+            .exact
+            .iter()
+            .filter(|word| !exact_label_words.contains(word.as_str()))
             .count();
         let precision = match record.point.map(|point| point.precision) {
             Some(PointPrecision::Point) => 0,
@@ -1627,43 +3049,124 @@ impl TieBreak {
             Some(ObjectType::Row) => 3,
             None => 4,
         };
-        // A flat kept as written ("2/10") is the one "2/10" names, though it
-        // states no unit.
-        let as_written = ranking.unit.is_some()
-            && record
+        let focus_band = ranking
+            .focus
+            .zip(record.point)
+            .map_or(0, |([lon, lat], point)| {
+                focus_band(haversine_m(lon, lat, point.lon, point.lat))
+            });
+        let street = if !ranking.numbered {
+            None
+        } else if record.layer == Layer::Street.as_str() {
+            Some(record.name.as_str())
+        } else {
+            record
                 .address
-                .housenumber
+                .street
                 .as_deref()
-                .and_then(normalize_index_text)
-                .is_some_and(|written| {
-                    [&ranking.number_text, &ranking.flat_text]
-                        .into_iter()
-                        .flatten()
-                        .any(|text| *text == written)
-                });
-        let stated = record
-            .address
-            .unit
-            .as_deref()
-            .and_then(normalize_index_text);
-        let unit = match (ranking.unit.as_deref(), stated.as_deref()) {
-            _ if as_written => 0,
-            (Some(sought), Some(stated))
-                if stated.split_whitespace().any(|word| word == sought) =>
-            {
-                0
-            }
-            (Some(_), None) | (None, None) => 1,
-            (_, Some(_)) => 2,
+                .or(record.address.place.as_deref())
         };
+        let extra_street_words = street
+            .and_then(search_key)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter(|word| {
+                !query_words.contains(word)
+                    && !query_words.iter().any(|query_word| {
+                        ranking.edits.reaches(query_word, word)
+                            || lattice::full_forms(query_word)
+                                .iter()
+                                .any(|form| form == word)
+                    })
+                    && !ranking
+                        .sought
+                        .iter()
+                        .any(|sought| sought.corrected.as_deref() == Some(*word))
+            })
+            .count();
         Self {
-            unit,
-            extra_label_tokens,
+            extra_street_words,
+            unit: unit_rank(record, ranking),
+            extra_name_words,
             missing_query_words,
+            inexact_query_words,
+            place_rank: prior.place_rank.unwrap_or(u8::MAX),
+            focus_band,
+            disputed: prior.disputed,
+            poi: prior.prominence.map(std::cmp::Reverse),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
         }
+    }
+}
+
+/// What the Pack knows of a record apart from the query, for [`TieBreak`].
+#[derive(Debug, Clone, Copy)]
+struct Prior {
+    /// See [`place_rank`].
+    place_rank: Option<u8>,
+    /// A POI's, `None` for the other layers.
+    prominence: Option<Prominence>,
+    disputed: bool,
+}
+
+/// How a record answers the unit the query names: 0 the flat it names, 1
+/// the building, 2 another flat (see [`TieBreak::unit`]).
+fn unit_rank(record: &Summary, ranking: &Ranking) -> u8 {
+    // A flat kept as written ("2/10") is the one "2/10" names, though it
+    // states no unit.
+    let as_written = ranking.unit.is_some()
+        && record
+            .address
+            .housenumber
+            .as_deref()
+            .and_then(search_key)
+            .is_some_and(|written| {
+                [&ranking.number_text, &ranking.flat_text]
+                    .into_iter()
+                    .flatten()
+                    .any(|text| *text == written)
+            });
+    let stated = record.address.unit.as_deref().and_then(search_key);
+    match (ranking.unit.as_deref(), stated.as_deref()) {
+        _ if as_written => 0,
+        (Some(sought), Some(stated)) if stated.split_whitespace().any(|word| word == sought) => 0,
+        (Some(_), None) | (None, None) => 1,
+        (_, Some(_)) => 2,
+    }
+}
+
+/// Whether a record states `number` as its house number, or `flat`, the
+/// flat the query names written with it.
+fn states_number(record: &Summary, number: &str, flat: Option<&str>) -> bool {
+    record
+        .address
+        .housenumber
+        .as_deref()
+        .and_then(search_key)
+        .is_some_and(|stated| stated == number || Some(stated.as_str()) == flat)
+}
+
+/// The words of a record's label, as search keys.
+fn label_words(record: &Summary) -> Vec<String> {
+    search_key(&record.label)
+        .iter()
+        .flat_map(|label| label.split_whitespace())
+        .map(str::to_string)
+        .collect()
+}
+
+fn count<T>(items: impl Iterator<Item = T>) -> u8 {
+    items.count().min(usize::from(u8::MAX)) as u8
+}
+
+/// An [`Agreement`] of a check that says yes, no, or nothing.
+fn agreement(agrees: Option<bool>) -> Agreement {
+    match agrees {
+        Some(true) => Agreement::Agrees,
+        Some(false) => Agreement::Contradicts,
+        None => Agreement::Unknown,
     }
 }
 
@@ -1677,19 +3180,25 @@ enum Parses {
     Numbered,
 }
 
-/// The retrieval passes of [`TextSearcher::search_variants`], in order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pass {
+/// The retrieval passes of [`TextSearcher::search_variants`], in order,
+/// strictest first. The order is also how strongly a hit found by each
+/// answers the query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Pass {
     /// The house number, stated or on a range, in every named locality.
+    #[default]
     Strict,
     /// The number between its stated neighbours, or a street standing in for
     /// it, still in every locality.
     Street,
     /// The localities only rank, and a street may stand in for the number.
+    /// A hit in other localities than the ones named is still left out.
     Lenient,
 }
 
 impl Pass {
+    const ALL: [Self; 3] = [Self::Strict, Self::Street, Self::Lenient];
+
     fn requires_locality(self) -> bool {
         self != Self::Lenient
     }
@@ -1710,12 +3219,227 @@ impl Pass {
     }
 }
 
+/// How strongly a reading's hits answer the query: the pass that found them,
+/// then whether anything confirms the postcode the reading states, then the
+/// parser's score of the reading. Compared in that order, never summed: the
+/// score is an unnormalised Viterbi path score on no scale shared with
+/// retrieval, so any weight joining the two would be made up. A stricter
+/// pass outweighs any score; the score decides only between readings found
+/// by the same pass and as confirmed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Evidence {
+    pass: Pass,
+    /// A hit agrees with the postcode the reading states, or it states none.
+    /// A number read as a postcode that nothing says the hits are in may be
+    /// their house number: "3010 Coast Road, Barrytown" is the house 3010,
+    /// not any house in a postcode 3010 no Barrytown record states.
+    confirmed: bool,
+    score: f32,
+}
+
+impl Evidence {
+    fn outweighs(self, other: Self) -> bool {
+        self.pass < other.pass
+            || (self.pass == other.pass
+                && (self.confirmed, self.score) > (other.confirmed, other.score))
+    }
+
+    /// Whether a later reading, which scores no higher, may still outweigh
+    /// it: in a stricter pass, or in the same pass with its postcode
+    /// confirmed.
+    fn open(self) -> bool {
+        self.pass == Pass::Lenient || !self.confirmed
+    }
+}
+
+/// The reading whose hits rest on the strongest [`Evidence`], with its hits;
+/// `None` when no reading finds any. `scores` are the readings' parser
+/// scores, best first, and `search` runs one pass over one reading.
+///
+/// Readings run in turn, each through the passes until one finds hits;
+/// `search` also says whether they confirm the reading's postcode (see
+/// [`Evidence::confirmed`]). Confirmed hits from [`Pass::Strict`] or
+/// [`Pass::Street`] end the search. After others the later readings run
+/// only the passes that could outweigh them: a later reading scores no
+/// higher, so only a stricter pass, or a confirmed one at the same pass,
+/// could. That bounds the extra work to a few passes over each remaining
+/// reading.
+fn choose_reading<T>(
+    scores: &[f32],
+    mut search: impl FnMut(usize, Pass) -> Result<Option<(T, bool)>>,
+) -> Result<Option<(usize, T)>> {
+    let mut best = None::<(Evidence, usize, T)>;
+    for (reading, &score) in scores.iter().enumerate() {
+        if best.as_ref().is_some_and(|(held, ..)| !held.open()) {
+            break;
+        }
+        for pass in Pass::ALL {
+            if best
+                .as_ref()
+                .is_some_and(|(held, ..)| pass > held.pass || (pass == held.pass && held.confirmed))
+            {
+                break;
+            }
+            let Some((hits, confirmed)) = search(reading, pass)? else {
+                continue;
+            };
+            let evidence = Evidence {
+                pass,
+                confirmed,
+                score,
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(held, ..)| evidence.outweighs(*held))
+            {
+                best = Some((evidence, reading, hits));
+            }
+            break;
+        }
+    }
+    Ok(best.map(|(_, reading, hits)| (reading, hits)))
+}
+
+/// How many edits a query word may be from a record's in one typo tier of
+/// [`TextSearcher::search_variants`]. Tantivy scores every term a fuzzy
+/// query matches the same (tantivy#563), so no one query lets the spelling
+/// as written outrank a typo: a tier runs only when the ones before it kept
+/// nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Edits {
+    #[default]
+    None,
+    One,
+    Two,
+}
+
+impl Edits {
+    const TIERS: [Self; 3] = [Self::None, Self::One, Self::Two];
+
+    fn most(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+
+    /// The edits `word` may be from a record's word in this tier, and how
+    /// many of its first characters must be as written: one edit for words
+    /// of [`MIN_TYPO_CHARS`] to six, two for longer ones, and
+    /// [`TYPO_PREFIX_CHARS`] characters for both. `None` when it is matched
+    /// only as written: it is short, or holds a digit. In a dense run of
+    /// numbers every edit names another real address ("12 Main St" is one
+    /// edit from "13 Main St"), so a house number, a postcode, a unit or a
+    /// route number is never a typo.
+    fn allowed(self, word: &str) -> Option<(u8, usize)> {
+        if self == Self::None || word.chars().any(char::is_numeric) {
+            return None;
+        }
+        let chars = word.chars().count();
+        if chars < MIN_TYPO_CHARS {
+            None
+        } else if chars < LONG_TYPO_CHARS {
+            Some((1, TYPO_PREFIX_CHARS))
+        } else {
+            Some((self.most(), TYPO_PREFIX_CHARS))
+        }
+    }
+
+    /// Whether `other` is a typo of `word` this tier allows.
+    fn reaches(self, word: &str, other: &str) -> bool {
+        let Some((most, prefix)) = self.allowed(word) else {
+            return false;
+        };
+        word.chars().take(prefix).eq(other.chars().take(prefix))
+            && matches!(
+                automaton_builder(most).build_dfa(word).eval(other),
+                Distance::Exact(_)
+            )
+    }
+}
+
+/// What a typo tier lets each query word match besides itself, by the field
+/// of the text index it is searched in and the word.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Spellings {
+    words: HashMap<(Field, String), Spelt>,
+}
+
+/// What the Pack says of the words of a plan that may name where a record
+/// is.
+#[derive(Debug, Default)]
+struct AreaWords {
+    /// The words of its localities the Pack knows as a word of an area (see
+    /// [`TextSearcher::subject_clauses`]).
+    known: HashSet<String>,
+    postcodes: PostcodeWeights,
+    /// What each word of what is sought scores where it stands in for an
+    /// area (see [`TextSearcher::stand_in_weights`]).
+    stand_ins: HashMap<String, Score>,
+}
+
+/// What agreeing on a postcode weighs, by each term of a plan the postcode
+/// field may index and each country the Pack holds a postcode of it in.
+/// Fellegi-Sunter: `ln(m / u)`, `u` the share of the country's addresses
+/// stating a postcode that state this one, `m` [`MATCH_AGREEMENT`]. One
+/// global weight cannot fit both a UK postcode, a street's side, and a US
+/// ZIP, thousands of addresses; the counts give each its own. Counted per
+/// country, not over the Pack, as a code names a postcode only within one
+/// (AU and NZ both have a "2110"), and a Pack covering more countries would
+/// otherwise make every postcode rarer.
+#[derive(Debug, Default)]
+struct PostcodeWeights {
+    terms: HashMap<String, Vec<(Option<CountryCode>, Score)>>,
+}
+
+impl PostcodeWeights {
+    /// What agreeing on a postcode `covered` of `addresses` addresses state
+    /// weighs. A postcode most addresses state says next to nothing, and
+    /// never counts against a record.
+    fn agreement(covered: u64, addresses: u64) -> Score {
+        let covered = covered.max(1) as f64;
+        let addresses = (addresses as f64).max(covered);
+        (MATCH_AGREEMENT * addresses / covered).ln().max(0.0) as Score
+    }
+}
+
+/// The terms of one field a query word may be a typo of.
+#[derive(Debug, Clone, PartialEq)]
+struct Spelt {
+    /// The word of the name the parser read it as.
+    corrected: Option<String>,
+    /// The other terms near it (see [`TextSearcher::near_terms`]).
+    near: Vec<String>,
+}
+
+/// A Levenshtein automaton, as Tantivy's term dictionaries walk one.
+struct Levenshtein<'a>(&'a DFA);
+
+impl tantivy_fst::Automaton for Levenshtein<'_> {
+    type State = u32;
+
+    fn start(&self) -> u32 {
+        self.0.initial_state()
+    }
+
+    fn is_match(&self, state: &u32) -> bool {
+        matches!(self.0.distance(*state), Distance::Exact(_))
+    }
+
+    fn can_match(&self, state: &u32) -> bool {
+        *state != SINK_STATE
+    }
+
+    fn accept(&self, state: &u32, byte: u8) -> u32 {
+        self.0.transition(*state, byte)
+    }
+}
+
 /// What [`TextSearcher::ranked_hits`] ranks by besides the text score.
 #[derive(Debug, Clone, Default)]
 struct Ranking {
-    /// The query's words as written, before abbreviations were expanded, to
-    /// compare with records' own labels.
-    query_words: HashSet<String>,
+    query_words: QueryWords,
     /// Whether the query asks for a house number.
     numbered: bool,
     /// The house number, when interpolation ranges can estimate it.
@@ -1729,12 +3453,87 @@ struct Ranking {
     /// with its unit ("29" of "29 181").
     unit: Option<String>,
     postcode: QueryPostcode,
+    /// Where the caller is, `[lon, lat]`.
+    focus: Option<[f64; 2]>,
+    /// The words of what the query seeks, its subject and unplaced words,
+    /// and the typo tier they were matched in: what an address or street
+    /// must account for to rank above a POI (see
+    /// [`TextSearcher::demoted`]). Empty leaves POIs where they rank.
+    sought: Vec<Word>,
+    edits: Edits,
 }
 
-/// The postcode a query names, to rank records by how much of it their own
-/// postcode shares from its start: "M5C 2A1" agrees with "M5C 1B2" on three
-/// characters, with "M4C 1B2" on one. Longer agreement ranks first, whatever
-/// the country's postcode format.
+/// Hits whose own postcode contradicts the one their query names, kept
+/// across passes and readings: they answer a query only after every hit
+/// that does not.
+#[derive(Debug, Default)]
+struct Contradicting {
+    /// The reading that found the first of them.
+    query: Option<String>,
+    hits: Vec<TextSearchHit>,
+}
+
+impl Contradicting {
+    fn keep(&mut self, query: &str, hits: Vec<TextSearchHit>) {
+        for hit in hits {
+            if !self.hits.iter().any(|kept| kept.record.id == hit.record.id) {
+                self.query.get_or_insert_with(|| query.to_string());
+                self.hits.push(hit);
+            }
+        }
+    }
+
+    /// `hits`, then the contradicting hits they do not hold, at most `limit`.
+    fn after(self, mut hits: Vec<TextSearchHit>, limit: usize) -> Vec<TextSearchHit> {
+        for hit in self.hits {
+            if hits.len() >= limit {
+                break;
+            }
+            if !hits.iter().any(|held| held.record.id == hit.record.id) {
+                hits.push(hit);
+            }
+        }
+        hits
+    }
+
+    /// The contradicting hits alone, at most `limit`, with the reading that
+    /// found the first; `None` when there are none.
+    fn alone(mut self, limit: usize) -> Option<(String, Vec<TextSearchHit>)> {
+        self.hits.truncate(limit);
+        Some((self.query?, self.hits))
+    }
+}
+
+/// The query's words as written, before abbreviations were expanded, to
+/// compare with records' own labels.
+#[derive(Debug, Clone, Default)]
+struct QueryWords {
+    /// As [`search_key`] writes them, and the words of the structured
+    /// context.
+    search: HashSet<String>,
+    /// As [`exact_key`] writes them.
+    exact: HashSet<String>,
+}
+
+impl QueryWords {
+    fn new(query: &str) -> Self {
+        let words = |key: Option<String>| {
+            key.iter()
+                .flat_map(|text| text.split_whitespace())
+                .map(str::to_string)
+                .collect()
+        };
+        Self {
+            search: words(search_key(query)),
+            exact: words(exact_key(query)),
+        }
+    }
+}
+
+/// The postcode a query names, to rank records by whether their own
+/// postcodes hold it, and else by how much of it they share from its start:
+/// "M5C 2A1" agrees with "M5C 1B2" on three characters, with "M4C 1B2" on
+/// one. Longer agreement ranks first, whatever the country's postcode format.
 #[derive(Debug, Clone, Default)]
 struct QueryPostcode {
     /// Compacted forms of the postcode part: all of it, and from its first
@@ -1747,7 +3546,59 @@ struct QueryPostcode {
     points: Vec<[f64; 2]>,
 }
 
+/// How [`QueryPostcode::rank`] ranks a record its own postcodes place in the
+/// named postcode.
+const POSTCODE_HELD: u8 = u8::MAX;
+/// The least [`QueryPostcode::rank`] gives a record with no postcode of its
+/// own: one whose own postcodes contradict the named one ranks below.
+const POSTCODE_UNKNOWN: u8 = 128;
+
 impl QueryPostcode {
+    /// Whether `postcode`, compacted, is in the named one: either starts the
+    /// other.
+    fn holds(&self, postcode: &str) -> bool {
+        self.forms
+            .iter()
+            .any(|form| postcode.starts_with(form.as_str()) || form.starts_with(postcode))
+    }
+
+    /// A record's rank by the named postcode, larger is better. `own` is
+    /// whether the postcodes it is in by its own data hold the named one
+    /// and the longest prefix of it they share, `None` when it has none;
+    /// `area` the same of the postcode centroid nearest it. Its own
+    /// postcodes holding it come first and contradicting it last, by the
+    /// prefix they share: a mismatch ranks down, never out. Between them,
+    /// with none of its own, the nearest centroid holding it, then the
+    /// record's [`band`](PostcodeNearness::band) from the postcode's own
+    /// records, then the prefix the nearest centroid shares.
+    fn rank(
+        own: Option<(bool, u8)>,
+        area: Option<(bool, u8)>,
+        band: impl FnOnce() -> Option<u8>,
+    ) -> u8 {
+        let farthest_band = POSTCODE_HELD - 2 - (POSTCODE_NEARNESS_BANDS_M.len() - 1) as u8;
+        match (own, area) {
+            (Some((true, _)), _) => POSTCODE_HELD,
+            (Some((false, shared)), _) => shared.min(POSTCODE_UNKNOWN - 1),
+            (None, Some((true, _))) => POSTCODE_HELD - 1,
+            (None, area) => match band() {
+                Some(band) => POSTCODE_HELD - 2 - band,
+                None => POSTCODE_UNKNOWN
+                    .saturating_add(area.map_or(0, |(_, shared)| shared))
+                    .min(farthest_band - 1),
+            },
+        }
+    }
+
+    /// [`Self::rank`] of compacted postcodes, without the bands.
+    fn rank_of(&self, own: &[String], area: Option<&str>) -> u8 {
+        let read = |postcode: &str| (self.holds(postcode), self.agreement(postcode));
+        let own = own.iter().map(|postcode| read(postcode)).reduce(
+            |(left_held, left), (right_held, right)| (left_held || right_held, left.max(right)),
+        );
+        Self::rank(own, area.map(read), || None)
+    }
+
     /// How far a point lies from the nearest record of the postcode, when the
     /// Pack has one.
     fn distance_m(&self, lon: f64, lat: f64) -> Option<f64> {
@@ -1841,21 +3692,78 @@ fn effective_autocomplete_limit(limit: usize) -> usize {
 }
 
 /// A query's words by role, from one labelling of its tokens by the address
-/// parser (see [`crate::parse::lattice`]). Street and other words name what
-/// is sought and are required; locality, region, postcode and country words
-/// place it; unit words only rank (see [`TextSearcher::build_query`]).
+/// parser (see [`crate::parse::lattice`]). Street words name what is sought;
+/// words the parser placed nowhere may; locality, region, postcode and
+/// country words place it; unit words only rank (see
+/// [`TextSearcher::build_query`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct QueryPlan {
     /// The house number the parser read ("670", "221b", "993_5"), when other
-    /// required words name the street it is on.
+    /// words name the street it is on.
     house_number: Option<HouseNumber>,
     /// The unit the query names by a number ("29" of "unit 29" or of
     /// "29/181" read as a unit), to find and rank the flat.
     unit: Option<String>,
-    required: Vec<String>,
+    /// The words that name [`Self::unit`] as written ("unit 602"), kept for
+    /// [`Self::text`]. They score nothing.
+    unit_words: Vec<String>,
+    /// The words of what is sought, in order: its street's, or of a query
+    /// with neither street nor unplaced words, its first place or its
+    /// number.
+    subject: Vec<SubjectWord>,
+    /// Words the parser could not place: a suite designator, a country
+    /// exonym, a word of a language the Pack does not speak. Each only
+    /// ranks, unless the plan has no subject: then most must match (see
+    /// [`unplaced_floor`]).
+    unplaced: Vec<Word>,
     optional: Vec<String>,
     /// Each run of locality, region, postcode or country words, in order.
     context: Vec<ContextPart>,
+    /// What the typo tier the plan is searched in lets its words match
+    /// besides themselves; empty in the exact tier (see
+    /// [`TextSearcher::spelt`]).
+    spellings: Spellings,
+}
+
+/// A query word, with the word of the name the parser read it as when it
+/// took it for a typo of one.
+#[derive(Debug, Clone, PartialEq)]
+struct Word {
+    text: String,
+    corrected: Option<String>,
+}
+
+impl Word {
+    /// `written` words, each with the word of `corrected` in its place
+    /// where that differs: corrections only when both have as many words.
+    fn paired(written: Vec<String>, corrected: Option<Vec<String>>) -> Vec<Self> {
+        let corrected = corrected.filter(|corrected| corrected.len() == written.len());
+        written
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| Self {
+                corrected: corrected
+                    .as_ref()
+                    .map(|corrected| corrected[index].clone())
+                    .filter(|corrected| *corrected != text),
+                text,
+            })
+            .collect()
+    }
+}
+
+/// A word of what a query seeks.
+#[derive(Debug, Clone, PartialEq)]
+struct SubjectWord {
+    text: String,
+    /// The parser's reading of it, when it took it for a typo.
+    corrected: Option<String>,
+    /// Whether a record must have it. A street's type, direction or
+    /// qualifier ("boulevard", "north") only ranks: "Roosevelt Blvd N" is
+    /// "Roosevelt Boulevard", and a "Main Street South" ranks below a "Main
+    /// Street North" for "Main St N", never out. All are required when the
+    /// street has no other words ("North Road").
+    required: bool,
 }
 
 /// A run of query words that says where the sought record is.
@@ -1864,6 +3772,9 @@ struct ContextPart {
     /// Locality, region, postcode or country.
     label: Label,
     words: Vec<String>,
+    /// The words of the name the parser read the part as, when it took a
+    /// word of it for a typo.
+    corrected: Option<Vec<String>>,
 }
 
 impl ContextPart {
@@ -1871,7 +3782,11 @@ impl ContextPart {
     /// it has no words.
     fn of(label: Label, value: Option<&str>) -> Option<Self> {
         let words = Tokens::new(value?).words;
-        (!words.is_empty()).then_some(Self { label, words })
+        (!words.is_empty()).then_some(Self {
+            label,
+            words,
+            corrected: None,
+        })
     }
 
     fn is_postcode(&self) -> bool {
@@ -1879,20 +3794,125 @@ impl ContextPart {
     }
 }
 
+/// A locality or region a query names, by the words of it the Pack knows
+/// (see [`TextSearcher::area_agreement`]).
+#[derive(Debug, Clone, PartialEq)]
+struct StatedArea {
+    label: Label,
+    words: Vec<String>,
+}
+
+impl StatedArea {
+    /// The words of `part` that `known` holds, `None` when it holds none.
+    fn known(part: &ContextPart, known: &HashSet<String>) -> Option<Self> {
+        let words = part
+            .words
+            .iter()
+            .filter(|word| known.contains(*word))
+            .cloned()
+            .collect::<Vec<_>>();
+        (!words.is_empty()).then_some(Self {
+            label: part.label,
+            words,
+        })
+    }
+}
+
+/// How many of `count` unplaced words a record must match when a query has
+/// no subject, as Pelias's `minimum_should_match` of `1<-1 3<-25%` asks: one
+/// may be missing of up to five, a quarter of more. Without a subject the
+/// parser placed nothing, which is every word of a query in a language the
+/// Pack's parser does not know.
+fn unplaced_floor(count: usize) -> usize {
+    match count {
+        ..=1 => 1,
+        2..=5 => count - 1,
+        _ => count - count / 4,
+    }
+}
+
+/// The flat a run of unit words names: its word with a digit, else the word
+/// after its designator ("B" of "Flat B"), else a word that is none ("G" of
+/// "G/9"). Libpostal's designators hold letters too ("b" of some language),
+/// so a word after one is the flat whatever it is. `None` for a designator
+/// alone.
+fn named_unit(words: &[String]) -> Option<String> {
+    words
+        .iter()
+        .rev()
+        .find(|word| word.chars().any(|character| character.is_ascii_digit()))
+        .or_else(|| match words {
+            [only] => (!designates_unit(only)).then_some(only),
+            [.., last] => Some(last),
+            [] => None,
+        })
+        .cloned()
+}
+
 impl QueryPlan {
     /// Plan one labelling of a query's tokens, with `context` (the
     /// structured fields of a geocoded row) after the parts the labelling
-    /// names. `None` when the query has no words.
-    fn from_tagged(tokens: &[Tagged], context: &[ContextPart]) -> Option<Self> {
+    /// names. `corrections` are the parser's, one per token where it has
+    /// them (see [`crate::parse::lattice::ParsedQuery::corrections`]). `describes_street` tells a
+    /// word that only describes a street from one of its name (see
+    /// [`SubjectWord::required`]). `None` when the query has no words.
+    fn from_tagged(
+        tokens: &[Tagged],
+        corrections: &[Option<String>],
+        context: &[ContextPart],
+        describes_street: impl Fn(&str) -> bool,
+    ) -> Option<Self> {
         let mut plan = Self::default();
-        let mut runs = Vec::<(Label, Vec<String>)>::new();
-        for tagged in tokens {
+        let mut street = Vec::new();
+        let expanded = |words: &[String]| {
+            expand_address_abbreviations(&words.join(" "))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let expanded_run = |words: &[String], corrected: &Option<Vec<String>>| {
+            Word::paired(
+                expanded(words),
+                corrected.as_ref().map(|corrected| expanded(corrected)),
+            )
+        };
+        // Each run of one label, as written and, when the parser corrected
+        // a word of it, as corrected.
+        let mut runs = Vec::<(Label, Vec<String>, Option<Vec<String>>)>::new();
+        for (index, tagged) in tokens.iter().enumerate() {
+            let correction = corrections.get(index).cloned().flatten();
             match runs.last_mut() {
-                Some((label, words)) if *label == tagged.label => words.push(tagged.token.clone()),
-                _ => runs.push((tagged.label, vec![tagged.token.clone()])),
+                Some((label, words, corrected)) if *label == tagged.label => {
+                    if let Some(correction) = correction {
+                        corrected
+                            .get_or_insert_with(|| words.clone())
+                            .push(correction);
+                    } else if let Some(corrected) = corrected {
+                        corrected.push(tagged.token.clone());
+                    }
+                    words.push(tagged.token.clone());
+                }
+                _ => runs.push((
+                    tagged.label,
+                    vec![tagged.token.clone()],
+                    correction.map(|correction| vec![correction]),
+                )),
             }
         }
-        for (label, words) in runs {
+        // A word the parser could not place, written just before the house
+        // number with a digit of its own, is the flat's ("G11" of
+        // "G11/40"): a street word holds no digit, and a number the parser
+        // would have read.
+        let unplaced_unit = runs
+            .iter()
+            .position(|(label, ..)| *label == Label::HouseNumber)
+            .and_then(|at| at.checked_sub(1))
+            .and_then(|before| match &runs[before] {
+                (Label::Other, words, _) => words.last().cloned(),
+                _ => None,
+            })
+            .filter(|word| word.chars().any(|character| character.is_ascii_digit()));
+        for (label, words, corrected) in runs {
             match label {
                 Label::HouseNumber if plan.house_number.is_none() => {
                     // A number written in parts ("993.5", "1384 1/2") is one
@@ -1903,49 +3923,140 @@ impl QueryPlan {
                         plan.house_number = Some(number);
                         plan.optional.extend(words.into_iter().skip(1));
                     } else {
-                        plan.required.extend(words);
+                        street.extend(Word::paired(words, None));
                     }
                 }
-                Label::Unit => {
-                    if let Some(unit) = words
-                        .iter()
-                        .rev()
-                        .find(|word| word.chars().any(|character| character.is_ascii_digit()))
-                    {
-                        plan.unit = Some(unit.clone());
+                // A named flat chooses among the addresses of one street in
+                // the tie-break and scores nothing: as words, "unit 2" would
+                // rank a street with many flats above the street the query
+                // names ("Unit 2, 1 Balfour Street" answered on Balfour Road).
+                Label::Unit => match named_unit(&words) {
+                    Some(unit) => {
+                        plan.unit = Some(unit);
+                        plan.unit_words.extend(words);
                     }
-                    plan.optional.extend(words);
-                }
+                    None => plan.optional.extend(words),
+                },
                 Label::HouseNumber => plan.optional.extend(words),
-                Label::Street | Label::Other => plan.required.extend(
-                    expand_address_abbreviations(&words.join(" "))
-                        .split_whitespace()
-                        .map(str::to_string),
-                ),
+                Label::Street => street.extend(expanded_run(&words, &corrected)),
+                // A run the parser could not place that opens with a unit
+                // designator and the flat after it ("unit 2", "suite 410")
+                // is that flat, whatever the parser read it as.
+                Label::Other
+                    if words.len() >= 2
+                        && plan.unit.is_none()
+                        && designates_unit(&words[0])
+                        && let Some(unit) = named_unit(&words[..2]) =>
+                {
+                    plan.unit = Some(unit);
+                    plan.unit_words.extend(words[..2].iter().cloned());
+                    let rest = corrected
+                        .as_ref()
+                        .map(|corrected| corrected.get(2..).unwrap_or_default().to_vec());
+                    plan.unplaced.extend(expanded_run(&words[2..], &rest));
+                }
+                Label::Other => plan.unplaced.extend(expanded_run(&words, &corrected)),
                 Label::Locality | Label::Region | Label::Postcode | Label::Country => {
-                    plan.context.push(ContextPart { label, words });
+                    plan.context.push(ContextPart {
+                        label,
+                        words,
+                        corrected,
+                    });
                 }
             }
         }
         plan.context.extend(context.iter().cloned());
-        // A query of places only ("Toronto", "Seaforth, Huron East") seeks
-        // the first; a house number alone is sought as a word.
-        if plan.required.is_empty() {
-            if !plan.context.is_empty() {
-                plan.required = plan.context.remove(0).words;
-            } else if let Some(number) = plan.house_number.take() {
-                plan.required = number.text.split_whitespace().map(str::to_string).collect();
-            } else {
-                plan.required = std::mem::take(&mut plan.optional);
-            }
+        if plan.unit.is_none() && plan.house_number.is_some() {
+            plan.unit = unplaced_unit;
         }
-        if plan.required.is_empty() {
+        if plan.house_number.is_some()
+            && let Some(last) = street.last_mut()
+        {
+            let mut text = [std::mem::take(&mut last.text)];
+            expand_final_direction(&mut text);
+            [last.text] = text;
+        }
+        let named = street.iter().any(|word| !describes_street(&word.text));
+        plan.subject = street
+            .into_iter()
+            .map(|word| SubjectWord {
+                required: !named || !describes_street(&word.text),
+                text: word.text,
+                corrected: word.corrected,
+            })
+            .collect();
+        if plan.subject.is_empty() && plan.unplaced.is_empty() {
+            // A query of places only ("Toronto", "Seaforth, Huron East")
+            // seeks the first; a house number alone is sought as a word.
+            let words = if !plan.context.is_empty() {
+                let part = plan.context.remove(0);
+                Word::paired(part.words, part.corrected)
+            } else if let Some(number) = plan.house_number.take() {
+                let words = number.text.split_whitespace().map(str::to_string);
+                Word::paired(words.collect(), None)
+            } else {
+                Word::paired(std::mem::take(&mut plan.optional), None)
+            };
+            plan.subject = words
+                .into_iter()
+                .map(|word| SubjectWord {
+                    text: word.text,
+                    corrected: word.corrected,
+                    required: true,
+                })
+                .collect();
+        }
+        if plan.subject.is_empty() && plan.unplaced.is_empty() {
             return None;
         }
-        if plan.house_number.is_some() {
-            expand_final_direction(&mut plan.required);
-        }
         Some(plan)
+    }
+
+    /// The words a street-type or direction abbreviation of the plan stands
+    /// for, searched besides it: "tce" is "terrace" ("46 Highfield Tce" is a
+    /// terrace before a "Highfield Way"). Libpostal's lists, every language
+    /// alike: too ambiguous to rewrite the indexed text by ("pl" is "place"
+    /// and "platz"), so the query asks for each. None for a word the text
+    /// index expands, which it leaves as written on purpose ("St" before a
+    /// name is "Saint"), or for a form the plan already seeks: "st" of "12
+    /// St George Street" must not count the "street" again.
+    fn full_forms(&self, word: &str) -> Vec<&'static str> {
+        if STREET_TYPE_ABBREVIATIONS
+            .iter()
+            .any(|(abbreviation, _)| *abbreviation == word)
+        {
+            return Vec::new();
+        }
+        lattice::full_forms(word)
+            .iter()
+            .map(String::as_str)
+            .filter(|form| {
+                !self
+                    .subject
+                    .iter()
+                    .map(|word| &word.text)
+                    .chain(self.unplaced.iter().map(|word| &word.text))
+                    .any(|sought| sought == form)
+            })
+            .collect()
+    }
+
+    /// The words and context parts of the plan that are searched in where a
+    /// record is, so any may write a postcode: an unplaced word or one that
+    /// stands in for an area as much as a postcode part.
+    fn area_terms(&self) -> Vec<String> {
+        let words = self
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .chain(self.unplaced.iter().map(|word| word.text.clone()));
+        let parts = self.context.iter().flat_map(|part| {
+            part.words
+                .iter()
+                .cloned()
+                .chain((part.words.len() > 1).then(|| part.words.join(" ")))
+        });
+        unique_strings(words.chain(parts).collect())
     }
 
     /// The plan as text: the house number, the words it seeks, then each
@@ -1955,8 +4066,10 @@ impl QueryPlan {
             .house_number
             .iter()
             .map(|number| number.text.as_str())
-            .chain(self.required.iter().map(String::as_str))
+            .chain(self.subject.iter().map(|word| word.text.as_str()))
+            .chain(self.unplaced.iter().map(|word| word.text.as_str()))
             .chain(self.optional.iter().map(String::as_str))
+            .chain(self.unit_words.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
         std::iter::once(subject)
@@ -1980,6 +4093,17 @@ impl QueryPlan {
             }),
             ..self.clone()
         })
+    }
+
+    /// Whether a plan with no house number reads as its postcode a word that
+    /// could be one: "3010" of "3010 Coast Road" is a postcode in one
+    /// reading and the house in another. "A1A 9Z9" never is.
+    fn postcode_may_be_house_number(&self) -> bool {
+        self.house_number.is_none()
+            && self.context.iter().any(|part| {
+                part.is_postcode()
+                    && matches!(part.words.as_slice(), [word] if HouseNumber::parse(word).is_some())
+            })
     }
 
     /// The postcode the last postcode part names. A postcode given apart
@@ -2042,7 +4166,7 @@ impl HouseNumber {
 }
 
 fn normalized_for_match(value: Option<&str>) -> Option<String> {
-    normalize_index_text(value?.trim())
+    search_key(value?.trim())
 }
 
 fn unique_strings(values: Vec<String>) -> Vec<String> {
@@ -2127,6 +4251,8 @@ mod tests {
                 limit: 3,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         let ids = hits
@@ -2135,6 +4261,427 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["osm:node:5", "osm:node:7", "osm:way:9"]);
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn equal_hits_prefer_an_address_no_source_disputes() {
+        let temp_dir = temp_pack_path("search-disputed");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut disputed = address_record("osm:node:5", "", "342", "Albert Street", None, None);
+        disputed.disputed = true;
+        for record in [
+            disputed,
+            address_record("osm:node:7", "", "342", "Albert Street", None, None),
+        ] {
+            writer.write(&record.into(), None).expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            top_ids(&searcher, "342 Albert Street"),
+            vec!["osm:node:7", "osm:node:5"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn answers_carry_a_confidence_only_from_a_calibrated_pack() {
+        use crate::confidence::{FEATURES, Model};
+
+        let temp_dir = temp_pack_path("search-confidence");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for record in [
+            address_record("osm:node:1", "", "10", "King Street", None, Some("M5V 1A1")),
+            address_record("osm:node:2", "", "12", "King Street", None, Some("M5V 1A1")),
+        ] {
+            writer.write(&record.into(), None).expect("write");
+        }
+        writer
+            .write(&street_record("osm:way:9", "King Street").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let search = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+        };
+
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert!(searcher.confidence_model().is_none());
+        let hits = search(&searcher, "10 King Street");
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.confidence.is_none()));
+        let top = &hits[0].features;
+        assert_eq!(top.pass, Pass::Strict);
+        assert_eq!(top.number, Some(true));
+        assert_eq!(top.dropped_words, 0);
+        assert!(!top.lower_rank);
+
+        let pack = pack::Reader::open(&temp_dir).expect("pack");
+        let mut weights = [0.0; FEATURES];
+        weights[0] = 1.0;
+        Model::new(weights, std::collections::BTreeMap::new())
+            .save(&pack)
+            .expect("save");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        for query in ["10 King Street", "99 King Street", "King"] {
+            let hits = search(&searcher, query);
+            assert!(!hits.is_empty(), "{query}");
+            for hit in hits {
+                let confidence = hit
+                    .confidence
+                    .expect("a calibrated Pack rates every answer");
+                assert!((0.0..=1.0).contains(&confidence), "{query}: {confidence}");
+            }
+        }
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "10 King St".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("autocomplete");
+        assert!(suggestions.iter().all(|hit| hit.confidence.is_some()));
+        assert!(suggestions.iter().all(|hit| hit.features.prefix));
+
+        // A model fit to another Pack is refused, not misread.
+        let other = temp_pack_path("search-confidence-other");
+        let _ = std::fs::remove_dir_all(&other);
+        let mut writer = Writer::create(&other).expect("writer");
+        writer
+            .write(&street_record("osm:way:9", "Queen Street").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let other_pack = pack::Reader::open(&other).expect("pack");
+        std::fs::copy(
+            confidence::Model::path(pack.path()),
+            confidence::Model::path(other_pack.path()),
+        )
+        .expect("copy");
+        assert!(TextSearcher::open(&other).is_err());
+        let _ = std::fs::remove_dir_all(other);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    fn search_near(
+        searcher: &TextSearcher,
+        query: &str,
+        limit: usize,
+        focus: Option<[f64; 2]>,
+        bbox: Option<BoundingBox>,
+    ) -> Vec<String> {
+        searcher
+            .search(TextSearchOptions {
+                query: query.to_string(),
+                limit,
+                layer: None,
+                countries: Vec::new(),
+                focus,
+                bbox,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_focus_breaks_ties_toward_the_caller_and_nothing_else() {
+        let temp_dir = temp_pack_path("search-focus");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // Forty streets of one name the query cannot tell apart, more than
+        // the rank window holds for one hit, the nearest written last.
+        for index in 1..=40 {
+            let mut street = street_record(&format!("osm:way:{index}"), "Mill Road");
+            let lon = -100.0 + f64::from(index);
+            street.geometry = point_geometry(lon, 45.0);
+            street.representative_point = [lon, 45.0];
+            writer.write(&street.into(), None).expect("street");
+        }
+        // The better match lies far away, the worse beside the caller.
+        let mut prince =
+            address_record("osm:node:1", "", "342", "Prince Albert Street", None, None);
+        prince.geometry = point_geometry(-60.0, 45.0);
+        writer.write(&prince.into(), None).expect("prince");
+        let mut albert = address_record("osm:node:2", "", "342", "Albert Street", None, None);
+        albert.geometry = point_geometry(-120.0, 45.0);
+        writer.write(&albert.into(), None).expect("albert");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            search_near(&searcher, "Mill Road", 1, Some([-60.001, 45.0]), None),
+            ["osm:way:40"],
+            "the nearest of the tied makes the window and ranks first"
+        );
+        assert_eq!(
+            search_near(&searcher, "Mill Road", 2, Some([-98.999, 45.0]), None),
+            ["osm:way:1", "osm:way:2"]
+        );
+        assert_eq!(
+            search_near(&searcher, "342 Albert Street", 2, Some([-60.0, 45.0]), None)[0],
+            "osm:node:2",
+            "a focus never outranks a better match"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn of_equal_scores_the_window_keeps_the_closest_name_then_the_larger_place() {
+        use crate::record::{PlaceLayer, PlaceRecord, Record};
+
+        let temp_dir = temp_pack_path("search-window-ties");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // More roads of the name than the rank window holds, written first,
+        // so a window that kept any of the tie would keep only roads.
+        for index in 1..=60 {
+            writer
+                .write(
+                    &street_record(&format!("osm:way:{index}"), "Richmond Road").into(),
+                    None,
+                )
+                .expect("road");
+        }
+        for (object_id, place_type) in [(101, "hamlet"), (102, "town")] {
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: "Richmond".to_string(),
+                            place_type: place_type.to_string(),
+                            geometry: point_geometry(-79.0, 43.0),
+                            source: SourceProvenance::osm(ObjectType::Node, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("place");
+        }
+        // A street known by a second name repeats a word of it, which must
+        // not score it over the street the query names.
+        let mut upper = street_record("osm:way:201", "Upper Queen Street");
+        upper.alt_names = vec!["Belgium Street".to_string()];
+        writer.write(&upper.into(), None).expect("upper");
+        writer
+            .write(&street_record("osm:way:202", "Queen Street").into(), None)
+            .expect("queen");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            top_ids(&searcher, "Richmond")[..2],
+            ["osm:node:102", "osm:node:101"],
+            "the town, then the hamlet, before any road"
+        );
+        assert_eq!(top_ids(&searcher, "Queen Street")[0], "osm:way:202");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_known_area_word_places_the_record_in_every_reading() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("search-loose-areas");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut locality = |name: &str, object_id: i64| {
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: name.to_string(),
+                            place_type: "city".to_string(),
+                            geometry: point_geometry(-79.0, 43.0),
+                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("locality")
+        };
+        let auckland = locality("Auckland", 100);
+        let christchurch = locality("Christchurch", 101);
+        writer.set_context_names(
+            [
+                (auckland, vec!["Auckland".to_string()]),
+                (christchurch, vec!["Christchurch".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let within = |locality| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, locality)]),
+                flags: 0,
+            })
+        };
+        let in_auckland = within(auckland);
+        // So the Pack knows Christchurch as where a record is.
+        writer
+            .write(
+                &street_record("osm:way:3", "Riccarton Road").into(),
+                within(christchurch),
+            )
+            .expect("riccarton road");
+        writer
+            .write(
+                &street_record("osm:way:1", "Ponsonby Road").into(),
+                in_auckland.clone(),
+            )
+            .expect("ponsonby road");
+        writer
+            .write(
+                &street_record("osm:way:2", "Christchurch Road").into(),
+                in_auckland,
+            )
+            .expect("christchurch road");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        let search = |reading: &str, placed: &[&str]| {
+            let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], |word| {
+                searcher.describes_street(word)
+            })
+            .expect("plan");
+            let placed = placed.iter().map(|word| word.to_string()).collect();
+            let query = reading
+                .split_whitespace()
+                .filter_map(|pair| pair.split_once('/'))
+                .map(|(word, _)| word)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (hits, _) = searcher
+                .search_plan(
+                    &plan,
+                    &placed,
+                    Pass::Strict,
+                    Edits::None,
+                    &QueryWords::new(&query),
+                    Filters::default(),
+                    None,
+                    5,
+                    &mut |_, _, _| Ok(true),
+                )
+                .expect("search");
+            hits.into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+
+        // A region only ranks, so alone it places nothing; the best reading
+        // read the word as a locality, and that holds.
+        let as_region = "ponsonby/street road/street christchurch/region";
+        assert_eq!(search(as_region, &[]), ["osm:way:1"]);
+        assert!(search(as_region, &["christchurch"]).is_empty());
+        // A word no label placed is where the record is too, once the Pack
+        // knows it as an area's.
+        assert!(search("ponsonby/street road/street christchurch/other", &[]).is_empty());
+        // Unless it is a word of the record itself.
+        assert_eq!(
+            search("christchurch/street road/street", &["christchurch"])[0],
+            "osm:way:2"
+        );
+        assert_eq!(search("christchurch/other road/other", &[])[0], "osm:way:2");
+        // A word that only describes a street names no road of its own.
+        assert!(search("ponsonby/other road/other christchurch/locality", &[]).is_empty());
+        // A query the parser placed nothing in may leave a word unmatched,
+        // even one the best reading took for a locality.
+        assert_eq!(
+            search(
+                "ponsonby/other road/other christchurch/other",
+                &["christchurch"]
+            )[0],
+            "osm:way:1"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_bounding_box_keeps_only_the_records_inside_it() {
+        let temp_dir = temp_pack_path("search-bbox");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // One street group whose addresses run across the box's east edge,
+        // and the same street name far away.
+        for number in 1..=6 {
+            let mut address = address_record(
+                &format!("osm:node:{number}"),
+                "",
+                &number.to_string(),
+                "Mill Road",
+                None,
+                None,
+            );
+            address.geometry = point_geometry(-79.0 + f64::from(number) * 0.001, 43.0);
+            writer.write(&address.into(), None).expect("address");
+        }
+        let mut far = address_record("osm:node:9", "", "2", "Mill Road", None, None);
+        far.geometry = point_geometry(10.0, 50.0);
+        writer.write(&far.into(), None).expect("far");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let bbox = BoundingBox {
+            min_lon: -79.0,
+            min_lat: 42.9,
+            max_lon: -78.9965,
+            max_lat: 43.1,
+        };
+
+        assert_eq!(
+            search_near(&searcher, "2 Mill Road", 5, None, None).len(),
+            2,
+            "unboxed, both houses 2 answer"
+        );
+        assert_eq!(
+            search_near(&searcher, "2 Mill Road", 5, None, Some(bbox)),
+            ["osm:node:2"]
+        );
+        assert!(
+            !search_near(&searcher, "5 Mill Road", 5, None, Some(bbox))
+                .contains(&"osm:node:5".to_string()),
+            "house 5 lies past the east edge, though its group's extent meets the box"
+        );
+        let suggestions = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "2 Mill".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: Some(bbox),
+            })
+            .expect("autocomplete");
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["osm:node:2"]
+        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -2205,6 +4752,7 @@ mod tests {
                 .write(
                     &PostcodeRecord {
                         postcode: postcode.to_string(),
+                        country: None,
                         geometry: point_geometry(lon + 0.001, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(5),
                     }
@@ -2248,6 +4796,7 @@ mod tests {
                 .write(
                     &PostcodeRecord {
                         postcode: postcode.to_string(),
+                        country: None,
                         geometry: point_geometry(lon, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(5),
                     }
@@ -2317,6 +4866,7 @@ mod tests {
             .write(
                 &PostcodeRecord {
                     postcode: "K0J 1K0".to_string(),
+                    country: None,
                     geometry: point_geometry(-76.881, 45.631),
                     source: DerivedSourceProvenance::osm_address_records(5),
                 }
@@ -2359,6 +4909,7 @@ mod tests {
                 .write(
                     &PostcodeRecord {
                         postcode: code,
+                        country: None,
                         geometry: point_geometry(lon, 43.0),
                         source: DerivedSourceProvenance::osm_address_records(1),
                     }
@@ -2420,6 +4971,15 @@ mod tests {
         };
         let hamilton = locality("Hamilton", 100);
         let toronto = locality("Toronto", 101);
+        // As a build names them, so the Pack knows the localities' words.
+        writer.set_context_names(
+            [
+                (hamilton, vec!["Hamilton".to_string()]),
+                (toronto, vec!["Toronto".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
         let in_locality = |record_id| {
             Some(RecordContext {
                 admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, record_id)]),
@@ -2491,6 +5051,7 @@ mod tests {
             geometry: point_geometry(-79.5, 45.1),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
         };
         writer
             .write(
@@ -2528,6 +5089,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")[0]
                 .record
@@ -2540,6 +5103,191 @@ mod tests {
         assert_eq!(top("Walmer Road Parkette"), "osm:node:4");
         assert_eq!(top("Fire Station, Muskoka Lakes Township"), "osm:node:2");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The `ontario-poi` cases on a Pack of one street: a POI named after
+    /// the street, a shop at one of its addresses and a park off it.
+    #[test]
+    fn addresses_rank_above_pois_unless_a_poi_confirms_the_address() {
+        let temp_dir = temp_pack_path("search-addresses-beat-pois");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut street = street_record("osm:way:1", "Walmer Road");
+        street.geometry = queen_street_line();
+        writer.write(&street.into(), None).expect("street");
+        writer
+            .write(
+                &address_record("osm:node:4", "", "4", "Walmer Road", Some("Toronto"), None).into(),
+                None,
+            )
+            .expect("address");
+        let poi = |object_id, name: &str, number: Option<&str>, lon: f64| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "shop:convenience".to_string(),
+            address: number.map(|number| {
+                address_record(
+                    "osm:node:0",
+                    "",
+                    number,
+                    "Walmer Road",
+                    Some("Toronto"),
+                    None,
+                )
+                .address
+            }),
+            geometry: point_geometry(lon, 43.0005),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+        };
+        for record in [
+            poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
+            poi(11, "Corner Store", Some("4"), -79.0),
+            poi(12, "Walmer Road Bakery", None, -79.3),
+        ] {
+            writer.write(&record.into(), None).expect("poi");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let layers = |query: &str| {
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| (hit.record.id, hit.record.layer))
+                .collect::<Vec<_>>()
+        };
+        let first_poi = |hits: &[(String, String)]| {
+            hits.iter()
+                .position(|(_, layer)| layer == "poi")
+                .unwrap_or(hits.len())
+        };
+        let last_address = |hits: &[(String, String)]| {
+            hits.iter()
+                .rposition(|(_, layer)| layer != "poi")
+                .expect("an address or street")
+        };
+
+        // The query names a street the Pack has: every POI follows it.
+        let street = layers("Walmer Road");
+        assert!(last_address(&street) < first_poi(&street), "{street:?}");
+        // A house number: the shop at number 4 follows the address.
+        let numbered = layers("4 Walmer Road");
+        assert_eq!(numbered[0].0, "osm:node:4", "{numbered:?}");
+        assert!(
+            last_address(&numbered) < first_poi(&numbered),
+            "{numbered:?}"
+        );
+        // The shop's own name confirms the address it stands at.
+        let confirmed = layers("Corner Store 4 Walmer Road");
+        assert!(
+            confirmed.iter().take(2).any(|(id, _)| id == "osm:node:11"),
+            "{confirmed:?}"
+        );
+        // A number only a POI states is the POI.
+        assert_eq!(layers("6 Walmer Road")[0].0, "osm:node:10");
+        // Name-only POI queries rank as they did: the street lacks a word.
+        assert_eq!(layers("Walmer Road Bakery")[0].0, "osm:node:12");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Two cafes of one name the query cannot tell apart: the one its tags
+    /// show better known first, never ahead of an address it ties with.
+    #[test]
+    fn equal_pois_prefer_the_better_known() {
+        let temp_dir = temp_pack_path("search-poi-prominence");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let cafe = |object_id, prominence| PoiRecord {
+            alt_names: Vec::new(),
+            name: "Blue Door".to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(-79.0, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence,
+        };
+        for record in [
+            cafe(1, Prominence::default()),
+            cafe(
+                2,
+                Prominence {
+                    linked: false,
+                    languages: 3,
+                },
+            ),
+            cafe(
+                3,
+                Prominence {
+                    linked: true,
+                    languages: 1,
+                },
+            ),
+        ] {
+            writer.write(&record.into(), None).expect("cafe");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            top_ids(&searcher, "Blue Door"),
+            ["osm:node:3", "osm:node:2", "osm:node:1"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        // At a full tie a record of another layer stays ahead of a POI,
+        // however well known.
+        let first = TieBreak::new(
+            &street_summary(),
+            Prior {
+                place_rank: None,
+                prominence: None,
+                disputed: false,
+            },
+            &HashSet::new(),
+            &Ranking::default(),
+        );
+        let known = TieBreak::new(
+            &street_summary(),
+            Prior {
+                place_rank: None,
+                prominence: Some(Prominence {
+                    linked: true,
+                    languages: 40,
+                }),
+                disputed: false,
+            },
+            &HashSet::new(),
+            &Ranking::default(),
+        );
+        assert!(first < known);
+    }
+
+    fn street_summary() -> Summary {
+        Summary {
+            id: "osm:way:1".to_string(),
+            layer: "street".to_string(),
+            name: "Blue Door".to_string(),
+            label: "Blue Door".to_string(),
+            address: Address::default(),
+            category: None,
+            point: None,
+            source: Source {
+                dataset: "osm".to_string(),
+                object_type: Some(ObjectType::Way),
+                object_id: Some(1),
+                derived_from: None,
+                record_count: None,
+            },
+        }
     }
 
     #[test]
@@ -2562,6 +5310,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect_err("unparseable query");
         assert!(matches!(error, Error::UnparsableQuery { .. }));
@@ -2611,6 +5361,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
 
@@ -2654,6 +5406,8 @@ mod tests {
                 limit: 10,
                 layer: Some("street".to_string()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
 
@@ -2674,6 +5428,7 @@ mod tests {
             .write(
                 &PostcodeRecord {
                     postcode: "M5V".to_string(),
+                    country: None,
                     geometry: point_geometry(-79.4, 43.6),
                     source: DerivedSourceProvenance::osm_address_records(2),
                 }
@@ -2690,6 +5445,8 @@ mod tests {
                 limit: 5,
                 layer: Some("postcode".to_string()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
 
@@ -2743,6 +5500,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
 
@@ -2782,6 +5541,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
 
@@ -2823,6 +5584,8 @@ mod tests {
                 limit: 10,
                 layer: Some("street".to_string()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
 
@@ -2862,6 +5625,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("postcode autocomplete");
         let number_hits = searcher
@@ -2870,6 +5635,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("number autocomplete");
 
@@ -2909,6 +5676,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("number plus street autocomplete");
 
@@ -2949,6 +5718,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("blank autocomplete")
                 .is_empty()
@@ -2960,6 +5731,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("single character autocomplete")
                 .is_empty()
@@ -2971,6 +5744,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("two character autocomplete")
                 .is_empty()
@@ -2986,6 +5761,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search")
             .into_iter()
@@ -3028,6 +5805,111 @@ mod tests {
         assert_eq!(
             geocode(&searcher, "99 King Street", None, Some("M5V 1A1")),
             None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_long_word_with_its_second_and_third_letters_swapped_is_one_typo() {
+        let temp_dir = temp_pack_path("search-swapped-letters");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "53", "Michael Jones Drive", None, None).into(),
+                None,
+            )
+            .expect("address");
+        writer
+            .write(
+                &address_record("osm:node:2", "", "53", "Morgan Jones Drive", None, None).into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert!(Edits::One.reaches("mcihael", "michael"));
+        assert_eq!(
+            top_ids(&searcher, "53 Mcihael Jones Drive")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:1")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn an_abbreviated_street_type_ranks_the_street_of_that_type_first() {
+        let temp_dir = temp_pack_path("search-street-type-abbreviation");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, street) in [
+            ("osm:node:1", "Highfield Way"),
+            ("osm:node:2", "Highfield Terrace"),
+            ("osm:node:3", "Highfield Road"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", "46", street, None, None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // Libpostal's lists hold "tce", which the text index keeps as
+        // written.
+        assert_eq!(
+            top_ids(&searcher, "46 Highfield Tce")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:2")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn the_street_the_query_names_beats_one_with_more_words() {
+        let temp_dir = temp_pack_path("search-exact-street-name");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut flat = address_record("osm:node:1", "", "45", "Lomond Crescent", None, None);
+        flat.address.unit = Some("2".to_string());
+        let records = [
+            flat,
+            address_record("osm:node:2", "", "45", "Ben Lomond Crescent", None, None),
+            address_record("osm:node:3", "", "47", "Mill Road", None, None),
+            address_record(
+                "osm:node:4",
+                "",
+                "47",
+                "Millton Park Road",
+                Some("Mill Road"),
+                None,
+            ),
+        ];
+        for record in records {
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // A flat of the street named before the house of another street.
+        assert_eq!(
+            top_ids(&searcher, "45 Lomond Crescent")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:1")
+        );
+        // "mill" in the locality Mill Road stands in for less than in the
+        // street, though "road" names few areas and many streets.
+        assert_eq!(
+            top_ids(&searcher, "47 Mill Road")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:3")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -3091,6 +5973,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         assert_eq!(
@@ -3299,23 +6183,23 @@ mod tests {
 
         // The index knows no "A1A 9Z9", but the record near "A1A 1A1" shares
         // its first three characters. The record that states "B2B 2B2"
-        // contradicts the query outright and is left out: it is not an answer
-        // to it, however little else matches.
+        // contradicts the query outright and ranks last: a mismatch ranks
+        // down, never out.
         assert_eq!(
             top_ids(&searcher, "5 Main Street, A1A 9Z9"),
-            vec!["osm:node:2", "osm:node:3"]
+            vec!["osm:node:2", "osm:node:3", "osm:node:1"]
         );
         assert_eq!(
             top_ids(&searcher, "5 Main Street, Toronto ON B2B 2B2")[0],
             "osm:node:1",
             "the postcode starts at its first word with a digit"
         );
-        // A postcode nobody shares prefers no one: the closest labels first,
-        // and again without the record whose own postcode disagrees.
-        assert_eq!(
-            top_ids(&searcher, "5 Main Street, Z9Z 9Z9"),
-            vec!["osm:node:2", "osm:node:3"]
-        );
+        // A postcode nobody shares, which this Pack's parser does not read
+        // as one, prefers no one: what a label states beyond the name is
+        // where the record lies, and counts neither way.
+        let mut ids = top_ids(&searcher, "5 Main Street, Z9Z 9Z9");
+        ids.sort();
+        assert_eq!(ids, vec!["osm:node:1", "osm:node:2", "osm:node:3"]);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -3340,10 +6224,10 @@ mod tests {
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
-        let ids = top_ids(&searcher, "8 High Street, 7304");
-        assert!(
-            !ids.contains(&"osm:node:1".to_string()),
-            "the 7018 address answers no query for 7304: {ids:?}"
+        // The 7018 address still answers, after the street.
+        assert_eq!(
+            top_ids(&searcher, "8 High Street, 7304"),
+            vec!["osm:way:2", "osm:node:1"]
         );
         // A query that states no postcode still reaches it.
         assert!(top_ids(&searcher, "8 High Street").contains(&"osm:node:1".to_string()));
@@ -3402,6 +6286,11 @@ mod tests {
         let mut number = address_record("osm:node:4", "", "7", "Elm Street", None, None);
         number.geometry = point_geometry(-79.5, 43.6);
         writer.write(&number.into(), None).expect("number");
+        // So the Pack knows Atlantis, and does not drop it from the query.
+        let mut atlantis =
+            address_record("osm:node:5", "", "1", "Ocean Drive", Some("Atlantis"), None);
+        atlantis.geometry = point_geometry(-60.0, 30.0);
+        writer.write(&atlantis.into(), None).expect("atlantis");
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
@@ -3469,6 +6358,8 @@ mod tests {
                     limit: 5,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .into_iter()
@@ -3550,6 +6441,7 @@ mod tests {
                     geometry: point_geometry(-79.41, 43.68),
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 1),
+                    prominence: Default::default(),
                 }
                 .into(),
                 None,
@@ -3588,8 +6480,64 @@ mod tests {
     }
 
     #[test]
+    fn a_unit_is_read_from_a_letter_or_a_word_glued_to_the_number() {
+        let unit = |text: &str| {
+            QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false)
+                .expect("plan")
+                .unit
+        };
+        assert_eq!(
+            unit("g/unit 9/house_number gore/street street/street").as_deref(),
+            Some("g")
+        );
+        assert_eq!(
+            unit("flat/unit b/unit 9/house_number gore/street street/street").as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            unit("g11/other 40/house_number rosedale/street road/street").as_deref(),
+            Some("g11")
+        );
+        assert_eq!(
+            unit("unit/unit 9/house_number gore/street street/street"),
+            None
+        );
+        assert_eq!(
+            unit("acme/other 40/house_number rosedale/street road/street"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reading_whose_postcode_nothing_confirms_yields_to_one_confirmed() {
+        let mut searched = Vec::new();
+        let mut search = |confirms: bool| {
+            searched.clear();
+            choose_reading(&[2.0, 1.0], |reading, pass| {
+                searched.push((reading, pass));
+                Ok(Some((reading, reading == 1 || confirms)))
+            })
+            .expect("chosen")
+            .map(|(reading, _)| reading)
+        };
+        // "3010" read as a postcode no hit is known to be in, then as the
+        // house number: the house wins.
+        assert_eq!(search(false), Some(1));
+        // A confirmed postcode ends the search at the first reading.
+        assert_eq!(search(true), Some(0));
+        assert_eq!(searched, [(0, Pass::Strict)]);
+    }
+
+    #[test]
     fn plans_numbers_units_streets_and_places_from_labelled_tokens() {
-        let plan = |text: &str| QueryPlan::from_tagged(&tagged(text), &[]).expect("plan");
+        let plan =
+            |text: &str| QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false).expect("plan");
+        let subject = |plan: &QueryPlan| {
+            plan.subject
+                .iter()
+                .map(|word| word.text.clone())
+                .collect::<Vec<_>>()
+        };
         let words = |words: &[&str]| {
             words
                 .iter()
@@ -3599,21 +6547,30 @@ mod tests {
         let part = |label: Label, words: &[&str]| ContextPart {
             label,
             words: words.iter().map(|word| word.to_string()).collect(),
+            corrected: None,
         };
 
         let floor =
             plan("79/house_number wellington/street st/street w/street fl36/unit toronto/locality");
-        assert_eq!(floor.house_number.expect("number").text, "79");
-        assert_eq!(floor.required, words(&["wellington", "street", "west"]));
-        assert_eq!(floor.optional, words(&["fl36"]));
+        assert_eq!(floor.house_number.as_ref().expect("number").text, "79");
+        assert_eq!(subject(&floor), words(&["wellington", "street", "west"]));
+        assert_eq!(floor.unit.as_deref(), Some("fl36"));
+        assert!(floor.optional.is_empty());
         assert_eq!(floor.context, [part(Label::Locality, &["toronto"])]);
 
-        // Unit text only ranks, before or after the address.
+        // A named unit is the plan's flat, before or after the address, and
+        // scores nothing.
         let unit = plan(
             "unit/unit 602/unit 670/house_number king/street st/street w/street \
              toronto/locality on/region m5v/postcode 1m9/postcode",
         );
-        assert_eq!(unit.optional, words(&["unit", "602"]));
+        assert_eq!(unit.unit.as_deref(), Some("602"));
+        assert!(unit.optional.is_empty());
+        // So is a designator and flat the parser could not place.
+        let unplaced = plan("unit/other 2/other 1/house_number balfour/street street/street");
+        assert_eq!(unplaced.unit.as_deref(), Some("2"));
+        assert!(unplaced.unplaced.is_empty());
+        assert_eq!(subject(&unplaced), words(&["balfour", "street"]));
         assert_eq!(
             unit.context,
             [
@@ -3638,21 +6595,21 @@ mod tests {
         // A street type that leads the name keeps the number after it, and
         // an initial "st" is Saint.
         assert_eq!(
-            plan("1000/house_number highway/street 7/street").required,
+            subject(&plan("1000/house_number highway/street 7/street")),
             words(&["highway", "7"])
         );
         assert_eq!(
-            plan("st/street clair/street ave/street w/street").required,
+            subject(&plan("st/street clair/street ave/street w/street")),
             words(&["st", "clair", "avenue", "west"])
         );
         assert_eq!(
-            plan("15/house_number the/street donway/street e/street").required,
+            subject(&plan("15/house_number the/street donway/street e/street")),
             words(&["the", "donway", "east"])
         );
         // A street named first, its number after it.
         let german = plan("maximilianstr/street 5/house_number münchen/locality");
-        assert_eq!(german.house_number.expect("number").text, "5");
-        assert_eq!(german.required, words(&["maximilianstr"]));
+        assert_eq!(german.house_number.as_ref().expect("number").text, "5");
+        assert_eq!(subject(&german), words(&["maximilianstr"]));
 
         for (text, number, base) in [
             (
@@ -3689,17 +6646,19 @@ mod tests {
         // field joins after the parsed parts.
         let places = QueryPlan::from_tagged(
             &tagged("seaforth/locality huron/locality east/locality"),
+            &[],
             &[part(Label::Region, &["ontario"])],
+            |_| false,
         )
         .expect("plan");
-        assert_eq!(places.required, words(&["seaforth", "huron", "east"]));
+        assert_eq!(subject(&places), words(&["seaforth", "huron", "east"]));
         assert_eq!(places.context, [part(Label::Region, &["ontario"])]);
         let number = plan("670/house_number");
         assert_eq!(
-            (number.house_number, number.required),
+            (number.house_number.clone(), subject(&number)),
             (None, words(&["670"]))
         );
-        assert!(QueryPlan::from_tagged(&[], &[]).is_none());
+        assert!(QueryPlan::from_tagged(&[], &[], &[], |_| false).is_none());
     }
 
     #[test]
@@ -3794,6 +6753,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
         assert_eq!(
@@ -3832,6 +6793,18 @@ mod tests {
                 None,
             )
             .expect("municipality");
+        writer.set_context_names(
+            [(huron_east, vec!["Huron East".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        // So the Pack knows Goderich, as a town of its own.
+        writer
+            .write(
+                &address_record("osm:node:3", "", "1", "The Square", Some("Goderich"), None).into(),
+                None,
+            )
+            .expect("goderich");
         writer
             .write(
                 &address_record(
@@ -3899,6 +6872,29 @@ mod tests {
         };
         let auckland = area(PlaceLayer::Locality, "Auckland", 1);
         let dickson = area(PlaceLayer::SubLocality, "Dickson", 2);
+        writer.set_context_names(
+            [
+                (auckland, vec!["Auckland".to_string()]),
+                (dickson, vec!["Dickson".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // So the Pack knows Ponsonby, the suburb next to Grey Lynn.
+        writer
+            .write(
+                &address_record(
+                    "osm:node:5",
+                    "",
+                    "1",
+                    "Jervois Road",
+                    Some("Ponsonby"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("ponsonby");
         // Grey Lynn is a point in OSM: no boundary holds the address, but
         // the address states it.
         let mut grey_lynn = address_record("osm:node:3", "", "123", "Crummer Road", None, None);
@@ -3966,6 +6962,8 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(1);
         AddressRecord {
+            disputed: false,
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: number.to_string(),
@@ -3995,6 +6993,7 @@ mod tests {
             .unwrap_or(9);
         StreetRecord {
             alt_names: Vec::new(),
+            locality: None,
             name: label.to_string(),
             geometry: point_geometry(-79.0, 43.0),
             representative_point: [-79.0, 43.0],

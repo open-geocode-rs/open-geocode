@@ -43,6 +43,10 @@ fst = "0.4"
 flate2 = "1.1"
 geo = "0.33"
 geojson = "1.0"
+# NFC and NFKC of search keys, and the General_Category that tells a mark,
+# already in the tree through ureq's url.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_properties = "2.3"
 indicatif = "0.17"
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"
@@ -68,6 +72,9 @@ signal-hook = { version = "0.3", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
 stable_deref_trait = "1.2"
 tantivy = "0.25.0"
+# The automaton trait Tantivy's term dictionaries walk, to find the terms a
+# query word may be a typo of. Tantivy's own fuzzy query has no prefix length.
+tantivy-fst = "0.5"
 thiserror = "2"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }

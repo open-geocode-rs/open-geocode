@@ -19,6 +19,7 @@ use tower::ServiceExt;
 
 use crate::{
     batch,
+    confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
     pack::{RecordId, Writer},
     record::{
@@ -250,6 +251,8 @@ async fn responses_match_the_committed_examples() {
         })
     );
     assert!(properties["score"].is_number());
+    let confidence = properties["confidence"].as_f64().expect("a confidence");
+    assert!((0.0..=1.0).contains(&confidence), "{confidence}");
     assert!(properties.get("distance_m").is_none());
 
     let poi = get(&router, "/search?q=Queen%20Bakery").await;
@@ -274,6 +277,22 @@ async fn responses_match_the_committed_examples() {
     ] {
         assert_example(name, &get(&router, uri).await);
     }
+    // A caller's location ranks ties and a box filters: the street the
+    // box holds answers, and one wholly outside it does not.
+    let near = get(
+        &router,
+        "/search?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
+    )
+    .await;
+    assert_example("search-near", &near);
+    assert!(!near["features"].as_array().expect("features").is_empty());
+    let far = get(&router, "/search?q=King%20Street&bbox=10,10,11,11").await;
+    assert_eq!(far["features"], json!([]));
+    let (status, crossed) = get_error(&router, "/search?q=king&bbox=170,-10,-170,10").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(crossed["error_code"], "invalid_coordinate");
+    assert_eq!(crossed["invalid_params"][0]["name"], "bbox");
+
     let suggestions = get(&router, "/autocomplete?q=Quee").await;
     assert_example("autocomplete", &suggestions);
     assert!(
@@ -506,6 +525,8 @@ fn write_pack(dir: &PathBuf) -> Ids {
     let address = writer
         .write(
             &AddressRecord {
+                disputed: false,
+                street_postcodes: Vec::new(),
                 address: king.clone(),
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Point,
@@ -528,6 +549,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 geometry: point_geometry(-79.005, 43.0),
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 11),
+                prominence: Default::default(),
             }
             .into(),
             context.clone(),
@@ -537,6 +559,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
         .write(
             &StreetRecord {
                 alt_names: Vec::new(),
+                locality: None,
                 name: "King Street".to_string(),
                 geometry: line(-79.0, 43.0, -79.0, 43.001),
                 representative_point: [-79.0, 43.0005],
@@ -573,8 +596,21 @@ fn write_pack(dir: &PathBuf) -> Ids {
         )
         .expect("interpolation");
     writer.finish().expect("finish");
+    // Calibrated, so the examples show what a calibrated Pack answers. The
+    // weights are made up: the fit has its own tests.
+    let pack = crate::pack::Reader::open(dir).expect("pack");
+    Model::new(CONTRACT_WEIGHTS, Default::default())
+        .save(&pack)
+        .expect("confidence model");
     Ids { address }
 }
+
+/// A plausible model: an answer is likelier right on a strict pass, with
+/// its number, in its postcode and well clear of the next.
+const CONTRACT_WEIGHTS: [f64; FEATURES] = [
+    1.5, -1.0, -1.5, -0.8, -1.5, -1.0, -0.7, -2.0, -1.5, 0.8, -2.5, -0.2, 0.5, -2.0, -0.3, 1.0,
+    -1.5, 0.3, -0.3, -1.0, -0.6, 1.2, -1.5,
+];
 
 fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
     Geometry::new(GeometryValue::LineString {

@@ -8,7 +8,7 @@
 //! limits for the non-commercial public demo.
 
 use crate::http::problem::{InvalidParam, Problem};
-use crate::search::MAX_AUTOCOMPLETE_LIMIT;
+use crate::search::{BoundingBox, MAX_AUTOCOMPLETE_LIMIT};
 
 /// Maximum length (in Unicode scalar values) of a `q` query string.
 pub(crate) const MAX_QUERY_CHARS: usize = 256;
@@ -81,9 +81,120 @@ pub(crate) fn validate_coords(lon: f64, lat: f64) -> Result<(), Problem> {
     }
 }
 
+/// The degrees of a comma-separated list of `count` numbers, as `focus`
+/// and `bbox` write them. Empty or whitespace means none was given.
+fn degrees(name: &str, value: Option<&str>, count: usize) -> Result<Option<Vec<f64>>, Problem> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let numbers = value
+        .split(',')
+        .map(|part| part.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .filter(|numbers| numbers.len() == count);
+    let Some(numbers) = numbers else {
+        let shape = if count == 2 {
+            "lon,lat"
+        } else {
+            "min_lon,min_lat,max_lon,max_lat"
+        };
+        return Err(Problem::malformed_parameter(format!(
+            "{name} must be {count} comma-separated numbers, {shape}"
+        ))
+        .with_invalid_params(vec![InvalidParam::new(name, format!("not {shape}"))]));
+    };
+    let mut invalid = Vec::new();
+    for pair in numbers.chunks(2) {
+        if !(-180.0..=180.0).contains(&pair[0]) {
+            invalid.push(InvalidParam::new(
+                name,
+                "longitudes must be within [-180, 180]",
+            ));
+        }
+        if !(-90.0..=90.0).contains(&pair[1]) {
+            invalid.push(InvalidParam::new(
+                name,
+                "latitudes must be within [-90, 90]",
+            ));
+        }
+    }
+    if invalid.is_empty() {
+        Ok(Some(numbers))
+    } else {
+        invalid.dedup_by(|left, right| left.reason == right.reason);
+        Err(Problem::invalid_coordinate(invalid))
+    }
+}
+
+/// Validate `focus`, the caller's `lon,lat`, like a reverse point.
+pub(crate) fn parse_focus(value: Option<&str>) -> Result<Option<[f64; 2]>, Problem> {
+    Ok(degrees("focus", value, 2)?.map(|numbers| [numbers[0], numbers[1]]))
+}
+
+/// Validate `bbox`, `min_lon,min_lat,max_lon,max_lat`: each corner a valid
+/// point, west of east and south of north. A box across the antimeridian is
+/// two requests, as its west edge would lie east of its east edge.
+pub(crate) fn parse_bbox(value: Option<&str>) -> Result<Option<BoundingBox>, Problem> {
+    let Some(numbers) = degrees("bbox", value, 4)? else {
+        return Ok(None);
+    };
+    let bbox = BoundingBox {
+        min_lon: numbers[0],
+        min_lat: numbers[1],
+        max_lon: numbers[2],
+        max_lat: numbers[3],
+    };
+    let mut invalid = Vec::new();
+    if bbox.min_lon > bbox.max_lon {
+        invalid.push(InvalidParam::new("bbox", "min_lon must not exceed max_lon"));
+    }
+    if bbox.min_lat > bbox.max_lat {
+        invalid.push(InvalidParam::new("bbox", "min_lat must not exceed max_lat"));
+    }
+    if invalid.is_empty() {
+        Ok(Some(bbox))
+    } else {
+        Err(Problem::invalid_coordinate(invalid))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_and_bbox_are_points_in_range() {
+        assert_eq!(parse_focus(None).unwrap(), None);
+        assert_eq!(parse_focus(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_focus(Some("-79.38, 43.65")).unwrap(),
+            Some([-79.38, 43.65])
+        );
+        let shape = parse_focus(Some("-79.38")).unwrap_err();
+        assert_eq!(shape.error_code().as_str(), "malformed_parameter");
+        assert_eq!(shape.invalid_params()[0].name, "focus");
+        assert!(parse_focus(Some("a,b")).is_err());
+        let range = parse_focus(Some("200,43")).unwrap_err();
+        assert_eq!(range.error_code().as_str(), "invalid_coordinate");
+        assert!(parse_focus(Some("NaN,43")).is_err());
+        assert!(parse_focus(Some("-79,inf")).is_err());
+
+        let bbox = parse_bbox(Some("-79.6,43.5,-79.1,43.9"))
+            .unwrap()
+            .expect("bbox");
+        assert!(bbox.contains(-79.38, 43.65));
+        assert!(!bbox.contains(-80.0, 43.65));
+        assert_eq!(parse_bbox(Some("")).unwrap(), None);
+        assert!(parse_bbox(Some("-79.6,43.5,-79.1")).is_err());
+        let crossed = parse_bbox(Some("170,-10,-170,10")).unwrap_err();
+        assert_eq!(crossed.error_code().as_str(), "invalid_coordinate");
+        assert_eq!(
+            crossed.invalid_params()[0].reason,
+            "min_lon must not exceed max_lon"
+        );
+        assert!(parse_bbox(Some("-79,95,-78,96")).is_err());
+    }
 
     #[test]
     fn rejects_empty_and_over_length_queries() {

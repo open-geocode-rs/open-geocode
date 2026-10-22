@@ -13,7 +13,7 @@ use crate::record::{
 use super::{
     address::address_components,
     emitted::Emitted,
-    tags::{OsmTags, alternate_names, name_tags},
+    tags::{OsmTags, alternate_names, name_tags, prominence},
 };
 
 /// Keys that make a named object a POI, in category order: an object tagged
@@ -77,13 +77,14 @@ pub(crate) fn is_poi(tags: &BTreeMap<String, String>) -> bool {
     poi_name(tags).is_some() && poi_category(tags).is_some()
 }
 
-/// The tags a POI keeps: its names, its category tags and, when they state a
-/// valid address, its `addr:*` tags.
+/// The tags a POI keeps: its names, its category tags, its Wikidata and
+/// Wikipedia links and, when they state a valid address, its `addr:*` tags.
 pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
-    ["information"]
+    // The links are kept for the POI's prominence.
+    ["information", "wikidata", "wikipedia"]
         .into_iter()
         .chain(POI_KEYS)
         .filter_map(|key| Some((key.to_string(), tags.get(key)?.clone())))
@@ -111,11 +112,9 @@ pub(crate) fn emit_poi(candidate: PoiCandidate, out: &mut Emitted) {
         geometry: point_geometry(candidate.lon, candidate.lat),
         location_precision: candidate.location_precision,
         source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
+        prominence: prominence(tags),
     };
     out.report.accept_poi(&record);
-    if let Some(address) = &record.address {
-        out.postcodes.accept(address, &record.geometry);
-    }
     out.records.push(Record::Poi(record));
 }
 
@@ -279,13 +278,33 @@ mod tests {
         assert_eq!(out.report.accepted.by_layer.get("poi"), Some(&1));
         assert_eq!(out.report.accepted.by_layer.get("address"), None);
         assert_eq!(out.report.accepted.pois_with_address, 1);
-        assert_eq!(out.postcodes.len(), 1, "its postcode still counts");
 
         let plain = emit(&[("name", "Riverdale Farm"), ("tourism", "attraction")]);
         let [Record::Poi(record)] = plain.records.as_slice() else {
             panic!("one POI record");
         };
         assert_eq!(record.address, None);
-        assert_eq!(plain.postcodes.len(), 0);
+        assert_eq!(record.prominence, crate::record::Prominence::default());
+    }
+
+    #[test]
+    fn keeps_what_shows_how_widely_a_poi_is_known() {
+        let known = emit(&[
+            ("name", "Royal Ontario Museum"),
+            ("name:fr", "Musee royal de l'Ontario"),
+            ("name:zh", "皇家安大略博物馆"),
+            ("tourism", "museum"),
+            ("wikidata", "Q1347123"),
+        ]);
+        let [Record::Poi(record)] = known.records.as_slice() else {
+            panic!("one POI record");
+        };
+        assert_eq!(
+            record.prominence,
+            crate::record::Prominence {
+                linked: true,
+                languages: 2,
+            }
+        );
     }
 }

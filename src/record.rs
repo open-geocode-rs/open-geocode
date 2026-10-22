@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use geojson::{Geometry, GeometryValue};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
-use crate::{labels, util::geo::point_lon_lat};
+use crate::{labels, parse::lattice::CountryCode, util::geo::point_lon_lat};
 
 /// One normalized geocoding record, as the builder emits it and the Pack
 /// stores it.
@@ -20,9 +20,16 @@ pub enum Record {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressRecord {
     pub address: AddressComponents,
+    /// For an address that states no postcode, the postcodes the other
+    /// addresses of its street state: the evidence of where it is. Empty when
+    /// it states one, or its street's addresses state none.
+    pub street_postcodes: Vec<String>,
     pub geometry: Geometry,
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
+    /// Whether another source places the same house farther from this point
+    /// than sources placing one house ever disagree: the point may be wrong.
+    pub disputed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +48,9 @@ pub struct StreetRecord {
     pub name: String,
     /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
+    /// The town or city it lies in, which its label names: one name is
+    /// many streets across a country.
+    pub locality: Option<String>,
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
@@ -49,6 +59,9 @@ pub struct StreetRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostcodeRecord {
     pub postcode: String,
+    /// The country its addresses lie in. A code names a postcode only within
+    /// one country: AU and NZ both have a "2110".
+    pub country: Option<CountryCode>,
     pub geometry: Geometry,
     pub source: DerivedSourceProvenance,
 }
@@ -66,6 +79,42 @@ pub struct PoiRecord {
     pub geometry: Geometry,
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
+    pub prominence: Prominence,
+}
+
+/// How widely a POI is known, read from its own OSM tags alone: whether
+/// mappers linked it to Wikidata or Wikipedia, and in how many languages
+/// they named it. A museum of a city is linked and named in a dozen
+/// languages; a corner shop of the same name in neither. It breaks ties
+/// between POIs only (see the search's tie-break), never against another
+/// layer, and needs no data beyond the extract.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct Prominence {
+    /// It carries `wikidata=` or `wikipedia=`.
+    pub linked: bool,
+    /// The languages of its `name:<lang>` tags, `ja`, `ja-Hira` and `ja_rm`
+    /// counted once, up to [`Prominence::MAX_LANGUAGES`].
+    pub languages: u8,
+}
+
+impl Prominence {
+    /// Languages counted at most: the Pack stores the count in seven bits,
+    /// and past a few dozen a name is everywhere already.
+    pub const MAX_LANGUAGES: u8 = 127;
+
+    /// One byte: the languages, then whether it is linked.
+    pub fn to_byte(self) -> u8 {
+        self.languages.min(Self::MAX_LANGUAGES) << 1 | u8::from(self.linked)
+    }
+
+    pub const fn from_byte(byte: u8) -> Self {
+        Self {
+            linked: byte & 1 != 0,
+            languages: byte >> 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -576,7 +625,7 @@ impl AddressRecord {
 
 impl Serialize for AddressRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("AddressRecord", 7)?;
+        let mut state = serializer.serialize_struct("AddressRecord", 8)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
@@ -584,6 +633,11 @@ impl Serialize for AddressRecord {
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("location_precision", &self.location_precision)?;
         state.serialize_field("source", &self.source)?;
+        if self.disputed {
+            state.serialize_field("disputed", &true)?;
+        } else {
+            state.skip_field("disputed")?;
+        }
         state.end()
     }
 }
@@ -635,17 +689,20 @@ impl StreetRecord {
     }
 
     pub fn label(&self) -> String {
-        self.name.clone()
+        labels::street_label(&self.name, self.locality.as_deref())
     }
 }
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 7)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 8)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
         serialize_alt_names(&mut state, &self.alt_names)?;
+        if let Some(locality) = &self.locality {
+            state.serialize_field("locality", locality)?;
+        }
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
         state.serialize_field("source", &self.source)?;
@@ -655,7 +712,7 @@ impl Serialize for StreetRecord {
 
 impl PostcodeRecord {
     pub fn id(&self) -> String {
-        labels::derived_postcode_id(&self.postcode)
+        labels::derived_postcode_id(self.country, &self.postcode)
     }
 
     pub fn name(&self) -> String {
@@ -669,11 +726,12 @@ impl PostcodeRecord {
 
 impl Serialize for PostcodeRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PostcodeRecord", 6)?;
+        let mut state = serializer.serialize_struct("PostcodeRecord", 7)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
         state.serialize_field("postcode", &self.postcode)?;
+        state.serialize_field("country", &self.country.as_ref().map(CountryCode::as_str))?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("source", &self.source)?;
         state.end()
@@ -692,6 +750,39 @@ impl PlaceRecord {
     pub fn label(&self) -> String {
         self.name.clone()
     }
+}
+
+/// How large a place of `place_type` is, smaller being larger: twice an
+/// `admin_level`, and each `place=` value at the rank of the admin unit it
+/// usually stands beside, as Nominatim's search ranks place them. One scale
+/// for every country, read from what mappers tagged. None for an area of
+/// unknown kind.
+pub fn place_rank(place_type: &str) -> Option<u8> {
+    if let Some(level) = place_type.strip_prefix("admin_level:") {
+        return level
+            .parse::<u8>()
+            .ok()
+            .map(|level| level.saturating_mul(2));
+    }
+    if place_type.starts_with("derived_country:") {
+        return Some(4);
+    }
+    Some(match place_type.to_ascii_lowercase().as_str() {
+        "country" => 4,
+        "state" | "province" | "region" => 8,
+        "county" | "district" => 12,
+        "municipality" => 14,
+        "city" => 16,
+        "island" => 17,
+        "town" | "borough" => 18,
+        "village" | "suburb" => 19,
+        "hamlet" | "quarter" | "islet" => 20,
+        "isolated_dwelling" => 22,
+        "farm" => 23,
+        "neighbourhood" => 24,
+        "locality" => 25,
+        _ => return None,
+    })
 }
 
 impl Serialize for PlaceRecord {
@@ -724,7 +815,7 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 9)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 10)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -738,6 +829,11 @@ impl Serialize for PoiRecord {
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("location_precision", &self.location_precision)?;
         state.serialize_field("source", &self.source)?;
+        if self.prominence == Prominence::default() {
+            state.skip_field("prominence")?;
+        } else {
+            state.serialize_field("prominence", &self.prominence)?;
+        }
         state.end()
     }
 }

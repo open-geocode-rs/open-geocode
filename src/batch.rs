@@ -53,6 +53,9 @@ pub struct GeocodeOptions {
     pub region_field: Option<Column>,
     pub postcode_field: Option<Column>,
     pub layer: Option<String>,
+    /// Answer only from these countries, by ISO 3166-1 alpha-2 code; empty
+    /// means every country the Pack covers.
+    pub countries: Vec<String>,
     pub limit: usize,
     pub lat_column: String,
     pub lon_column: String,
@@ -74,6 +77,7 @@ impl fmt::Debug for GeocodeOptions {
             .field("header_row", &self.header_row)
             .field("address_field_groups", &self.address_field_groups)
             .field("layer", &self.layer)
+            .field("countries", &self.countries)
             .field("limit", &self.limit)
             .finish_non_exhaustive()
     }
@@ -92,6 +96,7 @@ impl Default for GeocodeOptions {
             region_field: None,
             postcode_field: None,
             layer: None,
+            countries: Vec::new(),
             limit: 10,
             lat_column: "lat".to_string(),
             lon_column: "lon".to_string(),
@@ -266,6 +271,16 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
         ));
     }
     ensure_distinct_paths(&options.input, &options.output, options.audit.as_deref())?;
+    // A typo that matched no country would read as rows no Pack answers.
+    if let Some(code) = options
+        .countries
+        .iter()
+        .find(|code| code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_alphabetic()))
+    {
+        return Err(Error::BadOptions(
+            format!("country {code:?} is not an ISO 3166-1 alpha-2 code, such as CA or NZ").into(),
+        ));
+    }
 
     let delimiter = detect_delimiter(&options.input)?;
     let mut reader = open_delimited(&options.input, delimiter)?;
@@ -604,7 +619,7 @@ fn geocode_row(
             postcode: postcode.clone(),
             limit: options.limit,
             layer: options.layer.clone(),
-            countries: Vec::new(),
+            countries: options.countries.clone(),
         })?;
         tried_queries.push(address);
         if let Some(response) = response {
@@ -1006,6 +1021,8 @@ mod tests {
             writer
                 .write(
                     &AddressRecord {
+                        disputed: false,
+                        street_postcodes: Vec::new(),
                         address: AddressComponents {
                             areas: Vec::new(),
                             number: number.into(),
@@ -1064,7 +1081,12 @@ mod tests {
         );
         let audit = read_csv(&root.join("audit.csv")).expect("audit");
         assert_eq!(audit.rows[1][2], "unresolved");
-        assert_eq!(audit.rows[2][6], "osm:node:1");
+        let id = audit
+            .headers
+            .iter()
+            .position(|header| header == "geocode_id")
+            .expect("id column");
+        assert_eq!(audit.rows[2][id], "osm:node:1");
 
         // A file without a header row, watched row by row, with no audit.
         struct Rows(std::sync::Mutex<Vec<(usize, Option<String>)>>);

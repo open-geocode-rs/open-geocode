@@ -1,10 +1,10 @@
 //! Turning source rows and baseline output into fixture rows.
 //!
 //! Sources tokenize addresses their own way, so both directions go through
-//! [`normalize_tokens`], og's index normalization. A source token is normalized on its own and
-//! every word it yields keeps its label; since normalization maps each
-//! character on its own and never joins across whitespace, that is the same
-//! as normalizing the whole address and carrying labels by character span. A
+//! [`search_key`], the key og matches text by. A source token is normalized on its own and
+//! every word it yields keeps its label; since the key never joins across
+//! whitespace, that is the same as normalizing the whole address and carrying
+//! labels by character span. A
 //! baseline's output is aligned back to the gold tokens character by
 //! character, so a parser that splits, joins or drops punctuation differently
 //! is still scored on og's tokens.
@@ -12,10 +12,13 @@
 use anyhow::{Context, Result, bail, ensure};
 
 use super::{
-    fixture::{TaggedRow, normalize_tokens},
+    fixture::TaggedRow,
     mapping::{Mapped, Scheme},
 };
-use crate::parse::types::{Label, Tagged};
+use crate::{
+    parse::types::{Label, Tagged},
+    util::fold::search_key,
+};
 
 /// A raw `lang<TAB>country<TAB>token/label ...` row in a source's own labels,
 /// as a fixture row. `None` when no token survives normalization.
@@ -50,10 +53,7 @@ pub fn normalize_raw_line(line: &str, scheme: Scheme) -> Result<Option<TaggedRow
                 continue;
             }
         };
-        for word in normalize_tokens(token)
-            .iter()
-            .flat_map(|text| text.split(' '))
-        {
+        for word in search_key(token).iter().flat_map(|text| text.split(' ')) {
             if part_ended {
                 row.breaks.push(row.tokens.len());
                 part_ended = false;
@@ -86,7 +86,7 @@ pub fn align_components(
             Mapped::Label(label) => label,
             Mapped::Separator => continue,
         };
-        if let Some(text) = normalize_tokens(value) {
+        if let Some(text) = search_key(value) {
             predicted.extend(
                 text.chars()
                     .filter(|character| *character != ' ')
@@ -231,7 +231,7 @@ mod tests {
         .expect("tokens");
         assert_eq!(
             row.to_line(),
-            "pl\tpl\tsmętna/street 8/house_number , pl/postcode 31/postcode 343/postcode kraków/locality"
+            "pl\tpl\tsmetna/street 8/house_number , pl/postcode 31/postcode 343/postcode krakow/locality"
         );
     }
 
@@ -247,13 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn tokens_are_normalized_until_a_second_pass_changes_nothing() {
-        // Lowercased, "İ" is "i" and a combining dot, which one more pass of
-        // the index normalization splits off.
+    fn a_dotted_capital_i_stays_in_its_word() {
+        // Lowercased, "İ" is "i" and a combining dot: an accent, never a
+        // word break.
         let row = normalize_raw_line("tr\tch\tİsviçre/country", Scheme::Libpostal)
             .expect("row")
             .expect("tokens");
-        assert_eq!(row.to_line(), "tr\tch\ti/country sviçre/country");
+        assert_eq!(row.to_line(), "tr\tch\tisvicre/country");
         assert!(TaggedRow::parse_line(&row.to_line()).is_ok());
     }
 

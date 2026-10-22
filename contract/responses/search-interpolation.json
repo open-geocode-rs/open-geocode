@@ -15,6 +15,7 @@
           "locality": "Toronto",
           "street": "Queen Street"
         },
+        "confidence": 0.95257413,
         "context": {
           "country": {
             "id": "osm:relation:1",

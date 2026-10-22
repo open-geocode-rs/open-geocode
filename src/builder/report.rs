@@ -10,7 +10,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 21;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 22;
 
 /// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -274,6 +274,9 @@ pub struct AcceptedCounts {
     pub way_centroid_addresses: u64,
     pub interpolation_ranges: u64,
     pub street_segments: u64,
+    /// Street records, the segments of each street joined into one.
+    #[serde(default)]
+    pub streets: u64,
     pub postcode_records: u64,
     pub place_nodes: u64,
     /// Places drawn as a closed way or a multipolygon, not admin boundaries.
@@ -442,7 +445,7 @@ pub struct CompletenessCounts {
     pub country: u64,
 }
 
-/// Wall-clock time per build phase, in order.
+/// Wall-clock time per build phase.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PhaseTimings {
     /// Pass 1: classify every OSM object.
@@ -457,12 +460,17 @@ pub struct PhaseTimings {
     pub boundary_build_ms: u128,
     /// Fetch and read address files from outside OSM.
     pub address_import_ms: u128,
-    /// Order every address by street and number, and drop the imported
-    /// ones that repeat another.
+    /// Order every address by street and number, drop the imported ones
+    /// that repeat another, lend each street's postcodes to its addresses
+    /// without one, and place each country's postcodes.
     pub address_order_ms: u128,
-    /// Write places, postcodes and boundaries.
+    /// Write places and boundaries.
     pub context_record_write_ms: u128,
-    /// Write addresses, interpolations and streets in Hilbert order.
+    /// Join the ways of each street into one street record.
+    #[serde(default)]
+    pub street_join_ms: u128,
+    /// Write addresses, POIs, interpolations, streets and postcodes in
+    /// Hilbert order.
     pub record_write_ms: u128,
     /// Finish the text and spatial indexes and write the Pack file.
     pub pack_seal_ms: u128,
@@ -1603,6 +1611,8 @@ mod tests {
     ) -> AddressRecord {
         let street = street.map(str::to_string);
         AddressRecord {
+            disputed: false,
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: "10".to_string(),

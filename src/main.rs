@@ -22,6 +22,7 @@ use open_geocode::{
         addresses::{AddressFile, AddressFiles, AddressSource, AddressSources},
         build_planned_osm_pack, plan_osm_build,
     },
+    calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     openaddresses::OpenAddresses,
     pack::{Reader, RecordId},
@@ -264,6 +265,40 @@ enum GeocodeCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+
+    /// Fit the Pack's answer confidence to held-out address points: each is
+    /// written as messy queries, searched, and its answers judged right or
+    /// wrong. The model is written beside the Pack file, replacing any
+    /// before it, and every answer from then on carries a `confidence`.
+    Calibrate {
+        /// Pack directory or Pack file.
+        #[arg(long)]
+        pack: PathBuf,
+
+        /// Held-out address points, in the layouts `pack build --addresses`
+        /// reads, never ones the Pack was built from. `DATASET=PATH` names
+        /// the dataset; a bare path is named by its file name. Repeat it to
+        /// add several.
+        #[arg(long = "addresses", value_name = "[DATASET=]PATH", required = true)]
+        address_files: Vec<String>,
+
+        /// Rows drawn from each file.
+        #[arg(long, default_value_t = 1000)]
+        rows: usize,
+
+        /// Messy queries written of each row.
+        #[arg(long, default_value_t = 3)]
+        variants: usize,
+
+        /// Seed of the draws; the same Pack, rows and seed fit the same model.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+
+        /// How far from its row's point, in metres, an answer may lie and
+        /// still be right.
+        #[arg(long, default_value_t = 100.0)]
+        radius_m: f64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -451,6 +486,11 @@ struct BatchGeocodeArgs {
     #[arg(long)]
     layer: Option<String>,
 
+    /// ISO 3166-1 alpha-2 codes to answer from, comma-separated; default
+    /// every country the Pack covers.
+    #[arg(long = "country", value_delimiter = ',')]
+    countries: Vec<String>,
+
     /// Number of engine candidates to inspect per query. Use 0 for the engine default.
     #[arg(long, default_value_t = 10)]
     limit: usize,
@@ -599,6 +639,24 @@ async fn main() -> Result<()> {
                 write_json(value)
             }
         }
+        Commands::Geocode(GeocodeCommand::Calibrate {
+            pack,
+            address_files,
+            rows,
+            variants,
+            seed,
+            radius_m,
+        }) => {
+            let report = calibration::run(&calibration::Options {
+                pack,
+                files: address_files_of(&address_files)?,
+                rows,
+                variants,
+                seed,
+                radius_m,
+            })?;
+            write_json(serde_json::to_value(report)?)
+        }
         Commands::Fixture(FixtureCommand::SamplePoi {
             pack,
             count,
@@ -674,35 +732,40 @@ fn address_sources(
         )?));
     }
     if !files.is_empty() {
-        let files = files
-            .iter()
-            .map(|file| {
-                let (dataset, path) = match file.split_once('=') {
-                    Some((dataset, path)) if !dataset.is_empty() => {
-                        (dataset.to_string(), PathBuf::from(path))
-                    }
-                    _ => {
-                        let path = PathBuf::from(file);
-                        let name = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .and_then(|name| name.split('.').next())
-                            .filter(|name| !name.is_empty())
-                            .with_context(|| format!("--addresses {file} names no file"))?
-                            .to_string();
-                        (name, path)
-                    }
-                };
-                Ok(AddressFile { dataset, path })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        sources.push(Arc::new(AddressFiles(files)));
+        sources.push(Arc::new(AddressFiles(address_files_of(files)?)));
     }
     Ok(match sources.len() {
         0 => None,
         1 => sources.pop(),
         _ => Some(Arc::new(AddressSources(sources))),
     })
+}
+
+/// The files `--addresses` names, each `[DATASET=]PATH`: a bare path is
+/// named by its file name.
+fn address_files_of(files: &[String]) -> Result<Vec<AddressFile>> {
+    files
+        .iter()
+        .map(|file| {
+            let (dataset, path) = match file.split_once('=') {
+                Some((dataset, path)) if !dataset.is_empty() => {
+                    (dataset.to_string(), PathBuf::from(path))
+                }
+                _ => {
+                    let path = PathBuf::from(file);
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.split('.').next())
+                        .filter(|name| !name.is_empty())
+                        .with_context(|| format!("--addresses {file} names no file"))?
+                        .to_string();
+                    (name, path)
+                }
+            };
+            Ok(AddressFile { dataset, path })
+        })
+        .collect()
 }
 
 fn parse_fixture(command: ParseFixtureCommand) -> Result<()> {
@@ -918,6 +981,8 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
         limit,
         layer,
         countries: Vec::new(),
+        focus: None,
+        bbox: None,
     })?;
     write_json(serde_json::to_value(api::forward_collection(
         &pack, query, hits,
@@ -966,6 +1031,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         region_field,
         postcode_field,
         layer,
+        countries,
         limit,
         lat_column,
         lon_column,
@@ -996,6 +1062,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         region_field: region_field.map(Column::Named),
         postcode_field: postcode_field.map(Column::Named),
         layer,
+        countries,
         limit,
         lat_column,
         lon_column,

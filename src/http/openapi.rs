@@ -54,8 +54,9 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         description = "Search, autocomplete and reverse geocoding served from a single \
                        binary Pack built from OpenStreetMap extracts.\n\n\
                        Every answer is one GeoJSON FeatureCollection, so a response drops \
-                       straight into a map library. Forward answers carry a `score`, \
-                       reverse answers a `distance_m`; nothing else differs between them.\n\n\
+                       straight into a map library. Forward answers carry a `score`, and a \
+                       calibrated `confidence` once the Pack has been calibrated; reverse \
+                       answers carry a `distance_m`. Nothing else differs between them.\n\n\
                        Errors are RFC 9457 problem documents served as \
                        `application/problem+json`. Branch on `error_code`, which is a \
                        closed set; `title` and `detail` are prose and may be reworded.",
@@ -148,7 +149,8 @@ pub(crate) struct Problem {
 pub(crate) enum ErrorCode {
     /// `q` was empty, too long, or could not be parsed as a query.
     InvalidQuery,
-    /// `lon` or `lat` was missing or outside its range.
+    /// `lon` or `lat` was missing or outside its range, or `focus` or
+    /// `bbox` named a point outside it.
     InvalidCoordinate,
     /// `limit` was above the maximum for the route.
     LimitTooLarge,

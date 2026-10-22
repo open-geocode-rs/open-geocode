@@ -91,6 +91,10 @@ pub(crate) struct SearchParams {
     /// layer is a 400 naming the valid ones rather than a serde rejection
     /// reading `unknown variant`.
     layer: Option<String>,
+    /// `lon,lat`; see [`bounds::parse_focus`].
+    focus: Option<String>,
+    /// `min_lon,min_lat,max_lon,max_lat`; see [`bounds::parse_bbox`].
+    bbox: Option<String>,
 }
 
 /// Resolve the `layer` filter, rejecting a layer that does not exist.
@@ -313,12 +317,26 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
                         rejected; one the Pack does not cover simply matches \
                         nothing.",
          example = "NZ,AU"),
+        ("focus" = Option<String>, Query,
+         description = "Where the caller is, `lon,lat`. Of answers the query \
+                        cannot tell apart, the nearer ranks first; it never \
+                        outranks what the query states or a better match. A \
+                        point out of range is rejected.",
+         example = "-79.38,43.65"),
+        ("bbox" = Option<String>, Query,
+         description = "Return only answers inside this box, \
+                        `min_lon,min_lat,max_lon,max_lat`. Its west edge must \
+                        not lie east of its east edge, nor its south edge \
+                        north of its north edge: a box across the \
+                        antimeridian is two requests.",
+         example = "-79.64,43.58,-79.12,43.86"),
     ),
     responses(
         (status = 200, description = "The places that matched, best first.",
          body = ForwardCollection),
         (status = 400, description = "`q` was empty or too long, `limit` was above \
-                                      the maximum, or a parameter did not parse.",
+                                      the maximum, `focus` or `bbox` was out of \
+                                      range, or a parameter did not parse.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The search failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -334,12 +352,16 @@ pub(crate) async fn search(
     bounds::validate_search_limit(params.limit)?;
     let layer = parse_layer(params.layer.as_deref())?;
     let countries = parse_countries(params.country.as_deref())?;
+    let focus = bounds::parse_focus(params.focus.as_deref())?;
+    let bbox = bounds::parse_bbox(params.bbox.as_deref())?;
 
     let options = TextSearchOptions {
         query: query.clone(),
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
         countries: countries.clone(),
+        focus,
+        bbox,
     };
     let collection = blocking(move || {
         let hits = state.searcher.search(options)?;
@@ -377,12 +399,26 @@ pub(crate) async fn search(
                         rejected; one the Pack does not cover simply matches \
                         nothing.",
          example = "NZ,AU"),
+        ("focus" = Option<String>, Query,
+         description = "Where the caller is, `lon,lat`. Of answers the query \
+                        cannot tell apart, the nearer ranks first; it never \
+                        outranks what the query states or a better match. A \
+                        point out of range is rejected.",
+         example = "-79.38,43.65"),
+        ("bbox" = Option<String>, Query,
+         description = "Return only answers inside this box, \
+                        `min_lon,min_lat,max_lon,max_lat`. Its west edge must \
+                        not lie east of its east edge, nor its south edge \
+                        north of its north edge: a box across the \
+                        antimeridian is two requests.",
+         example = "-79.64,43.58,-79.12,43.86"),
     ),
     responses(
         (status = 200, description = "The suggestions, best first.",
          body = ForwardCollection),
         (status = 400, description = "`q` was too long, `limit` was above the \
-                                      maximum, or a parameter did not parse.",
+                                      maximum, `focus` or `bbox` was out of range, \
+                                      or a parameter did not parse.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The search failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -400,12 +436,16 @@ pub(crate) async fn autocomplete(
     bounds::validate_autocomplete_limit(params.limit)?;
     let layer = parse_layer(params.layer.as_deref())?;
     let countries = parse_countries(params.country.as_deref())?;
+    let focus = bounds::parse_focus(params.focus.as_deref())?;
+    let bbox = bounds::parse_bbox(params.bbox.as_deref())?;
 
     let options = TextAutocompleteOptions {
         query: query.clone(),
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
         countries,
+        focus,
+        bbox,
     };
     let collection = blocking(move || {
         let hits = state.searcher.autocomplete(options)?;
@@ -595,6 +635,8 @@ mod router_tests {
         writer
             .write(
                 &AddressRecord {
+                    disputed: false,
+                    street_postcodes: Vec::new(),
                     address: AddressComponents {
                         areas: Vec::new(),
                         number: "10".to_string(),
@@ -825,6 +867,10 @@ mod router_tests {
         let feature = &body["features"][0];
         assert_eq!(feature["properties"]["layer"], "address");
         assert_eq!(feature["geometry"]["coordinates"][0], -79.0);
+        assert!(
+            feature["properties"].get("confidence").is_none(),
+            "a Pack never calibrated rates no answer"
+        );
 
         // The same address in a postcode it is not in finds nothing. An empty
         // collection, not an error: the request was fine, the answer is that

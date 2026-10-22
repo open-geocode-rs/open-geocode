@@ -31,17 +31,18 @@ use crate::{
     pack::RecordId,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRecord,
-        Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord,
+        Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord, place_rank,
     },
+    records::quantize,
     spatial_index::haversine_m,
-    util::text::collapse_whitespace,
+    util::{fold::search_key, geo::line_parts, text::collapse_whitespace},
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 10;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
 /// Postcode data within this radius describes where a record is: a record
-/// that states no postcode is ranked by the nearest postcode centroid within
-/// it, and the batch check compares the postcode areas within it.
+/// with no postcode of its own is ranked by the nearest postcode centroid
+/// within it, and the batch check compares the postcode areas within it.
 pub(crate) const POSTCODE_AREA_RADIUS_M: f64 = 10_000.0;
 
 /// Tantivy needs at least 15 MB per indexing thread (it uses fewer threads
@@ -62,8 +63,15 @@ pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
 const INTERPOLATION_END_FIELD: &str = "interpolation_end";
 pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
 pub(crate) const RANK_POSTCODE_FIELD: &str = "rank_postcode";
+pub(crate) const AREA_POSTCODE_FIELD: &str = "area_postcode";
 pub(crate) const COUNTRY_CODE_FIELD: &str = "country_code";
+pub(crate) const MIN_LON_FIELD: &str = "min_lon";
+pub(crate) const MIN_LAT_FIELD: &str = "min_lat";
+pub(crate) const MAX_LON_FIELD: &str = "max_lon";
+pub(crate) const MAX_LAT_FIELD: &str = "max_lat";
 pub(crate) const RECORD_COUNT_FIELD: &str = "record_count";
+pub(crate) const NAME_WORDS_FIELD: &str = "name_words";
+pub(crate) const PLACE_RANK_FIELD: &str = "place_rank";
 /// Addresses one document holds at most, so finding a number in a group reads
 /// a bounded run of records.
 const MAX_GROUP_RECORDS: u64 = 1_024;
@@ -119,13 +127,77 @@ pub struct Fields {
     /// "407A"). Ranking asks only whether a record states one, so a street
     /// group keeps one value, not one per address.
     pub house_number: Field,
-    /// The postcode a record is ranked by: the one it states, else the
-    /// nearest postcode centroid (see [`PostcodeAreas`]).
+    /// The postcodes a record is in by its own data: the one it states,
+    /// else for an address the ones its street's addresses state.
     pub rank_postcode: Field,
+    /// For a record with no `rank_postcode`, the nearest postcode centroid
+    /// (see [`PostcodeAreas`]): a guess, which never contradicts a query.
+    pub area_postcode: Field,
     /// The ISO 3166-1 alpha-2 code of the country the record lies in, upper
     /// case, so a Pack covering several countries can be searched one at a
     /// time. Exact, like `layer`: it is filtered on, never matched as text.
     pub country_code: Field,
+    /// The [`Extent`] of the records a document stands for, so a bounding
+    /// box narrows a search before it ranks, and a caller's location ranks
+    /// the documents near it into the window.
+    pub min_lon: Field,
+    pub min_lat: Field,
+    pub max_lon: Field,
+    pub max_lat: Field,
+    /// The words of the record's own name, as the name field spells them,
+    /// so that of records a query scores alike the text index keeps the
+    /// ones whose name it covers with the fewest words left over.
+    pub name_words: Field,
+    /// The [`place_rank`] of a place, so that of places a query scores
+    /// alike the text index keeps the larger.
+    pub place_rank: Field,
+}
+
+/// The smallest box holding a document's records, in 1e-7 degrees, the
+/// precision the record store keeps. A street group's covers each of its
+/// addresses, a street's its whole line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub min_lon: i32,
+    pub min_lat: i32,
+    pub max_lon: i32,
+    pub max_lat: i32,
+}
+
+impl Extent {
+    /// The extent of a record's geometry, `None` when it has no finite
+    /// coordinates in range.
+    pub fn of(record: &Record) -> Option<Self> {
+        let point = |lon: f64, lat: f64| {
+            let (lon, lat) = (quantize(lon).ok()?, quantize(lat).ok()?);
+            Some(Self {
+                min_lon: lon,
+                min_lat: lat,
+                max_lon: lon,
+                max_lat: lat,
+            })
+        };
+        match line_parts(record.geometry()) {
+            Some(parts) => parts
+                .into_iter()
+                .flatten()
+                .map(|position| point(position[0], position[1]))
+                .reduce(|left, right| Some(left?.union(right?)))
+                .flatten(),
+            None => record
+                .display_point()
+                .and_then(|[lon, lat]| point(lon, lat)),
+        }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min_lon: self.min_lon.min(other.min_lon),
+            min_lat: self.min_lat.min(other.min_lat),
+            max_lon: self.max_lon.max(other.max_lon),
+            max_lat: self.max_lat.max(other.max_lat),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +234,16 @@ pub struct Document {
     /// First and last number of an interpolation range.
     pub interpolation_range: Option<(u32, u32)>,
     /// Normalized without spaces, as [`compact_postcode`] gives.
-    pub rank_postcode: Option<String>,
+    pub rank_postcodes: Vec<String>,
+    /// Normalized the same way.
+    pub area_postcode: Option<String>,
     /// The country the record lies in, from its admin context.
     pub country_code: Option<String>,
+    pub extent: Option<Extent>,
+    /// Words of the record's own name (see [`Fields::name_words`]).
+    pub name_words: Option<u64>,
+    /// See [`Fields::place_rank`].
+    pub place_rank: Option<u8>,
 }
 
 impl fmt::Debug for Writer {
@@ -258,6 +337,10 @@ impl Writer {
             && group.same_group(&document)
         {
             group.record_count += 1;
+            group.extent = match (group.extent, document.extent) {
+                (Some(group), Some(address)) => Some(group.union(address)),
+                (group, address) => group.or(address),
+            };
             group.address_numbers.extend(document.address_numbers);
             group.flat_numbers.extend(document.flat_numbers);
             group.units.extend(document.units);
@@ -350,7 +433,14 @@ impl Fields {
             street_text: schema.get_field("street_text")?,
             house_number: schema.get_field(HOUSE_NUMBER_FIELD)?,
             rank_postcode: schema.get_field(RANK_POSTCODE_FIELD)?,
+            area_postcode: schema.get_field(AREA_POSTCODE_FIELD)?,
             country_code: schema.get_field(COUNTRY_CODE_FIELD)?,
+            min_lon: schema.get_field(MIN_LON_FIELD)?,
+            min_lat: schema.get_field(MIN_LAT_FIELD)?,
+            max_lon: schema.get_field(MAX_LON_FIELD)?,
+            max_lat: schema.get_field(MAX_LAT_FIELD)?,
+            name_words: schema.get_field(NAME_WORDS_FIELD)?,
+            place_rank: schema.get_field(PLACE_RANK_FIELD)?,
         })
     }
 
@@ -404,9 +494,14 @@ impl Fields {
             document.add_text(self.context_text, &projected.context_text);
         }
         add_text_if_present(&mut document, self.name_text, projected.name.as_deref());
-        for street in &projected.streets {
-            add_text_if_present(&mut document, self.street_text, Some(street));
-        }
+        // One value of each word, as the name and content fields are: a
+        // street known by several names ("Upper Queen Street", "Belgium
+        // Street") would else score its repeated words over a street of one.
+        add_text_if_present(
+            &mut document,
+            self.street_text,
+            unique_words(&projected.streets.join(" ")).as_deref(),
+        );
         let mut terms = BTreeSet::new();
         let mut lowest: Option<u32> = None;
         for number in &projected.address_numbers {
@@ -437,11 +532,26 @@ impl Fields {
             document.add_u64(self.interpolation_start, start.into());
             document.add_u64(self.interpolation_end, end.into());
         }
-        if let Some(postcode) = &projected.rank_postcode {
+        for postcode in &projected.rank_postcodes {
             document.add_text(self.rank_postcode, postcode);
+        }
+        if let Some(postcode) = &projected.area_postcode {
+            document.add_text(self.area_postcode, postcode);
         }
         if let Some(country) = &projected.country_code {
             document.add_text(self.country_code, country);
+        }
+        if let Some(extent) = projected.extent {
+            document.add_i64(self.min_lon, extent.min_lon.into());
+            document.add_i64(self.min_lat, extent.min_lat.into());
+            document.add_i64(self.max_lon, extent.max_lon.into());
+            document.add_i64(self.max_lat, extent.max_lat.into());
+        }
+        if let Some(words) = projected.name_words {
+            document.add_u64(self.name_words, words);
+        }
+        if let Some(rank) = projected.place_rank {
+            document.add_u64(self.place_rank, rank.into());
         }
         document
     }
@@ -459,7 +569,8 @@ impl Document {
             && self.postcode == other.postcode
             && self.autocomplete_subject_text == other.autocomplete_subject_text
             && self.interpolation_range == other.interpolation_range
-            && self.rank_postcode == other.rank_postcode
+            && self.rank_postcodes == other.rank_postcodes
+            && self.area_postcode == other.area_postcode
             && self.country_code == other.country_code
     }
 
@@ -471,8 +582,8 @@ impl Document {
     /// in: a POI name alone rarely identifies one place ("Tim Hortons"), and
     /// most addresses carry no `addr:city`.
     ///
-    /// Every record but a place is ranked by the postcode it states, or else
-    /// by the nearest of `postcode_areas`.
+    /// Every record but a place is ranked by the postcodes it is in by its
+    /// own data, or else by the nearest of `postcode_areas`.
     pub fn from_record(
         record_id: RecordId,
         record: &Record,
@@ -490,24 +601,34 @@ impl Document {
         };
         let mut document = builder.build(context_names);
         document.country_code = country_code.map(str::to_string);
-        document.rank_postcode = match record {
-            Record::Place(..) => None,
-            _ => match document.postcode.as_deref() {
-                Some(postcode) => compact_postcode(postcode),
-                None => record
+        document.extent = Extent::of(record);
+        if !matches!(record, Record::Place(..)) {
+            document.rank_postcodes = match (document.postcode.as_deref(), record) {
+                (Some(postcode), _) => compact_postcode(postcode).into_iter().collect(),
+                (None, Record::Address(address)) => address
+                    .street_postcodes
+                    .iter()
+                    .filter_map(|postcode| compact_postcode(postcode))
+                    .collect(),
+                (None, _) => Vec::new(),
+            };
+            if document.rank_postcodes.is_empty() {
+                document.area_postcode = record
                     .display_point()
                     .and_then(|point| postcode_areas.nearest(point))
-                    .map(str::to_string),
-            },
-        };
-        if let Record::Poi(_) = record {
-            // A POI repeats words across its name and address ("Walmer Road
-            // Parkette, 227 Walmer Road"). Without field norms every repeat
-            // would add to its score, so each word counts once: a POI must not
-            // outrank the address or place a query names on repetition alone.
-            document.name = document.name.as_deref().and_then(unique_words);
-            document.content_text = unique_words(&document.content_text).unwrap_or_default();
+                    .map(str::to_string);
+            }
         }
+        if let Record::Place(_, place) = record {
+            document.place_rank = place_rank(&place.place_type);
+        }
+        // A record repeats words across its names and address ("Walmer Road
+        // Parkette, 227 Walmer Road", "Upper Queen Street" also named
+        // "Belgium Street"). Without field norms every repeat would add to
+        // its score, so each word counts once: a record must not outrank the
+        // one a query names on repetition alone.
+        document.name = document.name.as_deref().and_then(unique_words);
+        document.content_text = unique_words(&document.content_text).unwrap_or_default();
         document
     }
 
@@ -517,6 +638,11 @@ impl Document {
         let mut builder = ProjectionBuilder::new(record_id, "address");
         if let Some(subject) = address.address.subject() {
             builder.name_for_search(subject);
+            // Its name is its number and street ("10 Queen Street"), so of
+            // documents a street's words match alike the street comes first.
+            if let Some(words) = &mut builder.projected.name_words {
+                *words += 1;
+            }
         }
         builder.address_parts(&address.address);
         builder.projected.units.extend(address.address.unit.clone());
@@ -691,7 +817,21 @@ fn build_schema() -> (Schema, Fields) {
         RANK_POSTCODE_FIELD,
         TextOptions::default().set_fast(Some("raw")),
     );
-    let country_code = builder.add_text_field(COUNTRY_CODE_FIELD, exact_string_options());
+    let area_postcode = builder.add_text_field(
+        AREA_POSTCODE_FIELD,
+        TextOptions::default().set_fast(Some("raw")),
+    );
+    // Fast too: confidence is rated by the country an answer lies in.
+    let country_code = builder.add_text_field(
+        COUNTRY_CODE_FIELD,
+        exact_string_options().set_fast(Some("raw")),
+    );
+    let min_lon = builder.add_i64_field(MIN_LON_FIELD, FAST);
+    let min_lat = builder.add_i64_field(MIN_LAT_FIELD, FAST);
+    let max_lon = builder.add_i64_field(MAX_LON_FIELD, FAST);
+    let max_lat = builder.add_i64_field(MAX_LAT_FIELD, FAST);
+    let name_words = builder.add_u64_field(NAME_WORDS_FIELD, FAST);
+    let place_rank = builder.add_u64_field(PLACE_RANK_FIELD, FAST);
     let schema = builder.build();
     let fields = Fields {
         record_id,
@@ -708,7 +848,14 @@ fn build_schema() -> (Schema, Fields) {
         street_text,
         house_number,
         rank_postcode,
+        area_postcode,
         country_code,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        name_words,
+        place_rank,
     };
     (schema, fields)
 }
@@ -767,8 +914,12 @@ impl ProjectionBuilder {
                 postcode: None,
                 autocomplete_subject_text: String::new(),
                 interpolation_range: None,
-                rank_postcode: None,
+                rank_postcodes: Vec::new(),
+                area_postcode: None,
                 country_code: None,
+                extent: None,
+                name_words: None,
+                place_rank: None,
             },
             name_parts: Vec::new(),
             content_parts: Vec::new(),
@@ -786,8 +937,13 @@ impl ProjectionBuilder {
         self.add_autocomplete_subject_text(value);
     }
 
+    /// A name of the record; the first is its own (see
+    /// [`Fields::name_words`]).
     fn name_for_search(&mut self, value: &str) {
         if let Some(text) = search_text(value) {
+            self.projected
+                .name_words
+                .get_or_insert(text.split_whitespace().count() as u64);
             self.name_parts.push(text);
         }
         self.add_content_text(value);
@@ -843,7 +999,7 @@ impl ProjectionBuilder {
     fn postcode(&mut self, value: &str) {
         self.projected.postcode = collapse_whitespace(value);
         self.add_content_text(value);
-        if let Some(normalized) = normalize_index_text(value) {
+        if let Some(normalized) = search_key(value) {
             for form in postcode_forms(&normalized) {
                 self.content_parts.push(form.clone());
                 self.autocomplete_subject_parts.push(form);
@@ -873,7 +1029,7 @@ impl ProjectionBuilder {
     /// The postcode an address states: where it is, and a prefix to complete.
     fn add_optional_postcode_text(&mut self, value: Option<&str>) -> Option<String> {
         let cleaned = self.add_optional_postcode_for_search(value)?;
-        if let Some(normalized) = normalize_index_text(&cleaned) {
+        if let Some(normalized) = search_key(&cleaned) {
             self.autocomplete_subject_parts
                 .extend(postcode_forms(&normalized));
         }
@@ -882,7 +1038,7 @@ impl ProjectionBuilder {
 
     fn add_optional_postcode_for_search(&mut self, value: Option<&str>) -> Option<String> {
         let cleaned = value.and_then(collapse_whitespace)?;
-        if let Some(normalized) = normalize_index_text(&cleaned) {
+        if let Some(normalized) = search_key(&cleaned) {
             self.context_parts.extend(postcode_forms(&normalized));
         }
         Some(cleaned)
@@ -895,7 +1051,7 @@ impl ProjectionBuilder {
     }
 
     fn add_autocomplete_subject_text(&mut self, value: &str) {
-        if let Some(normalized) = normalize_index_text(value) {
+        if let Some(normalized) = search_key(value) {
             self.autocomplete_subject_parts.push(normalized);
         }
     }
@@ -945,30 +1101,8 @@ fn add_normalized_text_if_present(
     field: Field,
     value: Option<&str>,
 ) {
-    if let Some(value) = value.and_then(normalize_index_text) {
+    if let Some(value) = value.and_then(search_key) {
         document.add_text(field, value);
-    }
-}
-
-pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
-    let mut normalized = String::with_capacity(value.len());
-    let mut previous_was_space = true;
-    for character in value.chars() {
-        if character.is_alphanumeric() {
-            for folded in character.to_lowercase() {
-                normalized.push(folded);
-            }
-            previous_was_space = false;
-        } else if !previous_was_space {
-            normalized.push(' ');
-            previous_was_space = true;
-        }
-    }
-    let normalized = normalized.trim().to_string();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
     }
 }
 
@@ -1110,18 +1244,18 @@ pub(crate) fn is_numeric_token(token: &str) -> bool {
 /// The terms a house number is indexed under: each value of a list ("12;14")
 /// is a number of its own, normalized ("407A" is "407a").
 pub(crate) fn address_number_terms(number: &str) -> impl Iterator<Item = String> + '_ {
-    number.split(';').filter_map(normalize_index_text)
+    number.split(';').filter_map(search_key)
 }
 
 /// The term a flat is also found under: its unit and number as a slash
 /// number writes them, "10 1367" for unit 10 of 1367 ("10/1367"). Only a unit
 /// of one word: "Flat 4" is written before no number.
 pub(crate) fn flat_number_term(number: &str, unit: Option<&str>) -> Option<String> {
-    let unit = normalize_index_text(unit?)?;
+    let unit = search_key(unit?)?;
     if unit.contains(' ') {
         return None;
     }
-    Some(format!("{unit} {}", normalize_index_text(number)?))
+    Some(format!("{unit} {}", search_key(number)?))
 }
 
 /// The digits a house number starts with: 407 of "407A", "407 1/2" and
@@ -1136,7 +1270,7 @@ pub(crate) fn base_house_number(number: &str) -> Option<u32> {
 
 /// A postcode normalized without spaces: "M5V 1A1" is "m5v1a1".
 pub(crate) fn compact_postcode(value: &str) -> Option<String> {
-    normalize_index_text(value.trim()).map(|value| value.split_whitespace().collect())
+    search_key(value.trim()).map(|value| value.split_whitespace().collect())
 }
 
 /// Postcode centroids, so a record that states no postcode can be ranked by
@@ -1197,12 +1331,12 @@ fn unit_vector(lon: f64, lat: f64) -> [f64; 3] {
 /// Text as the searchable fields index it: normalized, with address
 /// abbreviations expanded.
 fn search_text(value: &str) -> Option<String> {
-    normalize_index_text(value).map(|text| expand_address_abbreviations(&text))
+    search_key(value).map(|text| expand_address_abbreviations(&text))
 }
 
 /// Normalized words of `value`, each once, in order of first use.
 fn unique_words(value: &str) -> Option<String> {
-    let normalized = normalize_index_text(value)?;
+    let normalized = search_key(value)?;
     let mut seen = BTreeSet::new();
     Some(
         normalized
@@ -1235,6 +1369,8 @@ mod tests {
     #[test]
     fn projects_address_fields_for_search() {
         let record = AddressRecord {
+            disputed: false,
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: "221B".to_string(),
@@ -1317,6 +1453,7 @@ mod tests {
     fn projects_postcodes_and_place_layers() {
         let postcode = PostcodeRecord {
             postcode: "M5V".to_string(),
+            country: None,
             geometry: point_geometry(-79.4, 43.6),
             source: DerivedSourceProvenance::osm_address_records(2),
         };
@@ -1370,6 +1507,7 @@ mod tests {
             geometry: point_geometry(-79.38, 43.65),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, 5),
+            prominence: Default::default(),
         };
 
         let projected = Document::from_record(
@@ -1388,7 +1526,8 @@ mod tests {
         );
         assert_eq!(projected.streets, vec!["king street west"]);
         assert_eq!(projected.address_numbers, vec!["123"]);
-        assert_eq!(projected.rank_postcode.as_deref(), Some("m5v1a1"));
+        assert_eq!(projected.rank_postcodes, vec!["m5v1a1"]);
+        assert_eq!(projected.area_postcode, None);
         for text in ["tim hortons", "amenity cafe", "king street west"] {
             assert!(projected.content_text.contains(text), "{text}");
         }
@@ -1423,8 +1562,9 @@ mod tests {
         let projected = Document::from_record(4, &plain.clone().into(), &["Toronto"], &areas, None);
         assert_eq!(projected.name.as_deref(), Some("walmer road parkette"));
         assert_eq!(projected.streets, vec!["walmer road"]);
+        assert!(projected.rank_postcodes.is_empty());
         assert_eq!(
-            projected.rank_postcode.as_deref(),
+            projected.area_postcode.as_deref(),
             Some("m5r2z3"),
             "the nearest postcode stands in for the one it does not state"
         );
@@ -1445,7 +1585,7 @@ mod tests {
             Document::from_record(5, &unaddressed.into(), &[], &PostcodeAreas::default(), None);
         assert_eq!(projected.layers, vec!["poi"]);
         assert!(projected.address_numbers.is_empty());
-        assert_eq!(projected.rank_postcode, None, "no postcode data nearby");
+        assert_eq!(projected.area_postcode, None, "no postcode data nearby");
     }
 
     #[test]

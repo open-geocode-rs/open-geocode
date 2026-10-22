@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::util::{text::collapse_whitespace, transliterate::to_latin};
+use crate::{
+    record::Prominence,
+    util::{text::collapse_whitespace, transliterate::to_latin},
+};
 
 /// Convenience accessors over an OSM tag map. Replaces the per-module
 /// `tag_value`/`has_*` free functions with one shared, testable surface.
@@ -38,6 +41,23 @@ pub(crate) fn is_name_key(key: &str) -> bool {
     };
     let base_ok = (base == "name" && language.is_some()) || ALT_NAME_KEYS.contains(&base);
     base_ok && language.is_none_or(is_language_tag)
+}
+
+/// How widely a feature is known by its tags (see [`Prominence`]).
+pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
+    let mut languages = tags
+        .iter()
+        .filter(|(_, value)| collapse_whitespace(value).is_some())
+        .filter_map(|(key, _)| key.strip_prefix("name:"))
+        .filter(|language| is_language_tag(language))
+        .map(|language| language.split(['-', '_']).next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    languages.sort_unstable();
+    languages.dedup();
+    Prominence {
+        linked: tags.has("wikidata") || tags.has("wikipedia"),
+        languages: languages.len().min(usize::from(Prominence::MAX_LANGUAGES)) as u8,
+    }
 }
 
 /// `ja`, `ja-Hira`, `ja_rm`, `zh-Hant-TW`: a two or three letter lower case
@@ -98,6 +118,51 @@ pub(crate) fn name_tags(tags: &BTreeMap<String, String>) -> impl Iterator<Item =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prominence_counts_languages_and_links() {
+        let tags = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            prominence(&tags(&[("name", "Corner Store")])),
+            Prominence::default()
+        );
+        assert_eq!(
+            prominence(&tags(&[
+                ("name", "Tokyo Tower"),
+                ("name:en", "Tokyo Tower"),
+                ("name:ja", "東京タワー"),
+                ("name:ja-Hira", "とうきょうたわー"),
+                ("name:ja_rm", "Tōkyō Tawā"),
+                ("name:etymology", "Tokyo"),
+                ("name:fr", " "),
+                ("alt_name:de", "Tokioturm"),
+                ("wikidata", "Q186170"),
+            ])),
+            Prominence {
+                linked: true,
+                languages: 2,
+            },
+            "ja and its scripts are one language; an etymology, a blank and an alt name none"
+        );
+        assert!(prominence(&tags(&[("wikipedia", "en:Tokyo Tower")])).linked);
+        let byte = Prominence {
+            linked: true,
+            languages: 5,
+        }
+        .to_byte();
+        assert_eq!(
+            Prominence::from_byte(byte),
+            Prominence {
+                linked: true,
+                languages: 5
+            }
+        );
+    }
 
     #[test]
     fn reads_cleaned_values_and_presence() {

@@ -16,6 +16,7 @@
           "street": "King Street"
         },
         "category": "shop:bakery",
+        "confidence": 0.76852477,
         "context": {
           "country": {
             "id": "osm:relation:1",

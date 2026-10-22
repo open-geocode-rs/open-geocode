@@ -15,6 +15,7 @@
           "postcode": "M5V 1A1",
           "street": "King Street"
         },
+        "confidence": 0.9890131,
         "context": {
           "country": {
             "id": "osm:relation:1",
@@ -34,7 +35,7 @@
         "layer": "address",
         "name": "10 King Street",
         "record_id": 3,
-        "score": 6.609153,
+        "score": 5.459071,
         "source": {
           "dataset": "osm",
           "object_id": 10,

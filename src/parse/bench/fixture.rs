@@ -16,27 +16,11 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
     parse::types::{Label, Tagged},
-    text_index::normalize_index_text,
+    util::fold::search_key,
 };
 
 /// The field that marks a part boundary.
 pub const SEPARATOR: &str = ",";
-
-/// Source text as fixture tokens: [`normalize_index_text`] applied until it
-/// no longer changes the text. One pass is not always enough: lowercasing
-/// `İ` yields `i` and a combining dot, which a second pass splits off as a
-/// separator. A tagger normalizing the fixture query again therefore sees
-/// exactly the fixture tokens.
-pub fn normalize_tokens(text: &str) -> Option<String> {
-    let mut normalized = normalize_index_text(text)?;
-    loop {
-        let again = normalize_index_text(&normalized)?;
-        if again == normalized {
-            return Some(normalized);
-        }
-        normalized = again;
-    }
-}
 
 /// One tagged address: its tokens in order, and where the source separated
 /// its parts.
@@ -130,7 +114,7 @@ impl TaggedRow {
             let label =
                 Label::from_name(label).with_context(|| format!("unknown label {label:?}"))?;
             ensure!(
-                normalize_index_text(token).as_deref() == Some(token),
+                search_key(token).as_deref() == Some(token),
                 "token {token:?} is not normalized"
             );
             tokens.push(Tagged {
@@ -298,9 +282,9 @@ mod tests {
 
     #[test]
     fn a_row_without_separators_is_one_part() {
-        let row = TaggedRow::parse_line("de\tde\tmünchen/locality 80331/postcode").expect("row");
+        let row = TaggedRow::parse_line("de\tde\tmunchen/locality 80331/postcode").expect("row");
         assert!(row.breaks.is_empty());
-        assert_eq!(row.query(), "münchen 80331");
+        assert_eq!(row.query(), "munchen 80331");
     }
 
     #[test]

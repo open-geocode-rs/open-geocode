@@ -80,16 +80,23 @@ use crate::{
     },
     extsort::{ExternalSorter, SortStats, Spool},
     memory::Budget,
-    pack::{AUDIT_DIR, BUILD_REPORT_FILE, REJECTIONS_FILE, RecordContext, Writer, WriterOptions},
+    pack::{
+        AUDIT_DIR, BUILD_REPORT_FILE, REJECTIONS_FILE, RecordContext, RecordId, Writer,
+        WriterOptions,
+    },
     parse::lattice::{
+        CountryCode,
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{OSM_DATASET, Record, RejectedRecord},
+    record::{
+        AddressComponents, AddressRecord, OSM_DATASET, ObjectType, Record, RejectedRecord,
+        StreetRecord,
+    },
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
-    util::{geo::point_lon_lat, hilbert::hilbert_key},
+    util::{fold::search_key, geo::point_lon_lat, hilbert::hilbert_key},
 };
 use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_context};
 use emit::{FeatureOutput, emit_features};
@@ -97,9 +104,10 @@ use emitted::Emitted;
 use nodes::join_nodes;
 pub use pbf::replication_timestamp;
 use pbf::{for_each_block, input_bytes};
-use postcode::PostcodeAccumulator;
 use scan::scan_block;
-use spill::{NodeRequest, PendingAddress, PendingRecord, ResolvedRef, WayFeature, WayKind};
+use spill::{
+    NodeRequest, PendingAddress, PendingRecord, PendingStreet, ResolvedRef, WayFeature, WayKind,
+};
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -273,9 +281,9 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             ..BuilderReport::default()
         },
         audit: Audit::create(writer.generation())?,
-        postcodes: PostcodeAccumulator::default(),
         records: ExternalSorter::new(&scratch, "records", &memory, budget),
         addresses: ExternalSorter::new(&scratch, "addresses", &memory, budget),
+        streets: ExternalSorter::new(&scratch, "streets", &memory, budget),
         context_records: ExternalSorter::new(
             &scratch,
             "context-records",
@@ -429,9 +437,9 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         }
     }
 
-    // Admin boundaries, their place records and postcode centroids. Every
-    // input has been read, so a relation whose ways span two extracts is
-    // assembled from all of them.
+    // Admin boundaries and their place records. Every input has been read,
+    // so a relation whose ways span two extracts is assembled from all of
+    // them.
     let phase = Instant::now();
     progress.start(BuildStage::Boundaries, None)?;
     // Boundary features that were incomplete have no entry in `boundary_ways`
@@ -462,14 +470,6 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     ));
     for (origin, record) in boundaries.place_records(&mut build.report) {
         build.push(record, Some(origin))?;
-    }
-    let mut postcode_centroids = Vec::new();
-    for record in std::mem::take(&mut build.postcodes).into_records() {
-        build.report.accept_postcode();
-        if let Some(point) = point_lon_lat(&record.geometry) {
-            postcode_centroids.push((record.postcode.clone(), point));
-        }
-        build.push(Record::Postcode(record), None)?;
     }
     progress.finish(BuildStage::Boundaries);
     build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
@@ -519,16 +519,107 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     progress.finish(BuildStage::ImportAddresses);
     build.report.phases.address_import_ms = phase.elapsed().as_millis();
 
-    let phase = Instant::now();
     let Build {
         mut report,
         audit,
         mut records,
         addresses,
+        streets,
         context_records,
         mut seq,
         ..
     } = build;
+
+    // Context records first: once their ids are known, the boundary index can
+    // describe every other record, and tell the country each address lies in.
+    let phase = Instant::now();
+    let context_stats = context_records.stats();
+    let mut ordered = Spool::<PendingRecord>::create(&scratch, "context-ordered")?;
+    let mut boundary_ids = vec![0; boundaries.len()];
+    let mut country_ids = HashMap::new();
+    let first_id = writer.record_count();
+    // The areas that are settlements by their own tags, and the settlement
+    // points that may name the area they lie in.
+    let mut settled = HashSet::new();
+    let mut settlements = Vec::new();
+    for (index, item) in context_records.finish()?.enumerate() {
+        let item = item?;
+        let record_id = first_id + index as u64;
+        match &item.origin {
+            Some(ContextOrigin::Boundary(boundary)) => boundary_ids[*boundary as usize] = record_id,
+            Some(ContextOrigin::DerivedCountry(code)) => {
+                country_ids.insert(code.clone(), record_id);
+            }
+            None => {}
+        }
+        if let Record::Place(_, place) = &item.record
+            && street::is_settlement(&place.place_type)
+        {
+            match item.origin {
+                Some(ContextOrigin::Boundary(_)) => {
+                    settled.insert(record_id);
+                }
+                Some(ContextOrigin::DerivedCountry(_)) => {}
+                None => {
+                    settlements.extend(search_key(&place.name).zip(point_lon_lat(&place.geometry)))
+                }
+            }
+        }
+        ordered.write(&item)?;
+    }
+    let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
+    let area_names = boundaries.context_names(&boundary_ids, &country_ids);
+    writer.set_context_names(area_names.clone());
+    writer.set_country_codes(country_codes.clone());
+    writer.set_region_groups(boundaries.region_groups(&boundary_ids));
+    let index = boundaries.into_index(&boundary_ids, &country_ids);
+    // An admin area is a settlement too when a settlement of its name lies
+    // in it, as a town's boundary holds the town's point: Nominatim links
+    // the two the same way. A ward or a local board holds none of its name.
+    settled.extend(
+        settlements
+            .par_iter()
+            .filter_map(|(name, [lon, lat])| {
+                let locality = index
+                    .context_for_point(*lon, *lat, Default::default())
+                    .admin_context
+                    .locality_record_id()?;
+                area_names
+                    .get(&locality)?
+                    .iter()
+                    .any(|area| search_key(area).as_ref() == Some(name))
+                    .then_some(locality)
+            })
+            .collect::<Vec<_>>(),
+    );
+    drop(settlements);
+    let context_count = ordered.written();
+    let mut sample = Sampler::default();
+    write_ordered(
+        &mut writer,
+        &mut sample,
+        ordered.into_reader()?,
+        context_count,
+        &index,
+        &progress,
+        BuildStage::ContextRecords,
+    )?;
+    report.phases.context_record_write_ms = phase.elapsed().as_millis();
+
+    let phase = Instant::now();
+    let street_stats = streets.stats();
+    report.accepted.streets = join_streets(
+        streets,
+        &index,
+        &settled,
+        &area_names,
+        &mut records,
+        &mut seq,
+    )?;
+    drop(area_names);
+    report.phases.street_join_ms = phase.elapsed().as_millis();
+
+    let phase = Instant::now();
     let address_stats = addresses.stats();
     // Slash numbers are read before imported rows are matched against OSM
     // ones, so an OSM flat "10/1367" repeats an imported 1367 unit 10.
@@ -545,85 +636,39 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             &mut slash_numbers,
         )?
     };
-    // Each street's addresses join the records as one run, in number order,
-    // placed in the Hilbert order by its first address: the run stays whole
-    // for the record store and the text index to share what its addresses
-    // state.
-    let mut anchor = None;
-    let mut previous: Option<PendingAddress> = None;
-    let mut push = |address: PendingAddress| -> Result<()> {
-        if previous
-            .as_ref()
-            .is_none_or(|previous| !previous.same_group(&address))
-        {
-            let [lon, lat] = address.record.display_point().ok_or_else(|| {
-                Error::BadGeometry(format!(
-                    "record {} has no display point",
-                    address.record.id()
-                ))
-            })?;
-            anchor = Some(hilbert_key(quantize(lon)?, quantize(lat)?));
-        }
-        records.push(PendingRecord {
-            key: anchor.expect("a group has an anchor"),
-            seq,
-            origin: None,
-            record: address.record.clone(),
-        })?;
-        seq += 1;
-        previous = Some(address);
-        Ok(())
-    };
+    let mut runs = AddressRuns::new(&mut records, &mut seq, &index, &country_codes);
     if files.is_empty() {
-        slash::read_slash_numbers(addresses.finish()?, &mut slash_numbers, &mut push)?;
+        slash::read_slash_numbers(addresses.finish()?, &mut slash_numbers, |address| {
+            runs.push(address)
+        })?;
     } else {
         for address in addresses.finish()? {
-            push(address?)?;
+            runs.push(address?)?;
         }
     }
+    let postcodes = runs.finish()?;
     report.slash_numbers = slash_numbers;
+    // Every address is placed, so each postcode's points are all known.
+    let mut postcode_points = Vec::new();
+    for record in postcodes.into_records() {
+        report.accept_postcode();
+        let [lon, lat] = point_lon_lat(&record.geometry).ok_or_else(|| {
+            Error::BadGeometry(format!("postcode {} has no point", record.postcode))
+        })?;
+        postcode_points.push((record.postcode.clone(), [lon, lat]));
+        records.push(PendingRecord {
+            key: hilbert_key(quantize(lon)?, quantize(lat)?),
+            seq,
+            origin: None,
+            record: Record::Postcode(record),
+        })?;
+        seq += 1;
+    }
+    writer.set_postcode_areas(PostcodeAreas::new(postcode_points));
     report.phases.address_order_ms = phase.elapsed().as_millis();
 
-    // Context records first: once their ids are known, the boundary index can
-    // describe every other record.
     let phase = Instant::now();
-    let context_stats = context_records.stats();
     let record_stats = records.stats();
-    let mut ordered = Spool::<PendingRecord>::create(&scratch, "context-ordered")?;
-    let mut boundary_ids = vec![0; boundaries.len()];
-    let mut country_ids = HashMap::new();
-    let first_id = writer.record_count();
-    for (index, item) in context_records.finish()?.enumerate() {
-        let item = item?;
-        let record_id = first_id + index as u64;
-        match &item.origin {
-            Some(ContextOrigin::Boundary(boundary)) => boundary_ids[*boundary as usize] = record_id,
-            Some(ContextOrigin::DerivedCountry(code)) => {
-                country_ids.insert(code.clone(), record_id);
-            }
-            None => {}
-        }
-        ordered.write(&item)?;
-    }
-    writer.set_context_names(boundaries.context_names(&boundary_ids, &country_ids));
-    writer.set_country_codes(boundaries.country_codes(&boundary_ids, &country_ids));
-    writer.set_region_groups(boundaries.region_groups(&boundary_ids));
-    writer.set_postcode_areas(PostcodeAreas::new(postcode_centroids));
-    let index = boundaries.into_index(&boundary_ids, &country_ids);
-    let context_count = ordered.written();
-    let mut sample = Sampler::default();
-    write_ordered(
-        &mut writer,
-        &mut sample,
-        ordered.into_reader()?,
-        context_count,
-        &index,
-        &progress,
-        BuildStage::ContextRecords,
-    )?;
-    report.phases.context_record_write_ms = phase.elapsed().as_millis();
-
-    let phase = Instant::now();
     write_ordered(
         &mut writer,
         &mut sample,
@@ -673,6 +718,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         ("node_requests", request_stats),
         ("resolved_nodes", resolved_stats),
         ("addresses", address_stats),
+        ("streets", street_stats),
         ("records", record_stats),
         ("context_records", context_stats),
     ] {
@@ -701,13 +747,15 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
 struct Build {
     report: BuilderReport,
     audit: Audit,
-    postcodes: PostcodeAccumulator,
     /// POIs, interpolations and streets, then the addresses.
     records: ExternalSorter<PendingRecord>,
     /// Addresses, until every one is known and they can join `records` a
     /// street at a time.
     addresses: ExternalSorter<PendingAddress>,
-    /// Places and postcodes: everything a context tuple can point at.
+    /// The ways of streets, until every one is known and the ways of one
+    /// street can join (see [`join_streets`]).
+    streets: ExternalSorter<PendingStreet>,
+    /// Places: everything a context tuple can point at.
     context_records: ExternalSorter<PendingRecord>,
     seq: u64,
 }
@@ -719,10 +767,8 @@ impl Build {
             report,
             records,
             rejections,
-            postcodes,
         } = emitted;
         self.report.merge(report);
-        self.postcodes.merge(postcodes);
         for rejection in &rejections {
             self.audit.write(rejection)?;
         }
@@ -738,6 +784,10 @@ impl Build {
             return self
                 .addresses
                 .push(PendingAddress::new(address, self.seq - 1)?);
+        }
+        if let Record::Street(street) = record {
+            self.seq += 1;
+            return self.streets.push(PendingStreet::new(street, self.seq - 1)?);
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
@@ -757,14 +807,246 @@ impl Build {
     }
 }
 
+/// Addresses on their way into the record sorter, in street order: each
+/// group placed in the Hilbert order by its first address, so the group
+/// stays one run for the record store and the text index to share what its
+/// addresses state; lent its street's postcodes when it states none; and
+/// counted toward its postcode's point in the country it lies in.
+struct AddressRuns<'a> {
+    records: &'a mut ExternalSorter<PendingRecord>,
+    seq: &'a mut u64,
+    index: &'a BoundaryIndex,
+    country_codes: &'a HashMap<RecordId, CountryCode>,
+    street: postcode::Street,
+    postcodes: postcode::Accumulator,
+    batch: Vec<PendingAddress>,
+    /// The group key of the last address placed, its Hilbert key, and the
+    /// country it lies in.
+    group: Option<(Vec<u8>, u64, Option<CountryCode>)>,
+}
+
+impl<'a> AddressRuns<'a> {
+    fn new(
+        records: &'a mut ExternalSorter<PendingRecord>,
+        seq: &'a mut u64,
+        index: &'a BoundaryIndex,
+        country_codes: &'a HashMap<RecordId, CountryCode>,
+    ) -> Self {
+        Self {
+            records,
+            seq,
+            index,
+            country_codes,
+            street: postcode::Street::default(),
+            postcodes: postcode::Accumulator::default(),
+            batch: Vec::new(),
+            group: None,
+        }
+    }
+
+    fn push(&mut self, address: PendingAddress) -> Result<()> {
+        self.batch.push(address);
+        if self.batch.len() == WRITE_BATCH_RECORDS {
+            self.place_batch()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<postcode::Accumulator> {
+        self.place_batch()?;
+        Ok(self.postcodes)
+    }
+
+    fn place_batch(&mut self) -> Result<()> {
+        let batch = std::mem::take(&mut self.batch);
+        let starts = batch
+            .iter()
+            .enumerate()
+            .map(|(at, address)| match at {
+                0 => self
+                    .group
+                    .as_ref()
+                    .is_none_or(|(key, ..)| key[..] != address.order[..address.group_len]),
+                _ => !batch[at - 1].same_group(address),
+            })
+            .collect::<Vec<_>>();
+        // One lookup per group, not per address: a group is one street in
+        // one cell, which a border runs through too rarely to matter. Only
+        // a group stating a postcode needs its country.
+        let countries = batch
+            .par_iter()
+            .zip(&starts)
+            .map(|(address, start)| {
+                let Record::Address(record) = &address.record else {
+                    unreachable!("a pending address holds an address");
+                };
+                (*start && record.address.postcode.is_some())
+                    .then(|| record_context(self.index, &address.record))
+                    .flatten()
+                    .and_then(|context| context.admin_context.country_record_id())
+                    .and_then(|country| self.country_codes.get(&country).copied())
+            })
+            .collect::<Vec<_>>();
+        for ((mut address, start), country) in batch.into_iter().zip(starts).zip(countries) {
+            if start {
+                let [lon, lat] = address.record.display_point().ok_or_else(|| {
+                    Error::BadGeometry(format!(
+                        "record {} has no display point",
+                        address.record.id()
+                    ))
+                })?;
+                self.group = Some((
+                    address.order[..address.group_len].to_vec(),
+                    hilbert_key(quantize(lon)?, quantize(lat)?),
+                    country,
+                ));
+            }
+            let (_, key, country) = self.group.as_ref().expect("a group has a start");
+            self.street.lend(&mut address);
+            let Record::Address(record) = &address.record else {
+                unreachable!("a pending address holds an address");
+            };
+            self.postcodes
+                .accept(*country, &record.address, &record.geometry);
+            self.records.push(PendingRecord {
+                key: *key,
+                seq: *self.seq,
+                origin: None,
+                record: address.record,
+            })?;
+            *self.seq += 1;
+        }
+        Ok(())
+    }
+}
+
+/// The ways of each street name, joined into one street record per street
+/// of each area and pushed to `records`; how many streets that makes. OSM
+/// draws a road as a way per stretch between its junctions, so one road was
+/// as many answers as it has stretches, told apart only by their ids.
+///
+/// Ways join within the area their street is labelled with: the locality
+/// they lie in when that is a settlement (see `settled`), else its
+/// district, so a street in a city's ward or local board is named by the
+/// city and joins across the wards; else the locality. One name is many
+/// streets across a country, and a road crossing a town line is a street in
+/// each town. `area_names` are the names of each area, its own first.
+fn join_streets(
+    streets: ExternalSorter<PendingStreet>,
+    index: &BoundaryIndex,
+    settled: &HashSet<RecordId>,
+    area_names: &HashMap<RecordId, Vec<String>>,
+    records: &mut ExternalSorter<PendingRecord>,
+    seq: &mut u64,
+) -> Result<u64> {
+    let mut count = 0;
+    let mut flush = |runs: &mut Vec<Vec<StreetRecord>>| -> Result<()> {
+        let joined = runs
+            .par_drain(..)
+            .flat_map_iter(|run| {
+                let mut areas = Vec::<(Option<RecordId>, Option<String>, Vec<StreetRecord>)>::new();
+                for way in run {
+                    let [lon, lat] = way.representative_point;
+                    let context = index.context_for_point(lon, lat, Default::default());
+                    let tuple = &context.admin_context;
+                    let locality = tuple.locality_record_id();
+                    let area = locality
+                        .filter(|locality| settled.contains(locality))
+                        .or(tuple.district_record_id())
+                        .or(locality);
+                    match areas.iter_mut().find(|(at, ..)| *at == area) {
+                        Some((.., members)) => members.push(way),
+                        None => {
+                            let named =
+                                area.and_then(|area| area_names.get(&area)?.first().cloned());
+                            areas.push((area, named, vec![way]));
+                        }
+                    }
+                }
+                areas.into_iter().flat_map(|(_, named, members)| {
+                    street::join_ways(members)
+                        .into_iter()
+                        .map(move |mut street| {
+                            street.locality.clone_from(&named);
+                            street
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        for street in joined {
+            let [lon, lat] = street.representative_point;
+            records.push(PendingRecord {
+                key: hilbert_key(quantize(lon)?, quantize(lat)?),
+                seq: *seq,
+                origin: None,
+                record: Record::Street(street),
+            })?;
+            *seq += 1;
+            count += 1;
+        }
+        Ok(())
+    };
+    // Whole names at a time, a batch of ways or so per parallel join.
+    let mut runs = Vec::<Vec<StreetRecord>>::new();
+    let mut ways = 0;
+    let mut name = None::<Vec<u8>>;
+    for pending in streets.finish()? {
+        let pending = pending?;
+        if name.as_deref() != Some(pending.name_key()) {
+            if ways >= WRITE_BATCH_RECORDS {
+                flush(&mut runs)?;
+                ways = 0;
+            }
+            name = Some(pending.name_key().to_vec());
+            runs.push(Vec::new());
+        }
+        ways += 1;
+        runs.last_mut()
+            .expect("a run was started")
+            .push(pending.into_street());
+    }
+    flush(&mut runs)?;
+    Ok(count)
+}
+
 /// An imported address within this distance of an earlier address of the
 /// same house (street, number and unit) repeats it. Sources place one house a
 /// few metres apart, at the door, the parcel or the building's middle.
 const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 
+/// An imported address farther than [`REPEATED_HOUSE_RADIUS_M`] from a kept
+/// address of the same house, but within this, still names that house: the
+/// sources disagree on where it is. Below half the 2 km street-group cell, so
+/// it never joins what the cell grid keeps apart as two runs of one street,
+/// and far below the spacing of the places a street name repeats in (two
+/// villages' Hauptstrasse, a rural road crossing a county line where the
+/// numbers start over). A large rural parcel's centroid lies a few hundred
+/// metres from its house; a row geocoded to the wrong end of a street or to
+/// another town does not, and is kept as the house it says it is.
+const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
+
+/// An address kept so far in one house group.
+struct KeptHouse {
+    point: [f64; 2],
+    /// Where in the group's buffer it waits.
+    at: usize,
+}
+
 /// The addresses again, without the imported rows that repeat an address
 /// the Pack already has, OSM ones first: read in house order, then sorted
 /// back into street groups. Each dropped row is counted on its file.
+///
+/// One record answers for one house. A row within
+/// [`REPEATED_HOUSE_RADIUS_M`] of a kept address of its house agrees with it
+/// and is dropped. One beyond that, but within [`DISPUTED_HOUSE_RADIUS_M`] of
+/// a kept address it does not contradict, is dropped too: the kept address
+/// keeps its point, OSM's when OSM has the house, and is marked
+/// [`AddressRecord::disputed`]. Only a row farther still, or one stating
+/// another postcode, locality or area than every kept address near it, is a
+/// house of its own. Two houses of one street name and number lie apart by
+/// the distance between the places that repeat the name, which the radius
+/// stays below; where they lie closer, the postcode or the locality tells
+/// them apart.
 fn drop_repeated_houses(
     addresses: ExternalSorter<PendingAddress>,
     scratch: &Arc<crate::extsort::Scratch>,
@@ -779,14 +1061,26 @@ fn drop_repeated_houses(
         houses.push(PendingAddress::house(address.into_address(), seq)?)
     })?;
     let mut grouped = ExternalSorter::new(scratch, "addresses-kept", memory, budget);
-    let mut house: Option<PendingAddress> = None;
-    let mut kept: Vec<[f64; 2]> = Vec::new();
+    // A kept address is marked disputed only by the rows after it, so the
+    // house waits whole before it is passed on.
+    let mut house: Vec<(AddressRecord, u64)> = Vec::new();
+    let mut house_key: Option<PendingAddress> = None;
+    let mut kept: Vec<KeptHouse> = Vec::new();
+    let flush = |house: &mut Vec<(AddressRecord, u64)>,
+                 grouped: &mut ExternalSorter<PendingAddress>|
+     -> Result<()> {
+        for (record, seq) in house.drain(..) {
+            grouped.push(PendingAddress::new(record, seq)?)?;
+        }
+        Ok(())
+    };
     for address in houses.finish()? {
         let address = address?;
-        if house
+        if house_key
             .as_ref()
             .is_none_or(|house| !house.same_group(&address))
         {
+            flush(&mut house, &mut grouped)?;
             kept.clear();
         }
         let point = address.record.display_point().ok_or_else(|| {
@@ -795,26 +1089,87 @@ fn drop_repeated_houses(
                 address.record.id()
             ))
         })?;
-        let repeated = kept.iter().any(|[lon, lat]| {
-            crate::spatial_index::haversine_m(*lon, *lat, point[0], point[1])
-                <= REPEATED_HOUSE_RADIUS_M
-        });
         let record = address.clone().into_address();
-        if repeated && record.source.object_type == crate::record::ObjectType::Row {
+        let imported = record.source.object_type == ObjectType::Row;
+        let distance = |kept: &KeptHouse| {
+            crate::spatial_index::haversine_m(kept.point[0], kept.point[1], point[0], point[1])
+        };
+        let repeated = imported
+            && kept
+                .iter()
+                .any(|kept| distance(kept) <= REPEATED_HOUSE_RADIUS_M);
+        let disputed = if imported && !repeated {
+            kept.iter()
+                .filter(|kept| {
+                    distance(kept) <= DISPUTED_HOUSE_RADIUS_M
+                        && !other_house(&house[kept.at].0, &record)
+                })
+                .min_by(|left, right| distance(left).total_cmp(&distance(right)))
+                .map(|kept| kept.at)
+        } else {
+            None
+        };
+        if repeated || disputed.is_some() {
+            if let Some(at) = disputed {
+                house[at].0.disputed = true;
+            }
             if let Some(import) = report
                 .imports
                 .iter_mut()
                 .find(|import| import.dataset == record.source.dataset)
             {
-                import.duplicates += 1;
+                if repeated {
+                    import.duplicates += 1;
+                } else {
+                    import.disputes += 1;
+                }
             }
         } else {
-            kept.push(point);
-            grouped.push(PendingAddress::new(record, address.seq)?)?;
+            kept.push(KeptHouse {
+                point,
+                at: house.len(),
+            });
+            house.push((record, address.seq));
         }
-        house = Some(address);
+        house_key = Some(address);
     }
+    flush(&mut house, &mut grouped)?;
     Ok(grouped)
+}
+
+/// Whether two addresses of one house key state where they are differently:
+/// both state a postcode, a locality or areas, and they differ. Then they are
+/// two houses, however close.
+fn other_house(kept: &AddressRecord, row: &AddressRecord) -> bool {
+    fn differ<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
+        left.zip(right).is_some_and(|(left, right)| left != right)
+    }
+    let postcode = |address: &AddressComponents| {
+        address
+            .postcode
+            .as_deref()
+            .and_then(crate::text_index::compact_postcode)
+    };
+    let locality = |address: &AddressComponents| {
+        address
+            .locality
+            .as_deref()
+            .and_then(crate::util::fold::search_key)
+    };
+    let areas = |address: &AddressComponents| {
+        Some(
+            address
+                .areas
+                .iter()
+                .filter_map(|area| crate::util::fold::search_key(area))
+                .collect::<Vec<_>>(),
+        )
+        .filter(|areas| !areas.is_empty())
+    };
+    let (kept, row) = (&kept.address, &row.address);
+    differ(postcode(kept), postcode(row))
+        || differ(locality(kept), locality(row))
+        || differ(areas(kept), areas(row))
 }
 
 fn request_nodes(
@@ -1204,6 +1559,8 @@ mod tests {
                     limit: 20,
                     layer: None,
                     countries,
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
         };
@@ -1342,6 +1699,8 @@ mod tests {
                     limit: 1,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .into_iter()
@@ -1351,6 +1710,70 @@ mod tests {
         assert_eq!(top("16 King Street"), vec!["openaddresses:test:row:2"]);
         assert_eq!(top("10 King Street"), vec!["osm:node:1"]);
         assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A row naming a house OSM has, placed a few hundred metres away, is
+    /// the same house in the wrong place: one record, OSM's, marked disputed.
+    /// Farther, or in another postcode, it is a house of its own.
+    #[test]
+    fn keeps_one_record_of_a_house_two_sources_place_apart() {
+        let dir = temp_dir("disputed");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let csv = dir.join("addresses.csv");
+        // OSM has 10 King Street, Toronto, M5V 1A1 at 43.60, -79.40.
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.40,43.604,10,King Street,Toronto,M5V 1A1\n\
+             -79.40,43.70,10,King Street,Toronto,\n\
+             -79.40,43.596,10,King Street,Toronto,K7L 1A1\n",
+        )
+        .expect("csv");
+        let report = build_osm_pack(BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                addresses::AddressFile {
+                    dataset: "openaddresses:test".to_string(),
+                    path: csv,
+                },
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let imported = &report.imports[0];
+        assert_eq!((imported.duplicates, imported.disputes), (0, 1));
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
+        let disputed = |id: &str| {
+            let record_id = reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"));
+            match reader.records().record(record_id).expect("record") {
+                Record::Address(address) => address.disputed,
+                other => panic!("{id} is an address: {other:?}"),
+            }
+        };
+        assert!(disputed("osm:node:1"), "OSM's point is kept, disputed");
+        assert_eq!(
+            reader
+                .find_by_source_id("openaddresses:test:row:1")
+                .expect("lookup"),
+            None,
+            "the row 445 m away is dropped"
+        );
+        assert!(
+            !disputed("openaddresses:test:row:2"),
+            "11 km away: another house"
+        );
+        assert!(
+            !disputed("openaddresses:test:row:3"),
+            "another postcode: another house"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1409,6 +1832,8 @@ mod tests {
                     limit: 1,
                     layer: None,
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .into_iter()
@@ -1483,24 +1908,20 @@ mod tests {
         assert!(report.scratch.peak_tracked_bytes > 0);
         assert!(report.scratch.peak_tracked_bytes <= report.scratch.memory_budget_bytes);
 
-        // Context records come first, and each group is in Hilbert order, a
-        // street's addresses placed at the first of them.
+        // Places come first, and each group is in Hilbert order, a street's
+        // addresses placed at the first of them. Postcodes are placed with
+        // the rest: they wait on every address.
         let headers = (0..reader.manifest().record_count)
             .map(|id| reader.records().header(id).expect("header"))
             .collect::<Vec<_>>();
         let first_other = headers
             .iter()
-            .position(|header| !header.layer.is_context())
-            .expect("non-context records");
-        assert!(
-            headers[..first_other]
-                .iter()
-                .all(|header| header.layer.is_context())
-        );
+            .position(|header| header.layer.place_layer().is_none())
+            .expect("records other than places");
         assert!(
             headers[first_other..]
                 .iter()
-                .all(|header| !header.layer.is_context())
+                .all(|header| header.layer.place_layer().is_none())
         );
         for range in [0..first_other, first_other..headers.len()] {
             let mut keys = Vec::new();
@@ -1548,6 +1969,8 @@ mod tests {
                 limit: 1,
                 layer: Some("address".into()),
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("search");
         assert_eq!(hits[0].record.id, "osm:node:1");
@@ -1700,6 +2123,8 @@ mod tests {
                     limit: 1,
                     layer: Some(layer.into()),
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
                 .first()
@@ -1950,6 +2375,8 @@ mod tests {
                     limit: 5,
                     layer: layer.map(str::to_string),
                     countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
                 })
                 .expect("search")
         };
@@ -1997,6 +2424,8 @@ mod tests {
                 limit: 5,
                 layer: None,
                 countries: Vec::new(),
+                focus: None,
+                bbox: None,
             })
             .expect("autocomplete");
         assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);
@@ -2016,6 +2445,108 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn joins_the_ways_of_a_street_and_labels_it_with_its_town() {
+        let dir = temp_dir("street-join");
+        let input = dir.join("streets.osm.pbf");
+        let square = |first: i64, low: f64, high: f64| {
+            [
+                node(first, low, low, &[]),
+                node(first + 1, low, high, &[]),
+                node(first + 2, high, high, &[]),
+                node(first + 3, high, low, &[]),
+            ]
+        };
+        let area =
+            |relation_id: i64, ways: i64, first: i64, level: &'static str, name: &'static str| {
+                (
+                    [
+                        way(ways, &[first, first + 1, first + 2], &[]),
+                        way(ways + 1, &[first + 2, first + 3, first], &[]),
+                    ],
+                    relation(
+                        relation_id,
+                        &[(ways, "outer"), (ways + 1, "outer")],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", level),
+                            ("name", name),
+                        ],
+                    ),
+                )
+            };
+        let road = |name: &'static str| [("highway", "residential"), ("name", name)];
+        let mut nodes = Vec::new();
+        nodes.extend(square(101, 0.0, 1.0));
+        nodes.extend(square(111, 0.1, 0.4));
+        nodes.extend(square(121, 0.6, 0.9));
+        nodes.extend([
+            // The town Kingston's point names the boundary it lies in; no
+            // point names the local board.
+            node(130, 0.75, 0.75, &[("place", "town"), ("name", "Kingston")]),
+            node(201, 0.2, 0.2, &[]),
+            node(202, 0.2, 0.201, &[]),
+            node(203, 0.2, 0.202, &[]),
+            node(204, 0.2005, 0.203, &[]),
+            node(205, 0.3, 0.3, &[]),
+            node(206, 0.3, 0.301, &[]),
+            node(211, 0.7, 0.7, &[]),
+            node(212, 0.7, 0.701, &[]),
+            node(213, 0.7, 0.702, &[]),
+        ]);
+        let (district_ways, district) = area(900, 500, 101, "6", "Auckland");
+        let (board_ways, board) = area(910, 510, 111, "8", "Waitematā");
+        let (town_ways, town) = area(920, 520, 121, "8", "Kingston");
+        let mut ways = Vec::new();
+        ways.extend(district_ways);
+        ways.extend(board_ways);
+        ways.extend(town_ways);
+        ways.extend([
+            // One road drawn as three ways, then a road of its name far off.
+            way(700, &[201, 202], &road("Ponsonby Road")),
+            way(701, &[202, 203], &road("Ponsonby Road")),
+            way(702, &[203, 204], &road("Ponsonby Road")),
+            way(703, &[205, 206], &road("Ponsonby Road")),
+            way(710, &[211, 212], &road("Main Street")),
+            way(711, &[212, 213], &road("Main Street")),
+        ]);
+        write_pbf(&input, &[nodes, ways, vec![district, board, town]]);
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.street_segments, 6);
+        assert_eq!(report.accepted.streets, 3);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut streets = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| {
+                (
+                    street["id"].as_str().expect("id").to_string(),
+                    street["label"].as_str().expect("label").to_string(),
+                    street["geometry"]["type"]
+                        .as_str()
+                        .expect("type")
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        streets.sort();
+        let street = |id: &str, label: &str, kind: &str| {
+            (id.to_string(), label.to_string(), kind.to_string())
+        };
+        assert_eq!(
+            streets,
+            vec![
+                street("osm:way:700", "Ponsonby Road, Auckland", "MultiLineString"),
+                street("osm:way:703", "Ponsonby Road, Auckland", "LineString"),
+                street("osm:way:710", "Main Street, Kingston", "MultiLineString"),
+            ],
+            "a street in a local board is named by its district, one in a town by the town"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

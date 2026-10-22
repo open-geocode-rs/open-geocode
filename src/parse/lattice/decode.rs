@@ -59,6 +59,9 @@ pub(super) struct Lattice {
     /// The spans that are names of areas the Pack knows, as `(start, end,
     /// the record ids of the areas)`.
     pub places: Vec<(usize, usize, Vec<u32>)>,
+    /// The names spans are a typo of, as `(start, end, the label the name
+    /// is read as, the name's key)`.
+    pub corrections: Vec<(usize, usize, Label, String)>,
     /// Span indices by the token they end before.
     by_end: Vec<Vec<usize>>,
 }
@@ -76,6 +79,7 @@ impl Lattice {
             spans,
             candidates,
             places: Vec::new(),
+            corrections: Vec::new(),
             by_end,
         }
     }
@@ -163,6 +167,13 @@ impl Lattice {
                 put_u64(out, u64::from(*id));
             }
         }
+        put_u64(out, self.corrections.len() as u64);
+        for (start, end, label, name) in &self.corrections {
+            put_u64(out, *start as u64);
+            put_u64(out, *end as u64);
+            out.push(*label as u8);
+            put_str(out, name);
+        }
     }
 
     pub(super) fn decode(input: &mut &[u8]) -> Result<Self> {
@@ -232,8 +243,18 @@ impl Lattice {
                 .collect::<Result<Vec<_>>>()?;
             places.push((start, end, ids));
         }
+        let mut corrections = Vec::new();
+        for _ in 0..count(input)? {
+            let start = count(input)?;
+            let end = count(input)?;
+            let label = *Label::ALL
+                .get(usize::from(get_u8(input)?))
+                .ok_or(Error::Decode("invalid label in a lattice"))?;
+            corrections.push((start, end, label, get_string(input)?));
+        }
         let mut lattice = Self::new(units, spans, candidates);
         lattice.places = places;
+        lattice.corrections = corrections;
         Ok(lattice)
     }
 }

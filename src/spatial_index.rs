@@ -33,7 +33,7 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use geojson::{Geometry, GeometryValue};
+use geojson::Geometry;
 use serde::Serialize;
 
 use crate::{
@@ -42,7 +42,7 @@ use crate::{
     pack::RecordId,
     record::{Layer, Record},
     records::{self, BLOCK_RECORDS, dequantize, quantize},
-    util::codec::read_u64_le,
+    util::{codec::read_u64_le, geo::line_parts},
 };
 
 pub const SPATIAL_VERSION: u32 = 3;
@@ -279,11 +279,11 @@ impl Writer {
 }
 
 fn line_box(geometry: &Geometry) -> Result<Option<BoundingBox>> {
-    let GeometryValue::LineString { coordinates } = &geometry.value else {
+    let Some(parts) = line_parts(geometry) else {
         return Ok(None);
     };
     let mut bbox = EMPTY;
-    for position in coordinates {
+    for position in parts.into_iter().flatten() {
         if let [lon, lat, ..] = position.as_slice()
             && lon.is_finite()
             && lat.is_finite()
@@ -546,10 +546,26 @@ impl std::fmt::Debug for Reader {
     }
 }
 
+/// The segments of a line record, each part's in order, with the length of
+/// the line before and at the end of each, in metres. The parts of a street
+/// of several ways are measured end to end, as one line without the gaps.
 struct LineCache {
-    points: Vec<[f64; 2]>,
-    /// Cumulative length at each vertex, in metres.
-    lengths: Vec<f64>,
+    segments: Vec<LineSegment>,
+}
+
+struct LineSegment {
+    start: [f64; 2],
+    end: [f64; 2],
+    start_length: f64,
+    end_length: f64,
+}
+
+impl LineCache {
+    fn total(&self) -> f64 {
+        self.segments
+            .last()
+            .map_or(0.0, |segment| segment.end_length)
+    }
 }
 
 impl Reader {
@@ -677,15 +693,15 @@ impl Reader {
             let Some(line) = self.records.line(record_id)?.map(line_cache) else {
                 continue;
             };
-            let total = *line.lengths.last().expect("line has vertices");
-            for (segment, pair) in line.points.windows(2).enumerate() {
-                if haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]) <= f64::EPSILON {
+            let total = line.total();
+            for segment in &line.segments {
+                if segment.end_length - segment.start_length <= f64::EPSILON {
                     continue;
                 }
-                let projection = project_to_segment_m(lon, lat, pair[0], pair[1]);
+                let projection = project_to_segment_m(lon, lat, segment.start, segment.end);
                 if projection.distance_m <= radius_m {
-                    let start_fraction = line.lengths[segment] / total;
-                    let end_fraction = line.lengths[segment + 1] / total;
+                    let start_fraction = segment.start_length / total;
+                    let end_fraction = segment.end_length / total;
                     closest.add(projection.distance_m);
                     candidates.push(SegmentCandidate {
                         record_id,
@@ -708,23 +724,22 @@ impl Reader {
         let Some(line) = self.records.line(record_id)?.map(line_cache) else {
             return Ok(None);
         };
-        let total = *line.lengths.last().expect("line has vertices");
-        let target = fraction.clamp(0.0, 1.0) * total;
-        let segment = line
-            .lengths
-            .windows(2)
-            .position(|pair| target <= pair[1])
-            .unwrap_or(line.points.len().saturating_sub(2));
-        let (Some(start), Some(end)) = (line.points.get(segment), line.points.get(segment + 1))
+        let target = fraction.clamp(0.0, 1.0) * line.total();
+        let Some(segment) = line
+            .segments
+            .iter()
+            .find(|segment| target <= segment.end_length)
+            .or(line.segments.last())
         else {
-            return Ok(line.points.first().copied());
+            return Ok(None);
         };
-        let length = line.lengths[segment + 1] - line.lengths[segment];
+        let length = segment.end_length - segment.start_length;
         let t = if length <= f64::EPSILON {
             0.0
         } else {
-            (target - line.lengths[segment]) / length
+            (target - segment.start_length) / length
         };
+        let (start, end) = (segment.start, segment.end);
         Ok(Some([
             start[0] + t * (end[0] - start[0]),
             start[1] + t * (end[1] - start[1]),
@@ -808,19 +823,26 @@ impl DegreeWindow {
     }
 }
 
-fn line_cache(points: Vec<[i32; 2]>) -> LineCache {
-    let points = points
-        .into_iter()
-        .map(|[lon, lat]| [dequantize(lon), dequantize(lat)])
-        .collect::<Vec<_>>();
-    let mut lengths = Vec::with_capacity(points.len());
+fn line_cache(parts: Vec<Vec<[i32; 2]>>) -> LineCache {
+    let mut segments = Vec::new();
     let mut total = 0.0;
-    lengths.push(0.0);
-    for pair in points.windows(2) {
-        total += haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]);
-        lengths.push(total);
+    for part in parts {
+        let points = part
+            .into_iter()
+            .map(|[lon, lat]| [dequantize(lon), dequantize(lat)])
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            let start_length = total;
+            total += haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]);
+            segments.push(LineSegment {
+                start: pair[0],
+                end: pair[1],
+                start_length,
+                end_length: total,
+            });
+        }
     }
-    LineCache { points, lengths }
+    LineCache { segments }
 }
 
 struct SegmentProjection {
@@ -927,6 +949,7 @@ mod tests {
         },
         records,
     };
+    use geojson::GeometryValue;
 
     #[test]
     fn closest_candidates_matches_stable_full_sort() {
@@ -959,6 +982,8 @@ mod tests {
 
     fn address(lon: f64, lat: f64, object_id: i64) -> Record {
         Record::Address(AddressRecord {
+            disputed: false,
+            street_postcodes: Vec::new(),
             address: AddressComponents {
                 areas: Vec::new(),
                 number: "10".to_string(),
@@ -1069,6 +1094,7 @@ mod tests {
             .map(|(index, [lon, lat])| {
                 Record::Postcode(PostcodeRecord {
                     postcode: format!("P{index}"),
+                    country: None,
                     geometry: point_geometry(*lon, *lat),
                     source: DerivedSourceProvenance::osm_address_records(1),
                 })
@@ -1132,6 +1158,7 @@ mod tests {
             address(-79.4, 43.6, 1),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".to_string(),
+                country: None,
                 geometry: point_geometry(-79.4, 43.6),
                 source: DerivedSourceProvenance::osm_address_records(1),
             }),
@@ -1150,6 +1177,7 @@ mod tests {
         let street = |object_id: i64, lon: f64| {
             Record::Street(StreetRecord {
                 alt_names: Vec::new(),
+                locality: None,
                 name: "King Street".to_string(),
                 geometry: Geometry::new(GeometryValue::LineString {
                     coordinates: vec![
@@ -1186,5 +1214,37 @@ mod tests {
                 .expect("other layer")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn measures_a_street_of_several_ways_end_to_end() {
+        let part = |lon: f64| vec![vec![lon, 43.0].into(), vec![lon, 43.001].into()];
+        let street = Record::Street(StreetRecord {
+            alt_names: Vec::new(),
+            locality: None,
+            name: "King Street".to_string(),
+            // Two ways of one street, a gap between them.
+            geometry: Geometry::new(GeometryValue::MultiLineString {
+                coordinates: vec![part(-79.0), part(-78.99)],
+            }),
+            representative_point: [-79.0, 43.0005],
+            source: SourceProvenance::osm(ObjectType::Way, 1),
+        });
+        let (reader, commit) = build(&[street]);
+        assert_eq!(commit.line_count, 1);
+        let hits = reader
+            .segment_candidates(-78.99001, 43.0005, Layer::Street, 5.0, 1)
+            .expect("hits");
+        assert_eq!(hits.len(), 1, "the second way is found");
+        assert!(
+            (hits[0].fraction - 0.75).abs() < 0.01,
+            "{}",
+            hits[0].fraction
+        );
+        let [lon, lat] = reader
+            .point_along_line(0, 0.25)
+            .expect("read")
+            .expect("a line");
+        assert!((lon + 79.0).abs() < 1e-9 && (lat - 43.0005).abs() < 1e-6);
     }
 }

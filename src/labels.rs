@@ -1,5 +1,9 @@
-use crate::record::{
-    AddressComponents, InterpolationAddressComponents, InterpolationRange, OSM_DATASET, ObjectType,
+use crate::{
+    parse::lattice::CountryCode,
+    record::{
+        AddressComponents, InterpolationAddressComponents, InterpolationRange, OSM_DATASET,
+        ObjectType,
+    },
 };
 
 pub fn address_name(components: &AddressComponents) -> String {
@@ -10,11 +14,30 @@ pub fn address_name(components: &AddressComponents) -> String {
         .join(" ")
 }
 
+/// A unit as a label shows it: "Unit 1" for a bare "1", so it never reads
+/// as a place; "Flat 2" or "Apt 4B" as stated.
+fn unit_label(unit: &str) -> String {
+    let unit = unit.trim();
+    if unit.split_whitespace().count() > 1
+        || unit.starts_with(|character: char| character.is_alphabetic())
+            && unit
+                .chars()
+                .filter(|character| character.is_alphabetic())
+                .count()
+                > 1
+    {
+        unit.to_string()
+    } else {
+        format!("Unit {unit}")
+    }
+}
+
 pub fn address_label(components: &AddressComponents) -> String {
     let primary = address_name(components);
+    let unit = components.unit.as_deref().map(unit_label);
     [
         Some(primary.as_str()),
-        components.unit.as_deref(),
+        unit.as_deref(),
         components.locality.as_deref(),
         components.region.as_deref(),
         components.postcode.as_deref(),
@@ -38,10 +61,11 @@ pub fn poi_label(
     let field = |field: fn(&AddressComponents) -> &Option<String>| {
         address.and_then(|address| field(address).as_deref())
     };
+    let unit = field(|address| &address.unit).map(unit_label);
     [
         Some(name),
         primary.as_deref(),
-        field(|address| &address.unit),
+        unit.as_deref(),
         field(|address| &address.locality).or(locality),
         field(|address| &address.region),
         field(|address| &address.postcode),
@@ -52,6 +76,14 @@ pub fn poi_label(
     .filter(|part| !part.is_empty())
     .collect::<Vec<_>>()
     .join(", ")
+}
+
+/// "Ponsonby Road, Auckland": a street and the locality it lies in.
+pub fn street_label(name: &str, locality: Option<&str>) -> String {
+    match locality {
+        Some(locality) if !locality.is_empty() => format!("{name}, {locality}"),
+        _ => name.to_string(),
+    }
 }
 
 pub fn interpolation_name(components: &InterpolationAddressComponents) -> String {
@@ -131,8 +163,17 @@ pub fn record_id(dataset: &str, object_type: ObjectType, object_id: i64) -> Stri
     format!("{dataset}:{}:{object_id}", object_type_name(object_type))
 }
 
-pub fn derived_postcode_id(postcode: &str) -> String {
-    format!("derived:osm:postcode:{}", url_safe_id_component(postcode))
+/// "derived:osm:postcode:nz:2110": one postcode of one country. Without a
+/// known country, "derived:osm:postcode:2110".
+pub fn derived_postcode_id(country: Option<CountryCode>, postcode: &str) -> String {
+    let postcode = url_safe_id_component(postcode);
+    match country {
+        Some(country) => format!(
+            "derived:osm:postcode:{}:{postcode}",
+            country.as_str().to_ascii_lowercase()
+        ),
+        None => format!("derived:osm:postcode:{postcode}"),
+    }
 }
 
 pub fn derived_country_id(code: &str) -> String {
@@ -180,6 +221,33 @@ fn url_safe_id_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_unit_reads_as_a_unit_not_a_place() {
+        let address = AddressComponents {
+            areas: Vec::new(),
+            number: "40".to_string(),
+            street: Some("Rosedale Road".to_string()),
+            place: None,
+            unit: Some("1".to_string()),
+            locality: Some("Auckland".to_string()),
+            region: None,
+            postcode: None,
+            country: None,
+        };
+        assert_eq!(
+            address_label(&address),
+            "40 Rosedale Road, Unit 1, Auckland"
+        );
+        for (unit, shown) in [
+            ("4B", "Unit 4B"),
+            ("G", "Unit G"),
+            ("Flat 2", "Flat 2"),
+            ("Apt4B", "Apt4B"),
+        ] {
+            assert_eq!(unit_label(unit), shown);
+        }
+    }
 
     #[test]
     fn composes_poi_labels_from_name_address_and_locality() {

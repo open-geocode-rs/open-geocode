@@ -255,8 +255,15 @@
           },
           {
             "properties": {
+              "confidence": {
+                "description": "The chance this answer is the address or place the query asks for,\nfrom 0 to 1, comparable across queries: of the answers given 0.8,\nabout eight in ten are right. It is calibrated per Pack, by\n`geocode calibrate` on held-out addresses, and is absent from every\nanswer of a Pack that has not been calibrated.",
+                "format": "float",
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
               "score": {
-                "description": "Text relevance: higher is better, comparable only within one answer.\n\nIt orders the features of one response and nothing else. It is not a\nprobability, not a quality score, and not comparable between queries\nor between Packs — two answers' scores say nothing about each other.\nTo judge how good a single answer is, read `accuracy` and `layer`,\nwhich mean the same thing in every response.",
+                "description": "Text relevance: higher is better, comparable only within one answer.\n\nIt orders the features of one response and nothing else. It is not a\nprobability, not a quality score, and not comparable between queries\nor between Packs — two answers' scores say nothing about each other.\nTo judge how good a single answer is, read `confidence`, or\n`accuracy` and `layer`, which mean the same thing in every response.",
                 "format": "float",
                 "type": "number"
               }
@@ -534,7 +541,7 @@
     }
   },
   "info": {
-    "description": "Search, autocomplete and reverse geocoding served from a single binary Pack built from OpenStreetMap extracts.\n\nEvery answer is one GeoJSON FeatureCollection, so a response drops straight into a map library. Forward answers carry a `score`, reverse answers a `distance_m`; nothing else differs between them.\n\nErrors are RFC 9457 problem documents served as `application/problem+json`. Branch on `error_code`, which is a closed set; `title` and `detail` are prose and may be reworded.",
+    "description": "Search, autocomplete and reverse geocoding served from a single binary Pack built from OpenStreetMap extracts.\n\nEvery answer is one GeoJSON FeatureCollection, so a response drops straight into a map library. Forward answers carry a `score`, and a calibrated `confidence` once the Pack has been calibrated; reverse answers carry a `distance_m`. Nothing else differs between them.\n\nErrors are RFC 9457 problem documents served as `application/problem+json`. Branch on `error_code`, which is a closed set; `title` and `detail` are prose and may be reworded.",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -589,6 +596,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Where the caller is, `lon,lat`. Of answers the query cannot tell apart, the nearer ranks first; it never outranks what the query states or a better match. A point out of range is rejected.",
+            "example": "-79.38,43.65",
+            "in": "query",
+            "name": "focus",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return only answers inside this box, `min_lon,min_lat,max_lon,max_lat`. Its west edge must not lie east of its east edge, nor its south edge north of its north edge: a box across the antimeridian is two requests.",
+            "example": "-79.64,43.58,-79.12,43.86",
+            "in": "query",
+            "name": "bbox",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -619,7 +646,7 @@
                 }
               }
             },
-            "description": "`q` was too long, `limit` was above the maximum, or a parameter did not parse.",
+            "description": "`q` was too long, `limit` was above the maximum, `focus` or `bbox` was out of range, or a parameter did not parse.",
             "headers": {
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
@@ -1188,6 +1215,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Where the caller is, `lon,lat`. Of answers the query cannot tell apart, the nearer ranks first; it never outranks what the query states or a better match. A point out of range is rejected.",
+            "example": "-79.38,43.65",
+            "in": "query",
+            "name": "focus",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return only answers inside this box, `min_lon,min_lat,max_lon,max_lat`. Its west edge must not lie east of its east edge, nor its south edge north of its north edge: a box across the antimeridian is two requests.",
+            "example": "-79.64,43.58,-79.12,43.86",
+            "in": "query",
+            "name": "bbox",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1218,7 +1265,7 @@
                 }
               }
             },
-            "description": "`q` was empty or too long, `limit` was above the maximum, or a parameter did not parse.",
+            "description": "`q` was empty or too long, `limit` was above the maximum, `focus` or `bbox` was out of range, or a parameter did not parse.",
             "headers": {
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",

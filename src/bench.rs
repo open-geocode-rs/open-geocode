@@ -15,7 +15,7 @@ use crate::{
     record::{Layer, ObjectType, Record},
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
-    text_index::normalize_index_text,
+    util::fold::search_key,
 };
 
 /// Hits a sampled POI case asks for: enough to score hit@5.
@@ -329,6 +329,8 @@ fn benchmark_search_cases(
             limit,
             layer: case.layer.clone(),
             countries: Vec::new(),
+            focus: None,
+            bbox: None,
         })
     })
 }
@@ -345,6 +347,8 @@ fn benchmark_autocomplete_cases(
             limit,
             layer: case.layer.clone(),
             countries: Vec::new(),
+            focus: None,
+            bbox: None,
         })
     })
 }
@@ -496,7 +500,7 @@ pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture
         let Some(context) = reader.boundary_context(record_id)? else {
             continue;
         };
-        let name = normalize_index_text(&poi.name).unwrap_or_default();
+        let name = search_key(&poi.name).unwrap_or_default();
         let tuple = context.admin_context;
         let mut areas = Vec::new();
         for area_id in [tuple.locality_record_id(), tuple.district_record_id()]
@@ -504,7 +508,7 @@ pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture
             .flatten()
         {
             if let Some(area) = reader.context_record(area_id)? {
-                areas.push(normalize_index_text(&area.name).unwrap_or_default());
+                areas.push(search_key(&area.name).unwrap_or_default());
             }
         }
         areas.dedup();
@@ -512,7 +516,7 @@ pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture
             *name_counts.entry((area, name.clone())).or_default() += 1;
         }
         if let Some(locality) = reader.locality(record_id)? {
-            let key = (normalize_index_text(&locality).unwrap_or_default(), name);
+            let key = (search_key(&locality).unwrap_or_default(), name);
             candidates.push((key, poi, locality));
         }
     }
@@ -694,6 +698,7 @@ mod tests {
                 geometry: point_geometry(-79.4, 43.6),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, object_id),
+                prominence: Default::default(),
             };
             writer.write(&poi.into(), context).expect("POI");
         }
@@ -844,6 +849,8 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    disputed: false,
+                    street_postcodes: Vec::new(),
                     address: AddressComponents {
                         areas: Vec::new(),
                         number: "10".to_string(),

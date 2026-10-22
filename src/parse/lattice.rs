@@ -46,6 +46,7 @@ use crate::{
     container::Container,
     pack::resolve_pack_path,
     text_index::{expand_address_abbreviations, expand_final_direction},
+    util::fold::{Piece, search_key, search_pieces},
 };
 
 /// The longest span looked up as one name.
@@ -121,7 +122,7 @@ impl fmt::Display for CountryCode {
     }
 }
 
-/// A query split into the words `normalize_index_text` produces, with where
+/// A query split into the words [`search_key`] produces, with where
 /// punctuation that separates fields (a comma, a semicolon, a line break)
 /// stood between them, and which words punctuation joins to the word before
 /// ("993.5", "1/2", "306-1333"). Commas are a feature of the parse, never its
@@ -138,37 +139,29 @@ pub struct Tokens {
 
 impl Tokens {
     /// Split raw query text. Joined by single spaces the words are exactly
-    /// `normalize_index_text` of the text.
+    /// [`search_key`] of the text.
     pub fn new(text: &str) -> Self {
         let mut tokens = Self::default();
-        let mut word = String::new();
         let mut pending_break = false;
         // What stood between the last word and this one, while it can still
         // be a joiner.
         let mut gap = Gap::None;
-        for character in text.chars() {
-            if character.is_alphanumeric() {
-                for folded in character.to_lowercase() {
-                    word.push(folded);
-                }
-                continue;
-            }
-            if !word.is_empty() {
-                tokens.push(std::mem::take(&mut word), pending_break, gap.joiner());
+        search_pieces(text, |piece| match piece {
+            Piece::Word(word) => {
+                tokens.push(word.to_string(), pending_break, gap.joiner());
                 pending_break = false;
                 gap = Gap::None;
             }
-            gap = match gap {
-                Gap::None if JOINERS.contains(&character) => Gap::Joiner(character),
-                _ => Gap::Other,
-            };
-            if FIELD_BREAKS.contains(&character) && !tokens.words.is_empty() {
-                pending_break = true;
+            Piece::Gap(character) => {
+                gap = match gap {
+                    Gap::None if JOINERS.contains(&character) => Gap::Joiner(character),
+                    _ => Gap::Other,
+                };
+                if FIELD_BREAKS.contains(&character) && !tokens.words.is_empty() {
+                    pending_break = true;
+                }
             }
-        }
-        if !word.is_empty() {
-            tokens.push(word, pending_break, gap.joiner());
-        }
+        });
         tokens
     }
 
@@ -234,18 +227,6 @@ fn is_neutral(word: &str) -> bool {
         })
 }
 
-/// `word` with the fullwidth forms of ASCII characters ("１", "ａ") written as
-/// ASCII, as compatibility normalization (NFKC) folds them, so a number typed
-/// through an input method is the number a name is stored with.
-fn fold_width(word: &str) -> String {
-    word.chars()
-        .map(|character| match u32::from(character) {
-            code @ 0xFF01..=0xFF5E => char::from_u32(code - 0xFEE0).unwrap_or(character),
-            _ => character,
-        })
-        .collect()
-}
-
 /// `character<TAB>value` rows of the ideographs that are numerals, from the
 /// Unihan kPrimaryNumeric property (Unicode License V3, see
 /// `NOTICE`), vendored.
@@ -303,7 +284,7 @@ pub fn mask_numerals(key: &str) -> Option<String> {
 /// ("とうきょう たからづかげきじょう") is found by the units of a query that
 /// writes it.
 pub fn dictionary_key(name: &str) -> Option<String> {
-    let normalized = crate::text_index::normalize_index_text(name)?;
+    let normalized = search_key(name)?;
     let words = normalized.split(' ').collect::<Vec<_>>();
     let units = Units::of(&Tokens::from_words(&words));
     Some(units.key(0, units.len()))
@@ -312,11 +293,10 @@ pub fn dictionary_key(name: &str) -> Option<String> {
 /// The units a lattice is built on: the tokens of a [`Tokens`], except that
 /// a token holding characters of a script written without spaces is split
 /// into one unit per such character and one per run of other characters
-/// ("丸の内2" is "丸", "の", "内", "2"), and fullwidth forms are folded to
-/// ASCII ([`fold_width`]). Units written with no space between them, or with
-/// only a space between a character of such a script and another or a digit
-/// (see [`is_neutral`]), are *glued*: they join without a space in a
-/// dictionary key, so "東京都千代田区", "東京都 千代田区" and
+/// ("丸の内2" is "丸", "の", "内", "2"). Units written with no space between
+/// them, or with only a space between a character of such a script and
+/// another or a digit (see [`is_neutral`]), are *glued*: they join without a
+/// space in a dictionary key, so "東京都千代田区", "東京都 千代田区" and
 /// "東 京 都 千 代 田 区" are the same units with the same keys, and so are
 /// "5番2号" and "5 番 2 号".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -339,9 +319,8 @@ impl Units {
             glued: Vec::with_capacity(tokens.len()),
         };
         for (index, word) in tokens.words.iter().enumerate() {
-            let word = fold_width(word);
             if !word.chars().any(is_unspaced) {
-                units.push(tokens, index, word, true);
+                units.push(tokens, index, word.clone(), true);
                 continue;
             }
             let mut first = true;
@@ -480,25 +459,103 @@ impl Units {
     /// with one label, a name read a character at a time ("丸", "の", "内"
     /// is "丸の内"), so a search looks up the names the text index holds.
     pub fn pieces(&self, segments: &[(usize, usize, Label)]) -> Vec<Tagged> {
+        self.corrected_pieces(segments, &[]).0
+    }
+
+    /// [`Self::pieces`], each with the word of the name it is a typo of
+    /// when that word differs from it (see [`Self::unit_corrections`]).
+    fn corrected_pieces(
+        &self,
+        segments: &[(usize, usize, Label)],
+        corrections: &[(usize, usize, Label, String)],
+    ) -> (Vec<Tagged>, Vec<Option<String>>) {
+        let by_unit = self.unit_corrections(segments, corrections);
         let mut pieces: Vec<Tagged> = Vec::with_capacity(segments.len());
+        let mut corrected: Vec<Option<String>> = Vec::with_capacity(segments.len());
         // Whether the last piece is a run of one-unit segments.
         let mut open_run = false;
         for &(start, end, label) in segments {
             let single = end - start == 1;
-            for unit in start..end {
+            for (unit, correction) in (start..end).zip(&by_unit[start..end]) {
                 let word = &self.tokens.words[unit];
                 let joins = self.glued[unit] && (unit > start || (single && open_run));
                 match pieces.last_mut() {
-                    Some(last) if joins && last.label == label => last.token.push_str(word),
-                    _ => pieces.push(Tagged {
-                        token: word.clone(),
-                        label,
-                    }),
+                    Some(last) if joins && last.label == label => {
+                        last.token.push_str(word);
+                        *corrected.last_mut().expect("one per piece") = None;
+                    }
+                    _ => {
+                        pieces.push(Tagged {
+                            token: word.clone(),
+                            label,
+                        });
+                        corrected.push(correction.clone());
+                    }
                 }
             }
             open_run = single;
         }
-        pieces
+        (pieces, corrected)
+    }
+
+    /// The word of the name each unit is a typo of, from a lattice's
+    /// `corrections`: of a span whose every unit `segments` label as its
+    /// name reads, so a name read a word at a time ("lamton", "quay" as two
+    /// street segments) is still corrected. A span that is a segment comes
+    /// first, then the longest.
+    fn unit_corrections(
+        &self,
+        segments: &[(usize, usize, Label)],
+        corrections: &[(usize, usize, Label, String)],
+    ) -> Vec<Option<String>> {
+        let mut labels = vec![Label::Other; self.len()];
+        for &(start, end, label) in segments {
+            labels[start..end].fill(label);
+        }
+        let mut candidates = corrections
+            .iter()
+            .filter(|(start, end, label, _)| labels[*start..*end].iter().all(|at| at == label))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(start, end, label, _)| {
+            (
+                !segments.contains(&(*start, *end, *label)),
+                std::cmp::Reverse(end - start),
+            )
+        });
+        let mut by_unit = vec![None; self.len()];
+        let mut decided = vec![false; self.len()];
+        for (start, end, _, name) in candidates {
+            if decided[*start..*end].iter().any(|decided| *decided) {
+                continue;
+            }
+            if let Some(words) = self.correction(*start, *end, name) {
+                for (unit, word) in (*start..*end).zip(words) {
+                    by_unit[unit] = word;
+                    decided[unit] = true;
+                }
+            }
+        }
+        by_unit
+    }
+
+    /// The word of `name` each unit of `start..end` is a typo of, `None`
+    /// where it is the unit as the text index expands it. `None` when the
+    /// span's words do not pair one to one with the name's, or it has a
+    /// glued unit: fuzzy lookup skips scripts without spaces.
+    fn correction(&self, start: usize, end: usize, name: &str) -> Option<Vec<Option<String>>> {
+        if self.glued[start..end].iter().any(|glued| *glued) {
+            return None;
+        }
+        let expanded = expand_key(&self.key(start, end));
+        let written = expanded.split(' ').collect::<Vec<_>>();
+        let named = name.split(' ').collect::<Vec<_>>();
+        (written.len() == end - start && named.len() == written.len()).then(|| {
+            written
+                .iter()
+                .zip(named)
+                .map(|(written, named)| (*written != named).then(|| named.to_string()))
+                .collect()
+        })
     }
 }
 
@@ -529,6 +586,10 @@ pub struct ParsedQuery {
     /// written without spaces is split where its label changes, and glued
     /// characters with one label are one word.
     pub pieces: Vec<Tagged>,
+    /// One per piece: the word of the name the parser read a misspelt
+    /// piece as ("lambton" of "lamton"), `None` for a piece read as written.
+    /// [`Tagged`] stays the written word, as the parse contract has it.
+    pub corrections: Vec<Option<String>>,
     /// The country whose transition table and postcode pattern scored it,
     /// `None` for the global fallback.
     pub country: Option<CountryCode>,
@@ -557,10 +618,18 @@ pub struct LatticeTagger {
 /// transpositions counted as one: built once per process and shared, as
 /// Tantivy shares its builders, since the two-edit one takes milliseconds
 /// and megabytes to build.
-fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuilder {
+pub(crate) fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuilder {
     static BUILDERS: [OnceLock<LevenshteinAutomatonBuilder>; 2] =
         [OnceLock::new(), OnceLock::new()];
     BUILDERS[usize::from(edits - 1)].get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true))
+}
+
+/// The words a street-type or direction abbreviation stands for in any
+/// language libpostal lists, none when `word` is no abbreviation. A query
+/// word is searched in each of them besides itself, so a list too
+/// ambiguous to expand the indexed text by still finds the record.
+pub(crate) fn full_forms(word: &str) -> &'static [String] {
+    abbreviations::abbreviations().full_forms(word)
 }
 
 impl fmt::Debug for LatticeTagger {
@@ -639,6 +708,9 @@ impl LatticeTagger {
             .take(n)
             .map(|path| {
                 let labels = path.labels(&lattice);
+                let (pieces, corrections) = lattice
+                    .units
+                    .corrected_pieces(&path.segments(&lattice), &lattice.corrections);
                 ParsedQuery {
                     tokens: tokens
                         .words
@@ -649,7 +721,8 @@ impl LatticeTagger {
                             label,
                         })
                         .collect(),
-                    pieces: lattice.units.pieces(&path.segments(&lattice)),
+                    pieces,
+                    corrections,
                     country: path.country,
                     score: path.score,
                 }
@@ -739,6 +812,7 @@ impl LatticeTagger {
         let mut areas = Vec::new();
         let mut places = Vec::new();
         let mut glued_spans = Vec::new();
+        let mut corrections = Vec::new();
         for start in 0..tokens.len() {
             for end in start + 1..=(start + longest).min(tokens.len()) {
                 if end - start > MAX_SPAN_TOKENS && !units.unspaced(start, end) {
@@ -780,8 +854,11 @@ impl LatticeTagger {
                     if suppression.hides(field, start, end) {
                         continue;
                     }
-                    if let Some(hit) = self.lookup(field, &mut key) {
+                    if let Some((hit, name)) = self.lookup(field, &mut key) {
                         evidence = true;
+                        if let (Some(name), Some(label)) = (name, field_label(field)) {
+                            corrections.push((start, end, label, name));
+                        }
                         if hit.distance == 0 && Field::AREAS.contains(&field) {
                             areas.push((start, end, field == Field::Region));
                             area = true;
@@ -878,6 +955,7 @@ impl LatticeTagger {
         let candidates = countries.top(MAX_CANDIDATE_COUNTRIES, &self.weights);
         let mut lattice = Lattice::new(units, spans, candidates);
         lattice.places = places;
+        lattice.corrections = corrections;
         lattice
     }
 
@@ -915,8 +993,8 @@ impl LatticeTagger {
 
     /// The best hit of `key` in `field`: exact, as written or with its
     /// abbreviations expanded the way the text index expands them, else the
-    /// nearest name the key's fuzzy automaton accepts.
-    fn lookup(&self, field: Field, key: &mut SpanKey) -> Option<Match> {
+    /// nearest name the key's fuzzy automaton accepts, given with the hit.
+    fn lookup(&self, field: Field, key: &mut SpanKey) -> Option<(Match, Option<String>)> {
         // The span as written first: another spelling of it (the name
         // without its type word, an abbreviation in full) is only read when
         // the span itself names nothing, so "verwaltungsgemeinschaft
@@ -932,7 +1010,7 @@ impl LatticeTagger {
         )
         .or_else(|| best(&mut key.spellings.iter()));
         if let Some(entry) = exact {
-            return Some(Match { entry, distance: 0 });
+            return Some((Match { entry, distance: 0 }, None));
         }
         if field == Field::Poi && key.tokens < 2 && key.chars < MIN_FUZZY_POI_CHARS {
             return None;
@@ -943,7 +1021,10 @@ impl LatticeTagger {
             key.dfa()?
         };
         let first = key.expanded.chars().next().map_or(0, char::len_utf8);
-        self.dictionaries.fuzzy(field, &dfa, &key.expanded[..first])
+        let (name, hit) = self
+            .dictionaries
+            .fuzzy(field, &dfa, &key.expanded[..first])?;
+        Some((hit, Some(name)))
     }
 
     /// The countries whose postcode pattern `start..end` matches, written
@@ -1284,6 +1365,19 @@ fn spellings(key: &str) -> Vec<String> {
         }
     }
     spellings
+}
+
+/// The label a name of `field` is read as, for the fields whose names a
+/// span is corrected to.
+fn field_label(field: Field) -> Option<Label> {
+    match field {
+        Field::Locality => Some(Label::Locality),
+        Field::Region => Some(Label::Region),
+        Field::Street => Some(Label::Street),
+        Field::Country => Some(Label::Country),
+        Field::Poi => Some(Label::Other),
+        _ => None,
+    }
 }
 
 /// A dictionary key with street-type and direction abbreviations expanded,

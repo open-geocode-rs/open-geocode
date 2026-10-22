@@ -13,8 +13,8 @@
 //! records/index    record_count u64, then (block_count + 1) u64 block offsets
 //! records/blocks   blocks: base_lon i32 | base_lat i32 | start width u8 (2 or 4)
 //!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
-//!                  u64, each when its flag is set | the start (u16 or u32) of
-//!                  each body that is not continued | bodies
+//!                  u64, disputed u64, each when its flag is set | the start (u16
+//!                  or u32) of each body that is not continued | bodies
 //! records/datasets count varint, then each imported dataset's name
 //! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
@@ -27,13 +27,22 @@
 //!                     dataset's index in `records/datasets`
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
+//!                     (a street's locality after them, behind a presence byte)
 //!                     (and category or place type) as a varint count and ids, and
-//!                     an address's areas follow its other fields the same way;
-//!                     a POI's address follows a presence byte
-//!       geometry      line strings only: varint count, then zigzag deltas
+//!                     an address's areas follow its other fields the same way,
+//!                     then its street's postcodes; a POI's prominence follows
+//!                     its names as one byte, then its address after a
+//!                     presence byte; a postcode's country follows its code as
+//!                     a varint, 0 = none, else its two letters as a u16
+//!       geometry      lines only: varint part count, then per part a varint
+//!                     point count and zigzag deltas, chained across parts
 //!
 //! continued address (its bit set in `continued`; no tag, its precision and
 //! source kind are in the block's bitmaps)
+//!
+//! An address another source placed elsewhere (see
+//! [`AddressRecord::disputed`]) has its bit set in `disputed`, continued or
+//! not: a bit per slot costs nothing in the many blocks with none.
 //!       dlon, dlat    zigzag varints from the record before it
 //!       source        zigzag OSM object id delta from the record before it
 //!       number        varint: value << 2 | unit (1) | text (1); a plain number's
@@ -44,9 +53,10 @@
 //!
 //! The builder writes the addresses of one street as a run, ordered by house
 //! number. An address that states the same street, place, areas, locality,
-//! region, postcode, country and admin context as the address before it in its
-//! block is written as a continuation of that run: only its number, unit, point
-//! and id, each as a small delta. The run's first address in the block, its
+//! region, postcode, country, street postcodes and admin context as the
+//! address before it in its block is written as a continuation of that run:
+//! only its number, unit, point and id, each as a small delta. The run's
+//! first address in the block, its
 //! anchor, holds every shared field, so any record decodes from its own block.
 //! A continued address has no start of its own: it is read on from its
 //! anchor, as its number and point are deltas along the run anyway.
@@ -79,15 +89,19 @@ use crate::{
     extsort::Scratch,
     memory::{Budget, Reservation},
     pack::RecordId,
+    parse::lattice::CountryCode,
     record::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Record,
-        SourceProvenance, StreetRecord, point_geometry,
+        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord,
+        Prominence, Record, SourceProvenance, StreetRecord, point_geometry,
     },
-    util::codec::{
-        get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
-        unzigzag, zigzag,
+    util::{
+        codec::{
+            get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
+            unzigzag, zigzag,
+        },
+        geo::{line_geometry, line_parts},
     },
 };
 
@@ -95,7 +109,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 7;
+pub const RECORDS_VERSION: u32 = 8;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -110,6 +124,7 @@ const BLOCK_HEADER_BYTES: usize = 18;
 const BLOCK_CENTROIDS: u8 = 1;
 const BLOCK_WAYS: u8 = 2;
 const BLOCK_RELATIONS: u8 = 4;
+const BLOCK_DISPUTED: u8 = 8;
 
 const TAG_LAYER_MASK: u8 = 0x0f;
 const TAG_CENTROID: u8 = 0x10;
@@ -213,6 +228,8 @@ pub struct Header {
     pub lon_e7: i32,
     pub lat_e7: i32,
     pub context: Option<ContextRef>,
+    /// See [`AddressRecord::disputed`].
+    pub disputed: bool,
     centroid: bool,
     line: bool,
     source_kind: SourceKind,
@@ -335,6 +352,7 @@ pub struct Writer {
     centroids: u64,
     ways: u64,
     relations: u64,
+    disputed: u64,
     block_base: (i32, i32),
     record_count: u64,
     strings: StringTable,
@@ -349,6 +367,7 @@ pub struct Writer {
 #[derive(Debug)]
 struct AddressRun {
     shared: AddressComponents,
+    street_postcodes: Vec<String>,
     /// The imported dataset of the run, `None` for OSM addresses.
     dataset: Option<String>,
     context: Option<ContextRef>,
@@ -371,6 +390,7 @@ impl AddressRun {
             && shared.postcode == address.postcode
             && shared.country == address.country
             && shared.areas == address.areas
+            && self.street_postcodes == record.street_postcodes
     }
 }
 
@@ -472,6 +492,7 @@ impl Writer {
             centroids: 0,
             ways: 0,
             relations: 0,
+            disputed: 0,
             block_base: (0, 0),
             record_count: 0,
             strings: StringTable {
@@ -533,6 +554,11 @@ impl Writer {
         let mut body = std::mem::take(&mut self.body);
         body.clear();
         let slot = 1u64 << self.block_slots;
+        if let Record::Address(address) = record
+            && address.disputed
+        {
+            self.disputed |= slot;
+        }
         match record {
             Record::Address(address)
                 if self
@@ -561,6 +587,7 @@ impl Writer {
                 self.run = match record {
                     Record::Address(address) => Some(AddressRun {
                         shared: address.address.clone(),
+                        street_postcodes: address.street_postcodes.clone(),
                         dataset: imported_dataset(address).map(str::to_string),
                         context,
                         point,
@@ -627,11 +654,15 @@ impl Writer {
         }
 
         match record {
-            Record::Address(record) => self.put_address(out, &record.address)?,
+            Record::Address(record) => {
+                self.put_address(out, &record.address)?;
+                self.put_strings(out, &record.street_postcodes)?;
+            }
             Record::Poi(record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 put_u64(out, u64::from(self.strings.id(&record.category)?));
                 self.put_strings(out, &record.alt_names)?;
+                out.push(record.prominence.to_byte());
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -664,6 +695,7 @@ impl Writer {
             Record::Street(record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 self.put_strings(out, &record.alt_names)?;
+                self.put_optional_strings(out, &[record.locality.as_deref()])?;
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
@@ -673,6 +705,10 @@ impl Writer {
                     )));
                 }
                 put_u64(out, u64::from(self.strings.id(&record.postcode)?));
+                put_u64(
+                    out,
+                    record.country.map_or(0, |country| country.to_u16().into()),
+                );
             }
             Record::Place(_, record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
@@ -681,13 +717,16 @@ impl Writer {
             }
         }
 
-        if let Some(line) = line {
-            put_u64(out, line.len() as u64);
+        if let Some(parts) = line {
+            put_u64(out, parts.len() as u64);
             let mut previous = point;
-            for position in line {
-                put_i64(out, i64::from(position.0) - i64::from(previous.0));
-                put_i64(out, i64::from(position.1) - i64::from(previous.1));
-                previous = position;
+            for part in parts {
+                put_u64(out, part.len() as u64);
+                for position in part {
+                    put_i64(out, i64::from(position.0) - i64::from(previous.0));
+                    put_i64(out, i64::from(position.1) - i64::from(previous.1));
+                    previous = position;
+                }
             }
         }
         Ok(())
@@ -793,6 +832,7 @@ impl Writer {
             (BLOCK_CENTROIDS, self.centroids),
             (BLOCK_WAYS, self.ways),
             (BLOCK_RELATIONS, self.relations),
+            (BLOCK_DISPUTED, self.disputed),
         ];
         let flags = bitmaps
             .iter()
@@ -820,6 +860,7 @@ impl Writer {
         self.centroids = 0;
         self.ways = 0;
         self.relations = 0;
+        self.disputed = 0;
         Ok(())
     }
 
@@ -977,22 +1018,24 @@ impl Reader {
                 let address = self.entry_address(&entry, &mut fields)?;
                 Record::Address(AddressRecord {
                     address,
+                    street_postcodes: self.string_list(header.strings, &mut fields)?,
                     geometry: geometry(&mut fields)?,
                     location_precision,
                     source: header.provenance(&self.datasets)?,
+                    disputed: header.disputed,
                 })
             }
             Layer::Poi => {
-                let (name, category, alt_names, address) =
-                    self.poi_fields(header.strings, &mut fields)?;
+                let poi = self.poi_fields(header.strings, &mut fields)?;
                 Record::Poi(PoiRecord {
-                    name: name.to_string(),
-                    alt_names,
-                    category: category.to_string(),
-                    address,
+                    name: poi.name.to_string(),
+                    alt_names: poi.alt_names,
+                    category: poi.category.to_string(),
+                    address: poi.address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
                     source: header.provenance(&self.datasets)?,
+                    prominence: poi.prominence,
                 })
             }
             Layer::Interpolation => {
@@ -1010,12 +1053,17 @@ impl Reader {
             Layer::Street => Record::Street(StreetRecord {
                 name: self.string_field(header.strings, &mut fields)?.to_string(),
                 alt_names: self.string_list(header.strings, &mut fields)?,
+                locality: {
+                    let [locality] = self.optional_strings(header.strings, &mut fields)?;
+                    locality
+                },
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance(&self.datasets)?,
             }),
             Layer::Postcode => Record::Postcode(PostcodeRecord {
                 postcode: self.string_field(header.strings, &mut fields)?.to_string(),
+                country: country_field(&mut fields)?,
                 geometry: geometry(&mut fields)?,
                 source: DerivedSourceProvenance::osm_address_records(header.source_value),
             }),
@@ -1054,17 +1102,16 @@ impl Reader {
                 )
             }
             Layer::Poi => {
-                let (name, poi_category, _, address) =
-                    self.poi_fields(header.strings, &mut fields)?;
+                let poi = self.poi_fields(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.object()?;
-                category = Some(poi_category.to_string());
-                if let Some(address) = &address {
+                category = Some(poi.category.to_string());
+                if let Some(address) = &poi.address {
                     stated = Address::from(address);
                 }
                 (
                     crate::labels::osm_record_id(object_type, object_id),
-                    name.to_string(),
-                    crate::labels::poi_label(name, address.as_ref(), None),
+                    poi.name.to_string(),
+                    crate::labels::poi_label(poi.name, poi.address.as_ref(), None),
                 )
             }
             Layer::Interpolation => {
@@ -1082,17 +1129,19 @@ impl Reader {
             Layer::Street => {
                 let (object_type, object_id) = header.object()?;
                 let name = self.string_field(header.strings, &mut fields)?.to_string();
+                self.string_list(header.strings, &mut fields)?;
+                let [locality] = self.optional_strings(header.strings, &mut fields)?;
                 (
                     crate::labels::osm_record_id(object_type, object_id),
                     name.clone(),
-                    name,
+                    crate::labels::street_label(&name, locality.as_deref()),
                 )
             }
             Layer::Postcode => {
                 let postcode = self.string_field(header.strings, &mut fields)?;
                 stated = Address::postcode(postcode);
                 (
-                    crate::labels::derived_postcode_id(postcode),
+                    crate::labels::derived_postcode_id(country_field(&mut fields)?, postcode),
                     postcode.to_string(),
                     postcode.to_string(),
                 )
@@ -1132,7 +1181,7 @@ impl Reader {
             }
             Layer::Poi => self
                 .poi_fields(header.strings, &mut fields)?
-                .3
+                .address
                 .and_then(|address| address.postcode),
             Layer::Interpolation => {
                 self.interpolation_fields(header.strings, &mut fields)?
@@ -1142,6 +1191,47 @@ impl Reader {
             Layer::Postcode => Some(self.string_field(header.strings, &mut fields)?.to_string()),
             _ => None,
         })
+    }
+
+    /// A POI's prominence; none for the other layers. Reads no geometry.
+    pub fn prominence(&self, id: RecordId) -> Result<Option<Prominence>> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        if header.layer != Layer::Poi {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.poi_fields(header.strings, &mut fields)?.prominence,
+        ))
+    }
+
+    /// A place's `place_type`; none for the other layers. Reads no geometry.
+    pub fn place_type(&self, id: RecordId) -> Result<Option<String>> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        if header.layer.place_layer().is_none() {
+            return Ok(None);
+        }
+        self.string_field(header.strings, &mut fields)?;
+        Ok(Some(
+            self.string_field(header.strings, &mut fields)?.to_string(),
+        ))
+    }
+
+    /// The postcodes a record is in by its own data: the one it states, else
+    /// for an address the ones its street's addresses state. Empty when
+    /// neither says.
+    pub fn postcodes(&self, id: RecordId) -> Result<Vec<String>> {
+        let entry = self.body(id)?;
+        if entry.header.layer != Layer::Address {
+            return Ok(self.postcode(id)?.into_iter().collect());
+        }
+        let mut fields = entry.fields;
+        let address = self.address_components(entry.header.strings, &mut fields)?;
+        match address.postcode {
+            Some(postcode) => Ok(vec![postcode]),
+            None => self.string_list(entry.header.strings, &mut fields),
+        }
     }
 
     /// Whether a record is an explicit address: an address record or a POI
@@ -1157,6 +1247,7 @@ impl Reader {
                 for _ in 0..get_u64(&mut fields)? {
                     get_u32(&mut fields)?;
                 }
+                get_u8(&mut fields)?;
                 get_u8(&mut fields)? != 0
             }
             _ => false,
@@ -1172,8 +1263,8 @@ impl Reader {
         let (name, alt_names) = match header.layer {
             Layer::Address | Layer::Interpolation | Layer::Postcode => return Ok(Vec::new()),
             Layer::Poi => {
-                let (name, _, alt_names, _) = self.poi_fields(strings, &mut fields)?;
-                (name, alt_names)
+                let poi = self.poi_fields(strings, &mut fields)?;
+                (poi.name, poi.alt_names)
             }
             Layer::Street => {
                 let name = self.string_field(strings, &mut fields)?;
@@ -1206,7 +1297,8 @@ impl Reader {
     }
 
     /// Line geometry as 1e-7 degree coordinates, `None` for point records.
-    pub fn line(&self, id: RecordId) -> Result<Option<Vec<[i32; 2]>>> {
+    /// The lines of a line record, one per part, `None` for a point record.
+    pub fn line(&self, id: RecordId) -> Result<Option<Vec<Vec<[i32; 2]>>>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
         if !header.line {
@@ -1305,6 +1397,7 @@ impl Reader {
         let centroids = bitmap(BLOCK_CENTROIDS)?;
         let ways = bitmap(BLOCK_WAYS)?;
         let relations = bitmap(BLOCK_RELATIONS)?;
+        let disputed = bitmap(BLOCK_DISPUTED)?;
         let mask = low_slots(count);
         if continued & !mask != 0 || continued & 1 != 0 {
             return Err(Error::Decode("record block marks a slot it does not have"));
@@ -1326,6 +1419,7 @@ impl Reader {
             centroids,
             ways,
             relations,
+            disputed,
             starts: &bytes[at..bodies_start],
             bodies: &bytes[bodies_start..],
         })
@@ -1461,8 +1555,10 @@ impl Reader {
     fn body(&self, id: RecordId) -> Result<Entry<'_>> {
         let (block, slot) = self.locate(id)?;
         let strings = self.segment(id);
+        let disputed = block.disputed & 1 << slot != 0;
         if !block.is_continued(slot) {
-            let (header, fields) = plain_header(block.base, strings, block.plain_body(slot)?)?;
+            let (mut header, fields) = plain_header(block.base, strings, block.plain_body(slot)?)?;
+            header.disputed = disputed;
             return Ok(Entry {
                 header,
                 fields,
@@ -1504,6 +1600,7 @@ impl Reader {
                 lon_e7: point.0,
                 lat_e7: point.1,
                 context: anchor_header.context,
+                disputed,
                 centroid: block.centroids & 1 << slot != 0,
                 line: false,
                 // A run is all OSM or all of one imported dataset.
@@ -1589,19 +1686,22 @@ impl Reader {
         })
     }
 
-    fn poi_fields(
-        &self,
-        strings: StringSegment,
-        fields: &mut &[u8],
-    ) -> Result<(&str, &str, Vec<String>, Option<AddressComponents>)> {
+    fn poi_fields(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<PoiFields<'_>> {
         let name = self.string_field(strings, fields)?;
         let category = self.string_field(strings, fields)?;
         let alt_names = self.string_list(strings, fields)?;
+        let prominence = Prominence::from_byte(get_u8(fields)?);
         let address = match get_u8(fields)? {
             0 => None,
             _ => Some(self.address_components(strings, fields)?),
         };
-        Ok((name, category, alt_names, address))
+        Ok(PoiFields {
+            name,
+            category,
+            alt_names,
+            prominence,
+            address,
+        })
     }
 
     fn interpolation_fields(
@@ -1639,6 +1739,7 @@ impl Reader {
         match header.layer {
             Layer::Address => {
                 self.address_components(header.strings, fields)?;
+                self.string_list(header.strings, fields)?;
             }
             Layer::Poi => {
                 self.poi_fields(header.strings, fields)?;
@@ -1649,9 +1750,11 @@ impl Reader {
             Layer::Street => {
                 get_u32(fields)?;
                 self.string_list(header.strings, fields)?;
+                self.optional_strings::<1>(header.strings, fields)?;
             }
             Layer::Postcode => {
                 get_u32(fields)?;
+                country_field(fields)?;
             }
             _ => {
                 get_u32(fields)?;
@@ -1666,31 +1769,54 @@ impl Reader {
         if !header.line {
             return Ok(point_geometry(header.lon(), header.lat()));
         }
-        let coordinates = self
+        let parts = self
             .line_points(header, fields)?
             .into_iter()
-            .map(|[lon, lat]| vec![dequantize(lon), dequantize(lat)].into())
+            .map(|part| {
+                part.into_iter()
+                    .map(|[lon, lat]| vec![dequantize(lon), dequantize(lat)].into())
+                    .collect()
+            })
             .collect();
-        Ok(Geometry::new(GeometryValue::LineString { coordinates }))
+        Ok(line_geometry(parts))
     }
 
-    fn line_points(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<[i32; 2]>> {
-        let count = usize::try_from(get_u64(fields)?)?;
-        if count < 2 || count > fields.len() {
+    fn line_points(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<Vec<[i32; 2]>>> {
+        let part_count = usize::try_from(get_u64(fields)?)?;
+        if part_count == 0 || part_count > fields.len() {
             return Err(Error::BadGeometry(format!(
-                "stored line geometry has an invalid point count {count}"
+                "stored line geometry has an invalid part count {part_count}"
             )));
         }
-        let mut points = Vec::with_capacity(count);
+        let mut parts = Vec::with_capacity(part_count);
         let mut previous = [header.lon_e7, header.lat_e7];
-        for _ in 0..count {
-            let lon = add_delta(previous[0], get_i64(fields)?)?;
-            let lat = add_delta(previous[1], get_i64(fields)?)?;
-            previous = [lon, lat];
-            points.push(previous);
+        for _ in 0..part_count {
+            let count = usize::try_from(get_u64(fields)?)?;
+            if count < 2 || count > fields.len() {
+                return Err(Error::BadGeometry(format!(
+                    "stored line geometry has an invalid point count {count}"
+                )));
+            }
+            let mut points = Vec::with_capacity(count);
+            for _ in 0..count {
+                let lon = add_delta(previous[0], get_i64(fields)?)?;
+                let lat = add_delta(previous[1], get_i64(fields)?)?;
+                previous = [lon, lat];
+                points.push(previous);
+            }
+            parts.push(points);
         }
-        Ok(points)
+        Ok(parts)
     }
+}
+
+/// What a POI's body holds before its geometry.
+struct PoiFields<'a> {
+    name: &'a str,
+    category: &'a str,
+    alt_names: Vec<String>,
+    prominence: Prominence,
+    address: Option<AddressComponents>,
 }
 
 /// One block of the store, as [`Reader::block`] finds it.
@@ -1705,6 +1831,8 @@ struct Block<'a> {
     centroids: u64,
     ways: u64,
     relations: u64,
+    /// Of every slot: a disputed address.
+    disputed: u64,
     /// Where each slot that is not continued starts in `bodies`.
     starts: &'a [u8],
     bodies: &'a [u8],
@@ -1837,14 +1965,29 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     for _ in 0..present.count_ones() {
         get_u64(&mut body)?;
     }
-    let areas = get_u64(&mut body)?;
-    if areas > body.len() as u64 {
-        return Err(Error::Decode("string list is truncated"));
-    }
-    for _ in 0..areas {
-        get_u64(&mut body)?;
+    // Its areas, then its street's postcodes.
+    for _ in 0..2 {
+        let strings = get_u64(&mut body)?;
+        if strings > body.len() as u64 {
+            return Err(Error::Decode("string list is truncated"));
+        }
+        for _ in 0..strings {
+            get_u64(&mut body)?;
+        }
     }
     Ok(body)
+}
+
+/// A postcode record's country, 0 when unknown.
+fn country_field(fields: &mut &[u8]) -> Result<Option<CountryCode>> {
+    match get_u64(fields)? {
+        0 => Ok(None),
+        code => u16::try_from(code)
+            .ok()
+            .and_then(CountryCode::from_u16)
+            .map(Some)
+            .ok_or(Error::Decode("postcode country is not a country code")),
+    }
 }
 
 /// A record's header, the bytes of the fields it shares with its run's anchor
@@ -1922,6 +2065,7 @@ fn plain_header(
             lon_e7,
             lat_e7,
             context,
+            disputed: false,
             centroid: tag & TAG_CENTROID != 0,
             line: tag & TAG_LINE != 0,
             source_kind,
@@ -1949,18 +2093,32 @@ fn layer_code(layer: Layer) -> u8 {
         .expect("every layer has a code") as u8
 }
 
-/// Quantized vertices of a line geometry, `None` for points.
-fn line_coordinates(geometry: &Geometry) -> Result<Option<Vec<(i32, i32)>>> {
-    match &geometry.value {
-        GeometryValue::Point { .. } => Ok(None),
-        GeometryValue::LineString { coordinates } => {
-            if coordinates.len() < 2 {
+/// Quantized vertices of a line, one list per part.
+type LineVertices = Vec<Vec<(i32, i32)>>;
+
+/// The vertices of a line geometry, `None` for points.
+fn line_coordinates(geometry: &Geometry) -> Result<Option<LineVertices>> {
+    if let GeometryValue::Point { .. } = &geometry.value {
+        return Ok(None);
+    }
+    let Some(parts) = line_parts(geometry) else {
+        return Err(Error::BadGeometry(format!(
+            "unsupported stored record geometry: {}",
+            geometry.value.type_name()
+        )));
+    };
+    if parts.is_empty() {
+        return Err(Error::BadGeometry("line geometry has no parts".into()));
+    }
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.len() < 2 {
                 return Err(Error::BadGeometry(
                     "line geometry needs at least two positions".into(),
                 ));
             }
-            coordinates
-                .iter()
+            part.iter()
                 .map(|position| {
                     let [lon, lat, ..] = position.as_slice() else {
                         return Err(Error::BadGeometry(
@@ -1970,13 +2128,9 @@ fn line_coordinates(geometry: &Geometry) -> Result<Option<Vec<(i32, i32)>>> {
                     Ok((quantize(*lon)?, quantize(*lat)?))
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(Some)
-        }
-        other => Err(Error::BadGeometry(format!(
-            "unsupported stored record geometry: {}",
-            other.type_name()
-        ))),
-    }
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 pub(crate) fn quantize(value: f64) -> Result<i32> {
@@ -2013,6 +2167,8 @@ mod tests {
     fn sample_records() -> Vec<Record> {
         let mut records = vec![
             Record::Address(AddressRecord {
+                disputed: false,
+                street_postcodes: Vec::new(),
                 address: AddressComponents {
                     areas: vec!["Old Toronto".into(), "Liberty Village".into()],
                     number: "10".into(),
@@ -2030,6 +2186,7 @@ mod tests {
             }),
             Record::Street(StreetRecord {
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
+                locality: None,
                 name: "King Street".into(),
                 geometry: line(&[[-79.0, 43.0], [-79.001, 43.001], [-79.0015, 43.0]]),
                 representative_point: [-79.0, 43.0],
@@ -2037,6 +2194,7 @@ mod tests {
             }),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V 1A1".into(),
+                country: None,
                 geometry: point_geometry(-79.0, 43.0),
                 source: DerivedSourceProvenance::osm_address_records(12),
             }),
@@ -2078,6 +2236,10 @@ mod tests {
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 6),
+                prominence: Prominence {
+                    linked: true,
+                    languages: 12,
+                },
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -2087,6 +2249,7 @@ mod tests {
                 geometry: point_geometry(-79.0, 43.0),
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 7),
+                prominence: Default::default(),
             }),
         ];
         for layer in [
@@ -2211,11 +2374,11 @@ mod tests {
         assert_eq!(reader.line(0).expect("address line"), None);
         assert_eq!(
             reader.line(1).expect("street line"),
-            Some(vec![
+            Some(vec![vec![
                 [-790_000_000, 430_000_000],
                 [-790_010_000, 430_010_000],
                 [-790_015_000, 430_000_000]
-            ])
+            ]])
         );
     }
 
@@ -2369,6 +2532,8 @@ mod tests {
                     },
                     1_000_000 - index_i64 * 37,
                 );
+                // Anchors and continued addresses both carry their mark.
+                address.disputed = index % 7 == 3;
                 if index == 70 {
                     // A different postcode breaks the run; the next continues
                     // the new one.

@@ -7,6 +7,12 @@
 //! so the builder adds the Latin form of every such name as one more name.
 //! Han characters have no one reading, so a name holding any is left alone,
 //! as is a name of any other script without a table here.
+//!
+//! Hand tables, not CLDR's script-to-Latin transforms: those write scholarly
+//! forms nobody types ("selkovo" for "щёлково", "athḗna", "toukyou"), read
+//! Japanese kanji as Mandarin, and have no Thai or any-script form. The Latin
+//! written here is then folded to ASCII like every other Latin name
+//! ([`crate::util::fold::search_key`]).
 
 /// The Latin form of `name`, lower case, or `None` when it holds no kana,
 /// Cyrillic or Greek letter, or a letter of a script this does not read.
