@@ -203,11 +203,29 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
-/// For a hit that states no postcode, the batch check compares the postcode
-/// records within [`POSTCODE_AREA_RADIUS_M`] with the requested postcode on
-/// their leading characters (a Canadian FSA, a US sectional centre, the start
-/// of a UK outward code).
-const POSTCODE_AREA_CHARS: usize = 3;
+/// Terms and postcode records read to find the area of a postcode the query
+/// names (see [`TextSearcher::postcode_areas`]): a sample, enough to place
+/// it and measure how far it reaches.
+const POSTCODE_AREA_TERMS: usize = 256;
+const POSTCODE_AREA_RECORDS: usize = 64;
+/// The least a postcode area reaches, so a few postcodes standing close
+/// together still leave a house between them its room.
+const POSTCODE_AREA_REACH_FLOOR_M: f64 = 500.0;
+/// How far around a postcode area its nearest other postcode is looked for,
+/// and so the most it reaches: past the farthest
+/// [`POSTCODE_NEARNESS_BANDS_M`] a postcode ranks nothing.
+const POSTCODE_AREA_REACH_LIMIT_M: f64 = 200_000.0;
+/// Postcode records looked at around a point to find the nearest other one.
+const POSTCODE_NEIGHBOURS: usize = 16;
+/// The fewest records of a country that place a postcode the Pack has no
+/// record of: one postcode sharing a start with it may lie anywhere in the
+/// area that start names ("m1k 4g7" is no sign of where "m1k 4c9" is), a
+/// few spread over it say where that area is.
+const POSTCODE_AREA_MIN_NEIGHBOURS: usize = 3;
+/// How many of its reaches from a postcode's area a hit lies before it
+/// contradicts the postcode. Between one and this it neither agrees nor
+/// contradicts.
+const POSTCODE_CONTRADICTING_REACHES: f64 = 3.0;
 /// How a hit's distance from the named postcode ranks it: hits in the same
 /// band tie on it and are ranked by what comes after.
 const POSTCODE_NEARNESS_BANDS_M: [f64; 8] = [
@@ -1725,13 +1743,15 @@ impl TextSearcher {
         Ok(areas)
     }
 
-    /// Whether a hit is in the postcode the query names: confirmed when the
-    /// postcodes it is in by its own data (the one it states, else its
-    /// street's) hold it, contradicted when they do not, and else judged by
-    /// the postcode records around it. Either of two postcodes may be a
-    /// prefix of the other, so "M5V" matches "M5V 1A1". `None` when nothing
-    /// says either way: the query names none, or the hit has no postcode of
-    /// its own and no postcode data lies around it.
+    /// Whether a hit lies in the postcode the query names, `None` when
+    /// nothing says either way. Its own postcode or one its street's
+    /// addresses state holding it agrees. Else where it lies decides (see
+    /// [`QueryPostcode::placement`]): a street's postcodes name the blocks
+    /// its addresses state, and a long street crosses many, so the one asked
+    /// for missing from them says nothing ("1161 Queen Street East" lies
+    /// between the M4M 1L2 and M4M 1L5 its street states, not in M4M 1L3).
+    /// A postcode the hit states itself that does not hold the one asked for
+    /// contradicts it when where it lies cannot say.
     fn postcode_agreement(
         &self,
         hit: &TextSearchHit,
@@ -1740,51 +1760,49 @@ impl TextSearcher {
         if postcode.forms.is_empty() {
             return Ok(None);
         }
-        let own = self
-            .pack
-            .records()
+        let records = self.pack.records();
+        let held = records
             .postcodes(hit.record_id)?
             .iter()
             .filter_map(|own| compact_postcode(own))
-            .collect::<Vec<_>>();
-        if !own.is_empty() {
-            return Ok(Some(own.iter().any(|own| postcode.holds(own))));
+            .any(|own| postcode.holds(&own));
+        if held {
+            return Ok(Some(true));
         }
-        let Some(point) = hit.record.point else {
-            return Ok(None);
-        };
-        let mut agreement = Some(false);
-        for form in &postcode.forms {
-            match self.near_postcode_area(point.lon, point.lat, form)? {
-                Some(true) => return Ok(Some(true)),
-                Some(false) => {}
-                None => agreement = None,
+        if let Some(point) = hit.record.point {
+            if !postcode.areas.is_empty() {
+                if let Some(placement) = postcode.placement(point.lon, point.lat) {
+                    return Ok(Some(placement));
+                }
+            } else if self.unlike_postcode_near(point.lon, point.lat, postcode)? {
+                return Ok(Some(false));
             }
         }
-        Ok(agreement)
+        Ok(records.postcode(hit.record_id)?.map(|_| false))
     }
 
-    /// Whether the postcode records around a point share the leading
-    /// characters of `postcode`, `None` with no postcode data nearby.
-    fn near_postcode_area(&self, lon: f64, lat: f64, postcode: &str) -> Result<Option<bool>> {
-        let area: String = postcode.chars().take(POSTCODE_AREA_CHARS).collect();
-        let in_area = self.spatial.any_context_point(
+    /// Whether the postcode nearest a point, within
+    /// [`POSTCODE_AREA_RADIUS_M`], shares not even its first character with
+    /// the one asked for: for a postcode the Pack cannot place, the one sign
+    /// a hit lies elsewhere.
+    fn unlike_postcode_near(&self, lon: f64, lat: f64, postcode: &QueryPostcode) -> Result<bool> {
+        for candidate in self.spatial.context_candidates(
             lon,
             lat,
-            Layer::Postcode,
             POSTCODE_AREA_RADIUS_M,
-            |record_id| {
-                Ok(self
-                    .pack
-                    .records()
-                    .postcode(record_id)?
-                    .and_then(|postcode| compact_postcode(&postcode))
-                    .is_some_and(|postcode| {
-                        postcode.starts_with(&area) || area.starts_with(postcode.as_str())
-                    }))
-            },
-        )?;
-        Ok(in_area)
+            POSTCODE_NEIGHBOURS,
+        )? {
+            if candidate.layer != Layer::Postcode {
+                continue;
+            }
+            return Ok(self
+                .pack
+                .records()
+                .postcode(candidate.record_id)?
+                .and_then(|near| compact_postcode(&near))
+                .is_some_and(|near| postcode.agreement(&near) == 0));
+        }
+        Ok(false)
     }
 
     /// The postcode `plan` names, with the points of the Pack's records of
@@ -1794,16 +1812,133 @@ impl TextSearcher {
         if postcode.forms.is_empty() {
             return Ok(postcode);
         }
-        let terms = unique_strings(
-            std::iter::once(postcode.exact.clone())
-                .chain(postcode.forms.iter().cloned())
-                .collect(),
-        );
-        for record_id in self.postcode_records(&terms)? {
-            let (_, lon, lat) = self.pack.records().point(record_id)?;
-            postcode.points.push([lon, lat]);
-        }
+        postcode.areas = self.postcode_areas(&postcode.exact)?;
         Ok(postcode)
+    }
+
+    /// Where the postcode written `exact` lies, in each country the Pack
+    /// holds it in: its own records, or for a postcode the Pack has no
+    /// record of, the records that share the longest start with it, at
+    /// least [`POSTCODE_AREA_MIN_NEIGHBOURS`] of a country ("m4m 1l3" by
+    /// "m4m 1l2", "m4m 1l5" and "m4m 1l7"), else the longest start any
+    /// record shares. Each area reaches as far as its
+    /// nearest other postcode, so as far as postcodes of that grain do:
+    /// blocks in a Canadian city, tens of kilometres for a rural code.
+    /// Countries stay apart, so "2110" is an area in Sydney and one in
+    /// Papakura, never one between them.
+    fn postcode_areas(&self, exact: &str) -> Result<Vec<PostcodeArea>> {
+        let searcher = self.reader.searcher();
+        let mut ends = exact
+            .char_indices()
+            .map(|(at, character)| at + character.len_utf8())
+            .collect::<Vec<_>>();
+        ends.reverse();
+        // The longest start shared by too few records to place the postcode,
+        // used when no start is shared by enough.
+        let mut sparse = None;
+        for end in ends {
+            let prefix = &exact[..end];
+            if prefix.ends_with(char::is_whitespace) {
+                continue;
+            }
+            let terms = self.terms_with_prefix(&searcher, self.fields.postcode_exact, prefix)?;
+            if terms.is_empty() {
+                continue;
+            }
+            let mut by_country = HashMap::<Option<CountryCode>, Vec<(RecordId, [f64; 2])>>::new();
+            for record_id in self.postcode_records(&terms, POSTCODE_AREA_RECORDS)? {
+                if let Record::Postcode(record) = self.pack.records().record(record_id)? {
+                    let (_, lon, lat) = self.pack.records().point(record_id)?;
+                    by_country
+                        .entry(record.country)
+                        .or_default()
+                        .push((record_id, [lon, lat]));
+                }
+            }
+            if by_country.is_empty() {
+                continue;
+            }
+            let own = end == exact.len();
+            if !own
+                && by_country
+                    .values()
+                    .all(|members| members.len() < POSTCODE_AREA_MIN_NEIGHBOURS)
+            {
+                sparse.get_or_insert(by_country);
+                continue;
+            }
+            by_country.retain(|_, members| own || members.len() >= POSTCODE_AREA_MIN_NEIGHBOURS);
+            return self.postcode_areas_of(by_country);
+        }
+        sparse.map_or(Ok(Vec::new()), |by_country| {
+            self.postcode_areas_of(by_country)
+        })
+    }
+
+    /// An area of the records that place a postcode, for each country.
+    fn postcode_areas_of(
+        &self,
+        by_country: HashMap<Option<CountryCode>, Vec<(RecordId, [f64; 2])>>,
+    ) -> Result<Vec<PostcodeArea>> {
+        by_country
+            .into_values()
+            .map(|members| {
+                let neighbour_m = self.nearest_other_postcode_m(&members)?;
+                Ok(PostcodeArea::new(
+                    members.into_iter().map(|(_, point)| point).collect(),
+                    neighbour_m,
+                ))
+            })
+            .collect()
+    }
+
+    /// How far the nearest postcode record that is none of `members` lies
+    /// from them, at most [`POSTCODE_AREA_REACH_LIMIT_M`].
+    fn nearest_other_postcode_m(&self, members: &[(RecordId, [f64; 2])]) -> Result<f64> {
+        let mut nearest = POSTCODE_AREA_REACH_LIMIT_M;
+        for (_, [lon, lat]) in members {
+            for candidate in self.spatial.context_candidates(
+                *lon,
+                *lat,
+                POSTCODE_AREA_REACH_LIMIT_M,
+                POSTCODE_NEIGHBOURS,
+            )? {
+                if candidate.layer == Layer::Postcode
+                    && !members
+                        .iter()
+                        .any(|(member, _)| *member == candidate.record_id)
+                {
+                    nearest = nearest.min(candidate.distance_m);
+                    break;
+                }
+            }
+        }
+        Ok(nearest)
+    }
+
+    /// Up to [`POSTCODE_AREA_TERMS`] terms of `field` that start with
+    /// `prefix`.
+    fn terms_with_prefix(
+        &self,
+        searcher: &Searcher,
+        field: Field,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        // No term holds the byte 0xFF, which UTF-8 never uses, so every term
+        // with the prefix sorts below it.
+        let mut upper = prefix.as_bytes().to_vec();
+        upper.push(0xFF);
+        let mut found = std::collections::BTreeSet::new();
+        for segment in searcher.segment_readers() {
+            let index = segment.inverted_index(field)?;
+            let mut terms = index.terms().range().ge(prefix).lt(&upper).into_stream()?;
+            while found.len() < POSTCODE_AREA_TERMS && terms.advance() {
+                if let Ok(term) = std::str::from_utf8(terms.key()) {
+                    found.insert(term.to_string());
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
     }
 
     /// What agreeing on each term of `terms` as a postcode weighs, in each
@@ -1815,7 +1950,9 @@ impl TextSearcher {
                 continue;
             }
             let mut covered = HashMap::<Option<CountryCode>, u64>::new();
-            for record_id in self.postcode_records(std::slice::from_ref(term))? {
+            for record_id in
+                self.postcode_records(std::slice::from_ref(term), POSTCODE_RECORD_LIMIT)?
+            {
                 if let Record::Postcode(record) = self.pack.records().record(record_id)? {
                     *covered.entry(record.country).or_default() += record.source.record_count;
                 }
@@ -1837,7 +1974,7 @@ impl TextSearcher {
 
     /// The Pack's postcode records of any of `terms`, as the postcode field
     /// indexes them.
-    fn postcode_records(&self, terms: &[String]) -> Result<Vec<RecordId>> {
+    fn postcode_records(&self, terms: &[String], limit: usize) -> Result<Vec<RecordId>> {
         let query = BooleanQuery::new(vec![
             (Occur::Must, self.layer_query(Layer::Postcode.as_str())),
             (
@@ -1860,7 +1997,7 @@ impl TextSearcher {
         ]);
         let searcher = self.reader.searcher();
         searcher
-            .search(&query, &TopDocs::with_limit(POSTCODE_RECORD_LIMIT))?
+            .search(&query, &TopDocs::with_limit(limit))?
             .into_iter()
             .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
             .collect()
@@ -2906,7 +3043,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             false => Some(SegmentPostcodes {
                 own: column(&columns.rank_postcode)?,
                 area: column(&columns.area_postcode)?,
-                nearness: (!named.points.is_empty()).then(|| PostcodeNearness {
+                nearness: (!named.areas.is_empty()).then(|| PostcodeNearness {
                     record_id: columns.record_id.clone(),
                     pack: Arc::clone(self.pack),
                     postcode: named.clone(),
@@ -3541,9 +3678,37 @@ struct QueryPostcode {
     forms: Vec<String>,
     /// The part as the postcode field indexes it ("m5v 1a1").
     exact: String,
-    /// Points of the Pack's records of the postcode, found by
-    /// [`TextSearcher::query_postcode`].
+    /// Where it lies, found by [`TextSearcher::postcode_areas`].
+    areas: Vec<PostcodeArea>,
+}
+
+/// Where a postcode lies in one country: the points of the postcode records
+/// that place it, and how far it reaches from them: as far as they spread,
+/// or to the nearest other postcode when that lies farther.
+#[derive(Debug, Clone)]
+struct PostcodeArea {
     points: Vec<[f64; 2]>,
+    reach_m: f64,
+}
+
+impl PostcodeArea {
+    fn new(points: Vec<[f64; 2]>, neighbour_m: f64) -> Self {
+        let count = points.len() as f64;
+        let lon = points.iter().map(|[lon, _]| lon).sum::<f64>() / count;
+        let lat = points.iter().map(|[_, lat]| lat).sum::<f64>() / count;
+        let reach_m = points
+            .iter()
+            .map(|[point_lon, point_lat]| haversine_m(lon, lat, *point_lon, *point_lat))
+            .fold(neighbour_m.max(POSTCODE_AREA_REACH_FLOOR_M), f64::max);
+        Self { points, reach_m }
+    }
+
+    fn distance_m(&self, lon: f64, lat: f64) -> f64 {
+        self.points
+            .iter()
+            .map(|[point_lon, point_lat]| haversine_m(lon, lat, *point_lon, *point_lat))
+            .fold(f64::INFINITY, f64::min)
+    }
 }
 
 /// How [`QueryPostcode::rank`] ranks a record its own postcodes place in the
@@ -3579,11 +3744,11 @@ impl QueryPostcode {
         let farthest_band = POSTCODE_HELD - 2 - (POSTCODE_NEARNESS_BANDS_M.len() - 1) as u8;
         match (own, area) {
             (Some((true, _)), _) => POSTCODE_HELD,
-            (Some((false, shared)), _) => shared.min(POSTCODE_UNKNOWN - 1),
             (None, Some((true, _))) => POSTCODE_HELD - 1,
-            (None, area) => match band() {
-                Some(band) => POSTCODE_HELD - 2 - band,
-                None => POSTCODE_UNKNOWN
+            (own, area) => match (band(), own) {
+                (Some(band), _) => POSTCODE_HELD - 2 - band,
+                (None, Some((_, shared))) => shared.min(POSTCODE_UNKNOWN - 1),
+                (None, None) => POSTCODE_UNKNOWN
                     .saturating_add(area.map_or(0, |(_, shared)| shared))
                     .min(farthest_band - 1),
             },
@@ -3599,13 +3764,32 @@ impl QueryPostcode {
         Self::rank(own, area.map(read), || None)
     }
 
-    /// How far a point lies from the nearest record of the postcode, when the
-    /// Pack has one.
+    /// How far a point lies from the nearest record placing the postcode,
+    /// when the Pack has any.
     fn distance_m(&self, lon: f64, lat: f64) -> Option<f64> {
-        self.points
+        self.areas
             .iter()
-            .map(|[point_lon, point_lat]| haversine_m(lon, lat, *point_lon, *point_lat))
+            .map(|area| area.distance_m(lon, lat))
             .min_by(f64::total_cmp)
+    }
+
+    /// Whether a point lies in the postcode by where its area lies: within
+    /// its reach it does, beyond [`POSTCODE_CONTRADICTING_REACHES`] of them
+    /// it does not, and between, or with no area, nothing says. Of the
+    /// areas of several countries the one it lies nearest decides.
+    fn placement(&self, lon: f64, lat: f64) -> Option<bool> {
+        let reaches = self
+            .areas
+            .iter()
+            .map(|area| area.distance_m(lon, lat) / area.reach_m)
+            .min_by(f64::total_cmp)?;
+        if reaches <= 1.0 {
+            Some(true)
+        } else if reaches > POSTCODE_CONTRADICTING_REACHES {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     fn agreement(&self, postcode: &str) -> u8 {
@@ -4121,7 +4305,7 @@ impl QueryPlan {
         QueryPostcode {
             forms: unique_strings(vec![words.concat(), words[first_digit..].concat()]),
             exact: words.join(" "),
-            points: Vec::new(),
+            areas: Vec::new(),
         }
     }
 }
@@ -4893,6 +5077,113 @@ mod tests {
             geocode(&searcher, "7 Far Road", None, Some("M5V 1A1")).as_deref(),
             Some("osm:node:2")
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_reads_a_postcode_two_countries_share_in_each_one() {
+        use crate::parse::lattice::CountryCode;
+
+        // AU and NZ both use "2110": Hunters Hill in Sydney, Papakura in
+        // Auckland, each among postcodes of its own country.
+        let codes = [
+            ("AU", "2110", 151.150, -33.830),
+            ("AU", "2111", 151.135, -33.815),
+            ("AU", "2112", 151.120, -33.800),
+            ("NZ", "2110", 174.944, -37.065),
+            ("NZ", "2112", 174.900, -37.150),
+            ("NZ", "2113", 174.980, -37.120),
+        ];
+        for (country, lon, lat) in [("NZ", 174.945, -37.066), ("AU", 151.151, -33.831)] {
+            let temp_dir = temp_pack_path(&format!("geocode-postcode-shared-{country}"));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            let mut writer = Writer::create(&temp_dir).expect("writer");
+            for (code_country, code, code_lon, code_lat) in codes {
+                writer
+                    .write(
+                        &PostcodeRecord {
+                            postcode: code.to_string(),
+                            country: CountryCode::parse(code_country),
+                            geometry: point_geometry(code_lon, code_lat),
+                            source: DerivedSourceProvenance::osm_address_records(5),
+                        }
+                        .into(),
+                        None,
+                    )
+                    .expect("postcode");
+            }
+            let mut address = address_record("osm:node:1", "", "10", "Elliot Street", None, None);
+            address.geometry = point_geometry(lon, lat);
+            writer.write(&address.into(), None).expect("address");
+            writer.finish().expect("finish");
+            let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+            assert_eq!(
+                geocode(&searcher, "10 Elliot Street", None, Some("2110")).as_deref(),
+                Some("osm:node:1"),
+                "the {country} 2110 is not measured against the other country's"
+            );
+            // A code only the other country uses lies a sea away.
+            let foreign = if country == "NZ" { "2111" } else { "2113" };
+            assert_eq!(
+                geocode(&searcher, "10 Elliot Street", None, Some(foreign)),
+                None,
+                "{foreign} contradicts the {country} address"
+            );
+            let _ = std::fs::remove_dir_all(temp_dir);
+        }
+    }
+
+    /// A street's postcodes name the blocks its addresses state. The one a
+    /// query asks for missing from them says nothing: where the hit lies
+    /// decides, and the house in that postcode's neighbourhood wins.
+    #[test]
+    fn a_house_between_its_streets_postcodes_lies_in_the_one_asked_for() {
+        let temp_dir = temp_pack_path("search-postcode-between");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (code, lon) in [
+            ("M4M 1L2", -79.3330),
+            ("M4M 1L5", -79.3338),
+            ("M4M 1L7", -79.3345),
+            ("M6J 1H9", -79.4250),
+            ("M6J 1J2", -79.4258),
+            ("M6J 1J4", -79.4265),
+        ] {
+            writer
+                .write(
+                    &PostcodeRecord {
+                        postcode: code.to_string(),
+                        country: None,
+                        geometry: point_geometry(lon, 43.65),
+                        source: DerivedSourceProvenance::osm_address_records(3),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("postcode");
+        }
+        let mut east = address_record("osm:node:1", "", "1161", "Queen Street East", None, None);
+        east.street_postcodes = vec!["M4M 1L2".to_string(), "M4M 1L5".to_string()];
+        east.geometry = point_geometry(-79.3334, 43.65);
+        let mut west = address_record("osm:node:2", "", "1161", "Queen Street West", None, None);
+        west.street_postcodes = vec!["M6J 1H9".to_string(), "M6J 1J2".to_string()];
+        west.geometry = point_geometry(-79.4255, 43.65);
+        for record in [east, west] {
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        for limit in [1, 10] {
+            assert_eq!(
+                top_ids_limited(&searcher, "1161 Queen Street, M4M 1L3", limit)
+                    .first()
+                    .map(String::as_str),
+                Some("osm:node:1"),
+                "limit {limit}"
+            );
+        }
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -5755,10 +6046,14 @@ mod tests {
     }
 
     fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
+        top_ids_limited(searcher, query, 5)
+    }
+
+    fn top_ids_limited(searcher: &TextSearcher, query: &str, limit: usize) -> Vec<String> {
         searcher
             .search(TextSearchOptions {
                 query: query.to_string(),
-                limit: 5,
+                limit,
                 layer: None,
                 countries: Vec::new(),
                 focus: None,
