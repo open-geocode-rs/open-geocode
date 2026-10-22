@@ -213,6 +213,10 @@ pub struct BuildPlan {
     pub shortfalls: Vec<String>,
     /// Whether the build was told to run despite a shortfall.
     pub forced: bool,
+    /// Scratch a stopped build left that this one goes on with: counted as
+    /// free, since the build's need includes it.
+    #[serde(default)]
+    pub held_scratch_bytes: u64,
 }
 
 /// What a build looks like after an input's scan: the items counted so far,
@@ -274,11 +278,9 @@ impl BuildPlan {
         let streets = items.streets as f64;
         let pack = items.records as f64 * PACK_BYTES_PER_RECORD
             + items.imported_rows as f64 * PACK_BYTES_PER_IMPORTED_ROW;
-        let locations = if self.locations_in_memory {
-            0.0
-        } else {
-            (items.needed_nodes * NODE_SLOT_BYTES) as f64
-        };
+        // Coordinates held in memory are saved at the node pass's
+        // checkpoint, so they are on disk through the way pass either way.
+        let locations = (items.needed_nodes * NODE_SLOT_BYTES) as f64;
         // Scratch held at the end of each stage that peaks: the way pass
         // (the records other than addresses and streets, the OSM addresses,
         // the streets, mapped coordinates), address placement (every other
@@ -310,8 +312,16 @@ impl BuildPlan {
     /// Check the needs against what is free, failing unless forced.
     fn check(&mut self) -> Result<()> {
         self.warnings.clear();
-        self.scratch_disk_free_bytes = resources::free_disk(&self.scratch_dir);
-        self.output_disk_free_bytes = resources::free_disk(&self.output_dir);
+        let held = self.held_scratch_bytes;
+        self.scratch_disk_free_bytes =
+            resources::free_disk(&self.scratch_dir).map(|free| free + held);
+        self.output_disk_free_bytes = resources::free_disk(&self.output_dir).map(|free| {
+            if resources::same_volume(&self.scratch_dir, &self.output_dir) {
+                free + held
+            } else {
+                free
+            }
+        });
         let counted = if self.counted {
             "counted"
         } else {
@@ -450,11 +460,37 @@ pub fn plan_build(
     scratch_budget: Option<u64>,
     force: bool,
 ) -> Result<BuildPlan> {
+    plan_build_holding(
+        input_bytes,
+        imported_rows,
+        scratch,
+        output,
+        budget_override,
+        scratch_budget,
+        force,
+        0,
+    )
+}
+
+/// [`plan_build`] for a build that goes on with `held` bytes of scratch a
+/// stopped one left.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_build_holding(
+    input_bytes: u64,
+    imported_rows: u64,
+    scratch: &Path,
+    output: &Path,
+    budget_override: Option<usize>,
+    scratch_budget: Option<u64>,
+    force: bool,
+    held: u64,
+) -> Result<BuildPlan> {
     let mut plan = BuildPlan {
         scratch_budget_bytes: scratch_budget,
         scratch_dir: scratch.to_path_buf(),
         output_dir: output.to_path_buf(),
         forced: force,
+        held_scratch_bytes: held,
         ..preflight(
             Resources::probe(),
             input_bytes,
@@ -588,8 +624,11 @@ mod tests {
     }
 
     #[test]
-    fn coordinates_mapped_from_disk_count_as_scratch() {
+    fn coordinates_count_as_scratch_in_memory_or_mapped() {
         let mut plan = preflight(machine(28), 200_000_000, 0, None);
+        plan.items.needed_nodes = 0;
+        plan.size();
+        let none = plan.scratch_disk_needed_bytes;
         plan.items.needed_nodes = 1_000_000_000;
         plan.locations_in_memory = true;
         plan.size();
@@ -597,7 +636,8 @@ mod tests {
         plan.locations_in_memory = false;
         plan.size();
         let mapped = plan.scratch_disk_needed_bytes;
-        assert!(mapped > in_memory, "{mapped} > {in_memory}");
+        assert_eq!(mapped, in_memory);
+        assert!(mapped > none, "{mapped} > {none}");
     }
 
     #[test]

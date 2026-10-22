@@ -50,7 +50,7 @@ pub trait AddressSource: Send + Sync + fmt::Debug {
 
 /// One file of address points and the dataset its records name as their
 /// source, such as `openaddresses:nz/countrywide`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddressFile {
     pub dataset: String,
     pub path: PathBuf,

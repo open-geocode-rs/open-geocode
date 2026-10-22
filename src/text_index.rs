@@ -58,6 +58,9 @@ const MAX_INDEX_THREADS: usize = 16;
 /// Segments the finished text index keeps, one per merge run in parallel
 /// (Tantivy merges on four threads).
 const MERGED_SEGMENTS: usize = 4;
+/// Where in the scratch directory Tantivy writes, and whose bytes they are.
+const DIRECTORY: &str = "text";
+const LABEL: &str = "pack-text";
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
 const INTERPOLATION_END_FIELD: &str = "interpolation_end";
@@ -76,6 +79,12 @@ pub(crate) const PLACE_RANK_FIELD: &str = "place_rank";
 /// a bounded run of records.
 const MAX_GROUP_RECORDS: u64 = 1_024;
 
+/// The text index as a checkpoint leaves it: committed in its directory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriterState {
+    document_count: u64,
+}
+
 pub struct Writer {
     /// Created with the first document, so its buffers are reserved only for
     /// the phase that writes records.
@@ -87,6 +96,9 @@ pub struct Writer {
     scratch: Arc<Scratch>,
     fields: Fields,
     document_count: u64,
+    /// Documents a checkpoint committed: a checkpoint commits again only
+    /// once there are more, so the directory it synced stays as it was.
+    committed: u64,
     /// The address group the next address may join.
     group: Option<Document>,
 }
@@ -201,7 +213,7 @@ impl Extent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Commit {
     pub document_count: u64,
     pub bytes: u64,
@@ -264,7 +276,7 @@ impl Writer {
         memory_bytes: usize,
     ) -> Result<Self> {
         let (schema, fields) = build_schema();
-        let path = scratch.path().join("text");
+        let path = scratch.path().join(DIRECTORY);
         fs::create_dir_all(&path).map_err(|source| Error::IoPath {
             action: "failed to create",
             path: path.clone(),
@@ -272,7 +284,7 @@ impl Writer {
         })?;
         // Tantivy writes its segments itself, so the ledger measures them
         // at checkpoints instead of reserving each write.
-        scratch.watch("pack-text", &path);
+        scratch.watch(LABEL, &path);
         let index = Index::create_in_dir(&path, schema)?;
         Ok(Self {
             scratch: Arc::clone(scratch),
@@ -283,12 +295,59 @@ impl Writer {
             path,
             fields,
             document_count: 0,
+            committed: 0,
             group: None,
         })
     }
 
     pub fn fields(&self) -> Fields {
         self.fields
+    }
+
+    /// Commit every document, for a checkpoint, once every record is
+    /// added: the open address group is closed, as [`Self::finish`] would.
+    pub fn state(&mut self) -> Result<WriterState> {
+        self.close_group()?;
+        if let Some((writer, _)) = &mut self.writer
+            && self.committed < self.document_count
+        {
+            writer.commit()?;
+            self.committed = self.document_count;
+        }
+        Ok(WriterState {
+            document_count: self.document_count,
+        })
+    }
+
+    /// The directory Tantivy writes the index to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The index a checkpoint committed, ready to be merged and copied into
+    /// the Pack.
+    pub fn restore(
+        scratch: &Arc<Scratch>,
+        budget: &Arc<Budget>,
+        memory_bytes: usize,
+        state: &WriterState,
+    ) -> Result<Self> {
+        let path = scratch.path().join(DIRECTORY);
+        scratch.watch(LABEL, &path);
+        let index = Index::open_in_dir(&path)?;
+        let fields = Fields::from_schema(&index.schema())?;
+        Ok(Self {
+            scratch: Arc::clone(scratch),
+            writer: None,
+            budget: Arc::clone(budget),
+            memory_bytes: memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES),
+            index,
+            path,
+            fields,
+            document_count: state.document_count,
+            committed: state.document_count,
+            group: None,
+        })
     }
 
     fn writer(&mut self) -> Result<&mut IndexWriter> {
@@ -425,12 +484,7 @@ impl Writer {
         } = self;
         drop(index);
         scratch.measure();
-        fs::remove_dir_all(&path).map_err(|source| Error::IoPath {
-            action: "failed to remove",
-            path: path.clone(),
-            source,
-        })?;
-        scratch.unwatch(&path);
+        scratch.remove_dir(&path)?;
         Ok(Commit {
             document_count,
             bytes,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::{
     error::{Error, Result},
-    extsort::{IndexedSpool, IndexedSpoolFile, Scratch, Spill},
+    extsort::{IndexedSpool, IndexedSpoolFile, IndexedState, Scratch, Spill},
     util::codec::{get_u64, put_u64},
 };
 
@@ -98,6 +98,25 @@ impl<T: Entry> Book<T> {
 /// A book closed for reading. The file is removed once it is dropped.
 pub(crate) struct BookFile<T> {
     file: IndexedSpoolFile<Chunk<T>>,
+}
+
+impl<T> BookFile<T> {
+    /// The book as a checkpoint names it.
+    pub(crate) fn state(&mut self, scratch: &Arc<Scratch>) -> Result<IndexedState> {
+        self.file.state(scratch)
+    }
+
+    /// The files a checkpoint names for it.
+    pub(crate) fn files(&self) -> Vec<std::path::PathBuf> {
+        self.file.files()
+    }
+
+    /// The book a checkpoint named.
+    pub(crate) fn restore(scratch: &Arc<Scratch>, state: &IndexedState) -> Result<Self> {
+        Ok(Self {
+            file: IndexedSpoolFile::restore(scratch, state)?,
+        })
+    }
 }
 
 impl<T: Entry> BookFile<T> {

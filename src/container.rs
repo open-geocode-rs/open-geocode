@@ -26,6 +26,7 @@ use std::{
 
 use crate::error::{Error, Result};
 use memmap2::{Mmap, MmapOptions};
+use serde::{Deserialize, Serialize};
 pub use tantivy::directory::OwnedBytes as Bytes;
 
 use rayon::prelude::*;
@@ -41,13 +42,21 @@ const TRAILER_BYTES: usize = 24;
 const SECTION_ALIGN: u64 = 64;
 const WRITE_BUFFER_BYTES: usize = 4 << 20;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionInfo {
     pub version: u32,
     pub offset: u64,
     pub len: u64,
     /// XXH3-64 of the section bytes.
     pub checksum: u64,
+}
+
+/// How far a Pack file was written: the end of its last section, and the
+/// sections before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct State {
+    pub offset: u64,
+    pub sections: BTreeMap<String, SectionInfo>,
 }
 
 #[derive(Debug)]
@@ -129,6 +138,54 @@ impl Writer {
             file: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
             offset: end,
             sections,
+            open: None,
+        })
+    }
+
+    /// Where a Pack file being written stands, for a build to go on from:
+    /// everything written so far is flushed and synced first.
+    pub fn state(&mut self) -> Result<State> {
+        if self.open.is_some() {
+            return Err(Error::Inconsistent(
+                "Pack checkpoint taken with an open section".into(),
+            ));
+        }
+        self.file.flush()?;
+        self.file
+            .get_mut()
+            .sync_all()
+            .map_err(|source| Error::IoPath {
+                action: "failed to sync",
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(State {
+            offset: self.offset,
+            sections: self.sections.clone(),
+        })
+    }
+
+    /// Go on writing the Pack file at `path` from where `state` left it.
+    /// Whatever follows, a section half written or a table of contents, is
+    /// cut off.
+    pub fn resume(path: impl AsRef<Path>, state: &State) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let failed = |source| Error::IoPath {
+            action: "failed to reopen",
+            path: path.clone(),
+            source,
+        };
+        let mut file = OpenOptions::new().write(true).open(&path).map_err(failed)?;
+        if file.metadata().map_err(failed)?.len() < state.offset {
+            return Err(Error::Truncated);
+        }
+        file.set_len(state.offset).map_err(failed)?;
+        file.seek(SeekFrom::Start(state.offset))?;
+        Ok(Self {
+            path,
+            file: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+            offset: state.offset,
+            sections: state.sections.clone(),
             open: None,
         })
     }

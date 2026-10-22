@@ -216,6 +216,51 @@ impl Sampler {
         }
     }
 
+    /// The sample as a checkpoint saves it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u64(&mut out, self.random.0);
+        put_u64(&mut out, self.reservoirs.len() as u64);
+        for ((country, draw), reservoir) in &self.reservoirs {
+            put_u64(&mut out, country.map_or(0, |country| country + 1));
+            match draw {
+                Draw::Layer(layer) => put_str(&mut out, layer.as_str()),
+                Draw::BlockAddress => put_str(&mut out, ""),
+            }
+            put_u64(&mut out, reservoir.seen);
+            put_u64(&mut out, reservoir.ids.len() as u64);
+            for id in &reservoir.ids {
+                put_u64(&mut out, *id);
+            }
+        }
+        out
+    }
+
+    /// The sample [`Sampler::to_bytes`] saved.
+    pub fn from_bytes(mut input: &[u8]) -> Result<Self> {
+        let input = &mut input;
+        let random = Random(get_u64(input)?);
+        let mut reservoirs = BTreeMap::new();
+        for _ in 0..get_u64(input)? {
+            let country = get_u64(input)?.checked_sub(1);
+            let draw = match get_string(input)?.as_str() {
+                "" => Draw::BlockAddress,
+                layer => Draw::Layer(
+                    Layer::parse(layer).ok_or(Error::Decode("unknown layer in a saved sample"))?,
+                ),
+            };
+            let seen = get_u64(input)?;
+            let ids = (0..get_u64(input)?)
+                .map(|_| get_u64(input))
+                .collect::<Result<Vec<_>>>()?;
+            reservoirs.insert((country, draw), Reservoir { seen, ids });
+        }
+        if !input.is_empty() {
+            return Err(Error::Decode("a saved sample has trailing bytes"));
+        }
+        Ok(Self { reservoirs, random })
+    }
+
     /// Bytes the sample holds.
     pub fn resident_bytes(&self) -> usize {
         self.reservoirs

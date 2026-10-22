@@ -116,6 +116,7 @@ struct BoundaryBox {
 
 /// An area records lie in: an admin boundary, or a place drawn as a closed
 /// way or a multipolygon (`place=island`, `place=suburb`).
+#[derive(Clone)]
 struct BuiltBoundary {
     layer: PlaceLayer,
     /// `None` for a place area, which takes its layer from its `place` tag
@@ -139,7 +140,8 @@ struct BuiltBoundary {
     representative_point: [f64; 2],
 }
 
-struct BoundaryCandidate {
+#[derive(Clone)]
+pub(crate) struct BoundaryCandidate {
     source_object_type: ObjectType,
     source_object_id: i64,
     boundary: BuiltBoundary,
@@ -1469,6 +1471,232 @@ fn source_type_rank(object_type: ObjectType) -> u8 {
         ObjectType::Node => 2,
         ObjectType::Row => 3,
     }
+}
+
+/// A part of a [`BoundarySet`] as a checkpoint saves it.
+pub(crate) enum SetItem {
+    Candidate(Box<BoundaryCandidate>),
+    DerivedCountry(String, Box<PlaceRecord>),
+    Unmatched(String),
+}
+
+impl BoundarySet {
+    /// Save the set to a spool, for a checkpoint.
+    pub(crate) fn save(
+        &self,
+        scratch: &std::sync::Arc<crate::extsort::Scratch>,
+    ) -> crate::error::Result<crate::extsort::SpoolFile<SetItem>> {
+        let mut spool = crate::extsort::Spool::create(scratch, "boundaries")?;
+        for candidate in &self.candidates {
+            spool.write(&SetItem::Candidate(Box::new(candidate.clone())))?;
+        }
+        for (code, record) in &self.derived_countries {
+            spool.write(&SetItem::DerivedCountry(
+                code.clone(),
+                Box::new(record.clone()),
+            ))?;
+        }
+        for id in &self.unmatched_admin_ids {
+            spool.write(&SetItem::Unmatched(id.clone()))?;
+        }
+        spool.finish()
+    }
+
+    /// The set a checkpoint saved.
+    pub(crate) fn load(saved: &crate::extsort::SpoolFile<SetItem>) -> crate::error::Result<Self> {
+        let mut set = Self {
+            candidates: Vec::new(),
+            derived_countries: Vec::new(),
+            unmatched_admin_ids: Vec::new(),
+        };
+        for item in saved.reader()? {
+            match item? {
+                SetItem::Candidate(candidate) => set.candidates.push(*candidate),
+                SetItem::DerivedCountry(code, record) => {
+                    set.derived_countries.push((code, *record))
+                }
+                SetItem::Unmatched(id) => set.unmatched_admin_ids.push(id),
+            }
+        }
+        Ok(set)
+    }
+}
+
+impl crate::extsort::Spill for SetItem {
+    fn encode(&self, out: &mut Vec<u8>) {
+        use crate::util::codec::{put_i64, put_opt_str, put_str, put_u64};
+        match self {
+            Self::Candidate(candidate) => {
+                out.push(0);
+                out.push(object_type_code(candidate.source_object_type));
+                put_i64(out, candidate.source_object_id);
+                let boundary = &candidate.boundary;
+                out.push(boundary.layer as u8);
+                out.push(
+                    boundary
+                        .admin_level
+                        .map_or(0, |level| level.saturating_add(1)),
+                );
+                put_opt_str(out, boundary.place_type.as_deref());
+                put_str(out, &boundary.name);
+                put_u64(out, boundary.alt_names.len() as u64);
+                for name in &boundary.alt_names {
+                    put_str(out, name);
+                }
+                out.push(boundary.place_layer.map_or(u8::MAX, |layer| layer as u8));
+                put_opt_str(out, boundary.designation.as_deref());
+                put_opt_str(out, boundary.inferred_country_code.as_deref());
+                put_opt_str(out, boundary.subdivision_code.as_deref());
+                put_u64(out, boundary.geometry.0.len() as u64);
+                let mut last = (0, 0);
+                for polygon in &boundary.geometry.0 {
+                    put_u64(out, polygon.interiors().len() as u64);
+                    for ring in std::iter::once(polygon.exterior()).chain(polygon.interiors()) {
+                        put_u64(out, ring.0.len() as u64);
+                        for coord in &ring.0 {
+                            super::checkpoint::put_degrees(out, &mut last.0, coord.x);
+                            super::checkpoint::put_degrees(out, &mut last.1, coord.y);
+                        }
+                    }
+                }
+                for value in boundary.representative_point {
+                    out.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+            Self::DerivedCountry(code, record) => {
+                out.push(1);
+                put_str(out, code);
+                super::spill::encode_record(
+                    out,
+                    &Record::Place(PlaceLayer::Country, (**record).clone()),
+                );
+            }
+            Self::Unmatched(id) => {
+                out.push(2);
+                put_str(out, id);
+            }
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> crate::error::Result<Self> {
+        use crate::{
+            error::Error,
+            util::codec::{get_i64, get_opt_string, get_string, get_u8, get_u64},
+        };
+        let layer = |code: u8| {
+            PlaceLayer::ALL
+                .get(usize::from(code))
+                .copied()
+                .ok_or(Error::Decode("unknown place layer"))
+        };
+        Ok(match get_u8(input)? {
+            0 => {
+                let source_object_type = object_type_of(get_u8(input)?)?;
+                let source_object_id = get_i64(input)?;
+                let boundary_layer = layer(get_u8(input)?)?;
+                let admin_level = get_u8(input)?.checked_sub(1);
+                let place_type = get_opt_string(input)?;
+                let name = get_string(input)?;
+                let alt_names = (0..get_u64(input)?)
+                    .map(|_| get_string(input))
+                    .collect::<crate::error::Result<Vec<_>>>()?;
+                let place_layer = match get_u8(input)? {
+                    u8::MAX => None,
+                    code => Some(layer(code)?),
+                };
+                let designation = get_opt_string(input)?;
+                let inferred_country_code = get_opt_string(input)?;
+                let subdivision_code = get_opt_string(input)?;
+                let mut polygons = Vec::new();
+                let mut last = (0, 0);
+                for _ in 0..get_u64(input)? {
+                    let interiors = get_u64(input)?;
+                    let mut rings = Vec::new();
+                    for _ in 0..=interiors {
+                        let mut coords = Vec::new();
+                        for _ in 0..get_u64(input)? {
+                            let x = super::checkpoint::get_degrees(input, &mut last.0)?;
+                            let y = super::checkpoint::get_degrees(input, &mut last.1)?;
+                            coords.push(geo::Coord { x, y });
+                        }
+                        rings.push(LineString(coords));
+                    }
+                    let exterior = rings.remove(0);
+                    polygons.push(Polygon::new(exterior, rings));
+                }
+                let representative_point = [
+                    super::checkpoint::get_f64(input)?,
+                    super::checkpoint::get_f64(input)?,
+                ];
+                Self::Candidate(Box::new(BoundaryCandidate {
+                    source_object_type,
+                    source_object_id,
+                    boundary: BuiltBoundary {
+                        layer: boundary_layer,
+                        admin_level,
+                        place_type,
+                        name,
+                        alt_names,
+                        place_layer,
+                        designation,
+                        inferred_country_code,
+                        subdivision_code,
+                        geometry: MultiPolygon(polygons),
+                        representative_point,
+                    },
+                }))
+            }
+            1 => {
+                let code = get_string(input)?;
+                match super::spill::decode_record(input)? {
+                    Record::Place(_, record) => Self::DerivedCountry(code, Box::new(record)),
+                    _ => return Err(Error::Decode("a saved derived country is not a place")),
+                }
+            }
+            2 => Self::Unmatched(get_string(input)?),
+            _ => return Err(Error::Decode("unknown saved boundary item")),
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Candidate(candidate) => {
+                    std::mem::size_of::<BoundaryCandidate>()
+                        + candidate
+                            .boundary
+                            .geometry
+                            .0
+                            .iter()
+                            .flat_map(|polygon| {
+                                std::iter::once(polygon.exterior()).chain(polygon.interiors())
+                            })
+                            .map(|ring| ring.0.len() * std::mem::size_of::<geo::Coord>())
+                            .sum::<usize>()
+                }
+                Self::DerivedCountry(code, record) => code.len() + record.name.len() + 256,
+                Self::Unmatched(id) => id.len(),
+            }
+    }
+}
+
+fn object_type_code(object_type: ObjectType) -> u8 {
+    match object_type {
+        ObjectType::Node => 0,
+        ObjectType::Way => 1,
+        ObjectType::Relation => 2,
+        ObjectType::Row => 3,
+    }
+}
+
+fn object_type_of(code: u8) -> crate::error::Result<ObjectType> {
+    Ok(match code {
+        0 => ObjectType::Node,
+        1 => ObjectType::Way,
+        2 => ObjectType::Relation,
+        3 => ObjectType::Row,
+        _ => return Err(crate::error::Error::Decode("unknown object type")),
+    })
 }
 
 #[cfg(test)]

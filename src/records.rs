@@ -74,12 +74,13 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufWriter, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
 use crate::error::{Error, Result};
 use geojson::{Geometry, GeometryValue};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -111,6 +112,7 @@ pub const SECTION_STRINGS: &str = "records/strings";
 pub const RECORDS_VERSION: u32 = 8;
 
 pub const BLOCK_RECORDS: u64 = 64;
+const LABEL: &str = "pack-records";
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
 /// key, the id and the hash table slot.
 const DICTIONARY_ENTRY_OVERHEAD: usize = 48;
@@ -333,6 +335,22 @@ impl Header {
     }
 }
 
+/// The record store as a checkpoint names it: its files, by name in the
+/// scratch directory and length, and the counts its sections start with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterState {
+    blocks: (String, u64),
+    blocks_len: u64,
+    block_offsets: (String, u64),
+    record_count: u64,
+    segments: Vec<(u64, u64)>,
+    string_count: u64,
+    strings_len: u64,
+    strings: (String, u64),
+    string_ends: (String, u64),
+    datasets: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Writer {
     blocks: BufWriter<ScratchFile>,
@@ -463,7 +481,7 @@ impl Writer {
         let create = |name: &str| -> Result<BufWriter<ScratchFile>> {
             Ok(BufWriter::with_capacity(
                 1 << 20,
-                ScratchFile::create(scratch, "pack-records", name)?,
+                ScratchFile::create(scratch, LABEL, name)?,
             ))
         };
         Ok(Self {
@@ -503,6 +521,84 @@ impl Writer {
 
     pub fn string_count(&self) -> u64 {
         self.strings.count
+    }
+
+    /// The store once every record is written, its files flushed, for a
+    /// checkpoint. No record may be written after.
+    pub fn state(&mut self) -> Result<WriterState> {
+        self.flush_block()?;
+        let file = |file: &mut BufWriter<ScratchFile>| -> Result<(String, u64)> {
+            file.flush()?;
+            Ok((file.get_ref().name(), file.get_ref().bytes()))
+        };
+        Ok(WriterState {
+            blocks: file(&mut self.blocks)?,
+            blocks_len: self.blocks_len,
+            block_offsets: file(&mut self.block_offsets)?,
+            record_count: self.record_count,
+            segments: self.strings.segments.clone(),
+            string_count: self.strings.count,
+            strings_len: self.strings.bytes_len,
+            strings: file(&mut self.strings.bytes)?,
+            string_ends: file(&mut self.strings.ends)?,
+            datasets: self.datasets.clone(),
+        })
+    }
+
+    /// The scratch files the store streams to.
+    pub fn files(&self) -> Vec<PathBuf> {
+        [
+            &self.blocks,
+            &self.block_offsets,
+            &self.strings.bytes,
+            &self.strings.ends,
+        ]
+        .into_iter()
+        .map(|file| file.get_ref().path().to_path_buf())
+        .collect()
+    }
+
+    /// The store a checkpoint left, ready to be copied into the Pack.
+    pub fn restore(
+        scratch: &Arc<Scratch>,
+        budget: &Arc<Budget>,
+        state: &WriterState,
+    ) -> Result<Self> {
+        let reopen = |(name, bytes): &(String, u64)| -> Result<BufWriter<ScratchFile>> {
+            Ok(BufWriter::with_capacity(
+                1 << 20,
+                ScratchFile::reopen(scratch, LABEL, name, *bytes)?,
+            ))
+        };
+        Ok(Self {
+            blocks: reopen(&state.blocks)?,
+            blocks_len: state.blocks_len,
+            block_offsets: reopen(&state.block_offsets)?,
+            block: Vec::new(),
+            block_starts: Vec::new(),
+            block_slots: 0,
+            continued: 0,
+            centroids: 0,
+            ways: 0,
+            relations: 0,
+            disputed: 0,
+            block_base: (0, 0),
+            record_count: state.record_count,
+            strings: StringTable {
+                ids: HashMap::new(),
+                memory: Reservation::empty(budget),
+                memory_share: budget.limit() / DICTIONARY_BUDGET_FRACTION,
+                segment_records: SEGMENT_RECORDS,
+                segments: state.segments.clone(),
+                count: state.string_count,
+                bytes_len: state.strings_len,
+                bytes: reopen(&state.strings)?,
+                ends: reopen(&state.string_ends)?,
+            },
+            body: Vec::new(),
+            run: None,
+            datasets: state.datasets.clone(),
+        })
     }
 
     #[cfg(test)]

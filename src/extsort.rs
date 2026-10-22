@@ -16,6 +16,10 @@
 //!
 //! Every byte is reserved in the [`Scratch`] ledger before it is written;
 //! see [`scratch`] for what happens when it runs out.
+//!
+//! A sorter or a closed spool can be saved at a checkpoint and restored
+//! from it ([`SorterState`], [`RunState`]): a build that stops goes on with
+//! the runs already on disk.
 
 mod block;
 mod merge;
@@ -35,6 +39,7 @@ use std::{
 };
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 pub use crate::util::codec::Delta;
 use crate::{
@@ -42,11 +47,14 @@ use crate::{
     memory::{Budget, Reservation, Spillable},
     util::codec::{get_delta, get_u64, put_delta, put_u64},
 };
+pub use block::RunState;
 use block::{
     BLOCK_BYTES, Block, Cursor, Failure, Frame, MIN_BLOCK_BYTES, Prefetch, Run, RunWriter, Stream,
 };
 pub use merge::Merge;
-pub use scratch::{IoTimes, Owner, Scratch, ScratchFile, Shortfall, Traffic};
+pub use scratch::{
+    IoTimes, Ledger, MANIFEST_FILE, Owner, Scratch, ScratchFile, Shortfall, Traffic,
+};
 
 const IO_BUFFER_BYTES: usize = 1 << 20;
 /// When the shared pool is full, a sorter spills only once its buffer holds at
@@ -110,6 +118,31 @@ fn buffer_bytes(share: usize) -> usize {
 /// Raw bytes of a run's blocks for a sorter with `share` bytes.
 fn block_bytes(share: usize) -> usize {
     (share / 32).clamp(MIN_BLOCK_BYTES, BLOCK_BYTES)
+}
+
+/// A sorter as a checkpoint names it: every item it was given is in its
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SorterState {
+    pub label: String,
+    pub items: u64,
+    pub runs_written: u64,
+    pub runs: Vec<RunState>,
+}
+
+impl SorterState {
+    /// The files its runs are in.
+    pub fn files<'a>(
+        &'a self,
+        scratch: &'a Scratch,
+    ) -> impl Iterator<Item = std::path::PathBuf> + 'a {
+        self.runs.iter().flat_map(|run| run.files(scratch))
+    }
+
+    /// Bytes its runs hold on disk.
+    pub fn bytes(&self) -> u64 {
+        self.runs.iter().map(|run| run.bytes).sum()
+    }
 }
 
 #[derive(Debug)]
@@ -210,6 +243,48 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
             items: self.items,
             runs: self.runs_written.load(Ordering::Relaxed),
         }
+    }
+
+    /// Write what the buffer holds as a run and wait for every run to be
+    /// on disk, for a checkpoint to name them. The buffer's memory is free
+    /// again after.
+    pub fn checkpoint(&mut self) -> Result<SorterState> {
+        self.spill()?;
+        if let Some(spiller) = self.spiller.take() {
+            self.runs.extend(spiller.join()?);
+        }
+        Ok(SorterState {
+            label: self.owner.label().to_string(),
+            items: self.items,
+            runs_written: self.runs_written.load(Ordering::Relaxed),
+            runs: self.runs.iter().map(Run::state).collect(),
+        })
+    }
+
+    /// A sorter holding the runs `state` names, as [`ExternalSorter::new`]
+    /// makes an empty one.
+    pub fn restore(
+        scratch: &Arc<Scratch>,
+        budget: &Arc<Budget>,
+        share_bytes: usize,
+        state: &SorterState,
+    ) -> Result<Self> {
+        let mut sorter = Self {
+            scratch: Arc::clone(scratch),
+            budget: Arc::clone(budget),
+            owner: scratch.owner(&state.label),
+            share_bytes: share_bytes.max(1),
+            reservation: Spillable::new(budget),
+            buffer: Vec::new(),
+            runs: Vec::new(),
+            spiller: None,
+            items: state.items,
+            runs_written: Arc::new(AtomicU64::new(state.runs_written)),
+        };
+        for run in &state.runs {
+            sorter.runs.push(Run::restore(scratch, run)?);
+        }
+        Ok(sorter)
     }
 
     /// Sorted items, ascending.
@@ -512,6 +587,25 @@ impl<T: Spill> SpoolFile<T> {
         Ok(SpoolReader::new(&self.scratch, Cursor::keep(&self.run)))
     }
 
+    /// Read it once more, removing each chunk as it is read.
+    pub fn into_reader(self) -> SpoolReader<T> {
+        SpoolReader::new(&self.scratch, Cursor::consume(self.run))
+    }
+
+    /// The spool as a checkpoint names it.
+    pub fn state(&self) -> RunState {
+        self.run.state()
+    }
+
+    /// The spool a checkpoint named.
+    pub fn restore(scratch: &Arc<Scratch>, state: &RunState) -> Result<Self> {
+        Ok(Self {
+            run: Run::restore(scratch, state)?,
+            scratch: Arc::clone(scratch),
+            _marker: PhantomData,
+        })
+    }
+
     /// Items the spool holds.
     pub fn len(&self) -> u64 {
         self.run.items
@@ -624,6 +718,33 @@ impl<T: Spill> IndexedSpool<T> {
             .file
             .into_inner()
             .map_err(|error| Error::Io(error.into_error()))?;
+        IndexedSpoolFile::map(file, self.offsets, None)
+    }
+}
+
+/// A closed [`IndexedSpool`].
+#[derive(Debug)]
+pub struct IndexedSpoolFile<T> {
+    /// Taken before the file is removed: Windows cannot remove a mapped file.
+    map: Option<memmap2::Mmap>,
+    file: ScratchFile,
+    offsets: Vec<u64>,
+    /// The offsets, once a checkpoint wrote them out.
+    saved: Option<ScratchFile>,
+    _marker: PhantomData<T>,
+}
+
+/// An [`IndexedSpoolFile`] as a checkpoint names it: its file and the file
+/// of its items' offsets, by name and length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedState {
+    pub label: String,
+    pub file: (String, u64),
+    pub offsets: (String, u64),
+}
+
+impl<T> IndexedSpoolFile<T> {
+    fn map(file: ScratchFile, offsets: Vec<u64>, saved: Option<ScratchFile>) -> Result<Self> {
         let path = file.path().to_path_buf();
         let read = File::open(&path).map_err(|source| Error::IoPath {
             action: "failed to open scratch file",
@@ -637,23 +758,56 @@ impl<T: Spill> IndexedSpool<T> {
             path,
             source,
         })?;
-        Ok(IndexedSpoolFile {
+        Ok(Self {
             map: Some(map),
             file,
-            offsets: self.offsets,
+            offsets,
+            saved,
             _marker: PhantomData,
         })
     }
-}
 
-/// A closed [`IndexedSpool`].
-#[derive(Debug)]
-pub struct IndexedSpoolFile<T> {
-    /// Taken before the file is removed: Windows cannot remove a mapped file.
-    map: Option<memmap2::Mmap>,
-    file: ScratchFile,
-    offsets: Vec<u64>,
-    _marker: PhantomData<T>,
+    /// The file as a checkpoint names it, its offsets written out once.
+    pub fn state(&mut self, scratch: &Arc<Scratch>) -> Result<IndexedState> {
+        if self.saved.is_none() {
+            let name = scratch.new_file(&format!("{}-offsets", self.file.label()));
+            let name = name
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut offsets =
+                BufWriter::new(ScratchFile::create(scratch, self.file.label(), &name)?);
+            for offset in &self.offsets {
+                offsets.write_all(&offset.to_le_bytes())?;
+            }
+            self.saved = Some(offsets.into_inner().map_err(|error| error.into_error())?);
+        }
+        let saved = self.saved.as_ref().expect("offsets saved");
+        Ok(IndexedState {
+            label: self.file.label().to_string(),
+            file: (self.file.name(), self.file.bytes()),
+            offsets: (saved.name(), saved.bytes()),
+        })
+    }
+
+    /// The files a checkpoint names for it.
+    pub fn files(&self) -> Vec<std::path::PathBuf> {
+        std::iter::once(&self.file)
+            .chain(self.saved.as_ref())
+            .map(|file| file.path().to_path_buf())
+            .collect()
+    }
+
+    /// The file a checkpoint named.
+    pub fn restore(scratch: &Arc<Scratch>, state: &IndexedState) -> Result<Self> {
+        let file = ScratchFile::reopen(scratch, &state.label, &state.file.0, state.file.1)?;
+        let saved = ScratchFile::reopen(scratch, &state.label, &state.offsets.0, state.offsets.1)?;
+        let offsets = std::fs::read(saved.path())?
+            .chunks_exact(8)
+            .map(|offset| u64::from_le_bytes(offset.try_into().expect("8 bytes")))
+            .collect();
+        Self::map(file, offsets, Some(saved))
+    }
 }
 
 impl<T: Spill> IndexedSpoolFile<T> {
@@ -1258,5 +1412,86 @@ mod tests {
         assert!(message.contains("--scratch-budget-mb"), "{message}");
         assert_eq!(scratch.level(), 9);
         assert_eq!(scratch.live_bytes(), 0);
+    }
+
+    /// A sorter checkpointed and committed outlives a build that fails,
+    /// and a scratch reopened from the checkpoint sorts what it held.
+    #[test]
+    fn a_checkpointed_sorter_survives_a_failure_and_is_restored() {
+        let scratch = scratch("checkpoint");
+        let path = scratch.path().to_path_buf();
+        let budget = Budget::unlimited();
+        let input = pseudo_random(5_000);
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &budget, 1 << 20);
+        for item in &input[..3_000] {
+            sorter.push(*item).expect("push");
+        }
+        let state = sorter.checkpoint().expect("checkpoint");
+        let files = state.files(&scratch).collect::<Vec<_>>();
+        assert!(!files.is_empty());
+        scratch.commit(&files, b"{}").expect("commit");
+        // Work after the checkpoint is not the checkpoint's.
+        for item in &input[3_000..] {
+            sorter.push(*item).expect("push");
+        }
+        sorter.checkpoint().expect("later runs");
+        drop(sorter);
+        assert!(scratch.resumable());
+        assert!(files.iter().all(|file| file.exists()));
+        drop(scratch);
+        assert!(path.join(MANIFEST_FILE).exists(), "kept for a resume");
+
+        let scratch = Scratch::reopen(&path, &files, 1_000).expect("reopen");
+        assert_eq!(
+            fs::read_dir(&path).expect("scratch").count(),
+            files.len() + 1,
+            "only what the checkpoint names is left, and its manifest"
+        );
+        let restored = ExternalSorter::<(u64, u64)>::restore(&scratch, &budget, 1 << 20, &state)
+            .expect("restore");
+        assert_eq!(restored.stats().items, 3_000);
+        let mut expected = input[..3_000].to_vec();
+        expected.sort();
+        assert_eq!(sorted(restored.finish().expect("finish")), expected);
+        assert!(
+            scratch.retained_bytes() > 0,
+            "read runs wait for a checkpoint"
+        );
+        scratch.commit(&[], b"{}").expect("commit");
+        assert_eq!(scratch.retained_bytes(), 0);
+        assert!(files.iter().all(|file| !file.exists()));
+        scratch.complete();
+        drop(scratch);
+        assert!(!path.exists(), "a completed build leaves nothing");
+    }
+
+    /// Files a checkpoint keeps after the build is done with them are given
+    /// up, with the checkpoint, before the ledger refuses a write.
+    #[test]
+    fn retired_files_give_way_when_the_ledger_runs_short() {
+        let scratch = scratch("reclaim");
+        scratch.set_stage("write records");
+        let budget = Budget::unlimited();
+        let mut sorter = ExternalSorter::new(&scratch, "pairs", &budget, 1 << 20);
+        for item in pseudo_random(20_000) {
+            sorter.push(item).expect("push");
+        }
+        let state = sorter.checkpoint().expect("checkpoint");
+        let files = state.files(&scratch).collect::<Vec<_>>();
+        scratch.commit(&files, b"{}").expect("commit");
+        assert_eq!(sorted(sorter.finish().expect("finish")).len(), 20_000);
+        let retained = scratch.retained_bytes();
+        assert_eq!(retained, state.bytes());
+        assert_eq!(scratch.peak_retained_bytes(), retained);
+        // Room for the write only once the retired runs are gone.
+        scratch.set_budget(Some(retained + scratch.live_bytes()));
+        let owner = scratch.owner("pack-records");
+        scratch.reserve(&owner, retained).expect("room made");
+        assert_eq!(scratch.retained_bytes(), 0);
+        assert!(files.iter().all(|file| !file.exists()));
+        assert!(!scratch.resumable());
+        assert!(!scratch.path().join(MANIFEST_FILE).exists());
+        assert_eq!(scratch.voided().as_deref(), Some("write records"));
+        scratch.release(&owner, retained);
     }
 }

@@ -12,7 +12,7 @@ use std::{
 
 use open_geocode::{
     alloc,
-    builder::{BuildPlan, plan_build},
+    builder::{BuildPlan, Leftover, plan_build},
     resources,
 };
 use ratatui::{
@@ -1118,6 +1118,9 @@ impl App {
                 memory_budget_bytes: None,
                 scratch_budget_bytes: None,
                 force: self.force,
+                // The interface has no flags: building a region again goes
+                // on from where a stopped build of it left off.
+                leftover: Leftover::Resume,
                 openaddresses: self.openaddresses && self.openaddresses_data().is_some(),
             },
             Arc::clone(&self.home),

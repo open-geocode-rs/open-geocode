@@ -65,6 +65,44 @@ pub struct BuilderReport {
     /// What each stage cost, in the order they ran; a stage run once per
     /// input has one entry per input.
     pub stages: Vec<StageReport>,
+    /// The checkpoints the build wrote, every run's together.
+    #[serde(default)]
+    pub checkpoints: CheckpointReport,
+    /// Each time the build went on from a checkpoint a run before left.
+    #[serde(default)]
+    pub resumes: Vec<ResumeReport>,
+}
+
+/// What checkpointing cost.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CheckpointReport {
+    pub count: u64,
+    /// Time spent writing them: spilling sorter buffers, saving state and
+    /// syncing the files they name.
+    pub wall_ms: u64,
+    /// The stage the last one completed.
+    pub last: Option<String>,
+    /// Most bytes held on disk at once for a checkpoint that the build was
+    /// done with: inputs a stage consumed, kept until the stage's own
+    /// checkpoint replaced the one before. Not live: given up first when
+    /// the scratch disk runs short.
+    pub peak_retained_bytes: u64,
+    /// The stage in which retained files were given up to make room, so
+    /// the build could not have gone on from the checkpoint before it.
+    pub voided: Option<String>,
+}
+
+/// A run that went on from the checkpoint another left.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ResumeReport {
+    /// The last stage the stopped run completed.
+    pub after: String,
+    /// Scratch bytes it went on with, by owner: sorters, spools, the node
+    /// store, the address books, the Pack writer's parts.
+    pub reused: BTreeMap<String, u64>,
+    pub reused_bytes: u64,
+    /// Build time up to the checkpoint, not spent again.
+    pub saved_ms: u64,
 }
 
 /// How the build read the house numbers written "N/M".
@@ -424,6 +462,28 @@ impl BuilderReport {
             mib(scratch.spilled_bytes),
             scratch.zstd_level,
         ));
+        let checkpoints = &self.checkpoints;
+        table.push_str(&format!(
+            "{} checkpoints, {:.1} s; at most {:.0} MiB kept for them past use{}
+",
+            checkpoints.count,
+            checkpoints.wall_ms as f64 / 1000.0,
+            mib(checkpoints.peak_retained_bytes),
+            checkpoints
+                .voided
+                .as_ref()
+                .map(|stage| format!(", given up for room in stage {stage}"))
+                .unwrap_or_default(),
+        ));
+        for resume in &self.resumes {
+            table.push_str(&format!(
+                "resumed after \"{}\": {:.0} MiB reused, {:.1} s not run again
+",
+                resume.after,
+                mib(resume.reused_bytes),
+                resume.saved_ms as f64 / 1000.0,
+            ));
+        }
         table
     }
 }

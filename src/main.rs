@@ -18,7 +18,7 @@ use open_geocode::{
         sample_poi_fixture,
     },
     builder::{
-        BuildOsmOptions,
+        BuildOsmOptions, Leftover,
         addresses::{AddressFile, AddressFiles, AddressSource, AddressSources},
         build_planned_osm_pack, plan_osm_build,
     },
@@ -134,6 +134,19 @@ enum PackCommand {
         /// disk for the input.
         #[arg(long)]
         force: bool,
+
+        /// Go on with a build of this Pack that stopped (failed, was
+        /// cancelled, ran out of disk or lost power) from its last
+        /// checkpoint, when it was a build of the same inputs and options.
+        /// Starts over when there is none.
+        #[arg(long, conflicts_with = "fresh")]
+        resume: bool,
+
+        /// Clear what a build of this Pack that stopped left, and start
+        /// over. Without --resume or --fresh, a build refuses to start
+        /// beside one and says what it left.
+        #[arg(long)]
+        fresh: bool,
 
         /// Add the OpenAddresses points of the countries the Pack covers,
         /// leaving out the ones OSM already has. Downloading needs an
@@ -545,6 +558,8 @@ async fn main() -> Result<()> {
             scratch_dir,
             scratch_budget_mb,
             force,
+            resume,
+            fresh,
             openaddresses,
             address_files,
         }) => {
@@ -561,6 +576,11 @@ async fn main() -> Result<()> {
                 scratch_dir,
                 scratch_budget_bytes: scratch_budget_mb.map(|mb| mb << 20),
                 force,
+                leftover: match (resume, fresh) {
+                    (true, _) => Leftover::Resume,
+                    (_, true) => Leftover::Clear,
+                    _ => Leftover::Refuse,
+                },
                 ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;

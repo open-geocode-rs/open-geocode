@@ -114,6 +114,21 @@ impl Datasets {
         id
     }
 
+    /// Every name, in the order of their indexes.
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The table that gave `names` their indexes.
+    pub(crate) fn from_names(names: Vec<String>) -> Self {
+        let ids = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| (name.clone(), id as u32))
+            .collect();
+        Self { names, ids }
+    }
+
     pub(crate) fn name(&self, id: u32) -> Result<&str> {
         self.names
             .get(id as usize)
@@ -1030,7 +1045,7 @@ fn get_strings(input: &mut &[u8]) -> Result<Vec<String>> {
     (0..count).map(|_| get_string(input)).collect()
 }
 
-fn encode_record(out: &mut Vec<u8>, record: &Record) {
+pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
     out.push(
         Layer::ALL
             .iter()
@@ -1106,7 +1121,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
     }
 }
 
-fn decode_record(input: &mut &[u8]) -> Result<Record> {
+pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
     let layer = *Layer::ALL
         .get(usize::from(get_u8(input)?))
         .ok_or(Error::Decode("unknown spilled record layer"))?;

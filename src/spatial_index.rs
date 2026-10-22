@@ -28,12 +28,13 @@ use std::{
     collections::BinaryHeap,
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
 use crate::error::{Error, Result};
 use geojson::Geometry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     container::{self, Bytes, Container},
@@ -59,6 +60,7 @@ const EARTH_RADIUS_M: f64 = 6_371_008.8;
 const LOWER_BOUND_SLACK: f64 = 0.99;
 
 type BoundingBox = [i32; 4];
+const LABEL: &str = "pack-spatial";
 const EMPTY: BoundingBox = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -80,7 +82,7 @@ pub struct SegmentCandidate {
     pub fraction: f64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub point_count: u64,
     pub line_count: u64,
@@ -101,31 +103,112 @@ fn union(left: BoundingBox, right: BoundingBox) -> BoundingBox {
 /// sixteenth of the items and less, are held in memory.
 #[derive(Debug)]
 struct TreeWriter {
+    name: String,
     leaves: BufWriter<ScratchFile>,
     ids: Option<BufWriter<ScratchFile>>,
     count: u64,
     widest_id: u64,
     parents: Vec<BoundingBox>,
     open: BoundingBox,
+    /// The parents, once a checkpoint wrote them out.
+    saved: Option<ScratchFile>,
+}
+
+/// One tree as a checkpoint names it: its files, by name and length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TreeState {
+    leaves: (String, u64),
+    ids: Option<(String, u64)>,
+    parents: (String, u64),
+    count: u64,
+    widest_id: u64,
+    open: BoundingBox,
 }
 
 impl TreeWriter {
     fn create(scratch: &Arc<Scratch>, name: &str, with_ids: bool) -> Result<Self> {
         let create = |suffix: &str| -> Result<BufWriter<ScratchFile>> {
-            let file = ScratchFile::create(
-                scratch,
-                "pack-spatial",
-                &format!("spatial-{name}-{suffix}.bin"),
-            )?;
+            let file =
+                ScratchFile::create(scratch, LABEL, &format!("spatial-{name}-{suffix}.bin"))?;
             Ok(BufWriter::with_capacity(1 << 20, file))
         };
         Ok(Self {
+            name: name.to_string(),
             leaves: create("leaves")?,
             ids: with_ids.then(|| create("ids")).transpose()?,
             count: 0,
             widest_id: 0,
             parents: Vec::new(),
             open: EMPTY,
+            saved: None,
+        })
+    }
+
+    /// Flush the leaves and write the parents out, once no box is pushed
+    /// any more.
+    fn state(&mut self, scratch: &Arc<Scratch>) -> Result<TreeState> {
+        let flushed = |file: &mut BufWriter<ScratchFile>| -> Result<(String, u64)> {
+            file.flush()?;
+            Ok((file.get_ref().name(), file.get_ref().bytes()))
+        };
+        if self.saved.is_none() {
+            let mut file = BufWriter::new(ScratchFile::create(
+                scratch,
+                LABEL,
+                &format!("spatial-{}-parents.bin", self.name),
+            )?);
+            for bbox in &self.parents {
+                for value in bbox {
+                    file.write_all(&value.to_le_bytes())?;
+                }
+            }
+            self.saved = Some(file.into_inner().map_err(|error| error.into_error())?);
+        }
+        let saved = self.saved.as_ref().expect("parents saved");
+        Ok(TreeState {
+            leaves: flushed(&mut self.leaves)?,
+            ids: self.ids.as_mut().map(flushed).transpose()?,
+            parents: (saved.name(), saved.bytes()),
+            count: self.count,
+            widest_id: self.widest_id,
+            open: self.open,
+        })
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        std::iter::once(self.leaves.get_ref().path())
+            .chain(self.ids.as_ref().map(|ids| ids.get_ref().path()))
+            .chain(self.saved.as_ref().map(ScratchFile::path))
+            .map(|path| path.to_path_buf())
+            .collect()
+    }
+
+    fn restore(scratch: &Arc<Scratch>, name: &str, state: &TreeState) -> Result<Self> {
+        let reopen = |(file, bytes): &(String, u64)| -> Result<BufWriter<ScratchFile>> {
+            Ok(BufWriter::with_capacity(
+                1 << 20,
+                ScratchFile::reopen(scratch, LABEL, file, *bytes)?,
+            ))
+        };
+        let saved = ScratchFile::reopen(scratch, LABEL, &state.parents.0, state.parents.1)?;
+        let bytes = std::fs::read(saved.path())?;
+        let parents = bytes
+            .chunks_exact(BOX_BYTES)
+            .map(|bbox| {
+                std::array::from_fn(|at| {
+                    i32::from_le_bytes(bbox[at * 4..at * 4 + 4].try_into().expect("4 bytes"))
+                })
+            })
+            .collect();
+        Ok(Self {
+            name: name.to_string(),
+            leaves: reopen(&state.leaves)?,
+            ids: state.ids.as_ref().map(reopen).transpose()?,
+            count: state.count,
+            widest_id: state.widest_id,
+            parents,
+            open: state.open,
+            saved: Some(saved),
         })
     }
 
@@ -193,6 +276,18 @@ impl TreeWriter {
     }
 }
 
+/// The spatial index writer as a checkpoint names it, every record added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterState {
+    blocks: TreeState,
+    lines: TreeState,
+    context: TreeState,
+    block: u64,
+    block_box: BoundingBox,
+    record_count: u64,
+    points: u64,
+}
+
 /// Boxes for the spatial index, taken from records as they are written, in
 /// record id order.
 #[derive(Debug)]
@@ -217,6 +312,41 @@ impl Writer {
             block_box: EMPTY,
             record_count: 0,
             points: 0,
+        })
+    }
+
+    /// The writer once every record is added, its files flushed, for a
+    /// checkpoint. No record may be added after.
+    pub fn state(&mut self, scratch: &Arc<Scratch>) -> Result<WriterState> {
+        Ok(WriterState {
+            blocks: self.blocks.state(scratch)?,
+            lines: self.lines.state(scratch)?,
+            context: self.context.state(scratch)?,
+            block: self.block,
+            block_box: self.block_box,
+            record_count: self.record_count,
+            points: self.points,
+        })
+    }
+
+    /// The scratch files the writer streams to.
+    pub fn files(&self) -> Vec<PathBuf> {
+        [&self.blocks, &self.lines, &self.context]
+            .into_iter()
+            .flat_map(TreeWriter::files)
+            .collect()
+    }
+
+    /// The writer a checkpoint left, ready to be copied into the Pack.
+    pub fn restore(scratch: &Arc<Scratch>, state: &WriterState) -> Result<Self> {
+        Ok(Self {
+            blocks: TreeWriter::restore(scratch, "blocks", &state.blocks)?,
+            lines: TreeWriter::restore(scratch, "lines", &state.lines)?,
+            context: TreeWriter::restore(scratch, "context", &state.context)?,
+            block: state.block,
+            block_box: state.block_box,
+            record_count: state.record_count,
+            points: state.points,
         })
     }
 

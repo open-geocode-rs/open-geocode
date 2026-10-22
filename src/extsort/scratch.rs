@@ -9,9 +9,18 @@
 //! degrades before it fails: spill blocks are compressed harder, a sorter
 //! merges its older runs at that level, and only then does the build stop,
 //! naming the stage, the live bytes by owner and what would fit.
+//!
+//! A checkpoint pins the files it names ([`Scratch::commit`]). The build
+//! still finishes with them as it goes, but a pinned file it is done with
+//! is retired, not removed: it stays on disk, outside the live bytes, until
+//! a later checkpoint no longer names it, so a build that stops can go on
+//! from the last checkpoint. Retired files give way first when the ledger
+//! runs short; the checkpoint they belong to is given up then, never the
+//! build. A scratch directory holding a checkpoint outlives a build that
+//! fails; one that completes, or never reached a checkpoint, is removed.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -36,15 +45,21 @@ use crate::{
 const LEVELS: [i32; 4] = [1, 3, 6, 9];
 /// Bytes reserved between two reads of the volume's free space.
 const DISK_PROBE_BYTES: u64 = 256 << 20;
+/// The checkpoint a build goes on from, in the scratch directory.
+pub const MANIFEST_FILE: &str = "resume.json";
+/// Whose bytes the manifest is.
+const CHECKPOINT_LABEL: &str = "checkpoint";
 
-/// Build scratch directory. Removed with everything in it when dropped.
+/// Build scratch directory. Removed with everything in it when dropped,
+/// unless it holds a checkpoint the build has not completed.
 ///
-/// Scratch files are never synced: a build that stops starts over, so only
-/// the published Pack is made durable. On Windows they are marked temporary
-/// while what was spilled fits the page cache the build leaves free (see
-/// [`Scratch::set_cache_bytes`]): the lazy writer then keeps them in memory
-/// instead of writing them out, which pays while they fit, but past that it
-/// would push the Pack and the input out of the cache.
+/// Scratch files are synced only once a checkpoint names them: a build that
+/// stops before goes on from the checkpoint before, which does not need
+/// them. On Windows they are marked temporary while what was spilled fits
+/// the page cache the build leaves free (see [`Scratch::set_cache_bytes`]):
+/// the lazy writer then keeps them in memory instead of writing them out,
+/// which pays while they fit, but past that it would push the Pack and the
+/// input out of the cache.
 #[derive(Debug)]
 pub struct Scratch {
     path: PathBuf,
@@ -71,6 +86,25 @@ pub struct Scratch {
     write_nanos: AtomicU64,
     read_wait_nanos: AtomicU64,
     spill_wait_nanos: AtomicU64,
+    pins: Mutex<Pins>,
+    /// Bytes of retired files: on disk, but not live.
+    retained: AtomicU64,
+    peak_retained: AtomicU64,
+}
+
+/// The files the last checkpoint names, and those of them the build is
+/// done with.
+#[derive(Debug, Default)]
+struct Pins {
+    /// A checkpoint is committed, and neither completed nor given up.
+    held: bool,
+    files: HashSet<PathBuf>,
+    retired: Vec<(PathBuf, u64)>,
+    /// Files an earlier commit synced: no scratch file is written again
+    /// once a checkpoint names it.
+    synced: HashSet<PathBuf>,
+    /// The stage whose checkpoint was given up to make room, if one was.
+    voided: Option<String>,
 }
 
 /// The volume's free space when last read, which caps the ledger as much as
@@ -226,13 +260,60 @@ impl Scratch {
             path: path.clone(),
             source,
         })?;
+        Ok(Arc::new(Self::with_counter(path, 0)))
+    }
+
+    /// The scratch directory of a build that stopped, to go on from its
+    /// checkpoint: everything `files` (the files and directories the
+    /// checkpoint names) leaves out is removed, and `files` are pinned
+    /// again. Each restored owner counts its own files with
+    /// [`Scratch::adopt`].
+    pub fn reopen(
+        path: impl Into<PathBuf>,
+        files: &[PathBuf],
+        next_file: u64,
+    ) -> Result<Arc<Self>> {
+        let path = path.into();
+        let named = files.iter().collect::<HashSet<_>>();
+        let io = |action: &'static str, path: &Path| {
+            let path = path.to_path_buf();
+            move |source| Error::IoPath {
+                action,
+                path,
+                source,
+            }
+        };
+        for entry in fs::read_dir(&path).map_err(io("failed to read scratch directory", &path))? {
+            let entry = entry?;
+            let found = entry.path();
+            if entry.file_name() == MANIFEST_FILE || named.contains(&found) {
+                continue;
+            }
+            let removed = if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(&found)
+            } else {
+                fs::remove_file(&found)
+            };
+            removed.map_err(io("failed to remove leftover scratch", &found))?;
+        }
+        let scratch = Self::with_counter(path, next_file);
+        {
+            let mut pins = scratch.pins.lock().expect("pins lock");
+            pins.held = true;
+            pins.files = files.iter().cloned().collect();
+            pins.synced = pins.files.clone();
+        }
+        Ok(Arc::new(scratch))
+    }
+
+    fn with_counter(path: PathBuf, next_file: u64) -> Self {
         let disk = DiskProbe {
             free: resources::free_disk(&path),
             ..DiskProbe::default()
         };
-        Ok(Arc::new(Self {
+        Self {
             path,
-            next_file: AtomicU64::new(0),
+            next_file: AtomicU64::new(next_file),
             cache_bytes: AtomicU64::new(0),
             cancel: OnceLock::new(),
             budget: AtomicU64::new(u64::MAX),
@@ -249,7 +330,10 @@ impl Scratch {
             write_nanos: AtomicU64::new(0),
             read_wait_nanos: AtomicU64::new(0),
             spill_wait_nanos: AtomicU64::new(0),
-        }))
+            pins: Mutex::new(Pins::default()),
+            retained: AtomicU64::new(0),
+            peak_retained: AtomicU64::new(0),
+        }
     }
 
     /// Cap the live scratch bytes, below what the volume caps them to.
@@ -386,7 +470,18 @@ impl Scratch {
     }
 
     /// Reserve `bytes` for `owner` before writing them, or say why not.
+    /// Retired files are removed to make room before the ledger refuses.
     pub fn reserve(&self, owner: &Owner, bytes: u64) -> std::result::Result<(), Shortfall> {
+        loop {
+            match self.try_reserve(owner, bytes) {
+                Err(shortfall) if !self.reclaim() => return Err(shortfall),
+                Err(_) => {}
+                Ok(()) => return Ok(()),
+            }
+        }
+    }
+
+    fn try_reserve(&self, owner: &Owner, bytes: u64) -> std::result::Result<(), Shortfall> {
         let cap = self.cap(bytes);
         let mut live = self.live.load(Ordering::Relaxed);
         let next = loop {
@@ -408,18 +503,214 @@ impl Scratch {
         Ok(())
     }
 
+    /// Count `bytes` already on disk as `owner`'s, as a restored checkpoint
+    /// finds them. Never refused: they are there whether counted or not.
+    pub fn adopt(&self, owner: &Owner, bytes: u64) {
+        let live = self.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let owned = owner.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        owner.peak.fetch_max(owned, Ordering::Relaxed);
+        self.record_peak(live);
+    }
+
     /// Return bytes a deleted file held.
     pub fn release(&self, owner: &Owner, bytes: u64) {
         self.live.fetch_sub(bytes, Ordering::Relaxed);
         owner.live.fetch_sub(bytes, Ordering::Relaxed);
     }
 
-    /// The most live bytes allowed now: the budget, or what the volume had
-    /// free when last read, whichever is less. The volume is read again
-    /// every [`DISK_PROBE_BYTES`], since the Pack and other programs fill it
-    /// too.
+    /// Remove `path`, a file of `bytes` bytes `owner` is done with, or
+    /// retire it while the last checkpoint names it. Its bytes stop being
+    /// live either way.
+    pub fn remove(&self, owner: &Owner, path: &Path, bytes: u64) {
+        if !self.retire(path, bytes) {
+            let _ = fs::remove_file(path);
+        }
+        self.release(owner, bytes);
+    }
+
+    /// Remove `path`, a directory counted by [`Scratch::watch`], or retire
+    /// it while the last checkpoint names it.
+    pub fn remove_dir(&self, path: &Path) -> Result<()> {
+        if !self.retire(path, directory_bytes(path)) {
+            fs::remove_dir_all(path).map_err(|source| Error::IoPath {
+                action: "failed to remove",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        self.unwatch(path);
+        Ok(())
+    }
+
+    /// Keep `path` on disk for the last checkpoint, when that names it.
+    fn retire(&self, path: &Path, bytes: u64) -> bool {
+        let mut pins = self.pins.lock().expect("pins lock");
+        if !pins.held || !pins.files.contains(path) {
+            return false;
+        }
+        pins.retired.push((path.to_path_buf(), bytes));
+        let retained = self.retained.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak_retained.fetch_max(retained, Ordering::Relaxed);
+        true
+    }
+
+    /// Remove every retired file to make room, giving up the checkpoint
+    /// that needs them. False when there is none to remove.
+    fn reclaim(&self) -> bool {
+        let mut pins = self.pins.lock().expect("pins lock");
+        if pins.retired.is_empty() {
+            return false;
+        }
+        for (path, bytes) in pins.retired.drain(..) {
+            remove_path(&path);
+            self.retained.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        pins.held = false;
+        pins.files.clear();
+        pins.voided = Some(self.stage.lock().expect("stage lock").to_string());
+        let _ = fs::remove_file(self.path.join(MANIFEST_FILE));
+        drop(pins);
+        let mut disk = self.disk.lock().expect("disk lock");
+        disk.free = resources::free_disk(&self.path);
+        disk.live = self.live_bytes();
+        disk.reserved_since = 0;
+        true
+    }
+
+    /// Make the checkpoint `manifest` describes durable: sync every one of
+    /// `files` (files and directories in the scratch directory, all it
+    /// names) not synced before, then replace the manifest atomically.
+    /// Retired files it no longer names are removed.
+    pub fn commit(&self, files: &[PathBuf], manifest: &[u8]) -> Result<()> {
+        let synced = self.pins.lock().expect("pins lock").synced.clone();
+        let mut newly = Vec::new();
+        for path in files {
+            if !synced.contains(path) {
+                sync_path(path)?;
+                newly.push(path.clone());
+            }
+        }
+        let pending = self.path.join(format!("{MANIFEST_FILE}.pending"));
+        let target = self.path.join(MANIFEST_FILE);
+        let io = |source| Error::IoPath {
+            action: "failed to write the build checkpoint",
+            path: target.clone(),
+            source,
+        };
+        let mut file = File::create(&pending).map_err(io)?;
+        file.write_all(manifest).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
+        fs::rename(&pending, &target).map_err(io)?;
+        sync_directory(&self.path);
+        let owner = self.owner(CHECKPOINT_LABEL);
+        self.release(&owner, owner.live.load(Ordering::Relaxed));
+        self.adopt(&owner, manifest.len() as u64);
+        let mut pins = self.pins.lock().expect("pins lock");
+        pins.held = true;
+        pins.files = files.iter().cloned().collect();
+        pins.synced.extend(newly);
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut pins.retired)
+            .into_iter()
+            .partition(|(path, _)| pins.files.contains(path));
+        pins.retired = kept;
+        for (path, bytes) in gone {
+            remove_path(&path);
+            self.retained.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Whether the directory holds a checkpoint the build may go on from,
+    /// and so outlives this.
+    pub fn resumable(&self) -> bool {
+        self.pins.lock().expect("pins lock").held
+    }
+
+    /// The build is done with its checkpoints: the directory goes when this
+    /// is dropped.
+    pub fn complete(&self) {
+        let mut pins = self.pins.lock().expect("pins lock");
+        pins.held = false;
+        pins.files.clear();
+        let _ = fs::remove_file(self.path.join(MANIFEST_FILE));
+        let owner = self.owner(CHECKPOINT_LABEL);
+        self.release(&owner, owner.live.load(Ordering::Relaxed));
+    }
+
+    /// The stage whose checkpoint was given up to make room, if one was.
+    pub fn voided(&self) -> Option<String> {
+        self.pins.lock().expect("pins lock").voided.clone()
+    }
+
+    /// Bytes of retired files on disk now.
+    pub fn retained_bytes(&self) -> u64 {
+        self.retained.load(Ordering::Relaxed)
+    }
+
+    /// Most bytes of retired files held at once.
+    pub fn peak_retained_bytes(&self) -> u64 {
+        self.peak_retained.load(Ordering::Relaxed)
+    }
+
+    /// Where new file names continue from, for a checkpoint to keep.
+    pub fn next_file(&self) -> u64 {
+        self.next_file.load(Ordering::Relaxed)
+    }
+
+    /// What a checkpoint keeps of the ledger, so a build that goes on from
+    /// it reports what every run wrote and read.
+    pub fn ledger(&self) -> Ledger {
+        Ledger {
+            written: self.spilled_bytes(),
+            peak: self.peak_bytes(),
+            peak_owners: self.peak_owners(),
+            peak_retained: self.peak_retained_bytes(),
+            owners: self.traffic(),
+        }
+    }
+
+    /// Carry on the counts the run before kept in `ledger`.
+    pub fn seed(&self, ledger: &Ledger) {
+        self.written.fetch_add(ledger.written, Ordering::Relaxed);
+        self.peak_retained
+            .fetch_max(ledger.peak_retained, Ordering::Relaxed);
+        if self.peak.fetch_max(ledger.peak, Ordering::Relaxed) < ledger.peak {
+            *self.peak_owners.lock().expect("peak lock") =
+                (ledger.peak, ledger.peak_owners.clone());
+        }
+        for (label, traffic) in &ledger.owners {
+            let owner = self.owner(label);
+            let add = |counter: &AtomicU64, value: u64| {
+                counter.fetch_add(value, Ordering::Relaxed);
+            };
+            add(&owner.items_written, traffic.items_written);
+            add(&owner.raw_written, traffic.raw_written_bytes);
+            add(&owner.written, traffic.written_bytes);
+            add(&owner.items_read, traffic.items_read);
+            add(&owner.raw_read, traffic.raw_read_bytes);
+            add(&owner.read, traffic.read_bytes);
+            add(&owner.runs, traffic.runs);
+            add(&owner.merges, traffic.merges);
+            owner
+                .merge_passes
+                .fetch_max(traffic.merge_passes, Ordering::Relaxed);
+            owner
+                .max_fan_in
+                .fetch_max(traffic.max_fan_in, Ordering::Relaxed);
+            owner.peak.fetch_max(traffic.peak_bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// The most live bytes allowed now: the budget less what retired files
+    /// hold, or what the volume had free when last read, whichever is less.
+    /// The volume is read again every [`DISK_PROBE_BYTES`], since the Pack
+    /// and other programs fill it too.
     fn cap(&self, bytes: u64) -> u64 {
-        let budget = self.budget.load(Ordering::Relaxed);
+        let budget = self
+            .budget
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.retained_bytes());
         let mut disk = self.disk.lock().expect("disk lock");
         disk.reserved_since += bytes;
         if disk.reserved_since >= DISK_PROBE_BYTES {
@@ -466,7 +757,9 @@ impl Scratch {
             .collect::<Vec<_>>()
             .join(", ");
         let limit = match self.budget() {
-            Some(budget) if budget <= cap => format!("the scratch budget of {} MiB", mib(budget)),
+            Some(budget) if budget.saturating_sub(self.retained_bytes()) <= cap => {
+                format!("the scratch budget of {} MiB", mib(budget))
+            }
             _ => format!(
                 "the {} MiB the scratch volume of {} leaves",
                 mib(cap),
@@ -546,7 +839,7 @@ impl Scratch {
         options.open(path)
     }
 
-    pub(super) fn new_file(&self, label: &str) -> PathBuf {
+    pub(crate) fn new_file(&self, label: &str) -> PathBuf {
         let index = self.next_file.fetch_add(1, Ordering::Relaxed);
         self.path.join(format!("{label}-{index:06}.bin"))
     }
@@ -558,8 +851,60 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if !self.resumable() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
+}
+
+/// What a checkpoint keeps of the ledger's counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ledger {
+    pub written: u64,
+    pub peak: u64,
+    pub peak_owners: BTreeMap<String, u64>,
+    pub peak_retained: u64,
+    pub owners: BTreeMap<String, Traffic>,
+}
+
+fn remove_path(path: &Path) {
+    let _ = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+}
+
+/// Flush `path` to the disk: a file, or every file of a directory and of
+/// the directories below it.
+fn sync_path(path: &Path) -> Result<()> {
+    let io = |source| Error::IoPath {
+        action: "failed to sync scratch file",
+        path: path.to_path_buf(),
+        source,
+    };
+    if path.is_dir() {
+        for entry in fs::read_dir(path).map_err(io)? {
+            sync_path(&entry.map_err(io)?.path())?;
+        }
+        sync_directory(path);
+        return Ok(());
+    }
+    // Windows flushes a file only through a handle that may write it.
+    File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(io)
+}
+
+fn sync_directory(path: &Path) {
+    #[cfg(unix)]
+    if let Ok(directory) = File::open(path) {
+        let _ = directory.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn nanos(time: Duration) -> u64 {
@@ -625,8 +970,55 @@ impl ScratchFile {
         })
     }
 
+    /// `name`, as a checkpoint left it with `bytes` bytes, to write on
+    /// after them.
+    pub fn reopen(scratch: &Arc<Scratch>, label: &str, name: &str, bytes: u64) -> Result<Self> {
+        let path = scratch.path().join(name);
+        let failed = |source| Error::IoPath {
+            action: "failed to reopen scratch file",
+            path: path.clone(),
+            source,
+        };
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(failed)?;
+        if file.metadata().map_err(failed)?.len() < bytes {
+            return Err(Error::BadScratch {
+                path,
+                detail: "a checkpoint names more bytes than the file holds",
+            });
+        }
+        // Bytes a failed run wrote after the checkpoint are not the build's.
+        file.set_len(bytes).map_err(failed)?;
+        io::Seek::seek(&mut file, io::SeekFrom::End(0)).map_err(failed)?;
+        let owner = scratch.owner(label);
+        scratch.adopt(&owner, bytes);
+        Ok(Self {
+            file: Some(file),
+            path,
+            scratch: Arc::clone(scratch),
+            owner,
+            bytes,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whose bytes the file holds.
+    pub fn label(&self) -> &str {
+        self.owner.label()
+    }
+
+    /// The file's name in the scratch directory.
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     pub fn bytes(&self) -> u64 {
@@ -663,7 +1055,6 @@ impl Write for ScratchFile {
 impl Drop for ScratchFile {
     fn drop(&mut self) {
         drop(self.file.take());
-        let _ = fs::remove_file(&self.path);
-        self.scratch.release(&self.owner, self.bytes);
+        self.scratch.remove(&self.owner, &self.path, self.bytes);
     }
 }

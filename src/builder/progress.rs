@@ -24,7 +24,7 @@ use std::{
 };
 
 use crate::{
-    builder::report::{Bound, BoundShares, InputRead, StageReport},
+    builder::report::{Bound, BoundShares, InputRead, ResumeReport, StageReport},
     error::Result,
     extsort::{IoTimes, Scratch, Traffic},
     memory::Budget,
@@ -151,6 +151,11 @@ pub trait BuildObserver: Send + Sync {
     /// runs and once when it ends.
     fn measured(&self, live: &LiveStage) {
         let _ = live;
+    }
+    /// The build goes on from the checkpoint a stopped one left, before
+    /// any stage starts.
+    fn resumed(&self, resume: &ResumeReport) {
+        let _ = resume;
     }
 }
 
@@ -596,6 +601,15 @@ impl BuildObserver for TerminalObserver {
             Some(bar) => bar.suspend(|| eprintln!("warning: {message}")),
             None => eprintln!("warning: {message}"),
         }
+    }
+
+    fn resumed(&self, resume: &ResumeReport) {
+        eprintln!(
+            "resuming after \"{}\": {:.0} MiB of scratch reused, {:.0} s of build not run again",
+            resume.after,
+            resume.reused_bytes as f64 / f64::from(1 << 20),
+            resume.saved_ms as f64 / 1000.0
+        );
     }
 
     fn measured(&self, live: &LiveStage) {

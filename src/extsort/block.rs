@@ -16,7 +16,7 @@
 
 use std::{
     collections::VecDeque,
-    fs::{self, File},
+    fs::File,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
@@ -28,6 +28,7 @@ use std::{
 };
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use super::{
     Spill,
@@ -165,19 +166,97 @@ pub(super) struct Run {
     pub(super) depth: u64,
 }
 
+/// A run or a spool as a checkpoint names it: its chunk files, by name in
+/// the scratch directory, and what reading it back needs to know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunState {
+    pub label: String,
+    pub chunks: Vec<(String, u64)>,
+    pub items: u64,
+    pub bytes: u64,
+    pub max_raw: usize,
+    pub max_frame: usize,
+    pub level: i32,
+    pub depth: u64,
+}
+
+impl RunState {
+    /// The chunk files, as paths in `scratch`.
+    pub fn files<'a>(&'a self, scratch: &'a Scratch) -> impl Iterator<Item = PathBuf> + 'a {
+        self.chunks
+            .iter()
+            .map(|(name, _)| scratch.path().join(name))
+    }
+}
+
 impl Run {
     /// Memory a reader of this run holds: the block being read, the one
     /// read ahead and the compressed bytes behind it.
     pub(super) fn read_bytes(&self) -> usize {
         2 * self.max_raw + self.max_frame
     }
+
+    pub(super) fn state(&self) -> RunState {
+        RunState {
+            label: self.owner.label().to_string(),
+            chunks: self
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    let name = chunk
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (name, chunk.bytes)
+                })
+                .collect(),
+            items: self.items,
+            bytes: self.bytes,
+            max_raw: self.max_raw,
+            max_frame: self.max_frame,
+            level: self.level,
+            depth: self.depth,
+        }
+    }
+
+    /// The run a checkpoint named, its chunks counted on the ledger again.
+    pub(super) fn restore(scratch: &Arc<Scratch>, state: &RunState) -> Result<Self> {
+        let owner = scratch.owner(&state.label);
+        let mut chunks = VecDeque::new();
+        for (name, bytes) in &state.chunks {
+            let path = scratch.path().join(name);
+            let found = std::fs::metadata(&path).map(|metadata| metadata.len());
+            if found.as_ref().ok() != Some(bytes) {
+                return Err(Error::BadScratch {
+                    path,
+                    detail: "a checkpoint names a chunk that is missing or changed",
+                });
+            }
+            scratch.adopt(&owner, *bytes);
+            chunks.push_back(Chunk {
+                path,
+                bytes: *bytes,
+            });
+        }
+        Ok(Self {
+            scratch: Arc::clone(scratch),
+            owner,
+            chunks,
+            items: state.items,
+            bytes: state.bytes,
+            max_raw: state.max_raw,
+            max_frame: state.max_frame,
+            level: state.level,
+            depth: state.depth,
+        })
+    }
 }
 
 impl Drop for Run {
     fn drop(&mut self) {
         for chunk in self.chunks.drain(..) {
-            let _ = fs::remove_file(&chunk.path);
-            self.scratch.release(&self.owner, chunk.bytes);
+            self.scratch.remove(&self.owner, &chunk.path, chunk.bytes);
         }
     }
 }
@@ -444,8 +523,7 @@ impl Cursor {
                 if finished.is_some()
                     && let Some(chunk) = run.chunks.pop_front()
                 {
-                    let _ = fs::remove_file(&chunk.path);
-                    run.scratch.release(&run.owner, chunk.bytes);
+                    run.scratch.remove(&run.owner, &chunk.path, chunk.bytes);
                 }
                 run.chunks.front().map(|chunk| chunk.path.clone())
             }

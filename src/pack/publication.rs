@@ -49,6 +49,35 @@ pub fn resolve_pack_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(pack)
 }
 
+/// The generations of the Pack at `destination` that `CURRENT` does not
+/// name: builds that stopped, or older published ones.
+pub fn unpublished_generations(destination: &Path) -> Result<Vec<PathBuf>> {
+    let current = fs::read_to_string(destination.join(CURRENT))
+        .map(|current| current.trim().to_string())
+        .ok();
+    let entries = match fs::read_dir(destination.join(GENERATIONS)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(Error::IoPath {
+                action: "failed to read the generations of",
+                path: destination.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut generations = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_dir() && current.as_deref() != Some(name.as_str()) {
+            generations.push(entry.path());
+        }
+    }
+    generations.sort();
+    Ok(generations)
+}
+
 pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
     let generations = destination.join(GENERATIONS);
     fs::create_dir_all(&generations).map_err(|source| Error::IoPath {

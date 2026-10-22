@@ -28,6 +28,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use open_geocode::{
     alloc::CountingAlloc,
+    builder::Leftover,
     resources,
     runtime::{ServeOptions, serve},
 };
@@ -96,6 +97,16 @@ enum Command {
         #[arg(long)]
         force: bool,
 
+        /// Go on with a build of this Pack that stopped from its last
+        /// checkpoint; start over when there is none.
+        #[arg(long, conflicts_with = "fresh")]
+        resume: bool,
+
+        /// Clear what a build of this Pack that stopped left, and start
+        /// over.
+        #[arg(long)]
+        fresh: bool,
+
         /// Download the extract again even when one is on disk.
         #[arg(long)]
         download: bool,
@@ -130,6 +141,8 @@ fn main() -> Result<()> {
             memory_budget_mb,
             scratch_budget_mb,
             force,
+            resume,
+            fresh,
             download,
             openaddresses,
         }) => {
@@ -145,6 +158,11 @@ fn main() -> Result<()> {
                     memory_budget_bytes,
                     scratch_budget_bytes: scratch_budget_mb.map(|mb| mb << 20),
                     force,
+                    leftover: match (resume, fresh) {
+                        (true, _) => Leftover::Resume,
+                        (_, true) => Leftover::Clear,
+                        _ => Leftover::Refuse,
+                    },
                     download,
                     openaddresses,
                 },
@@ -181,18 +199,20 @@ struct Flags {
     memory_budget_bytes: Option<usize>,
     scratch_budget_bytes: Option<u64>,
     force: bool,
+    leftover: Leftover,
     download: bool,
     openaddresses: bool,
 }
 
 /// `og build`: the build the interface runs, with one line per step. Ctrl-C
-/// stops it and removes the unfinished Pack generation; a second one quits
+/// stops it, keeping its last checkpoint for `--resume`; a second one quits
 /// at once.
 fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result<()> {
     let Flags {
         memory_budget_bytes,
         scratch_budget_bytes,
         force,
+        leftover,
         download,
         openaddresses,
     } = flags;
@@ -250,6 +270,7 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         memory_budget_bytes,
         scratch_budget_bytes,
         force,
+        leftover,
         openaddresses,
     };
     let pack = request.pack.clone();
@@ -524,7 +545,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Quitting during a build leaves no unfinished Pack generation behind.
+    /// Quitting during a build leaves no unfinished Pack generation behind
+    /// but one a later build can resume.
     #[test]
     #[ignore = "needs the Andorra extract in OG_HOME"]
     fn quitting_mid_build_cleans_up() {
@@ -543,6 +565,7 @@ mod tests {
                 memory_budget_bytes: None,
                 scratch_budget_bytes: None,
                 force: false,
+                leftover: open_geocode::builder::Leftover::Refuse,
                 openaddresses: false,
             },
             std::sync::Arc::new(home),
@@ -551,12 +574,15 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.quit);
         drop(app);
-        let left = std::fs::read_dir(pack.join("generations"))
+        let generations = std::fs::read_dir(pack.join("generations"))
             .map(|entries| entries.count())
             .unwrap_or(0);
-        assert_eq!(
-            left,
-            0,
+        let stopped = open_geocode::builder::resume::find(&pack).unwrap();
+        assert!(
+            stopped
+                .iter()
+                .all(open_geocode::builder::resume::Found::resumable)
+                && generations == stopped.len(),
             "an unfinished generation was left in {}",
             pack.display()
         );

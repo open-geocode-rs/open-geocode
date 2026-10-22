@@ -5,9 +5,10 @@
 //! over the id space, the node pass keeps only their coordinates, in id
 //! order, and the way pass reads the kept ways again and finds each node by
 //! its rank among the marked ids. Finished records flow through scratch
-//! files and external sorts. A region fits in memory and never touches disk;
-//! a planet maps its coordinates from scratch when the budget cannot hold
-//! them, and spills and merges records through the same code. The budget
+//! files and external sorts. A region's sorts fit in memory, reaching
+//! scratch only once, compressed, as the checkpoints write them; a planet
+//! maps its coordinates from scratch when the budget cannot hold them, and
+//! spills and merges records through the same code. The budget
 //! and the worker threads are sized to the machine before the build starts,
 //! and the rest of the build to what each scan counted (see [`plan_build`]).
 //!
@@ -30,17 +31,26 @@
 //!         (parallel)                         records, boundary ways
 //!
 //! once:
+//! order   context records, given their ids; streets joined; addresses
+//!         written to the address book, repeated houses found, addresses
+//!         placed
 //! write   context records, then the rest, each in Hilbert order,
 //!         drawing a sample of each country's records
 //! seal    text, spatial and parser dictionary indexes into the Pack file
 //! train   the address parser on the sample, its weights added to the Pack
 //! ```
+//!
+//! Every step above ends in a checkpoint ([`checkpoint::Step`]): its
+//! outputs are durable in scratch and a manifest names them, so a build
+//! that stops goes on from the last one (see [`crate::builder::resume`]).
+//! Stopping costs the step it stopped in, never the steps before.
 
 mod address;
 pub(crate) use address::LOCALITY_KEYS;
 mod admin_levels;
 mod book;
 mod boundary;
+mod checkpoint;
 mod containment;
 mod emit;
 mod emitted;
@@ -61,13 +71,13 @@ mod tags;
 mod test_pbf;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::error::{Error, Result};
@@ -76,19 +86,23 @@ use rayon::prelude::*;
 use crate::{
     alloc,
     builder::{
-        addresses::{self, AddressSource},
-        plan::{BuildPlan, ItemCounts, Scanned, plan_build},
+        addresses::{self, AddressFile, AddressSource},
+        plan::{BuildPlan, ItemCounts, Scanned, plan_build_holding},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
         report::{
-            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, ReportInput, SlashNumberCounts,
-            SorterReport,
+            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, ReportInput,
+            ResumeReport, SlashNumberCounts, SorterReport, StageReport,
         },
+        resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
     },
-    extsort::{ExternalSorter, Scratch, Sorted, Spool},
+    extsort::{
+        ExternalSorter, RunState, Scratch, ScratchFile, Sorted, SorterState, Spill, Spool,
+        SpoolFile,
+    },
     memory::Budget,
     pack::{
-        AUDIT_DIR, BUILD_REPORT_FILE, REJECTIONS_FILE, RecordContext, RecordId, Writer,
-        WriterOptions,
+        AUDIT_DIR, BUILD_REPORT_FILE, BuildStats, Generation, REJECTIONS_FILE, RecordContext,
+        RecordId, SCRATCH_POINTER_FILE, SealedPack, Sealing, Writer, WriterOptions,
     },
     parse::lattice::{
         CountryCode,
@@ -103,15 +117,19 @@ use crate::{
 };
 use book::{Book, BookFile};
 use boundary::{
-    BoundaryIndex, BoundaryRelationStub, BoundaryWay, ContextOrigin, SourceContext, Vertex,
-    build_boundaries, record_context,
+    BoundaryIndex, BoundaryRelationStub, BoundarySet, BoundaryWay, ContextOrigin, SetItem,
+    SourceContext, Vertex, build_boundaries, record_context,
+};
+use checkpoint::{
+    AddressState, AuditState, ContextState, GeometryItem, Id, InputState, KeptWays, Pass,
+    PostcodePoint, ScanCounts, State, Step,
 };
 use emitted::Emitted;
 pub(crate) use locations::{
     CHUNK_BYTES as NODE_SET_CHUNK_BYTES, LOCATION_BYTES as NODE_SLOT_BYTES, LoadStats,
     TABLE_BYTES as NODE_SET_TABLE_BYTES,
 };
-use locations::{NodeSet, Slots};
+use locations::{ChunkBits, Locations, NodeSet, Slots};
 use pbf::for_each_block;
 pub use pbf::replication_timestamp;
 use scan::scan_block;
@@ -143,6 +161,9 @@ pub struct BuildOsmOptions {
     pub scratch_budget_bytes: Option<u64>,
     /// Build even when the pre-flight check finds too little memory or disk.
     pub force: bool,
+    /// What to do with a build of the same Pack that stopped: refuse, go on
+    /// from its last checkpoint, or clear it.
+    pub leftover: Leftover,
     /// What the inputs are, for example region ids, kept in the build
     /// report. One per input, in the same order.
     pub input_sources: Vec<String>,
@@ -150,7 +171,8 @@ pub struct BuildOsmOptions {
     /// the plan's warnings.
     pub observer: Arc<dyn BuildObserver>,
     /// Set to stop the build: it then fails with
-    /// [`crate::builder::BuildCancelled`] and publishes nothing.
+    /// [`crate::builder::BuildCancelled`] and publishes nothing, keeping its
+    /// last checkpoint to resume from.
     pub cancel: Arc<AtomicBool>,
     /// Address points to add to the inputs' own, such as OpenAddresses.
     pub addresses: Option<Arc<dyn AddressSource>>,
@@ -168,6 +190,7 @@ impl Default for BuildOsmOptions {
             scratch_dir: None,
             scratch_budget_bytes: None,
             force: false,
+            leftover: Leftover::default(),
             input_sources: Vec::new(),
             observer: Arc::new(TerminalObserver::new()),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -187,6 +210,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("scratch_dir", &self.scratch_dir)
             .field("scratch_budget_bytes", &self.scratch_budget_bytes)
             .field("force", &self.force)
+            .field("leftover", &self.leftover)
             .field("input_sources", &self.input_sources)
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
@@ -195,7 +219,9 @@ impl fmt::Debug for BuildOsmOptions {
 }
 
 /// Plan a build of `options` on this machine: probe it, size the budget and
-/// the threads, and check the memory and disk the input needs.
+/// the threads, and check the memory and disk the input needs. A build of
+/// the Pack that stopped is refused, cleared or counted toward the disk the
+/// build has, as `options.leftover` says.
 pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     if options.inputs.is_empty() {
         return Err(Error::BadInput(
@@ -210,11 +236,12 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
             )));
         }
     }
+    let held = settle_leftovers(options)?.map_or(0, |found| found.bytes);
     let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
     // The passes run per input but the sorters, the heap the boundary stage
     // holds and the Pack are shared, so the build is sized to every input
     // together.
-    plan_build(
+    plan_build_holding(
         total_input_bytes(&options.inputs)?,
         options.imported_rows,
         scratch,
@@ -222,7 +249,39 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
         options.memory_budget_bytes,
         options.scratch_budget_bytes,
         options.force,
+        held,
     )
+}
+
+/// Refuse or clear the stopped builds of the Pack, as `options.leftover`
+/// says: the one to resume, if any.
+fn settle_leftovers(options: &BuildOsmOptions) -> Result<Option<Found>> {
+    let found = resume::find(&options.pack)?;
+    match options.leftover {
+        Leftover::Refuse if !found.is_empty() => Err(resume::refusal(&options.pack, &found)),
+        Leftover::Refuse => Ok(None),
+        Leftover::Clear => {
+            for found in &found {
+                resume::clear(found)?;
+            }
+            Ok(None)
+        }
+        Leftover::Resume => {
+            // Nothing can go on from a build that reached no checkpoint, and
+            // what it left only takes the disk this one needs.
+            let (resumable, unusable): (Vec<_>, Vec<_>) =
+                found.into_iter().partition(Found::resumable);
+            for found in &unusable {
+                resume::clear(found)?;
+            }
+            for older in resumable.iter().skip(1) {
+                options.observer.warned(&format!(
+                    "{older} is left as it is: only the last checkpointed build is resumed"
+                ));
+            }
+            Ok(resumable.into_iter().next())
+        }
+    }
 }
 
 /// The bytes of every input together.
@@ -237,465 +296,1532 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     build_planned_osm_pack(options, plan)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fails a build once the step's work is done but before its checkpoint
+    /// is written, as a crash there would.
+    static FAIL_BEFORE_CHECKPOINT: std::cell::Cell<Option<Step>> =
+        const { std::cell::Cell::new(None) };
+    /// Fails a build after its last checkpoint, as the parser's training
+    /// starts.
+    static FAIL_BEFORE_TRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Build with a plan made by [`plan_osm_build`]. The caller sizes the
 /// process's rayon pool to `plan.threads` before any parallel work, since
 /// one pool serves every stage.
-pub fn build_planned_osm_pack(
-    options: BuildOsmOptions,
-    mut plan: BuildPlan,
-) -> Result<BuilderReport> {
-    let started = Instant::now();
+pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
     for warning in plan.shortfalls.iter().chain(&plan.warnings) {
         options.observer.warned(warning);
     }
-    // The sorters and the parser's lattice cache split what the others leave
-    // of the pool by fair shares, each at most `budget`; the node store
-    // takes what it needs of the rest. While records are written the text
-    // index is what every record waits on, so it takes half a sorter's: more
-    // indexing threads, fewer segments. The context record and spatial
-    // sorters hold a few times less than the others, and are capped to stay
-    // so.
-    let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
-    let memory = Budget::new(usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX));
-    memory.sample(&plan.resources);
-    let report_inputs = options
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            Ok(ReportInput {
-                path: input.display().to_string(),
-                source: options.input_sources.get(index).cloned(),
-                replication_timestamp: replication_timestamp(input)?,
-                bytes: pbf::input_bytes(input)?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let input_bytes = report_inputs.iter().map(|input| input.bytes).sum::<u64>();
+    let mut run = Run::start(&options, plan)?;
+    for step in Step::all(options.inputs.len()) {
+        if run.done.is_some_and(|done| step <= done) {
+            continue;
+        }
+        run.step(step)?;
+        #[cfg(test)]
+        if FAIL_BEFORE_CHECKPOINT.get() == Some(step) {
+            return Err(Error::Inconsistent(format!(
+                "injected failure before the checkpoint of {step:?}"
+            )));
+        }
+        run.checkpoint(step)?;
+    }
+    run.finish()
+}
 
-    let mut writer = Writer::create_with(
-        &options.pack,
-        WriterOptions {
-            scratch_dir: options.scratch_dir.clone(),
-            memory: Arc::clone(&memory),
-            text_index_memory_bytes: (budget / 2).max(1),
-            scratch_budget_bytes: options.scratch_budget_bytes,
-        },
-    )?;
-    let scratch = Arc::clone(writer.scratch());
-    scratch.cancel_on(Arc::clone(&options.cancel));
-    let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel))
-        .metered(&scratch, &memory);
-    // Spill files stay in the page cache while they fit in a quarter of what
-    // the build leaves free: the rest keeps the Pack and the input it
-    // rereads, and dirty pages the lazy writer holds back are not free.
-    scratch.set_cache_bytes(
-        plan.resources
-            .available_memory_bytes
-            .saturating_sub(plan.memory_budget_bytes + plan.untracked_bytes)
-            / 4,
-    );
-    let mut build = Build {
-        report: BuilderReport {
-            schema_version: BUILD_REPORT_SCHEMA_VERSION,
-            inputs: report_inputs,
-            pack: options.pack.display().to_string(),
-            input_bytes,
-            datasets: vec![OSM_DATASET.to_string()],
-            ..BuilderReport::default()
-        },
-        audit: Audit::create(writer.generation())?,
-        records: ExternalSorter::new(&scratch, "records", &memory, budget),
-        addresses: ExternalSorter::new(&scratch, "addresses", &memory, budget),
-        streets: ExternalSorter::new(&scratch, "streets", &memory, budget),
-        context_records: ExternalSorter::new(
-            &scratch,
-            "context-records",
-            &memory,
-            (budget / 16).max(1),
-        ),
-        datasets: Datasets::default(),
-        seq: 0,
-    };
-    build.report.scratch.memory_budget_bytes = plan.memory_budget_bytes;
-    build.report.resources.threads = rayon::current_num_threads();
-    build.report.resources.plan = plan.clone();
+/// One run of a build: every step from the first, or from the checkpoint
+/// a run before this one left.
+struct Run<'a> {
+    options: &'a BuildOsmOptions,
+    plan: BuildPlan,
+    /// The most one sorter may hold.
+    budget: usize,
+    memory: Arc<Budget>,
+    scratch: Arc<Scratch>,
+    progress: Progress,
+    fingerprint: Fingerprint,
+    started: Instant,
+    /// Build time the runs before this one spent up to its checkpoint.
+    elapsed_before: Duration,
+    /// The last step a run before this one completed.
+    done: Option<Step>,
+    /// What every stage of the runs before this one cost.
+    stages_before: Vec<StageReport>,
+    /// Until the record write takes it.
+    generation: Option<Generation>,
+    build: Build,
+    /// Sorters already read, as the report counts them.
+    sorted: BTreeMap<String, SorterReport>,
+    scanned: Option<ScanCounts>,
+    /// Boundary geometry gathered across inputs, for the boundary stage: a
+    /// relation and the ways it is made of can only be assembled once all
+    /// of them are known. Each input's part is saved beside it.
+    geometry: Geometry,
+    geometry_saved: Vec<SpoolFile<GeometryItem>>,
+    input: Option<InputPasses>,
+    /// From the boundary stage until context ordering consumes it.
+    boundaries: Option<BoundarySet>,
+    /// The boundary set as saved, until the record write: what the context
+    /// index is derived from again.
+    boundaries_saved: Option<SpoolFile<SetItem>>,
+    imports: Option<Vec<AddressFile>>,
+    contexts: Option<Contexts>,
+    /// The addresses in street order, when imported rows are matched
+    /// against them before they are placed.
+    address_book: Option<BookFile<PendingAddress>>,
+    /// What matching them decided, sorted by position in the book.
+    verdicts: Option<ExternalSorter<(u64, u64)>>,
+    /// The books the placed addresses are read back from as they are
+    /// written.
+    books: Option<AddressBook>,
+    postcodes: Option<SpoolFile<PostcodePoint>>,
+    sample: Option<Sampler>,
+    sample_saved: Option<ScratchFile>,
+    sealing: Option<Sealing>,
+    sealed: Option<(SealedPack, BuildStats)>,
+    /// When the Pack's indexes started, in this run.
+    indexing: Option<Instant>,
+    checkpoints: CheckpointReport,
+}
 
-    // Boundary geometry accumulates across every input, because a boundary
-    // relation and the ways it is made of can only be assembled once all of
-    // them are known. Everything else each pass needs is per input.
-    let mut geometry = Geometry::default();
-    let passes = Passes {
-        scratch: &scratch,
-        memory: &memory,
-        progress: &progress,
-        observer: options.observer.as_ref(),
-    };
-    let mut scanned_bytes = 0;
-    // Each input is read on its own: the node pass stores coordinates in id
-    // order, and ids ascend only within one sorted PBF.
-    for input in &options.inputs {
-        scanned_bytes += pbf::input_bytes(input)?;
-        read_input(
-            input,
-            &mut build,
-            &mut geometry,
-            &mut plan,
-            scanned_bytes,
-            &passes,
+/// Context records in their order, the ids they were given, and what
+/// the index derived from them answers.
+struct Contexts {
+    ordered: SpoolFile<PendingRecord>,
+    boundary_ids: Vec<RecordId>,
+    country_ids: HashMap<String, RecordId>,
+    /// The areas that are settlements, by their own tags or by holding a
+    /// settlement of their name.
+    settled: HashSet<RecordId>,
+    index: BoundaryIndex,
+    area_names: HashMap<RecordId, Vec<String>>,
+    country_codes: HashMap<RecordId, CountryCode>,
+    region_groups: HashMap<RecordId, Vec<RecordId>>,
+}
+
+impl Contexts {
+    /// What the boundary set answers once its records have ids. Cheaper to
+    /// derive again from the saved set than to save: it is the polygons
+    /// indexed, and names and codes looked up.
+    fn derive(
+        boundaries: BoundarySet,
+        ordered: SpoolFile<PendingRecord>,
+        boundary_ids: Vec<RecordId>,
+        country_ids: HashMap<String, RecordId>,
+        settled: HashSet<RecordId>,
+    ) -> Self {
+        let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
+        let area_names = boundaries.context_names(&boundary_ids, &country_ids);
+        let region_groups = boundaries.region_groups(&boundary_ids);
+        let index = boundaries.into_index(&boundary_ids, &country_ids);
+        Self {
+            ordered,
+            boundary_ids,
+            country_ids,
+            settled,
+            index,
+            area_names,
+            country_codes,
+            region_groups,
+        }
+    }
+}
+
+impl<'a> Run<'a> {
+    /// A run from the first step, or from the last checkpoint of a build
+    /// of the Pack that stopped, when `options.leftover` asks for that.
+    fn start(options: &'a BuildOsmOptions, plan: BuildPlan) -> Result<Self> {
+        let fingerprint = Fingerprint::of(
+            &options.inputs,
+            &options.input_sources,
+            options
+                .addresses
+                .as_ref()
+                .map(|source| format!("{source:?}")),
         )?;
-        build.report.resources.plan = plan.clone();
+        match settle_leftovers(options)? {
+            Some(found) => Self::resume(options, plan, fingerprint, &found),
+            None => {
+                if options.leftover == Leftover::Resume {
+                    options.observer.warned(&format!(
+                        "no stopped build of {} to resume: starting over",
+                        options.pack.display()
+                    ));
+                }
+                Self::fresh(options, plan, fingerprint)
+            }
+        }
     }
-    let Geometry {
-        relations,
-        boundary_feature_ids,
-        boundary_ways,
-        member_vertices,
-    } = geometry;
 
-    // Admin boundaries and their place records. Every input has been read,
-    // so a relation whose ways span two extracts is assembled from all of
-    // them.
-    let phase = Instant::now();
-    progress.start(BuildStage::Boundaries, None)?;
-    // Boundary features that were incomplete have no entry in `boundary_ways`
-    // and resolve to `None`, like an incomplete member.
-    let mut member_lines: HashMap<i64, Option<&[Vertex]>> = boundary_feature_ids
-        .iter()
-        .map(|way_id| (*way_id, None))
-        .collect();
-    for way in &boundary_ways {
-        member_lines.insert(way.object_id, Some(way.vertices.as_slice()));
+    /// The parts every run shares: the memory budget, the scratch it
+    /// streams to and the meter.
+    fn new(
+        options: &'a BuildOsmOptions,
+        plan: BuildPlan,
+        fingerprint: Fingerprint,
+        generation: Generation,
+        scratch: Arc<Scratch>,
+        build: Build,
+    ) -> Self {
+        // The sorters and the parser's lattice cache split what the others
+        // leave of the pool by fair shares, each at most `budget`; the node
+        // store takes what it needs of the rest. While records are written
+        // the text index is what every record waits on, so it takes half a
+        // sorter's: more indexing threads, fewer segments. The context
+        // record and spatial sorters hold a few times less than the others,
+        // and are capped to stay so.
+        let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
+        scratch.cancel_on(Arc::clone(&options.cancel));
+        // Spill files stay in the page cache while they fit in a quarter of
+        // what the build leaves free: the rest keeps the Pack and the input
+        // it rereads, and dirty pages the lazy writer holds back are not
+        // free.
+        scratch.set_cache_bytes(
+            plan.resources
+                .available_memory_bytes
+                .saturating_sub(plan.memory_budget_bytes + plan.untracked_bytes)
+                / 4,
+        );
+        let memory = Arc::clone(build.memory());
+        let progress = Progress::new(Arc::clone(&options.observer), Arc::clone(&options.cancel))
+            .metered(&scratch, &memory);
+        Self {
+            options,
+            plan,
+            budget,
+            memory,
+            scratch,
+            progress,
+            fingerprint,
+            started: Instant::now(),
+            elapsed_before: Duration::ZERO,
+            done: None,
+            stages_before: Vec::new(),
+            generation: Some(generation),
+            build,
+            sorted: BTreeMap::new(),
+            scanned: None,
+            geometry: Geometry::default(),
+            geometry_saved: Vec::new(),
+            input: None,
+            boundaries: None,
+            boundaries_saved: None,
+            imports: None,
+            contexts: None,
+            address_book: None,
+            verdicts: None,
+            books: None,
+            postcodes: None,
+            sample: None,
+            sample_saved: None,
+            sealing: None,
+            sealed: None,
+            indexing: None,
+            checkpoints: CheckpointReport::default(),
+        }
     }
-    for (way_id, line) in &member_vertices {
-        member_lines.insert(*way_id, line.as_deref());
-    }
-    let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines, || {
-        progress.check()
-    })?;
-    build
-        .report
-        .unmatched_admin_level_ids
-        .extend_from_slice(boundaries.unmatched_admin_ids());
-    drop(member_lines);
-    drop((
-        boundary_ways,
-        member_vertices,
-        relations,
-        boundary_feature_ids,
-    ));
-    for (origin, record) in boundaries.place_records(&mut build.report) {
-        build.push(record, Some(origin))?;
-    }
-    progress.finish(BuildStage::Boundaries);
-    build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
 
-    // Addresses from outside OSM join the OSM ones before they are ordered.
-    // The source is asked only now, knowing the countries the Pack covers.
-    let phase = Instant::now();
-    let files = match &options.addresses {
-        Some(source) => source.files(&boundaries.coverage())?,
-        None => Vec::new(),
-    };
-    let import_bytes = files
-        .iter()
-        .map(|file| std::fs::metadata(&file.path).map(|metadata| metadata.len()))
-        .sum::<std::io::Result<u64>>()?;
-    // A source can cover more than the extracts: a country's file for a Pack
-    // of one province. Rows outside every extract's stated bounds are left
-    // out; an extract that states none keeps every row.
-    let extracts = options
-        .inputs
-        .iter()
-        .map(|input| pbf::header_bbox(input))
-        .collect::<Result<Option<Vec<_>>>>()?;
-    progress.start(BuildStage::ImportAddresses, Some(import_bytes))?;
-    for file in &files {
-        let imported = addresses::read_file(file, |record| {
-            progress.check()?;
-            let inside = point_lon_lat(&record.geometry).is_some_and(|[lon, lat]| {
-                extracts.as_ref().is_none_or(|boxes| {
-                    boxes
-                        .iter()
-                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
+    fn fresh(
+        options: &'a BuildOsmOptions,
+        plan: BuildPlan,
+        fingerprint: Fingerprint,
+    ) -> Result<Self> {
+        let memory = budget_of(&plan);
+        let report_inputs = options
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                Ok(ReportInput {
+                    path: input.display().to_string(),
+                    source: options.input_sources.get(index).cloned(),
+                    replication_timestamp: replication_timestamp(input)?,
+                    bytes: pbf::input_bytes(input)?,
                 })
-            });
-            if !inside {
-                return Ok(Some("outside_extract"));
-            }
-            build.push(Record::Address(record), None)?;
-            Ok(None)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input_bytes = report_inputs.iter().map(|input| input.bytes).sum::<u64>();
+        let mut generation = Generation::create(&options.pack)?;
+        let scratch = generation
+            .create_scratch(options.scratch_dir.as_deref(), options.scratch_budget_bytes)?;
+        // Written first, so a build killed before its first checkpoint is
+        // found too, and can be cleared.
+        let pointer = generation.path().join(SCRATCH_POINTER_FILE);
+        File::create(&pointer)
+            .and_then(|mut file| {
+                file.write_all(
+                    std::path::absolute(scratch.path())?
+                        .display()
+                        .to_string()
+                        .as_bytes(),
+                )?;
+                file.sync_all()
+            })
+            .map_err(|source| Error::IoPath {
+                action: "failed to write",
+                path: pointer,
+                source,
+            })?;
+        let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
+        let mut build = Build {
+            report: BuilderReport {
+                schema_version: BUILD_REPORT_SCHEMA_VERSION,
+                inputs: report_inputs,
+                pack: options.pack.display().to_string(),
+                input_bytes,
+                datasets: vec![OSM_DATASET.to_string()],
+                ..BuilderReport::default()
+            },
+            audit: Audit::create(generation.path())?,
+            records: Some(ExternalSorter::new(&scratch, "records", &memory, budget)),
+            addresses: Some(ExternalSorter::new(&scratch, "addresses", &memory, budget)),
+            streets: Some(ExternalSorter::new(&scratch, "streets", &memory, budget)),
+            context_records: Some(ExternalSorter::new(
+                &scratch,
+                "context-records",
+                &memory,
+                (budget / 16).max(1),
+            )),
+            datasets: Datasets::default(),
+            seq: 0,
+            memory,
+        };
+        build.report.scratch.memory_budget_bytes = plan.memory_budget_bytes;
+        build.report.resources.threads = rayon::current_num_threads();
+        build.report.resources.plan = plan.clone();
+        Ok(Self::new(
+            options,
+            plan,
+            fingerprint,
+            generation,
+            scratch,
+            build,
+        ))
+    }
+
+    /// Go on from the checkpoint `found` left: check it was a build of the
+    /// same inputs, options and og, reopen its scratch and generation, and
+    /// restore what the steps after it need.
+    fn resume(
+        options: &'a BuildOsmOptions,
+        mut plan: BuildPlan,
+        mut fingerprint: Fingerprint,
+        found: &Found,
+    ) -> Result<Self> {
+        let manifest = fs::read(found.manifest()).map_err(|source| Error::IoPath {
+            action: "failed to read the build checkpoint",
+            path: found.manifest(),
+            source,
         })?;
-        progress.advance(imported.bytes);
-        progress
-            .input(&file.path)
-            .add(imported.bytes, std::time::Duration::ZERO);
-        if !build.report.datasets.contains(&imported.dataset) {
-            build.report.datasets.push(imported.dataset.clone());
+        let manifest: Manifest<State> = serde_json::from_slice(&manifest)?;
+        if manifest.format != FORMAT_VERSION {
+            return Err(Error::BadOptions(
+                format!(
+                    "the build that stopped in {} wrote a checkpoint of format {}, not {FORMAT_VERSION}; pass --fresh to clear it and start over",
+                    found.scratch.display(),
+                    manifest.format
+                )
+                .into(),
+            ));
         }
-        build.report.imports.push(imported);
-    }
-    progress.finish(BuildStage::ImportAddresses);
-    build.report.phases.address_import_ms = phase.elapsed().as_millis();
-
-    let Build {
-        mut report,
-        audit,
-        mut records,
-        addresses,
-        streets,
-        context_records,
-        datasets,
-        mut seq,
-    } = build;
-
-    // Context records first: once their ids are known, the boundary index can
-    // describe every other record, and tell the country each address lies in.
-    let phase = Instant::now();
-    let context_stats = context_records.stats();
-    let mut ordered = Spool::<PendingRecord>::create(&scratch, "context-ordered")?;
-    let mut boundary_ids = vec![0; boundaries.len()];
-    let mut country_ids = HashMap::new();
-    let first_id = writer.record_count();
-    // The areas that are settlements by their own tags, and the settlement
-    // points that may name the area they lie in.
-    let mut settled = HashSet::new();
-    let mut settlements = Vec::new();
-    for (index, item) in context_records.finish()?.enumerate() {
-        let item = item?;
-        let record_id = first_id + index as u64;
-        match &item.origin {
-            Some(ContextOrigin::Boundary(boundary)) => boundary_ids[*boundary as usize] = record_id,
-            Some(ContextOrigin::DerivedCountry(code)) => {
-                country_ids.insert(code.clone(), record_id);
-            }
-            None => {}
+        let differences = manifest.fingerprint.differences(&fingerprint);
+        if !differences.is_empty() {
+            return Err(Error::BadOptions(
+                format!(
+                    "the build that stopped after \"{}\" in {} cannot go on, it was a build of something else:\n  {}\npass --fresh to clear it and start over",
+                    manifest.stage,
+                    found.scratch.display(),
+                    differences.join("\n  ")
+                )
+                .into(),
+            ));
         }
-        if let Body::Record(record) = &item.body
-            && let Record::Place(_, place) = record.as_ref()
-            && street::is_settlement(&place.place_type)
-        {
-            match item.origin {
-                Some(ContextOrigin::Boundary(_)) => {
-                    settled.insert(record_id);
-                }
-                Some(ContextOrigin::DerivedCountry(_)) => {}
-                None => {
-                    settlements.extend(search_key(&place.name).zip(point_lon_lat(&place.geometry)))
-                }
+        fingerprint.imported = manifest.fingerprint.imported.clone();
+        let state = manifest.state;
+        let files = manifest
+            .files
+            .iter()
+            .map(|name| found.scratch.join(name))
+            .collect::<Vec<_>>();
+        let scratch = Scratch::reopen(&found.scratch, &files, state.next_file)?;
+        scratch.set_budget(options.scratch_budget_bytes);
+        scratch.seed(&state.ledger);
+        let mut generation = Generation::reopen(&options.pack, &found.generation);
+        generation.attach(&scratch);
+        let memory = budget_of(&plan);
+        let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
+
+        // The plan is counted again from what the scans counted, on the
+        // machine as it is now.
+        if let Some(scanned) = &state.scanned {
+            let resources = Resources::probe();
+            memory.sample(&resources);
+            plan.refine(&Scanned {
+                items: scanned.items.clone(),
+                read_bytes: scanned.read_bytes,
+                heap_bytes: alloc::live_bytes().map(|bytes| bytes as u64),
+                tracked_bytes: memory.used() as u64,
+                resources,
+            })?;
+            for warning in plan.shortfalls.iter().chain(&plan.warnings) {
+                options.observer.warned(warning);
             }
         }
-        ordered.write(&item)?;
+        let mut report = state.report;
+        report.resources.threads = rayon::current_num_threads();
+        report.resources.plan = plan.clone();
+        report.scratch.memory_budget_bytes = plan.memory_budget_bytes;
+        let sorters = &state.sorters;
+        let verdicts = sorter_of(sorters, "house-verdicts", &scratch, &memory, budget)?;
+        let build = Build {
+            audit: Audit::reopen(generation.path(), &state.audit)?,
+            records: sorter_of(sorters, "records", &scratch, &memory, budget)?,
+            addresses: sorter_of(sorters, "addresses", &scratch, &memory, budget)?,
+            streets: sorter_of(sorters, "streets", &scratch, &memory, budget)?,
+            context_records: sorter_of(
+                sorters,
+                "context-records",
+                &scratch,
+                &memory,
+                (budget / 16).max(1),
+            )?,
+            datasets: Datasets::from_names(state.datasets.clone()),
+            seq: state.seq,
+            memory,
+            report,
+        };
+        let done = state.step;
+        let stages_before = build.report.stages.clone();
+        let mut run = Self::new(options, plan, fingerprint, generation, scratch, build);
+        run.elapsed_before = Duration::from_millis(manifest.elapsed_ms);
+        run.done = Some(done);
+        run.stages_before = stages_before;
+        run.sorted = state.sorted;
+        run.scanned = state.scanned;
+        run.imports = state.imports;
+        run.checkpoints = run.build.report.checkpoints.clone();
+        run.verdicts = verdicts;
+        let scratch = Arc::clone(&run.scratch);
+        if let Some(addresses) = &state.addresses {
+            if let Some(book) = &addresses.book {
+                run.address_book = Some(BookFile::restore(&scratch, book)?);
+            }
+            if let Some((book, postcodes)) = &addresses.placed {
+                run.books = Some(AddressBook {
+                    addresses: BookFile::restore(&scratch, book)?,
+                    postcodes: BookFile::restore(&scratch, postcodes)?,
+                    datasets: Datasets::from_names(state.datasets.clone()),
+                });
+            }
+        }
+        if done < Step::Boundaries {
+            for part in &state.geometry {
+                let part = SpoolFile::<GeometryItem>::restore(&scratch, part)?;
+                run.geometry.add(part.reader()?)?;
+                run.geometry_saved.push(part);
+            }
+        }
+        if let Some(input) = &state.input {
+            run.input = Some(InputPasses::restore(&scratch, &run.memory, input)?);
+        }
+        if let Some(saved) = &state.boundaries {
+            let saved = SpoolFile::restore(&scratch, saved)?;
+            let boundaries = BoundarySet::load(&saved)?;
+            match &state.contexts {
+                Some(contexts) => {
+                    run.contexts = Some(Contexts::derive(
+                        boundaries,
+                        SpoolFile::restore(&scratch, &contexts.ordered)?,
+                        contexts.boundary_ids.clone(),
+                        contexts.country_ids.clone().into_iter().collect(),
+                        contexts.settled.iter().copied().collect(),
+                    ));
+                }
+                None => run.boundaries = Some(boundaries),
+            }
+            run.boundaries_saved = Some(saved);
+        }
+        if let Some(postcodes) = &state.postcodes {
+            run.postcodes = Some(SpoolFile::restore(&scratch, postcodes)?);
+        }
+        if let Some((name, bytes)) = &state.sample {
+            let file = ScratchFile::reopen(&scratch, "sample", name, *bytes)?;
+            run.sample = Some(Sampler::from_bytes(&fs::read(file.path())?)?);
+            run.sample_saved = Some(file);
+        }
+        if let Some(sealing) = &state.sealing {
+            let generation = run.generation.take().expect("a generation until the write");
+            run.sealing = Some(Sealing::restore(
+                generation,
+                Arc::clone(&scratch),
+                &run.writer_options(),
+                sealing,
+            )?);
+        }
+        if let Some(sealed) = &state.sealed {
+            let generation = run.generation.take().expect("a generation until the write");
+            run.sealed = Some(SealedPack::restore(generation, sealed)?);
+        }
+        let resumed = ResumeReport {
+            after: manifest.stage,
+            reused: scratch
+                .traffic()
+                .into_iter()
+                .filter(|(_, traffic)| traffic.live_bytes > 0)
+                .map(|(label, traffic)| (label, traffic.live_bytes))
+                .collect(),
+            reused_bytes: scratch.live_bytes(),
+            saved_ms: manifest.elapsed_ms,
+        };
+        run.options.observer.resumed(&resumed);
+        run.build.report.resumes.push(resumed);
+        Ok(run)
     }
-    let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
-    let area_names = boundaries.context_names(&boundary_ids, &country_ids);
-    writer.set_context_names(area_names.clone());
-    writer.set_country_codes(country_codes.clone());
-    writer.set_region_groups(boundaries.region_groups(&boundary_ids));
-    let index = boundaries.into_index(&boundary_ids, &country_ids);
-    // An admin area is a settlement too when a settlement of its name lies
-    // in it, as a town's boundary holds the town's point: Nominatim links
-    // the two the same way. A ward or a local board holds none of its name.
-    settled.extend(
-        settlements
+
+    fn writer_options(&self) -> WriterOptions {
+        WriterOptions {
+            memory: Arc::clone(&self.memory),
+            text_index_memory_bytes: (self.budget / 2).max(1),
+        }
+    }
+
+    fn step(&mut self, step: Step) -> Result<()> {
+        match step {
+            Step::Input { index, pass } => match pass {
+                Pass::Scan => self.scan(index),
+                Pass::Members => self.members(index),
+                Pass::Nodes => self.nodes(index),
+                Pass::Ways => self.ways(index),
+            },
+            Step::Boundaries => self.boundaries(),
+            Step::ImportAddresses => self.import_addresses(),
+            Step::Contexts => self.order_contexts(),
+            Step::Streets => self.join_streets(),
+            Step::AddressBook => self.write_address_book(),
+            Step::Houses => self.find_repeated_houses(),
+            Step::Addresses => self.place_addresses(),
+            Step::Records => self.write_records(),
+            Step::Seal(_) => self.seal_part(),
+            Step::Sealed => self.seal(),
+        }
+    }
+
+    /// Pass 1: classify everything, and mark the nodes kept ways reference.
+    fn scan(&mut self, index: usize) -> Result<()> {
+        let input = &self.options.inputs[index];
+        let phase = Instant::now();
+        let nodes = NodeSet::new(&self.memory);
+        // Nodes whose address tags interpolation ways read.
+        let mut tag_ids = Vec::new();
+        let mut node_blobs = Vec::new();
+        let mut way_blobs = Vec::new();
+        // Blobs holding a kept way or a member way: all the way pass rereads.
+        let mut kept_blobs = Vec::new();
+        let mut kept = KeptWays::default();
+        let mut part = Vec::new();
+        let build = &mut self.build;
+        let geometry = &mut self.geometry;
+        let read = for_each_block(
+            input,
+            &self.progress,
+            BuildStage::Scan,
+            None,
+            |offset, block| {
+                let output = scan_block(&block);
+                for (_, refs) in &output.ways {
+                    nodes.mark(refs)?;
+                }
+                Ok((offset, output))
+            },
+            |(offset, output)| {
+                if output.has_nodes {
+                    node_blobs.push(offset);
+                }
+                if output.has_ways {
+                    way_blobs.push(offset);
+                }
+                if !output.ways.is_empty() {
+                    kept_blobs.push(offset);
+                }
+                for (feature, refs) in output.ways {
+                    let resolution = &mut build.report.geometry_resolution;
+                    resolution.required_node_refs += refs.len() as u64;
+                    kept.all += 1;
+                    kept.records += u64::from(feature.kind != WayKind::Boundary);
+                    match feature.kind {
+                        WayKind::Address => {
+                            resolution.address_way_stubs += 1;
+                            kept.addresses += 1;
+                        }
+                        WayKind::Poi => resolution.poi_way_stubs += 1,
+                        WayKind::Street => {
+                            resolution.street_way_stubs += 1;
+                            kept.streets += 1;
+                        }
+                        WayKind::Interpolation => {
+                            resolution.interpolation_way_stubs += 1;
+                            tag_ids.extend_from_slice(&refs);
+                        }
+                        WayKind::Boundary => {
+                            resolution.boundary_way_stubs += 1;
+                            build.report.geometry_passes.boundary_refs += refs.len() as u64;
+                            geometry.boundary_feature_ids.insert(feature.way_id);
+                            part.push(GeometryItem::Feature(feature.way_id));
+                        }
+                    }
+                }
+                part.extend(output.relations.iter().cloned().map(GeometryItem::Relation));
+                geometry.relations.extend(output.relations);
+                build.absorb(output.emitted)
+            },
+        )?;
+        self.build.report.geometry_passes.scan_read_bytes += read;
+        self.build.report.phases.scan_ms += phase.elapsed().as_millis();
+        self.save_geometry(part)?;
+        self.input = Some(InputPasses {
+            index,
+            nodes: Some(nodes),
+            tag_ids,
+            node_blobs,
+            way_blobs,
+            kept_blobs,
+            kept,
+            members: HashSet::new(),
+            locations: None,
+            saved: InputSaved::default(),
+            changed: true,
+        });
+        Ok(())
+    }
+
+    /// Pass 2: the ways boundary relations are made of. They often carry no
+    /// tags of their own, so pass 1 could not know to keep them.
+    fn members(&mut self, index: usize) -> Result<()> {
+        let input_path = &self.options.inputs[index];
+        let phase = Instant::now();
+        let input = self.input.as_mut().ok_or_else(|| missing("the scan"))?;
+        let nodes = input
+            .nodes
+            .as_ref()
+            .ok_or_else(|| missing("the node set"))?;
+        let member_ids = boundary::required_boundary_way_ids(&self.geometry.relations)
+            .into_iter()
+            .filter(|way_id| !self.geometry.boundary_feature_ids.contains(way_id))
+            .collect::<HashSet<_>>();
+        let build = &mut self.build;
+        if member_ids.is_empty() {
+            self.progress.start(BuildStage::BoundaryMembers, Some(0))?;
+            self.progress.finish(BuildStage::BoundaryMembers);
+        } else {
+            let members = &mut input.members;
+            let kept_blobs = &mut input.kept_blobs;
+            let read = for_each_block(
+                input_path,
+                &self.progress,
+                BuildStage::BoundaryMembers,
+                Some(&input.way_blobs),
+                |offset, block| Ok((offset, member_ways(&block, &member_ids))),
+                |(offset, found)| {
+                    if !found.is_empty() {
+                        kept_blobs.push(offset);
+                    }
+                    for (way_id, refs) in found {
+                        // A way the input repeats is read where it first
+                        // appears.
+                        if !members.insert(way_id) {
+                            continue;
+                        }
+                        nodes.mark(&refs)?;
+                        let refs = refs.len() as u64;
+                        build.report.geometry_resolution.required_node_refs += refs;
+                        build.report.geometry_passes.boundary_refs += refs;
+                    }
+                    Ok(())
+                },
+            )?;
+            build.report.geometry_passes.boundary_member_read_bytes += read;
+        }
+        build.report.phases.boundary_member_scan_ms += phase.elapsed().as_millis();
+        input.changed = true;
+
+        // The scan has counted what the rest of the build holds, and the
+        // machine has moved since the build started.
+        let resources = Resources::probe();
+        self.memory.sample(&resources);
+        let accepted = &build.report.accepted;
+        let counted = |layer: &str| accepted.by_layer.get(layer).copied().unwrap_or_default();
+        let kept = &input.kept;
+        let scanned = ScanCounts {
+            items: ItemCounts {
+                needed_nodes: nodes.len(),
+                node_set_bytes: nodes.bytes(),
+                kept_ways: build.report.geometry_passes.kept_ways + kept.all,
+                records: accepted.total + kept.records,
+                addresses: counted("address") + kept.addresses,
+                streets: counted("street") + kept.streets,
+                boundary_refs: build.report.geometry_passes.boundary_refs,
+                imported_rows: self.plan.items.imported_rows,
+            },
+            read_bytes: total_input_bytes(&self.options.inputs[..=index])?,
+        };
+        self.plan.refine(&Scanned {
+            items: scanned.items.clone(),
+            read_bytes: scanned.read_bytes,
+            heap_bytes: alloc::live_bytes().map(|bytes| bytes as u64),
+            tracked_bytes: self.memory.used() as u64,
+            resources: resources.clone(),
+        })?;
+        for warning in self.plan.shortfalls.iter().chain(&self.plan.warnings) {
+            self.options.observer.warned(warning);
+        }
+        build.report.geometry_passes.kept_ways += kept.all;
+        build.report.resources.plan = self.plan.clone();
+        self.scanned = Some(scanned);
+        Ok(())
+    }
+
+    /// Pass 3: the coordinates of every marked node.
+    fn nodes(&mut self, index: usize) -> Result<()> {
+        let phase = Instant::now();
+        let input = self.input.as_mut().ok_or_else(|| missing("the scan"))?;
+        let nodes = input.nodes.take().ok_or_else(|| missing("the node set"))?;
+        let mut tag_ids = std::mem::take(&mut input.tag_ids);
+        tag_ids.sort_unstable();
+        tag_ids.dedup();
+        let slots = Slots::new(
+            nodes.len(),
+            self.plan.locations_in_memory,
+            &self.memory,
+            &self.scratch,
+        )?;
+        let (locations, stored) = locations::load(
+            &self.options.inputs[index],
+            &input.node_blobs,
+            nodes,
+            &tag_ids,
+            slots,
+            &self.progress,
+        )?;
+        input.locations = Some(locations);
+        // Their saved copies go at the next checkpoint: the store holds
+        // what is left of them.
+        input.saved.node_set = None;
+        input.saved.tag_ids = None;
+        self.build.report.geometry_passes.add(&stored);
+        self.build.report.phases.node_join_ms += phase.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Pass 4: the kept ways and member ways again, now with coordinates.
+    fn ways(&mut self, index: usize) -> Result<()> {
+        let phase = Instant::now();
+        let mut input = self.input.take().ok_or_else(|| missing("the scan"))?;
+        let locations = input
+            .locations
+            .as_ref()
+            .ok_or_else(|| missing("the node store"))?;
+        input.kept_blobs.sort_unstable();
+        input.kept_blobs.dedup();
+        let mut input_members: HashMap<i64, Option<Vec<Vertex>>> = HashMap::new();
+        let mut part = Vec::new();
+        let build = &mut self.build;
+        let geometry = &mut self.geometry;
+        let read = for_each_block(
+            &self.options.inputs[index],
+            &self.progress,
+            BuildStage::AssembleWays,
+            Some(&input.kept_blobs),
+            |_, block| Ok(emit::assemble(&block, locations, &input.members)),
+            |assembled| {
+                let resolution = &mut build.report.geometry_resolution;
+                resolution.resolved_node_refs += assembled.resolved;
+                for (way_id, line, found) in assembled.members {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        input_members.entry(way_id)
+                    {
+                        resolution.resolved_node_refs += found;
+                        part.push(GeometryItem::Member(way_id, line.clone()));
+                        entry.insert(line);
+                    }
+                }
+                part.extend(
+                    assembled
+                        .output
+                        .boundary_ways
+                        .iter()
+                        .cloned()
+                        .map(GeometryItem::Way),
+                );
+                geometry
+                    .boundary_ways
+                    .extend(assembled.output.boundary_ways);
+                build.absorb(assembled.output.emitted)
+            },
+        )?;
+        self.build.report.geometry_passes.way_read_bytes += read;
+        self.geometry.member_vertices.extend(input_members);
+        self.build.report.phases.feature_emission_ms += phase.elapsed().as_millis();
+        drop(input);
+        self.save_geometry(part)
+    }
+
+    /// Keep an input's part of the boundary geometry on disk until the
+    /// boundary stage, for a run that goes on after it.
+    fn save_geometry(&mut self, part: Vec<GeometryItem>) -> Result<()> {
+        let mut spool = Spool::create(&self.scratch, "geometry")?;
+        for item in &part {
+            spool.write(item)?;
+        }
+        self.geometry_saved.push(spool.finish()?);
+        Ok(())
+    }
+
+    /// Admin boundaries and their place records. Every input has been read,
+    /// so a relation whose ways span two extracts is assembled from all of
+    /// them.
+    fn boundaries(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        self.progress.start(BuildStage::Boundaries, None)?;
+        let Geometry {
+            relations,
+            boundary_feature_ids,
+            boundary_ways,
+            member_vertices,
+        } = std::mem::take(&mut self.geometry);
+        // Boundary features that were incomplete have no entry in
+        // `boundary_ways` and resolve to `None`, like an incomplete member.
+        let mut member_lines: HashMap<i64, Option<&[Vertex]>> = boundary_feature_ids
+            .iter()
+            .map(|way_id| (*way_id, None))
+            .collect();
+        for way in &boundary_ways {
+            member_lines.insert(way.object_id, Some(way.vertices.as_slice()));
+        }
+        for (way_id, line) in &member_vertices {
+            member_lines.insert(*way_id, line.as_deref());
+        }
+        let progress = &self.progress;
+        let boundaries = build_boundaries(&boundary_ways, &relations, &member_lines, || {
+            progress.check()
+        })?;
+        self.build
+            .report
+            .unmatched_admin_level_ids
+            .extend_from_slice(boundaries.unmatched_admin_ids());
+        drop(member_lines);
+        drop((
+            boundary_ways,
+            member_vertices,
+            relations,
+            boundary_feature_ids,
+        ));
+        for (origin, record) in boundaries.place_records(&mut self.build.report) {
+            self.build.push(record, Some(origin))?;
+        }
+        self.boundaries_saved = Some(boundaries.save(&self.scratch)?);
+        self.boundaries = Some(boundaries);
+        self.geometry_saved.clear();
+        self.progress.finish(BuildStage::Boundaries);
+        self.build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Addresses from outside OSM join the OSM ones before they are
+    /// ordered. The source is asked only now, knowing the countries the
+    /// Pack covers.
+    fn import_addresses(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let boundaries = self
+            .boundaries
+            .as_ref()
+            .ok_or_else(|| missing("the boundaries"))?;
+        let files = match &self.options.addresses {
+            Some(source) => source.files(&boundaries.coverage())?,
+            None => Vec::new(),
+        };
+        let import_bytes = files
+            .iter()
+            .map(|file| std::fs::metadata(&file.path).map(|metadata| metadata.len()))
+            .sum::<std::io::Result<u64>>()?;
+        // A source can cover more than the extracts: a country's file for a
+        // Pack of one province. Rows outside every extract's stated bounds
+        // are left out; an extract that states none keeps every row.
+        let extracts = self
+            .options
+            .inputs
+            .iter()
+            .map(|input| pbf::header_bbox(input))
+            .collect::<Result<Option<Vec<_>>>>()?;
+        let progress = &self.progress;
+        progress.start(BuildStage::ImportAddresses, Some(import_bytes))?;
+        let build = &mut self.build;
+        for file in &files {
+            let imported = addresses::read_file(file, |record| {
+                progress.check()?;
+                let inside = point_lon_lat(&record.geometry).is_some_and(|[lon, lat]| {
+                    extracts.as_ref().is_none_or(|boxes| {
+                        boxes
+                            .iter()
+                            .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
+                    })
+                });
+                if !inside {
+                    return Ok(Some("outside_extract"));
+                }
+                build.push(Record::Address(record), None)?;
+                Ok(None)
+            })?;
+            progress.advance(imported.bytes);
+            progress
+                .input(&file.path)
+                .add(imported.bytes, std::time::Duration::ZERO);
+            if !build.report.datasets.contains(&imported.dataset) {
+                build.report.datasets.push(imported.dataset.clone());
+            }
+            build.report.imports.push(imported);
+            self.fingerprint.imported.push(FileStamp::of(&file.path)?);
+        }
+        progress.finish(BuildStage::ImportAddresses);
+        build.report.phases.address_import_ms = phase.elapsed().as_millis();
+        self.imports = Some(files);
+        Ok(())
+    }
+
+    /// Context records first: once their ids are known, the boundary index
+    /// can describe every other record, and tell the country each address
+    /// lies in.
+    fn order_contexts(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let boundaries = self
+            .boundaries
+            .take()
+            .ok_or_else(|| missing("the boundaries"))?;
+        let context_records = self
+            .build
+            .context_records
+            .take()
+            .ok_or_else(|| missing("the context records"))?;
+        self.sorted.insert(
+            "context_records".to_string(),
+            sorter_report(&context_records),
+        );
+        let mut ordered = Spool::<PendingRecord>::create(&self.scratch, "context-ordered")?;
+        let mut boundary_ids = vec![0; boundaries.len()];
+        let mut country_ids = HashMap::new();
+        // The areas that are settlements by their own tags, and the
+        // settlement points that may name the area they lie in.
+        let mut settled = HashSet::new();
+        let mut settlements = Vec::new();
+        // Context records are the first the Pack holds.
+        for (index, item) in context_records.finish()?.enumerate() {
+            let item = item?;
+            let record_id = index as u64;
+            match &item.origin {
+                Some(ContextOrigin::Boundary(boundary)) => {
+                    boundary_ids[*boundary as usize] = record_id;
+                }
+                Some(ContextOrigin::DerivedCountry(code)) => {
+                    country_ids.insert(code.clone(), record_id);
+                }
+                None => {}
+            }
+            if let Body::Record(record) = &item.body
+                && let Record::Place(_, place) = record.as_ref()
+                && street::is_settlement(&place.place_type)
+            {
+                match item.origin {
+                    Some(ContextOrigin::Boundary(_)) => {
+                        settled.insert(record_id);
+                    }
+                    Some(ContextOrigin::DerivedCountry(_)) => {}
+                    None => settlements
+                        .extend(search_key(&place.name).zip(point_lon_lat(&place.geometry))),
+                }
+            }
+            ordered.write(&item)?;
+        }
+        let mut contexts = Contexts::derive(
+            boundaries,
+            ordered.finish()?,
+            boundary_ids,
+            country_ids,
+            settled,
+        );
+        // An admin area is a settlement too when a settlement of its name
+        // lies in it, as a town's boundary holds the town's point: Nominatim
+        // links the two the same way. A ward or a local board holds none of
+        // its name.
+        let found = settlements
             .par_iter()
             .filter_map(|(name, [lon, lat])| {
-                let locality = index
+                let locality = contexts
+                    .index
                     .context_for_point(*lon, *lat, Default::default())
                     .admin_context
                     .locality_record_id()?;
-                area_names
+                contexts
+                    .area_names
                     .get(&locality)?
                     .iter()
                     .any(|area| search_key(area).as_ref() == Some(name))
                     .then_some(locality)
             })
-            .collect::<Vec<_>>(),
-    );
-    drop(settlements);
-    let context_count = ordered.written();
-    let mut sample = Sampler::default();
-    write_ordered(
-        &mut writer,
-        &mut sample,
-        ordered.into_reader()?,
-        context_count,
-        &index,
-        None,
-        &progress,
-        BuildStage::ContextRecords,
-    )?;
-    report.phases.context_record_write_ms = phase.elapsed().as_millis();
+            .collect::<Vec<_>>();
+        contexts.settled.extend(found);
+        self.contexts = Some(contexts);
+        self.build.report.phases.context_record_write_ms = phase.elapsed().as_millis();
+        Ok(())
+    }
 
-    let phase = Instant::now();
-    let street_stats = streets.stats();
-    report.accepted.streets = join_streets(
-        streets,
-        &index,
-        &settled,
-        &area_names,
-        &mut records,
-        &mut seq,
-    )?;
-    drop(area_names);
-    report.phases.street_join_ms = phase.elapsed().as_millis();
-
-    let phase = Instant::now();
-    let address_stats = addresses.stats();
-    // Slash numbers are read before imported rows are matched against OSM
-    // ones, so an OSM flat "10/1367" repeats an imported 1367 unit 10.
-    let mut slash_numbers = SlashNumberCounts::default();
-    let lent = Book::create(&scratch, "street-postcodes")?;
-    let (postcodes, book, lent) = if files.is_empty() {
-        let mut runs = AddressRuns::new(
-            &mut records,
-            &mut seq,
-            &index,
-            &country_codes,
-            lent,
-            Some(Book::create(&scratch, "address-book")?),
-        );
-        slash::read_slash_numbers(addresses.finish()?, &mut slash_numbers, |address| {
-            runs.push(address, None)
-        })?;
-        let (postcodes, lent, book) = runs.finish()?;
-        let book = book.expect("the addresses were written to the book");
-        (postcodes, book.finish()?, lent)
-    } else {
-        let (book, verdicts) = drop_repeated_houses(
-            addresses,
-            &scratch,
-            &memory,
-            budget,
-            &datasets,
-            &mut report,
-            &mut slash_numbers,
+    fn join_streets(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let contexts = self
+            .contexts
+            .as_ref()
+            .ok_or_else(|| missing("the contexts"))?;
+        let streets = self
+            .build
+            .streets
+            .take()
+            .ok_or_else(|| missing("the streets"))?;
+        self.sorted
+            .insert("streets".to_string(), sorter_report(&streets));
+        let records = open(&mut self.build.records, "records")?;
+        self.build.report.accepted.streets = join_streets(
+            streets,
+            &contexts.index,
+            &contexts.settled,
+            &contexts.area_names,
+            records,
+            &mut self.build.seq,
         )?;
-        let mut runs = AddressRuns::new(&mut records, &mut seq, &index, &country_codes, lent, None);
-        let mut verdicts = verdicts.peekable();
-        for (at, address) in book.items().enumerate() {
-            let (address, at) = (address?, at as u64);
-            let (mut dropped, mut disputed) = (false, false);
-            while let Some(verdict) =
-                verdicts.next_if(|verdict| !matches!(verdict, Ok((position, _)) if *position != at))
-            {
-                match verdict?.1 {
-                    DROPPED => dropped = true,
-                    DISPUTED => disputed = true,
-                    _ => return Err(Error::Decode("unknown house verdict")),
-                }
-            }
-            if !dropped {
-                runs.push(address, Some((at, disputed)))?;
-            }
+        self.build.report.phases.street_join_ms = phase.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Whether imported rows are matched against the addresses the Pack
+    /// already has before they are placed.
+    fn imported(&self) -> bool {
+        self.imports.as_ref().is_some_and(|files| !files.is_empty())
+    }
+
+    /// The addresses in street order, with their slash numbers read, to
+    /// the address book, when imported rows are to be matched against
+    /// them. Without imported rows they are written as they are placed.
+    fn write_address_book(&mut self) -> Result<()> {
+        if !self.imported() {
+            return Ok(());
         }
-        let (postcodes, lent, _) = runs.finish()?;
-        (postcodes, book, lent)
-    };
-    let book = AddressBook {
-        addresses: book,
-        postcodes: lent.finish()?,
-        datasets,
-    };
-    report.slash_numbers = slash_numbers;
-    // Every address is placed, so each postcode's points are all known.
-    let mut postcode_points = Vec::new();
-    for record in postcodes.into_records() {
-        report.accept_postcode();
-        let [lon, lat] = point_lon_lat(&record.geometry).ok_or_else(|| {
-            Error::BadGeometry(format!("postcode {} has no point", record.postcode))
-        })?;
-        postcode_points.push((record.postcode.clone(), [lon, lat]));
-        records.push(PendingRecord {
-            key: hilbert_key(quantize(lon)?, quantize(lat)?),
-            seq,
-            origin: None,
-            body: Record::Postcode(record).into(),
-        })?;
-        seq += 1;
+        let phase = Instant::now();
+        let addresses = self
+            .build
+            .addresses
+            .take()
+            .ok_or_else(|| missing("the addresses"))?;
+        self.sorted
+            .insert("addresses".to_string(), sorter_report(&addresses));
+        self.address_book = Some(write_address_book(
+            addresses,
+            &self.scratch,
+            &mut self.build.report.slash_numbers,
+        )?);
+        self.build.report.phases.address_order_ms += phase.elapsed().as_millis();
+        Ok(())
     }
-    writer.set_postcode_areas(PostcodeAreas::new(postcode_points));
-    report.phases.address_order_ms = phase.elapsed().as_millis();
 
-    let phase = Instant::now();
-    let record_stats = records.stats();
-    write_ordered(
-        &mut writer,
-        &mut sample,
-        records.finish()?,
-        record_stats.items,
-        &index,
-        Some(&book),
-        &progress,
-        BuildStage::Records,
-    )?;
-    drop((index, book));
-    report.phases.record_write_ms = phase.elapsed().as_millis();
-
-    let phase = Instant::now();
-    report.scratch.peak_tracked_bytes = memory.peak() as u64;
-    progress.start(BuildStage::Indexes, None)?;
-    let (mut sealed, mut stats) = writer.seal()?;
-    progress.finish(BuildStage::Indexes);
-    report.phases.pack_seal_ms = phase.elapsed().as_millis();
-
-    // The parser learns from the sealed Pack's dictionaries and the records
-    // drawn while they were written, and its weights join the Pack before it
-    // is published.
-    let phase = Instant::now();
-    progress.start(BuildStage::Parser, None)?;
-    // By now the build has used memory and page cache a fresh process would
-    // have: sample again what is left.
-    let resources = Resources::probe();
-    memory.sample(&resources);
-    report.resources.at_training = resources;
-    let (weights, training) = train::train(&sealed.path(), sample, &scratch, &memory, budget)?;
-    if let Some(weights) = weights {
-        let bytes = weights.to_bytes();
-        sealed.add_section(WEIGHTS_SECTION, WEIGHTS_VERSION, &bytes)?;
-        stats.bytes = sealed.bytes();
-        stats
-            .sections
-            .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
+    fn find_repeated_houses(&mut self) -> Result<()> {
+        if !self.imported() {
+            return Ok(());
+        }
+        let phase = Instant::now();
+        let book = self
+            .address_book
+            .as_ref()
+            .ok_or_else(|| missing("the address book"))?;
+        self.verdicts = Some(find_repeated_houses(
+            book,
+            &self.scratch,
+            &self.memory,
+            self.budget,
+            &self.build.datasets,
+            &mut self.build.report,
+        )?);
+        self.build.report.phases.address_order_ms += phase.elapsed().as_millis();
+        Ok(())
     }
-    report.scratch.spilled_bytes = scratch.spilled_bytes();
-    report.scratch.budget_bytes = scratch.budget();
-    report.scratch.peak_live_bytes = scratch.peak_bytes();
-    report.scratch.peak_owners = scratch.peak_owners();
-    report.scratch.zstd_level = scratch.level();
-    report.scratch.spills = scratch.traffic();
-    drop(scratch);
-    progress.finish(BuildStage::Parser);
-    report.stages = progress.stages();
-    progress.check()?;
-    report.parser_training = training;
-    report.phases.parser_training_ms = phase.elapsed().as_millis();
 
-    for (name, stats) in [
-        ("addresses", address_stats),
-        ("streets", street_stats),
-        ("records", record_stats),
-        ("context_records", context_stats),
-    ] {
-        report.scratch.sorters.insert(
-            name.to_string(),
-            SorterReport {
-                items: stats.items,
-                runs: stats.runs,
+    fn place_addresses(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let contexts = self
+            .contexts
+            .as_ref()
+            .ok_or_else(|| missing("the contexts"))?;
+        let lent = Book::create(&self.scratch, "street-postcodes")?;
+        let records = open(&mut self.build.records, "records")?;
+        let seq = &mut self.build.seq;
+        let (postcodes, book, lent) = match self.address_book.take() {
+            None => {
+                let addresses = self
+                    .build
+                    .addresses
+                    .take()
+                    .ok_or_else(|| missing("the addresses"))?;
+                self.sorted
+                    .insert("addresses".to_string(), sorter_report(&addresses));
+                let mut runs = AddressRuns::new(
+                    records,
+                    seq,
+                    &contexts.index,
+                    &contexts.country_codes,
+                    lent,
+                    Some(Book::create(&self.scratch, "address-book")?),
+                );
+                // Slash numbers are read before the addresses are placed.
+                slash::read_slash_numbers(
+                    addresses.finish()?,
+                    &mut self.build.report.slash_numbers,
+                    |address| runs.push(address, None),
+                )?;
+                let (postcodes, lent, book) = runs.finish()?;
+                let book = book.expect("the addresses were written to the book");
+                (postcodes, book.finish()?, lent)
+            }
+            Some(book) => {
+                let verdicts = self
+                    .verdicts
+                    .take()
+                    .ok_or_else(|| missing("the house verdicts"))?;
+                let mut runs = AddressRuns::new(
+                    records,
+                    seq,
+                    &contexts.index,
+                    &contexts.country_codes,
+                    lent,
+                    None,
+                );
+                replay_address_book(&book, verdicts.finish()?, &mut runs)?;
+                let (postcodes, lent, _) = runs.finish()?;
+                (postcodes, book, lent)
+            }
+        };
+        self.books = Some(AddressBook {
+            addresses: book,
+            postcodes: lent.finish()?,
+            datasets: Datasets::from_names(self.build.datasets.names().to_vec()),
+        });
+        let report = &mut self.build.report;
+        // Every address is placed, so each postcode's points are all known.
+        let mut points = Spool::create(&self.scratch, "postcode-points")?;
+        for record in postcodes.into_records() {
+            report.accept_postcode();
+            let [lon, lat] = point_lon_lat(&record.geometry).ok_or_else(|| {
+                Error::BadGeometry(format!("postcode {} has no point", record.postcode))
+            })?;
+            points.write(&PostcodePoint(record.postcode.clone(), [lon, lat]))?;
+            let records = open(&mut self.build.records, "records")?;
+            records.push(PendingRecord {
+                key: hilbert_key(quantize(lon)?, quantize(lat)?),
+                seq: self.build.seq,
+                origin: None,
+                body: Record::Postcode(record).into(),
+            })?;
+            self.build.seq += 1;
+        }
+        self.postcodes = Some(points.finish()?);
+        self.build.report.phases.address_order_ms += phase.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Write context records, then every other record, then the parts of
+    /// the Pack the writer held in memory.
+    fn write_records(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let Contexts {
+            ordered,
+            index,
+            area_names,
+            country_codes,
+            region_groups,
+            ..
+        } = self
+            .contexts
+            .take()
+            .ok_or_else(|| missing("the contexts"))?;
+        let generation = self
+            .generation
+            .take()
+            .ok_or_else(|| missing("the Pack generation"))?;
+        let mut writer =
+            Writer::create_in(generation, Arc::clone(&self.scratch), self.writer_options())?;
+        writer.set_context_names(area_names);
+        writer.set_country_codes(country_codes);
+        writer.set_region_groups(region_groups);
+        let mut sample = Sampler::default();
+        let context_count = ordered.len();
+        write_ordered(
+            &mut writer,
+            &mut sample,
+            ordered.into_reader(),
+            context_count,
+            &index,
+            None,
+            &self.progress,
+            BuildStage::ContextRecords,
+        )?;
+        let postcodes = self
+            .postcodes
+            .take()
+            .ok_or_else(|| missing("the postcode points"))?;
+        let points = postcodes
+            .into_reader()
+            .map(|point| point.map(|PostcodePoint(postcode, point)| (postcode, point)))
+            .collect::<Result<Vec<_>>>()?;
+        writer.set_postcode_areas(PostcodeAreas::new(points));
+        let records = self
+            .build
+            .records
+            .take()
+            .ok_or_else(|| missing("the records"))?;
+        let record_stats = sorter_report(&records);
+        self.sorted
+            .insert("records".to_string(), record_stats.clone());
+        let books = self
+            .books
+            .take()
+            .ok_or_else(|| missing("the address book"))?;
+        write_ordered(
+            &mut writer,
+            &mut sample,
+            records.finish()?,
+            record_stats.items,
+            &index,
+            Some(&books),
+            &self.progress,
+            BuildStage::Records,
+        )?;
+        drop((index, books));
+        self.boundaries_saved = None;
+        self.build.report.phases.record_write_ms = phase.elapsed().as_millis();
+        self.build.report.scratch.peak_tracked_bytes = self.memory.peak() as u64;
+        self.progress.start(BuildStage::Indexes, None)?;
+        self.indexing = Some(Instant::now());
+        self.sealing = Some(writer.into_sealing()?);
+        self.sample = Some(sample);
+        Ok(())
+    }
+
+    /// Start the Pack's index stage, when a run goes on in the middle of it.
+    fn indexing(&mut self) -> Result<()> {
+        if self.indexing.is_none() {
+            self.progress.start(BuildStage::Indexes, None)?;
+            self.indexing = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    fn seal_part(&mut self) -> Result<()> {
+        self.indexing()?;
+        self.sealing
+            .as_mut()
+            .ok_or_else(|| missing("the sealing"))?
+            .seal_part()?;
+        Ok(())
+    }
+
+    fn seal(&mut self) -> Result<()> {
+        self.indexing()?;
+        let sealing = self.sealing.take().ok_or_else(|| missing("the sealing"))?;
+        self.sealed = Some(sealing.finish()?);
+        self.progress.finish(BuildStage::Indexes);
+        let started = self.indexing.take().expect("indexing started");
+        self.build.report.phases.pack_seal_ms += started.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Save what the steps after `step` need and name it in the manifest,
+    /// then make that the checkpoint a stopped build goes on from.
+    fn checkpoint(&mut self, step: Step) -> Result<()> {
+        let started = Instant::now();
+        let scratch = Arc::clone(&self.scratch);
+        let mut files = Vec::new();
+        let mut sorters = Vec::new();
+        save_sorter(&mut self.build.records, &mut sorters)?;
+        save_sorter(&mut self.build.addresses, &mut sorters)?;
+        save_sorter(&mut self.build.streets, &mut sorters)?;
+        save_sorter(&mut self.build.context_records, &mut sorters)?;
+        save_sorter(&mut self.verdicts, &mut sorters)?;
+        for sorter in &sorters {
+            files.extend(sorter.files(&scratch));
+        }
+        let mut addresses = AddressState::default();
+        if let Some(book) = &mut self.address_book {
+            addresses.book = Some(book.state(&scratch)?);
+            files.extend(book.files());
+        }
+        if let Some(books) = &mut self.books {
+            addresses.placed = Some((
+                books.addresses.state(&scratch)?,
+                books.postcodes.state(&scratch)?,
+            ));
+            files.extend(books.addresses.files());
+            files.extend(books.postcodes.files());
+        }
+        let geometry = self
+            .geometry_saved
+            .iter()
+            .map(SpoolFile::state)
+            .collect::<Vec<_>>();
+        let input = match &mut self.input {
+            Some(input) => {
+                let (state, input_files) = input.save(&scratch)?;
+                files.extend(input_files);
+                Some(state)
+            }
+            None => None,
+        };
+        let contexts = self.contexts.as_ref().map(|contexts| ContextState {
+            ordered: contexts.ordered.state(),
+            boundary_ids: contexts.boundary_ids.clone(),
+            country_ids: contexts
+                .country_ids
+                .iter()
+                .map(|(code, id)| (code.clone(), *id))
+                .collect(),
+            settled: {
+                let mut settled = contexts.settled.iter().copied().collect::<Vec<_>>();
+                settled.sort_unstable();
+                settled
             },
-        );
+        });
+        if let (Some(sample), None) = (&self.sample, &self.sample_saved) {
+            let mut file = ScratchFile::create(&scratch, "sample", "sample.bin")?;
+            file.write_all(&sample.to_bytes())?;
+            file.flush()?;
+            self.sample_saved = Some(file);
+        }
+        let sealing = self.sealing.as_mut().map(Sealing::state).transpose()?;
+        if let Some(sealing) = &self.sealing {
+            files.extend(sealing.files());
+        }
+        for state in &geometry {
+            files.extend(state.files(&scratch));
+        }
+        let boundaries = self.boundaries_saved.as_ref().map(SpoolFile::state);
+        let postcodes = self.postcodes.as_ref().map(SpoolFile::state);
+        for state in boundaries
+            .iter()
+            .chain(postcodes.iter())
+            .chain(contexts.iter().map(|contexts| &contexts.ordered))
+        {
+            files.extend(state.files(&scratch));
+        }
+        if let Some(file) = &self.sample_saved {
+            files.push(file.path().to_path_buf());
+        }
+        let stage = step.describe(self.options.inputs.len());
+        self.checkpoints.count += 1;
+        self.checkpoints.last = Some(stage.clone());
+        let mut report = self.report();
+        report.checkpoints = self.checkpoints.clone();
+        let state = State {
+            step,
+            seq: self.build.seq,
+            datasets: self.build.datasets.names().to_vec(),
+            addresses: (addresses != AddressState::default()).then_some(addresses),
+            audit: self.build.audit.state()?,
+            sorters,
+            sorted: self.sorted.clone(),
+            next_file: scratch.next_file(),
+            ledger: scratch.ledger(),
+            scanned: self.scanned.clone(),
+            geometry,
+            input,
+            boundaries,
+            imports: self.imports.clone(),
+            contexts,
+            postcodes,
+            sample: self
+                .sample_saved
+                .as_ref()
+                .map(|file| (file.name(), file.bytes())),
+            sealing,
+            sealed: self
+                .sealed
+                .as_ref()
+                .map(|(sealed, stats)| sealed.state(stats)),
+            report,
+        };
+        let manifest = Manifest {
+            format: FORMAT_VERSION,
+            stage,
+            fingerprint: self.fingerprint.clone(),
+            elapsed_ms: self.elapsed().as_millis() as u64,
+            files: files
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect(),
+            state,
+        };
+        scratch.commit(&files, &serde_json::to_vec(&manifest)?)?;
+        self.checkpoints.wall_ms += started.elapsed().as_millis() as u64;
+        Ok(())
     }
-    report.output.pack_bytes = stats.bytes;
-    report.output.record_count = sealed.manifest().record_count;
-    report.output.text_index_bytes = stats.text_index_bytes;
-    report.output.sections = stats.sections;
-    report.output.rejection_count = audit.count;
-    report.scratch.peak_heap_bytes = alloc::peak_bytes().unwrap_or_default() as u64;
-    report.phases.total_ms = started.elapsed().as_millis();
-    report.finalize_throughput();
-    audit.finish(&report)?;
-    sealed.publish()?;
-    Ok(report)
+
+    /// The build's time, every run's up to this one's checkpoint together.
+    fn elapsed(&self) -> Duration {
+        self.elapsed_before + self.started.elapsed()
+    }
+
+    /// The report as it stands, every run's stages in it.
+    fn report(&self) -> BuilderReport {
+        let mut report = self.build.report.clone();
+        report.stages = self.stages_before.clone();
+        report.stages.extend(self.progress.stages());
+        report
+    }
+
+    /// Train the parser on the sealed Pack and publish it.
+    fn finish(mut self) -> Result<BuilderReport> {
+        let phase = Instant::now();
+        let (mut sealed, mut stats) = self.sealed.take().ok_or_else(|| missing("the Pack"))?;
+        let sample = self.sample.take().ok_or_else(|| missing("the sample"))?;
+        #[cfg(test)]
+        if FAIL_BEFORE_TRAINING.get() {
+            return Err(Error::Inconsistent(
+                "injected failure before the training".into(),
+            ));
+        }
+        // The parser learns from the sealed Pack's dictionaries and the
+        // records drawn while they were written, and its weights join the
+        // Pack before it is published.
+        self.progress.start(BuildStage::Parser, None)?;
+        // By now the build has used memory and page cache a fresh process
+        // would have: sample again what is left.
+        let resources = Resources::probe();
+        self.memory.sample(&resources);
+        self.build.report.resources.at_training = resources;
+        let (weights, training) = train::train(
+            &sealed.path(),
+            sample,
+            &self.scratch,
+            &self.memory,
+            self.budget,
+        )?;
+        if let Some(weights) = weights {
+            let bytes = weights.to_bytes();
+            sealed.add_section(WEIGHTS_SECTION, WEIGHTS_VERSION, &bytes)?;
+            stats.bytes = sealed.bytes();
+            stats
+                .sections
+                .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
+        }
+        let scratch = Arc::clone(&self.scratch);
+        // Done with every checkpoint: a build that fails from here on goes
+        // on from nothing, at the cost of training again.
+        self.sample_saved = None;
+        scratch.complete();
+        let report = &mut self.build.report;
+        report.scratch.spilled_bytes = scratch.spilled_bytes();
+        report.scratch.budget_bytes = scratch.budget();
+        report.scratch.peak_live_bytes = scratch.peak_bytes();
+        report.scratch.peak_owners = scratch.peak_owners();
+        report.scratch.zstd_level = scratch.level();
+        report.scratch.spills = scratch.traffic();
+        self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
+        self.checkpoints.voided = scratch.voided();
+        self.progress.finish(BuildStage::Parser);
+        let mut report = self.report();
+        report.checkpoints = self.checkpoints.clone();
+        self.progress.check()?;
+        report.parser_training = training;
+        report.phases.parser_training_ms = phase.elapsed().as_millis();
+        for (name, sorted) in &self.sorted {
+            report.scratch.sorters.insert(name.clone(), sorted.clone());
+        }
+        report.output.pack_bytes = stats.bytes;
+        report.output.record_count = sealed.manifest().record_count;
+        report.output.text_index_bytes = stats.text_index_bytes;
+        report.output.sections = stats.sections;
+        report.output.rejection_count = self.build.audit.count;
+        report.scratch.peak_heap_bytes = alloc::peak_bytes().unwrap_or_default() as u64;
+        report.phases.total_ms = self.elapsed().as_millis();
+        report.finalize_throughput();
+        let Self {
+            build: Build { audit, .. },
+            ..
+        } = self;
+        audit.finish(&report)?;
+        let pointer = sealed.generation().join(SCRATCH_POINTER_FILE);
+        fs::remove_file(&pointer).map_err(|source| Error::IoPath {
+            action: "failed to remove",
+            path: pointer,
+            source,
+        })?;
+        drop(scratch);
+        sealed.publish()?;
+        Ok(report)
+    }
+}
+
+/// Write what `sorter` buffers as a run, and name its runs in `states`.
+fn save_sorter<T: Spill + Ord + Send + Sync + 'static>(
+    sorter: &mut Option<ExternalSorter<T>>,
+    states: &mut Vec<SorterState>,
+) -> Result<()> {
+    if let Some(sorter) = sorter {
+        states.push(sorter.checkpoint()?);
+    }
+    Ok(())
+}
+
+/// The sorter labelled `label` a checkpoint named, if it did.
+fn sorter_of<T: Spill + Ord + Send + Sync + 'static>(
+    states: &[SorterState],
+    label: &str,
+    scratch: &Arc<Scratch>,
+    memory: &Arc<Budget>,
+    share: usize,
+) -> Result<Option<ExternalSorter<T>>> {
+    states
+        .iter()
+        .find(|state| state.label == label)
+        .map(|state| ExternalSorter::restore(scratch, memory, share, state))
+        .transpose()
+}
+
+/// The memory budget a plan sizes.
+fn budget_of(plan: &BuildPlan) -> Arc<Budget> {
+    let memory = Budget::new(usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX));
+    memory.sample(&plan.resources);
+    memory
+}
+
+fn sorter_report<T: Spill + Ord + Send + Sync + 'static>(
+    sorter: &ExternalSorter<T>,
+) -> SorterReport {
+    let stats = sorter.stats();
+    SorterReport {
+        items: stats.items,
+        runs: stats.runs,
+    }
+}
+
+/// The sorter in `sorter`, unless a step read it already.
+fn open<'s, T>(
+    sorter: &'s mut Option<ExternalSorter<T>>,
+    label: &str,
+) -> Result<&'s mut ExternalSorter<T>> {
+    sorter
+        .as_mut()
+        .ok_or_else(|| Error::Inconsistent(format!("the {label} sorter was read already")))
+}
+
+/// A step ran before the one that makes what it needs.
+fn missing(what: &str) -> Error {
+    Error::Inconsistent(format!("{what} is missing: a build step ran out of order"))
 }
 
 /// Build state shared by the passes.
@@ -703,21 +1829,26 @@ struct Build {
     report: BuilderReport,
     audit: Audit,
     /// POIs, interpolations and streets, then the addresses.
-    records: ExternalSorter<PendingRecord>,
+    records: Option<ExternalSorter<PendingRecord>>,
     /// Addresses, until every one is known and they can join `records` a
     /// street at a time.
-    addresses: ExternalSorter<PendingAddress>,
+    addresses: Option<ExternalSorter<PendingAddress>>,
     /// The ways of streets, until every one is known and the ways of one
     /// street can join (see [`join_streets`]).
-    streets: ExternalSorter<PendingStreet>,
+    streets: Option<ExternalSorter<PendingStreet>>,
     /// Places: everything a context tuple can point at.
-    context_records: ExternalSorter<PendingRecord>,
+    context_records: Option<ExternalSorter<PendingRecord>>,
     /// The datasets of the imported addresses.
     datasets: Datasets,
     seq: u64,
+    memory: Arc<Budget>,
 }
 
 impl Build {
+    fn memory(&self) -> &Arc<Budget> {
+        &self.memory
+    }
+
     /// Merge one worker's output, in input order.
     fn absorb(&mut self, emitted: Emitted) -> Result<()> {
         let Emitted {
@@ -742,13 +1873,16 @@ impl Build {
                 _ => 0,
             };
             self.seq += 1;
-            return self
-                .addresses
-                .push(PendingAddress::new(address, self.seq - 1, dataset)?);
+            return open(&mut self.addresses, "addresses")?.push(PendingAddress::new(
+                address,
+                self.seq - 1,
+                dataset,
+            )?);
         }
         if let Record::Street(street) = record {
             self.seq += 1;
-            return self.streets.push(PendingStreet::new(street, self.seq - 1)?);
+            return open(&mut self.streets, "streets")?
+                .push(PendingStreet::new(street, self.seq - 1)?);
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
@@ -762,9 +1896,9 @@ impl Build {
         };
         self.seq += 1;
         if context {
-            self.context_records.push(pending)
+            open(&mut self.context_records, "context records")?.push(pending)
         } else {
-            self.records.push(pending)
+            open(&mut self.records, "records")?.push(pending)
         }
     }
 }
@@ -1106,11 +2240,50 @@ const DISPUTED: u64 = 1;
 type Verdicts = Sorted<(u64, u64)>;
 
 /// The addresses in street order, with their slash numbers read, written
-/// to an address book; and, sorted by position in it, which of them are
-/// imported rows repeating an address the Pack already has, OSM ones
-/// first, and which kept ones a row disputes. The houses are found in house
-/// order, from a hash of each house and its point, not the address. Each
-/// dropped row is counted on its file.
+/// to an address book.
+fn write_address_book(
+    addresses: ExternalSorter<PendingAddress>,
+    scratch: &Arc<Scratch>,
+    slash_numbers: &mut SlashNumberCounts,
+) -> Result<BookFile<PendingAddress>> {
+    let mut book = Book::create(scratch, "address-book")?;
+    slash::read_slash_numbers(addresses.finish()?, slash_numbers, |address| {
+        book.push(address).map(drop)
+    })?;
+    book.finish()
+}
+
+/// Place the addresses of `book` that `verdicts` keeps, in street order.
+fn replay_address_book(
+    book: &BookFile<PendingAddress>,
+    verdicts: Verdicts,
+    runs: &mut AddressRuns,
+) -> Result<()> {
+    let mut verdicts = verdicts.peekable();
+    for (at, address) in book.items().enumerate() {
+        let (address, at) = (address?, at as u64);
+        let (mut dropped, mut disputed) = (false, false);
+        while let Some(verdict) =
+            verdicts.next_if(|verdict| !matches!(verdict, Ok((position, _)) if *position != at))
+        {
+            match verdict?.1 {
+                DROPPED => dropped = true,
+                DISPUTED => disputed = true,
+                _ => return Err(Error::Decode("unknown house verdict")),
+            }
+        }
+        if !dropped {
+            runs.push(address, Some((at, disputed)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Sorted by position in the address book, which addresses are imported
+/// rows repeating an address the Pack already has, OSM ones first, and
+/// which kept ones a row disputes. The houses are found in house order,
+/// from a hash of each house and its point, not the address. Each dropped
+/// row is counted on its file.
 ///
 /// One record answers for one house. A row within
 /// [`REPEATED_HOUSE_RADIUS_M`] of a kept address of its house agrees with it
@@ -1123,20 +2296,14 @@ type Verdicts = Sorted<(u64, u64)>;
 /// lie apart by the distance between the places that repeat the name, which
 /// the radius stays below; where they lie closer, the postcode or the
 /// locality tells them apart.
-fn drop_repeated_houses(
-    addresses: ExternalSorter<PendingAddress>,
+fn find_repeated_houses(
+    book: &BookFile<PendingAddress>,
     scratch: &Arc<Scratch>,
     memory: &Arc<Budget>,
     budget: usize,
     datasets: &Datasets,
     report: &mut BuilderReport,
-    slash_numbers: &mut SlashNumberCounts,
-) -> Result<(BookFile<PendingAddress>, Verdicts)> {
-    let mut book = Book::create(scratch, "address-book")?;
-    slash::read_slash_numbers(addresses.finish()?, slash_numbers, |address| {
-        book.push(address).map(drop)
-    })?;
-    let book = book.finish()?;
+) -> Result<ExternalSorter<(u64, u64)>> {
     // Read from the book once the street order's runs are gone, so the
     // houses never share the disk with them.
     let mut houses = ExternalSorter::<House>::new(scratch, "houses", memory, budget);
@@ -1193,7 +2360,7 @@ fn drop_repeated_houses(
             }
         }
     }
-    Ok((book, verdicts.finish()?))
+    Ok(verdicts)
 }
 
 /// Boundary geometry gathered across inputs, for the boundary stage.
@@ -1209,215 +2376,192 @@ struct Geometry {
     member_vertices: HashMap<i64, Option<Vec<Vertex>>>,
 }
 
-/// What the passes over one input share with the rest of the build.
-struct Passes<'a> {
-    scratch: &'a Arc<Scratch>,
-    memory: &'a Arc<Budget>,
-    progress: &'a Progress,
-    observer: &'a dyn BuildObserver,
-}
-
-/// Kept ways one scan counted, by what they become.
-#[derive(Debug, Default)]
-struct KeptWays {
-    addresses: u64,
-    streets: u64,
-    /// Ways that become records: every kind but boundaries.
-    records: u64,
-    all: u64,
-}
-
-/// Read one input: the scan, the boundary member ways, the node pass and
-/// the way pass. `scanned_bytes` is how much of every input the scan has
-/// read once this one's is done, for the plan to extrapolate from.
-fn read_input(
-    input: &Path,
-    build: &mut Build,
-    geometry: &mut Geometry,
-    plan: &mut BuildPlan,
-    scanned_bytes: u64,
-    passes: &Passes,
-) -> Result<()> {
-    let progress = passes.progress;
-    // Pass 1: classify everything, and mark the nodes kept ways reference.
-    let phase = Instant::now();
-    let nodes = NodeSet::new(passes.memory);
-    // Nodes whose address tags interpolation ways read.
-    let mut tag_ids = Vec::new();
-    let mut node_blobs = Vec::new();
-    let mut way_blobs = Vec::new();
-    // Blobs holding a kept way or a member way: all the way pass rereads.
-    let mut kept_blobs = Vec::new();
-    let mut kept = KeptWays::default();
-    let read = for_each_block(
-        input,
-        progress,
-        BuildStage::Scan,
-        None,
-        |offset, block| {
-            let output = scan_block(&block);
-            for (_, refs) in &output.ways {
-                nodes.mark(refs)?;
-            }
-            Ok((offset, output))
-        },
-        |(offset, output)| {
-            if output.has_nodes {
-                node_blobs.push(offset);
-            }
-            if output.has_ways {
-                way_blobs.push(offset);
-            }
-            if !output.ways.is_empty() {
-                kept_blobs.push(offset);
-            }
-            for (feature, refs) in output.ways {
-                let resolution = &mut build.report.geometry_resolution;
-                resolution.required_node_refs += refs.len() as u64;
-                kept.all += 1;
-                kept.records += u64::from(feature.kind != WayKind::Boundary);
-                match feature.kind {
-                    WayKind::Address => {
-                        resolution.address_way_stubs += 1;
-                        kept.addresses += 1;
-                    }
-                    WayKind::Poi => resolution.poi_way_stubs += 1,
-                    WayKind::Street => {
-                        resolution.street_way_stubs += 1;
-                        kept.streets += 1;
-                    }
-                    WayKind::Interpolation => {
-                        resolution.interpolation_way_stubs += 1;
-                        tag_ids.extend_from_slice(&refs);
-                    }
-                    WayKind::Boundary => {
-                        resolution.boundary_way_stubs += 1;
-                        build.report.geometry_passes.boundary_refs += refs.len() as u64;
-                        geometry.boundary_feature_ids.insert(feature.way_id);
-                    }
+impl Geometry {
+    /// Add an input's part as saved, as its passes added it.
+    fn add(&mut self, part: impl Iterator<Item = Result<GeometryItem>>) -> Result<()> {
+        for item in part {
+            match item? {
+                GeometryItem::Relation(relation) => self.relations.push(relation),
+                GeometryItem::Feature(way_id) => {
+                    self.boundary_feature_ids.insert(way_id);
+                }
+                GeometryItem::Way(way) => self.boundary_ways.push(way),
+                GeometryItem::Member(way_id, line) => {
+                    self.member_vertices.insert(way_id, line);
                 }
             }
-            geometry.relations.extend(output.relations);
-            build.absorb(output.emitted)
-        },
-    )?;
-    build.report.geometry_passes.scan_read_bytes += read;
-    build.report.phases.scan_ms += phase.elapsed().as_millis();
+        }
+        Ok(())
+    }
+}
 
-    // Pass 2: the ways boundary relations are made of. They often carry no
-    // tags of their own, so pass 1 could not know to keep them.
-    let phase = Instant::now();
-    let member_ids = boundary::required_boundary_way_ids(&geometry.relations)
+/// What the passes over one input hand from one to the next.
+struct InputPasses {
+    index: usize,
+    /// The nodes kept ways need, until the node pass stores them.
+    nodes: Option<NodeSet>,
+    /// Nodes whose address tags interpolation ways read.
+    tag_ids: Vec<i64>,
+    node_blobs: Vec<u64>,
+    way_blobs: Vec<u64>,
+    /// Blobs holding a kept way or a member way: all the way pass rereads.
+    kept_blobs: Vec<u64>,
+    kept: KeptWays,
+    /// Boundary relation member ways the input has.
+    members: HashSet<i64>,
+    /// The node store, from the node pass.
+    locations: Option<Locations>,
+    saved: InputSaved,
+    /// The node set, the kept blobs or the members changed since they were
+    /// saved.
+    changed: bool,
+}
+
+/// What a checkpoint saved of an input's passes.
+#[derive(Default)]
+struct InputSaved {
+    node_blobs: Option<SpoolFile<Id>>,
+    way_blobs: Option<SpoolFile<Id>>,
+    kept_blobs: Option<SpoolFile<Id>>,
+    tag_ids: Option<SpoolFile<Id>>,
+    node_set: Option<SpoolFile<ChunkBits>>,
+    members: Option<SpoolFile<Id>>,
+}
+
+/// `values` saved to a spool.
+fn save_ids(
+    scratch: &Arc<Scratch>,
+    label: &str,
+    values: impl IntoIterator<Item = i64>,
+) -> Result<SpoolFile<Id>> {
+    let mut spool = Spool::create(scratch, label)?;
+    for value in values {
+        spool.write(&Id(value))?;
+    }
+    spool.finish()
+}
+
+/// The values a spool of [`save_ids`] holds.
+fn load_ids(saved: &SpoolFile<Id>) -> Result<Vec<i64>> {
+    saved.reader()?.map(|id| id.map(|Id(id)| id)).collect()
+}
+
+impl InputPasses {
+    /// Save what changed since the last checkpoint, and name all of it.
+    fn save(&mut self, scratch: &Arc<Scratch>) -> Result<(InputState, Vec<PathBuf>)> {
+        let offsets = |values: &[u64]| values.iter().map(|value| *value as i64).collect::<Vec<_>>();
+        let saved = &mut self.saved;
+        if saved.node_blobs.is_none() {
+            saved.node_blobs = Some(save_ids(scratch, "node-blobs", offsets(&self.node_blobs))?);
+            saved.way_blobs = Some(save_ids(scratch, "way-blobs", offsets(&self.way_blobs))?);
+        }
+        if let Some(nodes) = &self.nodes {
+            if saved.tag_ids.is_none() {
+                saved.tag_ids = Some(save_ids(scratch, "tag-ids", self.tag_ids.iter().copied())?);
+            }
+            if self.changed || saved.node_set.is_none() {
+                saved.node_set = Some(nodes.save(scratch)?);
+            }
+        }
+        if self.changed || saved.kept_blobs.is_none() {
+            saved.kept_blobs = Some(save_ids(scratch, "kept-blobs", offsets(&self.kept_blobs))?);
+            saved.members = Some(save_ids(scratch, "members", self.members.iter().copied())?);
+        }
+        self.changed = false;
+        let locations = self
+            .locations
+            .as_mut()
+            .map(|locations| locations.save(scratch))
+            .transpose()?;
+        let required = |spool: &Option<SpoolFile<Id>>| {
+            spool
+                .as_ref()
+                .map(SpoolFile::state)
+                .ok_or_else(|| missing("a saved list of the input"))
+        };
+        let input = InputState {
+            index: self.index,
+            kept: self.kept.clone(),
+            node_blobs: required(&saved.node_blobs)?,
+            way_blobs: required(&saved.way_blobs)?,
+            kept_blobs: required(&saved.kept_blobs)?,
+            node_set: saved.node_set.as_ref().map(SpoolFile::state),
+            tag_ids: saved.tag_ids.as_ref().map(SpoolFile::state),
+            members: saved.members.as_ref().map(SpoolFile::state),
+            locations,
+        };
+        let mut files = Vec::new();
+        for run in [
+            Some(&input.node_blobs),
+            Some(&input.way_blobs),
+            Some(&input.kept_blobs),
+            input.node_set.as_ref(),
+            input.tag_ids.as_ref(),
+            input.members.as_ref(),
+        ]
         .into_iter()
-        .filter(|way_id| !geometry.boundary_feature_ids.contains(way_id))
-        .collect::<HashSet<_>>();
-    let mut members = HashSet::new();
-    if member_ids.is_empty() {
-        progress.start(BuildStage::BoundaryMembers, Some(0))?;
-        progress.finish(BuildStage::BoundaryMembers);
-    } else {
-        let read = for_each_block(
-            input,
-            progress,
-            BuildStage::BoundaryMembers,
-            Some(&way_blobs),
-            |offset, block| Ok((offset, member_ways(&block, &member_ids))),
-            |(offset, found)| {
-                if !found.is_empty() {
-                    kept_blobs.push(offset);
-                }
-                for (way_id, refs) in found {
-                    // A way the input repeats is read where it first appears.
-                    if !members.insert(way_id) {
-                        continue;
-                    }
-                    nodes.mark(&refs)?;
-                    let refs = refs.len() as u64;
-                    build.report.geometry_resolution.required_node_refs += refs;
-                    build.report.geometry_passes.boundary_refs += refs;
-                }
-                Ok(())
+        .flatten()
+        {
+            files.extend(run.files(scratch));
+        }
+        if let Some(locations) = &self.locations {
+            files.extend(locations.files(scratch));
+        }
+        Ok((input, files))
+    }
+
+    /// The passes a checkpoint saved, to go on with.
+    fn restore(scratch: &Arc<Scratch>, memory: &Arc<Budget>, state: &InputState) -> Result<Self> {
+        let spool = |run: &RunState| SpoolFile::<Id>::restore(scratch, run);
+        let unsigned = |values: Vec<i64>| values.into_iter().map(|value| value as u64).collect();
+        let node_blobs = spool(&state.node_blobs)?;
+        let way_blobs = spool(&state.way_blobs)?;
+        let kept_blobs = spool(&state.kept_blobs)?;
+        let tag_ids = state.tag_ids.as_ref().map(spool).transpose()?;
+        let members = state.members.as_ref().map(spool).transpose()?;
+        let node_set = state
+            .node_set
+            .as_ref()
+            .map(|run| SpoolFile::<ChunkBits>::restore(scratch, run))
+            .transpose()?;
+        Ok(Self {
+            index: state.index,
+            nodes: node_set
+                .as_ref()
+                .map(|saved| NodeSet::load(memory, saved))
+                .transpose()?,
+            tag_ids: tag_ids
+                .as_ref()
+                .map(load_ids)
+                .transpose()?
+                .unwrap_or_default(),
+            node_blobs: unsigned(load_ids(&node_blobs)?),
+            way_blobs: unsigned(load_ids(&way_blobs)?),
+            kept_blobs: unsigned(load_ids(&kept_blobs)?),
+            kept: state.kept.clone(),
+            members: members
+                .as_ref()
+                .map(load_ids)
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            locations: state
+                .locations
+                .as_ref()
+                .map(|locations| Locations::restore(scratch, memory, locations))
+                .transpose()?,
+            saved: InputSaved {
+                node_blobs: Some(node_blobs),
+                way_blobs: Some(way_blobs),
+                kept_blobs: Some(kept_blobs),
+                tag_ids,
+                node_set,
+                members,
             },
-        )?;
-        build.report.geometry_passes.boundary_member_read_bytes += read;
+            changed: false,
+        })
     }
-    build.report.phases.boundary_member_scan_ms += phase.elapsed().as_millis();
-
-    // The scan has counted what the rest of the build holds, and the
-    // machine has moved since the build started.
-    let resources = Resources::probe();
-    passes.memory.sample(&resources);
-    let accepted = &build.report.accepted;
-    let counted = |layer: &str| accepted.by_layer.get(layer).copied().unwrap_or_default();
-    plan.refine(&Scanned {
-        items: ItemCounts {
-            needed_nodes: nodes.len(),
-            node_set_bytes: nodes.bytes(),
-            kept_ways: build.report.geometry_passes.kept_ways + kept.all,
-            records: accepted.total + kept.records,
-            addresses: counted("address") + kept.addresses,
-            streets: counted("street") + kept.streets,
-            boundary_refs: build.report.geometry_passes.boundary_refs,
-            imported_rows: plan.items.imported_rows,
-        },
-        read_bytes: scanned_bytes,
-        heap_bytes: alloc::live_bytes().map(|bytes| bytes as u64),
-        tracked_bytes: passes.memory.used() as u64,
-        resources: resources.clone(),
-    })?;
-    for warning in plan.shortfalls.iter().chain(&plan.warnings) {
-        passes.observer.warned(warning);
-    }
-    build.report.geometry_passes.kept_ways += kept.all;
-
-    // Pass 3: the coordinates of every marked node.
-    let phase = Instant::now();
-    tag_ids.sort_unstable();
-    tag_ids.dedup();
-    let slots = Slots::new(
-        nodes.len(),
-        plan.locations_in_memory,
-        passes.memory,
-        passes.scratch,
-    )?;
-    let (locations, stored) =
-        locations::load(input, &node_blobs, nodes, &tag_ids, slots, progress)?;
-    drop(tag_ids);
-    build.report.geometry_passes.add(&stored);
-    build.report.phases.node_join_ms += phase.elapsed().as_millis();
-
-    // Pass 4: the kept ways and member ways again, now with coordinates.
-    let phase = Instant::now();
-    kept_blobs.sort_unstable();
-    kept_blobs.dedup();
-    let mut input_members: HashMap<i64, Option<Vec<Vertex>>> = HashMap::new();
-    let read = for_each_block(
-        input,
-        progress,
-        BuildStage::AssembleWays,
-        Some(&kept_blobs),
-        |_, block| Ok(emit::assemble(&block, &locations, &members)),
-        |assembled| {
-            let resolution = &mut build.report.geometry_resolution;
-            resolution.resolved_node_refs += assembled.resolved;
-            for (way_id, line, found) in assembled.members {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    input_members.entry(way_id)
-                {
-                    resolution.resolved_node_refs += found;
-                    entry.insert(line);
-                }
-            }
-            geometry
-                .boundary_ways
-                .extend(assembled.output.boundary_ways);
-            build.absorb(assembled.output.emitted)
-        },
-    )?;
-    build.report.geometry_passes.way_read_bytes += read;
-    geometry.member_vertices.extend(input_members);
-    build.report.phases.feature_emission_ms += phase.elapsed().as_millis();
-    Ok(())
 }
 
 fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec<(i64, Vec<i64>)> {
@@ -1539,6 +2683,40 @@ impl Audit {
             dir,
             rejections: BufWriter::with_capacity(1 << 20, file),
             count: 0,
+        })
+    }
+
+    /// The audit as a checkpoint left it: rejections a failed run wrote
+    /// after it are cut off.
+    fn reopen(generation: &Path, state: &AuditState) -> Result<Self> {
+        let dir = generation.join(AUDIT_DIR);
+        let path = dir.join(REJECTIONS_FILE);
+        let failed = |source| Error::IoPath {
+            action: "failed to reopen",
+            path: path.clone(),
+            source,
+        };
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(failed)?;
+        file.set_len(state.bytes).map_err(failed)?;
+        file.seek(SeekFrom::End(0)).map_err(failed)?;
+        Ok(Self {
+            dir,
+            rejections: BufWriter::with_capacity(1 << 20, file),
+            count: state.count,
+        })
+    }
+
+    /// Flush and sync the rejections so far, for a checkpoint.
+    fn state(&mut self) -> Result<AuditState> {
+        self.rejections.flush()?;
+        let file = self.rejections.get_mut();
+        file.sync_all()?;
+        Ok(AuditState {
+            bytes: file.stream_position()?,
+            count: self.count,
         })
     }
 
@@ -2172,8 +3350,8 @@ mod tests {
         assert_eq!(report.accepted.postcode_records, 1);
         assert_eq!(report.geometry_resolution.street_way_stubs, 2);
         assert_eq!(
-            report.scratch.sorters["records"].runs, 0,
-            "a small input never spills"
+            report.scratch.spills["records"].merge_passes, 1,
+            "a small input merges what its checkpoints wrote once"
         );
         assert!(report.scratch.peak_tracked_bytes > 0);
         assert!(report.scratch.peak_tracked_bytes <= report.scratch.memory_budget_bytes);
@@ -2844,7 +4022,11 @@ mod tests {
         // owners, nothing is left live, and the Pack writer's files count.
         let ledger = &spilled.scratch;
         assert!(ledger.peak_live_bytes > 0 && !ledger.peak_owners.is_empty());
-        assert!(ledger.spills.values().all(|spill| spill.live_bytes == 0));
+        assert!(
+            ledger.spills.values().all(|spill| spill.live_bytes == 0),
+            "{:?}",
+            ledger.spills
+        );
         for owner in ["records", "pack-records", "pack-spatial", "pack-text"] {
             let spill = &ledger.spills[owner];
             assert!(spill.written_bytes > 0, "{owner}: {spill:?}");
@@ -3278,6 +4460,190 @@ mod tests {
                 "{unlent}: the row stating 3020 repeats OSM's 7 Tui Road"
             );
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Every record and the context of each, in Pack order.
+    fn records_and_contexts(pack: &Path) -> Vec<(serde_json::Value, Option<RecordContext>)> {
+        let reader = Reader::open(pack).expect("reader");
+        (0..reader.manifest().record_count)
+            .map(|id| {
+                (
+                    reader.record_json(id).expect("record"),
+                    reader.boundary_context(id).expect("context"),
+                )
+            })
+            .collect()
+    }
+
+    /// Two extracts and an address file, so a build runs every step:
+    /// both inputs' passes, the import, the address book and the houses.
+    fn resumable_inputs(dir: &Path) -> BuildOsmOptions {
+        let (first, second) = (dir.join("town.osm.pbf"), dir.join("other.osm.pbf"));
+        write_pbf(&first, &town_with_pois());
+        write_pbf(&second, &other_country());
+        let csv = dir.join("addresses.csv");
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.40005,43.60003,10,KING ST,Toronto,M5V 1A1\n\
+             -79.4003,43.6003,16,King Street,Toronto,M5V 1A1\n\
+             -79.40,43.604,10,King Street,Toronto,M5V 1A1\n\
+             -79.45,43.65,3,Queen Street,Toronto,\n",
+        )
+        .expect("csv");
+        BuildOsmOptions {
+            inputs: vec![first, second],
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                addresses::AddressFile {
+                    dataset: "openaddresses:test".to_string(),
+                    path: csv,
+                },
+            ]))),
+            ..BuildOsmOptions::default()
+        }
+    }
+
+    /// Build `options`, failing just before the checkpoint of `step` as a
+    /// crash there would.
+    fn fail_before(options: BuildOsmOptions, step: Step) -> Error {
+        FAIL_BEFORE_CHECKPOINT.set(Some(step));
+        let failed = build_osm_pack(options);
+        FAIL_BEFORE_CHECKPOINT.set(None);
+        failed.expect_err("the injected failure stops the build")
+    }
+
+    /// A build that stops at any step and is resumed makes the Pack an
+    /// uninterrupted build makes: every record, in the same order, with
+    /// the same context. In memory and spilling everything, coordinates
+    /// mapped from scratch included.
+    #[test]
+    fn a_build_resumed_after_any_step_makes_the_same_pack() {
+        for budget in [Some(4), None] {
+            let dir = temp_dir("resume");
+            let options = BuildOsmOptions {
+                memory_budget_bytes: budget,
+                ..resumable_inputs(&dir)
+            };
+            let whole = build_osm_pack(BuildOsmOptions {
+                pack: dir.join("whole"),
+                ..options.clone()
+            })
+            .expect("uninterrupted build");
+            assert_eq!(whole.checkpoints.count, Step::all(2).len() as u64);
+            assert!(whole.resumes.is_empty());
+            let expected = records_and_contexts(&dir.join("whole"));
+            let steps = Step::all(2);
+            for (at, step) in steps.iter().enumerate() {
+                let pack = dir.join(format!("stopped-{at}"));
+                let options = BuildOsmOptions {
+                    pack: pack.clone(),
+                    ..options.clone()
+                };
+                let error = fail_before(options.clone(), *step);
+                assert!(format!("{error}").contains("injected"), "{error}");
+                let found = resume::find(&pack).expect("find");
+                if at == 0 {
+                    assert!(found.is_empty(), "nothing is left before a checkpoint");
+                } else {
+                    assert_eq!(found.len(), 1, "{step:?}");
+                    assert_eq!(found[0].stage, Some(steps[at - 1].describe(2)));
+                    assert!(found[0].bytes > 0);
+                    assert!(!pack.join("CURRENT").exists());
+                }
+                let resumed = build_osm_pack(BuildOsmOptions {
+                    leftover: Leftover::Resume,
+                    ..options
+                })
+                .unwrap_or_else(|error| panic!("resumed after {step:?}: {error}"));
+                assert_eq!(
+                    records_and_contexts(&pack),
+                    expected,
+                    "the Pack resumed before the checkpoint of {step:?}"
+                );
+                assert_eq!(resumed.accepted, whole.accepted, "{step:?}");
+                assert_eq!(resumed.imports, whole.imports, "{step:?}");
+                assert_eq!(resumed.output.record_count, whole.output.record_count);
+                assert_eq!(resumed.output.rejection_count, whole.output.rejection_count);
+                assert_eq!(resumed.checkpoints.count, whole.checkpoints.count);
+                if at > 0 {
+                    let resume = &resumed.resumes[0];
+                    assert_eq!(resume.after, steps[at - 1].describe(2));
+                    assert!(resume.reused_bytes > 0, "{resume:?}");
+                }
+                assert!(
+                    resume::find(&pack).expect("find").is_empty(),
+                    "a completed build leaves nothing to resume"
+                );
+                let _ = fs::remove_dir_all(&pack);
+            }
+            // Past the last checkpoint, the sealed Pack is trained again.
+            let pack = dir.join("untrained");
+            let options = BuildOsmOptions {
+                pack: pack.clone(),
+                ..options.clone()
+            };
+            FAIL_BEFORE_TRAINING.set(true);
+            let failed = build_osm_pack(options.clone());
+            FAIL_BEFORE_TRAINING.set(false);
+            assert!(failed.is_err());
+            let resumed = build_osm_pack(BuildOsmOptions {
+                leftover: Leftover::Resume,
+                ..options
+            })
+            .expect("resumed before the training");
+            assert_eq!(resumed.resumes[0].after, "seal the Pack");
+            assert_eq!(records_and_contexts(&pack), expected);
+            assert_eq!(
+                resumed.parser_training.trained,
+                whole.parser_training.trained
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_stopped_build_is_reported_and_refuses_changed_inputs() {
+        let dir = temp_dir("resume-refused");
+        let options = BuildOsmOptions {
+            pack: dir.join("pack"),
+            ..resumable_inputs(&dir)
+        };
+        fail_before(options.clone(), Step::Contexts);
+
+        // Neither resumed nor cleared, it is reported, with both commands.
+        let refused = build_osm_pack(options.clone()).expect_err("refused");
+        let message = refused.to_string();
+        assert!(message.contains("import addresses"), "{message}");
+        assert!(
+            message.contains("--resume") && message.contains("--fresh"),
+            "{message}"
+        );
+
+        // An input that changed since refuses to resume, naming it.
+        write_pbf(&options.inputs[1], &town());
+        let changed = build_osm_pack(BuildOsmOptions {
+            leftover: Leftover::Resume,
+            ..options.clone()
+        })
+        .expect_err("a changed input");
+        let message = changed.to_string();
+        assert!(message.contains("input 2"), "{message}");
+        assert!(message.contains("--fresh"), "{message}");
+        assert_eq!(resume::find(&options.pack).expect("find").len(), 1);
+
+        // Cleared, the build starts over and nothing is left.
+        let fresh = build_osm_pack(BuildOsmOptions {
+            leftover: Leftover::Clear,
+            ..options.clone()
+        })
+        .expect("fresh build");
+        assert!(fresh.resumes.is_empty());
+        assert!(resume::find(&options.pack).expect("find").is_empty());
+        let generations = fs::read_dir(options.pack.join("generations"))
+            .expect("generations")
+            .count();
+        assert_eq!(generations, 1, "the stopped build's generation is gone");
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -107,3 +107,9 @@ _Avoid_: disk limit, quota
 **Bound**:
 The resource that held a build stage back, judged from what the stage measured: CPU, reading (the input or scratch), writing scratch, or waiting on something else.
 _Avoid_: bottleneck (alone)
+
+**Checkpoint**:
+The point after a build step where everything the later steps need is durable in scratch and a manifest names it, with a fingerprint of the inputs, options and og version that decide the Pack.
+A build that stops keeps its scratch and last checkpoint; `--resume` goes on from it, `--fresh` clears it, and a build given neither refuses to start beside it.
+Files a step is done with stay on disk until the next checkpoint replaces the one that names them, and are given up first when scratch runs short.
+_Avoid_: snapshot, savepoint

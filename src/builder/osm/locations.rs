@@ -17,7 +17,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -29,11 +29,14 @@ use memmap2::MmapMut;
 use osmpbf::{Element, PrimitiveBlock};
 use rayon::prelude::*;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     builder::progress::{BuildStage, Progress},
     error::{Error, Result},
-    extsort::{Owner, Scratch},
+    extsort::{Owner, RunState, Scratch, ScratchFile, Spill, Spool, SpoolFile},
     memory::{Budget, Reservation},
+    util::codec::{Delta, get_delta, get_u64, put_delta, put_u64},
 };
 
 use super::{
@@ -62,6 +65,7 @@ pub(crate) const TABLE_BYTES: u64 = (CHUNKS * std::mem::size_of::<OnceLock<Box<C
 /// Bytes one stored coordinate takes: latitude and longitude in the PBF's
 /// 1e-7 degree fixed point.
 pub(crate) const LOCATION_BYTES: u64 = 8;
+const LOCATIONS_LABEL: &str = "node-locations";
 
 #[derive(Debug)]
 struct Chunk {
@@ -202,6 +206,37 @@ impl NodeSet {
         }
     }
 
+    /// Write every chunk marked so far to a spool, for a checkpoint.
+    pub(crate) fn save(&self, scratch: &Arc<Scratch>) -> Result<SpoolFile<ChunkBits>> {
+        let mut spool = Spool::create(scratch, "node-set")?;
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            if let Some(chunk) = chunk.get() {
+                spool.write(&ChunkBits {
+                    index: index as u64,
+                    words: (0..WORDS).map(|word| chunk.word(word)).collect(),
+                })?;
+            }
+        }
+        spool.finish()
+    }
+
+    /// The set a checkpoint saved.
+    pub(crate) fn load(memory: &Arc<Budget>, saved: &SpoolFile<ChunkBits>) -> Result<Self> {
+        let set = Self::new(memory);
+        for chunk in saved.reader()? {
+            let ChunkBits { index, words } = chunk?;
+            let index = usize::try_from(index)
+                .ok()
+                .filter(|index| *index < CHUNKS && words.len() == WORDS)
+                .ok_or(Error::Decode("node set chunk out of range"))?;
+            let chunk = set.chunk(index);
+            for (word, bits) in words.into_iter().enumerate() {
+                chunk.words[word].store(bits, Ordering::Relaxed);
+            }
+        }
+        Ok(set)
+    }
+
     /// Index ranks, once no id is marked or unmarked any more.
     fn rank(&mut self) {
         let counts = self
@@ -247,6 +282,53 @@ impl NodeSet {
     }
 }
 
+/// One marked chunk of a [`NodeSet`], as a checkpoint saves it. Its words
+/// are written whole: the spool's compression takes the runs of zeros.
+#[derive(Debug)]
+pub(crate) struct ChunkBits {
+    index: u64,
+    words: Vec<u64>,
+}
+
+impl Spill for ChunkBits {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_after(&mut Delta::default(), out);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        Self::decode_after(&mut Delta::default(), input)
+    }
+
+    fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+        put_delta(out, delta, self.index as i64);
+        put_u64(out, self.words.len() as u64);
+        for word in &self.words {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+        let index = get_delta(input, delta)? as u64;
+        let count = usize::try_from(get_u64(input)?)
+            .ok()
+            .filter(|count| *count <= WORDS)
+            .ok_or(Error::Decode("node set chunk too long"))?;
+        let bytes = input
+            .get(..count * 8)
+            .ok_or(Error::Decode("node set chunk truncated"))?;
+        *input = &input[count * 8..];
+        let words = bytes
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+            .collect();
+        Ok(Self { index, words })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.words.len() * 8
+    }
+}
+
 /// A node's coordinates in the PBF's fixed point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Location {
@@ -267,7 +349,7 @@ impl Location {
 /// Degrees from a 1e-7 fixed-point PBF coordinate, computed the way `osmpbf`
 /// computes `lat()`/`lon()` (via nanodegrees), so a coordinate read through
 /// the store is bit-identical to one read from the node itself.
-fn degrees(value: i32) -> f64 {
+pub(crate) fn degrees(value: i32) -> f64 {
     1e-9 * (i64::from(value) * 100) as f64
 }
 
@@ -297,9 +379,9 @@ pub(crate) struct MappedSlots {
 impl MappedSlots {
     fn create(scratch: &Arc<Scratch>, capacity: u64) -> Result<Self> {
         let bytes = capacity * LOCATION_BYTES;
-        let owner = scratch.owner("node-locations");
+        let owner = scratch.owner(LOCATIONS_LABEL);
         scratch.reserve(&owner, bytes)?;
-        let path = scratch.path().join("node-locations.bin");
+        let path = scratch.new_file(LOCATIONS_LABEL);
         let io = |source| Error::IoPath {
             action: "failed to create node location file",
             path: path.clone(),
@@ -345,6 +427,47 @@ impl MappedSlots {
         Ok(())
     }
 
+    /// The file a checkpoint saved, `len` coordinates in it, mapped again.
+    fn reopen(scratch: &Arc<Scratch>, name: &str, len: usize) -> Result<Self> {
+        let path = scratch.path().join(name);
+        let failed = |source| Error::IoPath {
+            action: "failed to reopen node location file",
+            path: path.clone(),
+            source,
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(failed)?;
+        let bytes = file.metadata().map_err(failed)?.len();
+        if bytes < len as u64 * LOCATION_BYTES {
+            return Err(Error::BadScratch {
+                path: path.clone(),
+                detail: "node location file is shorter than its checkpoint",
+            });
+        }
+        let map = if bytes == 0 {
+            None
+        } else {
+            // SAFETY: the file is in the build's own scratch directory, named
+            // by its checkpoint, and nothing else opens, truncates or maps
+            // it; it is unmapped before it is closed and removed (see Drop).
+            Some(unsafe { MmapMut::map_mut(&file) }.map_err(failed)?)
+        };
+        let owner = scratch.owner(LOCATIONS_LABEL);
+        scratch.adopt(&owner, bytes);
+        Ok(Self {
+            map,
+            file: Some(file),
+            path,
+            len,
+            scratch: Arc::clone(scratch),
+            owner,
+            bytes,
+        })
+    }
+
     fn get(&self, index: usize) -> Location {
         let start = index * LOCATION_BYTES as usize;
         let map = self.map.as_ref().expect("a ranked slot is stored");
@@ -361,9 +484,7 @@ impl Drop for MappedSlots {
         // Windows refuses to remove a file that is still mapped or open.
         drop(self.map.take());
         drop(self.file.take());
-        if fs::remove_file(&self.path).is_ok() {
-            self.scratch.release(&self.owner, self.bytes);
-        }
+        self.scratch.remove(&self.owner, &self.path, self.bytes);
     }
 }
 
@@ -421,6 +542,63 @@ pub(crate) struct Locations {
     set: NodeSet,
     slots: Slots,
     tags: Vec<(i64, BTreeMap<String, String>)>,
+    /// What a checkpoint saved of them, kept on disk while they are used.
+    saved: Option<Saved>,
+}
+
+/// The store as a checkpoint saved it.
+#[derive(Debug)]
+struct Saved {
+    set: SpoolFile<ChunkBits>,
+    tags: SpoolFile<Tagged>,
+    /// The coordinates, when they were in memory; mapped ones are saved in
+    /// their own file.
+    slots: Option<ScratchFile>,
+}
+
+/// The store as a checkpoint names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LocationsState {
+    set: RunState,
+    tags: RunState,
+    /// The file the coordinates are in, and how many.
+    slots: String,
+    len: usize,
+}
+
+/// A node's address tags, as a checkpoint saves them.
+#[derive(Debug)]
+pub(crate) struct Tagged(i64, BTreeMap<String, String>);
+
+impl Spill for Tagged {
+    fn encode(&self, out: &mut Vec<u8>) {
+        crate::util::codec::put_i64(out, self.0);
+        put_u64(out, self.1.len() as u64);
+        for (key, value) in &self.1 {
+            crate::util::codec::put_str(out, key);
+            crate::util::codec::put_str(out, value);
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let id = crate::util::codec::get_i64(input)?;
+        let count = get_u64(input)?;
+        let mut tags = BTreeMap::new();
+        for _ in 0..count {
+            let key = crate::util::codec::get_string(input)?;
+            tags.insert(key, crate::util::codec::get_string(input)?);
+        }
+        Ok(Self(id, tags))
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .1
+                .iter()
+                .map(|(key, value)| key.len() + value.len() + 48)
+                .sum::<usize>()
+    }
 }
 
 /// What the node pass stored and read.
@@ -439,6 +617,107 @@ pub(crate) struct LoadStats {
 }
 
 impl Locations {
+    /// Save the store for a checkpoint, once: the bitmap and the tags to
+    /// spools, the coordinates to a file when they are in memory, or their
+    /// mapped file flushed. Kept until the store is dropped.
+    pub(crate) fn save(&mut self, scratch: &Arc<Scratch>) -> Result<LocationsState> {
+        if self.saved.is_none() {
+            let set = self.set.save(scratch)?;
+            let mut tags = Spool::create(scratch, "node-tags")?;
+            for (id, values) in &self.tags {
+                tags.write(&Tagged(*id, values.clone()))?;
+            }
+            let slots = match &self.slots {
+                Slots::Memory { locations, .. } => {
+                    let name = scratch.new_file(LOCATIONS_LABEL);
+                    let name = name
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let mut file = std::io::BufWriter::with_capacity(
+                        1 << 20,
+                        ScratchFile::create(scratch, LOCATIONS_LABEL, &name)?,
+                    );
+                    for location in locations {
+                        std::io::Write::write_all(&mut file, &location.lat_e7.to_le_bytes())?;
+                        std::io::Write::write_all(&mut file, &location.lon_e7.to_le_bytes())?;
+                    }
+                    Some(file.into_inner().map_err(|error| error.into_error())?)
+                }
+                Slots::Mapped(mapped) => {
+                    if let Some(map) = &mapped.map {
+                        map.flush()?;
+                    }
+                    None
+                }
+            };
+            self.saved = Some(Saved {
+                set,
+                tags: tags.finish()?,
+                slots,
+            });
+        }
+        let saved = self.saved.as_ref().expect("saved");
+        let slots = match (&saved.slots, &self.slots) {
+            (Some(file), _) => file.name(),
+            (None, Slots::Mapped(mapped)) => mapped
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            (None, Slots::Memory { .. }) => unreachable!("coordinates in memory are saved"),
+        };
+        Ok(LocationsState {
+            set: saved.set.state(),
+            tags: saved.tags.state(),
+            slots,
+            len: self.slots.len(),
+        })
+    }
+
+    /// The files a checkpoint names for the store.
+    pub(crate) fn files(&self, scratch: &Scratch) -> Vec<PathBuf> {
+        let Some(saved) = &self.saved else {
+            return Vec::new();
+        };
+        let mut files = saved.set.state().files(scratch).collect::<Vec<_>>();
+        files.extend(saved.tags.state().files(scratch));
+        match (&saved.slots, &self.slots) {
+            (Some(file), _) => files.push(file.path().to_path_buf()),
+            (None, Slots::Mapped(mapped)) => files.push(mapped.path.clone()),
+            (None, Slots::Memory { .. }) => {}
+        }
+        files
+    }
+
+    /// The store a checkpoint saved. Its coordinates are mapped from the
+    /// saved file, which the page cache serves as it would memory.
+    pub(crate) fn restore(
+        scratch: &Arc<Scratch>,
+        memory: &Arc<Budget>,
+        state: &LocationsState,
+    ) -> Result<Self> {
+        let set_file = SpoolFile::restore(scratch, &state.set)?;
+        let mut set = NodeSet::load(memory, &set_file)?;
+        set.rank();
+        let tags_file = SpoolFile::<Tagged>::restore(scratch, &state.tags)?;
+        let tags = tags_file
+            .reader()?
+            .map(|tagged| tagged.map(|Tagged(id, tags)| (id, tags)))
+            .collect::<Result<Vec<_>>>()?;
+        let slots = Slots::Mapped(MappedSlots::reopen(scratch, &state.slots, state.len)?);
+        Ok(Self {
+            set,
+            slots,
+            tags,
+            saved: Some(Saved {
+                set: set_file,
+                tags: tags_file,
+                slots: None,
+            }),
+        })
+    }
+
     pub(crate) fn get(&self, id: i64) -> Option<Location> {
         self.set.slot(id).map(|slot| self.slots.get(slot))
     }
@@ -578,7 +857,15 @@ pub(crate) fn load(
         tagged: tags.len() as u64,
         read_bytes,
     };
-    Ok((Locations { set, slots, tags }, stats))
+    Ok((
+        Locations {
+            set,
+            slots,
+            tags,
+            saved: None,
+        },
+        stats,
+    ))
 }
 
 #[cfg(test)]
@@ -661,7 +948,10 @@ mod tests {
             }
         );
         assert_eq!(slots.get(0).lon_e7, -900_000_000);
-        let path = scratch.path().join("node-locations.bin");
+        let Slots::Mapped(mapped) = &slots else {
+            unreachable!("mapped above");
+        };
+        let path = mapped.path.clone();
         assert!(path.exists());
         drop(slots);
         assert!(!path.exists());

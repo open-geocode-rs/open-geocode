@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 use open_geocode::{
     builder::{
-        BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, LiveStage, StageUnit,
+        BuildObserver, BuildOsmOptions, BuildPlan, BuildStage, Leftover, LiveStage, StageUnit,
         build_planned_osm_pack, plan_osm_build,
     },
     openaddresses::OpenAddresses,
@@ -135,6 +135,8 @@ pub(crate) struct BuildRequest {
     pub scratch_budget_bytes: Option<u64>,
     /// Build even when the plan finds too little memory or disk.
     pub force: bool,
+    /// What to do with a build of the Pack that stopped.
+    pub leftover: Leftover,
     /// Add the OpenAddresses points of the countries the Pack covers.
     pub openaddresses: bool,
 }
@@ -470,6 +472,7 @@ fn run(
         memory_budget_bytes: request.memory_budget_bytes,
         scratch_budget_bytes: request.scratch_budget_bytes,
         force: request.force,
+        leftover: request.leftover,
         input_sources: request
             .inputs
             .iter()

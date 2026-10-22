@@ -12,6 +12,11 @@
 //! <pack dir>/generations/<id>/pack.ogp       the Pack
 //! <pack dir>/generations/<id>/audit/         build report and rejections
 //! ```
+//!
+//! Sealing writes the parts the writer holds in memory into the Pack file
+//! first, then copies in the parts it streamed to scratch one at a time
+//! ([`Sealing`]), so a build can checkpoint between parts and go on from
+//! there.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -50,7 +55,7 @@ pub use crate::{
 pub type RecordId = u64;
 
 mod publication;
-pub use publication::resolve_pack_path;
+pub use publication::{resolve_pack_path, unpublished_generations};
 
 pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
@@ -144,25 +149,17 @@ impl PostcodeAddresses {
 
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
-    /// Directory for temporary build files. Defaults to a directory inside the
-    /// new generation.
-    pub scratch_dir: Option<PathBuf>,
     /// Pool every buffer of the build reserves from.
     pub memory: Arc<Budget>,
     /// Memory for Tantivy's indexing buffers, taken from the pool.
     pub text_index_memory_bytes: usize,
-    /// The most scratch disk the build may hold at once; the scratch
-    /// volume's free space caps it either way.
-    pub scratch_budget_bytes: Option<u64>,
 }
 
 impl Default for WriterOptions {
     fn default() -> Self {
         Self {
-            scratch_dir: None,
             memory: Budget::unlimited(),
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
-            scratch_budget_bytes: None,
         }
     }
 }
@@ -196,8 +193,7 @@ fn indexed_area_names<'a>(
 /// Writes records in their final order. Record ids are assigned sequentially.
 #[derive(Debug)]
 pub struct Writer {
-    destination: PathBuf,
-    generation: GenerationGuard,
+    generation: Generation,
     scratch: Arc<Scratch>,
     records: records::Writer,
     contexts: TupleWriter,
@@ -214,29 +210,100 @@ pub struct Writer {
 /// A finished, unpublished Pack.
 #[derive(Debug)]
 pub struct SealedPack {
-    destination: PathBuf,
-    generation: GenerationGuard,
+    generation: Generation,
     manifest: Manifest,
     bytes: u64,
+    /// Where the sections end, before the table of contents.
+    sections: container::State,
 }
 
-/// Removes a generation that was never published: no reader can be using it.
+/// A Pack generation being built, beside the published one. Removed when
+/// dropped unless it was published, or its build's scratch holds a
+/// checkpoint the build may go on from: no reader can be using it.
 #[derive(Debug)]
-struct GenerationGuard {
+pub struct Generation {
+    destination: PathBuf,
     path: PathBuf,
     keep: bool,
+    scratch: Option<Arc<Scratch>>,
 }
 
-impl Drop for GenerationGuard {
+/// A file in an unpublished generation naming its build's scratch
+/// directory, so a later build of the Pack finds a build to go on from.
+pub const SCRATCH_POINTER_FILE: &str = "scratch";
+
+impl Generation {
+    /// A new, empty generation of the Pack at `destination`.
+    pub fn create(destination: impl AsRef<Path>) -> Result<Self> {
+        let destination = destination.as_ref().to_path_buf();
+        Ok(Self {
+            path: publication::create_generation(&destination)?,
+            destination,
+            keep: false,
+            scratch: None,
+        })
+    }
+
+    /// The unpublished generation at `path`, of the Pack at `destination`,
+    /// to go on building.
+    pub fn reopen(destination: impl AsRef<Path>, path: impl AsRef<Path>) -> Self {
+        Self {
+            destination: destination.as_ref().to_path_buf(),
+            path: path.as_ref().to_path_buf(),
+            keep: false,
+            scratch: None,
+        }
+    }
+
+    /// Create the build's scratch directory: in `scratch_dir` when given,
+    /// else inside the generation. Its bytes are capped by `budget`.
+    pub fn create_scratch(
+        &mut self,
+        scratch_dir: Option<&Path>,
+        budget: Option<u64>,
+    ) -> Result<Arc<Scratch>> {
+        let scratch = Scratch::create(self.scratch_path(scratch_dir))?;
+        scratch.set_budget(budget);
+        self.scratch = Some(Arc::clone(&scratch));
+        Ok(scratch)
+    }
+
+    /// Where the build's scratch directory goes.
+    pub fn scratch_path(&self, scratch_dir: Option<&Path>) -> PathBuf {
+        scratch_dir
+            .map(|dir| dir.join(self.path.file_name().expect("generation name")))
+            .unwrap_or_else(|| self.path.join(SCRATCH_DIR))
+    }
+
+    /// Tie the generation to `scratch`: it outlives a failed build while
+    /// `scratch` holds a checkpoint.
+    pub fn attach(&mut self, scratch: &Arc<Scratch>) {
+        self.scratch = Some(Arc::clone(scratch));
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+}
+
+impl Drop for Generation {
     fn drop(&mut self) {
-        if !self.keep {
+        let resumable = self
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.resumable());
+        if !self.keep && !resumable {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
 
 /// Statistics a build reports after sealing the Pack.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildStats {
     pub bytes: u64,
     pub sections: BTreeMap<String, u64>,
@@ -249,18 +316,17 @@ impl Writer {
     }
 
     pub fn create_with(destination: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
-        let destination = destination.as_ref().to_path_buf();
-        let generation = GenerationGuard {
-            path: publication::create_generation(&destination)?,
-            keep: false,
-        };
-        let scratch = Scratch::create(
-            options
-                .scratch_dir
-                .map(|dir| dir.join(generation.path.file_name().expect("generation name")))
-                .unwrap_or_else(|| generation.path.join(SCRATCH_DIR)),
-        )?;
-        scratch.set_budget(options.scratch_budget_bytes);
+        let mut generation = Generation::create(destination)?;
+        let scratch = generation.create_scratch(None, None)?;
+        Self::create_in(generation, scratch, options)
+    }
+
+    /// Write into `generation`, streaming to `scratch`.
+    pub fn create_in(
+        generation: Generation,
+        scratch: Arc<Scratch>,
+        options: WriterOptions,
+    ) -> Result<Self> {
         Ok(Self {
             records: records::Writer::create(&scratch, &options.memory)?,
             contexts: TupleWriter::default(),
@@ -271,7 +337,6 @@ impl Writer {
             )?,
             spatial: spatial_index::Writer::new(&scratch)?,
             scratch,
-            destination,
             generation,
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
@@ -396,8 +461,17 @@ impl Writer {
 
     /// Write the Pack file without publishing it.
     pub fn seal(self) -> Result<(SealedPack, BuildStats)> {
+        let mut sealing = self.into_sealing()?;
+        while sealing.seal_part()?.is_some() {}
+        sealing.finish()
+    }
+
+    /// Start the Pack file with the parts held in memory, the context
+    /// table, the parser's dictionaries and the postcode counts, once every
+    /// record is written. The parts streamed to scratch follow, one
+    /// [`Sealing::seal_part`] at a time.
+    pub fn into_sealing(self) -> Result<Sealing> {
         let Self {
-            destination,
             generation,
             scratch,
             records,
@@ -410,21 +484,19 @@ impl Writer {
             dictionaries,
             ..
         } = self;
-        let path = generation.path.join(PACK_FILE);
-        let mut pack = container::Writer::create(&path)?;
-        let record_count = records.record_count();
-        let string_count = records.string_count();
-        let context_tuple_count = contexts.tuple_count();
-
-        // Each section can take minutes on a large input: a build asked to
-        // stop does so between them.
-        records.finish(&mut pack)?;
-        scratch.check_cancelled()?;
+        let mut pack = container::Writer::create(generation.path.join(PACK_FILE))?;
+        let counts = SealCounts {
+            record_count: records.record_count(),
+            string_count: records.string_count(),
+            context_tuple_count: contexts.tuple_count(),
+            layer_counts: layer_counts
+                .iter()
+                .map(|(layer, count)| (layer.as_str().to_string(), *count))
+                .collect(),
+            text: None,
+            spatial: None,
+        };
         contexts.finish(&mut pack)?;
-        let text_commit = text.finish(&mut pack)?;
-        scratch.check_cancelled()?;
-        let spatial_commit = spatial.finish(&mut pack)?;
-        scratch.check_cancelled()?;
         dictionaries.finish(&mut pack, &context_names)?;
         drop(context_names);
         pack.add(
@@ -432,56 +504,15 @@ impl Writer {
             POSTCODE_ADDRESSES_VERSION,
             &postcode_addresses.to_bytes(),
         )?;
-
-        let manifest = Manifest {
-            schema_version: PACK_SCHEMA_VERSION,
-            crate_version: env!("CARGO_PKG_VERSION").to_string(),
-            built_at_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default(),
-            record_count,
-            layer_counts: layer_counts
-                .iter()
-                .map(|(layer, count)| (layer.as_str().to_string(), *count))
-                .collect(),
-            string_count,
-            context_tuple_count,
-            text_document_count: text_commit.document_count,
-            spatial: SpatialManifest {
-                point_count: spatial_commit.point_count,
-                line_count: spatial_commit.line_count,
-                block_count: spatial_commit.block_count,
-                context_point_count: spatial_commit.context_point_count,
-            },
-        };
-        pack.add(
-            MANIFEST_SECTION,
-            MANIFEST_VERSION,
-            &serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        let bytes = pack.finish()?;
-        // Scratch files are no longer needed once the Pack file is complete.
-        drop(scratch);
-
-        let sections = Container::open(&path)?
-            .sections()
-            .iter()
-            .map(|(name, info)| (name.clone(), info.len))
-            .collect();
-        Ok((
-            SealedPack {
-                destination,
-                generation,
-                manifest,
-                bytes,
-            },
-            BuildStats {
-                bytes,
-                sections,
-                text_index_bytes: text_commit.bytes,
-            },
-        ))
+        Ok(Sealing {
+            generation,
+            scratch,
+            pack,
+            records: Some(records),
+            text: Some(text),
+            spatial: Some(spatial),
+            counts,
+        })
     }
 
     /// Seal and publish.
@@ -490,7 +521,231 @@ impl Writer {
     }
 }
 
+/// A Pack file being sealed: the parts held in memory are in it, and the
+/// parts streamed to scratch are copied in one at a time.
+#[derive(Debug)]
+pub struct Sealing {
+    generation: Generation,
+    scratch: Arc<Scratch>,
+    pack: container::Writer,
+    records: Option<records::Writer>,
+    text: Option<text_index::Writer>,
+    spatial: Option<spatial_index::Writer>,
+    counts: SealCounts,
+}
+
+/// What the Pack manifest counts, gathered as the parts are sealed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SealCounts {
+    record_count: u64,
+    string_count: u64,
+    context_tuple_count: u64,
+    layer_counts: BTreeMap<String, u64>,
+    text: Option<text_index::Commit>,
+    spatial: Option<spatial_index::Commit>,
+}
+
+/// A Pack file being sealed, as a checkpoint names it: how far the file
+/// was written, and the parts left to copy in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealingState {
+    pack: container::State,
+    records: Option<records::WriterState>,
+    text: Option<text_index::WriterState>,
+    spatial: Option<spatial_index::WriterState>,
+    counts: SealCounts,
+}
+
+impl Sealing {
+    /// Copy the next part streamed to scratch into the Pack file, removing
+    /// its scratch: its name, or `None` once every part is in.
+    pub fn seal_part(&mut self) -> Result<Option<&'static str>> {
+        self.scratch.check_cancelled()?;
+        if let Some(records) = self.records.take() {
+            records.finish(&mut self.pack)?;
+            return Ok(Some("records"));
+        }
+        if let Some(text) = self.text.take() {
+            self.counts.text = Some(text.finish(&mut self.pack)?);
+            return Ok(Some("text index"));
+        }
+        if let Some(spatial) = self.spatial.take() {
+            self.counts.spatial = Some(spatial.finish(&mut self.pack)?);
+            return Ok(Some("spatial index"));
+        }
+        Ok(None)
+    }
+
+    /// Where the sealing stands, for a checkpoint: the Pack file is synced.
+    pub fn state(&mut self) -> Result<SealingState> {
+        Ok(SealingState {
+            pack: self.pack.state()?,
+            records: self
+                .records
+                .as_mut()
+                .map(records::Writer::state)
+                .transpose()?,
+            text: self
+                .text
+                .as_mut()
+                .map(text_index::Writer::state)
+                .transpose()?,
+            spatial: match &mut self.spatial {
+                Some(spatial) => Some(spatial.state(&self.scratch)?),
+                None => None,
+            },
+            counts: self.counts.clone(),
+        })
+    }
+
+    /// The scratch files and directories the parts left to copy are in.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Some(records) = &self.records {
+            files.extend(records.files());
+        }
+        if let Some(text) = &self.text {
+            files.push(text.path().to_path_buf());
+        }
+        if let Some(spatial) = &self.spatial {
+            files.extend(spatial.files());
+        }
+        files
+    }
+
+    /// The sealing a checkpoint left, in `generation`, its parts in
+    /// `scratch`.
+    pub fn restore(
+        generation: Generation,
+        scratch: Arc<Scratch>,
+        options: &WriterOptions,
+        state: &SealingState,
+    ) -> Result<Self> {
+        let pack = container::Writer::resume(generation.path.join(PACK_FILE), &state.pack)?;
+        Ok(Self {
+            records: state
+                .records
+                .as_ref()
+                .map(|records| records::Writer::restore(&scratch, &options.memory, records))
+                .transpose()?,
+            text: state
+                .text
+                .as_ref()
+                .map(|text| {
+                    text_index::Writer::restore(
+                        &scratch,
+                        &options.memory,
+                        options.text_index_memory_bytes,
+                        text,
+                    )
+                })
+                .transpose()?,
+            spatial: state
+                .spatial
+                .as_ref()
+                .map(|spatial| spatial_index::Writer::restore(&scratch, spatial))
+                .transpose()?,
+            generation,
+            scratch,
+            pack,
+            counts: state.counts.clone(),
+        })
+    }
+
+    /// Write the manifest and the table of contents, once every part is in.
+    pub fn finish(mut self) -> Result<(SealedPack, BuildStats)> {
+        if self.records.is_some() || self.text.is_some() || self.spatial.is_some() {
+            return Err(Error::Inconsistent(
+                "a Pack was finished before every part was sealed".into(),
+            ));
+        }
+        let counts = &self.counts;
+        let text = counts.text.unwrap_or(text_index::Commit {
+            document_count: 0,
+            bytes: 0,
+        });
+        let spatial = counts.spatial.clone().unwrap_or_default();
+        let manifest = Manifest {
+            schema_version: PACK_SCHEMA_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            built_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            record_count: counts.record_count,
+            layer_counts: counts.layer_counts.clone(),
+            string_count: counts.string_count,
+            context_tuple_count: counts.context_tuple_count,
+            text_document_count: text.document_count,
+            spatial: SpatialManifest {
+                point_count: spatial.point_count,
+                line_count: spatial.line_count,
+                block_count: spatial.block_count,
+                context_point_count: spatial.context_point_count,
+            },
+        };
+        self.pack.add(
+            MANIFEST_SECTION,
+            MANIFEST_VERSION,
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        let sections = self.pack.state()?;
+        let bytes = self.pack.finish()?;
+        let stats = BuildStats {
+            bytes,
+            sections: sections
+                .sections
+                .iter()
+                .map(|(name, info)| (name.clone(), info.len))
+                .collect(),
+            text_index_bytes: text.bytes,
+        };
+        Ok((
+            SealedPack {
+                generation: self.generation,
+                manifest,
+                bytes,
+                sections,
+            },
+            stats,
+        ))
+    }
+}
+
+/// A sealed Pack as a checkpoint names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedState {
+    manifest: Manifest,
+    sections: container::State,
+    stats: BuildStats,
+}
+
 impl SealedPack {
+    /// The sealed Pack and what sealing it reported, for a checkpoint.
+    pub fn state(&self, stats: &BuildStats) -> SealedState {
+        SealedState {
+            manifest: self.manifest.clone(),
+            sections: self.sections.clone(),
+            stats: stats.clone(),
+        }
+    }
+
+    /// The Pack a checkpoint sealed, in `generation`. Sections a failed
+    /// build added after the checkpoint are cut off again.
+    pub fn restore(generation: Generation, state: &SealedState) -> Result<(Self, BuildStats)> {
+        let pack = container::Writer::resume(generation.path.join(PACK_FILE), &state.sections)?;
+        let bytes = pack.finish()?;
+        Ok((
+            Self {
+                generation,
+                manifest: state.manifest.clone(),
+                bytes,
+                sections: state.sections.clone(),
+            },
+            state.stats.clone(),
+        ))
+    }
+
     pub fn generation(&self) -> &Path {
         &self.generation.path
     }
@@ -520,7 +775,7 @@ impl SealedPack {
     /// Validate the Pack with the serving readers, then point `CURRENT` at it.
     pub fn publish(mut self) -> Result<Manifest> {
         publication::publish(
-            &self.destination,
+            &self.generation.destination,
             &self.generation.path,
             &self.manifest,
             &mut self.generation.keep,
@@ -1057,10 +1312,8 @@ mod tests {
         let mut writer = Writer::create_with(
             &root,
             WriterOptions {
-                scratch_dir: None,
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
-                scratch_budget_bytes: None,
             },
         )
         .expect("writer");
