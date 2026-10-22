@@ -323,6 +323,7 @@ pub fn build_planned_osm_pack(
         scratch: &scratch,
         memory: &memory,
         progress: &progress,
+        observer: options.observer.as_ref(),
     };
     let mut scanned_bytes = 0;
     // Each input is read on its own: the node pass stores coordinates in id
@@ -1097,6 +1098,7 @@ struct Passes<'a> {
     scratch: &'a Arc<Scratch>,
     memory: &'a Arc<Budget>,
     progress: &'a Progress,
+    observer: &'a dyn BuildObserver,
 }
 
 /// Kept ways one scan counted, by what they become.
@@ -1243,6 +1245,9 @@ fn read_input(
         heap_bytes: alloc::live_bytes().map(|bytes| bytes as u64),
         tracked_bytes: passes.memory.used() as u64,
     })?;
+    for warning in plan.shortfalls.iter().chain(&plan.warnings) {
+        passes.observer.warned(warning);
+    }
     build.report.geometry_passes.kept_ways += kept.all;
     passes.memory.sample(&plan.resources);
 
@@ -2005,6 +2010,32 @@ mod tests {
         // Each way's nodes are requested once, even when a boundary way is also
         // a relation member: 3 + 3 + 5 + 2 + 5 + 2 + 2 + 5.
         assert_eq!(report.geometry_resolution.required_node_refs, 27);
+        // 17 distinct nodes, of which the extract lacks Ghost Road's 9999;
+        // the interpolation's two anchors keep their address tags.
+        let passes = &report.geometry_passes;
+        assert_eq!(
+            (
+                passes.needed_nodes,
+                passes.stored_nodes,
+                passes.tagged_nodes
+            ),
+            (17, 16, 2)
+        );
+        assert_eq!(report.geometry_resolution.resolved_node_refs, 26);
+        assert_eq!(passes.mapped_location_bytes, 0);
+        let input_bytes = fs::metadata(&input).expect("input").len();
+        assert_eq!(passes.scan_read_bytes, input_bytes);
+        for read in [
+            passes.boundary_member_read_bytes,
+            passes.node_read_bytes,
+            passes.way_read_bytes,
+        ] {
+            assert!(read > 0 && read <= input_bytes, "{passes:?}");
+        }
+        let plan = &report.resources.plan;
+        assert!(plan.counted && plan.locations_in_memory);
+        assert_eq!(plan.items.needed_nodes, 17);
+        assert_eq!(plan.items.streets, 2);
         assert_eq!(report.accepted.postcode_records, 1);
         assert_eq!(report.geometry_resolution.street_way_stubs, 2);
         assert_eq!(

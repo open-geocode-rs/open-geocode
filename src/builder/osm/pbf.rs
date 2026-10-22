@@ -52,14 +52,17 @@ where
         source,
     })?;
     let read_bytes = Arc::new(AtomicU64::new(0));
-    let reader = BufReader::with_capacity(
-        READ_BUFFER_BYTES,
-        ProgressReader {
-            inner: file,
-            progress: offsets.is_none().then(|| progress.clone()),
-            read_bytes: Arc::clone(&read_bytes),
-        },
-    );
+    let reader = Buffered {
+        inner: BufReader::with_capacity(
+            READ_BUFFER_BYTES,
+            ProgressReader {
+                inner: file,
+                progress: offsets.is_none().then(|| progress.clone()),
+                read_bytes: Arc::clone(&read_bytes),
+            },
+        ),
+        position: 0,
+    };
     let mut blobs = BlobReader::new_seekable(reader)?;
 
     std::thread::scope(|scope| -> Result<()> {
@@ -178,6 +181,49 @@ pub(crate) fn input_bytes(input: &Path) -> Result<u64> {
     Ok(fs::metadata(input)?.len())
 }
 
+/// A buffered reader that keeps its buffer across a seek to where it already
+/// holds the bytes. `BlobReader` seeks to every blob it is asked for, and
+/// `BufReader` drops its whole buffer on any absolute seek, so reading the
+/// blobs of one kind, which mostly follow one another, read the file again
+/// buffer by buffer for each.
+struct Buffered<R> {
+    inner: BufReader<R>,
+    position: u64,
+}
+
+impl<R: Read> Read for Buffered<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for Buffered<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let out_of_range = || io::Error::other("seek offset out of range");
+        let delta = match position {
+            SeekFrom::Start(target) => i64::try_from(target)
+                .ok()
+                .zip(i64::try_from(self.position).ok())
+                .map(|(target, current)| target - current)
+                .ok_or_else(out_of_range)?,
+            SeekFrom::Current(delta) => delta,
+            SeekFrom::End(_) => {
+                self.position = self.inner.seek(position)?;
+                return Ok(self.position);
+            }
+        };
+        let target = self
+            .position
+            .checked_add_signed(delta)
+            .ok_or_else(out_of_range)?;
+        self.inner.seek_relative(delta)?;
+        self.position = target;
+        Ok(target)
+    }
+}
+
 struct ProgressReader<R> {
     inner: R,
     progress: Option<Progress>,
@@ -199,5 +245,40 @@ impl<R: Read> Read for ProgressReader<R> {
 impl<R: Seek> Seek for ProgressReader<R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.inner.seek(position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_seek_within_the_buffer_reads_the_file_once() {
+        let data = (0..=255u8).cycle().take(10_000).collect::<Vec<_>>();
+        let read_bytes = Arc::new(AtomicU64::new(0));
+        let mut reader = Buffered {
+            inner: BufReader::with_capacity(
+                4_096,
+                ProgressReader {
+                    inner: io::Cursor::new(data.clone()),
+                    progress: None,
+                    read_bytes: Arc::clone(&read_bytes),
+                },
+            ),
+            position: 0,
+        };
+        let mut read_at = |offset: u64| {
+            assert_eq!(reader.seek(SeekFrom::Start(offset)).expect("seek"), offset);
+            let mut byte = [0];
+            reader.read_exact(&mut byte).expect("read");
+            byte[0]
+        };
+        for offset in [0, 10, 100, 4_000, 3_000, 9_999] {
+            assert_eq!(read_at(offset), data[offset as usize]);
+        }
+        // The first buffer serves every offset below 4,096, back to 3,000
+        // after 4,000 too; only 9,999 is read again.
+        assert_eq!(read_bytes.load(Ordering::Relaxed), 4_096 + 1);
+        assert_eq!(reader.seek(SeekFrom::Current(-1)).expect("seek"), 9_999);
     }
 }
