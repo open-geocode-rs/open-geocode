@@ -67,6 +67,8 @@ pub struct Budget {
     /// Buffers that can spill and are open.
     spillable: AtomicUsize,
     peak: AtomicUsize,
+    /// Most bytes reserved at once since [`Budget::reset_stage_peak`].
+    stage_peak: AtomicUsize,
     /// The most bytes the heap may hold before reservations are refused.
     heap_ceiling: AtomicUsize,
 }
@@ -79,6 +81,7 @@ impl Budget {
             spillable_used: AtomicUsize::new(0),
             spillable: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            stage_peak: AtomicUsize::new(0),
             heap_ceiling: AtomicUsize::new(usize::MAX),
         })
     }
@@ -99,6 +102,17 @@ impl Budget {
     /// Most bytes reserved at once.
     pub fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Most bytes reserved at once since the last call to
+    /// [`Budget::reset_stage_peak`].
+    pub fn stage_peak(&self) -> usize {
+        self.stage_peak.load(Ordering::Relaxed)
+    }
+
+    /// Start a new stage's peak from what is reserved now.
+    pub fn reset_stage_peak(&self) {
+        self.stage_peak.store(self.used(), Ordering::Relaxed);
     }
 
     /// Let the heap grow by a share of what `resources` found available.
@@ -143,6 +157,7 @@ impl Budget {
             {
                 Ok(_) => {
                     self.peak.fetch_max(next, Ordering::Relaxed);
+                    self.stage_peak.fetch_max(next, Ordering::Relaxed);
                     if spillable {
                         self.spillable_used.fetch_add(bytes, Ordering::Relaxed);
                     }
@@ -161,6 +176,7 @@ impl Budget {
             .fetch_add(bytes, Ordering::Relaxed)
             .saturating_add(bytes);
         self.peak.fetch_max(next, Ordering::Relaxed);
+        self.stage_peak.fetch_max(next, Ordering::Relaxed);
         if spillable {
             self.spillable_used.fetch_add(bytes, Ordering::Relaxed);
         }
@@ -219,6 +235,17 @@ impl Reservation {
     pub fn release_all(&mut self) {
         self.budget.release(self.bytes, self.spillable);
         self.bytes = 0;
+    }
+
+    /// Move everything reserved to a new reservation, as a buffer handed to
+    /// another thread takes its bytes along: the pool sees no change.
+    pub fn take(&mut self) -> Self {
+        let bytes = std::mem::take(&mut self.bytes);
+        Self {
+            budget: Arc::clone(&self.budget),
+            bytes,
+            spillable: self.spillable,
+        }
     }
 }
 
@@ -317,6 +344,24 @@ mod tests {
         drop(kept);
         drop(second);
         assert_eq!(budget.used(), 200);
+    }
+
+    #[test]
+    fn a_taken_reservation_keeps_its_bytes_until_dropped() {
+        let budget = Budget::new(1_000);
+        let mut buffer = Spillable::new(&budget);
+        assert!(buffer.reservation().try_grow(300));
+        let handed = buffer.reservation().take();
+        assert_eq!((buffer.bytes(), handed.bytes()), (0, 300));
+        assert_eq!(budget.used(), 300);
+        // Still a buffer that could have spilled: not taken off the pool.
+        assert_eq!(buffer.share(usize::MAX), 1_000);
+        budget.reset_stage_peak();
+        drop(handed);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.stage_peak(), 300);
+        budget.reset_stage_peak();
+        assert_eq!(budget.stage_peak(), 0);
     }
 
     #[test]

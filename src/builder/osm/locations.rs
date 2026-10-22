@@ -32,7 +32,7 @@ use rayon::prelude::*;
 use crate::{
     builder::progress::{BuildStage, Progress},
     error::{Error, Result},
-    extsort::Scratch,
+    extsort::{Owner, Scratch},
     memory::{Budget, Reservation},
 };
 
@@ -288,12 +288,17 @@ pub(crate) struct MappedSlots {
     file: Option<File>,
     path: PathBuf,
     len: usize,
+    /// The ledger's hold on the file's bytes, returned when it is removed.
+    scratch: Arc<Scratch>,
+    owner: Arc<Owner>,
+    bytes: u64,
 }
 
 impl MappedSlots {
-    fn create(scratch: &Scratch, capacity: u64) -> Result<Self> {
+    fn create(scratch: &Arc<Scratch>, capacity: u64) -> Result<Self> {
         let bytes = capacity * LOCATION_BYTES;
-        scratch.check_room(bytes)?;
+        let owner = scratch.owner("node-locations");
+        scratch.reserve(&owner, bytes)?;
         let path = scratch.path().join("node-locations.bin");
         let io = |source| Error::IoPath {
             action: "failed to create node location file",
@@ -321,6 +326,9 @@ impl MappedSlots {
             file: Some(file),
             path,
             len: 0,
+            scratch: Arc::clone(scratch),
+            owner,
+            bytes,
         })
     }
 
@@ -353,7 +361,9 @@ impl Drop for MappedSlots {
         // Windows refuses to remove a file that is still mapped or open.
         drop(self.map.take());
         drop(self.file.take());
-        let _ = fs::remove_file(&self.path);
+        if fs::remove_file(&self.path).is_ok() {
+            self.scratch.release(&self.owner, self.bytes);
+        }
     }
 }
 
@@ -364,7 +374,7 @@ impl Slots {
         capacity: u64,
         in_memory: bool,
         memory: &Arc<Budget>,
-        scratch: &Scratch,
+        scratch: &Arc<Scratch>,
     ) -> Result<Self> {
         let mut reservation = Reservation::empty(memory);
         if in_memory

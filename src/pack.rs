@@ -151,6 +151,9 @@ pub struct WriterOptions {
     pub memory: Arc<Budget>,
     /// Memory for Tantivy's indexing buffers, taken from the pool.
     pub text_index_memory_bytes: usize,
+    /// The most scratch disk the build may hold at once; the scratch
+    /// volume's free space caps it either way.
+    pub scratch_budget_bytes: Option<u64>,
 }
 
 impl Default for WriterOptions {
@@ -159,6 +162,7 @@ impl Default for WriterOptions {
             scratch_dir: None,
             memory: Budget::unlimited(),
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
+            scratch_budget_bytes: None,
         }
     }
 }
@@ -256,6 +260,7 @@ impl Writer {
                 .map(|dir| dir.join(generation.path.file_name().expect("generation name")))
                 .unwrap_or_else(|| generation.path.join(SCRATCH_DIR)),
         )?;
+        scratch.set_budget(options.scratch_budget_bytes);
         Ok(Self {
             records: records::Writer::create(&scratch, &options.memory)?,
             contexts: TupleWriter::default(),
@@ -1055,6 +1060,7 @@ mod tests {
                 scratch_dir: None,
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
+                scratch_budget_bytes: None,
             },
         )
         .expect("writer");

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     builder::{osm::LOCALITY_KEYS, plan::BuildPlan},
+    extsort::Traffic,
     parse::lattice::train::Report,
     record::{AddressRecord, LocationPrecision, ObjectType, PlaceLayer, PoiRecord},
     resources::Resources,
@@ -61,6 +62,9 @@ pub struct BuilderReport {
     /// input's countries that the input lacks: rules that apply to nothing.
     pub unmatched_admin_level_ids: Vec<String>,
     pub slash_numbers: SlashNumberCounts,
+    /// What each stage cost, in the order they ran; a stage run once per
+    /// input has one entry per input.
+    pub stages: Vec<StageReport>,
 }
 
 /// How the build read the house numbers written "N/M".
@@ -232,14 +236,196 @@ pub struct ScratchReport {
     /// Most bytes the heap held at once, as the global allocator counts
     /// them; 0 when it does not.
     pub peak_heap_bytes: u64,
+    /// Bytes written to scratch files, as on disk.
     pub spilled_bytes: u64,
     pub sorters: BTreeMap<String, SorterReport>,
+    /// The `--scratch-budget-mb` cap; `None` when only the scratch volume's
+    /// free space capped the build.
+    pub budget_bytes: Option<u64>,
+    /// Most scratch bytes on disk at once, every owner together.
+    pub peak_live_bytes: u64,
+    /// What each owner held when that peak was reached.
+    pub peak_owners: BTreeMap<String, u64>,
+    /// The zstd level spill blocks ended at: above 1 when the ledger ran
+    /// short and blocks were compressed harder.
+    pub zstd_level: i32,
+    /// Every scratch owner's traffic: sorters and spools by label, the Pack
+    /// writer's files as `pack-*`.
+    pub spills: BTreeMap<String, Traffic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SorterReport {
     pub items: u64,
     pub runs: u64,
+}
+
+/// Which resource held a stage back, judged from what it measured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Bound {
+    /// The stage kept the threads busy, or one thread on its serial path.
+    Cpu,
+    /// Waiting on the input or on scratch being read.
+    ReadIo,
+    /// Writing scratch.
+    WriteIo,
+    /// None of these was saturated: the stage waited on another stage, a
+    /// lock or the machine.
+    #[default]
+    Waiting,
+}
+
+impl Bound {
+    /// A share past which a resource counts as what held the stage back.
+    const SATURATED: f64 = 0.5;
+
+    /// The resource with the largest share, if it is saturated. A stage
+    /// whose driving thread was busy all along is bound by that thread's
+    /// CPU, however idle the others were.
+    pub fn classify(shares: &BoundShares) -> Self {
+        let cpu = shares.cpu.max(shares.driver);
+        [
+            (Self::Cpu, cpu),
+            (Self::ReadIo, shares.read),
+            (Self::WriteIo, shares.write),
+        ]
+        .into_iter()
+        .filter(|(_, share)| *share >= Self::SATURATED)
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map_or(Self::Waiting, |(bound, _)| bound)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::ReadIo => "read-io",
+            Self::WriteIo => "write-io",
+            Self::Waiting => "waiting",
+        }
+    }
+}
+
+/// The shares of a stage's wall time each resource was busy, from 0 to 1.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+pub struct BoundShares {
+    /// CPU time over wall time and threads.
+    pub cpu: f64,
+    /// CPU time over wall time: threads kept busy on average.
+    pub cores: f64,
+    /// CPU time of the thread that drives the stage, its sink, over wall
+    /// time: near 1 when the stage waits on that one thread.
+    pub driver: f64,
+    /// Time reading the input or waiting for scratch to be read ahead.
+    pub read: f64,
+    /// Time writing scratch, over every writing thread.
+    pub write: f64,
+    /// Time a producer waited for its previous buffer to be written.
+    pub spill_wait: f64,
+}
+
+/// Bytes a stage read from one input.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct InputRead {
+    pub bytes: u64,
+    /// Time spent in reads, on the thread that reads.
+    pub wait_ms: u64,
+}
+
+/// What one stage of the build cost.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct StageReport {
+    /// The stage, as progress names it.
+    pub stage: String,
+    pub wall_ms: u64,
+    /// Process CPU time, user and kernel, over every thread.
+    pub cpu_ms: u64,
+    pub threads: usize,
+    /// The stage's work in its own unit ("bytes", "blocks", "ways",
+    /// "records"), or none.
+    pub unit: String,
+    pub units: u64,
+    /// Bytes read from each input file.
+    pub inputs: BTreeMap<String, InputRead>,
+    /// Scratch traffic by owner, of owners that wrote or read in the stage.
+    pub spills: BTreeMap<String, Traffic>,
+    pub items_written: u64,
+    pub items_read: u64,
+    pub scratch_raw_written_bytes: u64,
+    pub scratch_written_bytes: u64,
+    pub scratch_raw_read_bytes: u64,
+    pub scratch_read_bytes: u64,
+    pub peak_scratch_bytes: u64,
+    /// Most of the process in RAM, sampled every second.
+    pub peak_rss_bytes: u64,
+    /// Most of the memory budget reserved at once.
+    pub peak_budget_bytes: u64,
+    pub shares: BoundShares,
+    pub bound: Bound,
+}
+
+impl StageReport {
+    fn input_bytes(&self) -> u64 {
+        self.inputs.values().map(|input| input.bytes).sum()
+    }
+}
+
+impl BuilderReport {
+    /// What each stage cost, as a table for a person to read at the end of
+    /// a build.
+    pub fn stage_table(&self) -> String {
+        let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+        let mut table = format!(
+            "{:<28} {:>8} {:>6} {:>9} {:>17} {:>17} {:>9} {:>8} {:>8}  {}\n",
+            "stage",
+            "wall s",
+            "cores",
+            "in MB/s",
+            "spill w MiB (raw)",
+            "spill r MiB (raw)",
+            "scratch",
+            "RSS",
+            "budget",
+            "bound"
+        );
+        for stage in &self.stages {
+            let secs = stage.wall_ms as f64 / 1000.0;
+            let rate = if secs > 0.0 {
+                stage.input_bytes() as f64 / 1e6 / secs
+            } else {
+                0.0
+            };
+            table.push_str(&format!(
+                "{:<28} {:>8.1} {:>6.1} {:>9.0} {:>8.0} ({:>6.0}) {:>8.0} ({:>6.0}) {:>8.0}M {:>7.0}M {:>7.0}M  {}\n",
+                stage.stage,
+                secs,
+                stage.shares.cores,
+                rate,
+                mib(stage.scratch_written_bytes),
+                mib(stage.scratch_raw_written_bytes),
+                mib(stage.scratch_read_bytes),
+                mib(stage.scratch_raw_read_bytes),
+                mib(stage.peak_scratch_bytes),
+                mib(stage.peak_rss_bytes),
+                mib(stage.peak_budget_bytes),
+                stage.bound.as_str(),
+            ));
+        }
+        let scratch = &self.scratch;
+        let owners = scratch
+            .peak_owners
+            .iter()
+            .map(|(owner, bytes)| format!("{owner} {:.0} MiB", mib(*bytes)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table.push_str(&format!(
+            "peak scratch {:.0} MiB ({owners}); {:.0} MiB written; zstd level {}\n",
+            mib(scratch.peak_live_bytes),
+            mib(scratch.spilled_bytes),
+            scratch.zstd_level,
+        ));
+        table
+    }
 }
 
 /// What the build wrote.
@@ -1330,6 +1516,61 @@ const POI_CONTEXT_KEYS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use crate::record::{AddressComponents, SourceProvenance, point_geometry};
+
+    #[test]
+    fn a_stage_is_bound_by_the_resource_it_kept_busiest() {
+        let shares = |cpu: f64, driver: f64, read: f64, write: f64| BoundShares {
+            cpu,
+            cores: cpu * 24.0,
+            driver,
+            read,
+            write,
+            spill_wait: 0.0,
+        };
+        assert_eq!(Bound::classify(&shares(0.9, 0.3, 0.2, 0.1)), Bound::Cpu);
+        // One thread busy of 24 is still CPU: the stage's serial path.
+        assert_eq!(Bound::classify(&shares(0.06, 0.97, 0.1, 0.0)), Bound::Cpu);
+        assert_eq!(Bound::classify(&shares(0.3, 0.4, 0.95, 0.1)), Bound::ReadIo);
+        assert_eq!(Bound::classify(&shares(0.6, 0.2, 0.1, 0.8)), Bound::WriteIo);
+        assert_eq!(Bound::classify(&shares(0.1, 0.3, 0.2, 0.2)), Bound::Waiting);
+        assert_eq!(
+            serde_json::to_value(Bound::ReadIo).expect("json"),
+            serde_json::json!("read-io")
+        );
+    }
+
+    #[test]
+    fn the_stage_table_has_a_row_per_stage_and_the_peak() {
+        let mut report = BuilderReport::default();
+        report.stages.push(StageReport {
+            stage: "scan OSM objects".to_string(),
+            wall_ms: 2_000,
+            inputs: BTreeMap::from([(
+                "planet.osm.pbf".to_string(),
+                InputRead {
+                    bytes: 360_000_000,
+                    wait_ms: 1_900,
+                },
+            )]),
+            scratch_written_bytes: 100 << 20,
+            scratch_raw_written_bytes: 400 << 20,
+            bound: Bound::ReadIo,
+            ..StageReport::default()
+        });
+        report.scratch.peak_live_bytes = 300 << 20;
+        report.scratch.peak_owners = BTreeMap::from([("node-requests".to_string(), 200 << 20)]);
+        report.scratch.zstd_level = 1;
+        let table = report.stage_table();
+        let row = table.lines().nth(1).expect("row");
+        assert!(row.starts_with("scan OSM objects"), "{table}");
+        assert!(row.contains(" 180 "), "input MB/s: {table}");
+        assert!(row.contains("100 (   400)"), "spill: {table}");
+        assert!(row.ends_with("read-io"), "{table}");
+        assert!(
+            table.contains("peak scratch 300 MiB (node-requests 200 MiB)"),
+            "{table}"
+        );
+    }
 
     #[test]
     fn merging_worker_reports_matches_one_sequential_report() {

@@ -102,6 +102,61 @@ pub(crate) fn get_opt_string(input: &mut &[u8]) -> Result<Option<String>> {
     }
 }
 
+/// What the value before in a scratch block leaves for the next one to be
+/// coded against. A block starts from the default, so blocks decode on
+/// their own and in parallel.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Delta {
+    int: i64,
+    bytes: Vec<u8>,
+}
+
+/// An integer as its difference from the one before. Sorted ids and
+/// Hilbert keys differ from their neighbours by little, so most take a
+/// byte or two instead of up to ten. Wrapping, so a value of any size and
+/// either order round-trips.
+pub(crate) fn put_delta(out: &mut Vec<u8>, delta: &mut Delta, value: i64) {
+    put_i64(out, value.wrapping_sub(delta.int));
+    delta.int = value;
+}
+
+pub(crate) fn get_delta(input: &mut &[u8], delta: &mut Delta) -> Result<i64> {
+    let value = delta.int.wrapping_add(get_i64(input)?);
+    delta.int = value;
+    Ok(value)
+}
+
+/// Bytes front coded against the ones before: the length of the prefix
+/// both share, then the rest. Sort keys that start with a cell, a street or
+/// a name share most of their bytes with their neighbours in a sorted run.
+pub(crate) fn put_front(out: &mut Vec<u8>, delta: &mut Delta, bytes: &[u8]) {
+    let shared = delta
+        .bytes
+        .iter()
+        .zip(bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    put_u64(out, shared as u64);
+    put_bytes(out, &bytes[shared..]);
+    delta.bytes.truncate(shared);
+    delta.bytes.extend_from_slice(&bytes[shared..]);
+}
+
+/// The bytes [`put_front`] wrote, borrowed from `delta` until the next call.
+pub(crate) fn get_front<'a>(input: &mut &[u8], delta: &'a mut Delta) -> Result<&'a [u8]> {
+    let shared = usize::try_from(get_u64(input)?)
+        .map_err(|_| Error::Decode("length does not fit in usize"))?;
+    if shared > delta.bytes.len() {
+        return Err(Error::Decode(
+            "front coded prefix is longer than the key before",
+        ));
+    }
+    let rest = get_bytes(input)?;
+    delta.bytes.truncate(shared);
+    delta.bytes.extend_from_slice(rest);
+    Ok(&delta.bytes)
+}
+
 pub(crate) fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
     let array: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
     Some(u64::from_le_bytes(array))
@@ -161,6 +216,48 @@ mod tests {
             put_i64(&mut out, value);
             assert_eq!(out.len(), 1, "value {value}");
         }
+    }
+
+    #[test]
+    fn delta_and_front_coding_round_trip_in_any_order() {
+        let values = [5, 7, 7, 1_000_000, -3, i64::MAX, i64::MIN, 0];
+        let keys: [&[u8]; 6] = [b"king st", b"king street", b"king", b"", b"queen", b"queen"];
+        let mut out = Vec::new();
+        let mut delta = Delta::default();
+        for (value, key) in values.iter().zip(keys.iter().cycle()) {
+            put_delta(&mut out, &mut delta, *value);
+            put_front(&mut out, &mut delta, key);
+        }
+        let mut input = out.as_slice();
+        let mut delta = Delta::default();
+        for (value, key) in values.iter().zip(keys.iter().cycle()) {
+            assert_eq!(get_delta(&mut input, &mut delta).unwrap(), *value);
+            assert_eq!(get_front(&mut input, &mut delta).unwrap(), *key);
+        }
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn sorted_ids_and_shared_prefixes_code_short() {
+        let mut out = Vec::new();
+        let mut delta = Delta::default();
+        put_delta(&mut out, &mut delta, 9_000_000_000);
+        let first = out.len();
+        put_delta(&mut out, &mut delta, 9_000_000_017);
+        assert_eq!(out.len() - first, 1);
+        let before = out.len();
+        put_front(&mut out, &mut delta, b"cell-0042/king street/12");
+        put_front(&mut out, &mut delta, b"cell-0042/king street/14");
+        // The first key whole, then a shared length, a length and one byte.
+        assert_eq!(out.len() - before, (1 + 1 + 24) + 3);
+    }
+
+    #[test]
+    fn rejects_a_front_prefix_longer_than_the_key_before() {
+        let mut out = Vec::new();
+        put_u64(&mut out, 4);
+        put_bytes(&mut out, b"x");
+        assert!(get_front(&mut out.as_slice(), &mut Delta::default()).is_err());
     }
 
     #[test]

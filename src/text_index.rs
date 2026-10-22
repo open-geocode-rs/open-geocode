@@ -84,6 +84,7 @@ pub struct Writer {
     memory_bytes: usize,
     index: Index,
     path: PathBuf,
+    scratch: Arc<Scratch>,
     fields: Fields,
     document_count: u64,
     /// The address group the next address may join.
@@ -269,8 +270,12 @@ impl Writer {
             path: path.clone(),
             source,
         })?;
+        // Tantivy writes its segments itself, so the ledger measures them
+        // at checkpoints instead of reserving each write.
+        scratch.watch("pack-text", &path);
         let index = Index::create_in_dir(&path, schema)?;
         Ok(Self {
+            scratch: Arc::clone(scratch),
             writer: None,
             budget: Arc::clone(budget),
             memory_bytes: memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES),
@@ -409,8 +414,25 @@ impl Writer {
                 &file,
             )?;
         }
+        // The segments are in the Pack now; their scratch goes before the
+        // parser trains, not after.
+        let Self {
+            index,
+            path,
+            scratch,
+            document_count,
+            ..
+        } = self;
+        drop(index);
+        scratch.measure();
+        fs::remove_dir_all(&path).map_err(|source| Error::IoPath {
+            action: "failed to remove",
+            path: path.clone(),
+            source,
+        })?;
+        scratch.unwatch(&path);
         Ok(Commit {
-            document_count: self.document_count,
+            document_count,
             bytes,
         })
     }

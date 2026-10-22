@@ -84,6 +84,13 @@ enum Command {
         #[arg(long)]
         memory_budget_mb: Option<u64>,
 
+        /// The most scratch disk the build may hold at once, in MiB. It
+        /// compresses its spill harder as it nears the cap and stops early
+        /// when it cannot fit. The scratch volume's free space caps it
+        /// either way.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1 << 30))]
+        scratch_budget_mb: Option<u64>,
+
         /// Build even when the pre-flight check finds too little memory or
         /// disk.
         #[arg(long)]
@@ -121,6 +128,7 @@ fn main() -> Result<()> {
             regions,
             name,
             memory_budget_mb,
+            scratch_budget_mb,
             force,
             download,
             openaddresses,
@@ -133,10 +141,13 @@ fn main() -> Result<()> {
                 home,
                 &regions,
                 name.as_deref(),
-                memory_budget_bytes,
-                force,
-                download,
-                openaddresses,
+                Flags {
+                    memory_budget_bytes,
+                    scratch_budget_bytes: scratch_budget_mb.map(|mb| mb << 20),
+                    force,
+                    download,
+                    openaddresses,
+                },
             )
         }
         Some(Command::Serve { pack, bind }) => {
@@ -165,18 +176,26 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
         .map_err(Into::into)
 }
 
-/// `og build`: the build the interface runs, with one line per step. Ctrl-C
-/// stops it and removes the unfinished Pack generation; a second one quits
-/// at once.
-fn build(
-    home: Home,
-    ids: &[String],
-    name: Option<&str>,
+/// How `og build` was asked to build.
+struct Flags {
     memory_budget_bytes: Option<usize>,
+    scratch_budget_bytes: Option<u64>,
     force: bool,
     download: bool,
     openaddresses: bool,
-) -> Result<()> {
+}
+
+/// `og build`: the build the interface runs, with one line per step. Ctrl-C
+/// stops it and removes the unfinished Pack generation; a second one quits
+/// at once.
+fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result<()> {
+    let Flags {
+        memory_budget_bytes,
+        scratch_budget_bytes,
+        force,
+        download,
+        openaddresses,
+    } = flags;
     let tree = regions::tree();
     let mut picked: Vec<&'static Region> = Vec::new();
     for id in ids {
@@ -229,6 +248,7 @@ fn build(
         inputs,
         pack,
         memory_budget_bytes,
+        scratch_budget_bytes,
         force,
         openaddresses,
     };
@@ -280,6 +300,7 @@ fn build(
                 format::bytes(built.pack.bytes),
                 format::duration(built.build_secs)
             );
+            eprint!("{}", built.costs);
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -520,6 +541,7 @@ mod tests {
                 }],
                 pack: pack.clone(),
                 memory_budget_bytes: None,
+                scratch_budget_bytes: None,
                 force: false,
                 openaddresses: false,
             },

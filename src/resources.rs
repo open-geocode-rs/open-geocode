@@ -72,6 +72,36 @@ pub fn same_volume(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// CPU time this process has used, user and kernel, over every thread.
+/// The build divides it by wall time and threads to tell a stage that kept
+/// its cores busy from one that waited.
+pub fn process_cpu_time() -> Option<std::time::Duration> {
+    platform::process_cpu_time()
+}
+
+/// The CPU clock of one thread, readable from any thread: the build reads
+/// the thread that drives a stage, whose sink is often its serial path.
+#[derive(Debug)]
+pub struct ThreadClock(platform::ThreadClock);
+
+impl ThreadClock {
+    /// The clock of the calling thread, where it can be read.
+    pub fn current() -> Option<Self> {
+        platform::ThreadClock::current().map(Self)
+    }
+
+    /// CPU time the thread has used, user and kernel.
+    pub fn cpu_time(&self) -> Option<std::time::Duration> {
+        self.0.cpu_time()
+    }
+}
+
+/// Memory this process holds in RAM now: the working set on Windows, the
+/// resident set on Linux. `None` where it cannot be read.
+pub fn resident_bytes() -> Option<u64> {
+    platform::resident_bytes()
+}
+
 /// Ask the OS to run this process at full speed. Windows otherwise may move
 /// a long, unattended process to efficiency cores and lower clocks
 /// (EcoQoS) once it decides no user waits on it, which is what a build
@@ -85,6 +115,7 @@ mod platform {
     use std::{os::windows::ffi::OsStrExt, path::Path};
 
     use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME, HANDLE},
         Storage::FileSystem::GetDiskFreeSpaceExW,
         System::{
             JobObjects::{
@@ -98,9 +129,10 @@ mod platform {
             SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
             Threading::{
                 ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetCurrentProcess,
-                GetProcessAffinityMask, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                GetCurrentThreadId, GetProcessAffinityMask, GetProcessTimes, GetThreadTimes,
+                OpenThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                 PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-                ProcessPowerThrottling, SetProcessInformation,
+                ProcessPowerThrottling, SetProcessInformation, THREAD_QUERY_LIMITED_INFORMATION,
             },
         },
     };
@@ -228,6 +260,71 @@ mod platform {
         } else {
             0
         }
+    }
+
+    /// Kernel plus user time, from FILETIMEs in 100 ns ticks.
+    fn busy(kernel: &FILETIME, user: &FILETIME) -> std::time::Duration {
+        let ticks =
+            |time: &FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
+        std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+    }
+
+    pub(super) fn process_cpu_time() -> Option<std::time::Duration> {
+        let mut times = [FILETIME::default(); 4];
+        let [created, exited, kernel, user] = &mut times;
+        // SAFETY: four valid FILETIME out-pointers for the current process.
+        let read =
+            unsafe { GetProcessTimes(GetCurrentProcess(), created, exited, kernel, user) } != 0;
+        read.then(|| busy(kernel, user))
+    }
+
+    /// A handle to a thread, opened to read its times.
+    #[derive(Debug)]
+    pub(super) struct ThreadClock(HANDLE);
+
+    // SAFETY: the handle is a kernel object reference, valid on any thread
+    // until closed, and only ever used to query times.
+    unsafe impl Send for ThreadClock {}
+    // SAFETY: as for `Send`; queries do not mutate the handle.
+    unsafe impl Sync for ThreadClock {}
+
+    impl ThreadClock {
+        pub(super) fn current() -> Option<Self> {
+            // SAFETY: opens the calling thread, which exists, for queries.
+            let handle =
+                unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+            (!handle.is_null()).then_some(Self(handle))
+        }
+
+        pub(super) fn cpu_time(&self) -> Option<std::time::Duration> {
+            let mut times = [FILETIME::default(); 4];
+            let [created, exited, kernel, user] = &mut times;
+            // SAFETY: an open thread handle and four valid out-pointers.
+            let read = unsafe { GetThreadTimes(self.0, created, exited, kernel, user) } != 0;
+            read.then(|| busy(kernel, user))
+        }
+    }
+
+    impl Drop for ThreadClock {
+        fn drop(&mut self) {
+            // SAFETY: the handle was opened by `current` and is closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub(super) fn resident_bytes() -> Option<u64> {
+        // SAFETY: the counters are plain integers, valid all zero.
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        // SAFETY: as in `private_bytes`.
+        let read = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+                counters.cb,
+            )
+        } != 0;
+        read.then_some(counters.WorkingSetSize as u64)
     }
 
     pub(super) fn free_disk(path: &Path) -> Option<u64> {
@@ -416,6 +513,66 @@ mod platform {
         resources.memory_limit = "half of installed memory".to_string();
     }
 
+    pub(super) fn process_cpu_time() -> Option<std::time::Duration> {
+        // SAFETY: `rusage` is plain integers, valid all zero, and filled by
+        // the call.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is valid for the call.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return None;
+        }
+        let time = |value: libc::timeval| {
+            std::time::Duration::from_secs(value.tv_sec.max(0) as u64)
+                + std::time::Duration::from_micros(value.tv_usec.max(0) as u64)
+        };
+        Some(time(usage.ru_utime) + time(usage.ru_stime))
+    }
+
+    /// A thread's CPU clock, which POSIX lets any thread read.
+    #[derive(Debug)]
+    pub(super) struct ThreadClock(libc::clockid_t);
+
+    impl ThreadClock {
+        #[cfg(target_os = "linux")]
+        pub(super) fn current() -> Option<Self> {
+            let mut clock: libc::clockid_t = 0;
+            // SAFETY: the calling thread exists; `clock` is valid for the call.
+            let found = unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock) };
+            (found == 0).then_some(Self(clock))
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        pub(super) fn current() -> Option<Self> {
+            None
+        }
+
+        pub(super) fn cpu_time(&self) -> Option<std::time::Duration> {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: a clock id from `pthread_getcpuclockid` and a valid
+            // out-pointer.
+            (unsafe { libc::clock_gettime(self.0, &mut time) } == 0).then(|| {
+                std::time::Duration::new(time.tv_sec.max(0) as u64, time.tv_nsec.max(0) as u32)
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn resident_bytes() -> Option<u64> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        // SAFETY: a plain query.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        Some(pages.saturating_mul(page.max(0) as u64))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn resident_bytes() -> Option<u64> {
+        None
+    }
+
     pub(super) fn free_disk(path: &Path) -> Option<u64> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
         // SAFETY: `statvfs` is a plain C struct of integers, for which an
@@ -451,5 +608,17 @@ mod tests {
         let missing = std::env::temp_dir().join("open-geocode-no-such-directory/below");
         assert!(free_disk(&missing).is_some_and(|free| free > 0));
         assert!(same_volume(&missing, &std::env::temp_dir()));
+        assert!(process_cpu_time().is_some());
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let clock = ThreadClock::current().expect("thread clock");
+            let before = clock.cpu_time().expect("thread time");
+            let spin = std::time::Instant::now();
+            while spin.elapsed() < std::time::Duration::from_millis(30) {}
+            let read = std::thread::scope(|scope| scope.spawn(|| clock.cpu_time()).join());
+            assert!(read.expect("joined").expect("thread time") > before);
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(resident_bytes().is_some_and(|bytes| bytes > 0));
     }
 }

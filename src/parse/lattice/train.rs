@@ -53,7 +53,7 @@ use crate::{
     record::{AddressComponents, Layer, PlaceLayer, Record},
     resources::Resources,
     util::{
-        codec::{get_string, get_u8, get_u64, put_str, put_u64},
+        codec::{Delta, get_delta, get_string, get_u8, get_u64, put_delta, put_str, put_u64},
         fold::search_key,
     },
 };
@@ -296,6 +296,7 @@ pub fn train(
     // countries they are the strip an extract takes past a border, and would
     // take a whole country's rows.
     let in_countries = candidates.keys().any(Option::is_some);
+    let mut drawn_rows = 0;
     for (country, candidates) in candidates {
         scratch.check_cancelled()?;
         if country.is_none() && in_countries {
@@ -321,8 +322,10 @@ pub fn train(
             for (_, row) in drawn.into_iter().take(quota) {
                 shuffled.push(Shuffled {
                     key: random.next(),
+                    seq: drawn_rows,
                     row,
                 })?;
+                drawn_rows += 1;
                 rows += 1;
             }
         }
@@ -568,9 +571,6 @@ impl LatticeCache {
             self.rows.push(row);
             return Ok(());
         }
-        // The encoded rows take less than their resident bytes.
-        self.scratch
-            .check_room((self.reservation.bytes() + bytes) as u64)?;
         let mut file = IndexedSpool::create(&self.scratch, "parse-lattices")?;
         for held in self.rows.drain(..) {
             file.write(&held)?;
@@ -608,16 +608,19 @@ impl Lattices {
     }
 }
 
-/// A row with the random key that orders it among all rows.
+/// A row with the random key that orders it among all rows, and its draw
+/// order: two rows whose keys collide keep the order they were drawn in,
+/// so a build stays deterministic though the sort is not stable.
 #[derive(Debug)]
 struct Shuffled {
     key: u64,
+    seq: u64,
     row: Row,
 }
 
 impl PartialEq for Shuffled {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        (self.key, self.seq) == (other.key, other.seq)
     }
 }
 
@@ -631,25 +634,41 @@ impl PartialOrd for Shuffled {
 
 impl Ord for Shuffled {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
+        (self.key, self.seq).cmp(&(other.key, other.seq))
     }
 }
 
 impl Spill for Shuffled {
     fn encode(&self, out: &mut Vec<u8>) {
         put_u64(out, self.key);
+        put_u64(out, self.seq);
         self.row.encode(out);
     }
 
     fn decode(input: &mut &[u8]) -> Result<Self> {
         Ok(Self {
             key: get_u64(input)?,
+            seq: get_u64(input)?,
+            row: Row::decode(input)?,
+        })
+    }
+
+    fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
+        put_delta(out, delta, self.key as i64);
+        put_u64(out, self.seq);
+        self.row.encode(out);
+    }
+
+    fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
+        Ok(Self {
+            key: get_delta(input, delta)? as u64,
+            seq: get_u64(input)?,
             row: Row::decode(input)?,
         })
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<u64>() + self.row.resident_bytes()
+        2 * std::mem::size_of::<u64>() + self.row.resident_bytes()
     }
 }
 

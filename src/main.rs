@@ -122,6 +122,14 @@ enum PackCommand {
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
 
+        /// The most scratch disk the build may hold at once, in MiB. Near
+        /// the cap the build compresses its spill harder and merges older
+        /// runs to free space; past it, it stops early and says what is
+        /// live and what would fit. The scratch volume's free space caps it
+        /// either way.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1 << 30))]
+        scratch_budget_mb: Option<u64>,
+
         /// Build even when the pre-flight check finds too little memory or
         /// disk for the input.
         #[arg(long)]
@@ -535,6 +543,7 @@ async fn main() -> Result<()> {
             pack,
             memory_budget_mb,
             scratch_dir,
+            scratch_budget_mb,
             force,
             openaddresses,
             address_files,
@@ -550,6 +559,7 @@ async fn main() -> Result<()> {
                     .transpose()
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
+                scratch_budget_bytes: scratch_budget_mb.map(|mb| mb << 20),
                 force,
                 ..BuildOsmOptions::default()
             };
@@ -578,11 +588,13 @@ async fn main() -> Result<()> {
                 found.memory_limit,
             );
             let report = build_planned_osm_pack(options, plan)?;
+            eprint!("{}", report.stage_table());
             write_json(serde_json::json!({
                 "records": report.output.record_count,
                 "rejections": report.output.rejection_count,
                 "pack_bytes": report.output.pack_bytes,
                 "scratch_spilled_bytes": report.scratch.spilled_bytes,
+                "scratch_peak_bytes": report.scratch.peak_live_bytes,
                 "seconds": report.phases.total_ms as f64 / 1000.0,
             }))
         }

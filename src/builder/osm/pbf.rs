@@ -7,13 +7,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
+    time::Instant,
 };
 
 use crate::error::{Error, Result};
 use osmpbf::{Blob, BlobDecode, BlobReader, ByteOffset, PrimitiveBlock};
 use rayon::prelude::*;
 
-use crate::builder::progress::{BuildStage, Progress};
+use crate::builder::progress::{BuildStage, InputCounter, Progress};
 
 const READ_BUFFER_BYTES: usize = 4 << 20;
 /// Blobs decoded per parallel batch, per worker thread.
@@ -59,6 +60,7 @@ where
                 inner: file,
                 progress: offsets.is_none().then(|| progress.clone()),
                 read_bytes: Arc::clone(&read_bytes),
+                read: progress.input(input),
             },
         ),
         position: 0,
@@ -224,17 +226,22 @@ impl<R: Seek> Seek for Buffered<R> {
     }
 }
 
+/// Counts what is read from the input, and the time it takes, for the
+/// build report; and advances the stage when it is measured in bytes.
 struct ProgressReader<R> {
     inner: R,
     progress: Option<Progress>,
     read_bytes: Arc<AtomicU64>,
+    read: Arc<InputCounter>,
 }
 
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let started = Instant::now();
         let bytes_read = self.inner.read(buffer)?;
         self.read_bytes
             .fetch_add(bytes_read as u64, Ordering::Relaxed);
+        self.read.add(bytes_read as u64, started.elapsed());
         if let Some(progress) = &self.progress {
             progress.advance(bytes_read as u64);
         }
@@ -263,6 +270,7 @@ mod tests {
                     inner: io::Cursor::new(data.clone()),
                     progress: None,
                     read_bytes: Arc::clone(&read_bytes),
+                    read: Arc::default(),
                 },
             ),
             position: 0,
