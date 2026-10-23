@@ -7,11 +7,18 @@ Fast, lightweight, self-hosted geocoding in pure Rust.
 [![docs.rs](https://img.shields.io/docsrs/open-geocode?style=flat-square)](https://docs.rs/open-geocode)
 [![license](https://img.shields.io/crates/l/open-geocode.svg?style=flat-square)](LICENSE)
 
-`open-geocode` is a minimal Rust-native geocoding engine: address and named
-place search, Tantivy-backed autocomplete, and reverse geocoding from coordinates to
-address-first location context. It turns OpenStreetMap PBF extracts into a
-single compact Pack file holding a memory-mapped record store, a Tantivy text
-index, and an H3-backed spatial index, with no database or search cluster to run.
+`open-geocode` is a self-hosted address geocoding engine built entirely on open data (OpenStreetMap and OpenAddresses).
+Forward, autocomplete, reverse and batch geocoding, served from one file.
+
+Country-scale indexes build in minutes and serve 10× the queries per second of Pelias and Nominatim.
+og is an alternative to commercial API quotas and to the days-long builds of Pelias and Nominatim, whether for a single region or for global geocoding.
+
+**Features**
+
+- **Parser:** semi-Markov CRF, trained on every build from the addresses it serves.
+- **Search:** Tantivy index and FST dictionaries, with Levenshtein-automata typo tolerance and Unicode transliteration across scripts. Free-form or structured input.
+- **Reverse:** Hilbert-packed R-trees and point-in-polygon on real admin boundaries, returning the nearest address with its full locality, region and country.
+- **Results:** calibrated confidence, plus a rooftop, interpolated or street-level accuracy tier.
 
 <img src="demo/recording/og-demo.gif" alt="Building the Luxembourg Pack in og, then geocoding a CSV of 4,000 addresses" width="100%">
 
@@ -20,74 +27,15 @@ every row matched in about a second, p50 1.6 ms and p99 5.4 ms.
 
 ## Why open-geocode?
 
-Address data does not change minute to minute. You build it from an OSM extract
-and rebuild it when a newer one comes out, so it behaves like a lookup table
-rather than a live document you keep editing. The standard open-source options,
-Nominatim and Pelias, serve it from stateful systems that stay running, a
-PostgreSQL/PostGIS database or an Elasticsearch cluster.
+Geocoding your address data through a commercial API means per-lookup fees after the free tier, rate limits, and every address sent to a third party.
 
-open-geocode skips that. It compiles the extract once into one Pack file and
-serves it from a single small binary. No database, no Java, no cluster to
-babysit. To update, you build a new Pack and swap it in. And because a Pack is
-just a file, you can copy it, cache it, or ship it to the edge like any other
-static asset.
+Nominatim and Pelias, the open-source options, have no batch endpoint and are hard to self-host.
+Nominatim needs PostgreSQL with PostGIS, and a planet import takes days on a machine with 64 GB of RAM.
 
-open-geocode is stateless and read-only: it memory-maps the Pack for
-zero-overhead lookups, so it can run on scale-to-zero platforms like Cloud Run or
-Fly Machines and idle at near-zero cost between bursts. Always-on PostgreSQL or
-Elasticsearch can't scale to zero, so for spiky or low-traffic workloads, og can
-be far cheaper to run.
+open-geocode runs on your own hardware: drop in a CSV, get it back with coordinates, and no address leaves your network.
 
-## Quickstart
-
-Building the Ontario pack (~940 MB PBF) takes about a minute on a 24-core machine.
-
-1. Download an OSM extract, for example Ontario from [Geofabrik](https://download.geofabrik.de/north-america/canada/ontario.html), and save it as `data/ontario.pbf`.
-2. Build the pack:
-   ```
-   cargo run --release -- pack build --input data/ontario.pbf --pack data/pack
-   ```
-   Add `--openaddresses` to merge in the OpenAddresses points of the countries the Pack covers, leaving out the ones OSM already has.
-   Downloading them needs an OpenAddresses API token in `OA_TOKEN`; `--addresses PATH` adds a local OpenAddresses GeoJSON or CSV file instead.
-3. Serve the API and demo UI on `http://127.0.0.1:8080`:
-   ```
-   cargo run --release -- serve --pack data/pack
-   ```
-
-## The og interface
-
-`og` is the interactive way to do the same: pick a region, build its Pack, search it, and geocode CSV files.
-
-```
-cargo run --release --features tui --bin og
-```
-
-Regions come from the catalog in `catalog/regions.json`, generated from pinned upstream snapshots (see `catalog/README.md`).
-`og` downloads the region's OpenStreetMap extract, checks it against its published MD5 sum, and builds the Pack on this machine.
-Extracts and Packs live in the og home: `OG_HOME` when set, otherwise the platform's local data directory.
-An extract already at `<home>/pbf/<region id>.osm.pbf` is used without downloading.
-Before a build starts, `og` shows the builder's plan: the memory budget and threads sized to this machine, and the memory and disk the extract needs against what is free.
-A build that does not fit is not started unless forced (`f`, or `og build --force`).
-Time estimates appear once a build of a similar size has finished on the same machine; they are scaled from it, never assumed.
-
-The same work runs without the interface:
-
-```
-og build --region canada/ontario
-og serve canada-ontario
-```
-
-## What's next
-
-I'm actively working on turning open-geocode into a free batch geocoder for the whole planet: drop in a spreadsheet of addresses, get it back with coordinates.
-
-Think Adobe's file converter, but for addresses, and for the whole planet.
-
-## Hosted demo
-
-The public live demo and its Cloudflare Worker + Tunnel + VM deployment live in a
-separate repo, `open-geocode-live`. None of it is needed to run open-geocode
-locally.
+There is no PostgreSQL or Elasticsearch to keep running, and an update is a new file swapped in.
+Because the file is memory-mapped, og runs on scale-to-zero platforms like Cloud Run or Fly Machines and costs next to nothing between batches.
 
 ## Benchmarks
 
@@ -123,6 +71,19 @@ Single binary, no database or cluster: **~4.6× smaller on disk, lower memory us
 - Nominatim's forward p99 is a genuine heavy tail under the cap (p50 is 40 ms), not overload.
 - Single host: CPU capped, cache/disk shared; ratios travel better than absolute numbers.
 - Only the ~2.03M addresses are directly comparable; each engine indexes different extra layers.
+
+## Quickstart
+
+```
+cargo install --path . --features tui --bin og
+og build --region canada/ontario
+og serve canada-ontario
+```
+
+Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
+Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
+
+Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 
 ## Use Cases
 
