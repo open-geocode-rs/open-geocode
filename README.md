@@ -41,7 +41,7 @@ Because the file is memory-mapped, og runs on scale-to-zero platforms like Cloud
 
 ### Accuracy: MESSY STREETS
 
-[MESSY STREETS](https://doi.org/10.1145/3841645.3843362) (Gaere and von Wangenheim, SIGSPATIAL 2026) is a benchmark of verbatim addresses taken from the web, each verified to exist.
+[MESSY STREETS](https://arxiv.org/abs/2609.01612) (Gaere and von Wangenheim, SIGSPATIAL 2026) is a benchmark of verbatim addresses taken from the web, each verified to exist.
 The paper scored 12 geocoders on its gold tier: 10 runs of 100 rows at each resolution, 959 distinct inputs.
 og was given the same rows, as one free-text query each with default settings, as the paper queried the others.
 Ranked by CRR, as the paper ranks them:
