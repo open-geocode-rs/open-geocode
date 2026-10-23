@@ -1055,10 +1055,11 @@ impl TextSearcher {
             };
             match part.label {
                 Label::Country => {
-                    if let Some(country) = country_of(NameField::Country)
-                        && !places.countries.contains(&country)
-                    {
-                        places.countries.push(country);
+                    if let Some(country) = country_of(NameField::Country) {
+                        places.country_words.extend(part.words.iter().cloned());
+                        if !places.countries.contains(&country) {
+                            places.countries.push(country);
+                        }
                     }
                 }
                 Label::Region => {
@@ -2044,12 +2045,15 @@ impl TextSearcher {
             },
             false => filters,
         };
+        // A word of a country the Pack knows is held to that country, not to
+        // the names of the hit's areas: "ES" read first as a locality and
+        // then as Spain is Spain.
         let relabelled = plan
             .context
             .iter()
             .filter(|part| !matches!(part.label, Label::Locality | Label::Postcode))
             .flat_map(|part| &part.words)
-            .filter(|word| placed.contains(*word))
+            .filter(|word| placed.contains(*word) && !places.country_words.contains(word))
             .cloned();
         let unplaced = match plan.subject.is_empty() {
             true => HashSet::new(),
@@ -2271,8 +2275,10 @@ impl TextSearcher {
     /// The names, as search keys, of the [`NEAR_SETTLEMENTS`] settlements
     /// nearest a hit, within [`NEAR_SETTLEMENT_RADIUS_M`], that the Pack
     /// holds only as points: a town or suburb OSM maps as a node names the
-    /// land nearer it than most others, with no boundary to say so. None
-    /// for a hit with no point.
+    /// land nearer it than most others, with no boundary to say so. A node
+    /// inside a boundary of its own name is the point of a town its
+    /// boundary bounds, and names nothing past it (Dayton's node is no
+    /// sign that Clayton is Dayton). None for a hit with no point.
     fn near_settlements(&self, hit: &TextSearchHit) -> Result<Vec<String>> {
         let Some(point) = hit.record.point else {
             return Ok(Vec::new());
@@ -2290,10 +2296,18 @@ impl TextSearcher {
         )?;
         let mut names = Vec::new();
         for candidate in near {
-            for name in records.names(candidate.record_id)?.iter() {
-                if let Some(name) = normalized_for_match(Some(name)) {
-                    names.push(name);
-                }
+            let own = records
+                .names(candidate.record_id)?
+                .iter()
+                .filter_map(|name| normalized_for_match(Some(name)))
+                .collect::<Vec<_>>();
+            let bounded = self
+                .areas_of(candidate.record_id)?
+                .localities
+                .iter()
+                .any(|area| own.contains(area));
+            if !bounded {
+                names.extend(own);
             }
         }
         Ok(names)
@@ -4720,6 +4734,8 @@ struct StatedPlaces {
     /// The countries its country parts name that the Pack holds records in,
     /// by the Pack's names and codes of countries.
     countries: Vec<CountryCode>,
+    /// The words of the parts that name those countries.
+    country_words: Vec<String>,
     regions: Vec<StatedRegion>,
 }
 
