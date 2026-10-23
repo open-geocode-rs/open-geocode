@@ -39,7 +39,7 @@ Because the file is memory-mapped, og runs on scale-to-zero platforms like Cloud
 
 ## Benchmarks
 
-### Accuracy: MESSY STREETS
+### Accuracy
 
 [MESSY STREETS](https://arxiv.org/abs/2609.01612) (Gaere and von Wangenheim, SIGSPATIAL 2026) is a benchmark of verbatim addresses taken from the web, each verified to exist.
 The paper scored 12 geocoders on its gold tier: 10 runs of 100 rows at each resolution, 959 distinct inputs.
@@ -70,7 +70,7 @@ Other rows are the paper's (public endpoints, June 2026).
   Built in 2 h 51 min on a 24-core / 32 GB desktop with a 9 GB memory budget.
   53 inputs are answered with a `fallback` area (postcode, town or country); full answers only, CRR is 94.4%.
 
-### Speed: Ontario
+### Speed
 
 Three geocoders on the same inputs and resources: **open-geocode**, **Nominatim**,
 and **Pelias**, each serving the same Ontario OSM extract (~2.03M addresses) in
