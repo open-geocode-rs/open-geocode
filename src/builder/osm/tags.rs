@@ -8,7 +8,8 @@ use crate::{
 /// Convenience accessors over an OSM tag map. Replaces the per-module
 /// `tag_value`/`has_*` free functions with one shared, testable surface.
 pub(crate) trait OsmTags {
-    /// Whitespace-cleaned value for `key`, or `None` if missing or blank.
+    /// Whitespace-cleaned value for `key`, cut before any other tag pasted
+    /// into it (see [`without_pasted_tags`]), or `None` if missing or blank.
     fn cleaned(&self, key: &str) -> Option<String>;
 
     /// Whether `key` has a non-blank value.
@@ -19,9 +20,63 @@ pub(crate) trait OsmTags {
 
 impl OsmTags for BTreeMap<String, String> {
     fn cleaned(&self, key: &str) -> Option<String> {
-        self.get(key).and_then(|value| collapse_whitespace(value))
+        self.get(key)
+            .and_then(|value| collapse_whitespace(without_pasted_tags(value)))
     }
 }
+
+/// `value` up to where another tag written out as `key=value` starts, and
+/// without the separators before it: an editor's slip pastes the next tag
+/// into a value ("Evansvilleaddr:state=IN" for `addr:city=Evansville`), and
+/// the name a label shows must not carry it. A key is lower-case letters,
+/// digits and underscores in parts joined by colons, two parts at least, as
+/// every `addr:*` and `name:*` key is; so `=` in text of its own ("a=b",
+/// "E=mc²") is kept.
+pub(crate) fn without_pasted_tags(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let key_byte = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_';
+    for (equals, _) in value.match_indices('=') {
+        let mut start = equals;
+        while start > 0 && (key_byte(bytes[start - 1]) || bytes[start - 1] == b':') {
+            start -= 1;
+        }
+        let key = &value[start..equals];
+        let parts = key.split(':').collect::<Vec<_>>();
+        // The key may be glued to the value it was pasted after:
+        // "Evansvilleaddr:state" is "Evansville" and "addr:state". Its first
+        // part is cut back to the namespace a key of that kind starts with,
+        // the longest that fits, and a key in none is no key.
+        let first = parts[0];
+        let Some(namespace) = PASTED_KEY_NAMESPACES
+            .iter()
+            .filter(|namespace| first.ends_with(*namespace))
+            .max_by_key(|namespace| namespace.len())
+        else {
+            continue;
+        };
+        if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+            continue;
+        }
+        let cut = start + first.len() - namespace.len();
+        return value[..cut].trim_end_matches(|character: char| {
+            character.is_whitespace() || matches!(character, ';' | ',' | '|')
+        });
+    }
+    value
+}
+
+/// The namespaces of the keys whose tags are pasted into values: a key
+/// glued to the value before it is told apart from that value by them.
+const PASTED_KEY_NAMESPACES: [&str; 8] = [
+    "addr",
+    "name",
+    "alt_name",
+    "old_name",
+    "official_name",
+    "contact",
+    "is_in",
+    "building",
+];
 
 /// Keys whose values are other names of the feature, with or without a
 /// `:<lang>` suffix.
@@ -118,6 +173,30 @@ pub(crate) fn name_tags(tags: &BTreeMap<String, String>) -> impl Iterator<Item =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tag_pasted_into_a_value_is_cut_off() {
+        assert_eq!(without_pasted_tags("Evansvilleaddr:state=IN"), "Evansville");
+        assert_eq!(
+            without_pasted_tags("Main Street; addr:postcode=47708"),
+            "Main Street"
+        );
+        assert_eq!(without_pasted_tags("addr:city=Evansville"), "");
+        assert_eq!(without_pasted_tags("Evansville"), "Evansville");
+        assert_eq!(without_pasted_tags("E=mc2 Cafe"), "E=mc2 Cafe");
+        assert_eq!(without_pasted_tags("Route A=B"), "Route A=B");
+        let tags = [(
+            "addr:city".to_string(),
+            "Evansvilleaddr:state=IN".to_string(),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        assert_eq!(tags.cleaned("addr:city").as_deref(), Some("Evansville"));
+        let pasted = [("name".to_string(), "addr:city=Evansville".to_string())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(pasted.cleaned("name"), None);
+    }
 
     #[test]
     fn prominence_counts_languages_and_links() {

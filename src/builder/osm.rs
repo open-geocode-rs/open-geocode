@@ -361,8 +361,6 @@ struct Run<'a> {
     done: Option<Step>,
     /// What every stage of the runs before this one cost.
     stages_before: Vec<StageReport>,
-    /// Until the record write takes it.
-    generation: Option<Generation>,
     build: Build,
     /// Sorters already read, as the report counts them.
     sorted: BTreeMap<String, SorterReport>,
@@ -402,6 +400,11 @@ struct Run<'a> {
     /// When the Pack's indexes started, in this run.
     indexing: Option<Instant>,
     checkpoints: CheckpointReport,
+    /// Until the record write takes it. Last, so it drops last: a failed
+    /// build removes its generation's directory as it drops, and Windows
+    /// keeps a directory while a file in it is still open, as the audit
+    /// and the sorters' runs are until the fields before this one drop.
+    generation: Option<Generation>,
 }
 
 /// Context records in their order, the ids they were given, and what

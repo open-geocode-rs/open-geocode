@@ -193,7 +193,6 @@ fn indexed_area_names<'a>(
 /// Writes records in their final order. Record ids are assigned sequentially.
 #[derive(Debug)]
 pub struct Writer {
-    generation: Generation,
     scratch: Arc<Scratch>,
     records: records::Writer,
     contexts: TupleWriter,
@@ -205,6 +204,9 @@ pub struct Writer {
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
+    /// Last, so it drops after every writer of a file in it (see
+    /// [`Generation`]'s drop).
+    generation: Generation,
 }
 
 /// A finished, unpublished Pack.
@@ -290,6 +292,9 @@ impl Generation {
     }
 }
 
+/// A generation no build keeps is removed as it drops. Windows keeps a
+/// directory while a file in it is open, so whatever holds one drops first:
+/// the structs holding a generation declare it last.
 impl Drop for Generation {
     fn drop(&mut self) {
         let resumable = self
@@ -525,13 +530,15 @@ impl Writer {
 /// parts streamed to scratch are copied in one at a time.
 #[derive(Debug)]
 pub struct Sealing {
-    generation: Generation,
     scratch: Arc<Scratch>,
     pack: container::Writer,
     records: Option<records::Writer>,
     text: Option<text_index::Writer>,
     spatial: Option<spatial_index::Writer>,
     counts: SealCounts,
+    /// Last, so it drops after every writer of a file in it (see
+    /// [`Generation`]'s drop).
+    generation: Generation,
 }
 
 /// What the Pack manifest counts, gathered as the parts are sealed.

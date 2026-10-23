@@ -1046,8 +1046,12 @@ fn country_name_from_code(code: &str) -> &str {
 }
 
 /// The levels that are areas of the Pack at all. Outside it an `admin_level`
-/// is a supranational union (1) or past anything OSM ranks (12 and up).
-const RANKED_ADMIN_LEVELS: std::ops::RangeInclusive<u8> = 0..=11;
+/// is a supranational union (1) or past anything OSM ranks (12 and up). A
+/// union ranked as an area took the country tier of the country its centre
+/// lies in, and pushed that country's every level one tier down: France
+/// became a region, its departments localities and its communes
+/// neighbourhoods, so its streets were labelled with their region.
+const RANKED_ADMIN_LEVELS: std::ops::RangeInclusive<u8> = COUNTRY_ADMIN_LEVEL..=11;
 
 /// The provisional layer for an admin level, before containment is known.
 ///
@@ -1975,6 +1979,28 @@ mod tests {
         assert_eq!(tuple.get(PlaceLayer::Locality), Some(1), "the district");
         assert_eq!(tuple.get(PlaceLayer::SubLocality), Some(2), "the suburb");
         assert_eq!(tuple.entries().len(), 2, "both, not one: {tuple:?}");
+    }
+
+    /// A union of countries is no area of the Pack (see
+    /// [`RANKED_ADMIN_LEVELS`]), a country is.
+    #[test]
+    fn a_union_of_countries_is_no_area() {
+        let tags = |level: &str| {
+            [
+                ("boundary", "administrative"),
+                ("admin_level", level),
+                ("name", "European Union"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<BTreeMap<_, _>>()
+        };
+        assert!(area_parts(&tags("1")).is_none());
+        assert!(area_parts(&tags("0")).is_none());
+        assert_eq!(
+            area_parts(&tags("2")).map(|parts| parts.layer),
+            Some(PlaceLayer::Country)
+        );
     }
 
     /// Australia puts its suburbs at level 9 and uses no level 8, so without
