@@ -39,6 +39,39 @@ Because the file is memory-mapped, og runs on scale-to-zero platforms like Cloud
 
 ## Benchmarks
 
+### Accuracy: MESSY STREETS
+
+[MESSY STREETS](https://doi.org/10.1145/3841645.3843362) (Gaere and von Wangenheim, SIGSPATIAL 2026) is a benchmark of verbatim addresses taken from the web, each verified to exist.
+The paper scored 12 geocoders on its gold tier: 10 runs of 100 rows at each resolution, 959 distinct inputs.
+og was given the same rows, as one free-text query each with default settings, as the paper queried the others.
+Ranked by CRR, as the paper ranks them:
+
+| Geocoder | CRR (%) | GH1 (%) ±2500 km | GH4 (%) ±20 km | GH6 (%) ±0.6 km |
+| --- | ---: | ---: | ---: | ---: |
+| Google Maps v3 | 100.0±0.0 | 100.0±0.0 | 98.6±0.7 | 88.3±2.0 |
+| **open-geocode** * | **100.0** | **98.6** | **91.5** | **67.7** |
+| MapQuest v1 | 100.0±0.0 | 98.5±0.5 | 97.1±0.5 | 84.0±1.5 |
+| ArcGIS | 99.8±0.3 | 99.8±0.3 | 97.9±1.3 | 85.3±2.8 |
+| Geoapify v1 | 99.7±0.4 | 99.2±0.5 | 96.3±1.2 | 79.1±3.7 |
+| Here v7 | 99.1±0.6 | 99.0±0.5 | 97.6±0.5 | 85.1±2.0 |
+| Mapbox v5 | 99.1±0.5 | 98.6±0.7 | 95.1±1.5 | 81.0±2.9 |
+| OpenCage v1 | 98.4±1.0 | 97.4±1.0 | 90.2±1.8 | 68.2±2.9 |
+| Azure Maps | 97.2±0.8 | 97.1±0.9 | 94.8±1.5 | 81.3±3.7 |
+| Pelias v1 | 96.6±1.8 | 94.1±2.5 | 85.9±3.3 | 67.8±4.4 |
+| TomTom v2 | 94.0±1.3 | 93.9±1.4 | 91.8±1.7 | 79.4±3.6 |
+| Photon | 88.1±1.0 | 88.0±1.1 | 84.9±1.1 | 62.8±2.5 |
+| Nominatim | 68.2±4.3 | 68.2±4.3 | 66.6±4.7 | 55.6±3.6 |
+
+CRR: share of queries with any answer.
+GH1/GH4/GH6: share whose first answer is in the target's geohash cell.
+Other rows are the paper's (public endpoints, June 2026).
+
+- \* Planet Pack from OpenStreetMap only (October 2026), no OpenAddresses: the whole planet in one 17.9 GB file, memory-mapped when served, 233.7M records.
+  Built in 2 h 51 min on a 24-core / 32 GB desktop with a 9 GB memory budget.
+  53 inputs are answered with a `fallback` area (postcode, town or country); full answers only, CRR is 94.4%.
+
+### Speed: Ontario
+
 Three geocoders on the same inputs and resources: **open-geocode**, **Nominatim**,
 and **Pelias**, each serving the same Ontario OSM extract (~2.03M addresses) in
 Docker, one at a time, capped at an identical 4 CPU / 10 GB, over loopback HTTP.
@@ -50,7 +83,7 @@ Host: 24-core / 32 GB, Windows 11 + Docker Desktop:
 
 | | open-geocode | Pelias | Nominatim |
 | --- | ---: | ---: | ---: |
-| Deployable footprint ³ | **1.28 GiB** | 5.88 GiB | 5.92 GiB |
+| Deployable footprint ³ | **0.30 GiB** | 5.88 GiB | 5.92 GiB |
 | RAM while serving | **~1.2 GiB** ¹ | 4.60 GiB | 2.75 GiB |
 | Forward service-time p50 / p99 | **1.0 / 2.0 ms** | 11.5 / 67.6 ms | 40.0 / 1384.7 ms |
 | Reverse service-time p50 / p99 | **1.0 / 1.5 ms** | 5.0 / 9.5 ms | 7.5 / 14.2 ms |
@@ -58,15 +91,15 @@ Host: 24-core / 32 GB, Windows 11 + Docker Desktop:
 | Reverse throughput (req/s @ p99<100ms) | **1000** ² | 500 | 100 |
 | Addresses indexed | 2,032,851 | 2,036,529 | 2,037,682 |
 
-Single binary, no database or cluster: **~4.6× smaller on disk, lower memory use,
+Single binary, no database or cluster: **~20× smaller on disk, lower memory use,
 ~10–40× higher forward throughput, sub-millisecond latency.**
 
-### Notes
+#### Notes
 
 - ¹ open-geocode memory-maps its pack, so process RSS is only ~0.03 GiB but ~1.2 GiB figure is the working set: resident in the OS page cache
 - ² open-geocode's true throughput ceiling is higher; the load grid stopped at 1000.
-- ³ Measured with the previous multi-file Pack format, where the Ontario Pack was about 1.2 GB.
-  The single-file Pack for the same extract is about 0.3 GB; the serving benchmarks have not been re-run with it yet.
+- ³ The single-file Pack: 324 MB for Ontario.
+  The serving rows were measured on the earlier multi-file Pack (1.28 GiB) and have not been re-run.
 - Engines do unequal work per query (Pelias libpostal parsing, Nominatim hierarchy); reported, not corrected.
 - Nominatim's forward p99 is a genuine heavy tail under the cap (p50 is 40 ms), not overload.
 - Single host: CPU capped, cache/disk shared; ratios travel better than absolute numbers.
