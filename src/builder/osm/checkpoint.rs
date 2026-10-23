@@ -168,6 +168,9 @@ pub(super) struct State {
     pub input: Option<InputState>,
     /// From the boundary stage to the record write.
     pub boundaries: Option<RunState>,
+    /// The boundaries' shape file, by name and length, beside them.
+    #[serde(default)]
+    pub boundary_shapes: Option<(String, u64)>,
     /// The address files imported, once they are.
     pub imports: Option<Vec<AddressFile>>,
     /// From context ordering to the record write.

@@ -46,6 +46,14 @@ impl Resources {
         resources.available_memory_bytes = resources
             .available_memory_bytes
             .min(resources.total_memory_bytes);
+        // Tests run many small builds side by side, and each would count the
+        // others' memory as taken: a build's plan then refused or warned
+        // depending on what its neighbours held at that instant. A test build
+        // sizes itself to the machine instead.
+        #[cfg(test)]
+        {
+            resources.available_memory_bytes = resources.total_memory_bytes;
+        }
         resources
     }
 }
@@ -637,10 +645,17 @@ mod tests {
         {
             let clock = ThreadClock::current().expect("thread clock");
             let before = clock.cpu_time().expect("thread time");
+            // Spin until the clock moves rather than for a fixed time: a
+            // thread clock ticks in scheduler quanta, and a loaded machine can
+            // leave a short spin with less CPU time than one quantum.
             let spin = std::time::Instant::now();
-            while spin.elapsed() < std::time::Duration::from_millis(30) {}
+            let mut spun = before;
+            while spun <= before && spin.elapsed() < std::time::Duration::from_secs(10) {
+                spun = clock.cpu_time().expect("thread time");
+            }
+            assert!(spun > before, "the thread clock moves as the thread runs");
             let read = std::thread::scope(|scope| scope.spawn(|| clock.cpu_time()).join());
-            assert!(read.expect("joined").expect("thread time") > before);
+            assert!(read.expect("joined").expect("thread time") >= spun);
         }
         #[cfg(any(windows, target_os = "linux"))]
         assert!(resident_bytes().is_some_and(|bytes| bytes > 0));

@@ -711,6 +711,16 @@ pub struct GeometryPassReport {
     pub boundary_member_read_bytes: u64,
     pub node_read_bytes: u64,
     pub way_read_bytes: u64,
+    /// Vertices of the boundary shapes built, a vertex shared by two areas
+    /// counted in each.
+    #[serde(default)]
+    pub boundary_shape_vertices: u64,
+    /// Bytes of the shape file the boundary shapes are mapped from.
+    #[serde(default)]
+    pub boundary_shape_bytes: u64,
+    /// Heap the boundaries hold beside their shapes: names, codes, boxes.
+    #[serde(default)]
+    pub boundary_heap_bytes: u64,
 }
 
 impl GeometryPassReport {

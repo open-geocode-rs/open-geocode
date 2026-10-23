@@ -1,9 +1,10 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
 };
 
-use geo::{Area, BoundingRect, Centroid, Contains, LineString, MultiPolygon, Point, Polygon, Rect};
+use geo::{Area, BoundingRect, Centroid, Contains, LineString, MultiPolygon, Polygon, Rect};
 use rayon::prelude::*;
 use rstar::{AABB, RTree, RTreeObject};
 
@@ -20,7 +21,7 @@ use crate::{
 
 use super::{
     admin_levels::{self, admin_levels},
-    containment::AreaShape,
+    containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
     tags::{OsmTags, alternate_names, name_tags},
 };
@@ -76,6 +77,7 @@ pub(crate) struct BoundaryWay {
 pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
     tree: RTree<BoundaryBox>,
+    shapes: Arc<Shapes>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,7 +106,7 @@ struct AcceptedBoundary {
     source_object_type: ObjectType,
     source_object_id: i64,
     bounds: Rect<f64>,
-    shape: AreaShape,
+    shape: ShapeRef,
     area: f64,
 }
 
@@ -136,7 +138,10 @@ struct BuiltBoundary {
     /// `CA-ON`. Kept whatever tier the boundary is ranked at, which for a
     /// country with many levels need not be the region tier.
     subdivision_code: Option<String>,
-    geometry: MultiPolygon<f64>,
+    /// Where its shape lies in the shape file; nothing until it is written.
+    shape: ShapeRef,
+    bounds: Rect<f64>,
+    area: f64,
     representative_point: [f64; 2],
 }
 
@@ -162,32 +167,170 @@ pub(crate) struct BoundarySet {
     /// The ways and relations libpostal's admin table names for the
     /// countries of the input that the input does not have.
     unmatched_admin_ids: Vec<String>,
+    shapes: Arc<Shapes>,
 }
 
-impl BoundaryCandidate {
-    /// The candidate a closed boundary or place way makes, if any.
-    pub(crate) fn of_way(way: &BoundaryWay) -> Option<Self> {
-        Some(Self {
-            source_object_type: ObjectType::Way,
-            source_object_id: way.object_id,
-            boundary: boundary_from_way(way)?,
+/// A boundary assembled, and the block of its shape not yet written.
+struct Draft {
+    candidate: BoundaryCandidate,
+    block: Vec<u8>,
+}
+
+/// Boundaries as they are assembled. Each shape goes to the shape file as
+/// soon as it is built, so the heap holds only what describes the areas.
+pub(crate) struct BoundaryBuilder {
+    candidates: Vec<BoundaryCandidate>,
+    shapes: ShapeWriter,
+    heap_bytes: usize,
+    vertices: u64,
+}
+
+impl BoundaryBuilder {
+    pub(crate) fn new(scratch: &Arc<crate::extsort::Scratch>) -> crate::error::Result<Self> {
+        Ok(Self {
+            candidates: Vec::new(),
+            shapes: ShapeWriter::create(scratch)?,
+            heap_bytes: 0,
+            vertices: 0,
+        })
+    }
+
+    /// The closed boundary and place ways among `ways`, assembled in
+    /// parallel.
+    pub(crate) fn add_ways(&mut self, ways: &[BoundaryWay]) -> crate::error::Result<()> {
+        let drafts = ways
+            .par_iter()
+            .filter_map(|way| {
+                let (boundary, block) = boundary_from_way(way)?;
+                Some(Draft {
+                    candidate: BoundaryCandidate {
+                        source_object_type: ObjectType::Way,
+                        source_object_id: way.object_id,
+                        boundary,
+                    },
+                    block,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.write(drafts)
+    }
+
+    /// The areas `relations` make, assembled in parallel. `member_line`
+    /// gives a member way's vertices, `None` when it was not kept or a node
+    /// of it is missing.
+    pub(crate) fn add_relations(
+        &mut self,
+        relations: &[BoundaryRelationStub],
+        member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
+    ) -> crate::error::Result<()> {
+        let drafts = relations
+            .par_iter()
+            .map(|stub| {
+                Ok(
+                    boundary_from_relation(stub, &member_line)?.map(|(boundary, block)| Draft {
+                        candidate: BoundaryCandidate {
+                            source_object_type: ObjectType::Relation,
+                            source_object_id: stub.object_id,
+                            boundary,
+                        },
+                        block,
+                    }),
+                )
+            })
+            .collect::<crate::error::Result<Vec<_>>>()?;
+        self.write(drafts.into_iter().flatten().collect())
+    }
+
+    fn write(&mut self, drafts: Vec<Draft>) -> crate::error::Result<()> {
+        for Draft {
+            mut candidate,
+            block,
+        } in drafts
+        {
+            candidate.boundary.shape = self.shapes.write(&block)?;
+            self.vertices += u64::from(shape_vertices(&block));
+            self.heap_bytes += candidate.heap_bytes();
+            self.candidates.push(candidate);
+        }
+        Ok(())
+    }
+
+    /// Heap the boundaries assembled so far hold.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.heap_bytes
+    }
+
+    /// Vertices of the shapes written so far.
+    pub(crate) fn vertices(&self) -> u64 {
+        self.vertices
+    }
+
+    /// Rank the boundaries into layers, which is only knowable once every
+    /// one is in hand, and derive the countries the input has no boundary
+    /// of.
+    pub(crate) fn finish(self) -> crate::error::Result<BoundarySet> {
+        let shapes = Arc::new(self.shapes.finish()?);
+        let mut candidates = self.candidates;
+        let unmatched_admin_ids = assign_layers_by_containment(&mut candidates, &shapes);
+        let derived_countries = derived_country_records(&candidates);
+        Ok(BoundarySet {
+            candidates,
+            derived_countries,
+            unmatched_admin_ids,
+            shapes,
         })
     }
 }
 
+/// Vertices a shape block holds: its first count.
+fn shape_vertices(block: &[u8]) -> u32 {
+    block.get(..4).map_or(0, |count| {
+        u32::from_le_bytes(count.try_into().expect("4 bytes"))
+    })
+}
+
+impl BoundaryCandidate {
+    /// Heap the candidate holds; its shape is on disk.
+    fn heap_bytes(&self) -> usize {
+        let boundary = &self.boundary;
+        let text = |value: &Option<String>| value.as_ref().map_or(0, String::capacity);
+        std::mem::size_of::<Self>()
+            + boundary.name.capacity()
+            + boundary.alt_names.capacity() * std::mem::size_of::<String>()
+            + boundary
+                .alt_names
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+            + text(&boundary.place_type)
+            + text(&boundary.designation)
+            + text(&boundary.inferred_country_code)
+            + text(&boundary.subdivision_code)
+    }
+}
+
+/// Whether `boundary` covers `point`, its box tested first.
+fn covers_point(shapes: &Shapes, boundary: &BuiltBoundary, [lon, lat]: [f64; 2]) -> bool {
+    let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
+    (min.x..=max.x).contains(&lon)
+        && (min.y..=max.y).contains(&lat)
+        && shapes.covers(boundary.shape, lon, lat)
+}
+
 impl BoundarySet {
-    /// Heap the boundaries' shapes hold, for the memory budget: they stay
-    /// in memory through the build, as the index records find their areas
-    /// in.
-    pub(crate) fn shape_bytes(&self) -> usize {
-        use geo::CoordsIter;
+    /// Heap the boundaries hold, for the memory budget. Their shapes are
+    /// mapped from the shape file, page cache the system reclaims, so only
+    /// what describes them counts.
+    pub(crate) fn heap_bytes(&self) -> usize {
         self.candidates
             .iter()
-            .map(|candidate| {
-                candidate.boundary.geometry.coords_count() * BOUNDARY_SHAPE_BYTES_PER_COORD
-                    + std::mem::size_of::<BoundaryCandidate>()
-            })
+            .map(BoundaryCandidate::heap_bytes)
             .sum()
+    }
+
+    /// The shape file, which the index and a checkpoint keep.
+    pub(crate) fn shapes(&self) -> &Arc<Shapes> {
+        &self.shapes
     }
 
     /// The objects libpostal's admin table names that the input lacks: a
@@ -344,26 +487,18 @@ impl BoundarySet {
                     && candidate.boundary.admin_level.is_some()
             })
             .map(|(candidate, record_id)| {
-                (
-                    &candidate.boundary,
-                    candidate.boundary.geometry.unsigned_area(),
-                    *record_id,
-                )
+                (&candidate.boundary, candidate.boundary.area, *record_id)
             })
             .collect::<Vec<_>>();
         regions
             .par_iter()
             .filter_map(|(region, area, record_id)| {
-                let point = Point::new(
-                    region.representative_point[0],
-                    region.representative_point[1],
-                );
                 let groups = regions
                     .iter()
                     .filter(|(group, group_area, _)| {
                         group_area > area
                             && !same_text(&group.name, &region.name)
-                            && group.geometry.contains(&point)
+                            && covers_point(&self.shapes, group, region.representative_point)
                     })
                     .map(|(_, _, group_id)| *group_id)
                     .collect::<Vec<_>>();
@@ -372,8 +507,7 @@ impl BoundarySet {
             .collect()
     }
 
-    /// Index the boundaries under their final record ids. Edge indexes of
-    /// large areas are built in parallel.
+    /// Index the boundaries under their final record ids.
     pub(crate) fn into_index(
         self,
         boundary_record_ids: &[RecordId],
@@ -381,17 +515,16 @@ impl BoundarySet {
     ) -> BoundaryIndex {
         let accepted = self
             .candidates
-            .into_par_iter()
+            .into_iter()
             .zip(boundary_record_ids)
-            .filter_map(|(candidate, record_id)| {
+            .map(|(candidate, record_id)| {
                 let boundary = candidate.boundary;
-                let bounds = boundary.geometry.bounding_rect()?;
-                Some(AcceptedBoundary {
+                AcceptedBoundary {
                     record_id: *record_id,
                     layer: boundary.layer,
                     tiers: boundary_tiers(&boundary),
-                    area: boundary.geometry.unsigned_area(),
-                    bounds,
+                    area: boundary.area,
+                    bounds: boundary.bounds,
                     inferred_country_record_id: boundary
                         .inferred_country_code
                         .as_deref()
@@ -400,11 +533,11 @@ impl BoundarySet {
                     admin_level: boundary.admin_level,
                     source_object_type: candidate.source_object_type,
                     source_object_id: candidate.source_object_id,
-                    shape: AreaShape::new(boundary.geometry),
-                })
+                    shape: boundary.shape,
+                }
             })
             .collect();
-        BoundaryIndex::new(accepted)
+        BoundaryIndex::new(accepted, self.shapes)
     }
 }
 
@@ -467,7 +600,7 @@ impl RTreeObject for BoundaryBox {
 }
 
 impl BoundaryIndex {
-    fn new(boundaries: Vec<AcceptedBoundary>) -> Self {
+    fn new(boundaries: Vec<AcceptedBoundary>, shapes: Arc<Shapes>) -> Self {
         let boxes = boundaries
             .iter()
             .enumerate()
@@ -479,6 +612,7 @@ impl BoundaryIndex {
         Self {
             boundaries,
             tree: RTree::bulk_load(boxes),
+            shapes,
         }
     }
 
@@ -496,7 +630,7 @@ impl BoundaryIndex {
         let mut covered = Vec::new();
         for boundary_box in self.tree.locate_in_envelope_intersecting(&envelope) {
             let boundary = &self.boundaries[boundary_box.boundary_id];
-            if boundary.shape.covers(lon, lat) {
+            if self.shapes.covers(boundary.shape, lon, lat) {
                 covered.push(boundary);
             }
         }
@@ -564,49 +698,6 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
         .collect()
 }
 
-/// Build boundary polygons from the candidates of the boundary ways
-/// ([`BoundaryCandidate::of_way`], made as a build streams the ways from
-/// disk) and from the relations. `member_line` gives a relation member way's
-/// vertices, `None` when it was not kept or a node of it is missing. `check`
-/// is asked every [`CHECK_EVERY`] boundaries whether to go on, and its error
-/// is returned.
-pub(crate) fn build_boundaries(
-    mut candidates: Vec<BoundaryCandidate>,
-    relations: &[BoundaryRelationStub],
-    member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
-    check: impl Fn() -> crate::error::Result<()>,
-) -> crate::error::Result<BoundarySet> {
-    for (index, stub) in relations.iter().enumerate() {
-        if index % CHECK_EVERY == 0 {
-            check()?;
-        }
-        if let Some(boundary) = boundary_from_relation(stub, &member_line)? {
-            candidates.push(BoundaryCandidate {
-                source_object_type: ObjectType::Relation,
-                source_object_id: stub.object_id,
-                boundary,
-            });
-        }
-    }
-    // Layers come from how the boundaries nest, which is only knowable once
-    // every candidate is in hand.
-    check()?;
-    let unmatched_admin_ids = assign_layers_by_containment(&mut candidates);
-    let derived_countries = derived_country_records(&candidates);
-    Ok(BoundarySet {
-        candidates,
-        derived_countries,
-        unmatched_admin_ids,
-    })
-}
-
-/// Boundaries assembled between two checks of whether the build goes on.
-const CHECK_EVERY: usize = 256;
-
-/// Heap a boundary shape holds per coordinate: the coordinate itself (two
-/// f64) and, once indexed, the prepared shape's segment index beside it.
-pub(crate) const BOUNDARY_SHAPE_BYTES_PER_COORD: usize = 48;
-
 /// Region boundaries whose ISO 3166-2 code names a country that has no
 /// country boundary in the input get a derived country record.
 fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, PlaceRecord)> {
@@ -649,61 +740,33 @@ fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, Pla
     sources.into_iter().collect()
 }
 
-fn boundary_from_way(way: &BoundaryWay) -> Option<BuiltBoundary> {
-    let AreaParts {
-        layer,
-        admin_level,
-        place_type,
-        name,
-        alt_names,
-        place_layer,
-        designation,
-    } = area_parts(&way.tags)?;
-    let inferred_country_code = country_code_from_tags(&way.tags, layer);
-    let subdivision_code = subdivision_code_from_tags(&way.tags, layer);
-    let closed = ends(&way.vertices).is_some_and(|(first, last)| first == last);
-    if way.vertices.len() < 4 || !closed {
+/// Whether a boundary way can be an area of its own: closed, and tagged as
+/// one.
+pub(crate) fn may_be_area(way: &BoundaryWay) -> bool {
+    way.vertices.len() >= 4
+        && ends(&way.vertices).is_some_and(|(first, last)| first == last)
+        && has_area_tags(&way.tags)
+}
+
+fn boundary_from_way(way: &BoundaryWay) -> Option<(BuiltBoundary, Vec<u8>)> {
+    if !may_be_area(way) {
         return None;
     }
+    let parts = area_parts(&way.tags)?;
     let polygon = Polygon::new(ring_line_string(&way.vertices), Vec::new());
     if polygon.unsigned_area() <= f64::EPSILON {
         return None;
     }
-    let geometry = MultiPolygon::new(vec![polygon]);
-    let representative_point = representative_point(&geometry)?;
-    Some(BuiltBoundary {
-        layer,
-        admin_level,
-        place_type,
-        name,
-        alt_names,
-        place_layer,
-        designation,
-        inferred_country_code,
-        subdivision_code,
-        geometry,
-        representative_point,
-    })
+    built(parts, &way.tags, MultiPolygon::new(vec![polygon]))
 }
 
 fn boundary_from_relation(
     stub: &BoundaryRelationStub,
     member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
-) -> crate::error::Result<Option<BuiltBoundary>> {
-    let Some(AreaParts {
-        layer,
-        admin_level,
-        place_type,
-        name,
-        alt_names,
-        place_layer,
-        designation,
-    }) = area_parts(&stub.tags)
-    else {
+) -> crate::error::Result<Option<(BuiltBoundary, Vec<u8>)>> {
+    let Some(parts) = area_parts(&stub.tags) else {
         return Ok(None);
     };
-    let inferred_country_code = country_code_from_tags(&stub.tags, layer);
-    let subdivision_code = subdivision_code_from_tags(&stub.tags, layer);
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
@@ -724,10 +787,18 @@ fn boundary_from_relation(
     let Some(geometry) = multipolygon_from_rings(outer_rings, inner_rings) else {
         return Ok(None);
     };
-    let Some(representative_point) = representative_point(&geometry) else {
-        return Ok(None);
-    };
-    Ok(Some(BuiltBoundary {
+    Ok(built(parts, &stub.tags, geometry))
+}
+
+/// The boundary an area's tags and geometry make, and the block of its
+/// shape: what is asked of the geometry later is read off it now, so it
+/// need not stay in memory.
+fn built(
+    parts: AreaParts,
+    tags: &BTreeMap<String, String>,
+    geometry: MultiPolygon<f64>,
+) -> Option<(BuiltBoundary, Vec<u8>)> {
+    let AreaParts {
         layer,
         admin_level,
         place_type,
@@ -735,11 +806,29 @@ fn boundary_from_relation(
         alt_names,
         place_layer,
         designation,
-        inferred_country_code,
-        subdivision_code,
-        geometry,
-        representative_point,
-    }))
+    } = parts;
+    let representative_point = representative_point(&geometry)?;
+    let bounds = geometry.bounding_rect()?;
+    let mut block = Vec::new();
+    encode_shape(&geometry, &mut block);
+    Some((
+        BuiltBoundary {
+            layer,
+            admin_level,
+            place_type,
+            name,
+            alt_names,
+            place_layer,
+            designation,
+            inferred_country_code: country_code_from_tags(tags, layer),
+            subdivision_code: subdivision_code_from_tags(tags, layer),
+            shape: ShapeRef::default(),
+            bounds,
+            area: geometry.unsigned_area(),
+            representative_point,
+        },
+        block,
+    ))
 }
 
 fn multipolygon_from_rings(
@@ -1027,9 +1116,12 @@ const PLACE_TAG_AGREEMENT: f64 = 0.8;
 /// either side of a border, and per country rather than per individual chain so
 /// that one sparsely mapped region cannot classify differently to its
 /// neighbours, the usual way a relative-depth scheme goes wrong.
-fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<String> {
-    let (countries, country_ids) = Countries::intern(country_of_each_boundary(candidates));
-    let (verdicts, unmatched) = table_layers(candidates, &countries, &country_ids);
+fn assign_layers_by_containment(
+    candidates: &mut Vec<BoundaryCandidate>,
+    shapes: &Shapes,
+) -> Vec<String> {
+    let (countries, country_ids) = Countries::intern(country_of_each_boundary(candidates, shapes));
+    let (verdicts, unmatched) = table_layers(candidates, shapes, &countries, &country_ids);
     // A boundary the table says is no area of the Pack (a group of regions)
     // goes, and the rest are ranked without it.
     let keep = verdicts
@@ -1182,6 +1274,7 @@ fn assign_layers_by_containment(candidates: &mut Vec<BoundaryCandidate>) -> Vec<
 /// countries that the input lacks.
 fn table_layers(
     candidates: &[BoundaryCandidate],
+    shapes: &Shapes,
     countries: &Countries,
     country_ids: &[CountryId],
 ) -> (Vec<Option<Option<PlaceLayer>>>, Vec<String>) {
@@ -1212,14 +1305,11 @@ fn table_layers(
                 admin_level: candidate.boundary.admin_level,
                 designation: candidate.boundary.designation.as_deref(),
             };
-            let [lon, lat] = candidate.boundary.representative_point;
+            let point = candidate.boundary.representative_point;
             table.verdict(boundary, |object| {
-                by_object.get(&object).is_some_and(|index| {
-                    candidates[*index]
-                        .boundary
-                        .geometry
-                        .contains(&Point::new(lon, lat))
-                })
+                by_object
+                    .get(&object)
+                    .is_some_and(|index| covers_point(shapes, &candidates[*index].boundary, point))
             })
         })
         .collect();
@@ -1292,7 +1382,10 @@ fn conventional_admin_layer(admin_level: u8) -> Option<PlaceLayer> {
 /// the layers get filled consistently. Falling back to a per-boundary guess
 /// here would split the set and let an off-convention level take a layer that
 /// a conventional one holds elsewhere in the same country.
-fn country_of_each_boundary(candidates: &[BoundaryCandidate]) -> Vec<Option<String>> {
+fn country_of_each_boundary(
+    candidates: &[BoundaryCandidate],
+    shapes: &Shapes,
+) -> Vec<Option<String>> {
     let country_boundaries = candidates
         .iter()
         .filter(|candidate| {
@@ -1306,7 +1399,7 @@ fn country_of_each_boundary(candidates: &[BoundaryCandidate]) -> Vec<Option<Stri
                 .boundary
                 .inferred_country_code
                 .clone()
-                .map(|code| (&candidate.boundary.geometry, code))
+                .map(|code| (&candidate.boundary, code))
         })
         .collect::<Vec<_>>();
 
@@ -1333,18 +1426,15 @@ fn country_of_each_boundary(candidates: &[BoundaryCandidate]) -> Vec<Option<Stri
     }
 
     candidates
-        .iter()
+        .par_iter()
         .map(|candidate| {
             if let Some(code) = &candidate.boundary.inferred_country_code {
                 return Some(code.clone());
             }
-            let point = Point::new(
-                candidate.boundary.representative_point[0],
-                candidate.boundary.representative_point[1],
-            );
+            let point = candidate.boundary.representative_point;
             country_boundaries
                 .iter()
-                .find(|(geometry, _)| geometry.contains(&point))
+                .find(|(country, _)| covers_point(shapes, country, point))
                 .map(|(_, code)| code.clone())
         })
         .collect()
@@ -1525,12 +1615,16 @@ impl BoundarySet {
         spool.finish()
     }
 
-    /// The set a checkpoint saved.
-    pub(crate) fn load(saved: &crate::extsort::SpoolFile<SetItem>) -> crate::error::Result<Self> {
+    /// The set a checkpoint saved, its shapes in `shapes`.
+    pub(crate) fn load(
+        saved: &crate::extsort::SpoolFile<SetItem>,
+        shapes: Arc<Shapes>,
+    ) -> crate::error::Result<Self> {
         let mut set = Self {
             candidates: Vec::new(),
             derived_countries: Vec::new(),
             unmatched_admin_ids: Vec::new(),
+            shapes,
         };
         for item in saved.reader()? {
             match item? {
@@ -1540,6 +1634,16 @@ impl BoundarySet {
                 }
                 SetItem::Unmatched(id) => set.unmatched_admin_ids.push(id),
             }
+        }
+        let shapes = set
+            .candidates
+            .iter()
+            .map(|candidate| candidate.boundary.shape);
+        if !set.shapes.holds(shapes) {
+            return Err(crate::error::Error::BadScratch {
+                path: set.shapes.path().to_path_buf(),
+                detail: "a saved boundary's shape lies past the end of the shape file",
+            });
         }
         Ok(set)
     }
@@ -1570,19 +1674,13 @@ impl crate::extsort::Spill for SetItem {
                 put_opt_str(out, boundary.designation.as_deref());
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
                 put_opt_str(out, boundary.subdivision_code.as_deref());
-                put_u64(out, boundary.geometry.0.len() as u64);
-                let mut last = (0, 0);
-                for polygon in &boundary.geometry.0 {
-                    put_u64(out, polygon.interiors().len() as u64);
-                    for ring in std::iter::once(polygon.exterior()).chain(polygon.interiors()) {
-                        put_u64(out, ring.0.len() as u64);
-                        for coord in &ring.0 {
-                            super::checkpoint::put_degrees(out, &mut last.0, coord.x);
-                            super::checkpoint::put_degrees(out, &mut last.1, coord.y);
-                        }
-                    }
-                }
-                for value in boundary.representative_point {
+                put_u64(out, boundary.shape.offset);
+                put_u64(out, boundary.shape.bytes);
+                let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
+                for value in [min.x, min.y, max.x, max.y, boundary.area]
+                    .into_iter()
+                    .chain(boundary.representative_point)
+                {
                     out.extend_from_slice(&value.to_bits().to_le_bytes());
                 }
             }
@@ -1630,27 +1728,15 @@ impl crate::extsort::Spill for SetItem {
                 let designation = get_opt_string(input)?;
                 let inferred_country_code = get_opt_string(input)?;
                 let subdivision_code = get_opt_string(input)?;
-                let mut polygons = Vec::new();
-                let mut last = (0, 0);
-                for _ in 0..get_u64(input)? {
-                    let interiors = get_u64(input)?;
-                    let mut rings = Vec::new();
-                    for _ in 0..=interiors {
-                        let mut coords = Vec::new();
-                        for _ in 0..get_u64(input)? {
-                            let x = super::checkpoint::get_degrees(input, &mut last.0)?;
-                            let y = super::checkpoint::get_degrees(input, &mut last.1)?;
-                            coords.push(geo::Coord { x, y });
-                        }
-                        rings.push(LineString(coords));
-                    }
-                    let exterior = rings.remove(0);
-                    polygons.push(Polygon::new(exterior, rings));
+                let shape = ShapeRef {
+                    offset: get_u64(input)?,
+                    bytes: get_u64(input)?,
+                };
+                let mut values = [0.0; 7];
+                for value in &mut values {
+                    *value = super::checkpoint::get_f64(input)?;
                 }
-                let representative_point = [
-                    super::checkpoint::get_f64(input)?,
-                    super::checkpoint::get_f64(input)?,
-                ];
+                let [min_x, min_y, max_x, max_y, area, lon, lat] = values;
                 Self::Candidate(Box::new(BoundaryCandidate {
                     source_object_type,
                     source_object_id,
@@ -1664,8 +1750,10 @@ impl crate::extsort::Spill for SetItem {
                         designation,
                         inferred_country_code,
                         subdivision_code,
-                        geometry: MultiPolygon(polygons),
-                        representative_point,
+                        shape,
+                        bounds: Rect::new((min_x, min_y), (max_x, max_y)),
+                        area,
+                        representative_point: [lon, lat],
                     },
                 }))
             }
@@ -1684,19 +1772,7 @@ impl crate::extsort::Spill for SetItem {
     fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + match self {
-                Self::Candidate(candidate) => {
-                    std::mem::size_of::<BoundaryCandidate>()
-                        + candidate
-                            .boundary
-                            .geometry
-                            .0
-                            .iter()
-                            .flat_map(|polygon| {
-                                std::iter::once(polygon.exterior()).chain(polygon.interiors())
-                            })
-                            .map(|ring| ring.0.len() * std::mem::size_of::<geo::Coord>())
-                            .sum::<usize>()
-                }
+                Self::Candidate(candidate) => candidate.heap_bytes(),
                 Self::DerivedCountry(code, record) => code.len() + record.name.len() + 256,
                 Self::Unmatched(id) => id.len(),
             }
@@ -1738,7 +1814,7 @@ mod tests {
             -79.0,
             43.0,
         );
-        let index = BoundaryIndex::new(vec![toronto, oakville]);
+        let index = test_index(vec![toronto, oakville]);
 
         let assignment = index.context_for_point(-79.5, 43.5, SourceContext::default());
 
@@ -1750,7 +1826,7 @@ mod tests {
     fn shared_edge_sets_ambiguous_flag_and_chooses_stable_boundary() {
         let left = square_boundary(10, "Left", PlaceLayer::Locality, -1.0, -1.0, 0.0, 1.0);
         let right = square_boundary(11, "Right", PlaceLayer::Locality, 0.0, -1.0, 1.0, 1.0);
-        let index = BoundaryIndex::new(vec![right, left]);
+        let index = test_index(vec![right, left]);
 
         let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
 
@@ -1774,7 +1850,7 @@ mod tests {
             let mid = square_boundary(3, "Mid", PlaceLayer::Locality, -1.5, -1.5, 1.5, 1.5);
             vec![mid, small, big]
         }] {
-            let index = BoundaryIndex::new(order);
+            let index = test_index(order);
             let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
             assert_eq!(
                 assignment.admin_context.locality_record_id(),
@@ -1796,7 +1872,7 @@ mod tests {
         berlin.tiers = [PlaceLayer::Region, PlaceLayer::Locality]
             .into_iter()
             .collect();
-        let index = BoundaryIndex::new(vec![germany, berlin]);
+        let index = test_index(vec![germany, berlin]);
 
         let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
 
@@ -1869,7 +1945,9 @@ mod tests {
             inferred_country_code: None,
             subdivision_code: None,
             representative_point: representative_point(&geometry).expect("point"),
-            geometry,
+            shape: ShapeRef::default(),
+            bounds: geometry.bounding_rect().expect("bounds"),
+            area: geometry.unsigned_area(),
         }
     }
 
@@ -1889,7 +1967,7 @@ mod tests {
             1.0,
         );
         let suburb = square_boundary(2, "Dickson", PlaceLayer::SubLocality, -0.5, -0.5, 0.5, 0.5);
-        let index = BoundaryIndex::new(vec![district, suburb]);
+        let index = test_index(vec![district, suburb]);
 
         let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
 
@@ -2171,6 +2249,8 @@ mod tests {
         country: Option<&str>,
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
+        let scratch = test_scratch();
+        let mut shapes = ShapeWriter::create(&scratch).expect("shape file");
         let mut candidates = Vec::new();
         let levels = levels
             .iter()
@@ -2189,6 +2269,7 @@ mod tests {
                 (-span, -span),
             ]);
             let geometry = MultiPolygon::new(vec![Polygon::new(ring, Vec::new())]);
+            let (shape, bounds, area) = with_shape(&mut shapes, &geometry);
             candidates.push(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
                 source_object_id: index as i64 + 1,
@@ -2205,11 +2286,14 @@ mod tests {
                         .or_else(|| (level <= 2).then(|| "AU".to_string())),
                     subdivision_code: None,
                     representative_point: representative_point(&geometry).expect("point"),
-                    geometry,
+                    shape,
+                    bounds,
+                    area,
                 },
             });
         }
-        assign_layers_by_containment(&mut candidates);
+        let shapes = shapes.finish().expect("shapes");
+        assign_layers_by_containment(&mut candidates, &shapes);
         let mut layers = BTreeMap::new();
         for candidate in &candidates {
             let layer = *layers
@@ -2225,7 +2309,7 @@ mod tests {
         let mut region =
             square_boundary(20, "Ontario", PlaceLayer::Region, -90.0, 40.0, -70.0, 50.0);
         region.inferred_country_record_id = Some(7);
-        let index = BoundaryIndex::new(vec![region]);
+        let index = test_index(vec![region]);
 
         let assignment = index.context_for_point(-79.0, 43.0, SourceContext::default());
 
@@ -2263,13 +2347,10 @@ mod tests {
             square(2, "3", "関東地方", None, 4.0),
             square(3, "4", "千葉県", None, 1.0),
         ];
-        let set = build_boundaries(
-            ways.iter().filter_map(BoundaryCandidate::of_way).collect(),
-            &[],
-            |_| Ok(None),
-            || Ok(()),
-        )
-        .expect("boundaries");
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        builder.add_ways(&ways).expect("ways");
+        let set = builder.finish().expect("boundaries");
         let groups = set.region_groups(&[100, 101, 102]);
         assert_eq!(groups, HashMap::from([(102, vec![101])]));
     }
@@ -2327,8 +2408,12 @@ mod tests {
         ];
 
         let member_line = |way_id: i64| Ok(member_lines.get(&way_id).cloned().flatten());
-        let set =
-            build_boundaries(Vec::new(), &relations, member_line, || Ok(())).expect("boundaries");
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        builder
+            .add_relations(&relations, member_line)
+            .expect("relations");
+        let set = builder.finish().expect("boundaries");
         assert_eq!(
             set.len(),
             1,
@@ -2384,6 +2469,8 @@ mod tests {
             Vec::new(),
         );
         let geometry = MultiPolygon::new(vec![polygon]);
+        // The shape is written when the boundaries are indexed, from the
+        // square its box is: see `test_index`.
         AcceptedBoundary {
             record_id,
             layer,
@@ -2395,7 +2482,40 @@ mod tests {
             source_object_id: record_id as i64,
             area: geometry.unsigned_area(),
             bounds: geometry.bounding_rect().expect("bounds"),
-            shape: AreaShape::new(geometry),
+            shape: ShapeRef::default(),
         }
+    }
+
+    fn test_scratch() -> Arc<crate::extsort::Scratch> {
+        crate::extsort::Scratch::create(
+            std::env::temp_dir().join(format!("og-boundary-{}", uuid::Uuid::new_v4())),
+        )
+        .expect("scratch")
+    }
+
+    /// `geometry` written to `shapes` as the boundary stage writes it, with
+    /// its box and area.
+    fn with_shape(
+        shapes: &mut ShapeWriter,
+        geometry: &MultiPolygon<f64>,
+    ) -> (ShapeRef, Rect<f64>, f64) {
+        let mut block = Vec::new();
+        encode_shape(geometry, &mut block);
+        (
+            shapes.write(&block).expect("shape"),
+            geometry.bounding_rect().expect("bounds"),
+            geometry.unsigned_area(),
+        )
+    }
+
+    /// An index of square boundaries, each the square its box is.
+    fn test_index(mut boundaries: Vec<AcceptedBoundary>) -> BoundaryIndex {
+        let scratch = test_scratch();
+        let mut shapes = ShapeWriter::create(&scratch).expect("shape file");
+        for boundary in &mut boundaries {
+            let square = MultiPolygon::new(vec![boundary.bounds.to_polygon()]);
+            boundary.shape = with_shape(&mut shapes, &square).0;
+        }
+        BoundaryIndex::new(boundaries, Arc::new(shapes.finish().expect("shapes")))
     }
 }

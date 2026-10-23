@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     builder::osm::{
-        BOUNDARY_SHAPE_BYTES_PER_COORD, NODE_SET_CHUNK_BYTES, NODE_SET_TABLE_BYTES, NODE_SLOT_BYTES,
+        MIN_BOUNDARY_BATCH_BYTES, NODE_SET_CHUNK_BYTES, NODE_SET_TABLE_BYTES, NODE_SLOT_BYTES,
     },
     error::{Error, Result},
     memory::{MAX_DERIVED_BUDGET_BYTES, MIN_BUDGET_BYTES},
@@ -90,10 +90,19 @@ const WORKER_BYTES: u64 = 64 << 20;
 /// Germany held 1.6 GB beyond its tracked peak with 24 workers, which take
 /// 1.5 GB of it; this doubles the rest.
 const BASE_UNTRACKED_BYTES: u64 = 256 << 20;
-/// Heap a boundary vertex holds: only its shape's, inside the memory budget.
-/// The ways' vertices stay on disk until the boundary stage reads them back
-/// by way id.
-const BOUNDARY_VERTEX_BYTES: u64 = BOUNDARY_SHAPE_BYTES_PER_COORD as u64;
+/// Heap the boundaries hold per boundary vertex, inside the memory budget:
+/// what describes each area, and the index of the ways' lines while they
+/// are assembled. The vertices themselves stay on disk, the ways' until the
+/// boundary stage reads them back by way id and the shapes' in a file they
+/// are mapped from. The planet (2026-10) held 409 MB of descriptions for
+/// 203.6 million vertices, 2.0 B each; twice that leaves room for the line
+/// index.
+const BOUNDARY_HEAP_BYTES_PER_REF: f64 = 4.0;
+/// Scratch the shape file takes per boundary vertex: a shape's vertices in
+/// fixed point and its band entries, a vertex shared by two areas written
+/// in each. The planet's was 6.05 GB for 203.6 million vertices, 29.7 B
+/// each.
+const BOUNDARY_SHAPE_BYTES_PER_REF: f64 = 30.0;
 /// Share of the memory left beside the heap outside the budget that the
 /// derived budget takes. The rest is page cache: the input the passes
 /// reread, and the node coordinates when they are mapped from scratch.
@@ -252,7 +261,7 @@ impl BuildPlan {
         self.measured_untracked_bytes = scanned
             .heap_bytes
             .map_or(0, |heap| heap.saturating_sub(scanned.tracked_bytes));
-        let boundary = self.items.boundary_refs * BOUNDARY_VERTEX_BYTES;
+        let boundary = boundary_heap_bytes(self.items.boundary_refs);
         self.untracked_bytes = self
             .measured_untracked_bytes
             .max(untracked_beside_boundaries(self.threads));
@@ -282,7 +291,8 @@ impl BuildPlan {
         // holds beside the heap no budget tracks.
         self.memory_needed_bytes = least_budget + self.untracked_bytes;
         self.budget_needed_bytes = items.node_set_bytes
-            + items.boundary_refs * BOUNDARY_VERTEX_BYTES
+            + boundary_heap_bytes(items.boundary_refs)
+            + MIN_BOUNDARY_BATCH_BYTES as u64
             + MIN_BUDGET_BYTES as u64;
         let records = (items.records + items.imported_rows) as f64;
         let addresses = (items.addresses + items.imported_rows) as f64;
@@ -311,9 +321,13 @@ impl BuildPlan {
             0 => 0.0,
             _ => book + addresses * HOUSE_SPILL_BYTES,
         };
-        let placement =
-            others + (addresses * (ADDRESS_SPILL_BYTES + PLACED_ADDRESS_BYTES) + book).max(houses);
-        let write = others + addresses * PLACED_ADDRESS_BYTES + book + pack;
+        // The boundary shapes are mapped from scratch from the boundary
+        // stage to the record write.
+        let shapes = items.boundary_refs as f64 * BOUNDARY_SHAPE_BYTES_PER_REF;
+        let placement = shapes
+            + others
+            + (addresses * (ADDRESS_SPILL_BYTES + PLACED_ADDRESS_BYTES) + book).max(houses);
+        let write = shapes + others + addresses * PLACED_ADDRESS_BYTES + book + pack;
         let scratch = ways.max(placement).max(write);
         self.scratch_disk_needed_bytes = scratch as u64;
         self.shared_disk_needed_bytes = scratch.max(2.0 * pack) as u64;
@@ -424,6 +438,11 @@ impl BuildPlan {
         self.shortfalls = shortfalls;
         Ok(())
     }
+}
+
+/// Heap the boundaries of `refs` vertices hold.
+fn boundary_heap_bytes(refs: u64) -> u64 {
+    (refs as f64 * BOUNDARY_HEAP_BYTES_PER_REF) as u64
 }
 
 fn untracked_beside_boundaries(threads: usize) -> u64 {

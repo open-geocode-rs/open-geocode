@@ -116,15 +116,15 @@ use crate::{
     util::{fold::search_key, geo::point_lon_lat, hilbert::hilbert_key},
 };
 use book::{Book, BookFile};
-pub(crate) use boundary::BOUNDARY_SHAPE_BYTES_PER_COORD;
 use boundary::{
-    BoundaryCandidate, BoundaryIndex, BoundaryRelationStub, BoundarySet, ContextOrigin, SetItem,
-    SourceContext, Vertex, build_boundaries, record_context,
+    BoundaryBuilder, BoundaryIndex, BoundaryRelationStub, BoundarySet, ContextOrigin, SetItem,
+    SourceContext, Vertex, record_context,
 };
 use checkpoint::{
     AddressState, AuditState, ContextState, GeometryItem, Id, InputState, KeptWays, Pass,
     PostcodePoint, ScanCounts, State, Step,
 };
+use containment::Shapes;
 use emitted::Emitted;
 pub(crate) use locations::{
     CHUNK_BYTES as NODE_SET_CHUNK_BYTES, LOCATION_BYTES as NODE_SLOT_BYTES, LoadStats,
@@ -141,6 +141,17 @@ use spill::{
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
+
+/// Heap a boundary vertex takes at most while its area is assembled: the
+/// member way's vertex as read back, the stitched ring and the polygon made
+/// of it, and the shape block with its band entries.
+pub(crate) const BOUNDARY_BUILD_BYTES_PER_VERTEX: usize = 160;
+/// The least of the budget a batch of boundaries is assembled in, taken
+/// past the budget when it has less free: enough for a large country.
+pub(crate) const MIN_BOUNDARY_BATCH_BYTES: usize = 128 << 20;
+/// The most a batch takes: past it, batches only wait longer on their
+/// largest area.
+const MAX_BOUNDARY_BATCH_BYTES: usize = 1 << 30;
 
 #[derive(Clone)]
 pub struct BuildOsmOptions {
@@ -367,8 +378,11 @@ struct Run<'a> {
     /// The boundary set as saved, until the record write: what the context
     /// index is derived from again.
     boundaries_saved: Option<SpoolFile<SetItem>>,
-    /// The boundary shapes' hold on the memory budget, for as long as they
-    /// are held: they cannot spill.
+    /// The shape file the boundary set and its index read, until the
+    /// record write.
+    boundary_shapes: Option<Arc<Shapes>>,
+    /// The boundaries' hold on the memory budget, for as long as they are
+    /// held: they cannot spill.
     boundary_memory: Option<Reservation>,
     imports: Option<Vec<AddressFile>>,
     contexts: Option<Contexts>,
@@ -512,6 +526,7 @@ impl<'a> Run<'a> {
             input: None,
             boundaries: None,
             boundaries_saved: None,
+            boundary_shapes: None,
             boundary_memory: None,
             imports: None,
             contexts: None,
@@ -732,9 +747,20 @@ impl<'a> Run<'a> {
             run.input = Some(InputPasses::restore(&scratch, &run.memory, input)?);
         }
         if let Some(saved) = &state.boundaries {
+            let Some(shapes) = &state.boundary_shapes else {
+                return Err(Error::BadOptions(
+                    format!(
+                        "the build that stopped in {} saved its boundaries without their shape file, as an older og did; pass --fresh to clear it and start over",
+                        found.scratch.display()
+                    )
+                    .into(),
+                ));
+            };
+            let shapes = Arc::new(Shapes::restore(&scratch, shapes)?);
             let saved = SpoolFile::restore(&scratch, saved)?;
-            let boundaries = BoundarySet::load(&saved)?;
-            run.boundary_memory = Some(Reservation::forced(&run.memory, boundaries.shape_bytes()));
+            let boundaries = BoundarySet::load(&saved, Arc::clone(&shapes))?;
+            run.boundary_memory = Some(Reservation::forced(&run.memory, boundaries.heap_bytes()));
+            run.boundary_shapes = Some(shapes);
             match &state.contexts {
                 Some(contexts) => {
                     run.contexts = Some(Contexts::derive(
@@ -1088,54 +1114,120 @@ impl<'a> Run<'a> {
             boundary_feature_ids,
         } = std::mem::take(&mut self.geometry);
         drop(boundary_feature_ids);
+        // Shapes are assembled a batch at a time, in parallel, and written to
+        // the shape file as they are built. A batch takes what the budget has
+        // free, and at least enough for a few large areas.
+        let batch_bytes = self
+            .memory
+            .limit()
+            .saturating_sub(self.memory.used())
+            .clamp(MIN_BOUNDARY_BATCH_BYTES, MAX_BOUNDARY_BATCH_BYTES);
+        let mut batch_memory = Reservation::empty(&self.memory);
+        if !batch_memory.try_grow(batch_bytes) {
+            batch_memory.force_grow(MIN_BOUNDARY_BATCH_BYTES);
+        }
+        let batch_vertices = batch_memory.bytes() / BOUNDARY_BUILD_BYTES_PER_VERTEX;
+        let mut builder = BoundaryBuilder::new(&self.scratch)?;
         // Every boundary way's and member way's vertices go to one scratch
         // file read back by way id, so only the ids stay in memory. A way
         // with no line (a missing node, or a feature that was incomplete)
         // has none, as a relation needing it then has no shape.
         let mut lines = IndexedSpool::<GeometryItem>::create(&self.scratch, "boundary-lines")?;
-        let mut line_at = HashMap::<i64, usize>::new();
-        let mut candidates = Vec::new();
+        // Each line's way id, place in the file and vertex count.
+        let mut line_at = Vec::<(i64, u32, u32)>::new();
+        let mut ways = Vec::new();
+        let mut way_vertices = 0;
         for part in &self.geometry_saved {
             for item in part.reader()? {
                 let (way_id, line) = match item? {
                     GeometryItem::Way(way) => {
-                        candidates.extend(BoundaryCandidate::of_way(&way));
-                        (way.object_id, Some(way.vertices))
+                        let line = (way.object_id, Some(way.vertices.clone()));
+                        if boundary::may_be_area(&way) {
+                            way_vertices += way.vertices.len();
+                            ways.push(way);
+                        }
+                        if way_vertices >= batch_vertices {
+                            self.progress.check()?;
+                            builder.add_ways(&std::mem::take(&mut ways))?;
+                            way_vertices = 0;
+                        }
+                        line
                     }
                     GeometryItem::Member(way_id, line) => (way_id, line),
                     GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
                 };
-                line_at.insert(way_id, line_at.len());
+                let vertices = line.as_ref().map_or(0, Vec::len);
+                line_at.push((
+                    way_id,
+                    u32::try_from(line_at.len())
+                        .map_err(|_| Error::Decode("more boundary lines than a u32 counts"))?,
+                    u32::try_from(vertices).unwrap_or(u32::MAX),
+                ));
                 lines.write(&GeometryItem::Member(way_id, line))?;
             }
         }
+        builder.add_ways(&ways)?;
+        drop(ways);
         let lines = lines.finish()?;
+        line_at.sort_unstable_by_key(|(way_id, _, _)| *way_id);
+        let line_memory = Reservation::forced(
+            &self.memory,
+            line_at.capacity() * std::mem::size_of::<(i64, u32, u32)>(),
+        );
+        let find = |way_id: i64| {
+            line_at
+                .binary_search_by_key(&way_id, |(id, _, _)| *id)
+                .ok()
+                .map(|at| line_at[at])
+        };
         let member_line = |way_id: i64| -> Result<Option<Vec<Vertex>>> {
-            let Some(&at) = line_at.get(&way_id) else {
+            let Some((_, at, _)) = find(way_id) else {
                 return Ok(None);
             };
-            match lines.get(at)? {
+            match lines.get(at as usize)? {
                 GeometryItem::Member(_, line) => Ok(line),
                 _ => Err(Error::Decode("a boundary line file holds only lines")),
             }
         };
-        let progress = &self.progress;
-        let boundaries =
-            build_boundaries(candidates, &relations, member_line, || progress.check())?;
-        // The shapes stay in memory through the build, so they count against
-        // the budget: the sorters spill sooner instead of the build growing
-        // past it.
-        self.boundary_memory = Some(Reservation::forced(&self.memory, boundaries.shape_bytes()));
+        // What the boundaries describe stays on the heap, so it holds a share
+        // of the budget as it grows: the sorters spill sooner instead of the
+        // build growing past it.
+        let mut held = Reservation::empty(&self.memory);
+        let mut start = 0;
+        let mut vertices = 0;
+        for (at, stub) in relations.iter().enumerate() {
+            vertices += stub
+                .members
+                .iter()
+                .filter_map(|member| find(member.way_id))
+                .map(|(_, _, count)| count as usize)
+                .sum::<usize>();
+            if vertices >= batch_vertices || at + 1 == relations.len() {
+                self.progress.check()?;
+                builder.add_relations(&relations[start..=at], member_line)?;
+                held.force_grow(builder.heap_bytes().saturating_sub(held.bytes()));
+                start = at + 1;
+                vertices = 0;
+            }
+        }
+        self.progress.check()?;
+        drop((line_memory, line_at, lines, relations, batch_memory));
+        let passes = &mut self.build.report.geometry_passes;
+        passes.boundary_shape_vertices = builder.vertices();
+        let boundaries = builder.finish()?;
+        passes.boundary_shape_bytes = boundaries.shapes().bytes();
+        passes.boundary_heap_bytes = boundaries.heap_bytes() as u64;
+        drop(held);
+        self.boundary_memory = Some(Reservation::forced(&self.memory, boundaries.heap_bytes()));
         self.build
             .report
             .unmatched_admin_level_ids
             .extend_from_slice(boundaries.unmatched_admin_ids());
-        drop(line_at);
-        drop(relations);
         for (origin, record) in boundaries.place_records(&mut self.build.report) {
             self.build.push(record, Some(origin))?;
         }
         self.boundaries_saved = Some(boundaries.save(&self.scratch)?);
+        self.boundary_shapes = Some(Arc::clone(boundaries.shapes()));
         self.boundaries = Some(boundaries);
         self.geometry_saved.clear();
         self.progress.finish(BuildStage::Boundaries);
@@ -1518,6 +1610,7 @@ impl<'a> Run<'a> {
         )?;
         drop((index, books));
         self.boundaries_saved = None;
+        self.boundary_shapes = None;
         self.build.report.phases.record_write_ms = phase.elapsed().as_millis();
         self.build.report.scratch.peak_tracked_bytes = self.memory.peak() as u64;
         self.progress.start(BuildStage::Indexes, None)?;
@@ -1624,6 +1717,10 @@ impl<'a> Run<'a> {
             files.extend(state.files(&scratch));
         }
         let boundaries = self.boundaries_saved.as_ref().map(SpoolFile::state);
+        let boundary_shapes = self.boundary_shapes.as_ref().map(|shapes| {
+            files.push(shapes.path().to_path_buf());
+            shapes.state()
+        });
         let postcodes = self.postcodes.as_ref().map(SpoolFile::state);
         for state in boundaries
             .iter()
@@ -1654,6 +1751,7 @@ impl<'a> Run<'a> {
             geometry,
             input,
             boundaries,
+            boundary_shapes,
             imports: self.imports.clone(),
             contexts,
             postcodes,
