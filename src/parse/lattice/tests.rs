@@ -385,6 +385,36 @@ fn built_in_weights_read_common_address_shapes() {
 }
 
 #[test]
+fn a_query_ending_in_its_country_is_read_as_the_words_before_it_and_the_country() {
+    let tagger = tagger();
+    let without = tagger.parse("670 king st w toronto on m5v 1m9");
+    let with = tagger.parse("670 king st w toronto on m5v 1m9 ca");
+    let expected = labels(&without[0].tokens)
+        .into_iter()
+        .chain([Label::Country])
+        .collect::<Vec<_>>();
+    assert!(
+        with.iter()
+            .any(|reading| labels(&reading.tokens) == expected),
+        "{with:?}"
+    );
+    assert!(with.len() <= N_BEST);
+    for reading in &with {
+        assert_eq!(reading.pieces.len(), reading.corrections.len());
+        assert_eq!(reading.tokens.len(), 9);
+    }
+    // A query of a country alone, or ending in no country, reads as before.
+    assert_eq!(
+        tagger.parse("canada"),
+        tagger.parse_tokens(&Tokens::new("canada"), N_BEST)
+    );
+    assert_eq!(
+        tagger.parse("670 king st w toronto"),
+        tagger.parse_tokens(&Tokens::new("670 king st w toronto"), N_BEST)
+    );
+}
+
+#[test]
 fn queries_without_words_tag_nothing() {
     let tagger = tagger();
     assert!(tagger.tag("").is_empty());

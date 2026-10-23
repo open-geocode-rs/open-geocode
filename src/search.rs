@@ -29,7 +29,8 @@ use crate::{
     parse::{
         lattice::{
             self, CountryCode, LatticeTagger, Tokens, automaton_builder,
-            dictionary::designates_unit,
+            dictionary::{Field as NameField, designates_unit},
+            dictionary_key,
         },
         types::{Label, Tagged},
     },
@@ -47,7 +48,7 @@ use crate::{
         compact_postcode, expand_address_abbreviations, expand_final_direction, flat_number_term,
         is_numeric_token, open_text_index, street_search_text,
     },
-    util::fold::{exact_key, search_key},
+    util::fold::{exact_key, replaced_characters, search_key},
 };
 
 pub struct TextSearcher {
@@ -179,6 +180,11 @@ pub struct TextSearchHit {
     /// `None` when the Pack has no fitted model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// Whether the answer is no match of what the query asks for but the
+    /// finest area it names that the Pack holds, given because nothing more
+    /// precise was found (see [`TextSearcher::fallback`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +307,14 @@ const NEIGHBOUR_STREET_RADIUS_M: f64 = 100.0;
 /// shops and its parcel lie within a lot's depth of its address point, the
 /// depth [`NEIGHBOUR_STREET_RADIUS_M`] allows an address from its street.
 const AT_ADDRESS_RADIUS_M: f64 = NEIGHBOUR_STREET_RADIUS_M;
+/// Settlements held only as points read around a hit whose stated locality
+/// none of its areas names (see [`TextSearcher::near_settlements`]): the
+/// one it lies nearest, and the neighbours that crowd round a town where
+/// suburbs are mapped as points too.
+const NEAR_SETTLEMENTS: usize = 5;
+/// The farthest a settlement point names the land around it: few towns'
+/// built-up areas reach farther from their centre.
+const NEAR_SETTLEMENT_RADIUS_M: f64 = 15_000.0;
 
 impl TextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
@@ -377,10 +391,11 @@ impl TextSearcher {
                 .record
                 .point
                 .map(|point| Accuracy::of(point.precision, &hit.record.source));
-            hit.confidence = self
-                .confidence
-                .as_ref()
-                .map(|model| model.rate(&hit.features));
+            // A fallback is not what the query asks for, by what it is.
+            hit.confidence = self.confidence.as_ref().map(|model| match hit.fallback {
+                true => 0.0,
+                false => model.rate(&hit.features),
+            });
         }
     }
 
@@ -396,15 +411,19 @@ impl TextSearcher {
         }
 
         // One hit past the limit, so the last one asked for has a margin.
+        let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
         let (_, mut hits) = self.search_variants(
             query_text,
             &[],
-            Filters::new(options.layer.as_deref(), &options.countries, options.bbox),
+            filters,
             options.focus,
             limit + 1,
             Parses::All,
             |_, _, _| Ok(true),
         )?;
+        if hits.is_empty() && filters.layer.is_none() {
+            hits = self.fallback(query_text, &[], filters, options.focus, limit + 1)?;
+        }
         self.rate(&mut hits);
         hits.truncate(limit);
         Ok(hits)
@@ -441,10 +460,25 @@ impl TextSearcher {
             .filter(|part| matches!(part.label, Label::Locality | Label::Region))
             .collect::<Vec<_>>();
         let known = self.known_area_words(areas.iter().flat_map(|part| &part.words))?;
-        let stated = areas
+        let postcode_text = context
             .iter()
-            .filter_map(|part| StatedArea::known(part, &known))
+            .find(|part| part.is_postcode())
+            .map(|part| part.words.join(" "));
+        let mut stated = Vec::new();
+        for part in &areas {
+            if let Some(area) = self.stated_area(part, &known, postcode_text.as_deref())? {
+                stated.push(area);
+            }
+        }
+        let stated_localities = stated
+            .iter()
+            .filter(|area| area.label == Label::Locality)
+            .cloned()
             .collect::<Vec<_>>();
+        // A region given by its code ("ON") is no name of the areas a record
+        // lies in, so it is told apart by the regions it names (see
+        // [`Self::region_agreement`]).
+        let places = self.stated_places(&context);
         // Two at least, so the one answer given has a margin over the next.
         let (query, mut hits) = self.search_variants(
             address,
@@ -482,12 +516,25 @@ impl TextSearcher {
                 // A row's stated area must be confirmed: a hit in no named
                 // area is not taken to be in it. A name the Pack has never
                 // heard of confirms nothing and rejects nothing.
-                let in_areas = self
-                    .area_agreement(hit, &stated)?
-                    .unwrap_or(stated.is_empty());
+                // A region the Pack confirms by what it names needs no name
+                // of the hit's areas to agree too: "ON" is no word of
+                // "Ontario".
+                let in_areas = match self.region_agreement(hit, &places)? {
+                    Some(false) => false,
+                    Some(true) => self
+                        .area_agreement(hit, &stated_localities, postcode)?
+                        .unwrap_or(stated_localities.is_empty()),
+                    None => self
+                        .area_agreement(hit, &stated, postcode)?
+                        .unwrap_or(stated.is_empty()),
+                };
                 Ok(hit.record.point.is_some() && !unnumbered_address && in_postcode && in_areas)
             },
         )?;
+        if hits.is_empty() && options.layer.is_none() {
+            let filters = Filters::new(None, &options.countries, None);
+            hits = self.fallback(address, &context, filters, None, 2)?;
+        }
         self.rate(&mut hits);
         Ok(hits
             .into_iter()
@@ -653,7 +700,10 @@ impl TextSearcher {
                 return as_written(word);
             }
             Box::new(DisjunctionMaxQuery::new(
-                std::iter::once(word).chain(forms).map(as_written).collect(),
+                std::iter::once(word.to_string())
+                    .chain(forms)
+                    .map(|form| as_written(&form))
+                    .collect(),
             ))
         };
         // A query the parser found no places in may still name one
@@ -734,20 +784,17 @@ impl TextSearcher {
             clauses.extend(unplaced(&mut plan.unplaced.iter()));
         }
         for part in &plan.context {
-            let known = part
-                .words
-                .iter()
-                .filter(|word| areas.known.contains(*word))
-                .collect::<Vec<_>>();
-            let clause =
-                if pass.requires_locality() && part.label == Label::Locality && !known.is_empty() {
-                    (Occur::Must, self.locality_part_query(&known))
-                } else {
-                    (
-                        Occur::Should,
-                        self.context_part_query(part, spellings, areas),
-                    )
-                };
+            let stated = match pass.requires_locality() && part.label == Label::Locality {
+                true => self.stated_names(part, &areas.known),
+                false => None,
+            };
+            let clause = match stated {
+                Some(stated) => (Occur::Must, self.locality_part_query(&stated)),
+                None => (
+                    Occur::Should,
+                    self.context_part_query(part, spellings, areas),
+                ),
+            };
             clauses.push(clause);
         }
         clauses
@@ -822,14 +869,290 @@ impl TextSearcher {
         Ok(weights)
     }
 
-    /// Every word of a locality part the Pack knows, in where a record is.
-    fn locality_part_query(&self, known: &[&String]) -> Box<dyn Query> {
+    /// The names of a locality part in where a record is: every word of each,
+    /// and of every name unless the names cannot all hold one address, when
+    /// one will do (see [`StatedNames::any`]).
+    fn locality_part_query(&self, stated: &StatedNames) -> Box<dyn Query> {
+        let name = |words: &Vec<String>| -> Box<dyn Query> {
+            Box::new(BooleanQuery::new(
+                words
+                    .iter()
+                    .map(|word| (Occur::Must, self.area_term_query(word)))
+                    .collect(),
+            ))
+        };
+        let occur = if stated.any {
+            Occur::Should
+        } else {
+            Occur::Must
+        };
         Box::new(BooleanQuery::new(
-            known
+            stated
+                .names
                 .iter()
-                .map(|word| (Occur::Must, self.area_term_query(word)))
+                .map(|words| (occur, name(words)))
                 .collect(),
         ))
+    }
+
+    /// The places a locality part names, by the words of it the Pack knows
+    /// (`known`); `None` when it knows none, so the part says nothing of
+    /// where a record is.
+    ///
+    /// A part that is itself the name of a place the Pack knows names that
+    /// place. Else it is read as the names in it, longest first from its
+    /// start, and the words no name covers only rank: "Serfaus
+    /// Serfaus-Fiss-Ladis", a village and the ski area named after it and
+    /// two neighbours, is Serfaus, Fiss and Ladis. Names that lie one in
+    /// another are one address's ("Mount Eden Auckland") and must all agree;
+    /// names that cannot all hold one address (Serfaus, Fiss and Ladis are
+    /// neighbours) are the query naming its area more than once, and one
+    /// agreeing will do. A part with no name in it the Pack's dictionaries
+    /// hold keeps its known words as one name.
+    fn stated_names(&self, part: &ContextPart, known: &HashSet<String>) -> Option<StatedNames> {
+        let words = &part.words;
+        let dictionaries = self.tagger.dictionaries();
+        let key = |words: &[String]| dictionary_key(&words.join(" "));
+        let names_place = |key: &str| {
+            dictionaries.contains(NameField::Locality, key)
+                || dictionaries.contains(NameField::Region, key)
+        };
+        let known_words = |words: &[String]| words.iter().all(|word| known.contains(word));
+        let is_name = |words: &[String]| {
+            known_words(words) && key(words).is_some_and(|key| names_place(&key))
+        };
+        if is_name(words) {
+            return Some(StatedNames {
+                names: vec![words.clone()],
+                any: false,
+                whole: true,
+            });
+        }
+        let mut names = Vec::<Vec<String>>::new();
+        let mut start = 0;
+        while start < words.len() {
+            match (start + 1..=words.len())
+                .rev()
+                .find(|&end| is_name(&words[start..end]))
+            {
+                Some(end) => {
+                    let name = words[start..end].to_vec();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                    start = end;
+                }
+                None => start += 1,
+            }
+        }
+        if names.is_empty() {
+            let words = words
+                .iter()
+                .filter(|word| known.contains(*word))
+                .cloned()
+                .collect::<Vec<_>>();
+            return (!words.is_empty()).then_some(StatedNames {
+                names: vec![words],
+                any: false,
+                whole: true,
+            });
+        }
+        let ids = names
+            .iter()
+            .map(|name| {
+                key(name)
+                    .map(|key| dictionaries.areas(&key))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let any = ids.iter().enumerate().any(|(index, left)| {
+            ids[index + 1..].iter().any(|right| {
+                !left.is_empty() && !right.is_empty() && !dictionaries.nest(left, right)
+            })
+        });
+        Some(StatedNames {
+            names,
+            any,
+            whole: false,
+        })
+    }
+
+    /// A locality or region a query names, as [`Self::area_agreement`]
+    /// checks it: its names (see [`Self::stated_names`]) and whether it is a
+    /// town addresses of the query's postcode state, `postcode` as the
+    /// postcode field indexes it. `None` when the Pack knows no word of it.
+    fn stated_area(
+        &self,
+        part: &ContextPart,
+        known: &HashSet<String>,
+        postcode: Option<&str>,
+    ) -> Result<Option<StatedArea>> {
+        let names = match part.label {
+            Label::Locality => self.stated_names(part, known),
+            _ => StatedNames::known_words(part, known),
+        };
+        let Some(names) = names else {
+            return Ok(None);
+        };
+        let postal = match (part.label, postcode) {
+            (Label::Locality, Some(postcode)) => self.postal_town(&names, postcode)?,
+            _ => false,
+        };
+        Ok(Some(StatedArea {
+            label: part.label,
+            names,
+            postal,
+        }))
+    }
+
+    /// Whether some address of the postcode written `postcode` states one
+    /// of `names` as where it is: the town of a postal address, which need
+    /// not be any area the address lies in ("Alexandria, VA 22310" is a
+    /// postal town over part of Fairfax County). The Pack's own addresses
+    /// say so, so no table of postal towns is needed.
+    fn postal_town(&self, names: &StatedNames, postcode: &str) -> Result<bool> {
+        let searcher = self.reader.searcher();
+        for name in &names.names {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.postcode_exact, postcode),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+                (Occur::Must, self.layer_query(Layer::Address.as_str())),
+            ];
+            clauses.extend(
+                name.iter()
+                    .map(|word| (Occur::Must, self.area_term_query(word))),
+            );
+            if !searcher
+                .search(&BooleanQuery::new(clauses), &TopDocs::with_limit(1))?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The countries and regions the parts of a query name, as the Pack
+    /// knows them (see [`StatedPlaces`]).
+    fn stated_places(&self, context: &[ContextPart]) -> StatedPlaces {
+        let dictionaries = self.tagger.dictionaries();
+        let covered = |country: &CountryCode| dictionaries.country_weight(*country) > 0.0;
+        let mut places = StatedPlaces::default();
+        for part in context {
+            let Some(key) = dictionary_key(&part.words.join(" ")) else {
+                continue;
+            };
+            let country_of = |field| {
+                dictionaries
+                    .get(field, &key)
+                    .and_then(|entry| entry.country)
+                    .filter(covered)
+            };
+            match part.label {
+                Label::Country => {
+                    if let Some(country) = country_of(NameField::Country)
+                        && !places.countries.contains(&country)
+                    {
+                        places.countries.push(country);
+                    }
+                }
+                Label::Region => {
+                    // "CA" read as a region may still be Canada, not
+                    // California: a key that is also another country's name
+                    // says nothing of the country.
+                    let country = country_of(NameField::Region).filter(|country| {
+                        dictionaries
+                            .get(NameField::Country, &key)
+                            .and_then(|entry| entry.country)
+                            .is_none_or(|named| named == *country)
+                    });
+                    places.regions.push(StatedRegion {
+                        words: part.words.clone(),
+                        country,
+                        regions: dictionaries
+                            .regions(&key)
+                            .into_iter()
+                            .map(RecordId::from)
+                            .collect(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        places
+    }
+
+    /// Whether a hit lies in the countries and regions a query names, `None`
+    /// when nothing says either way. A hit in another country than one the
+    /// query names contradicts it, and so does one in another country than
+    /// the one a stated region lies in ("NC" lies in the United States,
+    /// whatever else "Highlands" names). A region the Pack lists by its key
+    /// agrees with a hit whose chain holds one of its regions or whose
+    /// address states it, and a hit in other regions contradicts it. A
+    /// country or region the Pack does not know only ranks.
+    fn region_agreement(&self, hit: &TextSearchHit, places: &StatedPlaces) -> Result<Option<bool>> {
+        if places.countries.is_empty() && places.regions.is_empty() {
+            return Ok(None);
+        }
+        let country = hit.features.country;
+        if let Some(country) = country
+            && !places.countries.is_empty()
+            && !places.countries.contains(&country)
+        {
+            return Ok(Some(false));
+        }
+        let mut agreement = (!places.countries.is_empty() && country.is_some()).then_some(true);
+        for region in &places.regions {
+            if let (Some(stated), Some(country)) = (region.country, country)
+                && stated != country
+            {
+                return Ok(Some(false));
+            }
+            if region.regions.is_empty() {
+                continue;
+            }
+            let chain = self
+                .pack
+                .boundary_context(hit.record_id)?
+                .map(|context| {
+                    context
+                        .admin_context
+                        .entries()
+                        .iter()
+                        .filter(|entry| {
+                            entry.tiers.iter().any(|tier| {
+                                matches!(tier, PlaceLayer::Region | PlaceLayer::SubRegion)
+                            })
+                        })
+                        .map(|entry| entry.record_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let stated_by_address = hit
+                .record
+                .address
+                .region
+                .as_deref()
+                .and_then(search_key)
+                .is_some_and(|stated| {
+                    let words = stated.split_whitespace().collect::<HashSet<_>>();
+                    region
+                        .words
+                        .iter()
+                        .all(|word| words.contains(word.as_str()))
+                });
+            if stated_by_address || chain.iter().any(|id| region.regions.contains(id)) {
+                agreement = Some(true);
+            } else if !chain.is_empty() {
+                return Ok(Some(false));
+            }
+        }
+        Ok(agreement)
     }
 
     /// The words found in where some record is: those the Pack knows as a
@@ -1327,7 +1650,14 @@ impl TextSearcher {
     /// house number in the wrong postcode would win the strict pass alone,
     /// and the later passes that find the right street would never run ("8
     /// High Street, Deloraine TAS 7304" answered with the 7018 High Street,
-    /// 163 km away). Fails when the query has no words to search.
+    /// 163 km away). So is a hit on a street whose type or direction
+    /// contradicts the one the query writes (see [`Descriptors`]): "5525
+    /// North US Highway 281" is the street the query names before the 5525
+    /// of South US Highway 281.
+    ///
+    /// When no labelling finds anything, each is searched again with its
+    /// street cut to the words of it that name a street the Pack has (see
+    /// [`Self::trimmed`]). Fails when the query has no words to search.
     #[allow(clippy::too_many_arguments)]
     fn search_variants(
         &self,
@@ -1339,6 +1669,78 @@ impl TextSearcher {
         parses: Parses,
         mut accept: impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
+        let (plans, scores) = self.readings(query_text, context, parses)?;
+        let Some(first_plan) = plans.first() else {
+            return Err(Error::UnparsableQuery {
+                query: query_text.to_string(),
+            });
+        };
+        let first_query = first_plan.text();
+        // Where the best reading says the record is holds in every reading:
+        // a later one that reads "Christchurch" of "Ponsonby Road
+        // Christchurch" as a region, which only ranks, must not answer with
+        // the Ponsonby Road in Auckland.
+        let placed = self.known_area_words(
+            first_plan
+                .context
+                .iter()
+                .filter(|part| part.label == Label::Locality)
+                .flat_map(|part| &part.words),
+        )?;
+        let mut query_words = QueryWords::new(query_text);
+        query_words
+            .search
+            .extend(context.iter().flat_map(|part| part.words.iter().cloned()));
+        let search = Search {
+            placed: &placed,
+            query_words: &query_words,
+            filters,
+            focus,
+            limit,
+        };
+        let readings = plans
+            .into_iter()
+            .map(|plan| (plan.text(), plan))
+            .collect::<Vec<_>>();
+        let mut contradicting = Contradicting::default();
+        if let Some(found) =
+            self.choose_in_tiers(&readings, &scores, &search, &mut accept, &mut contradicting)?
+        {
+            return Ok(found);
+        }
+        let mut trimmed = Vec::<(String, QueryPlan)>::new();
+        let mut trimmed_scores = Vec::new();
+        for ((_, plan), score) in readings.iter().zip(&scores) {
+            if let Some(plan) = self.trimmed(plan)
+                && !trimmed.iter().any(|(_, held)| *held == plan)
+            {
+                trimmed.push((plan.text(), plan));
+                trimmed_scores.push(*score);
+            }
+        }
+        if let Some(found) = self.choose_in_tiers(
+            &trimmed,
+            &trimmed_scores,
+            &search,
+            &mut accept,
+            &mut contradicting,
+        )? {
+            return Ok(found);
+        }
+        Ok(contradicting
+            .alone(limit)
+            .unwrap_or((first_query, Vec::new())))
+    }
+
+    /// The plans of the parser's best labellings of `query_text`, best first,
+    /// each with `context` after its own parts, and the parser's score of
+    /// each. `parses` says which are kept.
+    fn readings(
+        &self,
+        query_text: &str,
+        context: &[ContextPart],
+        parses: Parses,
+    ) -> Result<(Vec<QueryPlan>, Vec<f32>)> {
         let mut plans = Vec::<QueryPlan>::new();
         let mut scores = Vec::<f32>::new();
         for parsed in self.tagger.parse(query_text) {
@@ -1363,31 +1765,23 @@ impl TextSearcher {
                 .filter(|(plan, _)| plan.house_number.is_some())
                 .unzip();
         }
-        let Some(first_plan) = plans.first() else {
-            return Err(Error::UnparsableQuery {
-                query: query_text.to_string(),
-            });
-        };
-        let first_query = first_plan.text();
-        // Where the best reading says the record is holds in every reading:
-        // a later one that reads "Christchurch" of "Ponsonby Road
-        // Christchurch" as a region, which only ranks, must not answer with
-        // the Ponsonby Road in Auckland.
-        let placed = self.known_area_words(
-            first_plan
-                .context
-                .iter()
-                .filter(|part| part.label == Label::Locality)
-                .flat_map(|part| &part.words),
-        )?;
-        let mut query_words = QueryWords::new(query_text);
-        query_words
-            .search
-            .extend(context.iter().flat_map(|part| part.words.iter().cloned()));
-        let readings = plans
-            .into_iter()
-            .map(|plan| (plan.text(), plan))
-            .collect::<Vec<_>>();
+        Ok((plans, scores))
+    }
+
+    /// The hits of the reading with the strongest [`Evidence`] in the first
+    /// typo tier any reading finds hits in, after them the hits whose
+    /// postcode or street contradicts the query (see
+    /// [`Self::search_variants`]), with the text of the reading that found
+    /// them. `None` when no reading finds any, and then the contradicting
+    /// hits wait in `contradicting`, after the ones there already.
+    fn choose_in_tiers(
+        &self,
+        readings: &[(String, QueryPlan)],
+        scores: &[f32],
+        search: &Search<'_>,
+        accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
+        contradicting: &mut Contradicting,
+    ) -> Result<Option<(String, Vec<TextSearchHit>)>> {
         // Which readings' contradicting hits count is known only once one is
         // chosen, so they wait here, in search order, with their tier and
         // reading.
@@ -1396,7 +1790,7 @@ impl TextSearcher {
             // Spelt only when searched: a typo tier walks the term
             // dictionaries, and most readings never run in it.
             let mut variants = vec![None::<Vec<QueryPlan>>; readings.len()];
-            let chosen = choose_reading(&scores, |reading, pass| {
+            let chosen = choose_reading(scores, |reading, pass| {
                 if variants[reading].is_none() {
                     variants[reading] = Some(match self.spelt(&readings[reading].1, edits)? {
                         Some(plan) => {
@@ -1412,14 +1806,14 @@ impl TextSearcher {
                     }
                     let (hits, kept) = self.search_plan(
                         plan,
-                        &placed,
+                        search.placed,
                         pass,
                         edits,
-                        &query_words,
-                        filters,
-                        focus,
-                        limit,
-                        &mut accept,
+                        search.query_words,
+                        search.filters,
+                        search.focus,
+                        search.limit,
+                        &mut *accept,
                     )?;
                     contradicted.push((tier, reading, kept));
                     if !hits.is_empty() {
@@ -1435,40 +1829,144 @@ impl TextSearcher {
             if let Some((reading, hits)) = chosen {
                 // As if the readings had run in turn up to the chosen one:
                 // those after it ran only to be outweighed.
-                let mut contradicting = Contradicting::default();
+                let mut kept = Contradicting::default();
                 for (searched_tier, searched, hits) in contradicted {
                     if searched_tier < tier || searched <= reading {
-                        contradicting.keep(&readings[searched].0, hits);
+                        kept.keep(&readings[searched].0, hits);
                     }
                 }
-                return Ok((
+                kept.append(std::mem::take(contradicting));
+                return Ok(Some((
                     readings[reading].0.clone(),
-                    contradicting.after(hits, limit),
-                ));
+                    kept.after(hits, search.limit),
+                )));
             }
         }
-        let mut contradicting = Contradicting::default();
         for (_, reading, hits) in contradicted {
             contradicting.keep(&readings[reading].0, hits);
         }
-        Ok(contradicting
-            .alone(limit)
-            .unwrap_or((first_query, Vec::new())))
+        Ok(None)
+    }
+
+    /// `plan` with its street cut to the longest run of its words that is
+    /// the name of a street the Pack has, the rest of them only ranking:
+    /// "W Harrison Street M/C 147" is West Harrison Street and a mail code,
+    /// "Rue de la Riaille Sur les bords du" the street and where it runs.
+    /// A run of only words that describe a street ("road") names none.
+    /// `None` when the whole street is such a name already, or no part of
+    /// it is.
+    fn trimmed(&self, plan: &QueryPlan) -> Option<QueryPlan> {
+        let words = plan
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .collect::<Vec<_>>();
+        if words.len() < 2 || self.tagger.names_street(&words) {
+            return None;
+        }
+        let (start, end) = (1..words.len()).rev().find_map(|length| {
+            (0..=words.len() - length)
+                .map(|start| (start, start + length))
+                .find(|&(start, end)| {
+                    let run = &words[start..end];
+                    run.iter().any(|word| !self.describes_street(word))
+                        && self.tagger.names_street(run)
+                })
+        })?;
+        let mut trimmed = plan.clone();
+        let subject = std::mem::take(&mut trimmed.subject);
+        let named = subject[start..end]
+            .iter()
+            .any(|word| !self.describes_street(&word.text));
+        for (index, mut word) in subject.into_iter().enumerate() {
+            if (start..end).contains(&index) {
+                word.required = !named || !self.describes_street(&word.text);
+                trimmed.subject.push(word);
+            } else {
+                trimmed.optional.push(word.text);
+            }
+        }
+        Some(trimmed)
+    }
+
+    /// The finest area a query names that the Pack holds, when nothing it
+    /// asks for is found (#31): its postcode, else a place it names, else
+    /// its region, else its country, each in the coarser areas the query
+    /// names and agreeing with every country and region it states, so a
+    /// fallback never answers in an area the query did not name. Every hit
+    /// is marked [`TextSearchHit::fallback`]: it says where the query is,
+    /// not what it asks for, and its `layer` and `accuracy` say how coarse
+    /// it is. Empty when the query names no area the Pack holds.
+    fn fallback(
+        &self,
+        query_text: &str,
+        context: &[ContextPart],
+        filters: Filters<'_>,
+        focus: Option<[f64; 2]>,
+        limit: usize,
+    ) -> Result<Vec<TextSearchHit>> {
+        let (plans, _) = self.readings(query_text, context, Parses::All)?;
+        let query_words = QueryWords::new(query_text);
+        let no_places = HashSet::new();
+        for plan in &plans {
+            let known = self.known_area_words(
+                plan.context
+                    .iter()
+                    .filter(|part| part.label == Label::Locality)
+                    .flat_map(|part| &part.words),
+            )?;
+            for (area, layers) in plan.area_plans(|part| self.stated_names(part, &known)) {
+                for layer in layers {
+                    let filters = Filters {
+                        layer: Some(layer.as_str()),
+                        ..filters
+                    };
+                    for edits in Edits::TIERS {
+                        let Some(spelt) = self.spelt(&area, edits)? else {
+                            continue;
+                        };
+                        let (mut hits, contradicted) = self.search_plan(
+                            &spelt,
+                            &no_places,
+                            Pass::Strict,
+                            edits,
+                            &query_words,
+                            filters,
+                            focus,
+                            limit,
+                            &mut |_, _, _| Ok(true),
+                        )?;
+                        hits.extend(contradicted);
+                        hits.truncate(limit);
+                        if !hits.is_empty() {
+                            for hit in &mut hits {
+                                hit.fallback = true;
+                            }
+                            return Ok(hits);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// The hits of one pass over one plan that `accept` keeps, at most
-    /// `limit`, and apart from them the kept hits whose own postcode
-    /// contradicts the one the plan names. A pass that does not require the
-    /// plan's localities still leaves out a hit that lies in other ones:
-    /// "Ponsonby Road Christchurch" is not answered in Auckland. So does
-    /// every pass with the words of `placed` (the localities of the best
-    /// reading the Pack knows) the plan reads as a region or a country,
-    /// which only rank, and with the plan's unplaced words the Pack knows as
-    /// an area's: each is where the query says the record is, unless it is
-    /// a word of the record itself (see [`Self::in_loose_areas`]). A plan
-    /// with no subject is exempt: the parser placed none of its words, and
-    /// a few of them may go unmatched (see [`unplaced_floor`]). Each hit
-    /// carries the [`Features`] of what found it.
+    /// `limit`, and apart from them the kept hits whose own postcode or
+    /// street contradicts the plan (see [`Self::search_variants`]). A pass
+    /// that does not require the plan's localities still leaves out a hit
+    /// that lies in other ones: "Ponsonby Road Christchurch" is not answered
+    /// in Auckland. Every pass leaves out a hit in another country or region
+    /// than one the plan names and the Pack knows (see
+    /// [`Self::region_agreement`]), and every pass does with the words of
+    /// `placed` (the localities of the best reading the Pack knows) the plan
+    /// reads as a region or a country, which only rank, and with the plan's
+    /// unplaced words the Pack knows as an area's: each is where the query
+    /// says the record is, unless it is a word of the record itself (see
+    /// [`Self::in_loose_areas`]). A plan with no subject is exempt: the
+    /// parser placed none of its words, and a few of them may go unmatched
+    /// (see [`unplaced_floor`]). Each hit carries the [`Features`] of what
+    /// found it.
     #[allow(clippy::too_many_arguments)]
     fn search_plan(
         &self,
@@ -1519,13 +2017,32 @@ impl TextSearcher {
             postcodes: self.postcode_weights(&plan.area_terms())?,
             stand_ins: self.stand_in_weights(plan)?,
         };
+        // Every stated locality, known or not, for what the hits rest on.
+        let postcode =
+            (!ranking.postcode.forms.is_empty()).then_some(ranking.postcode.exact.as_str());
+        let mut localities_stated = Vec::with_capacity(localities.len());
+        for part in &localities {
+            localities_stated.push(self.stated_area(part, &areas.known, postcode)?);
+        }
         let stated = if pass.requires_locality() {
             Vec::new()
         } else {
-            localities
-                .iter()
-                .filter_map(|part| StatedArea::known(part, &areas.known))
-                .collect()
+            localities_stated.iter().flatten().cloned().collect()
+        };
+        let places = self.stated_places(&plan.context);
+        // A country the query names narrows retrieval as a filter would, so
+        // the rank window holds its records and not a namesake abroad.
+        let countries = places
+            .countries
+            .iter()
+            .map(|country| country.as_str().to_string())
+            .collect::<Vec<_>>();
+        let filters = match filters.countries.is_empty() {
+            true => Filters {
+                countries: &countries,
+                ..filters
+            },
+            false => filters,
         };
         let relabelled = plan
             .context
@@ -1543,7 +2060,8 @@ impl TextSearcher {
         loose.dedup();
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
             Ok(filters.admit(hit)
-                && self.area_agreement(hit, &stated)? != Some(false)
+                && self.region_agreement(hit, &places)? != Some(false)
+                && self.area_agreement(hit, &stated, &ranking.postcode)? != Some(false)
                 && self.in_loose_areas(hit, &loose)?
                 && accept(plan, &ranking.postcode, hit)?)
         };
@@ -1561,11 +2079,6 @@ impl TextSearcher {
         }
         let query = self.build_query(plan, pass, filters, &areas)?;
         candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
-        // Every stated locality, known or not, for what the hits rest on.
-        let localities = localities
-            .iter()
-            .map(|part| StatedArea::known(part, &areas.known))
-            .collect::<Vec<_>>();
         let sought = plan
             .subject
             .iter()
@@ -1576,16 +2089,21 @@ impl TextSearcher {
                     .map(|word| (&word.text, &word.corrected)),
             )
             .collect::<Vec<_>>();
+        let descriptors = self.descriptors(plan.subject.iter().map(|word| word.text.as_str()));
         let (mut hits, mut contradicted) = (Vec::new(), Vec::new());
         for mut hit in candidates {
             let postcode = self.postcode_agreement(&hit, &ranking.postcode)?;
-            let area = if localities.is_empty() {
+            let area = if localities_stated.is_empty() {
                 Agreement::Unstated
-            } else if localities.iter().any(Option::is_none) {
+            } else if localities_stated.iter().any(Option::is_none) {
                 Agreement::Unknown
             } else {
-                let known = localities.iter().flatten().cloned().collect::<Vec<_>>();
-                agreement(self.area_agreement(&hit, &known)?)
+                let known = localities_stated
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                agreement(self.area_agreement(&hit, &known, &ranking.postcode)?)
             };
             let label = label_words(&hit.record);
             let features = &mut hit.features;
@@ -1610,7 +2128,7 @@ impl TextSearcher {
                         || edits.reaches(text, label)
                 })
             }));
-            if postcode == Some(false) {
+            if postcode == Some(false) || self.street_contradicts(&descriptors, &hit) {
                 contradicted.push(hit);
             } else {
                 hits.push(hit);
@@ -1621,35 +2139,164 @@ impl TextSearcher {
         Ok((hits, contradicted))
     }
 
+    /// The words of `words`, a query's street, that say its type or which
+    /// way it runs, each in all its forms ("n" is "north").
+    fn descriptors<'w>(&self, words: impl Iterator<Item = &'w str>) -> Descriptors {
+        let dictionaries = self.tagger.dictionaries();
+        let mut descriptors = Descriptors::default();
+        for word in words {
+            let kind = if dictionaries.is_direction(word) {
+                &mut descriptors.directions
+            } else if dictionaries.is_street_type(word) {
+                &mut descriptors.types
+            } else {
+                descriptors.names.push(word.to_string());
+                continue;
+            };
+            kind.insert(word.to_string());
+            kind.extend(lattice::other_forms(word));
+        }
+        descriptors
+    }
+
+    /// Whether the street of `hit` is another street of the name the query
+    /// writes (`stated`): it has every word of the name, and a type or a
+    /// direction but none of the ones of that kind the query writes. "South
+    /// US Highway 281" for "North US Highway 281", "16th Avenue North" for
+    /// "16th St N". It ranks after the streets that agree, never out: a
+    /// street type or direction never rejects a record (a query may write a
+    /// street's type wrong). A street that says nothing of a kind the query
+    /// states contradicts nothing, and nor does one of another name: the
+    /// words of a POI's name may be a direction somewhere ("Tim" is east in
+    /// Indonesian).
+    fn street_contradicts(&self, stated: &Descriptors, hit: &TextSearchHit) -> bool {
+        if stated.names.is_empty() || (stated.directions.is_empty() && stated.types.is_empty()) {
+            return false;
+        }
+        let street = if hit.record.layer == Layer::Street.as_str() {
+            Some(hit.record.name.as_str())
+        } else {
+            hit.record
+                .address
+                .street
+                .as_deref()
+                .or(hit.record.address.place.as_deref())
+        };
+        let Some(street) = street.and_then(street_search_text) else {
+            return false;
+        };
+        let own = self.descriptors(street.split_whitespace());
+        let named = stated.names.iter().all(|word| {
+            own.names.contains(word)
+                || lattice::other_forms(word)
+                    .iter()
+                    .any(|form| own.names.contains(form))
+        });
+        if !named {
+            return false;
+        }
+        let differs = |stated: &HashSet<String>, own: &HashSet<String>| {
+            !stated.is_empty() && !own.is_empty() && stated.is_disjoint(own)
+        };
+        differs(&stated.directions, &own.directions) || differs(&stated.types, &own.types)
+    }
+
     /// Whether a hit lies in the areas `stated` names, `None` when nothing
     /// says either way: it names none, or the hit lies in no area of the
-    /// level of any it names. A hit agrees with a stated area when one name
-    /// of its areas of that level has every word of it.
-    fn area_agreement(&self, hit: &TextSearchHit, stated: &[StatedArea]) -> Result<Option<bool>> {
+    /// level of any it names. A hit agrees with a stated name when one name
+    /// of its areas of that level has every word of it; with a stated area
+    /// when it agrees with each of its names, or with one where they cannot
+    /// all hold one address (see [`StatedNames::any`]). A part of a query
+    /// that is no one name may name areas of any level, so its names are
+    /// looked for in the hit's regions too.
+    ///
+    /// A locality that no area of the hit names still agrees with it in two
+    /// cases: it is the postal town of the query's postcode and the hit lies
+    /// in that postcode (see [`Self::postal_town`]), or it is a settlement
+    /// mapped only as a point among the few nearest the hit (see
+    /// [`Self::near_settlements`]): Bootle is a town with no boundary of its
+    /// own, and its streets lie only in Sefton's.
+    fn area_agreement(
+        &self,
+        hit: &TextSearchHit,
+        stated: &[StatedArea],
+        postcode: &QueryPostcode,
+    ) -> Result<Option<bool>> {
         if stated.is_empty() {
             return Ok(None);
         }
         let areas = self.areas_of(hit.record_id)?;
+        let mut settlements = None;
         let mut agreement = None;
         for area in stated {
-            let names = if area.label == Label::Region {
-                &areas.regions
+            let mut names = if area.label == Label::Region {
+                areas.regions.clone()
             } else {
-                &areas.localities
+                areas.localities.clone()
             };
+            if area.label == Label::Locality && !area.names.whole {
+                names.extend(areas.regions.iter().cloned());
+            }
             if names.is_empty() {
                 continue;
             }
-            let agrees = names.iter().any(|name| {
-                let words = name.split_whitespace().collect::<HashSet<_>>();
-                area.words.iter().all(|word| words.contains(word.as_str()))
-            });
+            let names_one = |words: &Vec<String>, names: &[String]| {
+                names.iter().any(|name| {
+                    let name = name.split_whitespace().collect::<HashSet<_>>();
+                    words.iter().all(|word| name.contains(word.as_str()))
+                })
+            };
+            let agrees_with = |names: &[String]| match area.names.any {
+                true => area.names.names.iter().any(|words| names_one(words, names)),
+                false => area.names.names.iter().all(|words| names_one(words, names)),
+            };
+            let mut agrees = agrees_with(&names);
+            if !agrees && area.label == Label::Locality {
+                agrees = area.postal && self.postcode_agreement(hit, postcode)? == Some(true);
+                if !agrees {
+                    if settlements.is_none() {
+                        settlements = Some(self.near_settlements(hit)?);
+                    }
+                    agrees = settlements.as_deref().is_some_and(&agrees_with);
+                }
+            }
             if !agrees {
                 return Ok(Some(false));
             }
             agreement = Some(true);
         }
         Ok(agreement)
+    }
+
+    /// The names, as search keys, of the [`NEAR_SETTLEMENTS`] settlements
+    /// nearest a hit, within [`NEAR_SETTLEMENT_RADIUS_M`], that the Pack
+    /// holds only as points: a town or suburb OSM maps as a node names the
+    /// land nearer it than most others, with no boundary to say so. None
+    /// for a hit with no point.
+    fn near_settlements(&self, hit: &TextSearchHit) -> Result<Vec<String>> {
+        let Some(point) = hit.record.point else {
+            return Ok(Vec::new());
+        };
+        let records = self.pack.records();
+        let near = self.spatial.nearest_context_points(
+            point.lon,
+            point.lat,
+            NEAR_SETTLEMENT_RADIUS_M,
+            NEAR_SETTLEMENTS,
+            |layer, record_id| {
+                Ok(matches!(layer, Layer::Locality | Layer::Neighbourhood)
+                    && records.header(record_id)?.object()?.0 == ObjectType::Node)
+            },
+        )?;
+        let mut names = Vec::new();
+        for candidate in near {
+            for name in records.names(candidate.record_id)?.iter() {
+                if let Some(name) = normalized_for_match(Some(name)) {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
     }
 
     /// Whether a hit lies where `words`, area words a query states without
@@ -1807,10 +2454,22 @@ impl TextSearcher {
 
     /// The postcode `plan` names, with the points of the Pack's records of
     /// it, so hits can be ranked and judged by how far they lie from it.
+    ///
+    /// A postcode written with an extension the Pack holds no record of is
+    /// the code it starts with, when the Pack holds that: "45415-3457", a
+    /// ZIP+4, is the 45415 its addresses state.
     fn query_postcode(&self, plan: &QueryPlan) -> Result<QueryPostcode> {
         let mut postcode = plan.postcode();
         if postcode.forms.is_empty() {
             return Ok(postcode);
+        }
+        if let Some((first, _)) = postcode.exact.split_once(' ')
+            && self
+                .postcode_records(std::slice::from_ref(&postcode.exact), 1)?
+                .is_empty()
+            && !self.postcode_records(&[first.to_string()], 1)?.is_empty()
+        {
+            postcode = QueryPostcode::of(&[first.to_string()]);
         }
         postcode.areas = self.postcode_areas(&postcode.exact)?;
         Ok(postcode)
@@ -2155,6 +2814,7 @@ impl TextSearcher {
                         ..Features::default()
                     },
                     confidence: None,
+                    fallback: false,
                 };
                 if !accept(&hit)? {
                     continue;
@@ -2287,7 +2947,7 @@ impl TextSearcher {
                 !words.iter().any(|street| {
                     *street == word.text
                         || word.corrected.as_ref() == Some(street)
-                        || lattice::full_forms(&word.text).contains(street)
+                        || lattice::other_forms(&word.text).contains(street)
                         || ranking.edits.reaches(&word.text, street)
                 })
             })
@@ -2732,6 +3392,7 @@ impl TextSearcher {
             },
             features: Features::default(),
             confidence: None,
+            fallback: false,
         })
     }
 }
@@ -3211,7 +3872,7 @@ impl TieBreak {
                 !query_words.contains(word)
                     && !query_words.iter().any(|query_word| {
                         ranking.edits.reaches(query_word, word)
-                            || lattice::full_forms(query_word)
+                            || lattice::other_forms(query_word)
                                 .iter()
                                 .any(|form| form == word)
                     })
@@ -3469,9 +4130,20 @@ impl Edits {
     /// numbers every edit names another real address ("12 Main St" is one
     /// edit from "13 Main St"), so a house number, a postcode, a unit or a
     /// route number is never a typo.
+    ///
+    /// A character a wrong encoding replaced ("Is\u{fffd}re") is an edit
+    /// whatever the word's length, so a word holding one has a typo in every
+    /// tier but the exact one, and keeps no first character that is one.
     fn allowed(self, word: &str) -> Option<(u8, usize)> {
         if self == Self::None || word.chars().any(char::is_numeric) {
             return None;
+        }
+        if replaced_characters(word) > 0 {
+            let prefix = match word.starts_with(char::REPLACEMENT_CHARACTER) {
+                true => 0,
+                false => TYPO_PREFIX_CHARS,
+            };
+            return Some((self.most(), prefix));
         }
         let chars = word.chars().count();
         if chars < MIN_TYPO_CHARS {
@@ -3620,6 +4292,13 @@ impl Contradicting {
         }
     }
 
+    /// The contradicting hits of `other` after these, those not held yet.
+    fn append(&mut self, other: Self) {
+        if let Some(query) = other.query {
+            self.keep(&query, other.hits);
+        }
+    }
+
     /// `hits`, then the contradicting hits they do not hold, at most `limit`.
     fn after(self, mut hits: Vec<TextSearchHit>, limit: usize) -> Vec<TextSearchHit> {
         for hit in self.hits {
@@ -3719,6 +4398,19 @@ const POSTCODE_HELD: u8 = u8::MAX;
 const POSTCODE_UNKNOWN: u8 = 128;
 
 impl QueryPostcode {
+    /// The postcode a query writes in `words`, not yet placed.
+    fn of(words: &[String]) -> Self {
+        let first_digit = words
+            .iter()
+            .position(|word| word.chars().any(|character| character.is_ascii_digit()))
+            .unwrap_or_default();
+        Self {
+            forms: unique_strings(vec![words.concat(), words[first_digit..].concat()]),
+            exact: words.join(" "),
+            areas: Vec::new(),
+        }
+    }
+
     /// Whether `postcode`, compacted, is in the named one: either starts the
     /// other.
     fn holds(&self, postcode: &str) -> bool {
@@ -3978,17 +4670,35 @@ impl ContextPart {
     }
 }
 
-/// A locality or region a query names, by the words of it the Pack knows
-/// (see [`TextSearcher::area_agreement`]).
+/// A locality or region a query names, as [`TextSearcher::area_agreement`]
+/// checks it.
 #[derive(Debug, Clone, PartialEq)]
 struct StatedArea {
     label: Label,
-    words: Vec<String>,
+    names: StatedNames,
+    /// Whether addresses of the query's postcode state it as their town (see
+    /// [`TextSearcher::postal_town`]).
+    postal: bool,
 }
 
-impl StatedArea {
-    /// The words of `part` that `known` holds, `None` when it holds none.
-    fn known(part: &ContextPart, known: &HashSet<String>) -> Option<Self> {
+/// The places a part of a query names, by the words of them the Pack knows
+/// (see [`TextSearcher::stated_names`]).
+#[derive(Debug, Clone, PartialEq)]
+struct StatedNames {
+    names: Vec<Vec<String>>,
+    /// Whether one name agreeing will do: the names cannot all hold one
+    /// address.
+    any: bool,
+    /// Whether the part is one name, so names an area of its own level
+    /// only: a part made of several names may have read a region as a
+    /// locality.
+    whole: bool,
+}
+
+impl StatedNames {
+    /// The words of `part` that `known` holds as one name, `None` when it
+    /// holds none.
+    fn known_words(part: &ContextPart, known: &HashSet<String>) -> Option<Self> {
         let words = part
             .words
             .iter()
@@ -3996,10 +4706,53 @@ impl StatedArea {
             .cloned()
             .collect::<Vec<_>>();
         (!words.is_empty()).then_some(Self {
-            label: part.label,
-            words,
+            names: vec![words],
+            any: false,
+            whole: true,
         })
     }
+}
+
+/// The countries and regions a query names, as the Pack knows them (see
+/// [`TextSearcher::stated_places`]).
+#[derive(Debug, Default)]
+struct StatedPlaces {
+    /// The countries its country parts name that the Pack holds records in,
+    /// by the Pack's names and codes of countries.
+    countries: Vec<CountryCode>,
+    regions: Vec<StatedRegion>,
+}
+
+/// A region a query names.
+#[derive(Debug)]
+struct StatedRegion {
+    words: Vec<String>,
+    /// The country most records stating it lie in, when that is no other
+    /// country's name and the Pack holds records there.
+    country: Option<CountryCode>,
+    /// The regions the Pack lists for it (see
+    /// [`crate::parse::lattice::dictionary::REGIONS_SECTION`]); empty when it
+    /// lists none, as a Pack built before it listed them does.
+    regions: Vec<RecordId>,
+}
+
+/// The words of a street that say its type or which way it runs, each in
+/// all its forms, and the words that name it (see
+/// [`TextSearcher::street_contradicts`]).
+#[derive(Debug, Default)]
+struct Descriptors {
+    directions: HashSet<String>,
+    types: HashSet<String>,
+    names: Vec<String>,
+}
+
+/// What every pass over every reading of one query searches with.
+struct Search<'a> {
+    placed: &'a HashSet<String>,
+    query_words: &'a QueryWords,
+    filters: Filters<'a>,
+    focus: Option<[f64; 2]>,
+    limit: usize,
 }
 
 /// How many of `count` unplaced words a record must match when a query has
@@ -4013,6 +4766,44 @@ fn unplaced_floor(count: usize) -> usize {
         2..=5 => count - 1,
         _ => count - count / 4,
     }
+}
+
+/// Where a run of words the parser read as a street or a place, from word
+/// `from` on, holds a unit: a unit designator and the flat after it, a
+/// number or a letter ("Suite A", "Ste G", "Bat-C"). A street's first word
+/// is its own ("Unit Road"), so a street's run is read from its second.
+fn unit_in(words: &[String], from: usize) -> Option<usize> {
+    let flat = |word: &String| {
+        word.chars().any(|character| character.is_ascii_digit()) || word.chars().count() == 1
+    };
+    (from..words.len().saturating_sub(1))
+        .find(|&at| designates_unit(&words[at]) && flat(&words[at + 1]))
+}
+
+/// Words of a run, with the parser's corrections of them (see
+/// [`ContextPart::corrected`]).
+type RunPart = (Vec<String>, Option<Vec<String>>);
+
+/// A run of words split around the unit at `at`: the words before it, the
+/// unit's two words, and the words after it.
+fn split_run(
+    words: &[String],
+    corrected: &Option<Vec<String>>,
+    at: usize,
+) -> (RunPart, Vec<String>, RunPart) {
+    let part = |range: std::ops::Range<usize>| -> RunPart {
+        (
+            words[range.clone()].to_vec(),
+            corrected
+                .as_ref()
+                .and_then(|corrected| corrected.get(range).map(<[String]>::to_vec)),
+        )
+    };
+    (
+        part(0..at),
+        words[at..at + 2].to_vec(),
+        part(at + 2..words.len()),
+    )
 }
 
 /// The flat a run of unit words names: its word with a digit, else the word
@@ -4122,7 +4913,16 @@ impl QueryPlan {
                     None => plan.optional.extend(words),
                 },
                 Label::HouseNumber => plan.optional.extend(words),
-                Label::Street => street.extend(expanded_run(&words, &corrected)),
+                Label::Street => match unit_in(&words, 1).filter(|_| plan.unit.is_none()) {
+                    Some(at) => {
+                        let (before, unit, after) = split_run(&words, &corrected, at);
+                        street.extend(expanded_run(&before.0, &before.1));
+                        plan.unit = named_unit(&unit);
+                        plan.unit_words.extend(unit);
+                        street.extend(expanded_run(&after.0, &after.1));
+                    }
+                    None => street.extend(expanded_run(&words, &corrected)),
+                },
                 // A run the parser could not place that opens with a unit
                 // designator and the flat after it ("unit 2", "suite 410")
                 // is that flat, whatever the parser read it as.
@@ -4140,6 +4940,25 @@ impl QueryPlan {
                     plan.unplaced.extend(expanded_run(&words[2..], &rest));
                 }
                 Label::Other => plan.unplaced.extend(expanded_run(&words, &corrected)),
+                // A suite the parser read as a place ("Suite A" of "Suite A
+                // Dayton") is the flat, and the words around it the place.
+                Label::Locality | Label::Region | Label::Country
+                    if plan.unit.is_none()
+                        && let Some(at) = unit_in(&words, 0) =>
+                {
+                    let (before, unit, after) = split_run(&words, &corrected, at);
+                    plan.unit = named_unit(&unit);
+                    plan.unit_words.extend(unit);
+                    for (words, corrected) in [before, after] {
+                        if !words.is_empty() {
+                            plan.context.push(ContextPart {
+                                label,
+                                words,
+                                corrected,
+                            });
+                        }
+                    }
+                }
                 Label::Locality | Label::Region | Label::Postcode | Label::Country => {
                     plan.context.push(ContextPart {
                         label,
@@ -4204,16 +5023,15 @@ impl QueryPlan {
     /// index expands, which it leaves as written on purpose ("St" before a
     /// name is "Saint"), or for a form the plan already seeks: "st" of "12
     /// St George Street" must not count the "street" again.
-    fn full_forms(&self, word: &str) -> Vec<&'static str> {
+    fn full_forms(&self, word: &str) -> Vec<String> {
         if STREET_TYPE_ABBREVIATIONS
             .iter()
             .any(|(abbreviation, _)| *abbreviation == word)
         {
             return Vec::new();
         }
-        lattice::full_forms(word)
-            .iter()
-            .map(String::as_str)
+        lattice::other_forms(word)
+            .into_iter()
             .filter(|form| {
                 !self
                     .subject
@@ -4297,16 +5115,84 @@ impl QueryPlan {
         let Some(part) = self.context.iter().rev().find(|part| part.is_postcode()) else {
             return QueryPostcode::default();
         };
-        let words = &part.words;
-        let first_digit = words
-            .iter()
-            .position(|word| word.chars().any(|character| character.is_ascii_digit()))
-            .unwrap_or_default();
-        QueryPostcode {
-            forms: unique_strings(vec![words.concat(), words[first_digit..].concat()]),
-            exact: words.join(" "),
-            areas: Vec::new(),
+        QueryPostcode::of(&part.words)
+    }
+
+    /// Plans of the areas the plan names, finest first, each with the layers
+    /// an area of its kind is: its postcode (and the code a postcode written
+    /// with an extension starts with), each name of each locality (see
+    /// [`TextSearcher::stated_names`], `names`), its region, its country.
+    /// Each seeks its area in the coarser areas the plan names, and is ranked
+    /// by its postcode (see [`TextSearcher::fallback`]).
+    fn area_plans(
+        &self,
+        names: impl Fn(&ContextPart) -> Option<StatedNames>,
+    ) -> Vec<(Self, &'static [Layer])> {
+        const POSTCODE: &[Layer] = &[Layer::Postcode];
+        const LOCALITY: &[Layer] = &[
+            Layer::Locality,
+            Layer::Neighbourhood,
+            Layer::District,
+            Layer::Place,
+        ];
+        const REGION: &[Layer] = &[Layer::Region, Layer::District];
+        const COUNTRY: &[Layer] = &[Layer::Country];
+        let rank = |label: Label| match label {
+            Label::Postcode => 0,
+            Label::Locality => 1,
+            Label::Region => 2,
+            _ => 3,
+        };
+        let mut plans = Vec::new();
+        let mut add = |words: Vec<String>, label: Label, layers: &'static [Layer]| {
+            let context = self
+                .context
+                .iter()
+                .filter(|part| {
+                    rank(part.label) > rank(label)
+                        || (part.is_postcode() && label != Label::Postcode)
+                })
+                .cloned()
+                .collect();
+            let subject = words
+                .into_iter()
+                .map(|text| SubjectWord {
+                    text,
+                    corrected: None,
+                    required: true,
+                })
+                .collect();
+            plans.push((
+                Self {
+                    subject,
+                    context,
+                    ..Self::default()
+                },
+                layers,
+            ));
+        };
+        for part in self.context.iter().rev().filter(|part| part.is_postcode()) {
+            add(part.words.clone(), Label::Postcode, POSTCODE);
+            if part.words.len() > 1 {
+                add(vec![part.words[0].clone()], Label::Postcode, POSTCODE);
+            }
         }
+        for part in self
+            .context
+            .iter()
+            .filter(|part| part.label == Label::Locality)
+        {
+            let named = names(part).map_or_else(|| vec![part.words.clone()], |names| names.names);
+            for name in named {
+                add(name, Label::Locality, LOCALITY);
+            }
+        }
+        for (label, layers) in [(Label::Region, REGION), (Label::Country, COUNTRY)] {
+            for part in self.context.iter().filter(|part| part.label == label) {
+                add(part.words.clone(), label, layers);
+            }
+        }
+        plans
     }
 }
 
@@ -5123,11 +6009,16 @@ mod tests {
                 Some("osm:node:1"),
                 "the {country} 2110 is not measured against the other country's"
             );
-            // A code only the other country uses lies a sea away.
-            let foreign = if country == "NZ" { "2111" } else { "2113" };
+            // A code only the other country uses lies a sea away: the house
+            // is no answer, and the row falls back to the postcode it names.
+            let (foreign, other) = if country == "NZ" {
+                ("2111", "au")
+            } else {
+                ("2113", "nz")
+            };
             assert_eq!(
                 geocode(&searcher, "10 Elliot Street", None, Some(foreign)),
-                None,
+                Some(format!("derived:osm:postcode:{other}:{foreign}")),
                 "{foreign} contradicts the {country} address"
             );
             let _ = std::fs::remove_dir_all(temp_dir);
@@ -7237,6 +8128,943 @@ mod tests {
             geocode(&searcher, "123 Crummer Road", Some("Ponsonby"), None),
             None
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// One labelled reading of a query, searched as one reading of
+    /// [`TextSearcher::search_variants`] searches it in the exact tier: the
+    /// hits of the first pass that finds any, then the hits that contradict
+    /// the query.
+    fn answer(searcher: &TextSearcher, reading: &str) -> Vec<String> {
+        let plan = reading_plan(searcher, reading);
+        answer_plan(searcher, &plan)
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect()
+    }
+
+    fn reading_plan(searcher: &TextSearcher, reading: &str) -> QueryPlan {
+        QueryPlan::from_tagged(&tagged(reading), &[], &[], |word| {
+            searcher.describes_street(word)
+        })
+        .expect("plan")
+    }
+
+    fn answer_plan(searcher: &TextSearcher, plan: &QueryPlan) -> Vec<TextSearchHit> {
+        let mut contradicted = Vec::<TextSearchHit>::new();
+        for pass in Pass::ALL {
+            if !pass.searches_anew(plan) {
+                continue;
+            }
+            let (hits, kept) = searcher
+                .search_plan(
+                    plan,
+                    &HashSet::new(),
+                    pass,
+                    Edits::None,
+                    &QueryWords::new(&plan.text()),
+                    Filters::default(),
+                    None,
+                    5,
+                    &mut |_, _, _| Ok(true),
+                )
+                .expect("search");
+            for hit in kept {
+                if !contradicted
+                    .iter()
+                    .any(|held| held.record.id == hit.record.id)
+                {
+                    contradicted.push(hit);
+                }
+            }
+            if !hits.is_empty() {
+                let mut answers = hits;
+                for hit in contradicted {
+                    if !answers.iter().any(|held| held.record.id == hit.record.id) {
+                        answers.push(hit);
+                    }
+                }
+                return answers;
+            }
+        }
+        contradicted
+    }
+
+    /// A place record, an area when `object_type` is a relation, else a
+    /// point.
+    fn place(
+        writer: &mut Writer,
+        layer: crate::record::PlaceLayer,
+        name: &str,
+        object_type: ObjectType,
+        object_id: i64,
+        [lon, lat]: [f64; 2],
+        context: Option<crate::pack::RecordContext>,
+    ) -> RecordId {
+        writer
+            .write(
+                &crate::record::Record::Place(
+                    layer,
+                    crate::record::PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: name.to_string(),
+                        place_type: "boundary".to_string(),
+                        geometry: point_geometry(lon, lat),
+                        source: SourceProvenance::osm(object_type, object_id),
+                    },
+                ),
+                context,
+            )
+            .expect("place")
+    }
+
+    fn chain(
+        tiers: &[(crate::record::PlaceLayer, RecordId)],
+    ) -> Option<crate::pack::RecordContext> {
+        Some(crate::pack::RecordContext {
+            admin_context: crate::context::AdminContextTuple::from_tiers(tiers.iter().copied()),
+            flags: 0,
+        })
+    }
+
+    fn located(mut record: AddressRecord, [lon, lat]: [f64; 2]) -> AddressRecord {
+        record.geometry = point_geometry(lon, lat);
+        record
+    }
+
+    fn street_at(id: &str, name: &str, [lon, lat]: [f64; 2]) -> StreetRecord {
+        let mut street = street_record(id, name);
+        street.geometry = point_geometry(lon, lat);
+        street.representative_point = [lon, lat];
+        street
+    }
+
+    #[test]
+    fn a_stated_country_or_region_the_pack_knows_removes_a_record_elsewhere() {
+        use crate::record::PlaceLayer::{Country, Locality, Region};
+
+        let temp_dir = temp_pack_path("search-countries");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let at = [-83.2, 35.05];
+        let us = place(
+            &mut writer,
+            Country,
+            "United States",
+            ObjectType::Relation,
+            1,
+            at,
+            None,
+        );
+        let canada = place(
+            &mut writer,
+            Country,
+            "Canada",
+            ObjectType::Relation,
+            2,
+            at,
+            None,
+        );
+        writer.set_country_codes(
+            [
+                (us, CountryCode::parse("US").expect("code")),
+                (canada, CountryCode::parse("CA").expect("code")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let carolina = place(
+            &mut writer,
+            Region,
+            "North Carolina",
+            ObjectType::Relation,
+            3,
+            at,
+            chain(&[(Country, us)]),
+        );
+        let texas = place(
+            &mut writer,
+            Region,
+            "Texas",
+            ObjectType::Relation,
+            4,
+            at,
+            chain(&[(Country, us)]),
+        );
+        let ontario = place(
+            &mut writer,
+            Region,
+            "Ontario",
+            ObjectType::Relation,
+            5,
+            at,
+            chain(&[(Country, canada)]),
+        );
+        let in_region = |country, region| chain(&[(Country, country), (Region, region)]);
+        let highlands_nc = place(
+            &mut writer,
+            Locality,
+            "Highlands",
+            ObjectType::Relation,
+            6,
+            at,
+            in_region(us, carolina),
+        );
+        let highlands_tx = place(
+            &mut writer,
+            Locality,
+            "Highlands",
+            ObjectType::Relation,
+            7,
+            at,
+            in_region(us, texas),
+        );
+        let addington = place(
+            &mut writer,
+            Locality,
+            "Addington Highlands",
+            ObjectType::Relation,
+            8,
+            at,
+            in_region(canada, ontario),
+        );
+        writer.set_context_names(
+            [
+                (us, "United States"),
+                (canada, "Canada"),
+                (carolina, "North Carolina"),
+                (texas, "Texas"),
+                (ontario, "Ontario"),
+                (highlands_nc, "Highlands"),
+                (highlands_tx, "Highlands"),
+                (addington, "Addington Highlands"),
+            ]
+            .into_iter()
+            .map(|(id, name)| (id, vec![name.to_string()]))
+            .collect(),
+        );
+        let in_town = |country, region, locality| {
+            chain(&[(Country, country), (Region, region), (Locality, locality)])
+        };
+        for (id, region, context) in [
+            ("osm:node:10", "NC", in_town(us, carolina, highlands_nc)),
+            ("osm:node:11", "TX", in_town(us, texas, highlands_tx)),
+            ("osm:node:12", "ON", in_town(canada, ontario, addington)),
+        ] {
+            let mut address = address_record(id, "", "134", "North 5th Street", None, None);
+            address.address.region = Some(region.to_string());
+            writer.write(&address.into(), context).expect("address");
+        }
+        writer
+            .write(
+                &street_record("osm:way:20", "Main Street").into(),
+                in_town(us, texas, highlands_tx),
+            )
+            .expect("street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let street = "134/house_number north/street 5th/street street/street highlands/locality";
+
+        // A geocoded row's region, by its name or the code its addresses
+        // state, though the street states none.
+        let geocode_in = |address: &str, region: &str| {
+            searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: address.to_string(),
+                    locality: Some("Highlands".to_string()),
+                    region: Some(region.to_string()),
+                    postcode: None,
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                })
+                .expect("geocode")
+                .map(|found| found.hit.record.id)
+        };
+        assert_eq!(
+            geocode_in("134 North 5th Street", "NC").as_deref(),
+            Some("osm:node:10")
+        );
+        assert_eq!(
+            geocode_in("134 North 5th Street", "North Carolina").as_deref(),
+            Some("osm:node:10")
+        );
+        assert_eq!(
+            geocode_in("Main Street", "TX").as_deref(),
+            Some("osm:way:20")
+        );
+        assert_eq!(
+            geocode_in("Main Street", "Texas").as_deref(),
+            Some("osm:way:20")
+        );
+
+        // "NC" lies in the United States, and in North Carolina.
+        assert_eq!(
+            answer(&searcher, &format!("{street} nc/region")),
+            ["osm:node:10"]
+        );
+        let mut american = answer(
+            &searcher,
+            &format!("{street} united/country states/country"),
+        );
+        american.sort();
+        assert_eq!(american, ["osm:node:10", "osm:node:11"]);
+        assert_eq!(
+            answer(&searcher, &format!("{street} ca/country")),
+            ["osm:node:12"]
+        );
+        // A country or region the Pack does not know only ranks.
+        assert_eq!(
+            answer(&searcher, &format!("{street} atlantis/country")).len(),
+            3
+        );
+        assert_eq!(answer(&searcher, &format!("{street} zz/region")).len(), 3);
+
+        // An address the Pack lacks falls back to the town in the region the
+        // query names, never a namesake elsewhere.
+        let context = [
+            ContextPart::of(Label::Locality, Some("Highlands")).expect("part"),
+            ContextPart::of(Label::Region, Some("NC")).expect("part"),
+        ];
+        let fallback = searcher
+            .fallback("999 Nowhere Lane", &context, Filters::default(), None, 5)
+            .expect("fallback");
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["osm:relation:6"]
+        );
+        assert!(fallback.iter().all(|hit| hit.fallback));
+        let nowhere = [ContextPart::of(Label::Locality, Some("Atlantis")).expect("part")];
+        assert!(
+            searcher
+                .fallback("999 Nowhere Lane", &nowhere, Filters::default(), None, 5)
+                .expect("fallback")
+                .is_empty(),
+            "a town the Pack does not know is no answer"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_postal_town_or_a_settlement_point_nearby_agrees_with_a_record_outside_it() {
+        use crate::record::PlaceLayer::{District, Locality, Neighbourhood};
+
+        let temp_dir = temp_pack_path("search-postal-towns");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let franconia_at = [-77.15, 38.78];
+        let franconia = place(
+            &mut writer,
+            Locality,
+            "Franconia",
+            ObjectType::Relation,
+            1,
+            franconia_at,
+            None,
+        );
+        let springfield = place(
+            &mut writer,
+            Locality,
+            "Springfield",
+            ObjectType::Relation,
+            2,
+            [-89.6, 39.8],
+            None,
+        );
+        let sefton = place(
+            &mut writer,
+            District,
+            "Sefton",
+            ObjectType::Relation,
+            3,
+            [-3.0, 53.46],
+            None,
+        );
+        // Bootle is a town mapped only as a point, a kilometre from the road.
+        place(
+            &mut writer,
+            Neighbourhood,
+            "Bootle",
+            ObjectType::Node,
+            4,
+            [-2.99, 53.455],
+            None,
+        );
+        writer.set_context_names(
+            [
+                (franconia, "Franconia"),
+                (springfield, "Springfield"),
+                (sefton, "Sefton"),
+            ]
+            .into_iter()
+            .map(|(id, name)| (id, vec![name.to_string()]))
+            .collect(),
+        );
+        // Fairfax County's addresses state the postal town, not the CDP.
+        writer
+            .write(
+                &located(
+                    address_record(
+                        "osm:node:10",
+                        "",
+                        "1",
+                        "Maple Street",
+                        Some("Alexandria"),
+                        Some("22310"),
+                    ),
+                    franconia_at,
+                )
+                .into(),
+                chain(&[(Locality, franconia)]),
+            )
+            .expect("alexandria address");
+        writer
+            .write(
+                &PostcodeRecord {
+                    postcode: "22310".to_string(),
+                    country: None,
+                    geometry: point_geometry(franconia_at[0], franconia_at[1]),
+                    source: DerivedSourceProvenance::osm_address_records(1),
+                }
+                .into(),
+                None,
+            )
+            .expect("postcode");
+        writer
+            .write(
+                &street_at("osm:way:20", "Applemint Lane", franconia_at).into(),
+                chain(&[(Locality, franconia)]),
+            )
+            .expect("applemint lane");
+        writer
+            .write(
+                &located(
+                    address_record("osm:node:11", "", "5", "Elm Street", None, None),
+                    [-89.6, 39.8],
+                )
+                .into(),
+                chain(&[(Locality, springfield)]),
+            )
+            .expect("springfield address");
+        writer
+            .write(
+                &located(
+                    address_record("osm:node:12", "", "7", "Stanley Road", Some("Bootle"), None),
+                    [-2.98, 53.45],
+                )
+                .into(),
+                chain(&[(District, sefton)]),
+            )
+            .expect("bootle address");
+        writer
+            .write(
+                &street_at("osm:way:21", "Knowsley Road", [-3.0, 53.46]).into(),
+                chain(&[(District, sefton)]),
+            )
+            .expect("knowsley road");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            answer(
+                &searcher,
+                "applemint/street lane/street alexandria/locality 22310/postcode"
+            ),
+            ["osm:way:20"]
+        );
+        // A known town no address of the postcode states still rejects.
+        assert!(
+            answer(
+                &searcher,
+                "applemint/street lane/street springfield/locality 22310/postcode"
+            )
+            .is_empty()
+        );
+        assert!(
+            answer(
+                &searcher,
+                "applemint/street lane/street alexandria/locality"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            answer(&searcher, "knowsley/street road/street bootle/locality"),
+            ["osm:way:21"]
+        );
+        assert!(
+            answer(
+                &searcher,
+                "knowsley/street road/street springfield/locality"
+            )
+            .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_locality_run_is_read_as_the_places_named_in_it() {
+        use crate::record::PlaceLayer::{Locality, Neighbourhood};
+
+        let temp_dir = temp_pack_path("search-locality-runs");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let at = [10.6, 47.03];
+        let serfaus = place(
+            &mut writer,
+            Locality,
+            "Serfaus",
+            ObjectType::Relation,
+            1,
+            at,
+            None,
+        );
+        let fiss = place(
+            &mut writer,
+            Locality,
+            "Fiss",
+            ObjectType::Relation,
+            2,
+            at,
+            None,
+        );
+        let ladis = place(
+            &mut writer,
+            Locality,
+            "Ladis",
+            ObjectType::Relation,
+            3,
+            at,
+            None,
+        );
+        let auckland = place(
+            &mut writer,
+            Locality,
+            "Auckland",
+            ObjectType::Relation,
+            4,
+            at,
+            None,
+        );
+        let mount_eden = place(
+            &mut writer,
+            Neighbourhood,
+            "Mount Eden",
+            ObjectType::Relation,
+            5,
+            at,
+            chain(&[(Locality, auckland)]),
+        );
+        writer.set_context_names(
+            [
+                (serfaus, "Serfaus"),
+                (fiss, "Fiss"),
+                (ladis, "Ladis"),
+                (auckland, "Auckland"),
+                (mount_eden, "Mount Eden"),
+            ]
+            .into_iter()
+            .map(|(id, name)| (id, vec![name.to_string()]))
+            .collect(),
+        );
+        for (id, number, street, context) in [
+            (
+                "osm:node:10",
+                "15",
+                "Dorfbahnstraße",
+                chain(&[(Locality, serfaus)]),
+            ),
+            ("osm:node:11", "3", "Dorfstraße", chain(&[(Locality, fiss)])),
+            (
+                "osm:node:12",
+                "5",
+                "Dorfstraße",
+                chain(&[(Locality, ladis)]),
+            ),
+            (
+                "osm:node:13",
+                "10",
+                "Eden Road",
+                chain(&[(Locality, auckland), (Neighbourhood, mount_eden)]),
+            ),
+            (
+                "osm:node:14",
+                "10",
+                "Eden Road",
+                chain(&[(Locality, auckland)]),
+            ),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", number, street, None, None).into(),
+                    context,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // The village, and the ski area named after it and its neighbours.
+        assert_eq!(
+            answer(
+                &searcher,
+                "dorfbahnstrasse/street 15/house_number serfaus/locality serfaus/locality fiss/locality ladis/locality"
+            ),
+            ["osm:node:10"]
+        );
+        // A suburb and its city are one address's, and both must agree.
+        assert_eq!(
+            answer(
+                &searcher,
+                "10/house_number eden/street road/street mount/locality eden/locality auckland/locality"
+            ),
+            ["osm:node:13"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_street_whose_direction_or_type_contradicts_the_query_ranks_after() {
+        let temp_dir = temp_pack_path("search-descriptors");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:10",
+                    "",
+                    "5525",
+                    "South US Highway 281",
+                    None,
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("south address");
+        writer
+            .write(
+                &street_record("osm:way:20", "North US Highway 281").into(),
+                None,
+            )
+            .expect("north");
+        writer
+            .write(
+                &street_record("osm:way:21", "South US Highway 281").into(),
+                None,
+            )
+            .expect("south");
+        writer
+            .write(
+                &address_record("osm:node:11", "", "3935", "16th Avenue North", None, None).into(),
+                None,
+            )
+            .expect("avenue address");
+        writer
+            .write(
+                &street_record("osm:way:22", "16th Street North").into(),
+                None,
+            )
+            .expect("16th street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        let north = answer(
+            &searcher,
+            "5525/house_number north/street us/street highway/street 281/street",
+        );
+        assert_eq!(north[0], "osm:way:20", "{north:?}");
+        assert!(
+            north.contains(&"osm:node:10".to_string()),
+            "ranked after, never out"
+        );
+        assert_eq!(
+            answer(
+                &searcher,
+                "5525/house_number south/street us/street highway/street 281/street"
+            )[0],
+            "osm:node:10"
+        );
+        assert_eq!(
+            answer(
+                &searcher,
+                "3935/house_number 16th/street st/street n/street"
+            )[0],
+            "osm:way:22"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn noise_around_an_address_leaves_the_address() {
+        let temp_dir = temp_pack_path("search-noise");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for record in [
+            address_record(
+                "osm:node:10",
+                "",
+                "1040",
+                "West Harrison Street",
+                None,
+                Some("60607"),
+            ),
+            address_record(
+                "osm:node:11",
+                "",
+                "8600",
+                "North Main Street",
+                None,
+                Some("45415"),
+            ),
+            address_record("osm:node:12", "", "73", "Eibacher Hauptstraße", None, None),
+            address_record("osm:node:13", "", "131", "Impasse de la Noria", None, None),
+        ] {
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer
+            .write(
+                &PostcodeRecord {
+                    postcode: "45415".to_string(),
+                    country: None,
+                    geometry: point_geometry(-79.0, 43.0),
+                    source: DerivedSourceProvenance::osm_address_records(1),
+                }
+                .into(),
+                None,
+            )
+            .expect("postcode");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        // A suite read as a place, or written in the street, is the flat.
+        let dayton = reading_plan(
+            &searcher,
+            "8600/house_number n/street main/street street/street suite/locality a/locality dayton/locality",
+        );
+        assert_eq!(dayton.unit.as_deref(), Some("a"));
+        assert_eq!(dayton.context.len(), 1);
+        assert_eq!(dayton.context[0].words, ["dayton"]);
+        let warner = reading_plan(
+            &searcher,
+            "7451/house_number warner/street ave/street ste/street g/street",
+        );
+        assert_eq!(warner.unit.as_deref(), Some("g"));
+        assert_eq!(
+            warner
+                .subject
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            ["warner", "avenue"]
+        );
+        assert!(
+            reading_plan(&searcher, "5/house_number unit/street road/street")
+                .unit
+                .is_none()
+        );
+
+        // A ZIP+4 is the ZIP its addresses state.
+        let zip = answer_plan(
+            &searcher,
+            &reading_plan(
+                &searcher,
+                "8600/house_number n/street main/street street/street 45415/postcode 3457/postcode",
+            ),
+        );
+        assert_eq!(zip[0].record.id, "osm:node:11");
+        assert_eq!(zip[0].features.postcode, Agreement::Agrees);
+
+        // A mail code after the street names no street.
+        let mail = reading_plan(
+            &searcher,
+            "1040/house_number w/street harrison/street street/street mail/street code/street 147/street",
+        );
+        assert!(answer_plan(&searcher, &mail).is_empty());
+        let trimmed = searcher.trimmed(&mail).expect("trimmed");
+        assert_eq!(
+            trimmed
+                .subject
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            ["w", "harrison", "street"]
+        );
+        assert_eq!(trimmed.optional, ["mail", "code", "147"]);
+        assert_eq!(answer_plan(&searcher, &trimmed)[0].record.id, "osm:node:10");
+        assert!(
+            searcher.trimmed(&trimmed).is_none(),
+            "the whole street is one"
+        );
+
+        // A street type glued onto the name, abbreviated.
+        assert_eq!(
+            answer(&searcher, "eibacher/street hauptstr/street 73/house_number"),
+            ["osm:node:12"]
+        );
+
+        // A letter a wrong encoding replaced is one edit from it.
+        let mangled = reading_plan(
+            &searcher,
+            "131/house_number impasse/street de/street la/street nor\u{fffd}a/street",
+        );
+        assert!(answer_plan(&searcher, &mangled).is_empty());
+        let spelt = searcher
+            .spelt(&mangled, Edits::One)
+            .expect("spelt")
+            .expect("a typo tier");
+        let (hits, _) = searcher
+            .search_plan(
+                &spelt,
+                &HashSet::new(),
+                Pass::Strict,
+                Edits::One,
+                &QueryWords::new("131 impasse de la nor\u{fffd}a"),
+                Filters::default(),
+                None,
+                5,
+                &mut |_, _, _| Ok(true),
+            )
+            .expect("search");
+        assert_eq!(hits[0].record.id, "osm:node:13");
+        assert!(Edits::One.reaches("\u{fffd}tretat", "etretat"));
+        assert!(!Edits::None.reaches("ari\u{fffd}ge", "ariege"));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The rule #36 rests on: a known locality that disagrees still rejects,
+    /// whatever the reading, and a fallback answers only in it.
+    #[test]
+    fn a_known_town_the_record_is_not_in_rejects_it() {
+        use crate::record::PlaceLayer::{Locality, Neighbourhood, Region};
+
+        let temp_dir = temp_pack_path("search-ponsonby");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let (auckland_at, wellington_at, christchurch_at) =
+            ([174.76, -36.85], [174.776, -41.286], [172.63, -43.53]);
+        let mut towns = Vec::new();
+        for (object_id, (town, region, at)) in [
+            ("Auckland", "Auckland", auckland_at),
+            ("Wellington", "Wellington", wellington_at),
+            ("Christchurch", "Canterbury", christchurch_at),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let object_id = object_id as i64 * 2;
+            let region = place(
+                &mut writer,
+                Region,
+                region,
+                ObjectType::Relation,
+                object_id + 1,
+                at,
+                None,
+            );
+            let town = place(
+                &mut writer,
+                Locality,
+                town,
+                ObjectType::Relation,
+                object_id + 2,
+                at,
+                chain(&[(Region, region)]),
+            );
+            towns.push((region, town));
+        }
+        let [auckland, wellington, christchurch] = towns[..] else {
+            panic!("three towns");
+        };
+        // Suburbs mapped as points beside the streets.
+        let in_town =
+            |(region, town): (RecordId, RecordId)| chain(&[(Region, region), (Locality, town)]);
+        place(
+            &mut writer,
+            Neighbourhood,
+            "Ponsonby",
+            ObjectType::Node,
+            10,
+            [174.745, -36.855],
+            in_town(auckland),
+        );
+        place(
+            &mut writer,
+            Neighbourhood,
+            "Thorndon",
+            ObjectType::Node,
+            11,
+            [174.775, -41.28],
+            in_town(wellington),
+        );
+        writer.set_context_names(
+            [
+                (auckland.0, "Auckland"),
+                (auckland.1, "Auckland"),
+                (wellington.0, "Wellington"),
+                (wellington.1, "Wellington"),
+                (christchurch.0, "Canterbury"),
+                (christchurch.1, "Christchurch"),
+            ]
+            .into_iter()
+            .map(|(id, name)| (id, vec![name.to_string()]))
+            .collect(),
+        );
+        for (id, name, at, town) in [
+            ("osm:way:20", "Ponsonby Road", [174.746, -36.855], auckland),
+            ("osm:way:21", "Lambton Quay", [174.776, -41.282], wellington),
+            (
+                "osm:way:22",
+                "Riccarton Road",
+                [172.6, -43.53],
+                christchurch,
+            ),
+        ] {
+            writer
+                .write(&street_at(id, name, at).into(), in_town(town))
+                .expect("street");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        for reading in [
+            "ponsonby/street road/street christchurch/locality",
+            "lambton/street quay/street auckland/locality",
+            // A region the Pack lists by its name places the record too.
+            "lambton/street quay/street auckland/region",
+            "ponsonby/street road/street canterbury/region",
+        ] {
+            assert!(answer(&searcher, reading).is_empty(), "{reading}");
+        }
+        assert_eq!(
+            answer(&searcher, "ponsonby/street road/street auckland/locality"),
+            ["osm:way:20"]
+        );
+        assert_eq!(
+            answer(&searcher, "lambton/street quay/street wellington/region"),
+            ["osm:way:21"]
+        );
+        // With nothing in the town it names, the answer is the town, marked
+        // a fallback, and never the street elsewhere.
+        let fallback = searcher
+            .fallback(
+                "Ponsonby Road",
+                &[ContextPart::of(Label::Locality, Some("Christchurch")).expect("part")],
+                Filters::default(),
+                None,
+                5,
+            )
+            .expect("fallback");
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["osm:relation:6"]
+        );
+        assert!(fallback[0].fallback);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

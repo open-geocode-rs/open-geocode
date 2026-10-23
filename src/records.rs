@@ -269,7 +269,7 @@ impl Header {
     }
 
     /// The object the record comes from: an OSM object, or an imported row.
-    fn object(&self) -> Result<(ObjectType, i64)> {
+    pub(crate) fn object(&self) -> Result<(ObjectType, i64)> {
         let object_type = match (self.source_kind, self.dataset) {
             (SourceKind::Node, _) => ObjectType::Node,
             (SourceKind::Way, _) => ObjectType::Way,

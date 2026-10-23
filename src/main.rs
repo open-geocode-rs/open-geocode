@@ -1105,6 +1105,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     write_json(serde_json::json!({
         "rows": report.rows,
         "resolved": report.resolved,
+        "fallback": report.fallback,
         "output": output.display().to_string(),
         "audit": audit.display().to_string(),
     }))

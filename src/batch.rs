@@ -150,7 +150,10 @@ pub struct CoordinateJoinOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeocodeReport {
     pub rows: usize,
+    /// Rows given coordinates, the fallbacks among them.
     pub resolved: usize,
+    /// Rows whose address matched nothing, given the finest area they name.
+    pub fallback: usize,
 }
 
 /// What the audit CSV appends to an input row: how the row went, then the
@@ -345,6 +348,7 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
     let mut report = GeocodeReport {
         rows: 0,
         resolved: 0,
+        fallback: 0,
     };
     loop {
         if options.cancel.load(Ordering::Relaxed) {
@@ -367,6 +371,7 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
                 resolved.then_some((coordinate_columns, &row_audit)),
             ))?;
             report.resolved += usize::from(resolved);
+            report.fallback += usize::from(row_audit.status == "fallback");
             if let Some(audit) = &mut audit {
                 audit.write_record(&audit_record(original_headers.len(), row, &row_audit))?;
             }
@@ -608,6 +613,9 @@ fn geocode_row(
     let postcode = field_value(row, fields.postcode);
 
     let mut tried_queries = Vec::new();
+    // The first area a group falls back to answers only when no group
+    // matches the address itself.
+    let mut fallback = None;
     for group in &fields.groups {
         let Some(address) = compose_query(row, group) else {
             continue;
@@ -622,18 +630,39 @@ fn geocode_row(
             countries: options.countries.clone(),
         })?;
         tried_queries.push(address);
-        if let Some(response) = response {
-            let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
-            let audit = AuditFields {
-                status: "resolved".to_string(),
-                query: response.query,
-                reason: String::new(),
-                lat: format_coordinate(feature.lat()),
-                lon: format_coordinate(feature.lon()),
-                result: column_values(Some(&feature)),
-            };
-            return Ok((audit, Some(feature)));
+        match response {
+            Some(response) if response.hit.fallback => {
+                fallback.get_or_insert(response);
+            }
+            Some(response) => {
+                let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
+                let audit = AuditFields {
+                    status: "resolved".to_string(),
+                    query: response.query,
+                    reason: String::new(),
+                    lat: format_coordinate(feature.lat()),
+                    lon: format_coordinate(feature.lon()),
+                    result: column_values(Some(&feature)),
+                };
+                return Ok((audit, Some(feature)));
+            }
+            None => {}
         }
+    }
+    if let Some(response) = fallback {
+        let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
+        let audit = AuditFields {
+            status: "fallback".to_string(),
+            query: response.query,
+            reason: format!(
+                "no address matched; answered with the {} the row names",
+                feature.properties.common.layer.as_str()
+            ),
+            lat: format_coordinate(feature.lat()),
+            lon: format_coordinate(feature.lon()),
+            result: column_values(Some(&feature)),
+        };
+        return Ok((audit, Some(feature)));
     }
 
     let audit = AuditFields {
@@ -1065,7 +1094,8 @@ mod tests {
             report,
             GeocodeReport {
                 rows: 3,
-                resolved: 2
+                resolved: 2,
+                fallback: 0,
             }
         );
         let output = read_csv(&root.join("out.csv")).expect("output");

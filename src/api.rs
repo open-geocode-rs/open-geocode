@@ -82,7 +82,8 @@ pub enum Attribution {
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardGeocoding {
     pub version: Version,
-    /// The query text as received, trimmed.
+    /// The query text as received, trimmed, with each run of whitespace
+    /// written as one space.
     pub query: String,
     pub attribution: Attribution,
 }
@@ -186,10 +187,19 @@ pub struct ForwardProperties {
     /// from 0 to 1, comparable across queries: of the answers given 0.8,
     /// about eight in ten are right. It is calibrated per Pack, by
     /// `geocode calibrate` on held-out addresses, and is absent from every
-    /// answer of a Pack that has not been calibrated.
+    /// answer of a Pack that has not been calibrated. A `fallback` is no
+    /// answer to what the query asks for, and its confidence is 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 0, maximum = 1)]
     pub confidence: Option<f32>,
+    /// Present, and `true`, when the feature is no match of what the query
+    /// asks for but the finest area it names that the Pack holds: its
+    /// postcode, a place it names, its region or its country. It is given
+    /// only when nothing more precise was found, and `layer` and `accuracy`
+    /// say how coarse it is. Absent from every other answer.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(value_type = Option<bool>)]
+    pub fallback: bool,
 }
 
 /// A reverse feature's properties: the common fields, and how far the feature
@@ -524,6 +534,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         common: common(contexts, hit.record_id, hit.record, accuracy)?,
         score: hit.score,
         confidence: hit.confidence,
+        fallback: hit.fallback,
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }

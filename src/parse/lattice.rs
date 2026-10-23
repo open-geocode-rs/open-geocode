@@ -57,6 +57,9 @@ pub const MAX_SPAN_TOKENS: usize = 5;
 pub const MAX_UNSPACED_SPAN: usize = 10;
 /// How many labellings [`LatticeTagger::parse`] returns at most.
 pub const N_BEST: usize = 3;
+/// The most words a country name a query ends in is read in: "United States
+/// of America".
+const MAX_COUNTRY_TOKENS: usize = 4;
 /// How many labellings are decoded per country before those that cannot be
 /// one address are dropped (see [`LatticeTagger::is_one_address`]).
 const CONSTRAINED_PATHS: usize = 8;
@@ -171,6 +174,15 @@ impl Tokens {
             words: words.iter().map(|word| word.as_ref().to_string()).collect(),
             breaks: vec![false; words.len()],
             joiners: vec![None; words.len()],
+        }
+    }
+
+    /// The first `end` words, with their breaks and joiners.
+    pub(crate) fn prefix(&self, end: usize) -> Self {
+        Self {
+            words: self.words[..end].to_vec(),
+            breaks: self.breaks[..end].to_vec(),
+            joiners: self.joiners[..end].to_vec(),
         }
     }
 
@@ -624,12 +636,22 @@ pub(crate) fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuild
     BUILDERS[usize::from(edits - 1)].get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true))
 }
 
-/// The words a street-type or direction abbreviation stands for in any
-/// language libpostal lists, none when `word` is no abbreviation. A query
-/// word is searched in each of them besides itself, so a list too
-/// ambiguous to expand the indexed text by still finds the record.
-pub(crate) fn full_forms(word: &str) -> &'static [String] {
-    abbreviations::abbreviations().full_forms(word)
+/// The other ways `word` is written as a street's: the words a street-type
+/// or direction abbreviation stands for in any language libpostal lists,
+/// and of a word ending in a street type its language glues onto the name,
+/// that word with the type in each other form ("hauptstr" is
+/// "hauptstrasse", as the Pack spells "Hauptstraße"). None when `word` is
+/// neither. A query word is searched in each of them besides itself, so a
+/// list too ambiguous to expand the indexed text by still finds the record.
+pub(crate) fn other_forms(word: &str) -> Vec<String> {
+    let table = abbreviations::abbreviations();
+    let mut forms = table.full_forms(word).to_vec();
+    for form in table.unglued(word) {
+        if !forms.contains(&form) {
+            forms.push(form);
+        }
+    }
+    forms
 }
 
 impl fmt::Debug for LatticeTagger {
@@ -677,11 +699,73 @@ impl LatticeTagger {
         self.weights = weights;
     }
 
+    /// Whether `words`, search keys, are the name of a street the Pack
+    /// holds: as written, with its abbreviations expanded the way the text
+    /// index expands them, or in another spelling of its street types and
+    /// directions.
+    pub fn names_street(&self, words: &[String]) -> bool {
+        let Some(key) = dictionary_key(&words.join(" ")) else {
+            return false;
+        };
+        let names = |key: &str| self.dictionaries.contains(Field::Street, key);
+        names(&key)
+            || names(&expand_key(&key))
+            || spellings(&key).iter().any(|spelling| names(spelling))
+    }
+
     /// The best labellings of raw query text, best first, at most
     /// [`N_BEST`], each with a different label sequence. Empty when the
     /// query has no words.
+    ///
+    /// A query that ends in a country the Pack knows by that name or code
+    /// ("… K9H 2H7 CA", "… United States") is also read as the words before
+    /// it with the country after them, and the best readings of both are
+    /// kept. The model scores a country's code where it was trained to see
+    /// it, so a code it rarely saw last can wreck the reading of every word
+    /// before it ("Peterborough ON" read as a street and a locality); read
+    /// apart, the words keep the labels they have without it.
     pub fn parse(&self, query: &str) -> Vec<ParsedQuery> {
-        self.parse_tokens(&Tokens::new(query), N_BEST)
+        let tokens = Tokens::new(query);
+        let mut parsed = self.parse_tokens(&tokens, N_BEST);
+        let Some(at) = self.trailing_country(&tokens) else {
+            return parsed;
+        };
+        let country = &tokens.words[at..];
+        for mut reading in self.parse_tokens(&tokens.prefix(at), N_BEST) {
+            let words = country.iter().map(|word| Tagged {
+                token: word.clone(),
+                label: Label::Country,
+            });
+            reading.tokens.extend(words.clone());
+            reading.pieces.extend(words);
+            reading
+                .corrections
+                .extend(std::iter::repeat_n(None, country.len()));
+            if !parsed.iter().any(|held| held.tokens == reading.tokens) {
+                parsed.push(reading);
+            }
+        }
+        parsed.sort_by(|left, right| right.score.total_cmp(&left.score));
+        parsed.truncate(N_BEST);
+        parsed
+    }
+
+    /// Where the country the query ends in starts: the longest run of its
+    /// last [`MAX_COUNTRY_TOKENS`] words, after some other word and not
+    /// joined to it, that the country dictionary holds as a name or code of
+    /// a country.
+    fn trailing_country(&self, tokens: &Tokens) -> Option<usize> {
+        (1..=MAX_COUNTRY_TOKENS.min(tokens.len().saturating_sub(1)))
+            .rev()
+            .map(|count| tokens.len() - count)
+            .find(|&at| {
+                tokens.joiners[at].is_none()
+                    && dictionary_key(&tokens.words[at..].join(" ")).is_some_and(|key| {
+                        self.dictionaries
+                            .get(Field::Country, &key)
+                            .is_some_and(|entry| entry.country.is_some())
+                    })
+            })
     }
 
     /// The best `n` labellings of `tokens`.

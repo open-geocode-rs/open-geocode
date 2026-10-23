@@ -770,6 +770,40 @@ impl Reader {
         Ok(closest_candidates(candidates, limit))
     }
 
+    /// The `limit` context points within `radius_m` nearest a point that
+    /// `keep` keeps, nearest first. `keep` sees each point's layer and record
+    /// before it counts, so points of other kinds never use up the limit.
+    pub fn nearest_context_points(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+        mut keep: impl FnMut(Layer, RecordId) -> Result<bool>,
+    ) -> Result<Vec<PointCandidate>> {
+        let mut candidates = Vec::new();
+        let mut closest = Closest::new(limit);
+        for (item, bound) in self.context.nearest(lon, lat, radius_m) {
+            if closest.settled(bound) {
+                break;
+            }
+            let record_id = self.context.id(item);
+            let (layer, point_lon, point_lat) = self.records.point(record_id)?;
+            let distance_m = haversine_m(lon, lat, point_lon, point_lat);
+            if distance_m <= radius_m && keep(layer, record_id)? {
+                closest.add(distance_m);
+                candidates.push(PointCandidate {
+                    record_id,
+                    layer,
+                    lon: point_lon,
+                    lat: point_lat,
+                    distance_m,
+                });
+            }
+        }
+        Ok(closest_candidates(candidates, limit))
+    }
+
     /// Whether any context point of `layer` within `radius_m` satisfies
     /// `matches`, nearest first, stopping at the first match. `None` when
     /// there is no point of that layer within the radius at all.

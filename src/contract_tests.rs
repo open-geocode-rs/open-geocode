@@ -271,6 +271,20 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(properties["name"], "50 Queen Street");
     assert_eq!(properties["address"]["housenumber"], "50");
 
+    // An address the Pack lacks, in a town it holds, is answered with the
+    // town, and the answer says so; an answer that matches says nothing.
+    let fallback = get(&router, "/search?q=99%20Nowhere%20Lane%2C%20Toronto").await;
+    assert_example("search-fallback", &fallback);
+    let properties = &fallback["features"][0]["properties"];
+    assert_eq!(properties["fallback"], true);
+    assert_eq!(properties["layer"], "locality");
+    assert_eq!(properties["name"], "Toronto");
+    assert!(
+        address["features"][0]["properties"]
+            .get("fallback")
+            .is_none()
+    );
+
     for (name, uri) in [
         ("search-street", "/search?q=King%20Street"),
         ("search-locality", "/search?q=Toronto"),

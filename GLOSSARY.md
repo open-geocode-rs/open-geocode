@@ -51,6 +51,11 @@ _Avoid_: context, area (alone), locality part
 A word of a stated area that names some area the Pack holds; a stated area made only of words the Pack does not know is ranked on, never required.
 _Avoid_: recognised place
 
+**Postal town**:
+The town addresses of a postcode state as theirs, whatever areas they lie in, as the Pack's own addresses show it ("Alexandria" for 22310, over part of Fairfax County).
+A stated locality that is the postal town of the stated postcode agrees with a record in that postcode.
+_Avoid_: mailing city, postal city
+
 ## Matching
 
 **Search key**:
@@ -71,7 +76,8 @@ _Avoid_: mode, attempt
 
 **Agreement**:
 How a record relates to a stated area or postcode: it agrees, it contradicts, or nothing says either way.
-A contradicting locality removes the record; in search, a contradicting postcode ranks it last.
+A contradicting locality, region or country removes the record; in search, a contradicting postcode ranks it last.
+A street whose type or direction contradicts the one the query writes is another street of that name, and ranks after the ones that agree.
 _Avoid_: match, mismatch, verdict
 
 **Focus**:
@@ -86,6 +92,11 @@ _Avoid_: score (alone), confidence (alone)
 **Stand-in**:
 A word answering for something it does not name: a street for a house number no record states, or a subject word for an area the Pack does not know.
 _Avoid_: fallback
+
+**Fallback**:
+The finest area a query names that the Pack holds (its postcode, a place it names, its region or its country), given when nothing it asks for is found, and marked so.
+It agrees with every area the query states, so it never lies where the query did not say.
+_Avoid_: stand-in, approximate match, coarse answer
 
 **Confidence**:
 How often an answer like this one is the record its query asks for, from 0 to 1, comparable across queries.

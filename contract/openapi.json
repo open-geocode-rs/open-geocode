@@ -234,7 +234,7 @@
             "$ref": "#/components/schemas/Attribution"
           },
           "query": {
-            "description": "The query text as received, trimmed.",
+            "description": "The query text as received, trimmed, with each run of whitespace\nwritten as one space.",
             "type": "string"
           },
           "version": {
@@ -256,11 +256,15 @@
           {
             "properties": {
               "confidence": {
-                "description": "The chance this answer is the address or place the query asks for,\nfrom 0 to 1, comparable across queries: of the answers given 0.8,\nabout eight in ten are right. It is calibrated per Pack, by\n`geocode calibrate` on held-out addresses, and is absent from every\nanswer of a Pack that has not been calibrated.",
+                "description": "The chance this answer is the address or place the query asks for,\nfrom 0 to 1, comparable across queries: of the answers given 0.8,\nabout eight in ten are right. It is calibrated per Pack, by\n`geocode calibrate` on held-out addresses, and is absent from every\nanswer of a Pack that has not been calibrated. A `fallback` is no\nanswer to what the query asks for, and its confidence is 0.",
                 "format": "float",
                 "maximum": 1,
                 "minimum": 0,
                 "type": "number"
+              },
+              "fallback": {
+                "description": "Present, and `true`, when the feature is no match of what the query\nasks for but the finest area it names that the Pack holds: its\npostcode, a place it names, its region or its country. It is given\nonly when nothing more precise was found, and `layer` and `accuracy`\nsay how coarse it is. Absent from every other answer.",
+                "type": "boolean"
               },
               "score": {
                 "description": "Text relevance: higher is better, comparable only within one answer.\n\nIt orders the features of one response and nothing else. It is not a\nprobability, not a quality score, and not comparable between queries\nor between Packs — two answers' scores say nothing about each other.\nTo judge how good a single answer is, read `confidence`, or\n`accuracy` and `layer`, which mean the same thing in every response.",

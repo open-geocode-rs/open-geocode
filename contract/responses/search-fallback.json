@@ -1,0 +1,36 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "confidence": 0.0,
+        "fallback": true,
+        "id": "osm:relation:3",
+        "label": "Toronto",
+        "layer": "locality",
+        "name": "Toronto",
+        "record_id": 2,
+        "score": 14.721161,
+        "source": {
+          "dataset": "osm",
+          "object_id": 3,
+          "object_type": "relation"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": "© OpenStreetMap contributors, ODbL",
+    "query": "99 Nowhere Lane, Toronto",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

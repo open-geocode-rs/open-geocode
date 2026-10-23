@@ -61,6 +61,17 @@ pub const NESTING_SECTION: &str = "parse/nesting";
 /// "関東地方"), sorted little-endian `u64`s of the region's id above the
 /// group's.
 pub const REGION_GROUPS_SECTION: &str = "parse/region_groups";
+/// The Pack section mapping each key a region is written as to where its
+/// regions are listed in [`REGION_IDS_SECTION`]: the names of the areas
+/// that are a region or sub-region of some record's chain, and what the
+/// addresses inside one state as their region ("NC", "Calif.").
+pub const REGIONS_SECTION: &str = "parse/regions";
+/// The record ids of the regions each region key names, little-endian `u32`.
+pub const REGION_IDS_SECTION: &str = "parse/region_ids";
+/// A value addresses state as their region names each region holding at
+/// least this share of them: a code shared by two neighbouring regions'
+/// mappers names both, a slip of a few addresses names nothing.
+const STATED_REGION_SHARE: f64 = 0.2;
 /// A name of more areas than this ("2丁目", "中央区") says too little of
 /// where it is: its areas are not listed.
 const MAX_AREAS_PER_NAME: usize = 64;
@@ -291,6 +302,10 @@ pub struct Dictionaries {
     area_ids: Bytes,
     nesting: Bytes,
     region_groups: Bytes,
+    /// Region keys to `offset << 8 | count` of their ids in `region_ids`;
+    /// empty in a Pack built before regions were listed.
+    regions: Map<Bytes>,
+    region_ids: Bytes,
     /// Records per country, from the country dictionary, to prefer the
     /// countries the Pack covers when only a postcode pattern names one.
     countries: HashMap<CountryCode, u64>,
@@ -343,6 +358,13 @@ impl Dictionaries {
         if let Some(region_groups) = section(REGION_GROUPS_SECTION)? {
             dictionaries.region_groups = region_groups;
         }
+        if let (Some(regions), Some(region_ids)) =
+            (section(REGIONS_SECTION)?, section(REGION_IDS_SECTION)?)
+        {
+            dictionaries.regions = Map::new(regions)
+                .map_err(|_| Error::Decode("invalid dictionary map in the Pack"))?;
+            dictionaries.region_ids = region_ids;
+        }
         Ok(dictionaries)
     }
 
@@ -384,6 +406,8 @@ impl Dictionaries {
             area_ids: Bytes::empty(),
             nesting: Bytes::empty(),
             region_groups: Bytes::empty(),
+            regions: empty_values(),
+            region_ids: Bytes::empty(),
             countries,
         }
     }
@@ -481,21 +505,23 @@ impl Dictionaries {
     /// The record ids of the areas named `key`; empty when it names none, or
     /// more than [`MAX_AREAS_PER_NAME`].
     pub fn areas(&self, key: &str) -> Vec<u32> {
-        let Some(value) = self.areas.get(key) else {
-            return Vec::new();
-        };
-        let (offset, count) = ((value >> 8) as usize, (value & 0xFF) as usize);
-        self.area_ids
-            .get(offset * 4..(offset + count) * 4)
-            .map(|bytes| {
-                bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| u32::from_le_bytes(*chunk))
-                    .collect()
-            })
-            .unwrap_or_default()
+        listed(&self.areas, &self.area_ids, key)
+    }
+
+    /// The record ids of the regions written `key` (see [`REGIONS_SECTION`]);
+    /// empty when it names none, or the Pack lists no regions.
+    pub fn regions(&self, key: &str) -> Vec<u32> {
+        listed(&self.regions, &self.region_ids, key)
+    }
+
+    /// Whether `key` is a way of writing a direction ("n", "nord").
+    pub fn is_direction(&self, key: &str) -> bool {
+        self.contains(Field::Directional, key)
+    }
+
+    /// Whether `key` is a street type ("road", "rue", "calle").
+    pub fn is_street_type(&self, key: &str) -> bool {
+        self.contains(Field::StreetType, key)
     }
 
     /// The groups of regions the region `region` lies in ("関東地方" of
@@ -602,6 +628,24 @@ fn build_fst(entries: &BTreeMap<String, Entry>) -> Result<Vec<u8>> {
         builder.insert(key, entry.encode())?;
     }
     Ok(builder.into_inner()?)
+}
+
+/// The ids `map` lists for `key` in `ids`, as [`area_sections`] wrote them.
+fn listed(map: &Map<Bytes>, ids: &Bytes, key: &str) -> Vec<u32> {
+    let Some(value) = map.get(key) else {
+        return Vec::new();
+    };
+    let (offset, count) = ((value >> 8) as usize, (value & 0xFF) as usize);
+    ids.get(offset * 4..(offset + count) * 4)
+        .map(|bytes| {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn empty_values() -> Map<Bytes> {
@@ -823,6 +867,16 @@ pub struct Builder {
     country_codes: HashMap<RecordId, CountryCode>,
     /// The groups of regions each region lies in, by the region's id.
     region_groups: HashMap<RecordId, Vec<RecordId>>,
+    /// Each region key records state (`addr:state`), with how many state it
+    /// and how many of those lie in each region or sub-region.
+    stated_regions: HashMap<String, StatedRegion>,
+}
+
+/// How the records stating one region key lie in the Pack's regions.
+#[derive(Debug, Default)]
+struct StatedRegion {
+    records: u64,
+    regions: HashMap<RecordId, u64>,
 }
 
 impl Builder {
@@ -868,7 +922,28 @@ impl Builder {
             .and_then(|tuple| tuple.country_record_id())
             .and_then(|id| self.country_codes.get(&id).copied())
             .or(names.country);
+        let regions = tuple
+            .into_iter()
+            .flat_map(|tuple| tuple.entries())
+            .filter(|entry| {
+                entry
+                    .tiers
+                    .iter()
+                    .any(|tier| matches!(tier, PlaceLayer::Region | PlaceLayer::SubRegion))
+            })
+            .map(|entry| entry.record_id)
+            .collect::<Vec<_>>();
         for (field, name, level) in names.names {
+            if field == Field::Region && !names.place {
+                let stated = match self.stated_regions.get_mut(&name) {
+                    Some(stated) => stated,
+                    None => self.stated_regions.entry(name.clone()).or_default(),
+                };
+                stated.records += 1;
+                for region in &regions {
+                    *stated.regions.entry(*region).or_default() += 1;
+                }
+            }
             let stats = self.names.entry((field, name)).or_default();
             stats.add(1, country);
             stats.levels |= level;
@@ -930,6 +1005,7 @@ impl Builder {
             place_names,
             country_codes,
             region_groups,
+            stated_regions,
         } = self;
         // The ids of the areas each area name names, and the levels of the
         // areas each name names.
@@ -1165,8 +1241,52 @@ impl Builder {
             .flat_map(|pair| pair.to_le_bytes())
             .collect::<Vec<_>>();
         pack.add(REGION_GROUPS_SECTION, DICTIONARY_VERSION, &groups)?;
+        let (map, ids) = area_sections(region_lists(&areas, area_names, stated_regions));
+        pack.add(REGIONS_SECTION, DICTIONARY_VERSION, &map)?;
+        pack.add(REGION_IDS_SECTION, DICTIONARY_VERSION, &ids)?;
         Ok(())
     }
+}
+
+/// The regions each region key names: every name of an area that is a
+/// region or sub-region of some record's chain, and each value records
+/// state as their region, of the regions holding at least
+/// [`STATED_REGION_SHARE`] of the records stating it. The mapping of "NC" to
+/// North Carolina is the Pack's own: it is where the addresses that write
+/// "NC" lie.
+fn region_lists(
+    areas: &HashMap<RecordId, Area>,
+    area_names: &HashMap<RecordId, Vec<String>>,
+    stated_regions: HashMap<String, StatedRegion>,
+) -> BTreeMap<String, Vec<u32>> {
+    let mut lists = BTreeMap::<String, Vec<u32>>::new();
+    for (area, Area { field, .. }) in areas {
+        let Ok(id) = u32::try_from(*area) else {
+            continue;
+        };
+        if *field != Field::Region {
+            continue;
+        }
+        for key in area_names
+            .get(area)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| dictionary_key(name))
+        {
+            lists.entry(key).or_default().push(id);
+        }
+    }
+    for (key, stated) in stated_regions {
+        let least = stated.records as f64 * STATED_REGION_SHARE;
+        for (region, count) in stated.regions {
+            if count as f64 >= least
+                && let Ok(id) = u32::try_from(region)
+            {
+                lists.entry(key.clone()).or_default().push(id);
+            }
+        }
+    }
+    lists
 }
 
 /// How an admin type word is written beside the name of its area.

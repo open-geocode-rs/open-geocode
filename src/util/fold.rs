@@ -102,11 +102,16 @@ fn split(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
             }
             continue;
         }
+        // A replacement character stands for a letter a wrong encoding lost
+        // ("Ch\u{fffd}teauneuf" of "Châteauneuf"), so it stays in its word, one
+        // edit from the letter it replaced, for a typo tier to reach.
+        if character == char::REPLACEMENT_CHARACTER {
+            word.push(character);
+            latin = true;
+            continue;
+        }
         if !character.is_alphanumeric() {
-            if !word.is_empty() {
-                piece(Piece::Word(&word));
-                word.clear();
-            }
+            flush(&mut word, &mut piece);
             piece(Piece::Gap(character));
             continue;
         }
@@ -121,9 +126,31 @@ fn split(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
             latin = character.script() == Script::Latin;
         }
     }
-    if !word.is_empty() {
-        piece(Piece::Word(&word));
+    flush(&mut word, &mut piece);
+}
+
+/// End the word being cut, if there is one. A run of replacement characters
+/// alone spells nothing, so it is a gap.
+fn flush(word: &mut String, piece: &mut impl FnMut(Piece<'_>)) {
+    if word
+        .chars()
+        .all(|character| character == char::REPLACEMENT_CHARACTER)
+    {
+        for _ in word.chars() {
+            piece(Piece::Gap(char::REPLACEMENT_CHARACTER));
+        }
+    } else {
+        piece(Piece::Word(word));
     }
+    word.clear();
+}
+
+/// How many characters of `word` a wrong encoding replaced: each is one
+/// edit from the letter it stood for.
+pub(crate) fn replaced_characters(word: &str) -> usize {
+    word.chars()
+        .filter(|character| *character == char::REPLACEMENT_CHARACTER)
+        .count()
 }
 
 fn is_mark(character: char) -> bool {
@@ -154,6 +181,20 @@ fn latin_ascii(character: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replacement_character_stays_in_its_word_and_alone_is_a_gap() {
+        assert_eq!(
+            search_key("Ch\u{fffd}teauneuf de Gadagne").as_deref(),
+            Some("ch\u{fffd}teauneuf de gadagne")
+        );
+        assert_eq!(
+            search_key("Main \u{fffd} Street").as_deref(),
+            Some("main street")
+        );
+        assert_eq!(search_key("\u{fffd}\u{fffd}"), None);
+        assert_eq!(replaced_characters("ari\u{fffd}ge"), 1);
+    }
 
     #[test]
     fn the_table_writes_lower_case_letters_and_digits() {

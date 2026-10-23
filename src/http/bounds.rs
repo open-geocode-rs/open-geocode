@@ -17,19 +17,23 @@ pub(crate) const MAX_QUERY_CHARS: usize = 256;
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
 
-/// Trim and bound a query by length, returning the trimmed string. Empty is
-/// allowed (autocomplete treats short/empty queries as "no suggestions").
+/// Trim and bound a query by length, returning it with each run of
+/// whitespace written as one space. Empty is allowed (autocomplete treats
+/// short/empty queries as "no suggestions").
 ///
 /// Length is counted in Unicode scalar values, not bytes, so multibyte queries
-/// are bounded by visible length rather than UTF-8 encoding size.
+/// are bounded by visible length rather than UTF-8 encoding size. It is
+/// counted after the whitespace is collapsed: an address pasted from a web
+/// page can carry hundreds of spaces and line breaks of its layout between
+/// a few words, and is no longer a query for them.
 pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
-    let query = raw.trim();
+    let query = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.chars().count() > MAX_QUERY_CHARS {
         return Err(Problem::invalid_query(format!(
             "q must be at most {MAX_QUERY_CHARS} characters"
         )));
     }
-    Ok(query.to_string())
+    Ok(query)
 }
 
 /// Like [`validate_query_length`] but additionally rejects an empty query, for
@@ -202,6 +206,21 @@ mod tests {
         let long = "a".repeat(MAX_QUERY_CHARS + 1);
         assert!(validate_query(&long).is_err());
         assert_eq!(validate_query("  king street  ").unwrap(), "king street");
+    }
+
+    #[test]
+    fn a_query_laid_out_with_whitespace_is_counted_by_its_words() {
+        let padded = format!(
+            "46 Museum Lp {}Browning{},  59417",
+            " 
+"
+            .repeat(200),
+            "	".repeat(100)
+        );
+        assert_eq!(
+            validate_query(&padded).unwrap(),
+            "46 Museum Lp Browning , 59417"
+        );
     }
 
     #[test]
