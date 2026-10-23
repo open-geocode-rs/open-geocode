@@ -453,6 +453,7 @@ mod tests {
             files: vec![AddressFile {
                 dataset: "held-out".into(),
                 path: csv,
+                entry: None,
             }],
             rows: 15,
             variants: 2,

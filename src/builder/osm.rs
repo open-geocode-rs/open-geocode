@@ -1253,8 +1253,8 @@ impl<'a> Run<'a> {
         };
         let import_bytes = files
             .iter()
-            .map(|file| std::fs::metadata(&file.path).map(|metadata| metadata.len()))
-            .sum::<std::io::Result<u64>>()?;
+            .map(addresses::AddressFile::bytes)
+            .sum::<Result<u64>>()?;
         // A source can cover more than the extracts: a country's file for a
         // Pack of one province. Rows outside every extract's stated bounds
         // are left out; an extract that states none keeps every row.
@@ -1291,7 +1291,11 @@ impl<'a> Run<'a> {
                 build.report.datasets.push(imported.dataset.clone());
             }
             build.report.imports.push(imported);
-            self.fingerprint.imported.push(FileStamp::of(&file.path)?);
+            // The entries of one archive share its stamp.
+            let stamp = FileStamp::of(&file.path)?;
+            if !self.fingerprint.imported.contains(&stamp) {
+                self.fingerprint.imported.push(stamp);
+            }
         }
         progress.finish(BuildStage::ImportAddresses);
         build.report.phases.address_import_ms = phase.elapsed().as_millis();
@@ -3197,6 +3201,7 @@ mod tests {
             files: vec![addresses::AddressFile {
                 dataset: "openaddresses:test".to_string(),
                 path: csv,
+                entry: None,
             }],
             ..RecordingSource::default()
         });
@@ -3274,6 +3279,7 @@ mod tests {
                 addresses::AddressFile {
                     dataset: "openaddresses:test".to_string(),
                     path: csv,
+                    entry: None,
                 },
             ]))),
             ..BuildOsmOptions::default()
@@ -4426,10 +4432,12 @@ mod tests {
             addresses::AddressFile {
                 dataset: "openaddresses:first".to_string(),
                 path: first,
+                entry: None,
             },
             addresses::AddressFile {
                 dataset: "openaddresses:second".to_string(),
                 path: second,
+                entry: None,
             },
         ]
     }
@@ -4613,6 +4621,7 @@ mod tests {
                 addresses::AddressFile {
                     dataset: "openaddresses:test".to_string(),
                     path: csv,
+                    entry: None,
                 },
             ]))),
             ..BuildOsmOptions::default()
