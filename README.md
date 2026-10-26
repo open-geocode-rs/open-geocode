@@ -49,7 +49,7 @@ Ranked by CRR, as the paper ranks them:
 | Geocoder | CRR (%) | GH1 (%) ±2500 km | GH4 (%) ±20 km | GH6 (%) ±0.6 km |
 | --- | ---: | ---: | ---: | ---: |
 | Google Maps v3 | 100.0±0.0 | 100.0±0.0 | 98.6±0.7 | 88.3±2.0 |
-| **open-geocode** * | **100.0** | **98.6** | **91.5** | **67.7** |
+| **open-geocode** * | **100.0** | **99.1** | **93.9** | **78.0** |
 | MapQuest v1 | 100.0±0.0 | 98.5±0.5 | 97.1±0.5 | 84.0±1.5 |
 | ArcGIS | 99.8±0.3 | 99.8±0.3 | 97.9±1.3 | 85.3±2.8 |
 | Geoapify v1 | 99.7±0.4 | 99.2±0.5 | 96.3±1.2 | 79.1±3.7 |
@@ -66,9 +66,10 @@ CRR: share of queries with any answer.
 GH1/GH4/GH6: share whose first answer is in the target's geohash cell.
 Other rows are the paper's (public endpoints, June 2026).
 
-- \* Planet Pack from OpenStreetMap only (October 2026), no OpenAddresses: the whole planet in one 17.9 GB file, memory-mapped when served, 233.7M records.
-  Built in 2 h 51 min on a 24-core / 32 GB desktop with a 9 GB memory budget.
-  53 inputs are answered with a `fallback` area (postcode, town or country); full answers only, CRR is 94.4%.
+- \* Planet Pack from OpenStreetMap and OpenAddresses (October 2026): the whole planet in one 26.3 GB file, memory-mapped when served, 630.9M records.
+  Built in 5 h 20 min on a 24-core / 32 GB desktop with a 9 GB memory budget.
+  52 inputs are answered with a `fallback` area (postcode, town or country); full answers only, CRR is 94.4%.
+  From OpenStreetMap alone (17.9 GB, 233.7M records, built in 2 h 51 min), GH6 is 67.7%.
 
 ### Speed
 
