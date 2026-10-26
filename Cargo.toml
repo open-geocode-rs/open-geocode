@@ -47,6 +47,9 @@ geojson = "1.0"
 # already in the tree through ureq's url.
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_properties = "2.3"
+# Tells a batch body over its cap from one that failed to arrive. Already in
+# the tree through axum.
+http-body-util = "0.1"
 indicatif = "0.17"
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"
@@ -67,6 +70,9 @@ regex = "1.12"
 rstar = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Reads a batch item as the query string its `GET` would carry, with the
+# parser axum's `Query` uses. Already in the tree through axum.
+serde_urlencoded = "0.7"
 # Stops `og build` cleanly on Ctrl-C.
 signal-hook = { version = "0.3", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
@@ -124,6 +130,9 @@ required-features = ["tui"]
 [dev-dependencies]
 # Used only by the in-crate router tests to drive the Router via `oneshot`.
 tower = { version = "0.5", features = ["util"] }
+# Holds a batch result's `response` as the bytes it was sent as, so the
+# contract tests compare it with its `GET` byte for byte.
+serde_json = { version = "1.0", features = ["raw_value"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

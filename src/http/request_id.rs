@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use axum::{
     extract::{Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::Response,
 };
@@ -51,6 +51,31 @@ impl ErrorLog {
             .unwrap_or_default()
     }
 
+    /// One line for a 500: the request, the route, how long it took and the
+    /// cause. `item` is the place of the batch item that failed, when one did.
+    pub(crate) fn internal_error(
+        &self,
+        request_id: &str,
+        route: &str,
+        item: Option<usize>,
+        started: Instant,
+        cause: Option<String>,
+    ) {
+        let mut line = serde_json::json!({
+            "level": "error",
+            "message": "internal error",
+            "request_id": request_id,
+            "route": route,
+            "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "latency_ms": started.elapsed().as_millis() as u64,
+            "cause": cause,
+        });
+        if let Some(item) = item {
+            line["item"] = item.into();
+        }
+        self.write(line.to_string());
+    }
+
     fn write(&self, line: String) {
         #[cfg(test)]
         if let Some(lines) = &self.captured {
@@ -61,11 +86,16 @@ impl ErrorLog {
     }
 }
 
+/// The id a request is logged under, for a handler that reports errors
+/// inside a 200, as a batch does.
+#[derive(Debug, Clone)]
+pub(crate) struct RequestId(pub String);
+
 /// Middleware: resolve (or generate) the request id, set it on the response
 /// `x-request-id` header and in any Problem body, and log a 500 with its cause.
 pub(crate) async fn propagate(
     State(log): State<ErrorLog>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let started = Instant::now();
@@ -79,13 +109,19 @@ pub(crate) async fn propagate(
     // The path only: the query string holds what the user searched for,
     // which is personal data and stays out of the log.
     let route = request.uri().path().to_string();
+    request.extensions_mut().insert(RequestId(id.clone()));
 
     let mut response = next.run(request).await;
-    // A Problem renders its own body and headers, so rendering it again with
-    // the id loses nothing.
+    // Only the body changes: headers set around the Problem, such as a
+    // route's `Allow`, stay.
     let problem = response.extensions_mut().remove::<Problem>();
     if let Some(problem) = &problem {
-        response = problem.clone().with_request_id(id.clone()).render();
+        *response.body_mut() = problem
+            .clone()
+            .with_request_id(id.clone())
+            .render()
+            .into_body();
+        response.headers_mut().remove(header::CONTENT_LENGTH);
     }
     // Only a 500 is ours to fix; a 4xx is the request's fault and a 503 from
     // `/readyz` is the expected answer while the Pack loads.
@@ -94,18 +130,7 @@ pub(crate) async fn propagate(
             .as_ref()
             .and_then(Problem::cause)
             .map(|cause| format!("{cause:#}"));
-        log.write(
-            serde_json::json!({
-                "level": "error",
-                "message": "internal error",
-                "request_id": id,
-                "route": route,
-                "status": response.status().as_u16(),
-                "latency_ms": started.elapsed().as_millis() as u64,
-                "cause": cause,
-            })
-            .to_string(),
-        );
+        log.internal_error(&id, &route, None, started, cause);
     }
     if let Ok(value) = HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);

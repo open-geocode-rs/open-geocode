@@ -57,6 +57,31 @@
         ],
         "type": "string"
       },
+      "BatchSummary": {
+        "description": "How a batch went.",
+        "properties": {
+          "failed": {
+            "description": "Items answered with an error.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "succeeded": {
+            "description": "Items answered with a 200.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "succeeded",
+          "failed"
+        ],
+        "type": "object"
+      },
       "Common": {
         "description": "What a feature is, where it lies and where it comes from: everything both\ndirections say about an answer.\n\nNot a response type of its own. It is flattened into\n[`ForwardProperties`] and [`ReverseProperties`], which add the one field\ntheir direction ranks by, so that both are one flat object on the wire.",
         "properties": {
@@ -166,8 +191,12 @@
           "invalid_coordinate",
           "limit_too_large",
           "malformed_parameter",
+          "malformed_body",
           "not_found",
           "method_not_allowed",
+          "too_many_items",
+          "body_too_large",
+          "unsupported_media_type",
           "internal_error"
         ],
         "type": "string"
@@ -183,6 +212,25 @@
           "Feature"
         ],
         "type": "string"
+      },
+      "ForwardBatch": {
+        "description": "A forward batch's answer: one result per item, in input order.\n\nMirrors the body `http::batch` renders, as [`Problem`] mirrors its own;\nthe contract tests hold the two together.",
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/ForwardResult"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/BatchSummary"
+          }
+        },
+        "required": [
+          "results",
+          "summary"
+        ],
+        "type": "object"
       },
       "ForwardCollection": {
         "description": "A forward answer: `/search` and `/autocomplete`.\n\nForward and reverse answers are the same GeoJSON FeatureCollection, best\nor most precise first, differing only in what `geocoding` says and in the\none ranking field each feature carries. Each direction is written out\nrather than shared through a generic, because a generic reached through a\ntype alias is transparent to the schema generator: it produced one\n`FeatureCollection` component for both directions and pointed `/search`\nand `/reverse` at it, so the published contract described each endpoint\nwith the other's fields. The duplication here is what makes the generated\nschemas distinct and true. The construction logic is still shared, by\n[`common`] and the builders below.",
@@ -279,6 +327,87 @@
           }
         ],
         "description": "A forward feature's properties: the common fields, and the text relevance\n`/search` and `/autocomplete` rank by."
+      },
+      "ForwardResult": {
+        "description": "One item's result: `response` when it succeeded, `error` when it failed.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Problem",
+            "description": "Exactly the Problem `GET` would return for this item."
+          },
+          "id": {
+            "description": "The item's `id`, when it sent one.",
+            "type": "string"
+          },
+          "response": {
+            "$ref": "#/components/schemas/ForwardCollection",
+            "description": "Exactly what `GET` returns for this item."
+          },
+          "status": {
+            "description": "The status `GET` would have answered this item with.",
+            "example": 200,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "GeocodeItem": {
+        "description": "One item of a `/geocode` batch: `GET /geocode`'s parameters and an `id`.",
+        "properties": {
+          "address": {
+            "description": "The street address on its own: house number and street, without the\ntown or postcode.",
+            "example": "10 King Street",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "country": {
+            "description": "ISO 3166-1 alpha-2 codes, comma-separated.",
+            "example": "CA",
+            "type": "string"
+          },
+          "id": {
+            "description": "Echoed in this item's result, to match it up.",
+            "example": "row-1",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "layer": {
+            "$ref": "#/components/schemas/Layer"
+          },
+          "limit": {
+            "description": "How many candidates to consider before picking the best.",
+            "maximum": 50,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "locality": {
+            "description": "The town or city the address is in.",
+            "example": "Toronto",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "postcode": {
+            "example": "M5V 1A1",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "region": {
+            "description": "The state, province or region.",
+            "example": "Ontario",
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "type": "object"
       },
       "InvalidParam": {
         "description": "Mirrors [`crate::http::problem::InvalidParam`] for the schema.",
@@ -421,6 +550,25 @@
         "title": "Problem",
         "type": "object"
       },
+      "ReverseBatch": {
+        "description": "A reverse batch's answer: one result per item, in input order.",
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/ReverseResult"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/BatchSummary"
+          }
+        },
+        "required": [
+          "results",
+          "summary"
+        ],
+        "type": "object"
+      },
       "ReverseCollection": {
         "description": "A reverse answer: `/reverse`. See [`ForwardCollection`] for why the two\ndirections are written out rather than shared through a generic.",
         "properties": {
@@ -485,6 +633,36 @@
         ],
         "type": "object"
       },
+      "ReverseItem": {
+        "description": "One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.",
+        "properties": {
+          "id": {
+            "description": "Echoed in this item's result, to match it up.",
+            "example": "row-1",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "lat": {
+            "example": 43.6532,
+            "format": "double",
+            "maximum": 90,
+            "minimum": -90,
+            "type": "number"
+          },
+          "lon": {
+            "example": -79.3832,
+            "format": "double",
+            "maximum": 180,
+            "minimum": -180,
+            "type": "number"
+          }
+        },
+        "required": [
+          "lon",
+          "lat"
+        ],
+        "type": "object"
+      },
       "ReverseProperties": {
         "allOf": [
           {
@@ -502,6 +680,79 @@
           }
         ],
         "description": "A reverse feature's properties: the common fields, and how far the feature\nlies from the point asked about."
+      },
+      "ReverseResult": {
+        "description": "One item's result: `response` when it succeeded, `error` when it failed.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Problem",
+            "description": "Exactly the Problem `GET` would return for this item."
+          },
+          "id": {
+            "description": "The item's `id`, when it sent one.",
+            "type": "string"
+          },
+          "response": {
+            "$ref": "#/components/schemas/ReverseCollection",
+            "description": "Exactly what `GET` returns for this item."
+          },
+          "status": {
+            "description": "The status `GET` would have answered this item with.",
+            "example": 200,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "SearchItem": {
+        "description": "One item of a `/search` batch: `GET /search`'s parameters and an `id`.",
+        "properties": {
+          "bbox": {
+            "description": "`min_lon,min_lat,max_lon,max_lat`.",
+            "example": "-79.64,43.58,-79.12,43.86",
+            "type": "string"
+          },
+          "country": {
+            "description": "ISO 3166-1 alpha-2 codes, comma-separated.",
+            "example": "NZ,AU",
+            "type": "string"
+          },
+          "focus": {
+            "description": "Where the caller is, `lon,lat`.",
+            "example": "-79.38,43.65",
+            "type": "string"
+          },
+          "id": {
+            "description": "Echoed in this item's result, to match it up.",
+            "example": "row-1",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "layer": {
+            "$ref": "#/components/schemas/Layer"
+          },
+          "limit": {
+            "maximum": 50,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "q": {
+            "description": "The text to search for.",
+            "example": "10 King Street, Toronto",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "q"
+        ],
+        "type": "object"
       },
       "Source": {
         "description": "Where a record comes from: an OSM object, or the address records a\nderived record (a postcode) was made from.",
@@ -805,6 +1056,20 @@
             },
             "description": "The one address that fits, or no features when none does.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -824,6 +1089,20 @@
             },
             "description": "`address` was empty or too long, a context field was too long, `limit` was above the maximum, or a parameter did not parse.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -841,12 +1120,19 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists the methods it accepts.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
               "Allow": {
                 "description": "The methods this route accepts.",
                 "schema": {
-                  "example": "GET",
+                  "example": "GET, QUERY, POST",
                   "type": "string"
                 }
               },
@@ -869,6 +1155,20 @@
             },
             "description": "The lookup failed inside the server.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -880,6 +1180,228 @@
           }
         },
         "summary": "Geocode an address whose parts are already apart.",
+        "tags": [
+          "geocoding"
+        ]
+      },
+      "post": {
+        "description": "The body is a JSON array of up to 1000 items, each taking the parameters\n`GET /geocode` takes, plus an optional `id` echoed in its result. The\nrequest's own query-string parameters apply to every item, and an item's\nown fields override them: `?country=CA` scopes every item to Canada.\n`QUERY` takes the same body and answers the same: `POST` is for clients\nthat cannot send `QUERY`.\n\nEach result's `response` is exactly what `GET` returns for its item, and\nits `error` the Problem `GET` would return. Results are in input order,\none per item, and a bad item never fails the batch.",
+        "operationId": "geocode_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/GeocodeItem"
+                },
+                "maxItems": 1000,
+                "type": "array"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardBatch"
+                }
+              }
+            },
+            "description": "One result per item, in input order.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is not a JSON array of objects, or the query string did not parse.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "More than 1000 items, or a body over its cap.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body was not sent as `application/json`.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The batch failed inside the server.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Geocode many addresses whose parts are already apart in one request.",
         "tags": [
           "geocoding"
         ]
@@ -1093,6 +1615,20 @@
             },
             "description": "What lies at the point, most precise first. `features` is empty when nothing is near.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -1112,6 +1648,20 @@
             },
             "description": "`lon` or `lat` was missing or out of range.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -1129,12 +1679,19 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists the methods it accepts.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
               "Allow": {
                 "description": "The methods this route accepts.",
                 "schema": {
-                  "example": "GET",
+                  "example": "GET, QUERY, POST",
                   "type": "string"
                 }
               },
@@ -1157,6 +1714,20 @@
             },
             "description": "Reverse geocoding failed inside the server.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -1168,6 +1739,228 @@
           }
         },
         "summary": "Find the places at a point.",
+        "tags": [
+          "geocoding"
+        ]
+      },
+      "post": {
+        "description": "The body is a JSON array of up to 1000 items, each taking the parameters\n`GET /reverse` takes, plus an optional `id` echoed in its result.\n`QUERY` takes the same body and answers the same: `POST` is for clients\nthat cannot send `QUERY`.\n\nEach result's `response` is exactly what `GET` returns for its item, and\nits `error` the Problem `GET` would return. Results are in input order,\none per item, and a bad item never fails the batch.",
+        "operationId": "reverse_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/ReverseItem"
+                },
+                "maxItems": 1000,
+                "type": "array"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReverseBatch"
+                }
+              }
+            },
+            "description": "One result per item, in input order.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is not a JSON array of objects, or the query string did not parse.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "More than 1000 items, or a body over its cap.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body was not sent as `application/json`.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The batch failed inside the server.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Find the places at many points in one request.",
         "tags": [
           "geocoding"
         ]
@@ -1252,6 +2045,20 @@
             },
             "description": "The places that matched, best first.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -1271,6 +2078,20 @@
             },
             "description": "`q` was empty or too long, `limit` was above the maximum, `focus` or `bbox` was out of range, or a parameter did not parse.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -1288,12 +2109,19 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists the methods it accepts.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
               "Allow": {
                 "description": "The methods this route accepts.",
                 "schema": {
-                  "example": "GET",
+                  "example": "GET, QUERY, POST",
                   "type": "string"
                 }
               },
@@ -1316,6 +2144,20 @@
             },
             "description": "The search failed inside the server.",
             "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
                 "schema": {
@@ -1327,6 +2169,228 @@
           }
         },
         "summary": "Search for a place by text.",
+        "tags": [
+          "geocoding"
+        ]
+      },
+      "post": {
+        "description": "The body is a JSON array of up to 1000 items, each taking the parameters\n`GET /search` takes, plus an optional `id` echoed in its result. The\nrequest's own query-string parameters apply to every item, and an item's\nown fields override them. `QUERY` takes the same body and answers the\nsame: `POST` is for clients that cannot send `QUERY`.\n\nEach result's `response` is exactly what `GET` returns for its item, and\nits `error` the Problem `GET` would return. Results are in input order,\none per item, and a bad item never fails the batch.",
+        "operationId": "search_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/SearchItem"
+                },
+                "maxItems": 1000,
+                "type": "array"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardBatch"
+                }
+              }
+            },
+            "description": "One result per item, in input order.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is not a JSON array of objects, or the query string did not parse.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists the methods it accepts.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "More than 1000 items, or a body over its cap.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body was not sent as `application/json`.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The batch failed inside the server.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Search for many places by text in one request.",
         "tags": [
           "geocoding"
         ]

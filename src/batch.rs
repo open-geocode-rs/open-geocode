@@ -530,34 +530,59 @@ impl Resolver {
                     }
                 })
                 .collect()),
-            Resolver::Pack { pack, searcher } => {
-                let mut order = (0..rows.len()).collect::<Vec<_>>();
-                order.sort_by_cached_key(|&index| locality_key(&rows[index], fields));
-                let mut results = order
-                    .into_par_iter()
-                    .map(|index| {
-                        if options.cancel.load(Ordering::Relaxed) {
-                            return Err(Cancelled.into());
-                        }
-                        let started = Instant::now();
-                        let (audit, feature) =
-                            geocode_row(pack, searcher, options, fields, &rows[index])?;
-                        if let Some(observer) = &options.observer {
-                            observer.row(&Row {
-                                index: first_index + index,
-                                query: &audit.query,
-                                feature: feature.as_ref(),
-                                elapsed: started.elapsed(),
-                            });
-                        }
-                        Ok((index, audit))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                results.sort_unstable_by_key(|(index, _)| *index);
-                Ok(results.into_iter().map(|(_, audit)| audit).collect())
-            }
+            Resolver::Pack { pack, searcher } => map_in_order(
+                rows,
+                |row| locality_key(row, fields),
+                &options.cancel,
+                |index, row| {
+                    let started = Instant::now();
+                    let (audit, feature) = geocode_row(pack, searcher, options, fields, row)?;
+                    if let Some(observer) = &options.observer {
+                        observer.row(&Row {
+                            index: first_index + index,
+                            query: &audit.query,
+                            feature: feature.as_ref(),
+                            elapsed: started.elapsed(),
+                        });
+                    }
+                    Ok(audit)
+                },
+            ),
         }
     }
+}
+
+/// The batch engine: `work` on every item, in parallel on the current rayon
+/// pool, with the results in input order. `geocode batch` runs a file's rows
+/// through it, and the HTTP batch routes a request's items.
+///
+/// Items run in order of `key`, so items that share one run together and
+/// touch the same index and record pages. Fails with [`Cancelled`] once
+/// `cancel` is set, and with the first error `work` returns.
+pub fn map_in_order<T, K, R>(
+    items: &[T],
+    key: impl Fn(&T) -> K,
+    cancel: &AtomicBool,
+    work: impl Fn(usize, &T) -> Result<R> + Sync + Send,
+) -> Result<Vec<R>>
+where
+    T: Sync,
+    K: Ord,
+    R: Send,
+{
+    let mut order = (0..items.len()).collect::<Vec<_>>();
+    order.sort_by_cached_key(|&index| key(&items[index]));
+    let mut results = order
+        .into_par_iter()
+        .map(|index| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Cancelled.into());
+            }
+            Ok((index, work(index, &items[index])?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    Ok(results.into_iter().map(|(_, result)| result).collect())
 }
 
 /// Group key: rows in the same postcode and place are geocoded together.
@@ -987,6 +1012,54 @@ fn format_coordinate(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every item runs once, and the results come back in input order
+    /// whatever order the items ran in.
+    #[test]
+    fn engine_answers_every_item_once_in_input_order() {
+        let items = ["b2", "a1", "b1", "a2"];
+        let ran = std::sync::Mutex::new(Vec::new());
+        let results = map_in_order(
+            &items,
+            |item| item.as_bytes()[0],
+            &AtomicBool::new(false),
+            |index, item| {
+                ran.lock().expect("lock").push(*item);
+                Ok((index, item.to_uppercase()))
+            },
+        )
+        .expect("engine");
+        assert_eq!(
+            results,
+            [(0, "B2"), (1, "A1"), (2, "B1"), (3, "A2")].map(|(index, item)| (index, item.into()))
+        );
+        assert_eq!(ran.into_inner().expect("lock").len(), items.len());
+    }
+
+    #[test]
+    fn engine_stops_when_cancelled_and_on_the_first_error() {
+        let cancelled = map_in_order(
+            &[1, 2, 3],
+            |_| (),
+            &AtomicBool::new(true),
+            |_, item| Ok(*item),
+        );
+        assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
+
+        let failed = map_in_order(
+            &[1, 2, 3],
+            |_| (),
+            &AtomicBool::new(false),
+            |_, item| {
+                if *item == 2 {
+                    Err(Error::BadOptions("item 2".into()))
+                } else {
+                    Ok(*item)
+                }
+            },
+        );
+        assert!(matches!(failed, Err(Error::BadOptions(_))), "{failed:?}");
+    }
 
     #[test]
     fn parses_repeated_field_groups() {

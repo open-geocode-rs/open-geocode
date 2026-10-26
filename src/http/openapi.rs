@@ -6,15 +6,21 @@
 //! it, and `contract_tests` fails when the committed
 //! `contract/openapi.json` and the code disagree.
 //!
-//! Three things are adjusted after generation, in [`transform`]:
+//! Four things are adjusted after generation, in [`transform`]:
 //!
 //! 1. `Option<T>` renders as a nullable union, `["string", "null"]`, but this
 //!    API never emits a null: an absent value is an absent key
 //!    (`skip_serializing_if`). The nulls are dropped so the spec says what
 //!    the API does.
-//! 2. Every route answers a non-GET with a 405, from the router's fallbacks
-//!    rather than from a handler, so there is no attribute to carry it.
-//! 3. Every response gains the `X-Request-Id` header it actually returns.
+//! 2. Every route answers a method it does not take with a 405, from the
+//!    router's fallbacks rather than from a handler, so there is no
+//!    attribute to carry it.
+//! 3. Every response gains the `X-Request-Id` header it actually returns,
+//!    and a batchable route's the `Allow` and `Accept-Query` it returns.
+//! 4. A batch body gains its `maxItems`.
+//!
+//! OpenAPI 3.1 has no `query` operation, so a batch is documented on its
+//! `post`, whose description says `QUERY` takes the same body.
 //!
 //! Bounds in the parameter attributes below are written as literals, because
 //! the attribute macro cannot read a constant. `bounds_match_the_constants`
@@ -36,6 +42,7 @@ use crate::{
         LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
         ReverseProperties, Version,
     },
+    http::{batch, bounds::MAX_BATCH_ITEMS},
     record::{Layer, ObjectType},
     records::Source,
 };
@@ -68,9 +75,12 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     ),
     paths(
         crate::runtime::search,
+        crate::runtime::search_batch,
         crate::runtime::autocomplete,
         crate::runtime::geocode,
+        crate::runtime::geocode_batch,
         crate::runtime::reverse,
+        crate::runtime::reverse_batch,
         crate::http::health::healthz,
         crate::http::health::readyz,
         openapi_json,
@@ -102,6 +112,14 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         // it is left out of the components and the `$ref` dangles.
         Layer,
         Problem,
+        GeocodeItem,
+        SearchItem,
+        ReverseItem,
+        ForwardBatch,
+        ForwardResult,
+        ReverseBatch,
+        ReverseResult,
+        BatchSummary,
     )),
     tags(
         (name = "geocoding", description = "Turn text or a point into places."),
@@ -157,11 +175,19 @@ pub(crate) enum ErrorCode {
     /// A parameter was the wrong type, or named a value that does not exist
     /// — an unknown `layer`, for instance.
     MalformedParameter,
+    /// A batch body was not a JSON array of objects.
+    MalformedBody,
     /// No such route.
     NotFound,
     /// The route exists but does not take this method. The `Allow` header
     /// lists the ones it does.
     MethodNotAllowed,
+    /// A batch held more than 1000 items.
+    TooManyItems,
+    /// A batch body was over its cap, which is checked before it is read.
+    BodyTooLarge,
+    /// A batch body was not sent as `application/json`.
+    UnsupportedMediaType,
     /// Something failed inside the server. The cause is in the logs under
     /// `request_id`, never in the body.
     InternalError,
@@ -177,6 +203,131 @@ pub(crate) struct InvalidParam {
     /// Why, in prose.
     #[schema(example = "must be at most 50")]
     pub reason: String,
+}
+
+/// One item of a `/geocode` batch: `GET /geocode`'s parameters and an `id`.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct GeocodeItem {
+    /// Echoed in this item's result, to match it up.
+    #[schema(example = "row-1", max_length = 128)]
+    pub id: Option<String>,
+    /// The street address on its own: house number and street, without the
+    /// town or postcode.
+    #[schema(example = "10 King Street", min_length = 1, max_length = 256)]
+    pub address: String,
+    /// The town or city the address is in.
+    #[schema(example = "Toronto", max_length = 256)]
+    pub locality: Option<String>,
+    /// The state, province or region.
+    #[schema(example = "Ontario", max_length = 256)]
+    pub region: Option<String>,
+    #[schema(example = "M5V 1A1", max_length = 256)]
+    pub postcode: Option<String>,
+    /// How many candidates to consider before picking the best.
+    #[schema(minimum = 0, maximum = 50)]
+    pub limit: Option<usize>,
+    pub layer: Option<Layer>,
+    /// ISO 3166-1 alpha-2 codes, comma-separated.
+    #[schema(example = "CA")]
+    pub country: Option<String>,
+}
+
+/// One item of a `/search` batch: `GET /search`'s parameters and an `id`.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SearchItem {
+    /// Echoed in this item's result, to match it up.
+    #[schema(example = "row-1", max_length = 128)]
+    pub id: Option<String>,
+    /// The text to search for.
+    #[schema(example = "10 King Street, Toronto", min_length = 1, max_length = 256)]
+    pub q: String,
+    #[schema(minimum = 0, maximum = 50)]
+    pub limit: Option<usize>,
+    pub layer: Option<Layer>,
+    /// ISO 3166-1 alpha-2 codes, comma-separated.
+    #[schema(example = "NZ,AU")]
+    pub country: Option<String>,
+    /// Where the caller is, `lon,lat`.
+    #[schema(example = "-79.38,43.65")]
+    pub focus: Option<String>,
+    /// `min_lon,min_lat,max_lon,max_lat`.
+    #[schema(example = "-79.64,43.58,-79.12,43.86")]
+    pub bbox: Option<String>,
+}
+
+/// One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct ReverseItem {
+    /// Echoed in this item's result, to match it up.
+    #[schema(example = "row-1", max_length = 128)]
+    pub id: Option<String>,
+    #[schema(example = -79.3832, minimum = -180.0, maximum = 180.0)]
+    pub lon: f64,
+    #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
+    pub lat: f64,
+}
+
+/// A forward batch's answer: one result per item, in input order.
+///
+/// Mirrors the body `http::batch` renders, as [`Problem`] mirrors its own;
+/// the contract tests hold the two together.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct ForwardBatch {
+    pub results: Vec<ForwardResult>,
+    pub summary: BatchSummary,
+}
+
+/// One item's result: `response` when it succeeded, `error` when it failed.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct ForwardResult {
+    /// The item's `id`, when it sent one.
+    pub id: Option<String>,
+    /// The status `GET` would have answered this item with.
+    #[schema(example = 200)]
+    pub status: u16,
+    /// Exactly what `GET` returns for this item.
+    pub response: Option<ForwardCollection>,
+    /// Exactly the Problem `GET` would return for this item.
+    pub error: Option<Problem>,
+}
+
+/// A reverse batch's answer: one result per item, in input order.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct ReverseBatch {
+    pub results: Vec<ReverseResult>,
+    pub summary: BatchSummary,
+}
+
+/// One item's result: `response` when it succeeded, `error` when it failed.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct ReverseResult {
+    /// The item's `id`, when it sent one.
+    pub id: Option<String>,
+    /// The status `GET` would have answered this item with.
+    #[schema(example = 200)]
+    pub status: u16,
+    /// Exactly what `GET` returns for this item.
+    pub response: Option<ReverseCollection>,
+    /// Exactly the Problem `GET` would return for this item.
+    pub error: Option<Problem>,
+}
+
+/// How a batch went.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct BatchSummary {
+    pub total: usize,
+    /// Items answered with a 200.
+    pub succeeded: usize,
+    /// Items answered with an error.
+    pub failed: usize,
 }
 
 /// The contract this server is serving.
@@ -221,15 +372,34 @@ pub(crate) fn document() -> serde_json::Result<String> {
 fn transform(value: &mut Value) {
     drop_nulls(value);
     add_boundary_responses(value);
-    add_request_id_header(value);
+    add_response_headers(value);
+    bound_batch_bodies(value);
 }
 
-/// Document the 405 every route answers a non-GET with.
+/// Give every batch body its item cap, which a `request_body` attribute has
+/// no way to say.
+fn bound_batch_bodies(value: &mut Value) {
+    let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for operations in paths.values_mut() {
+        let Some(schema) = operations
+            .pointer_mut("/post/requestBody/content/application~1json/schema")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        schema.insert("maxItems".to_string(), MAX_BATCH_ITEMS.into());
+    }
+}
+
+/// Document the 405 every route answers a method it does not take with.
 ///
 /// It comes from the router's own fallbacks rather than from a handler, so
 /// there is no handler attribute to carry it and it has to be added here.
-/// Every route is GET-only, including HEAD, which the router answers 405
-/// rather than letting axum route it to the GET handler.
+/// Every route takes GET, and a route with a batch QUERY and POST too. HEAD
+/// is never taken: the router answers it 405 rather than letting axum route
+/// it to the GET handler.
 ///
 /// The 404 is deliberately not added per operation: it belongs to paths that
 /// are not in this document at all, so hanging it off the paths that are
@@ -242,6 +412,7 @@ fn add_boundary_responses(value: &mut Value) {
         let Some(operations) = operations.as_object_mut() else {
             continue;
         };
+        let batchable = is_batchable(operations);
         for operation in operations.values_mut() {
             let Some(responses) = operation
                 .get_mut("responses")
@@ -251,20 +422,33 @@ fn add_boundary_responses(value: &mut Value) {
             };
             responses
                 .entry("405")
-                .or_insert_with(method_not_allowed_response);
+                .or_insert_with(|| method_not_allowed_response(batchable));
         }
     }
 }
 
-fn method_not_allowed_response() -> Value {
+/// A route with a batch, the one kind documented with a `post`.
+fn is_batchable(operations: &Map<String, Value>) -> bool {
+    operations.contains_key("post")
+}
+
+fn method_not_allowed_response(batchable: bool) -> Value {
+    let (description, allow) = if batchable {
+        (
+            "The route takes GET, and QUERY or POST for a batch. The `Allow` header lists \
+             the methods it accepts.",
+            batch::METHODS,
+        )
+    } else {
+        (
+            "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "GET",
+        )
+    };
     serde_json::json!({
-        "description": "The route takes GET only. The `Allow` header lists the methods \
-                        it accepts.",
+        "description": description,
         "headers": {
-            "Allow": {
-                "description": "The methods this route accepts.",
-                "schema": { "type": "string", "example": "GET" },
-            },
+            "Allow": allow_header(allow),
         },
         "content": {
             PROBLEM_JSON: {
@@ -329,8 +513,9 @@ fn is_null_schema(value: &Value) -> bool {
         .is_some_and(|map| map.len() == 1 && map.get("type") == Some(&Value::String("null".into())))
 }
 
-/// Document the `X-Request-Id` every response carries.
-fn add_request_id_header(value: &mut Value) {
+/// Document the `X-Request-Id` every response carries, and the `Allow` and
+/// `Accept-Query` every response of a batchable route carries.
+fn add_response_headers(value: &mut Value) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
     };
@@ -338,6 +523,7 @@ fn add_request_id_header(value: &mut Value) {
         let Some(operations) = operations.as_object_mut() else {
             continue;
         };
+        let batchable = is_batchable(operations);
         for operation in operations.values_mut() {
             let Some(responses) = operation
                 .get_mut("responses")
@@ -356,9 +542,29 @@ fn add_request_id_header(value: &mut Value) {
                     continue;
                 };
                 headers.insert(REQUEST_ID_HEADER.to_string(), request_id_header());
+                if batchable {
+                    headers
+                        .entry("Allow")
+                        .or_insert_with(|| allow_header(batch::METHODS));
+                    headers.insert("Accept-Query".to_string(), accept_query_header());
+                }
             }
         }
     }
+}
+
+fn allow_header(methods: &str) -> Value {
+    serde_json::json!({
+        "description": "The methods this route accepts.",
+        "schema": { "type": "string", "example": methods },
+    })
+}
+
+fn accept_query_header() -> Value {
+    serde_json::json!({
+        "description": "The media type a QUERY body is read as.",
+        "schema": { "type": "string", "example": batch::MEDIA_TYPE },
+    })
 }
 
 fn request_id_header() -> Value {
@@ -488,8 +694,12 @@ mod tests {
             RuntimeErrorCode::InvalidCoordinate,
             RuntimeErrorCode::LimitTooLarge,
             RuntimeErrorCode::MalformedParameter,
+            RuntimeErrorCode::MalformedBody,
             RuntimeErrorCode::NotFound,
             RuntimeErrorCode::MethodNotAllowed,
+            RuntimeErrorCode::TooManyItems,
+            RuntimeErrorCode::BodyTooLarge,
+            RuntimeErrorCode::UnsupportedMediaType,
             RuntimeErrorCode::InternalError,
         ] {
             assert!(
