@@ -1,0 +1,79 @@
+{
+  "results": [
+    {
+      "id": "row-1",
+      "response": {
+        "features": [
+          {
+            "geometry": {
+              "coordinates": [
+                -79.0,
+                43.0
+              ],
+              "type": "Point"
+            },
+            "properties": {
+              "accuracy": "rooftop",
+              "address": {
+                "housenumber": "10",
+                "postcode": "M5V 1A1",
+                "street": "King Street"
+              },
+              "confidence": 0.9890131,
+              "context": {
+                "country": {
+                  "id": "osm:relation:1",
+                  "name": "Canada"
+                },
+                "locality": {
+                  "id": "osm:relation:3",
+                  "name": "Toronto"
+                },
+                "region": {
+                  "id": "osm:relation:2",
+                  "name": "Ontario"
+                }
+              },
+              "id": "osm:node:10",
+              "label": "10 King Street, M5V 1A1",
+              "layer": "address",
+              "name": "10 King Street",
+              "record_id": 3,
+              "score": 5.459071,
+              "source": {
+                "dataset": "osm",
+                "object_id": 10,
+                "object_type": "node"
+              }
+            },
+            "type": "Feature"
+          }
+        ],
+        "geocoding": {
+          "attribution": "© OpenStreetMap contributors, ODbL",
+          "query": "10 king street, m5v 1a1",
+          "version": "1"
+        },
+        "type": "FeatureCollection"
+      },
+      "status": 200
+    },
+    {
+      "error": {
+        "detail": "address must not be empty",
+        "error_code": "invalid_query",
+        "request_id": "contract-example",
+        "status": 400,
+        "title": "Bad Request",
+        "type": "about:blank"
+      },
+      "id": "row-2",
+      "status": 400
+    }
+  ],
+  "summary": {
+    "failed": 1,
+    "succeeded": 1,
+    "total": 2
+  }
+}

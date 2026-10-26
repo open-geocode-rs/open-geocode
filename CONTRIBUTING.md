@@ -42,9 +42,6 @@ The numbers come from main and the pull request run on the same Pack, the same m
 1. **One problem per pull request.**
    Count underlying problems, not linked issues.
    A side cleanup or a second fix gets its own pull request.
-2. **Experimental search work cites its backing.**
-   A new idea in parsing, retrieval, ranking or confidence cites at least one source: a paper, a journal article, or the documented design of another geocoder (libpostal, Pelias, Nominatim, Photon, Mapbox).
-   The citation explains the idea; the Impact numbers on og decide it.
 
 ## Rust conventions
 
@@ -86,7 +83,7 @@ og uses edition 2024, minimum Rust 1.88, on the stable toolchain.
 
 Every pull request passes two gates before a maintainer reviews it.
 
-1. **Triage**, a GitHub Action: the title is a conventional commit, the template's sections are filled, the Impact rows are present, and an `experimental` pull request links a source.
+1. **Triage**, a GitHub Action: the title is a conventional commit, the template's sections are filled, and the Impact rows are present.
    It reruns on every push and edit.
    A pull request that fails triage is held as a draft, and returns to ready once it passes.
 2. **Devin Review**, once triage passes: bugs and security against [`REVIEW.md`](REVIEW.md), and a contribution check against this file.

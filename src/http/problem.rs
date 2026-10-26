@@ -8,7 +8,7 @@
 //! into the response extensions, never the body, so the request-id middleware
 //! can log it under the request id (issue #2).
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
@@ -45,8 +45,12 @@ pub(crate) enum ErrorCode {
     InvalidCoordinate,
     LimitTooLarge,
     MalformedParameter,
+    MalformedBody,
     NotFound,
     MethodNotAllowed,
+    TooManyItems,
+    BodyTooLarge,
+    UnsupportedMediaType,
     InternalError,
 }
 
@@ -57,8 +61,12 @@ impl ErrorCode {
             Self::InvalidCoordinate => "invalid_coordinate",
             Self::LimitTooLarge => "limit_too_large",
             Self::MalformedParameter => "malformed_parameter",
+            Self::MalformedBody => "malformed_body",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
+            Self::TooManyItems => "too_many_items",
+            Self::BodyTooLarge => "body_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
             Self::InternalError => "internal_error",
         }
     }
@@ -86,11 +94,9 @@ impl ErrorCode {
 /// A `type` that looks like a link but 404s is worse than one that never
 /// promised anything.
 ///
-/// Giving this a base URL turns every `type` into a real link, which is the
-/// property the error contracts developers like best all have: somewhere to
-/// read next to the code to branch on (Stripe `doc_url`, GitHub
-/// `documentation_url`, Twilio `more_info`, Meilisearch `link`). No separate
-/// link member is needed, because `type` already is one.
+/// Giving this a base URL turns every `type` into a real link: somewhere to
+/// read next to the code that branches on it. No separate link member is
+/// needed, because `type` already is one.
 ///
 /// That change is additive — `about:blank` promises nothing, so replacing it
 /// breaks no client — but it does change every error body, so it lands with
@@ -173,13 +179,12 @@ impl Problem {
         self.0.cause.as_deref()
     }
 
-    // Read accessors, used only by tests to assert on a constructed Problem
-    // before it is rendered to a response.
-
-    #[cfg(test)]
     pub(crate) fn status(&self) -> u16 {
         self.0.status
     }
+
+    // Read accessors, used only by tests to assert on a constructed Problem
+    // before it is rendered to a response.
 
     #[cfg(test)]
     pub(crate) fn error_code(&self) -> ErrorCode {
@@ -218,6 +223,16 @@ impl Problem {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedParameter).with_detail(detail)
     }
 
+    /// A query string, or a batch item read as one, that does not parse. Its
+    /// parser's own text is not shown.
+    pub(crate) fn unparsable_parameters() -> Self {
+        Self::malformed_parameter("could not parse query parameters")
+    }
+
+    pub(crate) fn malformed_body(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedBody).with_detail(detail)
+    }
+
     // --- 404 / 405 ---------------------------------------------------------
 
     pub(crate) fn not_found() -> Self {
@@ -232,6 +247,26 @@ impl Problem {
         problem
     }
 
+    // --- 413 / 415 ---------------------------------------------------------
+
+    pub(crate) fn too_many_items(max: usize) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::TooManyItems)
+            .with_detail(format!("a batch holds at most {max} items"))
+    }
+
+    pub(crate) fn body_too_large(max_bytes: usize) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::BodyTooLarge)
+            .with_detail(format!("the body must be at most {max_bytes} bytes"))
+    }
+
+    pub(crate) fn unsupported_media_type() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::UnsupportedMediaType,
+        )
+        .with_detail("the body must be sent as Content-Type: application/json")
+    }
+
     // --- 500 ---------------------------------------------------------------
 
     /// A generic 500. The body carries no detail so internal errors never
@@ -240,6 +275,18 @@ impl Problem {
         let mut problem = Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError);
         problem.0.cause = Some(Arc::new(cause));
         problem
+    }
+
+    /// A 500 for work that panicked, its cause the panic message, so the log
+    /// says what broke rather than just that something did.
+    pub(crate) fn panicked(payload: &(dyn Any + Send)) -> Self {
+        // `panic!` with a literal carries a `&str`, with a format a `String`.
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("(payload is not a string)");
+        Problem::internal(anyhow::anyhow!("blocking task panicked: {message}"))
     }
 
     /// The problem document with its status and headers. Unlike
@@ -291,21 +338,13 @@ impl From<crate::Error> for Problem {
     }
 }
 
-/// A blocking task that panicked is a 500 whose cause is the panic message, so
-/// the log says what broke rather than just that the task failed.
+/// A blocking task that panicked is a 500 whose cause is the panic message.
 impl From<JoinError> for Problem {
     fn from(error: JoinError) -> Self {
         if !error.is_panic() {
             return Problem::internal(anyhow::anyhow!("blocking task was cancelled"));
         }
-        // `panic!` with a literal carries a `&str`, with a format a `String`.
-        let payload = error.into_panic();
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("(payload is not a string)");
-        Problem::internal(anyhow::anyhow!("blocking task panicked: {message}"))
+        Problem::panicked(error.into_panic().as_ref())
     }
 }
 
@@ -350,13 +389,17 @@ mod tests {
         assert!(value.get("instance").is_none());
     }
 
-    const ALL_CODES: [ErrorCode; 7] = [
+    const ALL_CODES: [ErrorCode; 11] = [
         ErrorCode::InvalidQuery,
         ErrorCode::InvalidCoordinate,
         ErrorCode::LimitTooLarge,
         ErrorCode::MalformedParameter,
+        ErrorCode::MalformedBody,
         ErrorCode::NotFound,
         ErrorCode::MethodNotAllowed,
+        ErrorCode::TooManyItems,
+        ErrorCode::BodyTooLarge,
+        ErrorCode::UnsupportedMediaType,
         ErrorCode::InternalError,
     ];
 

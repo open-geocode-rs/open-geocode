@@ -17,6 +17,18 @@ pub(crate) const MAX_QUERY_CHARS: usize = 256;
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
 
+/// Most items one batch request may hold.
+pub(crate) const MAX_BATCH_ITEMS: usize = 1000;
+
+/// Largest batch body read. 4 KiB an item at [`MAX_BATCH_ITEMS`]: an item
+/// with every field at full length is about 1.2 KiB of ASCII, so this leaves
+/// room for escapes and non-Latin text without letting one request hold the
+/// server's memory.
+pub(crate) const MAX_BATCH_BODY_BYTES: usize = MAX_BATCH_ITEMS * 4096;
+
+/// Longest `id` a batch item may carry, in Unicode scalar values.
+pub(crate) const MAX_BATCH_ID_CHARS: usize = 128;
+
 /// Trim and bound a query by length, returning it with each run of
 /// whitespace written as one space. Empty is allowed (autocomplete treats
 /// short/empty queries as "no suggestions").

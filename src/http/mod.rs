@@ -11,6 +11,7 @@
 //! makes it a non-issue (ADR 0017 Decisions 6/35a, amended 2026-06-03); the
 //! bundled Runtime serves the basemap file raw as a local-dev convenience.
 
+pub(crate) mod batch;
 pub(crate) mod bounds;
 pub(crate) mod health;
 pub(crate) mod method;
