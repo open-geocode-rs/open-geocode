@@ -51,20 +51,18 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
 #[openapi(
     info(
         title = "open-geocode",
-        description = "Search, autocomplete and reverse geocoding served from a single \
-                       binary Pack built from OpenStreetMap extracts.\n\n\
-                       Every answer is one GeoJSON FeatureCollection, so a response drops \
-                       straight into a map library. Forward answers carry a `score`, and a \
-                       calibrated `confidence` once the Pack has been calibrated; reverse \
-                       answers carry a `distance_m`. Nothing else differs between them.\n\n\
-                       Errors are RFC 9457 problem documents served as \
-                       `application/problem+json`. Branch on `error_code`, which is a \
-                       closed set; `title` and `detail` are prose and may be reworded.",
+        description = "Forward, autocomplete and reverse geocoding of addresses, \
+                       served from a Pack built from OpenStreetMap and OpenAddresses.\n\n\
+                       Every response is a GeoJSON FeatureCollection. Forward results \
+                       carry a `score`, and a `confidence` when the Pack is calibrated. \
+                       Reverse results carry a `distance_m`.\n\n\
+                       Errors are RFC 9457 problem documents (`application/problem+json`). \
+                       Branch on `error_code`. `title` and `detail` are prose and may change.",
         license(name = "MIT", identifier = "MIT"),
     ),
     servers(
         (url = "http://127.0.0.1:8080",
-         description = "A Runtime serving a Pack locally, the default bind address."),
+         description = "Local server on the default address."),
     ),
     paths(
         crate::runtime::search,
@@ -104,45 +102,43 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Problem,
     )),
     tags(
-        (name = "geocoding", description = "Turn text or a point into places."),
-        (name = "operations", description = "Liveness, readiness and the contract itself."),
+        (name = "geocoding", description = "Geocode addresses and points."),
+        (name = "operations", description = "Health checks and the OpenAPI document."),
     ),
 )]
 pub(crate) struct ApiDoc;
 
-/// The error body, as the contract describes it.
-///
-/// A schema-only mirror of [`crate::http::problem::Problem`], whose fields are
-/// private so that nothing but its constructors can build one.
-/// `problem_schema_matches_the_rendered_body` holds the two together.
+// Schema-only mirror of [`crate::http::problem::Problem`], whose fields are
+// private so only its constructors build one.
+// `problem_schema_matches_the_rendered_body` holds the two together.
+/// Error response, an RFC 9457 problem document.
 #[derive(utoipa::ToSchema)]
 #[schema(as = Problem, title = "Problem")]
 #[allow(dead_code)]
 pub(crate) struct Problem {
-    /// A URI identifying the problem type. `about:blank` while the problem
-    /// pages are unwritten, per RFC 9457.
+    /// URI identifying the problem type. Currently always `about:blank`.
     #[schema(example = "about:blank")]
     pub r#type: String,
-    /// The status code's name. Prose: do not branch on it.
+    /// Name of the HTTP status. Do not branch on it.
     #[schema(example = "Bad Request")]
     pub title: String,
     #[schema(example = 400, minimum = 400, maximum = 599)]
     pub status: u16,
-    /// What went wrong, in prose. Absent on a 500, which never explains
-    /// itself to a client.
+    /// Human-readable explanation. Absent on `500` errors.
     #[schema(example = "q must not be empty")]
     pub detail: Option<String>,
-    /// The stable value to branch on.
+    /// Stable error code. Branch on this.
     pub error_code: ErrorCode,
-    /// The id this request is logged under. Quote it in a bug report.
+    /// ID the request is logged under. Include it in bug reports.
     #[schema(example = "01JA7Q2K3M4N5P6Q7R8S9T0V1W")]
     pub request_id: Option<String>,
-    /// The parameters that were rejected, when the problem is about
+    /// Rejected parameters. Present only when the error is about
     /// parameters.
     pub invalid_params: Option<Vec<InvalidParam>>,
 }
 
-/// Mirrors [`crate::http::problem::ErrorCode`] for the schema.
+// Mirrors [`crate::http::problem::ErrorCode`] for the schema.
+/// Stable error code.
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
@@ -167,28 +163,30 @@ pub(crate) enum ErrorCode {
     InternalError,
 }
 
-/// Mirrors [`crate::http::problem::InvalidParam`] for the schema.
+// Mirrors [`crate::http::problem::InvalidParam`] for the schema.
+/// A rejected parameter.
 #[derive(utoipa::ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct InvalidParam {
-    /// The parameter that was rejected.
+    /// Parameter name.
     #[schema(example = "limit")]
     pub name: String,
-    /// Why, in prose.
+    /// Why it was rejected.
     #[schema(example = "must be at most 50")]
     pub reason: String,
 }
 
-/// The contract this server is serving.
+// The same bytes as the committed `contract/openapi.json`, which the
+// contract tests hold to the code.
+/// Get the OpenAPI document
 ///
-/// The same bytes as the committed `contract/openapi.json`, which the
-/// contract tests hold to the code.
+/// Returns the OpenAPI 3.1 document describing this server's API.
 #[utoipa::path(
     get,
     path = "/openapi.json",
     tag = "operations",
     responses(
-        (status = 200, description = "The OpenAPI description of this API.",
+        (status = 200, description = "The OpenAPI document.",
          content_type = "application/json"),
     ),
 )]
@@ -258,11 +256,10 @@ fn add_boundary_responses(value: &mut Value) {
 
 fn method_not_allowed_response() -> Value {
     serde_json::json!({
-        "description": "The route takes GET only. The `Allow` header lists the methods \
-                        it accepts.",
+        "description": "Method not allowed. The route accepts `GET` only.",
         "headers": {
             "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": { "type": "string", "example": "GET" },
             },
         },
@@ -363,8 +360,8 @@ fn add_request_id_header(value: &mut Value) {
 
 fn request_id_header() -> Value {
     serde_json::json!({
-        "description": "The id this request is logged under, echoed from the request when it \
-                        carried one. Quote it in a bug report.",
+        "description": "ID the request is logged under: the request's own \
+                        `X-Request-Id` when it sent one. Include it in bug reports.",
         "schema": { "type": "string", "maxLength": 128 },
     })
 }

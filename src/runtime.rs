@@ -291,54 +291,50 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
     Problem::malformed_parameter("could not parse query parameters")
 }
 
-/// Search for a place by text.
+/// Search addresses
 ///
-/// Answers are ordered by `score`, best first.
+/// Geocodes free-form text, such as a full address, to coordinates. Results
+/// are sorted by `score`, highest first.
 #[utoipa::path(
     get,
     path = "/search",
     tag = "geocoding",
     params(
         ("q" = String, Query,
-         description = "The text to search for.",
+         description = "Text to geocode, such as a full address.",
          example = "10 King Street, Toronto",
          min_length = 1, max_length = 256),
         ("limit" = Option<usize>, Query,
-         description = "How many answers to return. 0, the default, lets the \
+         description = "Maximum number of results. `0`, the default, lets the \
                         server choose.",
          minimum = 0, maximum = 50),
         ("layer" = Option<Layer>, Query,
-         description = "Return only answers of this layer. An unknown layer is \
-                        rejected rather than silently matching nothing."),
+         description = "Return only results of this layer. An unknown layer \
+                        returns `400`."),
         ("country" = Option<String>, Query,
-         description = "Return only answers in these countries: ISO 3166-1 \
-                        alpha-2 codes, comma-separated. A Pack covering one \
-                        country needs none. A code that is not two letters is \
-                        rejected; one the Pack does not cover simply matches \
-                        nothing.",
+         description = "Return only results in these countries, as comma-separated \
+                        ISO 3166-1 alpha-2 codes. A code that is not two letters \
+                        returns `400`. A code the Pack does not cover returns no \
+                        results.",
          example = "NZ,AU"),
         ("focus" = Option<String>, Query,
-         description = "Where the caller is, `lon,lat`. Of answers the query \
-                        cannot tell apart, the nearer ranks first; it never \
-                        outranks what the query states or a better match. A \
-                        point out of range is rejected.",
+         description = "Point to prefer results near, as `lon,lat`. Breaks ties \
+                        between equally good matches only.",
          example = "-79.38,43.65"),
         ("bbox" = Option<String>, Query,
-         description = "Return only answers inside this box, \
-                        `min_lon,min_lat,max_lon,max_lat`. Its west edge must \
-                        not lie east of its east edge, nor its south edge \
-                        north of its north edge: a box across the \
-                        antimeridian is two requests.",
+         description = "Return only results inside this box, as \
+                        `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
+                        the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
     ),
     responses(
-        (status = 200, description = "The places that matched, best first.",
+        (status = 200, description = "Matching results, highest `score` first.",
          body = ForwardCollection),
-        (status = 400, description = "`q` was empty or too long, `limit` was above \
-                                      the maximum, `focus` or `bbox` was out of \
-                                      range, or a parameter did not parse.",
+        (status = 400, description = "`q` is empty or too long, `limit` is too \
+                                      large, `focus` or `bbox` is out of range, \
+                                      or a parameter is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 500, description = "The search failed inside the server.",
+        (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -372,55 +368,50 @@ pub(crate) async fn search(
     Ok(Json(collection))
 }
 
-/// Suggest places as a query is typed.
+/// Autocomplete addresses
 ///
-/// Like `/search`, but tuned for partial input: an empty or very short `q` is
-/// not an error, it simply has no suggestions.
+/// Suggests addresses for partial text, as a user types. An empty or very
+/// short `q` returns no results.
 #[utoipa::path(
     get,
     path = "/autocomplete",
     tag = "geocoding",
     params(
         ("q" = Option<String>, Query,
-         description = "The text typed so far. Empty returns no suggestions.",
+         description = "Text typed so far.",
          example = "10 King St",
          max_length = 256),
         ("limit" = Option<usize>, Query,
-         description = "How many suggestions to return. 0, the default, lets the \
+         description = "Maximum number of results. `0`, the default, lets the \
                         server choose.",
          minimum = 0, maximum = 20),
         ("layer" = Option<Layer>, Query,
-         description = "Return only suggestions of this layer. An unknown layer is \
-                        rejected rather than silently matching nothing."),
+         description = "Return only results of this layer. An unknown layer \
+                        returns `400`."),
         ("country" = Option<String>, Query,
-         description = "Return only answers in these countries: ISO 3166-1 \
-                        alpha-2 codes, comma-separated. A Pack covering one \
-                        country needs none. A code that is not two letters is \
-                        rejected; one the Pack does not cover simply matches \
-                        nothing.",
+         description = "Return only results in these countries, as comma-separated \
+                        ISO 3166-1 alpha-2 codes. A code that is not two letters \
+                        returns `400`. A code the Pack does not cover returns no \
+                        results.",
          example = "NZ,AU"),
         ("focus" = Option<String>, Query,
-         description = "Where the caller is, `lon,lat`. Of answers the query \
-                        cannot tell apart, the nearer ranks first; it never \
-                        outranks what the query states or a better match. A \
-                        point out of range is rejected.",
+         description = "Point to prefer results near, as `lon,lat`. Breaks ties \
+                        between equally good matches only.",
          example = "-79.38,43.65"),
         ("bbox" = Option<String>, Query,
-         description = "Return only answers inside this box, \
-                        `min_lon,min_lat,max_lon,max_lat`. Its west edge must \
-                        not lie east of its east edge, nor its south edge \
-                        north of its north edge: a box across the \
-                        antimeridian is two requests.",
+         description = "Return only results inside this box, as \
+                        `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
+                        the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
     ),
     responses(
-        (status = 200, description = "The suggestions, best first.",
+        (status = 200, description = "Suggested results, highest `score` first.",
          body = ForwardCollection),
-        (status = 400, description = "`q` was too long, `limit` was above the \
-                                      maximum, `focus` or `bbox` was out of range, \
-                                      or a parameter did not parse.",
+        (status = 400, description = "`q` is too long, `limit` is too large, \
+                                      `focus` or `bbox` is out of range, or a \
+                                      parameter is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 500, description = "The search failed inside the server.",
+        (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -456,68 +447,63 @@ pub(crate) async fn autocomplete(
     Ok(Json(collection))
 }
 
-/// Geocode an address whose parts are already apart.
+// For callers holding street, town and postcode in separate fields: joined
+// into one string, the parser would have to split them apart again, and a
+// town in the string could outrank the street. `geocode batch` runs this
+// same lookup per row.
+/// Geocode a structured address
 ///
-/// For callers who hold a street address, a town and a postcode in separate
-/// fields and would otherwise have to paste them into one string and hope the
-/// parser pulls them apart again. The street address is searched on its own
-/// and hits are kept only where they fit the locality, region and postcode
-/// given, so a town in the address cannot outrank the street.
+/// Geocodes an address given as separate fields, and returns the best match
+/// or no result. `address` is matched on its own, then checked against
+/// `locality`, `region` and `postcode`.
 ///
-/// This is the lookup `geocode batch` runs per row, over HTTP.
-///
-/// A house number the data lacks is placed between its neighbours
-/// (`accuracy` `interpolated`) or, failing that, answered with its street
-/// (`accuracy` `street`). A street answers a given postcode only where
-/// postcode data confirms it. The answer is never another house: a flat
-/// written "10/1367" is found as itself or by 1367, never as house 10.
-///
-/// The answer is the same FeatureCollection every other route returns, with
-/// at most one feature: `features` holds the one match, or is empty when
-/// nothing fits. `geocoding.query` is the rewrite that matched, which is not
-/// always the address as it was sent.
+/// - A house number missing from the data is interpolated between its
+///   neighbours (`accuracy: interpolated`), or answered with its street
+///   (`accuracy: street`).
+/// - A street matches `postcode` only when postcode data confirms it.
+/// - A different house is never returned: `10/1367` matches as written or
+///   as 1367, never as house 10.
+/// - `geocoding.query` is the form of the address that matched, which can
+///   differ from `address`.
 #[utoipa::path(
     get,
     path = "/geocode",
     tag = "geocoding",
     params(
         ("address" = String, Query,
-         description = "The street address on its own: house number and street, \
-                        without the town or postcode.",
+         description = "House number and street, without town or postcode.",
          example = "10 King Street", min_length = 1, max_length = 256),
         ("locality" = Option<String>, Query,
-         description = "The town or city the address is in.",
+         description = "City or town.",
          example = "Toronto", max_length = 256),
         ("region" = Option<String>, Query,
-         description = "The state, province or region.",
+         description = "State, province or region.",
          example = "Ontario", max_length = 256),
         ("postcode" = Option<String>, Query,
-         description = "The postcode.", example = "M5V 1A1", max_length = 256),
+         description = "Postal code.", example = "M5V 1A1", max_length = 256),
         ("limit" = Option<usize>, Query,
-         description = "How many candidates to consider before picking the best. \
-                        0, the default, lets the server choose. At most one is \
-                        ever returned.",
+         description = "Number of candidates to consider. `0`, the default, lets \
+                        the server choose. At most one result is returned.",
          minimum = 0, maximum = 50),
         ("layer" = Option<Layer>, Query,
          description = "Consider only candidates of this layer. An unknown layer \
-                        is rejected rather than silently matching nothing."),
+                        returns `400`."),
         ("country" = Option<String>, Query,
-         description = "Return only answers in these countries: ISO 3166-1 \
-                        alpha-2 codes, comma-separated. A Pack covering one \
-                        country needs none. A code that is not two letters is \
-                        rejected; one the Pack does not cover simply matches \
-                        nothing.",
+         description = "Return only results in these countries, as comma-separated \
+                        ISO 3166-1 alpha-2 codes. A code that is not two letters \
+                        returns `400`. A code the Pack does not cover returns no \
+                        results.",
          example = "NZ,AU"),
     ),
     responses(
         (status = 200,
-         description = "The one address that fits, or no features when none does.",
+         description = "The best match, or no features when nothing matches.",
          body = ForwardCollection),
-        (status = 400, description = "`address` was empty or too long, a context \
-                                      field was too long, `limit` was above the \
-                                      maximum, or a parameter did not parse.",
+        (status = 400, description = "`address` is empty or too long, another \
+                                      field is too long, `limit` is too large, or \
+                                      a parameter is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 500, description = "The lookup failed inside the server.",
+        (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -564,28 +550,28 @@ pub(crate) async fn geocode(
     Ok(Json(collection))
 }
 
-/// Find the places at a point.
+/// Reverse geocode a point
 ///
-/// The first feature is the place itself, when there is one, carrying its
-/// `distance_m`. The features after it are the areas the point lies in, from
-/// the most precise outwards, and carry no distance.
+/// Returns the nearest address or street to a point, followed by the areas
+/// that contain the point, most precise first. Only the first result carries
+/// `distance_m`.
 #[utoipa::path(
     get,
     path = "/reverse",
     tag = "geocoding",
     params(
-        ("lon" = f64, Query, description = "Longitude, in degrees.",
+        ("lon" = f64, Query, description = "Longitude in degrees.",
          example = -79.3832, minimum = -180.0, maximum = 180.0),
-        ("lat" = f64, Query, description = "Latitude, in degrees.",
+        ("lat" = f64, Query, description = "Latitude in degrees.",
          example = 43.6532, minimum = -90.0, maximum = 90.0),
     ),
     responses(
-        (status = 200, description = "What lies at the point, most precise first. \
+        (status = 200, description = "Results at the point, most precise first. \
                                       `features` is empty when nothing is near.",
          body = ReverseCollection),
-        (status = 400, description = "`lon` or `lat` was missing or out of range.",
+        (status = 400, description = "`lon` or `lat` is missing or out of range.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 500, description = "Reverse geocoding failed inside the server.",
+        (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]

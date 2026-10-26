@@ -2,7 +2,7 @@
   "components": {
     "schemas": {
       "Accuracy": {
-        "description": "How the feature's coordinates relate to the thing it names.\n\n| accuracy | Pack point |\n| --- | --- |\n| `rooftop` | the point of an address or POI (`point`) |\n| `interpolated` | a house number placed along a range or between neighbours (`estimated`) |\n| `street` | a point on a street or range line (`representative_point`, reverse `street`) |\n| `centroid` | the centre of a drawn way or relation (`centroid`) |\n| `approximate` | a node or derived point standing for something larger: a place node, a postcode |\n\nAccuracies order from the most precise.",
+        "description": "How precisely the coordinates locate the result, most precise first.\n\n- `rooftop`: the address or POI itself.\n- `interpolated`: a house number placed between known neighbours.\n- `street`: a point on the street.\n- `centroid`: the centre of a mapped area.\n- `approximate`: a point standing for something larger, such as a town\n  or postcode.",
         "enum": [
           "rooftop",
           "interpolated",
@@ -13,10 +13,10 @@
         "type": "string"
       },
       "Address": {
-        "description": "Address parts as the record states them. A part the record leaves out is\nabsent, never filled in from the areas around it: those are the\n`context`.",
+        "description": "Address parts stated by the source record. Parts the record omits are\nabsent, not filled in from `context`.",
         "properties": {
           "areas": {
-            "description": "The areas below the locality the address names, outermost first\n(`addr:suburb`, `addr:quarter`, `addr:neighbourhood`).",
+            "description": "Areas below the locality, outermost first (OSM `addr:suburb`,\n`addr:quarter`, `addr:neighbourhood`).",
             "items": {
               "type": "string"
             },
@@ -32,7 +32,7 @@
             "type": "string"
           },
           "place": {
-            "description": "`addr:place`: what the house number is on where there is no street.",
+            "description": "Named place the house number belongs to where there is no street\n(OSM `addr:place`).",
             "type": "string"
           },
           "postcode": {
@@ -51,48 +51,48 @@
         "type": "object"
       },
       "Attribution": {
-        "description": "The licence every answer is given under.",
+        "description": "Attribution required by the data licence.",
         "enum": [
           "© OpenStreetMap contributors, ODbL"
         ],
         "type": "string"
       },
       "Common": {
-        "description": "What a feature is, where it lies and where it comes from: everything both\ndirections say about an answer.\n\nNot a response type of its own. It is flattened into\n[`ForwardProperties`] and [`ReverseProperties`], which add the one field\ntheir direction ranks by, so that both are one flat object on the wire.",
+        "description": "Properties shared by forward and reverse results.",
         "properties": {
           "accuracy": {
             "$ref": "#/components/schemas/Accuracy"
           },
           "address": {
             "$ref": "#/components/schemas/Address",
-            "description": "The address parts the record itself states, and only those."
+            "description": "Address parts stated by the source record."
           },
           "category": {
-            "description": "A POI's category, for example `amenity:cafe`.",
+            "description": "POI category, such as `amenity:cafe`. Present only on POIs.",
             "type": "string"
           },
           "context": {
             "$ref": "#/components/schemas/Context",
-            "description": "The areas the record lies in, from the Pack's boundaries."
+            "description": "Administrative areas containing the result."
           },
           "id": {
-            "description": "Stable source id, for example `osm:node:123`.",
+            "description": "Stable ID from the source data, such as `osm:node:123`.",
             "type": "string"
           },
           "label": {
-            "description": "One line to show, the name followed by where it is.",
+            "description": "One-line display label: `name` followed by its location.",
             "type": "string"
           },
           "layer": {
             "$ref": "#/components/schemas/Layer"
           },
           "name": {
-            "description": "The thing itself: a POI's or place's name, a street's name, or an\naddress's house number and street (`12 King Street West`).",
+            "description": "House number and street for an address (`12 King Street West`), or\nthe name of a street, area or POI.",
             "type": "string"
           },
           "record_id": {
             "$ref": "#/components/schemas/u64",
-            "description": "Row of the record in this Pack. Not stable across Pack builds."
+            "description": "Row of the record in this Pack. Changes between Pack builds."
           },
           "source": {
             "$ref": "#/components/schemas/Source"
@@ -110,7 +110,7 @@
         "type": "object"
       },
       "Context": {
-        "description": "The areas a record lies in, one per tier: the admin areas most specific\nfirst, then the place area.\n\nThe `sub` tiers carry the levels a country maps between the conventional\nones. Germany mapping three `state_district` levels used to mean two of\nthem were dropped from every German address; they are now the district\nand its subdistrict. The field is absent where a country does not map\nthat depth, as every field here already is, so a reader of the\nconventional tiers alone is unaffected.",
+        "description": "Areas containing the result, one per tier, most specific first. A tier\nthe country does not map is absent.",
         "properties": {
           "country": {
             "$ref": "#/components/schemas/ContextArea"
@@ -126,7 +126,7 @@
           },
           "place": {
             "$ref": "#/components/schemas/ContextArea",
-            "description": "A named area outside the admin levels, mostly an island. It can be\nsmaller than a locality or larger than a region (Honshu)."
+            "description": "Named area outside the administrative levels, usually an island."
           },
           "region": {
             "$ref": "#/components/schemas/ContextArea"
@@ -146,7 +146,7 @@
       "ContextArea": {
         "properties": {
           "id": {
-            "description": "The area's source id, as a feature's `id`.",
+            "description": "Stable ID from the source data, as in a result's `id`.",
             "type": "string"
           },
           "name": {
@@ -160,7 +160,7 @@
         "type": "object"
       },
       "ErrorCode": {
-        "description": "Mirrors [`crate::http::problem::ErrorCode`] for the schema.",
+        "description": "Stable error code.",
         "enum": [
           "invalid_query",
           "invalid_coordinate",
@@ -185,7 +185,7 @@
         "type": "string"
       },
       "ForwardCollection": {
-        "description": "A forward answer: `/search` and `/autocomplete`.\n\nForward and reverse answers are the same GeoJSON FeatureCollection, best\nor most precise first, differing only in what `geocoding` says and in the\none ranking field each feature carries. Each direction is written out\nrather than shared through a generic, because a generic reached through a\ntype alias is transparent to the schema generator: it produced one\n`FeatureCollection` component for both directions and pointed `/search`\nand `/reverse` at it, so the published contract described each endpoint\nwith the other's fields. The duplication here is what makes the generated\nschemas distinct and true. The construction logic is still shared, by\n[`common`] and the builders below.",
+        "description": "A GeoJSON FeatureCollection answering `/search`, `/autocomplete` or\n`/geocode`.",
         "properties": {
           "features": {
             "items": {
@@ -195,7 +195,7 @@
           },
           "geocoding": {
             "$ref": "#/components/schemas/ForwardGeocoding",
-            "description": "What was asked, the contract version and the data attribution."
+            "description": "The query, API version and data attribution."
           },
           "type": {
             "$ref": "#/components/schemas/FeatureCollectionType"
@@ -209,7 +209,7 @@
         "type": "object"
       },
       "ForwardFeature": {
-        "description": "One forward answer: a record of the Pack, or a house number placed on one.",
+        "description": "One forward geocoding result.",
         "properties": {
           "geometry": {
             "$ref": "#/components/schemas/Point"
@@ -234,7 +234,7 @@
             "$ref": "#/components/schemas/Attribution"
           },
           "query": {
-            "description": "The query text as received, trimmed, with each run of whitespace\nwritten as one space.",
+            "description": "Query as received, trimmed, with each run of whitespace collapsed to\none space.",
             "type": "string"
           },
           "version": {
@@ -256,18 +256,18 @@
           {
             "properties": {
               "confidence": {
-                "description": "The chance this answer is the address or place the query asks for,\nfrom 0 to 1, comparable across queries: of the answers given 0.8,\nabout eight in ten are right. It is calibrated per Pack, by\n`geocode calibrate` on held-out addresses, and is absent from every\nanswer of a Pack that has not been calibrated. A `fallback` is no\nanswer to what the query asks for, and its confidence is 0.",
+                "description": "Probability, from 0 to 1, that this is the address the query asks\nfor. Of results at 0.8, about 8 in 10 are correct. Present only when\nthe Pack is calibrated. `0` on a `fallback` result.",
                 "format": "float",
                 "maximum": 1,
                 "minimum": 0,
                 "type": "number"
               },
               "fallback": {
-                "description": "Present, and `true`, when the feature is no match of what the query\nasks for but the finest area it names that the Pack holds: its\npostcode, a place it names, its region or its country. It is given\nonly when nothing more precise was found, and `layer` and `accuracy`\nsay how coarse it is. Absent from every other answer.",
+                "description": "`true` when no match was found and the result is the most precise\narea the query names instead: its postcode, a town or other area,\nits region or its country. `layer` says which. Absent otherwise.",
                 "type": "boolean"
               },
               "score": {
-                "description": "Text relevance: higher is better, comparable only within one answer.\n\nIt orders the features of one response and nothing else. It is not a\nprobability, not a quality score, and not comparable between queries\nor between Packs — two answers' scores say nothing about each other.\nTo judge how good a single answer is, read `confidence`, or\n`accuracy` and `layer`, which mean the same thing in every response.",
+                "description": "Text relevance. Higher is better. Comparable only within one\nresponse: use `confidence` to judge a single result.",
                 "format": "float",
                 "type": "number"
               }
@@ -278,18 +278,18 @@
             "type": "object"
           }
         ],
-        "description": "A forward feature's properties: the common fields, and the text relevance\n`/search` and `/autocomplete` rank by."
+        "description": "Properties of a forward geocoding result."
       },
       "InvalidParam": {
-        "description": "Mirrors [`crate::http::problem::InvalidParam`] for the schema.",
+        "description": "A rejected parameter.",
         "properties": {
           "name": {
-            "description": "The parameter that was rejected.",
+            "description": "Parameter name.",
             "example": "limit",
             "type": "string"
           },
           "reason": {
-            "description": "Why, in prose.",
+            "description": "Why it was rejected.",
             "example": "must be at most 50",
             "type": "string"
           }
@@ -301,7 +301,7 @@
         "type": "object"
       },
       "Layer": {
-        "description": "Every record layer. Place layers are the context layers used to describe\nwhere an address is.",
+        "description": "Kind of result: an address, a street, a POI, or an area such as a\nlocality or region.",
         "enum": [
           "address",
           "country",
@@ -335,7 +335,7 @@
         "type": "object"
       },
       "ObjectType": {
-        "description": "What a record's source object is: an OSM node, way or relation, or a row\nof an imported address dataset such as OpenAddresses.",
+        "description": "Source object type: an OSM `node`, `way` or `relation`, or a `row` of an\naddress dataset such as OpenAddresses.",
         "enum": [
           "node",
           "way",
@@ -345,7 +345,7 @@
         "type": "string"
       },
       "Point": {
-        "description": "A GeoJSON Point, `[lon, lat]`.",
+        "description": "GeoJSON Point. `coordinates` is `[lon, lat]`.",
         "properties": {
           "coordinates": {
             "items": {
@@ -371,26 +371,26 @@
         "type": "string"
       },
       "Problem": {
-        "description": "The error body, as the contract describes it.\n\nA schema-only mirror of [`crate::http::problem::Problem`], whose fields are\nprivate so that nothing but its constructors can build one.\n`problem_schema_matches_the_rendered_body` holds the two together.",
+        "description": "Error response, an RFC 9457 problem document.",
         "properties": {
           "detail": {
-            "description": "What went wrong, in prose. Absent on a 500, which never explains\nitself to a client.",
+            "description": "Human-readable explanation. Absent on `500` errors.",
             "example": "q must not be empty",
             "type": "string"
           },
           "error_code": {
             "$ref": "#/components/schemas/ErrorCode",
-            "description": "The stable value to branch on."
+            "description": "Stable error code. Branch on this."
           },
           "invalid_params": {
-            "description": "The parameters that were rejected, when the problem is about\nparameters.",
+            "description": "Rejected parameters. Present only when the error is about\nparameters.",
             "items": {
               "$ref": "#/components/schemas/InvalidParam"
             },
             "type": "array"
           },
           "request_id": {
-            "description": "The id this request is logged under. Quote it in a bug report.",
+            "description": "ID the request is logged under. Include it in bug reports.",
             "example": "01JA7Q2K3M4N5P6Q7R8S9T0V1W",
             "type": "string"
           },
@@ -402,12 +402,12 @@
             "type": "integer"
           },
           "title": {
-            "description": "The status code's name. Prose: do not branch on it.",
+            "description": "Name of the HTTP status. Do not branch on it.",
             "example": "Bad Request",
             "type": "string"
           },
           "type": {
-            "description": "A URI identifying the problem type. `about:blank` while the problem\npages are unwritten, per RFC 9457.",
+            "description": "URI identifying the problem type. Currently always `about:blank`.",
             "example": "about:blank",
             "type": "string"
           }
@@ -422,7 +422,7 @@
         "type": "object"
       },
       "ReverseCollection": {
-        "description": "A reverse answer: `/reverse`. See [`ForwardCollection`] for why the two\ndirections are written out rather than shared through a generic.",
+        "description": "A GeoJSON FeatureCollection answering `/reverse`.",
         "properties": {
           "features": {
             "items": {
@@ -432,7 +432,7 @@
           },
           "geocoding": {
             "$ref": "#/components/schemas/ReverseGeocoding",
-            "description": "The point asked about, the contract version and the data attribution."
+            "description": "The queried point, API version and data attribution."
           },
           "type": {
             "$ref": "#/components/schemas/FeatureCollectionType"
@@ -446,7 +446,7 @@
         "type": "object"
       },
       "ReverseFeature": {
-        "description": "One reverse answer: the record found at the point, or an area around it.",
+        "description": "One reverse geocoding result: the address or street at the point, or an\narea containing it.",
         "properties": {
           "geometry": {
             "$ref": "#/components/schemas/Point"
@@ -472,7 +472,7 @@
           },
           "point": {
             "$ref": "#/components/schemas/LonLat",
-            "description": "The point asked about."
+            "description": "Queried point."
           },
           "version": {
             "$ref": "#/components/schemas/Version"
@@ -493,7 +493,7 @@
           {
             "properties": {
               "distance_m": {
-                "description": "Metres from the point asked about to the feature's geometry, for the\nfeatures found by distance. The areas around the point carry none.",
+                "description": "Distance from the queried point in meters. Present only on the\naddress or street result, not on areas.",
                 "format": "double",
                 "type": "number"
               }
@@ -501,10 +501,10 @@
             "type": "object"
           }
         ],
-        "description": "A reverse feature's properties: the common fields, and how far the feature\nlies from the point asked about."
+        "description": "Properties of a reverse geocoding result."
       },
       "Source": {
-        "description": "Where a record comes from: an OSM object, or the address records a\nderived record (a postcode) was made from.",
+        "description": "Source data the result comes from.",
         "properties": {
           "dataset": {
             "type": "string"
@@ -531,7 +531,7 @@
         "type": "object"
       },
       "Version": {
-        "description": "The contract version. It changes only when a field changes meaning or\ngoes away; new optional fields keep it.",
+        "description": "API version. Changes only when a field is removed or changes meaning.\nNew optional fields keep the version.",
         "enum": [
           "1"
         ],
@@ -545,7 +545,7 @@
     }
   },
   "info": {
-    "description": "Search, autocomplete and reverse geocoding served from a single binary Pack built from OpenStreetMap extracts.\n\nEvery answer is one GeoJSON FeatureCollection, so a response drops straight into a map library. Forward answers carry a `score`, and a calibrated `confidence` once the Pack has been calibrated; reverse answers carry a `distance_m`. Nothing else differs between them.\n\nErrors are RFC 9457 problem documents served as `application/problem+json`. Branch on `error_code`, which is a closed set; `title` and `detail` are prose and may be reworded.",
+    "description": "Forward, autocomplete and reverse geocoding of addresses, served from a Pack built from OpenStreetMap and OpenAddresses.\n\nEvery response is a GeoJSON FeatureCollection. Forward results carry a `score`, and a `confidence` when the Pack is calibrated. Reverse results carry a `distance_m`.\n\nErrors are RFC 9457 problem documents (`application/problem+json`). Branch on `error_code`. `title` and `detail` are prose and may change.",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -557,11 +557,11 @@
   "paths": {
     "/autocomplete": {
       "get": {
-        "description": "Like `/search`, but tuned for partial input: an empty or very short `q` is\nnot an error, it simply has no suggestions.",
+        "description": "Suggests addresses for partial text, as a user types. An empty or very\nshort `q` returns no results.",
         "operationId": "autocomplete",
         "parameters": [
           {
-            "description": "The text typed so far. Empty returns no suggestions.",
+            "description": "Text typed so far.",
             "example": "10 King St",
             "in": "query",
             "name": "q",
@@ -572,7 +572,7 @@
             }
           },
           {
-            "description": "How many suggestions to return. 0, the default, lets the server choose.",
+            "description": "Maximum number of results. `0`, the default, lets the server choose.",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -583,7 +583,7 @@
             }
           },
           {
-            "description": "Return only suggestions of this layer. An unknown layer is rejected rather than silently matching nothing.",
+            "description": "Return only results of this layer. An unknown layer returns `400`.",
             "in": "query",
             "name": "layer",
             "required": false,
@@ -592,7 +592,7 @@
             }
           },
           {
-            "description": "Return only answers in these countries: ISO 3166-1 alpha-2 codes, comma-separated. A Pack covering one country needs none. A code that is not two letters is rejected; one the Pack does not cover simply matches nothing.",
+            "description": "Return only results in these countries, as comma-separated ISO 3166-1 alpha-2 codes. A code that is not two letters returns `400`. A code the Pack does not cover returns no results.",
             "example": "NZ,AU",
             "in": "query",
             "name": "country",
@@ -602,7 +602,7 @@
             }
           },
           {
-            "description": "Where the caller is, `lon,lat`. Of answers the query cannot tell apart, the nearer ranks first; it never outranks what the query states or a better match. A point out of range is rejected.",
+            "description": "Point to prefer results near, as `lon,lat`. Breaks ties between equally good matches only.",
             "example": "-79.38,43.65",
             "in": "query",
             "name": "focus",
@@ -612,7 +612,7 @@
             }
           },
           {
-            "description": "Return only answers inside this box, `min_lon,min_lat,max_lon,max_lat`. Its west edge must not lie east of its east edge, nor its south edge north of its north edge: a box across the antimeridian is two requests.",
+            "description": "Return only results inside this box, as `min_lon,min_lat,max_lon,max_lat`. The box cannot cross the antimeridian.",
             "example": "-79.64,43.58,-79.12,43.86",
             "in": "query",
             "name": "bbox",
@@ -631,10 +631,10 @@
                 }
               }
             },
-            "description": "The suggestions, best first.",
+            "description": "Suggested results, highest `score` first.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -650,10 +650,10 @@
                 }
               }
             },
-            "description": "`q` was too long, `limit` was above the maximum, `focus` or `bbox` was out of range, or a parameter did not parse.",
+            "description": "`q` is too long, `limit` is too large, `focus` or `bbox` is out of range, or a parameter is malformed.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -669,17 +669,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -695,10 +695,10 @@
                 }
               }
             },
-            "description": "The search failed inside the server.",
+            "description": "Internal server error.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -707,7 +707,7 @@
             }
           }
         },
-        "summary": "Suggest places as a query is typed.",
+        "summary": "Autocomplete addresses",
         "tags": [
           "geocoding"
         ]
@@ -715,11 +715,11 @@
     },
     "/geocode": {
       "get": {
-        "description": "For callers who hold a street address, a town and a postcode in separate\nfields and would otherwise have to paste them into one string and hope the\nparser pulls them apart again. The street address is searched on its own\nand hits are kept only where they fit the locality, region and postcode\ngiven, so a town in the address cannot outrank the street.\n\nThis is the lookup `geocode batch` runs per row, over HTTP.\n\nA house number the data lacks is placed between its neighbours\n(`accuracy` `interpolated`) or, failing that, answered with its street\n(`accuracy` `street`). A street answers a given postcode only where\npostcode data confirms it. The answer is never another house: a flat\nwritten \"10/1367\" is found as itself or by 1367, never as house 10.\n\nThe answer is the same FeatureCollection every other route returns, with\nat most one feature: `features` holds the one match, or is empty when\nnothing fits. `geocoding.query` is the rewrite that matched, which is not\nalways the address as it was sent.",
+        "description": "Geocodes an address given as separate fields, and returns the best match\nor no result. `address` is matched on its own, then checked against\n`locality`, `region` and `postcode`.\n\n- A house number missing from the data is interpolated between its\n  neighbours (`accuracy: interpolated`), or answered with its street\n  (`accuracy: street`).\n- A street matches `postcode` only when postcode data confirms it.\n- A different house is never returned: `10/1367` matches as written or\n  as 1367, never as house 10.\n- `geocoding.query` is the form of the address that matched, which can\n  differ from `address`.",
         "operationId": "geocode",
         "parameters": [
           {
-            "description": "The street address on its own: house number and street, without the town or postcode.",
+            "description": "House number and street, without town or postcode.",
             "example": "10 King Street",
             "in": "query",
             "name": "address",
@@ -731,7 +731,7 @@
             }
           },
           {
-            "description": "The town or city the address is in.",
+            "description": "City or town.",
             "example": "Toronto",
             "in": "query",
             "name": "locality",
@@ -742,7 +742,7 @@
             }
           },
           {
-            "description": "The state, province or region.",
+            "description": "State, province or region.",
             "example": "Ontario",
             "in": "query",
             "name": "region",
@@ -753,7 +753,7 @@
             }
           },
           {
-            "description": "The postcode.",
+            "description": "Postal code.",
             "example": "M5V 1A1",
             "in": "query",
             "name": "postcode",
@@ -764,7 +764,7 @@
             }
           },
           {
-            "description": "How many candidates to consider before picking the best. 0, the default, lets the server choose. At most one is ever returned.",
+            "description": "Number of candidates to consider. `0`, the default, lets the server choose. At most one result is returned.",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -775,7 +775,7 @@
             }
           },
           {
-            "description": "Consider only candidates of this layer. An unknown layer is rejected rather than silently matching nothing.",
+            "description": "Consider only candidates of this layer. An unknown layer returns `400`.",
             "in": "query",
             "name": "layer",
             "required": false,
@@ -784,7 +784,7 @@
             }
           },
           {
-            "description": "Return only answers in these countries: ISO 3166-1 alpha-2 codes, comma-separated. A Pack covering one country needs none. A code that is not two letters is rejected; one the Pack does not cover simply matches nothing.",
+            "description": "Return only results in these countries, as comma-separated ISO 3166-1 alpha-2 codes. A code that is not two letters returns `400`. A code the Pack does not cover returns no results.",
             "example": "NZ,AU",
             "in": "query",
             "name": "country",
@@ -803,10 +803,10 @@
                 }
               }
             },
-            "description": "The one address that fits, or no features when none does.",
+            "description": "The best match, or no features when nothing matches.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -822,10 +822,10 @@
                 }
               }
             },
-            "description": "`address` was empty or too long, a context field was too long, `limit` was above the maximum, or a parameter did not parse.",
+            "description": "`address` is empty or too long, another field is too long, `limit` is too large, or a parameter is malformed.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -841,17 +841,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -867,10 +867,10 @@
                 }
               }
             },
-            "description": "The lookup failed inside the server.",
+            "description": "Internal server error.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -879,7 +879,7 @@
             }
           }
         },
-        "summary": "Geocode an address whose parts are already apart.",
+        "summary": "Geocode a structured address",
         "tags": [
           "geocoding"
         ]
@@ -887,14 +887,14 @@
     },
     "/healthz": {
       "get": {
-        "description": "Answers 200 as soon as the server is listening, whether or not the Pack is\nloaded. Use `/readyz` to know whether it can answer geocoding requests.\nThe body is always empty.",
+        "description": "Returns `200` while the server is running, even before the Pack is loaded.\nUse `/readyz` to check that it can geocode. The body is empty.",
         "operationId": "healthz",
         "responses": {
           "200": {
-            "description": "The process is alive.",
+            "description": "The server is running.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -910,17 +910,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -929,7 +929,7 @@
             }
           }
         },
-        "summary": "Is the process alive?",
+        "summary": "Check liveness",
         "tags": [
           "operations"
         ]
@@ -937,17 +937,17 @@
     },
     "/openapi.json": {
       "get": {
-        "description": "The same bytes as the committed `contract/openapi.json`, which the\ncontract tests hold to the code.",
+        "description": "Returns the OpenAPI 3.1 document describing this server's API.",
         "operationId": "openapi_json",
         "responses": {
           "200": {
             "content": {
               "application/json": {}
             },
-            "description": "The OpenAPI description of this API.",
+            "description": "The OpenAPI document.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -963,17 +963,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -982,7 +982,7 @@
             }
           }
         },
-        "summary": "The contract this server is serving.",
+        "summary": "Get the OpenAPI document",
         "tags": [
           "operations"
         ]
@@ -990,14 +990,14 @@
     },
     "/readyz": {
       "get": {
-        "description": "200 once the Pack is open, 503 until then. The body is always empty.",
+        "description": "Returns `200` once the Pack is loaded, and `503` before that. The body is\nempty.",
         "operationId": "readyz",
         "responses": {
           "200": {
-            "description": "The Pack is loaded and queries can be served.",
+            "description": "The Pack is loaded.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1013,17 +1013,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1035,7 +1035,7 @@
             "description": "The Pack is not loaded yet.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1044,7 +1044,7 @@
             }
           }
         },
-        "summary": "Can the server answer geocoding requests?",
+        "summary": "Check readiness",
         "tags": [
           "operations"
         ]
@@ -1052,11 +1052,11 @@
     },
     "/reverse": {
       "get": {
-        "description": "The first feature is the place itself, when there is one, carrying its\n`distance_m`. The features after it are the areas the point lies in, from\nthe most precise outwards, and carry no distance.",
+        "description": "Returns the nearest address or street to a point, followed by the areas\nthat contain the point, most precise first. Only the first result carries\n`distance_m`.",
         "operationId": "reverse",
         "parameters": [
           {
-            "description": "Longitude, in degrees.",
+            "description": "Longitude in degrees.",
             "example": -79.3832,
             "in": "query",
             "name": "lon",
@@ -1069,7 +1069,7 @@
             }
           },
           {
-            "description": "Latitude, in degrees.",
+            "description": "Latitude in degrees.",
             "example": 43.6532,
             "in": "query",
             "name": "lat",
@@ -1091,10 +1091,10 @@
                 }
               }
             },
-            "description": "What lies at the point, most precise first. `features` is empty when nothing is near.",
+            "description": "Results at the point, most precise first. `features` is empty when nothing is near.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1110,10 +1110,10 @@
                 }
               }
             },
-            "description": "`lon` or `lat` was missing or out of range.",
+            "description": "`lon` or `lat` is missing or out of range.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1129,17 +1129,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1155,10 +1155,10 @@
                 }
               }
             },
-            "description": "Reverse geocoding failed inside the server.",
+            "description": "Internal server error.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1167,7 +1167,7 @@
             }
           }
         },
-        "summary": "Find the places at a point.",
+        "summary": "Reverse geocode a point",
         "tags": [
           "geocoding"
         ]
@@ -1175,11 +1175,11 @@
     },
     "/search": {
       "get": {
-        "description": "Answers are ordered by `score`, best first.",
+        "description": "Geocodes free-form text, such as a full address, to coordinates. Results\nare sorted by `score`, highest first.",
         "operationId": "search",
         "parameters": [
           {
-            "description": "The text to search for.",
+            "description": "Text to geocode, such as a full address.",
             "example": "10 King Street, Toronto",
             "in": "query",
             "name": "q",
@@ -1191,7 +1191,7 @@
             }
           },
           {
-            "description": "How many answers to return. 0, the default, lets the server choose.",
+            "description": "Maximum number of results. `0`, the default, lets the server choose.",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -1202,7 +1202,7 @@
             }
           },
           {
-            "description": "Return only answers of this layer. An unknown layer is rejected rather than silently matching nothing.",
+            "description": "Return only results of this layer. An unknown layer returns `400`.",
             "in": "query",
             "name": "layer",
             "required": false,
@@ -1211,7 +1211,7 @@
             }
           },
           {
-            "description": "Return only answers in these countries: ISO 3166-1 alpha-2 codes, comma-separated. A Pack covering one country needs none. A code that is not two letters is rejected; one the Pack does not cover simply matches nothing.",
+            "description": "Return only results in these countries, as comma-separated ISO 3166-1 alpha-2 codes. A code that is not two letters returns `400`. A code the Pack does not cover returns no results.",
             "example": "NZ,AU",
             "in": "query",
             "name": "country",
@@ -1221,7 +1221,7 @@
             }
           },
           {
-            "description": "Where the caller is, `lon,lat`. Of answers the query cannot tell apart, the nearer ranks first; it never outranks what the query states or a better match. A point out of range is rejected.",
+            "description": "Point to prefer results near, as `lon,lat`. Breaks ties between equally good matches only.",
             "example": "-79.38,43.65",
             "in": "query",
             "name": "focus",
@@ -1231,7 +1231,7 @@
             }
           },
           {
-            "description": "Return only answers inside this box, `min_lon,min_lat,max_lon,max_lat`. Its west edge must not lie east of its east edge, nor its south edge north of its north edge: a box across the antimeridian is two requests.",
+            "description": "Return only results inside this box, as `min_lon,min_lat,max_lon,max_lat`. The box cannot cross the antimeridian.",
             "example": "-79.64,43.58,-79.12,43.86",
             "in": "query",
             "name": "bbox",
@@ -1250,10 +1250,10 @@
                 }
               }
             },
-            "description": "The places that matched, best first.",
+            "description": "Matching results, highest `score` first.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1269,10 +1269,10 @@
                 }
               }
             },
-            "description": "`q` was empty or too long, `limit` was above the maximum, `focus` or `bbox` was out of range, or a parameter did not parse.",
+            "description": "`q` is empty or too long, `limit` is too large, `focus` or `bbox` is out of range, or a parameter is malformed.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1288,17 +1288,17 @@
                 }
               }
             },
-            "description": "The route takes GET only. The `Allow` header lists the methods it accepts.",
+            "description": "Method not allowed. The route accepts `GET` only.",
             "headers": {
               "Allow": {
-                "description": "The methods this route accepts.",
+                "description": "Methods the route accepts.",
                 "schema": {
                   "example": "GET",
                   "type": "string"
                 }
               },
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1314,10 +1314,10 @@
                 }
               }
             },
-            "description": "The search failed inside the server.",
+            "description": "Internal server error.",
             "headers": {
               "X-Request-Id": {
-                "description": "The id this request is logged under, echoed from the request when it carried one. Quote it in a bug report.",
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
                 "schema": {
                   "maxLength": 128,
                   "type": "string"
@@ -1326,7 +1326,7 @@
             }
           }
         },
-        "summary": "Search for a place by text.",
+        "summary": "Search addresses",
         "tags": [
           "geocoding"
         ]
@@ -1335,17 +1335,17 @@
   },
   "servers": [
     {
-      "description": "A Runtime serving a Pack locally, the default bind address.",
+      "description": "Local server on the default address.",
       "url": "http://127.0.0.1:8080"
     }
   ],
   "tags": [
     {
-      "description": "Turn text or a point into places.",
+      "description": "Geocode addresses and points.",
       "name": "geocoding"
     },
     {
-      "description": "Liveness, readiness and the contract itself.",
+      "description": "Health checks and the OpenAPI document.",
       "name": "operations"
     }
   ]

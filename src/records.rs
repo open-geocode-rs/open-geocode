@@ -188,8 +188,7 @@ pub enum PointPrecision {
     RepresentativePoint,
 }
 
-/// Where a record comes from: an OSM object, or the address records a
-/// derived record (a postcode) was made from.
+/// Source data the result comes from.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Source {
     pub dataset: String,
