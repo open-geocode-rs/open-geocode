@@ -8,7 +8,7 @@
 //! into the response extensions, never the body, so the request-id middleware
 //! can log it under the request id (issue #2).
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
@@ -45,9 +45,14 @@ pub(crate) enum ErrorCode {
     InvalidCoordinate,
     LimitTooLarge,
     MalformedParameter,
+    MalformedBody,
     NotFound,
     MethodNotAllowed,
+    TooManyItems,
+    BodyTooLarge,
+    UnsupportedMediaType,
     InternalError,
+    Busy,
 }
 
 impl ErrorCode {
@@ -57,9 +62,14 @@ impl ErrorCode {
             Self::InvalidCoordinate => "invalid_coordinate",
             Self::LimitTooLarge => "limit_too_large",
             Self::MalformedParameter => "malformed_parameter",
+            Self::MalformedBody => "malformed_body",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
+            Self::TooManyItems => "too_many_items",
+            Self::BodyTooLarge => "body_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
             Self::InternalError => "internal_error",
+            Self::Busy => "busy",
         }
     }
 
@@ -124,6 +134,10 @@ struct ProblemInner {
     /// Value for the `Allow` response header (405 only); never serialized.
     #[serde(skip)]
     allow: Option<String>,
+    /// Seconds for the `Retry-After` response header (503 only); never
+    /// serialized.
+    #[serde(skip)]
+    retry_after: Option<u32>,
     /// What went wrong behind a 500, for the log only; never serialized
     /// (Decision 31). An `Arc` because response extensions must be `Clone`.
     #[serde(skip)]
@@ -148,6 +162,7 @@ impl Problem {
             request_id: None,
             invalid_params: Vec::new(),
             allow: None,
+            retry_after: None,
             cause: None,
         }))
     }
@@ -173,20 +188,14 @@ impl Problem {
         self.0.cause.as_deref()
     }
 
-    // Read accessors, used only by tests to assert on a constructed Problem
-    // before it is rendered to a response.
-
-    #[cfg(test)]
     pub(crate) fn status(&self) -> u16 {
         self.0.status
     }
 
-    #[cfg(test)]
     pub(crate) fn error_code(&self) -> ErrorCode {
         self.0.error_code
     }
 
-    #[cfg(test)]
     pub(crate) fn detail(&self) -> Option<&str> {
         self.0.detail.as_deref()
     }
@@ -195,8 +204,6 @@ impl Problem {
     pub(crate) fn invalid_params(&self) -> &[InvalidParam] {
         &self.0.invalid_params
     }
-
-    // --- 400 ---------------------------------------------------------------
 
     pub(crate) fn invalid_query(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery).with_detail(detail)
@@ -218,7 +225,15 @@ impl Problem {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedParameter).with_detail(detail)
     }
 
-    // --- 404 / 405 ---------------------------------------------------------
+    /// A query string, or a batch item read as one, that does not parse. Its
+    /// parser's own text is not shown.
+    pub(crate) fn unparsable_parameters() -> Self {
+        Self::malformed_parameter("could not parse query parameters")
+    }
+
+    pub(crate) fn malformed_body(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedBody).with_detail(detail)
+    }
 
     pub(crate) fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound).with_detail("unknown route")
@@ -232,7 +247,33 @@ impl Problem {
         problem
     }
 
-    // --- 500 ---------------------------------------------------------------
+    pub(crate) fn too_many_items(max: usize) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::TooManyItems)
+            .with_detail(format!("a batch holds at most {max} items"))
+    }
+
+    pub(crate) fn body_too_large(max_bytes: usize) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::BodyTooLarge)
+            .with_detail(format!("the body must be at most {max_bytes} bytes"))
+    }
+
+    /// `expected` names the media types the route reads.
+    pub(crate) fn unsupported_media_type(expected: &str) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::UnsupportedMediaType,
+        )
+        .with_detail(format!("the body must be sent as Content-Type: {expected}"))
+    }
+
+    /// Every batch slot is taken. Refused at once rather than queued, so a
+    /// client learns to come back instead of holding a connection open.
+    pub(crate) fn busy(retry_after: u32) -> Self {
+        let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Busy)
+            .with_detail("the server is answering as many batches as it can; retry shortly");
+        problem.0.retry_after = Some(retry_after);
+        problem
+    }
 
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
@@ -240,6 +281,18 @@ impl Problem {
         let mut problem = Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError);
         problem.0.cause = Some(Arc::new(cause));
         problem
+    }
+
+    /// A 500 for work that panicked, its cause the panic message, so the log
+    /// says what broke rather than just that something did.
+    pub(crate) fn panicked(payload: &(dyn Any + Send)) -> Self {
+        // `panic!` with a literal carries a `&str`, with a format a `String`.
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("(payload is not a string)");
+        Problem::internal(anyhow::anyhow!("blocking task panicked: {message}"))
     }
 
     /// The problem document with its status and headers. Unlike
@@ -258,6 +311,11 @@ impl Problem {
             && let Ok(value) = HeaderValue::from_str(allow)
         {
             response.headers_mut().insert(header::ALLOW, value);
+        }
+        if let Some(seconds) = self.0.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
     }
@@ -291,21 +349,13 @@ impl From<crate::Error> for Problem {
     }
 }
 
-/// A blocking task that panicked is a 500 whose cause is the panic message, so
-/// the log says what broke rather than just that the task failed.
+/// A blocking task that panicked is a 500 whose cause is the panic message.
 impl From<JoinError> for Problem {
     fn from(error: JoinError) -> Self {
         if !error.is_panic() {
             return Problem::internal(anyhow::anyhow!("blocking task was cancelled"));
         }
-        // `panic!` with a literal carries a `&str`, with a format a `String`.
-        let payload = error.into_panic();
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("(payload is not a string)");
-        Problem::internal(anyhow::anyhow!("blocking task panicked: {message}"))
+        Problem::panicked(error.into_panic().as_ref())
     }
 }
 
@@ -350,14 +400,19 @@ mod tests {
         assert!(value.get("instance").is_none());
     }
 
-    const ALL_CODES: [ErrorCode; 7] = [
+    const ALL_CODES: [ErrorCode; 12] = [
         ErrorCode::InvalidQuery,
         ErrorCode::InvalidCoordinate,
         ErrorCode::LimitTooLarge,
         ErrorCode::MalformedParameter,
+        ErrorCode::MalformedBody,
         ErrorCode::NotFound,
         ErrorCode::MethodNotAllowed,
+        ErrorCode::TooManyItems,
+        ErrorCode::BodyTooLarge,
+        ErrorCode::UnsupportedMediaType,
         ErrorCode::InternalError,
+        ErrorCode::Busy,
     ];
 
     /// `type` is either RFC 9457's `about:blank` or a URI that can actually be

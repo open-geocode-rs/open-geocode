@@ -6,7 +6,8 @@
 //! number and unit, close by) is dropped: the Pack keeps one record per house,
 //! and marks it disputed when the two disagree on where it is.
 //!
-//! Two layouts are read, either one gzipped or not:
+//! Two layouts are read, either one gzipped or not, from a file of their own
+//! or from an entry of a zip archive (the collection OpenAddresses publishes):
 //!
 //! - OpenAddresses GeoJSON, one feature per line, with the properties
 //!   `number`, `street`, `unit`, `city`, `district`, `region` and `postcode`.
@@ -54,6 +55,71 @@ pub trait AddressSource: Send + Sync + fmt::Debug {
 pub struct AddressFile {
     pub dataset: String,
     pub path: PathBuf,
+    /// The file's name inside `path` when `path` is a zip archive, read from
+    /// the archive without unpacking it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+}
+
+impl AddressFile {
+    /// Bytes read to import the file: the entry's compressed bytes inside an
+    /// archive, else the file's.
+    pub fn bytes(&self) -> Result<u64> {
+        match &self.entry {
+            Some(entry) => Ok(zip_entry(&self.path, entry)?.compressed_bytes),
+            None => std::fs::metadata(&self.path)
+                .map(|metadata| metadata.len())
+                .map_err(|source| Error::IoPath {
+                    action: "failed to read",
+                    path: self.path.clone(),
+                    source,
+                }),
+        }
+    }
+
+    /// The file as a report names it: `archive.zip!entry` for an entry.
+    pub fn describe(&self) -> String {
+        match &self.entry {
+            Some(entry) => format!("{}!{entry}", self.path.display()),
+            None => self.path.display().to_string(),
+        }
+    }
+}
+
+/// Where an entry's data lies in a zip archive, and how it is stored.
+struct ZipEntry {
+    data_start: u64,
+    compressed_bytes: u64,
+    deflated: bool,
+}
+
+/// Find `entry` in the archive's central directory.
+fn zip_entry(path: &Path, entry: &str) -> Result<ZipEntry> {
+    let file = File::open(path).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let bad = |detail: String| Error::BadInput(format!("{}: {detail}", path.display()));
+    let mut archive = zip::ZipArchive::new(BufReader::new(file))
+        .map_err(|error| bad(format!("not a readable zip archive: {error}")))?;
+    let found = archive
+        .by_name(entry)
+        .map_err(|error| bad(format!("no entry {entry}: {error}")))?;
+    let deflated = match found.compression() {
+        zip::CompressionMethod::Deflated => true,
+        zip::CompressionMethod::Stored => false,
+        other => {
+            return Err(bad(format!(
+                "{entry} is compressed with {other}, not deflate"
+            )));
+        }
+    };
+    Ok(ZipEntry {
+        data_start: found.data_start(),
+        compressed_bytes: found.compressed_size(),
+        deflated,
+    })
 }
 
 /// Fixed files, whatever the Pack covers: the `--addresses` a build is given.
@@ -140,17 +206,10 @@ pub fn read_file(
     file: &AddressFile,
     mut accept: impl FnMut(AddressRecord) -> Result<Option<&'static str>>,
 ) -> Result<ImportReport> {
-    let bytes = std::fs::metadata(&file.path)
-        .map_err(|source| Error::IoPath {
-            action: "failed to read",
-            path: file.path.clone(),
-            source,
-        })?
-        .len();
     let mut report = ImportReport {
         dataset: file.dataset.clone(),
-        path: file.path.display().to_string(),
-        bytes,
+        path: file.describe(),
+        bytes: file.bytes()?,
         ..ImportReport::default()
     };
     let mut row_number = 0i64;
@@ -171,8 +230,11 @@ pub fn read_file(
             }
         }
     };
-    let input = open(&file.path)?;
-    match layout(&file.path)? {
+    let (input, named) = match &file.entry {
+        Some(entry) => (open_entry(&file.path, entry)?, Path::new(entry.as_str())),
+        None => (open(&file.path)?, file.path.as_path()),
+    };
+    match layout(named)? {
         Layout::GeoJson => {
             for line in input.lines() {
                 let line = line?;
@@ -268,6 +330,34 @@ fn layout(path: &Path) -> Result<Layout> {
     }
 }
 
+/// The text of `entry` in the zip archive at `path`, inflated as it is read.
+/// The entry is read from its own offset in the archive, so a collection of
+/// thousands of files is read one entry at a time and never unpacked.
+fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead>> {
+    use std::io::{Seek, SeekFrom};
+    let ZipEntry {
+        data_start,
+        compressed_bytes,
+        deflated,
+    } = zip_entry(path, entry)?;
+    let failed = |source| Error::IoPath {
+        action: "failed to read",
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = File::open(path).map_err(failed)?;
+    file.seek(SeekFrom::Start(data_start)).map_err(failed)?;
+    let data = BufReader::with_capacity(1 << 20, file).take(compressed_bytes);
+    Ok(if deflated {
+        Box::new(BufReader::with_capacity(
+            1 << 20,
+            flate2::read::DeflateDecoder::new(data),
+        ))
+    } else {
+        Box::new(data)
+    })
+}
+
 /// The file's text, gunzipped when it starts with the gzip magic.
 fn open(path: &Path) -> Result<Box<dyn BufRead>> {
     let failed = |source| Error::IoPath {
@@ -355,6 +445,7 @@ mod tests {
             &AddressFile {
                 dataset: "openaddresses:test".into(),
                 path,
+                entry: None,
             },
             |record| {
                 records.push(record);
@@ -427,7 +518,8 @@ mod tests {
             read_file(
                 &AddressFile {
                     dataset: "x".into(),
-                    path: missing
+                    path: missing,
+                    entry: None,
                 },
                 |_| Ok(None)
             )
