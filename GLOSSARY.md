@@ -66,13 +66,24 @@ _Avoid_: normalised text, folded text
 A word as written, in lower case with its accents kept, which breaks ties in favour of the spelling the query used.
 _Avoid_: original text
 
-**Typo tier**:
-How many edits from its written form a query word may match: none, then one, then two, each tried only when the ones before found nothing; numbers are never matched with a typo.
-_Avoid_: fuzziness, fuzzy level
+**Typo**:
+An index word a query word may stand for: one edit away for a word of four to six letters, two for a longer one, with the first letter as written; numbers are never matched with a typo.
+Each word's typos are looked up once per query, and every search matches them beside the word itself, scored below it; only the typos more common than the word as written count: a typo turns a common word into a rare one, rarely the reverse.
+_Avoid_: fuzziness, fuzzy level, typo tier
 
 **Pass**:
-How strictly a reading is searched: strict (the house number, in the stated localities), street (a nearby number or the street itself standing in for it) and lenient (the stated localities only rank).
+How strictly an answer matches its reading: strict (the house number, in the stated localities), street (a nearby number or the street itself standing in for it) and lenient (the stated localities only rank).
+One search in the stated localities finds strict and street answers together; a second, with the localities only ranking, runs only when it could find better evidence.
 _Avoid_: mode, attempt
+
+**Pool**:
+Every answer the searches of one query found, each with the reading that found it and the evidence it rests on, from which the answers are chosen or ranked.
+_Avoid_: candidates (alone), results
+
+**Budget**:
+How long one query may search, and how many searches it may run, before it answers with the best its pool holds.
+Readings run best first, so what the budget cuts off is what is least likely to answer.
+_Avoid_: timeout, deadline
 
 **Agreement**:
 How a record relates to a stated area or postcode: it agrees, it contradicts, or nothing says either way.
@@ -86,8 +97,18 @@ It never outranks a word of the query, and a stated area is never relaxed for it
 _Avoid_: location bias, proximity boost
 
 **Evidence**:
-What makes one reading's answers outrank another's: the stricter pass that found them first, then the parser's confidence in the reading.
+What makes one answer outrank another when the Pack has no ranker: fewer typos, then the stricter pass, then a confirmed postcode, then the parser's confidence in the reading that found it.
 _Avoid_: score (alone), confidence (alone)
+
+**Explanation**:
+How well the parser reads the query as an answer reads it: its best labelling in which each word takes only the labels of the answer's parts it names, scored against its best labelling of all.
+Joint decoding of the parse and the answer; an input of the ranker.
+_Avoid_: reparse
+
+**Ranker**:
+A model fit per Pack to held-out addresses that orders a query's pool, from each answer's features, its evidence and its explanation.
+A Pack never calibrated chooses its answers by evidence alone.
+_Avoid_: reranker, learning to rank (alone)
 
 **Stand-in**:
 A word answering for something it does not name: a street for a house number no record states, or a subject word for an area the Pack does not know.
@@ -100,7 +121,7 @@ _Avoid_: stand-in, approximate match, coarse answer
 
 **Confidence**:
 How often an answer like this one is the record its query asks for, from 0 to 1, comparable across queries.
-It is read from what search knew of the answer (its pass, typo tier, accuracy, agreement, and its margin over the next answer) by a model fit per Pack to held-out addresses; a Pack never calibrated gives none.
+It is read from what search knew of the answer (its pass, its typos, accuracy, agreement, and its margin over the next answer) by a model fit per Pack to held-out addresses; a Pack never calibrated gives none.
 _Avoid_: score, probability (alone)
 
 ## Building
