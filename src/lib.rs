@@ -18,6 +18,7 @@ pub mod memory;
 pub mod openaddresses;
 pub mod pack;
 pub mod parse;
+pub mod rank;
 pub mod record;
 pub mod records;
 pub mod resources;

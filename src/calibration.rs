@@ -1,5 +1,6 @@
-//! `geocode calibrate`: fit a Pack's confidence model (see
-//! [`crate::confidence`]) to address points the Pack was not built from.
+//! `geocode calibrate`: fit a Pack's ranker (see [`crate::rank`]) and
+//! confidence model (see [`crate::confidence`]) to address points the Pack
+//! was not built from.
 //!
 //! Each held-out row is a right answer whose query is unknown, so it is
 //! written the way messy input looks: its street type dropped or
@@ -15,7 +16,7 @@
 //! The rows must be held out: a row the Pack was built from is found as
 //! itself, so a model fit to it rates every answer too high.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -27,6 +28,7 @@ use crate::{
     error::{Error, Result},
     pack,
     parse::bench::variant::{Rng, abbreviation, typo},
+    rank::{self, Ranker},
     record::{AddressRecord, Layer},
     search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     spatial_index::haversine_m,
@@ -76,6 +78,25 @@ pub struct Report {
     pub brier: f64,
     /// By the country the answers lie in; `--` for answers in none.
     pub countries: BTreeMap<String, CountryReport>,
+    pub ranker: RankerReport,
+}
+
+/// How the ranker was fit, and how it does on queries it was not fit to.
+#[derive(Debug, Clone, Serialize)]
+pub struct RankerReport {
+    /// The sidecar file the ranker was written to.
+    pub model: PathBuf,
+    /// Queries whose pool held the answer and another hit, fit to.
+    pub fitted: usize,
+    /// Queries held out of the fit, every [`HELD_OUT_EVERY`]th.
+    pub held_out: usize,
+    /// Share of the held-out queries whose first answer is the row, chosen
+    /// by evidence alone, and by the ranker.
+    pub first_by_evidence: f64,
+    pub first_ranked: f64,
+    /// Share of the held-out queries whose pool holds the row at all: what
+    /// any order could reach.
+    pub in_pool: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -87,8 +108,15 @@ pub struct CountryReport {
     pub mean_confidence: f64,
 }
 
-/// Fit the Pack's confidence model to `options.files` and write it beside
-/// the Pack, replacing the model it had.
+/// Every this many queries one is held out of the ranker's fit, to measure
+/// it on.
+const HELD_OUT_EVERY: usize = 5;
+/// Hits a calibration search answers with, so its pool is a served query's.
+const POOL_LIMIT: usize = 10;
+
+/// Fit the Pack's ranker and confidence model to `options.files` and write
+/// them beside the Pack, replacing the ones it had. The ranker comes first,
+/// as the confidence model rates the answers in the order it gives them.
 pub fn run(options: &Options) -> Result<Report> {
     if options.files.is_empty() || options.rows == 0 {
         return Err(Error::BadOptions(
@@ -96,19 +124,125 @@ pub fn run(options: &Options) -> Result<Report> {
         ));
     }
     let pack = Arc::new(pack::Reader::open(&options.pack)?);
-    let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
+    // No clock: what a calibration learns must not depend on how loaded the
+    // machine was.
+    let mut searcher =
+        TextSearcher::from_pack(Arc::clone(&pack))?.with_budget(Duration::from_secs(3_600));
+    searcher.set_ranker(None);
     let mut rng = Rng::new(options.seed);
     let names = business_names(&pack, &mut rng)?;
     let mut rows = Vec::new();
     for file in &options.files {
         rows.extend(draw_rows(file, options.rows, options.seed)?);
     }
-    let per_row = rows
-        .par_iter()
+    let written = rows
+        .iter()
         .enumerate()
         .map(|(index, row)| {
             let mut rng = Rng::new(xxh3_64_with_seed(&index.to_le_bytes(), options.seed));
-            row_examples(&searcher, row, options, &names, &mut rng)
+            row_queries(
+                row,
+                options,
+                &names,
+                |word| searcher.describes_street(word),
+                &mut rng,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let pools = rows
+        .par_iter()
+        .zip(&written)
+        .map(|(row, (queries, _))| {
+            queries
+                .iter()
+                .map(|query| {
+                    let (chosen, pool) = searcher.search_pool(TextSearchOptions {
+                        query: query.clone(),
+                        limit: POOL_LIMIT,
+                        layer: None,
+                        countries: Vec::new(),
+                        focus: None,
+                        bbox: None,
+                    })?;
+                    let first = chosen
+                        .first()
+                        .is_some_and(|hit| is_row(hit, row, options.radius_m));
+                    let hits: Vec<_> = pool
+                        .iter()
+                        .map(|hit| (rank::inputs(hit), is_row(hit, row, options.radius_m)))
+                        .collect();
+                    if std::env::var_os("OG_DEBUG_MISSES").is_some()
+                        && !hits.iter().any(|(_, right)| *right)
+                    {
+                        eprintln!(
+                            "MISS {query:?} row {} {:?} {:?} -> {:?}",
+                            row.address.number,
+                            row.address.street,
+                            row.address.locality,
+                            chosen.first().map(|hit| &hit.record.label)
+                        );
+                    }
+                    Ok((rank::Query { hits }, first))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let (fit, held): (Vec<_>, Vec<_>) = pools
+        .into_iter()
+        .enumerate()
+        .partition(|(index, _)| index % HELD_OUT_EVERY != 0);
+    let fit = fit
+        .into_iter()
+        .map(|(_, (query, _))| query)
+        .collect::<Vec<_>>();
+    let ranker = Ranker::fit(&fit);
+    let share = |count: usize| match held.is_empty() {
+        true => 0.0,
+        false => count as f64 / held.len() as f64,
+    };
+    let first_ranked = held
+        .iter()
+        .filter(|(_, (query, _))| {
+            query
+                .hits
+                .iter()
+                .max_by(|left, right| {
+                    ranker
+                        .score_inputs(&left.0)
+                        .total_cmp(&ranker.score_inputs(&right.0))
+                })
+                .is_some_and(|(_, right)| *right)
+        })
+        .count();
+    let ranker_report = RankerReport {
+        model: ranker.save(&pack)?,
+        fitted: fit
+            .iter()
+            .filter(|query| {
+                query.hits.iter().any(|(_, right)| *right)
+                    && query.hits.iter().any(|(_, right)| !*right)
+            })
+            .count(),
+        held_out: held.len(),
+        first_by_evidence: share(held.iter().filter(|(_, (_, first))| *first).count()),
+        first_ranked: share(first_ranked),
+        in_pool: share(
+            held.iter()
+                .filter(|(_, (query, _))| query.hits.iter().any(|(_, right)| *right))
+                .count(),
+        ),
+    };
+    searcher.set_ranker(Some(ranker));
+
+    let per_row = rows
+        .par_iter()
+        .zip(&written)
+        .map(|(row, (queries, prefix))| {
+            row_examples(&searcher, row, queries, prefix.as_deref(), options)
         })
         .collect::<Result<Vec<_>>>()?;
     let queries = per_row.iter().map(|(queries, _)| queries).sum();
@@ -149,6 +283,7 @@ pub fn run(options: &Options) -> Result<Report> {
         },
         examples: examples.len(),
         countries,
+        ranker: ranker_report,
     })
 }
 
@@ -196,16 +331,30 @@ fn business_names(pack: &pack::Reader, rng: &mut Rng) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The queries written of one row and the examples their answers give.
-fn row_examples(
-    searcher: &TextSearcher,
+/// The messy queries written of one row, and the prefix of it typed so far.
+fn row_queries(
     row: &AddressRecord,
     options: &Options,
     names: &[String],
+    describes_street: impl Fn(&str) -> bool + Copy,
     rng: &mut Rng,
+) -> (Vec<String>, Option<String>) {
+    let queries = (0..options.variants)
+        .map(|_| messy_query(row, names, describes_street, rng))
+        .collect();
+    (queries, typed_prefix(row, rng))
+}
+
+/// The examples the answers to one row's queries give, and how many
+/// queries there were.
+fn row_examples(
+    searcher: &TextSearcher,
+    row: &AddressRecord,
+    queries: &[String],
+    prefix: Option<&str>,
+    options: &Options,
 ) -> Result<(usize, Vec<Example>)> {
     let mut examples = Vec::new();
-    let mut queries = 0;
     let mut take = |hits: Vec<TextSearchHit>| {
         for hit in hits.into_iter().take(ANSWERS_PER_QUERY) {
             examples.push(Example {
@@ -214,11 +363,9 @@ fn row_examples(
             });
         }
     };
-    for _ in 0..options.variants {
-        let query = messy_query(row, names, |word| searcher.describes_street(word), rng);
-        queries += 1;
+    for query in queries {
         take(searcher.search(TextSearchOptions {
-            query,
+            query: query.clone(),
             limit: ANSWERS_PER_QUERY,
             layer: None,
             countries: Vec::new(),
@@ -226,10 +373,9 @@ fn row_examples(
             bbox: None,
         })?);
     }
-    if let Some(prefix) = typed_prefix(row, rng) {
-        queries += 1;
+    if let Some(prefix) = prefix {
         take(searcher.autocomplete(TextAutocompleteOptions {
-            query: prefix,
+            query: prefix.to_string(),
             limit: ANSWERS_PER_QUERY,
             layer: None,
             countries: Vec::new(),
@@ -237,7 +383,7 @@ fn row_examples(
             bbox: None,
         })?);
     }
-    Ok((queries, examples))
+    Ok((queries.len() + usize::from(prefix.is_some()), examples))
 }
 
 /// Whether `hit` is the row's house: its number and street, within

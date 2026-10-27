@@ -252,13 +252,7 @@ fn n_best_paths_are_distinct_labellings_best_first() {
     let tokens = Tokens::new("670 king st w toronto");
     let lattice = tagger.lattice(&tokens, &Suppression::default());
     let gold = labels(&parses[1].tokens);
-    let forced = decode::decode(
-        &lattice,
-        tagger.weights(),
-        parses[1].country,
-        1,
-        Some(&gold),
-    );
+    let forced = decode::decode_gold(&lattice, tagger.weights(), parses[1].country, 1, &gold);
     assert_eq!(forced[0].labels(&lattice), gold);
     assert!((forced[0].score - parses[1].score).abs() < 1e-4);
 }
@@ -333,7 +327,7 @@ fn labellings_whose_places_cannot_be_one_address_are_dropped() {
     );
     let one_address = |gold: &[Label]| {
         let gold = lattice.units.expand(gold);
-        let path = decode::decode(&lattice, tagger.weights(), Some(code("JP")), 1, Some(&gold));
+        let path = decode::decode_gold(&lattice, tagger.weights(), Some(code("JP")), 1, &gold);
         tagger.is_one_address(&lattice, &path[0])
     };
     assert!(one_address(&[Region, Locality, Other]));

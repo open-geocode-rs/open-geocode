@@ -618,6 +618,32 @@ impl ParsedQuery {
     }
 }
 
+/// The lattice of a parsed query, kept for [`LatticeTagger::explain`].
+#[derive(Debug)]
+pub struct Explanation {
+    lattice: Lattice,
+    /// The score of the best labelling the parse returned.
+    pub best: f32,
+}
+
+/// A set of labels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LabelSet(u16);
+
+impl LabelSet {
+    pub fn with(self, label: Label) -> Self {
+        Self(self.0 | 1 << label as u16)
+    }
+
+    pub fn contains(self, label: Label) -> bool {
+        self.0 & 1 << label as u16 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Labels the tokens of free-text address queries from the Pack's own
 /// dictionaries and a learned linear model. Cheap to share across threads.
 pub struct LatticeTagger {
@@ -725,10 +751,25 @@ impl LatticeTagger {
     /// before it ("Peterborough ON" read as a street and a locality); read
     /// apart, the words keep the labels they have without it.
     pub fn parse(&self, query: &str) -> Vec<ParsedQuery> {
+        self.parse_explained(query).0
+    }
+
+    /// [`Self::parse`], with the lattice of the whole query kept to tell how
+    /// well a labelling that agrees with an answer reads it (see
+    /// [`Self::explain`]). `None` when the query has no words.
+    pub fn parse_explained(&self, query: &str) -> (Vec<ParsedQuery>, Option<Explanation>) {
         let tokens = Tokens::new(query);
-        let mut parsed = self.parse_tokens(&tokens, N_BEST);
+        if tokens.is_empty() {
+            return (Vec::new(), None);
+        }
+        let lattice = self.lattice(&tokens, &Suppression::default());
+        let mut parsed = self.parse_lattice(&tokens, &lattice, N_BEST);
+        let mut explanation = Explanation {
+            best: parsed.first().map_or(0.0, |parse| parse.score),
+            lattice,
+        };
         let Some(at) = self.trailing_country(&tokens) else {
-            return parsed;
+            return (parsed, Some(explanation));
         };
         let country = &tokens.words[at..];
         for mut reading in self.parse_tokens(&tokens.prefix(at), N_BEST) {
@@ -747,7 +788,37 @@ impl LatticeTagger {
         }
         parsed.sort_by(|left, right| right.score.total_cmp(&left.score));
         parsed.truncate(N_BEST);
-        parsed
+        if let Some(best) = parsed.first() {
+            explanation.best = best.score;
+        }
+        (parsed, Some(explanation))
+    }
+
+    /// The score of the best labelling of an explained query that gives
+    /// each of its words only a label `labels` allows it, `labels` saying of
+    /// each word (a unit of the lattice, as a search key) the labels an
+    /// answer agrees with; an empty set leaves the word free. Joint
+    /// decoding of the parse and the answer: the parser's own score of the
+    /// query read as the answer reads it. `None` when no labelling does.
+    pub fn explain(
+        &self,
+        explanation: &Explanation,
+        labels: impl Fn(&str) -> LabelSet,
+    ) -> Option<f32> {
+        let lattice = &explanation.lattice;
+        let allowed = lattice
+            .units
+            .tokens
+            .words
+            .iter()
+            .map(|word| labels(word))
+            .collect::<Vec<_>>();
+        let allows = |span: &decode::Span, label: Label| {
+            allowed[span.start..span.end]
+                .iter()
+                .all(|set| set.is_empty() || set.contains(label))
+        };
+        decode::best_allowed(lattice, &self.weights, &allows).map(|path| path.score)
     }
 
     /// Where the country the query ends in starts: the longest run of its
@@ -774,14 +845,21 @@ impl LatticeTagger {
             return Vec::new();
         }
         let lattice = self.lattice(tokens, &Suppression::default());
-        let mut paths = decode::best(&lattice, &self.weights, n);
+        self.parse_lattice(tokens, &lattice, n)
+    }
+
+    fn parse_lattice(&self, tokens: &Tokens, lattice: &Lattice, n: usize) -> Vec<ParsedQuery> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut paths = decode::best(lattice, &self.weights, n);
         // The best labellings are almost always addresses; only when one is
         // not are more decoded to find those that are. When none is, the
         // best ones still read it.
-        if !paths.iter().all(|path| self.is_one_address(&lattice, path)) {
-            let addresses = decode::best(&lattice, &self.weights, n.max(CONSTRAINED_PATHS))
+        if !paths.iter().all(|path| self.is_one_address(lattice, path)) {
+            let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS))
                 .into_iter()
-                .filter(|path| self.is_one_address(&lattice, path))
+                .filter(|path| self.is_one_address(lattice, path))
                 .collect::<Vec<_>>();
             if !addresses.is_empty() {
                 paths = addresses;
@@ -791,10 +869,10 @@ impl LatticeTagger {
             .into_iter()
             .take(n)
             .map(|path| {
-                let labels = path.labels(&lattice);
+                let labels = path.labels(lattice);
                 let (pieces, corrections) = lattice
                     .units
-                    .corrected_pieces(&path.segments(&lattice), &lattice.corrections);
+                    .corrected_pieces(&path.segments(lattice), &lattice.corrections);
                 ParsedQuery {
                     tokens: tokens
                         .words

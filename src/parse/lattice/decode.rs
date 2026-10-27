@@ -331,14 +331,47 @@ pub(super) fn best(lattice: &Lattice, weights: &Weights, n: usize) -> Vec<Path> 
     paths
 }
 
-/// The best `k` labellings decoded as `country`, or, with `gold`, the best
-/// that give every token its gold label.
+/// The best `k` labellings decoded as `country` that give every token its
+/// gold label.
+#[cfg(test)]
+pub(super) fn decode_gold(
+    lattice: &Lattice,
+    weights: &Weights,
+    country: Option<CountryCode>,
+    k: usize,
+    gold: &[Label],
+) -> Vec<Path> {
+    let allows =
+        |span: &Span, label: Label| gold[span.start..span.end].iter().all(|gold| *gold == label);
+    decode(lattice, weights, country, k, Some(&allows))
+}
+
+/// Which labels a span may take.
+pub(super) type Allows<'a> = &'a dyn Fn(&Span, Label) -> bool;
+
+/// The best labelling over the countries of [`countries`] that gives each
+/// span only a label `allows` lets it have, `None` when none does.
+pub(super) fn best_allowed(
+    lattice: &Lattice,
+    weights: &Weights,
+    allows: Allows<'_>,
+) -> Option<Path> {
+    let mut paths = countries(lattice)
+        .into_iter()
+        .flat_map(|country| decode(lattice, weights, country, 1, Some(allows)))
+        .collect::<Vec<_>>();
+    sort_paths(&mut paths);
+    paths.into_iter().next()
+}
+
+/// The best `k` labellings decoded as `country`, or, with `allows`, the
+/// best that give each span only a label it allows.
 pub(super) fn decode(
     lattice: &Lattice,
     weights: &Weights,
     country: Option<CountryCode>,
     k: usize,
-    gold: Option<&[Label]>,
+    allows: Option<Allows<'_>>,
 ) -> Vec<Path> {
     let k = k.max(1);
     let transitions = weights.transitions(country);
@@ -358,9 +391,7 @@ pub(super) fn decode(
                 0..LABELS
             };
             for label in Label::ALL {
-                if let Some(gold) = gold
-                    && gold[span.start..span.end].iter().any(|gold| *gold != label)
-                {
+                if allows.is_some_and(|allows| !allows(span, label)) {
                     continue;
                 }
                 let next = label as usize;
