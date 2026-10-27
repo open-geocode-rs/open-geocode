@@ -180,6 +180,9 @@ impl<'de> Visitor<'de> for RawItemVisitor {
 pub(crate) enum Prepared<Q> {
     Ready {
         id: Option<String>,
+        /// The query string the item's `GET` would carry: items with the
+        /// same key have the same answer.
+        key: String,
         query: Q,
     },
     Failed {
@@ -370,15 +373,15 @@ where
         Ok(id) => id,
         Err(problem) => return Prepared::Failed { id: None, problem },
     };
-    let checked = catch_unwind(AssertUnwindSafe(|| -> Result<Q, Problem> {
-        let query = item_query(shared, &fields)?;
-        let params = serde_urlencoded::from_str::<P>(&query)
-            .map_err(|_| Problem::unparsable_parameters())?;
-        (lookup.prepare)(params)
+    let checked = catch_unwind(AssertUnwindSafe(|| -> Result<(String, Q), Problem> {
+        let key = item_query(shared, &fields)?;
+        let params =
+            serde_urlencoded::from_str::<P>(&key).map_err(|_| Problem::unparsable_parameters())?;
+        Ok((key, (lookup.prepare)(params)?))
     }))
     .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
     match checked {
-        Ok(query) => Prepared::Ready { id, query },
+        Ok((key, query)) => Prepared::Ready { id, key, query },
         Err(problem) => Prepared::Failed { id, problem },
     }
 }

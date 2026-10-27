@@ -29,6 +29,20 @@ pub(crate) const MAX_BATCH_BODY_BYTES: usize = MAX_BATCH_ITEMS * 4096;
 /// Longest `id` a batch item may carry, in Unicode scalar values.
 pub(crate) const MAX_BATCH_ID_CHARS: usize = 128;
 
+/// Largest `/batches` upload, as Geocodio's Lists API takes.
+pub(crate) const MAX_BATCH_UPLOAD_BYTES: u64 = 1 << 30;
+
+/// Most rows one `/batches` upload may hold, as Geocodio's Lists API takes.
+pub(crate) const MAX_BATCH_ROWS: usize = 10_000_000;
+
+/// Seconds an upload may send nothing before it is cut off, so a client
+/// that stalls does not hold a batch slot.
+pub(crate) const UPLOAD_STALL_SECONDS: u64 = 30;
+
+/// How long a batch's results are kept after it stops, as Geocodio keeps a
+/// list's.
+pub(crate) const BATCH_RETENTION: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
+
 /// Trim and bound a query by length, returning it with each run of
 /// whitespace written as one space. Empty is allowed (autocomplete treats
 /// short/empty queries as "no suggestions").
