@@ -1910,6 +1910,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fst",
+ "futures-util",
  "geo",
  "geojson",
  "icu_normalizer",

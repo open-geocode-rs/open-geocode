@@ -72,7 +72,7 @@ async fn committed_openapi_is_the_served_contract() {
 
     let pack = contract_pack();
     let router = build_router(
-        AppState::open(&pack).expect("open pack"),
+        AppState::open(&pack, &pack.with_extension("batches")).expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -224,7 +224,7 @@ async fn responses_match_the_committed_examples() {
     ));
     let ids = write_pack(&pack);
     let router = build_router(
-        AppState::open(&pack).expect("open pack"),
+        AppState::open(&pack, &pack.with_extension("batches")).expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -454,7 +454,7 @@ struct RawBatch {
 async fn batch_results_are_their_get_answers() {
     let pack = contract_pack();
     let router = build_router(
-        AppState::open(&pack).expect("open pack"),
+        AppState::open(&pack, &pack.with_extension("batches")).expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );

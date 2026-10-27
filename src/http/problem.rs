@@ -192,15 +192,10 @@ impl Problem {
         self.0.status
     }
 
-    // Read accessors, used only by tests to assert on a constructed Problem
-    // before it is rendered to a response.
-
-    #[cfg(test)]
     pub(crate) fn error_code(&self) -> ErrorCode {
         self.0.error_code
     }
 
-    #[cfg(test)]
     pub(crate) fn detail(&self) -> Option<&str> {
         self.0.detail.as_deref()
     }

@@ -25,6 +25,7 @@ use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
         batch::{self, Lookup},
+        batches::{self, BatchStore},
         bounds, health, method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
@@ -56,10 +57,12 @@ pub(crate) struct AppState {
     error_log: ErrorLog,
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
+    batches: Arc<BatchStore>,
 }
 
 impl AppState {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    /// Open the Pack at `path`, keeping `/batches` files in `batches`.
+    pub(crate) fn open(path: &Path, batches: &Path) -> Result<Self> {
         let pack = Arc::new(Reader::open(path)?);
         let resources = Resources::probe();
         // Every query looks things up all over the Pack: read it in now
@@ -86,7 +89,12 @@ impl AppState {
             // Batches share the pool's cores, so running more of them at once
             // than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
+            batches: Arc::new(BatchStore::open(batches.to_path_buf())?),
         })
+    }
+
+    pub(crate) fn batches(&self) -> &BatchStore {
+        &self.batches
     }
 
     /// Where batch items run.
@@ -216,7 +224,8 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack)?;
+    let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
+    tokio::spawn(batches::sweep_forever(state.clone()));
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
     let listener = TcpListener::bind(options.bind)
@@ -251,6 +260,27 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", batchable(geocode, geocode_batch))
         .route("/reverse", batchable(reverse, reverse_batch))
+        .route(
+            "/batches",
+            only(MethodFilter::POST, "POST", batches::create),
+        )
+        .route(
+            "/batches/{id}",
+            on(MethodFilter::GET, batches::status)
+                .on(MethodFilter::DELETE, batches::delete)
+                .on(MethodFilter::HEAD, || async {
+                    Problem::method_not_allowed("DELETE, GET")
+                })
+                .fallback(|| async { Problem::method_not_allowed("DELETE, GET") }),
+        )
+        .route(
+            "/batches/{id}/results",
+            only(MethodFilter::GET, "GET", batches::results),
+        )
+        .route(
+            "/batches/{id}/cancel",
+            only(MethodFilter::POST, "POST", batches::cancel),
+        )
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz));
@@ -334,6 +364,19 @@ where
         // After the fallback, so the limit covers QUERY as well as POST.
         .layer(DefaultBodyLimit::max(bounds::MAX_BATCH_BODY_BYTES))
         .layer(middleware::map_response(batch::advertise))
+}
+
+/// A route that takes one method. HEAD is refused too, rather than routed to
+/// a GET handler, and every other method is a 405 naming the one it takes.
+fn only<H, T>(filter: MethodFilter, allow: &'static str, handler: H) -> MethodRouter<AppState>
+where
+    H: Handler<T, AppState>,
+    T: 'static,
+{
+    let refuse = move || async move { Problem::method_not_allowed(allow) };
+    on(filter, handler)
+        .on(MethodFilter::HEAD, refuse)
+        .fallback(refuse)
 }
 
 async fn batch_method_not_allowed() -> Problem {
@@ -646,14 +689,21 @@ pub(crate) async fn geocode(
     ),
 )]
 pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Request) -> Response {
-    let lookup = Lookup {
-        route: "/geocode",
-        prepare: geocode_request,
-        place: geocode_place,
-        answer: geocode_answer,
-    };
-    batch::run(state, lookup, request).await
+    batch::run(state, GEOCODE, request).await
 }
+
+/// `/geocode` as a batch item, in `QUERY /geocode` and in `/batches`.
+pub(crate) const GEOCODE: Lookup<
+    GeocodeParams,
+    AddressGeocodeOptions,
+    ForwardCollection,
+    [String; 3],
+> = Lookup {
+    route: "/geocode",
+    prepare: geocode_request,
+    place: geocode_place,
+    answer: geocode_answer,
+};
 
 /// `/geocode`'s parameters, checked.
 fn geocode_request(params: GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
@@ -779,14 +829,16 @@ pub(crate) async fn reverse(
     ),
 )]
 pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Request) -> Response {
-    let lookup = Lookup {
-        route: "/reverse",
-        prepare: reverse_request,
-        place: reverse_place,
-        answer: reverse_answer,
-    };
-    batch::run(state, lookup, request).await
+    batch::run(state, REVERSE, request).await
 }
+
+/// `/reverse` as a batch item, in `QUERY /reverse` and in `/batches`.
+pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollection, u64> = Lookup {
+    route: "/reverse",
+    prepare: reverse_request,
+    place: reverse_place,
+    answer: reverse_answer,
+};
 
 /// `/reverse`'s parameters, checked.
 fn reverse_request(params: ReverseParams) -> Result<GeocodeOptions, Problem> {
@@ -868,7 +920,8 @@ mod router_tests {
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {
-        let state = AppState::open(pack_dir).expect("open shared pack");
+        let state = AppState::open(pack_dir, &pack_dir.with_extension("batches"))
+            .expect("open shared pack");
         state.ready.store(ready, Ordering::Release);
         state
     }
