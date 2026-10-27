@@ -35,7 +35,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{ServeOptions, serve},
+    runtime::{ServeOptions, init_logs, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -90,6 +90,11 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// Serve Prometheus metrics at /metrics. Off by default: they show
+        /// the server's traffic to anyone who can reach the port.
+        #[arg(long)]
+        metrics: bool,
     },
 }
 
@@ -751,12 +756,15 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            metrics,
         } => {
+            init_logs();
             serve(ServeOptions {
                 pack,
                 demo: Some(demo),
                 bind,
                 basemap: Some(basemap),
+                metrics,
             })
             .await?;
             Ok(())

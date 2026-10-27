@@ -62,6 +62,9 @@ memmap2 = "0.9"
 # with a null read in its arena bitmap (`mi_bitmap_try_find_and_claim`).
 mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 osmpbf = "0.3"
+# `/metrics` of `serve`. One registry per server rather than a process-wide
+# recorder, so servers in one process (the tests) keep their own counts.
+prometheus-client = "0.25"
 # The interactive `og` interface, drawn inline below the prompt.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 rayon = "1.12"
@@ -83,7 +86,10 @@ tantivy = "0.25.0"
 tantivy-fst = "0.5"
 thiserror = "2"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+# Logs of `serve`: one line per request, under its request id.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 # The Unicode Script property: which characters the parser reads as a
 # script written without spaces.
 unicode-script = "0.5.7"

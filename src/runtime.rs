@@ -26,9 +26,12 @@ use crate::{
     http::{
         batch::{self, Lookup},
         batches::{self, BatchStore},
-        bounds, health, method, openapi,
+        bounds, health, method,
+        metrics::{self, Metrics},
+        openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
+        version,
     },
     pack::Reader,
     record::Layer,
@@ -46,6 +49,9 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    /// Serve `/metrics`. Off unless asked: it shows the server's load and
+    /// traffic to whoever can reach the port.
+    pub metrics: bool,
 }
 
 #[derive(Clone)]
@@ -58,6 +64,8 @@ pub(crate) struct AppState {
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
     batches: Arc<BatchStore>,
+    metrics: Metrics,
+    expose_metrics: bool,
 }
 
 impl AppState {
@@ -90,7 +98,20 @@ impl AppState {
             // than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
             batches: Arc::new(BatchStore::open(batches.to_path_buf())?),
+            metrics: Metrics::new(resources.usable_cpus),
+            expose_metrics: false,
         })
+    }
+
+    /// Serve `/metrics` and count requests. The counters exist either way,
+    /// for the batch hooks, which then cost one atomic add.
+    pub(crate) fn with_metrics(mut self) -> Self {
+        self.expose_metrics = true;
+        self
+    }
+
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     pub(crate) fn batches(&self) -> &BatchStore {
@@ -109,6 +130,10 @@ impl AppState {
 
     pub(crate) fn error_log(&self) -> &ErrorLog {
         &self.error_log
+    }
+
+    pub(crate) fn pack(&self) -> &Reader {
+        &self.pack
     }
 
     /// True once the Pack is loaded and the Runtime can answer API traffic
@@ -224,7 +249,10 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
+    let mut state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
+    if options.metrics {
+        state = state.with_metrics();
+    }
     tokio::spawn(batches::sweep_forever(state.clone()));
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
@@ -241,6 +269,27 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         options.bind
     );
     axum::serve(listener, app).await.map_err(Error::from)
+}
+
+/// Logs for a server run, on stderr, filtered by `RUST_LOG`
+/// (default `info`): text on a terminal, else JSON lines like the error log's,
+/// for a container's log collector. The other commands keep their plain stdout
+/// output, and the `og` interface its screen.
+pub fn init_logs() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        logs.init();
+    } else {
+        logs.json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .init();
+    }
 }
 
 /// Assemble the public-demo router with its boundary policy: method-restricted
@@ -283,7 +332,11 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         )
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
-        .route("/readyz", get_only(health::readyz));
+        .route("/readyz", get_only(health::readyz))
+        .route("/version", get_only(version::version));
+    if state.expose_metrics {
+        app = app.route("/metrics", get_only(metrics::metrics));
+    }
 
     // The basemap PMTiles lives with the other data artifacts (not in the demo
     // dir), so serve it explicitly. ServeFile honors HTTP range requests, which
@@ -314,6 +367,7 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
     // request-id layer is outermost so it also wraps both fallbacks, which puts
     // the id in every Problem and logs every 500 in one place.
     let error_log = state.error_log.clone();
+    let metrics = state.expose_metrics.then(|| state.metrics.clone());
     let app = app.method_not_allowed_fallback(method::method_not_allowed);
     let app = match demo {
         Some(demo) => app.fallback_service(
@@ -321,11 +375,18 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         ),
         None => app.fallback(method::not_found),
     };
-    app.layer(middleware::from_fn_with_state(
-        error_log,
-        request_id::propagate,
-    ))
-    .with_state(state)
+    // Layered on the router, not wrapped around it, so the request carries
+    // the route it matched when this runs.
+    let app = match metrics {
+        Some(metrics) => app.layer(middleware::from_fn_with_state(metrics, metrics::track)),
+        None => app,
+    };
+    app.layer(request_id::trace_layer())
+        .layer(middleware::from_fn_with_state(
+            error_log,
+            request_id::propagate,
+        ))
+        .with_state(state)
 }
 
 /// A GET-only route that also rejects HEAD with 405, defeating axum's default
@@ -1000,6 +1061,166 @@ mod router_tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn version_names_the_build_and_the_pack() {
+        let pack = temp_path("version");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let reply = send(router.clone(), request("GET", "/version")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.content_type(), "application/json");
+        let body = reply.json();
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            body["pack"]["schema_version"],
+            crate::pack::PACK_SCHEMA_VERSION
+        );
+        assert_eq!(body["pack"]["built_by"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["pack"]["record_count"], 1);
+        assert_eq!(body["pack"]["layer_counts"]["address"], 1);
+        assert!(
+            body["pack"]["built_at_unix"]
+                .as_u64()
+                .expect("built_at_unix")
+                > 0
+        );
+        assert_eq!(body["pack"]["id"].as_str().expect("id").len(), 16);
+        assert!(
+            !String::from_utf8_lossy(&reply.body).contains("open-geocode-http"),
+            "no path in the body"
+        );
+
+        assert_eq!(
+            send(router, request("HEAD", "/version")).await.status,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_off_unless_asked() {
+        let pack = temp_path("metrics-off");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let reply = send(router.clone(), request("GET", "/metrics")).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        assert_eq!(reply.content_type(), "application/problem+json");
+
+        let on = build_router(state_for(&pack, true).with_metrics(), None, None);
+        let reply = send(on.clone(), request("GET", "/metrics")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            reply
+                .content_type()
+                .starts_with("application/openmetrics-text")
+        );
+        assert_eq!(
+            send(on, request("HEAD", "/metrics")).await.status,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn metrics_text(reply: &Reply) -> String {
+        String::from_utf8(reply.body.clone()).expect("metrics are text")
+    }
+
+    #[tokio::test]
+    async fn metrics_count_requests_by_route_and_never_show_what_was_asked() {
+        let pack = temp_path("metrics-count");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true).with_metrics(), None, None);
+
+        let geocode = "/geocode?address=10%20King%20Street&postcode=M5V%201A1";
+        for _ in 0..2 {
+            assert_eq!(
+                send(router.clone(), request("GET", geocode)).await.status,
+                StatusCode::OK
+            );
+        }
+        send(router.clone(), request("GET", "/search?q=secret%20lane")).await;
+        send(router.clone(), request("GET", "/no/such/place/48151623")).await;
+        send(router.clone(), request("FETCH", "/geocode")).await;
+
+        let reply = send(router, request("GET", "/metrics")).await;
+        let text = metrics_text(&reply);
+        assert!(
+            text.contains(
+                r#"open_geocode_http_requests_total{route="/geocode",method="GET",status="200"} 2"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"open_geocode_http_requests_total{route="unmatched",method="GET",status="404"} 1"#
+            ),
+            "{text}"
+        );
+        assert!(text.contains(r#"method="other",status="405""#), "{text}");
+        assert!(
+            text.contains(
+                r#"open_geocode_http_request_duration_seconds_count{route="/geocode"} 3"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("open_geocode_http_requests_in_flight 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                r#"open_geocode_build_info{{version="{}"}} 1"#,
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("open_geocode_batch_slots_in_use 0\n"),
+            "{text}"
+        );
+        for private in [
+            "King", "king", "M5V", "secret", "lane", "48151623", "such", "address=", "?",
+        ] {
+            assert!(!text.contains(private), "{private} leaked:\n{text}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_batch_items_by_outcome() {
+        let pack = temp_path("metrics-batch");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true).with_metrics(), None, None);
+
+        let reply = send(
+            router.clone(),
+            batch_request(
+                "POST",
+                "/geocode",
+                r#"[{"address": "10 King Street"}, {"address": "10 King Street"}, {"address": ""}]"#,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        let text = metrics_text(&send(router, request("GET", "/metrics")).await);
+        assert!(
+            text.contains(r#"open_geocode_batch_items_total{outcome="succeeded"} 2"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"open_geocode_batch_items_total{outcome="failed"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"route="/geocode",method="POST",status="200""#),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

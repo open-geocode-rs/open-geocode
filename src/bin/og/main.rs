@@ -30,7 +30,7 @@ use open_geocode::{
     alloc::CountingAlloc,
     builder::Leftover,
     resources,
-    runtime::{ServeOptions, serve},
+    runtime::{ServeOptions, init_logs, serve},
 };
 use ratatui::{
     DefaultTerminal, Terminal, TerminalOptions, Viewport,
@@ -176,6 +176,7 @@ fn main() -> Result<()> {
             } else {
                 PathBuf::from(pack)
             };
+            init_logs();
             serve_pack(pack, bind)
         }
         None => interactive(home),
@@ -191,6 +192,7 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             demo: None,
             bind,
             basemap: None,
+            metrics: false,
         }))
         .map_err(Into::into)
 }
@@ -372,6 +374,7 @@ fn interactive(home: Home) -> Result<()> {
         let bind = app::SERVE_ADDRESS.parse().context("the serve address")?;
         // The interface and its Pack are closed before the server opens it.
         drop(app);
+        init_logs();
         return serve_pack(pack, bind);
     }
     Ok(())

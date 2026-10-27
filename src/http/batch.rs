@@ -339,6 +339,9 @@ fn finish<A>(
             item
         })
         .collect();
+    state
+        .metrics()
+        .batch_items(summary.succeeded, summary.failed);
     Batch { results, summary }
 }
 

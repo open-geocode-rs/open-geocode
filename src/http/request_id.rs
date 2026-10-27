@@ -15,11 +15,18 @@
 use std::time::Instant;
 
 use axum::{
+    body::Body,
     extract::{Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::Response,
 };
+use tower_http::{
+    LatencyUnit,
+    classify::{ServerErrorsAsFailures, SharedClassifier},
+    trace::{DefaultOnBodyChunk, DefaultOnEos, DefaultOnRequest, DefaultOnResponse, TraceLayer},
+};
+use tracing::{Level, Span};
 
 use crate::http::problem::Problem;
 
@@ -136,6 +143,47 @@ pub(crate) async fn propagate(
         response.headers_mut().insert("x-request-id", value);
     }
     response
+}
+
+/// The per-request log layer: a span carrying the request id, method and
+/// path, and one line per response with its status and latency. No separate
+/// failure line: the response line has the status, and [`propagate`] logs an
+/// internal error with its cause.
+pub(crate) type RequestTraceLayer = TraceLayer<
+    SharedClassifier<ServerErrorsAsFailures>,
+    fn(&axum::http::Request<Body>) -> Span,
+    DefaultOnRequest,
+    DefaultOnResponse,
+    DefaultOnBodyChunk,
+    DefaultOnEos,
+    (),
+>;
+
+/// Must sit inside [`propagate`] so the [`RequestId`] extension is already
+/// set. The query string is left out of the span: it holds the searched
+/// addresses.
+pub(crate) fn trace_layer() -> RequestTraceLayer {
+    TraceLayer::new_for_http()
+        .make_span_with(request_span as fn(&axum::http::Request<Body>) -> Span)
+        .on_response(
+            DefaultOnResponse::new()
+                .level(Level::INFO)
+                .latency_unit(LatencyUnit::Millis),
+        )
+        .on_failure(())
+}
+
+fn request_span(request: &axum::http::Request<Body>) -> Span {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map_or("-", |RequestId(id)| id.as_str());
+    tracing::info_span!(
+        "request",
+        request_id,
+        method = %request.method(),
+        path = request.uri().path(),
+    )
 }
 
 /// Keep only ASCII graphic characters and cap the length, so a hostile or

@@ -1330,10 +1330,12 @@ fn count<A>(
     status.summary.total += 1;
     let Some(error) = item.error.take() else {
         status.summary.succeeded += 1;
+        state.metrics().batch_items(1, 0);
         return;
     };
     status.summary.failed += 1;
     drop(status);
+    state.metrics().batch_items(0, 1);
     if error.status() == StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
         state.error_log().internal_error(
             request_id.unwrap_or("-"),

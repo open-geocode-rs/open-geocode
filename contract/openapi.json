@@ -557,6 +557,58 @@
         ],
         "type": "string"
       },
+      "PackInfo": {
+        "description": "What the Pack's manifest says, and which content it is.",
+        "properties": {
+          "built_at_unix": {
+            "description": "When the Pack was built, in seconds since the Unix epoch.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "built_by": {
+            "description": "Version of the `open-geocode` that built the Pack.",
+            "example": "0.1.0",
+            "type": "string"
+          },
+          "id": {
+            "description": "Identifies the Pack's content: equal ids, same Pack.",
+            "example": "9f2c4d1e7a3b5c60",
+            "type": "string"
+          },
+          "layer_counts": {
+            "additionalProperties": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Records per layer.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "record_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "schema_version",
+          "built_by",
+          "built_at_unix",
+          "record_count",
+          "layer_counts"
+        ],
+        "type": "object"
+      },
       "Point": {
         "description": "GeoJSON Point. `coordinates` is `[lon, lat]`.",
         "properties": {
@@ -822,6 +874,24 @@
           "1"
         ],
         "type": "string"
+      },
+      "VersionInfo": {
+        "description": "The server build and the Pack it serves.",
+        "properties": {
+          "pack": {
+            "$ref": "#/components/schemas/PackInfo"
+          },
+          "version": {
+            "description": "Version of the `open-geocode` server.",
+            "example": "0.1.0",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "pack"
+        ],
+        "type": "object"
       },
       "u64": {
         "format": "int64",
@@ -2953,6 +3023,63 @@
           "geocoding"
         ]
       }
+    },
+    "/version": {
+      "get": {
+        "description": "Returns the server's version and what identifies the Pack it serves: a\ncontent id, the schema version, who built it and when, and its record\ncounts. It names no path.",
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            },
+            "description": "The server and the Pack.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `GET` only.",
+            "headers": {
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get the server and Pack versions",
+        "tags": [
+          "operations"
+        ]
+      }
     }
   },
   "servers": [
@@ -2971,7 +3098,7 @@
       "name": "batches"
     },
     {
-      "description": "Health checks and the OpenAPI document.",
+      "description": "Health checks, the server and Pack versions, and the OpenAPI document.",
       "name": "operations"
     }
   ]
