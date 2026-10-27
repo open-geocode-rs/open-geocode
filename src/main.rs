@@ -35,7 +35,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{ServeOptions, serve},
+    runtime::{EdgeOptions, ServeOptions, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -90,6 +90,16 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// Origin a browser page may call the API from, `*` for any. Repeat
+        /// for several. Without it no CORS headers are sent.
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
+
+        /// Seconds a client may reuse a lookup answer (`Cache-Control:
+        /// max-age`). 0 sends no cache headers or ETag.
+        #[arg(long, default_value_t = 3600)]
+        cache_max_age: u32,
     },
 }
 
@@ -751,12 +761,18 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            cors_origins,
+            cache_max_age,
         } => {
             serve(ServeOptions {
                 pack,
                 demo: Some(demo),
                 bind,
                 basemap: Some(basemap),
+                edge: EdgeOptions {
+                    cors_origins,
+                    cache_max_age,
+                },
             })
             .await?;
             Ok(())

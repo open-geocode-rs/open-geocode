@@ -1475,7 +1475,9 @@ fn tail(batch: Arc<Batch>) -> Body {
             }
         },
     );
-    Body::from_stream(stream)
+    // Fused: compression polls a body once more after its end, to look for
+    // trailers, and unfold panics when polled past its end.
+    Body::from_stream(futures_util::StreamExt::fuse(stream))
 }
 
 fn unix_now() -> u64 {
