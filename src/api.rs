@@ -27,34 +27,29 @@ use crate::{
     search::TextSearchHit,
 };
 
-/// A forward answer: `/search` and `/autocomplete`.
-///
-/// Forward and reverse answers are the same GeoJSON FeatureCollection, best
-/// or most precise first, differing only in what `geocoding` says and in the
-/// one ranking field each feature carries. Each direction is written out
-/// rather than shared through a generic, because a generic reached through a
-/// type alias is transparent to the schema generator: it produced one
-/// `FeatureCollection` component for both directions and pointed `/search`
-/// and `/reverse` at it, so the published contract described each endpoint
-/// with the other's fields. The duplication here is what makes the generated
-/// schemas distinct and true. The construction logic is still shared, by
-/// [`common`] and the builders below.
+// Forward and reverse are written out rather than shared through a generic:
+// a generic reached through a type alias is transparent to the schema
+// generator, which then emitted one `FeatureCollection` for both and
+// described each endpoint with the other's fields. Construction is still
+// shared, by [`common`] and the builders below.
+/// A GeoJSON FeatureCollection answering `/search`, `/autocomplete` or
+/// `/geocode`.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardCollection {
     #[serde(rename = "type")]
     pub kind: FeatureCollectionType,
-    /// What was asked, the contract version and the data attribution.
+    /// The query, API version and data attribution.
     pub geocoding: ForwardGeocoding,
     pub features: Vec<ForwardFeature>,
 }
 
-/// A reverse answer: `/reverse`. See [`ForwardCollection`] for why the two
-/// directions are written out rather than shared through a generic.
+// See [`ForwardCollection`] for why the two directions are written out.
+/// A GeoJSON FeatureCollection answering `/reverse`.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ReverseCollection {
     #[serde(rename = "type")]
     pub kind: FeatureCollectionType,
-    /// The point asked about, the contract version and the data attribution.
+    /// The queried point, API version and data attribution.
     pub geocoding: ReverseGeocoding,
     pub features: Vec<ReverseFeature>,
 }
@@ -64,15 +59,15 @@ pub enum FeatureCollectionType {
     FeatureCollection,
 }
 
-/// The contract version. It changes only when a field changes meaning or
-/// goes away; new optional fields keep it.
+/// API version. Changes only when a field is removed or changes meaning.
+/// New optional fields keep the version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum Version {
     #[serde(rename = "1")]
     V1,
 }
 
-/// The licence every answer is given under.
+/// Attribution required by the data licence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum Attribution {
     #[serde(rename = "© OpenStreetMap contributors, ODbL")]
@@ -82,8 +77,8 @@ pub enum Attribution {
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardGeocoding {
     pub version: Version,
-    /// The query text as received, trimmed, with each run of whitespace
-    /// written as one space.
+    /// Query as received, trimmed, with each run of whitespace collapsed to
+    /// one space.
     pub query: String,
     pub attribution: Attribution,
 }
@@ -91,7 +86,7 @@ pub struct ForwardGeocoding {
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ReverseGeocoding {
     pub version: Version,
-    /// The point asked about.
+    /// Queried point.
     pub point: LonLat,
     pub attribution: Attribution,
 }
@@ -102,7 +97,7 @@ pub struct LonLat {
     pub lat: f64,
 }
 
-/// One forward answer: a record of the Pack, or a house number placed on one.
+/// One forward geocoding result.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardFeature {
     #[serde(rename = "type")]
@@ -111,7 +106,8 @@ pub struct ForwardFeature {
     pub properties: ForwardProperties,
 }
 
-/// One reverse answer: the record found at the point, or an area around it.
+/// One reverse geocoding result: the address or street at the point, or an
+/// area containing it.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ReverseFeature {
     #[serde(rename = "type")]
@@ -125,7 +121,7 @@ pub enum FeatureType {
     Feature,
 }
 
-/// A GeoJSON Point, `[lon, lat]`.
+/// GeoJSON Point. `coordinates` is `[lon, lat]`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
 pub struct Point {
     #[serde(rename = "type")]
@@ -138,93 +134,80 @@ pub enum PointType {
     Point,
 }
 
-/// What a feature is, where it lies and where it comes from: everything both
-/// directions say about an answer.
-///
-/// Not a response type of its own. It is flattened into
-/// [`ForwardProperties`] and [`ReverseProperties`], which add the one field
-/// their direction ranks by, so that both are one flat object on the wire.
+// Not a response type of its own: flattened into [`ForwardProperties`] and
+// [`ReverseProperties`], which add the field each direction ranks by, so both
+// are one flat object on the wire.
+/// Properties shared by forward and reverse results.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Common {
-    /// Stable source id, for example `osm:node:123`.
+    /// Stable ID from the source data, such as `osm:node:123`.
     pub id: String,
-    /// Row of the record in this Pack. Not stable across Pack builds.
+    /// Row of the record in this Pack. Changes between Pack builds.
     pub record_id: RecordId,
     pub layer: Layer,
     pub accuracy: Accuracy,
-    /// The thing itself: a POI's or place's name, a street's name, or an
-    /// address's house number and street (`12 King Street West`).
+    /// House number and street for an address (`12 King Street West`), or
+    /// the name of a street, area or POI.
     pub name: String,
-    /// One line to show, the name followed by where it is.
+    /// One-line display label: `name` followed by its location.
     pub label: String,
-    /// A POI's category, for example `amenity:cafe`.
+    /// POI category, such as `amenity:cafe`. Present only on POIs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    /// The address parts the record itself states, and only those.
+    /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
-    /// The areas the record lies in, from the Pack's boundaries.
+    /// Administrative areas containing the result.
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     pub source: Source,
 }
 
-/// A forward feature's properties: the common fields, and the text relevance
-/// `/search` and `/autocomplete` rank by.
+/// Properties of a forward geocoding result.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardProperties {
     #[serde(flatten)]
     pub common: Common,
-    /// Text relevance: higher is better, comparable only within one answer.
-    ///
-    /// It orders the features of one response and nothing else. It is not a
-    /// probability, not a quality score, and not comparable between queries
-    /// or between Packs — two answers' scores say nothing about each other.
-    /// To judge how good a single answer is, read `confidence`, or
-    /// `accuracy` and `layer`, which mean the same thing in every response.
+    /// Text relevance. Higher is better. Comparable only within one
+    /// response: use `confidence` to judge a single result.
     pub score: f32,
-    /// The chance this answer is the address or place the query asks for,
-    /// from 0 to 1, comparable across queries: of the answers given 0.8,
-    /// about eight in ten are right. It is calibrated per Pack, by
-    /// `geocode calibrate` on held-out addresses, and is absent from every
-    /// answer of a Pack that has not been calibrated. A `fallback` is no
-    /// answer to what the query asks for, and its confidence is 0.
+    /// Probability, from 0 to 1, that this is the address the query asks
+    /// for. Of results at 0.8, about 8 in 10 are correct. Present only when
+    /// the Pack is calibrated. `0` on a `fallback` result.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 0, maximum = 1)]
     pub confidence: Option<f32>,
-    /// Present, and `true`, when the feature is no match of what the query
-    /// asks for but the finest area it names that the Pack holds: its
-    /// postcode, a place it names, its region or its country. It is given
-    /// only when nothing more precise was found, and `layer` and `accuracy`
-    /// say how coarse it is. Absent from every other answer.
+    /// `true` when no match was found and the result is the most precise
+    /// area the query names instead: its postcode, a town or other area,
+    /// its region or its country. `layer` says which. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(value_type = Option<bool>)]
     pub fallback: bool,
 }
 
-/// A reverse feature's properties: the common fields, and how far the feature
-/// lies from the point asked about.
+/// Properties of a reverse geocoding result.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ReverseProperties {
     #[serde(flatten)]
     pub common: Common,
-    /// Metres from the point asked about to the feature's geometry, for the
-    /// features found by distance. The areas around the point carry none.
+    /// Distance from the queried point in meters. Present only on the
+    /// address or street result, not on areas.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_m: Option<f64>,
 }
 
-/// How the feature's coordinates relate to the thing it names.
+// From the Pack's point precision: `point` is rooftop, `estimated` is
+// interpolated, `representative_point` is street, a way or relation
+// `centroid` is centroid, and a node standing for something larger is
+// approximate.
+/// How precisely the coordinates locate the result, most precise first.
 ///
-/// | accuracy | Pack point |
-/// | --- | --- |
-/// | `rooftop` | the point of an address or POI (`point`) |
-/// | `interpolated` | a house number placed along a range or between neighbours (`estimated`) |
-/// | `street` | a point on a street or range line (`representative_point`, reverse `street`) |
-/// | `centroid` | the centre of a drawn way or relation (`centroid`) |
-/// | `approximate` | a node or derived point standing for something larger: a place node, a postcode |
-///
-/// Accuracies order from the most precise.
+/// - `rooftop`: the address or POI itself.
+/// - `interpolated`: a house number placed between known neighbours.
+/// - `street`: a point on the street.
+/// - `centroid`: the centre of a mapped area.
+/// - `approximate`: a point standing for something larger, such as a town
+///   or postcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Accuracy {
@@ -260,9 +243,8 @@ impl Accuracy {
     }
 }
 
-/// Address parts as the record states them. A part the record leaves out is
-/// absent, never filled in from the areas around it: those are the
-/// `context`.
+/// Address parts stated by the source record. Parts the record omits are
+/// absent, not filled in from `context`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Address {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,11 +253,12 @@ pub struct Address {
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub street: Option<String>,
-    /// `addr:place`: what the house number is on where there is no street.
+    /// Named place the house number belongs to where there is no street
+    /// (OSM `addr:place`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
-    /// The areas below the locality the address names, outermost first
-    /// (`addr:suburb`, `addr:quarter`, `addr:neighbourhood`).
+    /// Areas below the locality, outermost first (OSM `addr:suburb`,
+    /// `addr:quarter`, `addr:neighbourhood`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub areas: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,15 +327,11 @@ fn stated(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The areas a record lies in, one per tier: the admin areas most specific
-/// first, then the place area.
-///
-/// The `sub` tiers carry the levels a country maps between the conventional
-/// ones. Germany mapping three `state_district` levels used to mean two of
-/// them were dropped from every German address; they are now the district
-/// and its subdistrict. The field is absent where a country does not map
-/// that depth, as every field here already is, so a reader of the
-/// conventional tiers alone is unaffected.
+// The `sub` tiers exist for countries that map levels between the
+// conventional ones: Germany's three `state_district` levels would otherwise
+// lose two.
+/// Areas containing the result, one per tier, most specific first. A tier
+/// the country does not map is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Context {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,8 +350,7 @@ pub struct Context {
     pub region: Option<ContextArea>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<ContextArea>,
-    /// A named area outside the admin levels, mostly an island. It can be
-    /// smaller than a locality or larger than a region (Honshu).
+    /// Named area outside the administrative levels, usually an island.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<ContextArea>,
 }
@@ -385,7 +363,7 @@ impl Context {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ContextArea {
-    /// The area's source id, as a feature's `id`.
+    /// Stable ID from the source data, as in a result's `id`.
     pub id: String,
     pub name: String,
 }

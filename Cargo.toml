@@ -9,7 +9,7 @@ repository = "https://github.com/open-geocode-rs/open-geocode"
 readme = "README.md"
 keywords = ["geocoding", "geocoder", "osm", "gis", "geospatial"]
 categories = ["science::geo", "command-line-utilities"]
-exclude = ["data/", "demo/vendor/", "docs/", "*.pmtiles"]
+exclude = ["assets/", "data/", "docs/", "*.pmtiles"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -92,6 +92,8 @@ unicode-script = "0.5.7"
 ureq = { version = "3.4.2", features = ["json"] }
 utoipa = { version = "6.0.0", features = ["axum_extras", "preserve_order"] }
 uuid = { version = "1", features = ["v4"] }
+# Reads OpenAddresses collection archives without unpacking them.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # Compresses build scratch blocks: 2-5x less spill disk and I/O at zstd-1
 # speeds far above the scratch disk's. Already in the tree through Tantivy.

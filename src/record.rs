@@ -133,8 +133,8 @@ pub struct PlaceRecord {
     pub source: SourceProvenance,
 }
 
-/// Every record layer. Place layers are the context layers used to describe
-/// where an address is.
+/// Kind of result: an address, a street, a POI, or an area such as a
+/// locality or region.
 #[derive(
     Debug,
     Clone,
@@ -475,8 +475,8 @@ pub struct RejectedRecord {
     Hash,
     utoipa::ToSchema,
 )]
-/// What a record's source object is: an OSM node, way or relation, or a row
-/// of an imported address dataset such as OpenAddresses.
+/// Source object type: an OSM `node`, `way` or `relation`, or a `row` of an
+/// address dataset such as OpenAddresses.
 #[serde(rename_all = "snake_case")]
 pub enum ObjectType {
     Node,

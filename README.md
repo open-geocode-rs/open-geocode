@@ -20,7 +20,7 @@ og is an alternative to commercial API quotas and to the days-long builds of Pel
 - **Reverse:** Hilbert-packed R-trees and point-in-polygon on real admin boundaries, returning the nearest address with its full locality, region and country.
 - **Results:** calibrated confidence, plus a rooftop, interpolated or street-level accuracy tier.
 
-<img src="demo/recording/og-demo.gif" alt="Building the Luxembourg Pack in og, then geocoding a CSV of 4,000 addresses" width="100%">
+<img src="assets/og-demo.gif" alt="Building the Luxembourg Pack in og, then geocoding a CSV of 4,000 addresses" width="100%">
 
 Building the Luxembourg Pack, then geocoding a CSV of 4,000 addresses:
 every row matched in about a second, p50 1.6 ms and p99 5.4 ms.

@@ -8,30 +8,30 @@ use axum::{extract::State, http::StatusCode};
 
 use crate::runtime::AppState;
 
-/// Is the process alive?
+/// Check liveness
 ///
-/// Answers 200 as soon as the server is listening, whether or not the Pack is
-/// loaded. Use `/readyz` to know whether it can answer geocoding requests.
-/// The body is always empty.
+/// Returns `200` while the server is running, even before the Pack is loaded.
+/// Use `/readyz` to check that it can geocode. The body is empty.
 #[utoipa::path(
     get,
     path = "/healthz",
     tag = "operations",
-    responses((status = 200, description = "The process is alive.")),
+    responses((status = 200, description = "The server is running.")),
 )]
 pub(crate) async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
-/// Can the server answer geocoding requests?
+/// Check readiness
 ///
-/// 200 once the Pack is open, 503 until then. The body is always empty.
+/// Returns `200` once the Pack is loaded, and `503` before that. The body is
+/// empty.
 #[utoipa::path(
     get,
     path = "/readyz",
     tag = "operations",
     responses(
-        (status = 200, description = "The Pack is loaded and queries can be served."),
+        (status = 200, description = "The Pack is loaded."),
         (status = 503, description = "The Pack is not loaded yet."),
     ),
 )]
