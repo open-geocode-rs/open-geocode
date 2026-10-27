@@ -474,20 +474,6 @@ async fn batch_results_are_their_get_answers() {
             ]),
         ),
         (
-            "/search",
-            "",
-            json!([
-                {"q": "10 King Street"},
-                {"q": "Queen Bakery", "limit": 1, "layer": "poi"},
-                {"q": "99 Nowhere Lane, Toronto"},
-                {"q": "King Street", "focus": "-79.0,43.0", "bbox": "-79.01,42.99,-78.99,43.01"},
-                {"q": ""},
-                {"q": "king", "country": "Canada"},
-                {"q": "king", "bbox": "170,-10,-170,10"},
-                {"q": "king", "limit": "many"},
-            ]),
-        ),
-        (
             "/reverse",
             "",
             json!([

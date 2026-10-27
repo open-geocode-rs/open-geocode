@@ -1912,7 +1912,6 @@ dependencies = [
  "fst",
  "geo",
  "geojson",
- "http-body-util",
  "icu_normalizer",
  "icu_properties",
  "indicatif",
