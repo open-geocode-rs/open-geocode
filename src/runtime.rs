@@ -1386,6 +1386,308 @@ mod router_tests {
             .and_then(|value| value.to_str().ok())
     }
 
+    fn upload(uri: &str, content_type: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn csv_rows(body: &[u8]) -> Vec<BTreeMap<String, String>> {
+        let mut reader = csv::Reader::from_reader(body);
+        let headers = reader.headers().expect("headers").clone();
+        reader
+            .records()
+            .map(|record| {
+                let record = record.expect("record");
+                headers
+                    .iter()
+                    .zip(record.iter())
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A CSV comes back as it went, each row with `geocode batch`'s columns
+    /// holding its `GET` answer, and the batch can be read again by its id.
+    #[tokio::test]
+    async fn batches_stream_a_csv_back_with_each_rows_answer() {
+        let pack = temp_path("batches-csv");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let body = "ref,street,town,zip\n\
+                    a,10 King Street,,M5V 1A1\n\
+                    b,,,\n\
+                    c,10 King Street,,V6B 1A1\n\
+                    d,10 King Street,,M5V 1A1\n";
+        let reply = send(
+            router.clone(),
+            upload(
+                "/batches?address=street&locality=town&postcode=zip",
+                "text/csv",
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(reply.content_type(), "text/csv");
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+
+        let rows = csv_rows(&reply.body);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["ref"].as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+        let get = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
+            ),
+        )
+        .await
+        .json();
+        let coordinates = &get["features"][0]["geometry"]["coordinates"];
+        assert_eq!(rows[0]["geocode_status"], "resolved");
+        assert_eq!(
+            rows[0]["geocode_lon"].parse::<f64>().unwrap(),
+            coordinates[0].as_f64().unwrap()
+        );
+        assert_eq!(rows[1]["geocode_status"], "error");
+        assert!(rows[1]["geocode_reason"].starts_with("invalid_query"));
+        assert_eq!(rows[2]["geocode_status"], "unresolved");
+        // The repeat of row a is answered from it, alike.
+        assert_eq!(rows[3]["geocode_lon"], rows[0]["geocode_lon"]);
+
+        let status = send(router.clone(), request("GET", &location)).await.json();
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["endpoint"], "geocode");
+        assert_eq!(
+            status["summary"],
+            serde_json::json!({"total": 4, "succeeded": 3, "failed": 1})
+        );
+        assert!(status["expires_at"].is_u64());
+        let again = send(
+            router.clone(),
+            request("GET", &format!("{location}/results")),
+        )
+        .await;
+        assert_eq!(again.body, reply.body);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// JSONL rows are batch items, answered as their `GET` is, each tagged
+    /// with its place in the upload.
+    #[tokio::test]
+    async fn batches_answer_jsonl_rows_as_their_get() {
+        let pack = temp_path("batches-jsonl");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let body = "{\"id\": \"p\", \"lon\": -79.0, \"lat\": 43.0}\n\
+                    \n\
+                    {\"lon\": 999, \"lat\": 0}\n\
+                    not json\n";
+        let reply = send(
+            router.clone(),
+            upload("/batches?endpoint=reverse", "application/jsonl", body),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(reply.content_type(), "application/jsonl");
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 3);
+
+        let get = send(router.clone(), request("GET", "/reverse?lon=-79&lat=43"))
+            .await
+            .json();
+        assert_eq!(lines[0]["id"], "p");
+        assert_eq!(lines[0]["status"], 200);
+        assert_eq!(lines[0]["response"], get);
+        assert_eq!(lines[1]["status"], 400);
+        assert_eq!(lines[1]["error"]["error_code"], "invalid_coordinate");
+        assert_eq!(lines[2]["error"]["error_code"], "malformed_body");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `Prefer: respond-async` is answered once the upload is in, and the
+    /// results are read from the batch.
+    #[tokio::test]
+    async fn batches_answer_at_once_when_asked() {
+        let pack = temp_path("batches-async");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let mut request_ = upload("/batches", "text/csv", "Address,City\n10 King Street,\n");
+        request_
+            .headers_mut()
+            .insert("prefer", header::HeaderValue::from_static("respond-async"));
+        let reply = send(router.clone(), request_).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+        let id = reply.json()["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            header_value(&reply, "location"),
+            Some(format!("/batches/{id}").as_str())
+        );
+
+        let results = send(
+            router.clone(),
+            request("GET", &format!("/batches/{id}/results")),
+        )
+        .await;
+        let rows = csv_rows(&results.body);
+        assert_eq!(rows[0]["geocode_status"], "resolved");
+        let status = send(router.clone(), request("GET", &format!("/batches/{id}"))).await;
+        assert_eq!(status.json()["status"], "completed");
+
+        let deleted = send(router.clone(), request("DELETE", &format!("/batches/{id}"))).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+        let gone = send(router.clone(), request("GET", &format!("/batches/{id}"))).await;
+        assert_eq!(gone.status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// What `/batches` cannot read is refused before it starts.
+    #[tokio::test]
+    async fn batches_refuse_what_they_cannot_read() {
+        let pack = temp_path("batches-refused");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let code = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
+
+        let reply = send(router.clone(), upload("/batches", "application/json", "[]")).await;
+        assert_eq!(reply.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let reply = send(
+            router.clone(),
+            upload("/batches", "text/csv", "foo,bar\n1,2\n"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(
+            reply.json()["detail"]
+                .as_str()
+                .unwrap()
+                .contains("foo, bar")
+        );
+
+        let reply = send(
+            router.clone(),
+            upload("/batches?address=street", "text/csv", "foo,bar\n1,2\n"),
+        )
+        .await;
+        assert_eq!(code(&reply).as_deref(), Some("malformed_parameter"));
+        assert_eq!(reply.json()["invalid_params"][0]["name"], "street");
+
+        let reply = send(
+            router.clone(),
+            upload("/batches", "application/jsonl", "{}\n"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+
+        let reply = send(
+            router.clone(),
+            upload("/batches?endpoint=search", "application/jsonl", "{}\n"),
+        )
+        .await;
+        assert_eq!(reply.json()["invalid_params"][0]["name"], "endpoint");
+
+        for (method, uri) in [
+            ("GET", "/batches/nope"),
+            ("GET", "/batches/nope/results"),
+            ("POST", "/batches/nope/cancel"),
+            ("DELETE", "/batches/nope"),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        for (method, uri, allow) in [
+            ("GET", "/batches", "POST"),
+            ("PUT", "/batches/nope", "DELETE, GET"),
+            ("POST", "/batches/nope/results", "GET"),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(
+                reply.status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri}"
+            );
+            assert_eq!(header_value(&reply, "allow"), Some(allow));
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A finished batch is still served after a restart, and one that was
+    /// running when the server stopped is failed, not left running forever.
+    #[tokio::test]
+    async fn batches_outlive_a_restart() {
+        let pack = temp_path("batches-restart");
+        write_pack(&pack);
+        let spool = pack.with_extension("batches");
+        let _ = std::fs::remove_dir_all(&spool);
+        let router = build_router(state_for(&pack, true), None, None);
+        let reply = send(
+            router,
+            upload("/batches", "text/csv", "street\n10 King Street\n"),
+        )
+        .await;
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+        std::fs::write(
+            spool.join("interrupted.json"),
+            serde_json::json!({
+                "id": "interrupted",
+                "endpoint": "geocode",
+                "status": "running",
+                "input_format": "csv",
+                "output_format": "csv",
+                "summary": {"total": 0, "succeeded": 0, "failed": 0},
+                "created_at": 0,
+                "results_url": "/batches/interrupted/results",
+            })
+            .to_string(),
+        )
+        .expect("write a running batch");
+
+        let router = build_router(state_for(&pack, true), None, None);
+        let status = send(router.clone(), request("GET", &location)).await.json();
+        assert_eq!(status["status"], "completed");
+        let results = send(
+            router.clone(),
+            request("GET", &format!("{location}/results")),
+        )
+        .await;
+        assert_eq!(results.body, reply.body);
+        let interrupted = send(router, request("GET", "/batches/interrupted"))
+            .await
+            .json();
+        assert_eq!(interrupted["status"], "failed");
+        assert!(interrupted["error"].as_str().unwrap().contains("restarted"));
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
     /// Each item is answered as its own `GET` would be, a bad item fails
     /// alone, ids are echoed and the query string scopes every item.
     #[tokio::test]
