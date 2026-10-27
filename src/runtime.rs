@@ -243,6 +243,27 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     axum::serve(listener, app).await.map_err(Error::from)
 }
 
+/// Logs for a server run, on stderr, filtered by `RUST_LOG`
+/// (default `info`): text on a terminal, else JSON lines like the error log's,
+/// for a container's log collector. The other commands keep their plain stdout
+/// output, and the `og` interface its screen.
+pub fn init_logs() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        logs.init();
+    } else {
+        logs.json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .init();
+    }
+}
+
 /// Assemble the public-demo router with its boundary policy: method-restricted
 /// routes (ADR 0017 Decision 27), Problem Details 404/405 fallbacks
 /// (Decisions 27, 37), and request-id propagation (Decision 30). The basemap is
@@ -321,11 +342,12 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         ),
         None => app.fallback(method::not_found),
     };
-    app.layer(middleware::from_fn_with_state(
-        error_log,
-        request_id::propagate,
-    ))
-    .with_state(state)
+    app.layer(request_id::trace_layer())
+        .layer(middleware::from_fn_with_state(
+            error_log,
+            request_id::propagate,
+        ))
+        .with_state(state)
 }
 
 /// A GET-only route that also rejects HEAD with 405, defeating axum's default
@@ -1333,6 +1355,69 @@ mod router_tests {
             lines[0]["request_id"].as_str(),
             reply.request_id().as_deref()
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn each_request_is_logged_with_its_id_and_path_but_not_its_query() {
+        let pack = temp_path("request-log");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let buffer = TraceBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut tagged = request("GET", "/geocode?address=12%20Private%20Lane");
+        tagged
+            .headers_mut()
+            .insert("cf-ray", header::HeaderValue::from_static("ray-200"));
+        let reply = {
+            let _logs = tracing::subscriber::set_default(subscriber);
+            send(router, tagged).await
+        };
+
+        assert_eq!(reply.status, StatusCode::OK);
+        let text = String::from_utf8(buffer.0.lock().expect("trace buffer").clone())
+            .expect("log lines are UTF-8");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON log line"))
+            .collect();
+        let responses: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "finished processing request")
+            .collect();
+        assert_eq!(responses.len(), 1);
+        let line = responses[0];
+        assert_eq!(line["level"], "INFO");
+        assert_eq!(line["status"], 200);
+        assert_eq!(line["span"]["request_id"], "ray-200");
+        assert_eq!(line["span"]["method"], "GET");
+        assert_eq!(line["span"]["path"], "/geocode");
+        assert!(
+            !text.contains("Private"),
+            "the query is personal data: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]

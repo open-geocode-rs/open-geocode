@@ -35,7 +35,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{ServeOptions, serve},
+    runtime::{ServeOptions, init_logs, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -752,6 +752,7 @@ async fn main() -> Result<()> {
             bind,
             basemap,
         } => {
+            init_logs();
             serve(ServeOptions {
                 pack,
                 demo: Some(demo),

@@ -116,6 +116,7 @@ og serve canada-ontario
 ```
 
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
+The server logs one line per request to stderr, with its request id, status and latency; `RUST_LOG` sets the level (default `info`, e.g. `RUST_LOG=open_geocode=debug,info`), and off a terminal the lines are JSON.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
