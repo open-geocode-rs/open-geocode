@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -35,7 +36,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{ServeOptions, serve},
+    runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -90,6 +91,11 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// Seconds to let in-flight requests finish after Ctrl-C or SIGTERM
+        /// before dropping them. 0 drops them at once.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
+        shutdown_timeout: u64,
     },
 }
 
@@ -751,12 +757,14 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            shutdown_timeout,
         } => {
             serve(ServeOptions {
                 pack,
                 demo: Some(demo),
                 bind,
                 basemap: Some(basemap),
+                shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
             Ok(())

@@ -347,6 +347,35 @@ impl BatchStore {
             self.remove(&id);
         }
     }
+
+    /// Cancel every running batch and wait, up to `wait`, for each to record
+    /// that it stopped. Rows already answered stay in its results. One left
+    /// `running` on disk would only be failed by the next start, with no
+    /// sign of how far it got.
+    pub(crate) async fn stop_running(&self, wait: Duration) {
+        let running = self
+            .batches
+            .lock()
+            .expect("batches")
+            .values()
+            .filter(|batch| !batch.progress.borrow().done)
+            .cloned()
+            .collect::<Vec<_>>();
+        for batch in &running {
+            batch.cancel.store(true, Ordering::Relaxed);
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        for batch in running {
+            let _ = tokio::time::timeout_at(
+                deadline,
+                batch
+                    .progress
+                    .subscribe()
+                    .wait_for(|progress| progress.done),
+            )
+            .await;
+        }
+    }
 }
 
 /// What a row's answer adds to a CSV row: `geocode batch`'s audit columns.
@@ -1140,6 +1169,12 @@ impl Run {
         let now = unix_now();
         {
             let mut status = self.batch.status.lock().expect("batch status");
+            // A cancelled batch whose upload then ends early (the server is
+            // stopping and drops the connection) reads as a finished one.
+            let ending = match ending {
+                Ending::Read if self.batch.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
+                other => other,
+            };
             let (state, error) = match (ending, written) {
                 (_, Err(error)) => (
                     Status::Failed,

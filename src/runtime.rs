@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use crate::error::{Error, Result};
@@ -29,6 +30,7 @@ use crate::{
         bounds, health, method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
+        shutdown::shutdown_signal,
     },
     pack::Reader,
     record::Layer,
@@ -38,6 +40,12 @@ use crate::{
     util::hilbert::hilbert_key,
 };
 
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
+/// How long a stopping server waits for running batches to record that they
+/// stopped. Each looks at its cancel flag every window of rows.
+const BATCH_SETTLE: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub pack: PathBuf,
@@ -46,6 +54,9 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    /// Longest to let in-flight requests finish once Ctrl-C or SIGTERM
+    /// arrives. Zero drops them at once.
+    pub shutdown_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -226,7 +237,11 @@ pub(crate) struct ReverseParams {
 pub async fn serve(options: ServeOptions) -> Result<()> {
     let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
     tokio::spawn(batches::sweep_forever(state.clone()));
-    let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
+    let app = build_router(
+        state.clone(),
+        options.demo.as_deref(),
+        options.basemap.as_deref(),
+    );
 
     let listener = TcpListener::bind(options.bind)
         .await
@@ -240,7 +255,58 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         options.pack.display(),
         options.bind
     );
-    axum::serve(listener, app).await.map_err(Error::from)
+    run(
+        listener,
+        app,
+        state,
+        shutdown_signal(),
+        options.shutdown_timeout,
+    )
+    .await
+}
+
+/// Serve until `stop` resolves, then drain for at most `drain`.
+///
+/// Split out from [`serve`] so a test can stop it without a signal.
+async fn run(
+    listener: TcpListener,
+    app: Router,
+    state: AppState,
+    stop: impl Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> Result<()> {
+    let ready = Arc::clone(&state.ready);
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            stop.await;
+            ready.store(false, Ordering::Release);
+            eprintln!(
+                "Shutting down: finishing in-flight requests, for at most {} s",
+                drain.as_secs()
+            );
+            let _ = stopping_tx.send(());
+        })
+        .into_future();
+    tokio::pin!(server);
+    // axum waits on open connections without bound, and a batch upload can hold
+    // one for minutes. The clock starts at the signal, not at startup.
+    let deadline = async {
+        if stopping_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        result = &mut server => result.map_err(Error::from)?,
+        () = deadline => eprintln!("Shutdown timeout reached; dropping open connections"),
+    }
+    // A batch can outlive its request (`Prefer: respond-async`), and its
+    // blocking thread would otherwise hold the process open until it ends.
+    state.batches().stop_running(BATCH_SETTLE).await;
+    eprintln!("Stopped");
+    Ok(())
 }
 
 /// Assemble the public-demo router with its boundary policy: method-restricted
@@ -2087,5 +2153,212 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    fn raw_get(addr: SocketAddr, path: &str) -> std::io::Result<(u16, String)> {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+        )?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+        let status = reply
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .ok_or_else(|| std::io::Error::other(format!("no status in {reply:?}")))?;
+        let body = reply.split("\r\n\r\n").nth(1).unwrap_or_default();
+        Ok((status, body.to_string()))
+    }
+
+    /// `/slow` answers after a while and `/hang` never does; `started` is
+    /// told when either is entered.
+    fn drain_app(state: AppState, started: Arc<tokio::sync::Notify>) -> Router {
+        use axum::routing::get;
+        let on_slow = Arc::clone(&started);
+        Router::new()
+            .route(
+                "/slow",
+                get(move || async move {
+                    on_slow.notify_one();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "done"
+                }),
+            )
+            .route(
+                "/hang",
+                get(move || async move {
+                    started.notify_one();
+                    std::future::pending::<&str>().await
+                }),
+            )
+            .route("/readyz", get(health::readyz))
+            .with_state(state)
+    }
+
+    /// After the stop signal the server is not ready and takes no new
+    /// connection, and the request it was answering still completes.
+    #[tokio::test]
+    async fn shutdown_lets_an_in_flight_request_finish() {
+        let pack = temp_path("shutdown-drain");
+        write_pack(&pack);
+        let state = state_for(&pack, true);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app = drain_app(state.clone(), Arc::clone(&started));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(run(
+            listener,
+            app.clone(),
+            state.clone(),
+            async move {
+                let _ = stopped.await;
+            },
+            Duration::from_secs(10),
+        ));
+
+        let client = task::spawn_blocking(move || raw_get(addr, "/slow"));
+        started.notified().await;
+        assert!(state.is_ready());
+        stop.send(()).expect("stop");
+        while state.is_ready() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let readyz = send(app, request("GET", "/readyz")).await;
+        assert_eq!(readyz.status, StatusCode::SERVICE_UNAVAILABLE);
+        let mut refused = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(addr).is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(refused, "the listener is still accepting");
+
+        let (status, body) = client.await.expect("client").expect("reply");
+        assert_eq!((status, body.as_str()), (200, "done"));
+        server.await.expect("server").expect("clean stop");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A request that never ends cannot hold the server past the drain
+    /// timeout.
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_stuck_request_after_the_drain_timeout() {
+        use std::io::Write;
+        let pack = temp_path("shutdown-timeout");
+        write_pack(&pack);
+        let state = state_for(&pack, true);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app = drain_app(state.clone(), Arc::clone(&started));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(run(
+            listener,
+            app,
+            state.clone(),
+            async move {
+                started.notified().await;
+            },
+            Duration::from_millis(300),
+        ));
+        let mut stuck = std::net::TcpStream::connect(addr).expect("connect");
+        write!(stuck, "GET /hang HTTP/1.1\r\nHost: test\r\n\r\n").expect("send");
+
+        let began = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("shutdown is bounded")
+            .expect("server")
+            .expect("clean stop");
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert!(!state.is_ready());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A batch still running at shutdown is cancelled, keeping the rows it
+    /// answered, even when its upload then ends as if it were complete. It
+    /// is not left `running` for the next start to fail, nor recorded as
+    /// `completed` with rows missing.
+    #[tokio::test]
+    async fn shutdown_cancels_a_running_batch() {
+        let pack = temp_path("shutdown-batch");
+        write_pack(&pack);
+        let spool = pack.with_extension("batches");
+        let _ = std::fs::remove_dir_all(&spool);
+        let state = state_for(&pack, true);
+        let router = build_router(state.clone(), None, None);
+
+        // Past the 64 KiB the reader sniffs before it answers, then held open.
+        let rows = format!("street\n{}", "10 King Street\n".repeat(6000));
+        let (feed, chunks) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        feed.send(rows.into_bytes()).await.expect("first chunk");
+        let body = Body::from_stream(futures_util::stream::unfold(chunks, |mut chunks| async {
+            let chunk = chunks.recv().await?;
+            Some((Ok::<_, std::io::Error>(chunk), chunks))
+        }));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/batches")
+                    .header(header::CONTENT_TYPE, "text/csv")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .expect("location")
+            .to_string();
+        let status = || async { send(router.clone(), request("GET", &location)).await.json() };
+        // The reader answers whole windows of 256 rows and then waits for the
+        // rest of the next one, so 23 windows in it is parked on the upload.
+        let answered = 23 * 256;
+        let mut running = status().await;
+        for _ in 0..1000 {
+            if running["summary"]["total"].as_u64() >= Some(answered) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            running = status().await;
+        }
+        assert_eq!(running["status"], "running");
+        assert_eq!(running["summary"]["total"], answered);
+
+        state
+            .batches()
+            .stop_running(Duration::from_millis(100))
+            .await;
+        drop(feed);
+        let mut stopped = status().await;
+        for _ in 0..500 {
+            if stopped["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stopped = status().await;
+        }
+        assert_eq!(stopped["status"], "cancelled");
+        assert!(stopped["completed_at"].is_u64());
+        assert!(stopped["summary"]["total"].as_u64() >= Some(answered));
+        let record = std::fs::read_to_string(
+            spool.join(format!("{}.json", stopped["id"].as_str().expect("id"))),
+        )
+        .expect("record on disk");
+        assert!(record.contains("\"cancelled\""), "{record}");
+
+        drop(response);
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
     }
 }
