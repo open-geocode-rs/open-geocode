@@ -57,6 +57,92 @@
         ],
         "type": "string"
       },
+      "BatchEndpoint": {
+        "description": "The lookup every row of a batch runs.",
+        "enum": [
+          "geocode",
+          "reverse"
+        ],
+        "type": "string"
+      },
+      "BatchFormat": {
+        "description": "A batch file's format: CSV, or one JSON object a line.",
+        "enum": [
+          "csv",
+          "jsonl"
+        ],
+        "type": "string"
+      },
+      "BatchState": {
+        "description": "Where a batch is: running, or stopped and how.",
+        "enum": [
+          "running",
+          "completed",
+          "cancelled",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "BatchStatus": {
+        "description": "A batch as `GET /batches/{id}` shows it, and as it is kept on disk.",
+        "properties": {
+          "completed_at": {
+            "description": "Unix seconds, once the batch stops.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at": {
+            "description": "Unix seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "endpoint": {
+            "$ref": "#/components/schemas/BatchEndpoint"
+          },
+          "error": {
+            "description": "Why a failed batch stopped.",
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "When the results are deleted. Set once the batch stops.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_format": {
+            "$ref": "#/components/schemas/BatchFormat"
+          },
+          "output_format": {
+            "$ref": "#/components/schemas/BatchFormat"
+          },
+          "results_url": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BatchState"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/BatchSummary",
+            "description": "Rows answered so far."
+          }
+        },
+        "required": [
+          "id",
+          "endpoint",
+          "status",
+          "input_format",
+          "output_format",
+          "summary",
+          "created_at",
+          "results_url"
+        ],
+        "type": "object"
+      },
       "BatchSummary": {
         "description": "How a batch went.",
         "properties": {
@@ -910,6 +996,636 @@
         "summary": "Autocomplete addresses",
         "tags": [
           "geocoding"
+        ]
+      }
+    },
+    "/batches": {
+      "post": {
+        "description": "Geocodes every row of a CSV or JSONL upload. Rows are looked up while the\nfile uploads, and their results stream back in this response: CSV in the\norder rows were sent, JSONL in the order they finish, each line with its\n`row`. The results are kept for 72 hours at `Content-Location`.\n\n- CSV: name the columns with `address` (several, comma-separated, are\n  joined), `locality`, `region` and `postcode`, or `lat` and `lon` for\n  reverse. Without them, the header row's names are matched to common\n  ones (`street`, `city`, `zip`, `latitude` and so on). The output is the\n  input with `geocode batch`'s `geocode_*` columns added.\n- JSONL: each line is a `QUERY /geocode` or `QUERY /reverse` item, and\n  `endpoint` is required.\n\nEvery other query-string parameter, such as `country`, applies to every\nrow. Each row's answer is the one its `GET` returns. Send\n`Prefer: respond-async` to be answered with the batch's status once the\nupload is in, instead of with the results.",
+        "operationId": "create",
+        "parameters": [
+          {
+            "description": "The lookup every row runs. Required for JSONL; for CSV, inferred from the columns.",
+            "in": "query",
+            "name": "endpoint",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BatchEndpoint"
+            }
+          },
+          {
+            "description": "CSV only: the column, or comma-separated columns, holding the address.",
+            "example": "street",
+            "in": "query",
+            "name": "address",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CSV only: the town column.",
+            "in": "query",
+            "name": "locality",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CSV only: the region column.",
+            "in": "query",
+            "name": "region",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CSV only: the postcode column.",
+            "in": "query",
+            "name": "postcode",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CSV only: the latitude column.",
+            "in": "query",
+            "name": "lat",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CSV only: the longitude column.",
+            "in": "query",
+            "name": "lon",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated ISO 3166-1 alpha-2 codes every row is limited to.",
+            "example": "CA",
+            "in": "query",
+            "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`respond-async` to be answered with the batch's status once the upload is in.",
+            "example": "respond-async",
+            "in": "header",
+            "name": "Prefer",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`text/csv` or `application/jsonl`. Defaults to the upload's own format.",
+            "in": "header",
+            "name": "Accept",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/jsonl": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "text/csv": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The rows: a CSV with a header row, or one JSON object a line.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/jsonl": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The results, streamed as rows finish.",
+            "headers": {
+              "Content-Location": {
+                "description": "The results, kept for 72 hours.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "The batch.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            },
+            "description": "With `Prefer: respond-async`: the upload is in and the batch runs.",
+            "headers": {
+              "Location": {
+                "description": "The batch.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The CSV has no header row or no column to look up, or a parameter is malformed.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `POST` only.",
+            "headers": {
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The declared body is over 1 GiB.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is not `text/csv` or `application/jsonl`.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Every batch slot is taken. Retry after the `Retry-After` header's seconds.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Geocode a file",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{id}": {
+      "delete": {
+        "description": "Cancels the batch if it is running, and deletes its results.",
+        "operationId": "delete",
+        "parameters": [
+          {
+            "description": "The batch's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No batch has this id, or it expired.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `DELETE` and `GET`.",
+            "headers": {
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "DELETE, GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Delete a batch",
+        "tags": [
+          "batches"
+        ]
+      },
+      "get": {
+        "description": "Returns a batch's status and how many rows it has answered.",
+        "operationId": "status",
+        "parameters": [
+          {
+            "description": "The batch's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            },
+            "description": "The batch.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No batch has this id, or it expired.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `DELETE` and `GET`.",
+            "headers": {
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "DELETE, GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get a batch",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{id}/cancel": {
+      "post": {
+        "description": "Stops reading and looking up rows. The rows already answered are kept.",
+        "operationId": "cancel",
+        "parameters": [
+          {
+            "description": "The batch's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            },
+            "description": "The batch, stopping.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No batch has this id, or it expired.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `POST` only.",
+            "headers": {
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Cancel a batch",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{id}/results": {
+      "get": {
+        "description": "Returns everything the batch has written so far, then the rest as it is\nwritten, until the batch stops.",
+        "operationId": "results",
+        "parameters": [
+          {
+            "description": "The batch's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/jsonl": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The results, in the batch's output format.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No batch has this id, or it expired.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `GET` only.",
+            "headers": {
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get a batch's results",
+        "tags": [
+          "batches"
         ]
       }
     },
@@ -2249,6 +2965,10 @@
     {
       "description": "Geocode addresses and points.",
       "name": "geocoding"
+    },
+    {
+      "description": "Geocode a whole file, streamed back as it uploads.",
+      "name": "batches"
     },
     {
       "description": "Health checks and the OpenAPI document.",

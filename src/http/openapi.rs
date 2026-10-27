@@ -78,6 +78,11 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         crate::runtime::geocode_batch,
         crate::runtime::reverse,
         crate::runtime::reverse_batch,
+        crate::http::batches::create,
+        crate::http::batches::status,
+        crate::http::batches::results,
+        crate::http::batches::cancel,
+        crate::http::batches::delete,
         crate::http::health::healthz,
         crate::http::health::readyz,
         openapi_json,
@@ -119,6 +124,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     )),
     tags(
         (name = "geocoding", description = "Geocode addresses and points."),
+        (name = "batches", description = "Geocode a whole file, streamed back as it uploads."),
         (name = "operations", description = "Health checks and the OpenAPI document."),
     ),
 )]
@@ -393,7 +399,7 @@ fn add_boundary_responses(value: &mut Value) {
         let Some(operations) = operations.as_object_mut() else {
             continue;
         };
-        let batchable = is_batchable(operations);
+        let refusal = method_not_allowed_response(operations);
         for operation in operations.values_mut() {
             let Some(responses) = operation
                 .get_mut("responses")
@@ -401,31 +407,45 @@ fn add_boundary_responses(value: &mut Value) {
             else {
                 continue;
             };
-            responses
-                .entry("405")
-                .or_insert_with(|| method_not_allowed_response(batchable));
+            responses.entry("405").or_insert_with(|| refusal.clone());
         }
     }
 }
 
-/// A route with a batch, the one kind documented with a `post`.
+/// A lookup route with a batch: `GET` for one, `POST` for many.
 fn is_batchable(operations: &Map<String, Value>) -> bool {
-    operations.contains_key("post")
+    operations.contains_key("get") && operations.contains_key("post")
 }
 
-fn method_not_allowed_response(batchable: bool) -> Value {
-    let (description, allow) = if batchable {
+fn method_not_allowed_response(operations: &Map<String, Value>) -> Value {
+    let methods = operations
+        .keys()
+        .map(|method| method.to_uppercase())
+        .collect::<Vec<_>>();
+    let (description, allow) = if is_batchable(operations) {
         (
-            "Method not allowed. The route accepts `GET`, and `QUERY` or `POST` for a batch.",
-            batch::METHODS,
+            "Method not allowed. The route accepts `GET`, and `QUERY` or `POST` for a batch."
+                .to_string(),
+            batch::METHODS.to_string(),
         )
     } else {
-        ("Method not allowed. The route accepts `GET` only.", "GET")
+        let listed = methods
+            .iter()
+            .map(|method| format!("`{method}`"))
+            .collect::<Vec<_>>();
+        let description = match listed.as_slice() {
+            [only] => format!("Method not allowed. The route accepts {only} only."),
+            _ => format!(
+                "Method not allowed. The route accepts {}.",
+                listed.join(" and ")
+            ),
+        };
+        (description, methods.join(", "))
     };
     serde_json::json!({
         "description": description,
         "headers": {
-            "Allow": allow_header(allow),
+            "Allow": allow_header(&allow),
         },
         "content": {
             PROBLEM_JSON: {
