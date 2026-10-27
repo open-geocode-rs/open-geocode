@@ -78,19 +78,20 @@ struct Batch<A> {
     summary: Summary,
 }
 
-#[derive(Debug, Serialize)]
-struct Item<A> {
+/// One item's result: its `GET` answer, or the Problem that `GET` returns.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Item<A> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    status: u16,
+    pub(crate) id: Option<String>,
+    pub(crate) status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response: Option<A>,
+    pub(crate) response: Option<A>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<Problem>,
+    pub(crate) error: Option<Problem>,
 }
 
 impl<A> Item<A> {
-    fn failed(id: Option<String>, error: Problem) -> Self {
+    pub(crate) fn failed(id: Option<String>, error: Problem) -> Self {
         Self {
             id,
             status: error.status(),
@@ -108,7 +109,7 @@ struct Summary {
 }
 
 /// An item as sent: its fields in order, or what made it unreadable.
-enum RawItem {
+pub(crate) enum RawItem {
     Fields(Vec<(String, Value)>),
     /// A field named twice. `GET` with a repeated parameter fails to parse,
     /// so the item fails the same way rather than keeping the last value.
@@ -176,9 +177,15 @@ impl<'de> Visitor<'de> for RawItemVisitor {
 }
 
 /// An item checked and ready to look up, or already failed.
-enum Prepared<Q> {
-    Ready(Option<String>, Q),
-    Failed(Option<String>, Problem),
+pub(crate) enum Prepared<Q> {
+    Ready {
+        id: Option<String>,
+        query: Q,
+    },
+    Failed {
+        id: Option<String>,
+        problem: Problem,
+    },
 }
 
 /// Sets its flag when dropped. axum drops a handler's future when its client
@@ -276,14 +283,16 @@ where
     map_in_order(
         &prepared,
         |item| match item {
-            Prepared::Ready(_, query) => Some((lookup.place)(query)),
-            Prepared::Failed(..) => None,
+            Prepared::Ready { query, .. } => Some((lookup.place)(query)),
+            Prepared::Failed { .. } => None,
         },
         cancel,
         |_, item| {
             Ok(match item {
-                Prepared::Ready(id, query) => look_up(state, lookup, id.clone(), query.clone()),
-                Prepared::Failed(id, problem) => Item::failed(id.clone(), problem.clone()),
+                Prepared::Ready { id, query, .. } => {
+                    look_up(state, lookup, id.clone(), query.clone())
+                }
+                Prepared::Failed { id, problem } => Item::failed(id.clone(), problem.clone()),
             })
         },
     )
@@ -332,7 +341,7 @@ fn finish<A>(
 
 /// Check one item by the rules its `GET` is checked with. A panic fails the
 /// item, not the batch.
-fn prepare<P, Q, A, K>(
+pub(crate) fn prepare<P, Q, A, K>(
     lookup: Lookup<P, Q, A, K>,
     shared: &[(String, String)],
     item: RawItem,
@@ -342,12 +351,24 @@ where
 {
     let fields = match item {
         RawItem::Fields(fields) => fields,
-        RawItem::Repeated => return Prepared::Failed(None, Problem::unparsable_parameters()),
-        RawItem::NotAnObject => unreachable!("read_items rejects a body with one"),
+        RawItem::Repeated => {
+            return Prepared::Failed {
+                id: None,
+                problem: Problem::unparsable_parameters(),
+            };
+        }
+        // A `QUERY` body with one is refused whole; a `/batches` line fails
+        // alone.
+        RawItem::NotAnObject => {
+            return Prepared::Failed {
+                id: None,
+                problem: Problem::malformed_body("an item must be a JSON object"),
+            };
+        }
     };
     let id = match item_id(&fields) {
         Ok(id) => id,
-        Err(problem) => return Prepared::Failed(None, problem),
+        Err(problem) => return Prepared::Failed { id: None, problem },
     };
     let checked = catch_unwind(AssertUnwindSafe(|| -> Result<Q, Problem> {
         let query = item_query(shared, &fields)?;
@@ -357,13 +378,13 @@ where
     }))
     .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
     match checked {
-        Ok(query) => Prepared::Ready(id, query),
-        Err(problem) => Prepared::Failed(id, problem),
+        Ok(query) => Prepared::Ready { id, query },
+        Err(problem) => Prepared::Failed { id, problem },
     }
 }
 
 /// One item looked up. A panic fails the item, not the batch.
-fn look_up<P, Q, A, K>(
+pub(crate) fn look_up<P, Q, A, K>(
     state: &AppState,
     lookup: Lookup<P, Q, A, K>,
     id: Option<String>,
@@ -385,7 +406,7 @@ fn look_up<P, Q, A, K>(
 }
 
 /// The request's own query string, which every item starts from.
-fn shared_parameters(query: Option<&str>) -> Result<Vec<(String, String)>, Problem> {
+pub(crate) fn shared_parameters(query: Option<&str>) -> Result<Vec<(String, String)>, Problem> {
     serde_urlencoded::from_str(query.unwrap_or_default())
         .map_err(|_| Problem::unparsable_parameters())
 }
@@ -447,7 +468,7 @@ fn item_id(item: &[(String, Value)]) -> Result<Option<String>, Problem> {
 /// The body's items, checked before any is looked up.
 async fn read_items(request: Request) -> Result<Vec<RawItem>, Problem> {
     if !is_json(request.headers()) {
-        return Err(Problem::unsupported_media_type());
+        return Err(Problem::unsupported_media_type(MEDIA_TYPE));
     }
     let declared = request
         .headers()
@@ -486,11 +507,16 @@ async fn read_items(request: Request) -> Result<Vec<RawItem>, Problem> {
 
 /// `application/json`, with or without parameters such as `charset`.
 fn is_json(headers: &HeaderMap) -> bool {
+    media_type(headers).is_some_and(|media_type| media_type.eq_ignore_ascii_case(MEDIA_TYPE))
+}
+
+/// The `Content-Type` without its parameters, such as `charset`.
+pub(crate) fn media_type(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(MEDIA_TYPE))
+        .map(str::trim)
 }
 
 /// The headers every response of a batchable route carries, so a client can

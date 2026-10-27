@@ -262,12 +262,13 @@ impl Problem {
             .with_detail(format!("the body must be at most {max_bytes} bytes"))
     }
 
-    pub(crate) fn unsupported_media_type() -> Self {
+    /// `expected` names the media types the route reads.
+    pub(crate) fn unsupported_media_type(expected: &str) -> Self {
         Self::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ErrorCode::UnsupportedMediaType,
         )
-        .with_detail("the body must be sent as Content-Type: application/json")
+        .with_detail(format!("the body must be sent as Content-Type: {expected}"))
     }
 
     /// Every batch slot is taken. Refused at once rather than queued, so a
