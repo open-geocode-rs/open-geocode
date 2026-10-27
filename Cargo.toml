@@ -9,7 +9,7 @@ repository = "https://github.com/open-geocode-rs/open-geocode"
 readme = "README.md"
 keywords = ["geocoding", "geocoder", "osm", "gis", "geospatial"]
 categories = ["science::geo", "command-line-utilities"]
-exclude = ["assets/", "data/", "demo/vendor/", "docs/", "*.pmtiles"]
+exclude = ["assets/", "data/", "docs/", "*.pmtiles"]
 
 [package.metadata.docs.rs]
 all-features = true
