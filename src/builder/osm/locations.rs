@@ -318,8 +318,10 @@ impl Spill for ChunkBits {
             .ok_or(Error::Decode("node set chunk truncated"))?;
         *input = &input[count * 8..];
         let words = bytes
-            .chunks_exact(8)
-            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word))
             .collect();
         Ok(Self { index, words })
     }
