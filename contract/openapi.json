@@ -1138,7 +1138,7 @@
         "operationId": "geocode_batch",
         "parameters": [
           {
-            "description": "House number and street,          without town or postcode. Applies to every item; an item's own field          overrides it.",
+            "description": "House number and street, without town or postcode. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "address",
             "required": false,
@@ -1148,7 +1148,7 @@
             }
           },
           {
-            "description": "City or town. Applies to          every item; an item's own field overrides it.",
+            "description": "City or town. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "locality",
             "required": false,
@@ -1158,7 +1158,7 @@
             }
           },
           {
-            "description": "State, province or region.          Applies to every item; an item's own field overrides it.",
+            "description": "State, province or region. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "region",
             "required": false,
@@ -1168,7 +1168,7 @@
             }
           },
           {
-            "description": "Postal code. Applies to          every item; an item's own field overrides it.",
+            "description": "Postal code. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "postcode",
             "required": false,
@@ -1178,7 +1178,7 @@
             }
           },
           {
-            "description": "Number of candidates to          consider. Applies to every item; an item's own field overrides it.",
+            "description": "Number of candidates to consider. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -1189,7 +1189,7 @@
             }
           },
           {
-            "description": "Consider only candidates of          this layer. Applies to every item; an item's own field overrides it.",
+            "description": "Consider only candidates of this layer. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "layer",
             "required": false,
@@ -1198,7 +1198,7 @@
             }
           },
           {
-            "description": "Comma-separated ISO 3166-1          alpha-2 codes. Applies to every item; an item's own field overrides it.",
+            "description": "Comma-separated ISO 3166-1 alpha-2 codes. Applies to every item; an item's own field overrides it.",
             "example": "CA",
             "in": "query",
             "name": "country",
@@ -1429,7 +1429,7 @@
                 }
               }
             },
-            "description": "Every batch slot is taken. Retry after the                                       `Retry-After` header's seconds.",
+            "description": "Every batch slot is taken. Retry after the `Retry-After` header's seconds.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -1802,7 +1802,7 @@
         "operationId": "reverse_batch",
         "parameters": [
           {
-            "description": "Longitude in degrees. Applies to          every item; an item's own field overrides it.",
+            "description": "Longitude in degrees. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "lon",
             "required": false,
@@ -1814,7 +1814,7 @@
             }
           },
           {
-            "description": "Latitude in degrees. Applies to          every item; an item's own field overrides it.",
+            "description": "Latitude in degrees. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "lat",
             "required": false,
@@ -2047,7 +2047,7 @@
                 }
               }
             },
-            "description": "Every batch slot is taken. Retry after the                                       `Retry-After` header's seconds.",
+            "description": "Every batch slot is taken. Retry after the `Retry-After` header's seconds.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",

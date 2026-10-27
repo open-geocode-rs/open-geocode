@@ -599,14 +599,32 @@ pub(crate) async fn geocode(
     path = "/geocode",
     tag = "geocoding",
     params(
-        ("address" = Option<String>, Query, description = "House number and street,          without town or postcode. Applies to every item; an item's own field          overrides it.", max_length = 256),
-        ("locality" = Option<String>, Query, description = "City or town. Applies to          every item; an item's own field overrides it.", max_length = 256),
-        ("region" = Option<String>, Query, description = "State, province or region.          Applies to every item; an item's own field overrides it.", max_length = 256),
-        ("postcode" = Option<String>, Query, description = "Postal code. Applies to          every item; an item's own field overrides it.", max_length = 256),
-        ("limit" = Option<usize>, Query, description = "Number of candidates to          consider. Applies to every item; an item's own field overrides it.",
+        ("address" = Option<String>, Query,
+         description = "House number and street, without town or postcode. Applies \
+                        to every item; an item's own field overrides it.",
+         max_length = 256),
+        ("locality" = Option<String>, Query,
+         description = "City or town. Applies to every item; an item's own field \
+                        overrides it.",
+         max_length = 256),
+        ("region" = Option<String>, Query,
+         description = "State, province or region. Applies to every item; an \
+                        item's own field overrides it.",
+         max_length = 256),
+        ("postcode" = Option<String>, Query,
+         description = "Postal code. Applies to every item; an item's own field \
+                        overrides it.",
+         max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "Number of candidates to consider. Applies to every item; \
+                        an item's own field overrides it.",
          minimum = 0, maximum = 50),
-        ("layer" = Option<Layer>, Query, description = "Consider only candidates of          this layer. Applies to every item; an item's own field overrides it."),
-        ("country" = Option<String>, Query, description = "Comma-separated ISO 3166-1          alpha-2 codes. Applies to every item; an item's own field overrides it.",
+        ("layer" = Option<Layer>, Query,
+         description = "Consider only candidates of this layer. Applies to every \
+                        item; an item's own field overrides it."),
+        ("country" = Option<String>, Query,
+         description = "Comma-separated ISO 3166-1 alpha-2 codes. Applies to every \
+                        item; an item's own field overrides it.",
          example = "CA"),
     ),
     request_body(content = Vec<openapi::GeocodeItem>, content_type = "application/json"),
@@ -622,7 +640,8 @@ pub(crate) async fn geocode(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The batch failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the                                       `Retry-After` header's seconds.",
+        (status = 503, description = "Every batch slot is taken. Retry after the \
+                                      `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -732,8 +751,14 @@ pub(crate) async fn reverse(
     path = "/reverse",
     tag = "geocoding",
     params(
-        ("lon" = Option<f64>, Query, description = "Longitude in degrees. Applies to          every item; an item's own field overrides it.", minimum = -180.0, maximum = 180.0),
-        ("lat" = Option<f64>, Query, description = "Latitude in degrees. Applies to          every item; an item's own field overrides it.", minimum = -90.0, maximum = 90.0),
+        ("lon" = Option<f64>, Query,
+         description = "Longitude in degrees. Applies to every item; an item's own \
+                        field overrides it.",
+         minimum = -180.0, maximum = 180.0),
+        ("lat" = Option<f64>, Query,
+         description = "Latitude in degrees. Applies to every item; an item's own \
+                        field overrides it.",
+         minimum = -90.0, maximum = 90.0),
     ),
     request_body(content = Vec<openapi::ReverseItem>, content_type = "application/json"),
     responses(
@@ -748,7 +773,8 @@ pub(crate) async fn reverse(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The batch failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the                                       `Retry-After` header's seconds.",
+        (status = 503, description = "Every batch slot is taken. Retry after the \
+                                      `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
