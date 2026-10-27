@@ -125,6 +125,12 @@ pub fn yield_to_interactive_programs() {
     platform::yield_to_interactive_programs();
 }
 
+/// Run the calling thread below the process's other threads, so its work
+/// takes only the CPU they leave idle.
+pub fn lower_this_thread() {
+    platform::lower_this_thread();
+}
+
 #[cfg(windows)]
 mod platform {
     use std::{os::windows::ffi::OsStrExt, path::Path};
@@ -144,10 +150,11 @@ mod platform {
             SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
             Threading::{
                 ALL_PROCESSOR_GROUPS, BELOW_NORMAL_PRIORITY_CLASS, GetActiveProcessorCount,
-                GetCurrentProcess, GetCurrentThreadId, GetProcessAffinityMask, GetProcessTimes,
-                GetThreadTimes, OpenThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-                PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-                ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+                GetCurrentProcess, GetCurrentThread, GetCurrentThreadId, GetProcessAffinityMask,
+                GetProcessTimes, GetThreadTimes, OpenThread,
+                PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass,
+                SetProcessInformation, SetThreadPriority, THREAD_PRIORITY_LOWEST,
                 THREAD_QUERY_LIMITED_INFORMATION,
             },
         },
@@ -377,6 +384,14 @@ mod platform {
         // the call takes. Failure leaves the normal priority.
         unsafe {
             SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        }
+    }
+
+    pub(super) fn lower_this_thread() {
+        // SAFETY: the pseudo handle of the calling thread, and a priority the
+        // call takes. Failure leaves the normal priority.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         }
     }
 
@@ -616,6 +631,22 @@ mod platform {
     }
 
     pub(super) fn opt_out_of_power_throttling() {}
+
+    // Linux keeps a niceness per thread, so this lowers only the caller.
+    #[cfg(target_os = "linux")]
+    pub(super) fn lower_this_thread() {
+        // SAFETY: gettid and setpriority read no memory. Failure leaves the
+        // niceness the thread started with.
+        unsafe {
+            let thread = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            libc::setpriority(libc::PRIO_PROCESS, thread, 10);
+        }
+    }
+
+    // Elsewhere niceness belongs to the whole process, and lowering it would
+    // slow single lookups too.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn lower_this_thread() {}
 
     pub(super) fn yield_to_interactive_programs() {
         // SAFETY: setpriority reads no memory. Failure leaves the niceness

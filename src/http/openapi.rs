@@ -73,7 +73,6 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     ),
     paths(
         crate::runtime::search,
-        crate::runtime::search_batch,
         crate::runtime::autocomplete,
         crate::runtime::geocode,
         crate::runtime::geocode_batch,
@@ -111,7 +110,6 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Layer,
         Problem,
         GeocodeItem,
-        SearchItem,
         ReverseItem,
         ForwardBatch,
         ForwardResult,
@@ -180,13 +178,16 @@ pub(crate) enum ErrorCode {
     MethodNotAllowed,
     /// A batch held more than 1000 items.
     TooManyItems,
-    /// A batch body was over its cap, which is checked before it is read.
+    /// A batch body was over its cap.
     BodyTooLarge,
     /// A batch body was not sent as `application/json`.
     UnsupportedMediaType,
     /// Something failed inside the server. The cause is in the logs under
     /// `request_id`, never in the body.
     InternalError,
+    /// Every batch slot was taken. Retry after the `Retry-After` header's
+    /// seconds.
+    Busy,
 }
 
 // Mirrors [`crate::http::problem::InvalidParam`] for the schema.
@@ -203,6 +204,9 @@ pub(crate) struct InvalidParam {
 }
 
 /// One item of a `/geocode` batch: `GET /geocode`'s parameters and an `id`.
+///
+/// Every field is optional here because the request's query string may give
+/// it for all items. `address` must come from one or the other.
 #[derive(utoipa::ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct GeocodeItem {
@@ -212,7 +216,7 @@ pub(crate) struct GeocodeItem {
     /// The street address on its own: house number and street, without the
     /// town or postcode.
     #[schema(example = "10 King Street", min_length = 1, max_length = 256)]
-    pub address: String,
+    pub address: Option<String>,
     /// The town or city the address is in.
     #[schema(example = "Toronto", max_length = 256)]
     pub locality: Option<String>,
@@ -230,31 +234,10 @@ pub(crate) struct GeocodeItem {
     pub country: Option<String>,
 }
 
-/// One item of a `/search` batch: `GET /search`'s parameters and an `id`.
-#[derive(utoipa::ToSchema)]
-#[allow(dead_code)]
-pub(crate) struct SearchItem {
-    /// Echoed in this item's result, to match it up.
-    #[schema(example = "row-1", max_length = 128)]
-    pub id: Option<String>,
-    /// The text to search for.
-    #[schema(example = "10 King Street, Toronto", min_length = 1, max_length = 256)]
-    pub q: String,
-    #[schema(minimum = 0, maximum = 50)]
-    pub limit: Option<usize>,
-    pub layer: Option<Layer>,
-    /// ISO 3166-1 alpha-2 codes, comma-separated.
-    #[schema(example = "NZ,AU")]
-    pub country: Option<String>,
-    /// Where the caller is, `lon,lat`.
-    #[schema(example = "-79.38,43.65")]
-    pub focus: Option<String>,
-    /// `min_lon,min_lat,max_lon,max_lat`.
-    #[schema(example = "-79.64,43.58,-79.12,43.86")]
-    pub bbox: Option<String>,
-}
-
 /// One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.
+///
+/// `lon` and `lat` may come from the request's query string instead, for
+/// every item.
 #[derive(utoipa::ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct ReverseItem {
@@ -262,9 +245,9 @@ pub(crate) struct ReverseItem {
     #[schema(example = "row-1", max_length = 128)]
     pub id: Option<String>,
     #[schema(example = -79.3832, minimum = -180.0, maximum = 180.0)]
-    pub lon: f64,
+    pub lon: Option<f64>,
     #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
-    pub lat: f64,
+    pub lat: Option<f64>,
 }
 
 /// A forward batch's answer: one result per item, in input order.
@@ -437,10 +420,7 @@ fn method_not_allowed_response(batchable: bool) -> Value {
             batch::METHODS,
         )
     } else {
-        (
-            "Method not allowed. The route accepts `GET` only.",
-            "GET",
-        )
+        ("Method not allowed. The route accepts `GET` only.", "GET")
     };
     serde_json::json!({
         "description": description,
@@ -698,6 +678,7 @@ mod tests {
             RuntimeErrorCode::BodyTooLarge,
             RuntimeErrorCode::UnsupportedMediaType,
             RuntimeErrorCode::InternalError,
+            RuntimeErrorCode::Busy,
         ] {
             assert!(
                 documented.contains(code.as_str()),

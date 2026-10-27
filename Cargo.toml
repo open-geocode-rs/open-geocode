@@ -47,9 +47,6 @@ geojson = "1.0"
 # already in the tree through ureq's url.
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_properties = "2.3"
-# Tells a batch body over its cap from one that failed to arrive. Already in
-# the tree through axum.
-http-body-util = "0.1"
 indicatif = "0.17"
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"
@@ -82,7 +79,7 @@ tantivy = "0.25.0"
 # query word may be a typo of. Tantivy's own fuzzy query has no prefix length.
 tantivy-fst = "0.5"
 thiserror = "2"
-tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread", "sync"] }
 tower-http = { version = "0.6", features = ["fs"] }
 # The Unicode Script property: which characters the parser reads as a
 # script written without spaces.

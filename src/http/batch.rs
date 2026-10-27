@@ -6,7 +6,7 @@
 //! the one that `GET` would return. A bad item never fails the batch.
 
 use std::{
-    error::Error as _,
+    fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
@@ -16,15 +16,19 @@ use std::{
 };
 
 use axum::{
-    Json,
-    body::to_bytes,
-    extract::Request,
+    body::Bytes,
+    extract::{
+        FromRequest, Request,
+        rejection::{BytesRejection, FailedToBufferBody},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use http_body_util::LengthLimitError;
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Map, Value};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::Value;
 use tokio::task;
 
 use crate::{
@@ -43,24 +47,30 @@ pub(crate) const METHODS: &str = "GET, QUERY, POST";
 /// The one media type a batch body is read as, as `Accept-Query` lists it.
 pub(crate) const MEDIA_TYPE: &str = "application/json";
 
+/// Seconds a refused batch is told to wait. Batches of 1000 items finish in
+/// well under that on a warm Pack.
+const RETRY_AFTER_SECONDS: u32 = 1;
+
 /// One route's lookup, split where a batch needs it: `prepare` checks
-/// parameters by the rules `GET` checks them with, and `answer` looks them
-/// up. The `GET` handler runs the same two.
-pub(crate) struct Lookup<P, Q, A> {
+/// parameters by the rules `GET` checks them with, `place` says where the
+/// lookup will read in the Pack, and `answer` looks it up. The `GET` handler
+/// runs `prepare` and `answer` too.
+pub(crate) struct Lookup<P, Q, A, K> {
     pub(crate) route: &'static str,
     pub(crate) prepare: fn(P) -> Result<Q, Problem>,
+    pub(crate) place: fn(&Q) -> K,
     pub(crate) answer: fn(&AppState, Q) -> crate::Result<A>,
 }
 
-// By hand: a derive would demand `P`, `Q` and `A` be `Copy` too, though only
-// function pointers are held.
-impl<P, Q, A> Clone for Lookup<P, Q, A> {
+// By hand: a derive would demand the type parameters be `Copy` too, though
+// only function pointers are held.
+impl<P, Q, A, K> Clone for Lookup<P, Q, A, K> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<P, Q, A> Copy for Lookup<P, Q, A> {}
+impl<P, Q, A, K> Copy for Lookup<P, Q, A, K> {}
 
 #[derive(Debug, Serialize)]
 struct Batch<A> {
@@ -97,6 +107,80 @@ struct Summary {
     failed: usize,
 }
 
+/// An item as sent: its fields in order, or what made it unreadable.
+enum RawItem {
+    Fields(Vec<(String, Value)>),
+    /// A field named twice. `GET` with a repeated parameter fails to parse,
+    /// so the item fails the same way rather than keeping the last value.
+    Repeated,
+    NotAnObject,
+}
+
+impl<'de> Deserialize<'de> for RawItem {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(RawItemVisitor)
+    }
+}
+
+struct RawItemVisitor;
+
+impl<'de> Visitor<'de> for RawItemVisitor {
+    type Value = RawItem;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<RawItem, M::Error> {
+        let mut fields = Vec::<(String, Value)>::new();
+        let mut repeated = false;
+        while let Some((name, value)) = map.next_entry::<String, Value>()? {
+            repeated |= fields.iter().any(|(seen, _)| *seen == name);
+            fields.push((name, value));
+        }
+        Ok(if repeated {
+            RawItem::Repeated
+        } else {
+            RawItem::Fields(fields)
+        })
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<RawItem, S::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(RawItem::NotAnObject)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<RawItem, E> {
+        Ok(RawItem::NotAnObject)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<RawItem, E> {
+        Ok(RawItem::NotAnObject)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<RawItem, E> {
+        Ok(RawItem::NotAnObject)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<RawItem, E> {
+        Ok(RawItem::NotAnObject)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<RawItem, E> {
+        Ok(RawItem::NotAnObject)
+    }
+
+    fn visit_unit<E>(self) -> Result<RawItem, E> {
+        Ok(RawItem::NotAnObject)
+    }
+}
+
+/// An item checked and ready to look up, or already failed.
+enum Prepared<Q> {
+    Ready(Option<String>, Q),
+    Failed(Option<String>, Problem),
+}
+
 /// Sets its flag when dropped. axum drops a handler's future when its client
 /// disconnects, and this with it, which stops the items not yet started.
 struct StopOnDrop(Arc<AtomicBool>);
@@ -108,15 +192,16 @@ impl Drop for StopOnDrop {
 }
 
 /// Answer a batch request on `lookup`'s route.
-pub(crate) async fn run<P, Q, A>(
+pub(crate) async fn run<P, Q, A, K>(
     state: AppState,
-    lookup: Lookup<P, Q, A>,
+    lookup: Lookup<P, Q, A, K>,
     request: Request,
 ) -> Response
 where
     P: DeserializeOwned + 'static,
-    Q: 'static,
+    Q: Send + Sync + Clone + 'static,
     A: Serialize + Send + 'static,
+    K: Ord + 'static,
 {
     match answer(state, lookup, request).await {
         Ok(response) => response,
@@ -124,15 +209,16 @@ where
     }
 }
 
-async fn answer<P, Q, A>(
+async fn answer<P, Q, A, K>(
     state: AppState,
-    lookup: Lookup<P, Q, A>,
+    lookup: Lookup<P, Q, A, K>,
     request: Request,
 ) -> Result<Response, Problem>
 where
     P: DeserializeOwned + 'static,
-    Q: 'static,
+    Q: Send + Sync + Clone + 'static,
     A: Serialize + Send + 'static,
+    K: Ord + 'static,
 {
     let started = Instant::now();
     let request_id = request
@@ -141,25 +227,77 @@ where
         .map(|id| id.0.clone());
     let shared = shared_parameters(request.uri().query())?;
     let items = read_items(request).await?;
+    // Taken before any thread is, so a refused batch holds nothing while it
+    // waits to be told no.
+    let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
+        return Err(Problem::busy(RETRY_AFTER_SECONDS));
+    };
 
     let cancel = Arc::new(AtomicBool::new(false));
     let _stop = StopOnDrop(Arc::clone(&cancel));
     let worker = state.clone();
-    let results = task::spawn_blocking(move || {
-        // A pool of its own, so a single `GET` on the blocking pool never
-        // waits behind a batch's items.
+    let body = task::spawn_blocking(move || {
+        let _permit = permit;
         worker.batch_pool().install(|| {
-            map_in_order(
-                &items,
-                |_| (),
-                &cancel,
-                |_, item| Ok(look_up(&worker, lookup, &shared, item)),
-            )
+            let batch = answer_items(&worker, lookup, &shared, items, &cancel)?;
+            let batch = finish(&worker, lookup.route, request_id.as_deref(), started, batch);
+            serde_json::to_vec(&batch).map_err(crate::Error::from)
         })
     })
     .await?
     .map_err(Problem::from)?;
 
+    Ok((
+        [(header::CONTENT_TYPE, HeaderValue::from_static(MEDIA_TYPE))],
+        body,
+    )
+        .into_response())
+}
+
+/// Every item's result, in input order. Items are looked up in the order of
+/// where they read in the Pack, so neighbours share the pages they fault in.
+fn answer_items<P, Q, A, K>(
+    state: &AppState,
+    lookup: Lookup<P, Q, A, K>,
+    shared: &[(String, String)],
+    items: Vec<RawItem>,
+    cancel: &AtomicBool,
+) -> crate::Result<Vec<Item<A>>>
+where
+    P: DeserializeOwned,
+    Q: Send + Sync + Clone,
+    A: Send,
+    K: Ord,
+{
+    let prepared = items
+        .into_iter()
+        .map(|item| prepare(lookup, shared, item))
+        .collect::<Vec<_>>();
+    map_in_order(
+        &prepared,
+        |item| match item {
+            Prepared::Ready(_, query) => Some((lookup.place)(query)),
+            Prepared::Failed(..) => None,
+        },
+        cancel,
+        |_, item| {
+            Ok(match item {
+                Prepared::Ready(id, query) => look_up(state, lookup, id.clone(), query.clone()),
+                Prepared::Failed(id, problem) => Item::failed(id.clone(), problem.clone()),
+            })
+        },
+    )
+}
+
+/// Count the outcomes, and log and stamp the failures. Inside a 200 the
+/// request-id middleware sees no Problem, so the batch does both itself.
+fn finish<A>(
+    state: &AppState,
+    route: &str,
+    request_id: Option<&str>,
+    started: Instant,
+    results: Vec<Item<A>>,
+) -> Batch<A> {
     let mut summary = Summary {
         total: results.len(),
         ..Summary::default()
@@ -168,54 +306,71 @@ where
         .into_iter()
         .enumerate()
         .map(|(index, mut item)| {
-            let Some(error) = item.error.take() else {
+            let Some(mut error) = item.error.take() else {
                 summary.succeeded += 1;
                 return item;
             };
             summary.failed += 1;
-            // Inside a 200 the middleware sees no Problem, so the batch logs
-            // its own 500s and stamps its own ids.
-            let Some(id) = &request_id else {
-                item.error = Some(error);
-                return item;
-            };
             if error.status() == StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
                 state.error_log().internal_error(
-                    id,
-                    lookup.route,
+                    request_id.unwrap_or("-"),
+                    route,
                     Some(index),
                     started,
                     error.cause().map(|cause| format!("{cause:#}")),
                 );
             }
-            item.error = Some(error.with_request_id(id.clone()));
+            if let Some(id) = request_id {
+                error = error.with_request_id(id);
+            }
+            item.error = Some(error);
             item
         })
         .collect();
-
-    Ok(Json(Batch { results, summary }).into_response())
+    Batch { results, summary }
 }
 
-/// One item, answered or failed. A panic fails the item, not the batch.
-fn look_up<P, Q, A>(
-    state: &AppState,
-    lookup: Lookup<P, Q, A>,
+/// Check one item by the rules its `GET` is checked with. A panic fails the
+/// item, not the batch.
+fn prepare<P, Q, A, K>(
+    lookup: Lookup<P, Q, A, K>,
     shared: &[(String, String)],
-    item: &Map<String, Value>,
-) -> Item<A>
+    item: RawItem,
+) -> Prepared<Q>
 where
     P: DeserializeOwned,
 {
-    let id = match item_id(item) {
-        Ok(id) => id,
-        Err(problem) => return Item::failed(None, problem),
+    let fields = match item {
+        RawItem::Fields(fields) => fields,
+        RawItem::Repeated => return Prepared::Failed(None, Problem::unparsable_parameters()),
+        RawItem::NotAnObject => unreachable!("read_items rejects a body with one"),
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<A, Problem> {
-        let query = item_query(shared, item)?;
+    let id = match item_id(&fields) {
+        Ok(id) => id,
+        Err(problem) => return Prepared::Failed(None, problem),
+    };
+    let checked = catch_unwind(AssertUnwindSafe(|| -> Result<Q, Problem> {
+        let query = item_query(shared, &fields)?;
         let params = serde_urlencoded::from_str::<P>(&query)
             .map_err(|_| Problem::unparsable_parameters())?;
-        let prepared = (lookup.prepare)(params)?;
-        Ok((lookup.answer)(state, prepared)?)
+        (lookup.prepare)(params)
+    }))
+    .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
+    match checked {
+        Ok(query) => Prepared::Ready(id, query),
+        Err(problem) => Prepared::Failed(id, problem),
+    }
+}
+
+/// One item looked up. A panic fails the item, not the batch.
+fn look_up<P, Q, A, K>(
+    state: &AppState,
+    lookup: Lookup<P, Q, A, K>,
+    id: Option<String>,
+    query: Q,
+) -> Item<A> {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        (lookup.answer)(state, query).map_err(Problem::from)
     }))
     .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
     match outcome {
@@ -241,7 +396,7 @@ fn shared_parameters(query: Option<&str>) -> Result<Vec<(String, String)>, Probl
 /// Going through the query string, rather than reading the item as JSON into
 /// the parameters, is what makes an item mean what the same `GET` means: one
 /// parser, one set of rules, one set of errors.
-fn item_query(shared: &[(String, String)], item: &Map<String, Value>) -> Result<String, Problem> {
+fn item_query(shared: &[(String, String)], item: &[(String, Value)]) -> Result<String, Problem> {
     let mut own = Vec::with_capacity(item.len());
     for (name, value) in item {
         let value = match value {
@@ -252,11 +407,11 @@ fn item_query(shared: &[(String, String)], item: &Map<String, Value>) -> Result<
             Value::Null => continue,
             Value::Array(_) | Value::Object(_) => {
                 return Err(Problem::malformed_parameter(format!(
-                    "{name} must be a string or a number"
+                    "{name} must be a string, number or boolean"
                 ))
                 .with_invalid_params(vec![InvalidParam::new(
                     name.as_str(),
-                    "not a string or a number",
+                    "not a string, number or boolean",
                 )]));
             }
         };
@@ -274,12 +429,12 @@ fn item_query(shared: &[(String, String)], item: &Map<String, Value>) -> Result<
 }
 
 /// The item's `id`, echoed in its result.
-fn item_id(item: &Map<String, Value>) -> Result<Option<String>, Problem> {
+fn item_id(item: &[(String, Value)]) -> Result<Option<String>, Problem> {
     let invalid = |reason: &str| {
         Problem::malformed_parameter(format!("id {reason}"))
             .with_invalid_params(vec![InvalidParam::new("id", reason)])
     };
-    match item.get("id") {
+    match item.iter().find(|(name, _)| name == "id").map(|(_, id)| id) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(id)) if id.chars().count() <= MAX_BATCH_ID_CHARS => Ok(Some(id.clone())),
         Some(Value::String(_)) => Err(invalid(&format!(
@@ -290,46 +445,43 @@ fn item_id(item: &Map<String, Value>) -> Result<Option<String>, Problem> {
 }
 
 /// The body's items, checked before any is looked up.
-async fn read_items(request: Request) -> Result<Vec<Map<String, Value>>, Problem> {
-    let (parts, body) = request.into_parts();
-    if !is_json(&parts.headers) {
+async fn read_items(request: Request) -> Result<Vec<RawItem>, Problem> {
+    if !is_json(request.headers()) {
         return Err(Problem::unsupported_media_type());
     }
-    let declared = parts
-        .headers
+    let declared = request
+        .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
+    // A declared length is refused before a byte is read. A chunked body
+    // declares none, and the route's body limit stops it while it is read.
     if declared.is_some_and(|length| length > MAX_BATCH_BODY_BYTES as u64) {
         return Err(Problem::body_too_large(MAX_BATCH_BODY_BYTES));
     }
-    // A chunked body declares no length, so the cap is held while reading
-    // too.
-    let bytes = to_bytes(body, MAX_BATCH_BODY_BYTES)
+    let bytes = Bytes::from_request(request, &())
         .await
-        .map_err(|error| {
-            if is_length_limit(&error) {
+        .map_err(|rejection| match rejection {
+            BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
                 Problem::body_too_large(MAX_BATCH_BODY_BYTES)
-            } else {
-                Problem::malformed_body("the body could not be read")
             }
+            _ => Problem::malformed_body("the body could not be read"),
         })?;
 
-    let not_an_array = || Problem::malformed_body("the body must be a JSON array of objects");
-    let items: Vec<Value> = serde_json::from_slice(&bytes).map_err(|_| not_an_array())?;
+    let items: Vec<RawItem> = serde_json::from_slice(&bytes)
+        .map_err(|_| Problem::malformed_body("the body must be a JSON array of objects"))?;
     if items.len() > MAX_BATCH_ITEMS {
         return Err(Problem::too_many_items(MAX_BATCH_ITEMS));
     }
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, item)| match item {
-            Value::Object(item) => Ok(item),
-            _ => Err(Problem::malformed_body(format!(
-                "the body must be a JSON array of objects, and item {index} is not an object"
-            ))),
-        })
-        .collect()
+    if let Some(index) = items
+        .iter()
+        .position(|item| matches!(item, RawItem::NotAnObject))
+    {
+        return Err(Problem::malformed_body(format!(
+            "the body must be a JSON array of objects, and item {index} is not an object"
+        )));
+    }
+    Ok(items)
 }
 
 /// `application/json`, with or without parameters such as `charset`.
@@ -339,17 +491,6 @@ fn is_json(headers: &HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(MEDIA_TYPE))
-}
-
-fn is_length_limit(error: &axum::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
-    while let Some(error) = source {
-        if error.is::<LengthLimitError>() {
-            return true;
-        }
-        source = error.source();
-    }
-    false
 }
 
 /// The headers every response of a batchable route carries, so a client can

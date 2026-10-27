@@ -52,6 +52,7 @@ pub(crate) enum ErrorCode {
     BodyTooLarge,
     UnsupportedMediaType,
     InternalError,
+    Busy,
 }
 
 impl ErrorCode {
@@ -68,6 +69,7 @@ impl ErrorCode {
             Self::BodyTooLarge => "body_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::InternalError => "internal_error",
+            Self::Busy => "busy",
         }
     }
 
@@ -132,6 +134,10 @@ struct ProblemInner {
     /// Value for the `Allow` response header (405 only); never serialized.
     #[serde(skip)]
     allow: Option<String>,
+    /// Seconds for the `Retry-After` response header (503 only); never
+    /// serialized.
+    #[serde(skip)]
+    retry_after: Option<u32>,
     /// What went wrong behind a 500, for the log only; never serialized
     /// (Decision 31). An `Arc` because response extensions must be `Clone`.
     #[serde(skip)]
@@ -156,6 +162,7 @@ impl Problem {
             request_id: None,
             invalid_params: Vec::new(),
             allow: None,
+            retry_after: None,
             cause: None,
         }))
     }
@@ -203,8 +210,6 @@ impl Problem {
         &self.0.invalid_params
     }
 
-    // --- 400 ---------------------------------------------------------------
-
     pub(crate) fn invalid_query(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery).with_detail(detail)
     }
@@ -235,8 +240,6 @@ impl Problem {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedBody).with_detail(detail)
     }
 
-    // --- 404 / 405 ---------------------------------------------------------
-
     pub(crate) fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound).with_detail("unknown route")
     }
@@ -248,8 +251,6 @@ impl Problem {
         problem.0.allow = Some(allow);
         problem
     }
-
-    // --- 413 / 415 ---------------------------------------------------------
 
     pub(crate) fn too_many_items(max: usize) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::TooManyItems)
@@ -269,7 +270,14 @@ impl Problem {
         .with_detail("the body must be sent as Content-Type: application/json")
     }
 
-    // --- 500 ---------------------------------------------------------------
+    /// Every batch slot is taken. Refused at once rather than queued, so a
+    /// client learns to come back instead of holding a connection open.
+    pub(crate) fn busy(retry_after: u32) -> Self {
+        let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Busy)
+            .with_detail("the server is answering as many batches as it can; retry shortly");
+        problem.0.retry_after = Some(retry_after);
+        problem
+    }
 
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
@@ -307,6 +315,11 @@ impl Problem {
             && let Ok(value) = HeaderValue::from_str(allow)
         {
             response.headers_mut().insert(header::ALLOW, value);
+        }
+        if let Some(seconds) = self.0.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
     }
@@ -391,7 +404,7 @@ mod tests {
         assert!(value.get("instance").is_none());
     }
 
-    const ALL_CODES: [ErrorCode; 11] = [
+    const ALL_CODES: [ErrorCode; 12] = [
         ErrorCode::InvalidQuery,
         ErrorCode::InvalidCoordinate,
         ErrorCode::LimitTooLarge,
@@ -403,6 +416,7 @@ mod tests {
         ErrorCode::BodyTooLarge,
         ErrorCode::UnsupportedMediaType,
         ErrorCode::InternalError,
+        ErrorCode::Busy,
     ];
 
     /// `type` is either RFC 9457's `about:blank` or a URI that can actually be
