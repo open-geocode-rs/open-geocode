@@ -14,6 +14,7 @@
 pub(crate) mod batch;
 pub(crate) mod batches;
 pub(crate) mod bounds;
+pub(crate) mod edge;
 pub(crate) mod health;
 pub(crate) mod method;
 pub(crate) mod openapi;

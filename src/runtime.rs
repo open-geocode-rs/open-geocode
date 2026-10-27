@@ -21,12 +21,14 @@ use serde::Deserialize;
 use tokio::{net::TcpListener, sync::Semaphore, task};
 use tower_http::services::{ServeDir, ServeFile};
 
+pub use crate::http::edge::EdgeOptions;
+
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
         batch::{self, Lookup},
         batches::{self, BatchStore},
-        bounds, health, method, openapi,
+        bounds, edge, health, method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
@@ -46,6 +48,7 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    pub edge: EdgeOptions,
 }
 
 #[derive(Clone)]
@@ -226,7 +229,9 @@ pub(crate) struct ReverseParams {
 pub async fn serve(options: ServeOptions) -> Result<()> {
     let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
     tokio::spawn(batches::sweep_forever(state.clone()));
+    let pack_id = state.pack.container().fingerprint();
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
+    let app = edge::apply(app, &options.edge, pack_id)?;
 
     let listener = TcpListener::bind(options.bind)
         .await
@@ -1386,6 +1391,10 @@ mod router_tests {
             .and_then(|value| value.to_str().ok())
     }
 
+    fn header_value_of<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
     fn upload(uri: &str, content_type: &str, body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -2087,5 +2096,361 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    fn edge_router(pack: &Path, edge: EdgeOptions) -> Router {
+        let state = state_for(pack, true);
+        let pack_id = state.pack.container().fingerprint();
+        edge::apply(build_router(state, None, None), &edge, pack_id).expect("edge options")
+    }
+
+    fn with_headers(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = request(method, uri);
+        for (name, value) in headers {
+            request.headers_mut().append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn cors_headers_are_absent_unless_an_origin_is_allowed() {
+        let pack = temp_path("cors-off");
+        write_pack(&pack);
+        let router = edge_router(&pack, EdgeOptions::default());
+
+        let origin = [("origin", "https://app.example")];
+        for request in [
+            with_headers("GET", "/search?q=King%20Street", &origin),
+            with_headers(
+                "OPTIONS",
+                "/geocode",
+                &[
+                    ("origin", "https://app.example"),
+                    ("access-control-request-method", "POST"),
+                ],
+            ),
+        ] {
+            let reply = send(router.clone(), request).await;
+            assert!(
+                reply
+                    .headers
+                    .keys()
+                    .all(|name| !name.as_str().starts_with("access-control-")),
+                "{:?}",
+                reply.headers
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn cors_answers_a_preflight_before_the_method_restricted_routes() {
+        let pack = temp_path("cors-on");
+        write_pack(&pack);
+        let router = edge_router(
+            &pack,
+            EdgeOptions {
+                cors_origins: vec!["https://app.example/".to_string()],
+                ..EdgeOptions::default()
+            },
+        );
+
+        for (path, method) in [
+            ("/geocode", "POST"),
+            ("/geocode", "QUERY"),
+            ("/batches", "POST"),
+            ("/batches/abc", "DELETE"),
+            ("/search", "GET"),
+        ] {
+            let reply = send(
+                router.clone(),
+                with_headers(
+                    "OPTIONS",
+                    path,
+                    &[
+                        ("origin", "https://app.example"),
+                        ("access-control-request-method", method),
+                        ("access-control-request-headers", "content-type,prefer"),
+                    ],
+                ),
+            )
+            .await;
+            assert!(
+                reply.status.is_success(),
+                "{method} {path}: {}",
+                reply.status
+            );
+            assert_eq!(
+                header_value(&reply, "access-control-allow-origin"),
+                Some("https://app.example")
+            );
+            let methods = header_value(&reply, "access-control-allow-methods").unwrap();
+            assert!(methods.contains(method), "{methods}");
+            let allowed = header_value(&reply, "access-control-allow-headers")
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(allowed.contains("content-type") && allowed.contains("prefer"));
+        }
+
+        let reply = send(
+            router.clone(),
+            with_headers(
+                "GET",
+                "/search?q=King%20Street",
+                &[("origin", "https://app.example")],
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            header_value(&reply, "access-control-allow-origin"),
+            Some("https://app.example")
+        );
+        let exposed = header_value(&reply, "access-control-expose-headers").unwrap();
+        for name in ["x-request-id", "location", "retry-after"] {
+            assert!(exposed.contains(name), "{exposed}");
+        }
+
+        let other = send(
+            router,
+            with_headers(
+                "GET",
+                "/search?q=King%20Street",
+                &[("origin", "https://evil.example")],
+            ),
+        )
+        .await;
+        assert!(header_value(&other, "access-control-allow-origin").is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn cors_rejects_an_origin_that_is_not_a_header_value() {
+        let options = EdgeOptions {
+            cors_origins: vec!["bad\norigin".to_string()],
+            ..EdgeOptions::default()
+        };
+        assert!(edge::apply(Router::new(), &options, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn responses_are_compressed_as_the_client_accepts() {
+        use std::io::Read;
+
+        let pack = temp_path("compress");
+        write_pack(&pack);
+        let router = edge_router(&pack, EdgeOptions::default());
+        let uri = "/search?q=King%20Street";
+
+        let plain = send(router.clone(), request("GET", uri)).await;
+        assert!(plain.headers.get(header::CONTENT_ENCODING).is_none());
+
+        let gzip = send(
+            router.clone(),
+            with_headers("GET", uri, &[("accept-encoding", "gzip")]),
+        )
+        .await;
+        assert_eq!(header_value(&gzip, "content-encoding"), Some("gzip"));
+        assert!(
+            header_value(&gzip, "vary")
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("accept-encoding")
+        );
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&gzip.body[..])
+            .read_to_end(&mut decoded)
+            .expect("gunzip");
+        assert_eq!(decoded, plain.body);
+
+        let zstd = send(
+            router.clone(),
+            with_headers("GET", uri, &[("accept-encoding", "zstd")]),
+        )
+        .await;
+        assert_eq!(header_value(&zstd, "content-encoding"), Some("zstd"));
+
+        // Too small to be worth the frame.
+        let tiny = send(
+            router,
+            with_headers("GET", "/healthz", &[("accept-encoding", "gzip")]),
+        )
+        .await;
+        assert!(tiny.headers.get(header::CONTENT_ENCODING).is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Compression must not hold a batch's rows back until the upload ends.
+    #[tokio::test]
+    async fn compressed_batches_still_stream_while_uploading() {
+        use futures_util::{StreamExt, stream};
+        use std::convert::Infallible;
+        use std::io::Read;
+        use std::time::Duration;
+
+        let pack = temp_path("compress-stream");
+        write_pack(&pack);
+        let router = edge_router(&pack, EdgeOptions::default());
+
+        for encoding in ["gzip", "zstd"] {
+            let (upload, rows) = tokio::sync::mpsc::channel::<String>(4);
+            let body = Body::from_stream(stream::unfold(rows, |mut rows| async {
+                rows.recv()
+                    .await
+                    .map(|chunk| (Ok::<_, Infallible>(chunk), rows))
+            }));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/batches?endpoint=geocode")
+                .header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::ACCEPT_ENCODING, encoding)
+                .body(body)
+                .unwrap();
+            // Two windows of rows, so the first is answered while the upload
+            // is still open.
+            let rows = 2 * 256;
+            upload
+                .send("{\"address\": \"10 King Street\"}\n".repeat(rows))
+                .await
+                .unwrap();
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                header_value_of(response.headers(), "content-encoding"),
+                Some(encoding)
+            );
+
+            let mut chunks = response.into_body().into_data_stream();
+            let mut compressed = Vec::new();
+            let first = tokio::time::timeout(Duration::from_secs(5), chunks.next()).await;
+            let Ok(Some(Ok(first))) = first else {
+                panic!("{encoding}: no bytes arrived before the upload ended");
+            };
+            compressed.extend_from_slice(&first);
+
+            drop(upload);
+            while let Some(chunk) = chunks.next().await {
+                compressed.extend_from_slice(&chunk.expect("chunk"));
+            }
+            let mut decoded = Vec::new();
+            match encoding {
+                "gzip" => flate2::read::MultiGzDecoder::new(&compressed[..])
+                    .read_to_end(&mut decoded)
+                    .map(drop),
+                _ => zstd::stream::copy_decode(&compressed[..], &mut decoded),
+            }
+            .expect("decode");
+            assert_eq!(decoded.split(|byte| *byte == b'\n').count() - 1, rows);
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn lookups_carry_an_etag_and_answer_a_match_with_304() {
+        let pack = temp_path("etag");
+        write_pack(&pack);
+        let router = edge_router(&pack, EdgeOptions::default());
+        let uri = "/geocode?address=10%20King%20Street";
+
+        let first = send(router.clone(), request("GET", uri)).await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(
+            header_value(&first, "cache-control"),
+            Some("public, max-age=3600")
+        );
+        let etag = header_value(&first, "etag").expect("etag").to_string();
+
+        let again = send(router.clone(), request("GET", uri)).await;
+        assert_eq!(header_value(&again, "etag"), Some(etag.as_str()));
+
+        let other = send(router.clone(), request("GET", "/geocode?address=x")).await;
+        assert_ne!(header_value(&other, "etag"), Some(etag.as_str()));
+
+        for presented in [etag.clone(), format!("\"nope\", {etag}"), "*".to_string()] {
+            let reply = send(
+                router.clone(),
+                with_headers("GET", uri, &[("if-none-match", &presented)]),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::NOT_MODIFIED, "{presented}");
+            assert!(reply.body.is_empty());
+            assert_eq!(header_value(&reply, "etag"), Some(etag.as_str()));
+            assert_eq!(
+                header_value(&reply, "cache-control"),
+                Some("public, max-age=3600")
+            );
+            assert_eq!(header_value(&reply, "vary"), Some("accept-encoding"));
+        }
+
+        let stale = send(
+            router.clone(),
+            with_headers("GET", uri, &[("if-none-match", "W/\"0000000000000000\"")]),
+        )
+        .await;
+        assert_eq!(stale.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn only_successful_lookups_are_cacheable() {
+        let pack = temp_path("etag-errors");
+        write_pack(&pack);
+        let router = edge_router(&pack, EdgeOptions::default());
+
+        for (method, uri, status) in [
+            ("GET", "/search?q=", StatusCode::BAD_REQUEST),
+            ("GET", "/reverse?lon=999&lat=0", StatusCode::BAD_REQUEST),
+            ("GET", "/does-not-exist", StatusCode::NOT_FOUND),
+            ("POST", "/search", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(reply.status, status, "{method} {uri}");
+            assert!(reply.headers.get(header::CACHE_CONTROL).is_none(), "{uri}");
+            assert!(reply.headers.get(header::ETAG).is_none(), "{uri}");
+        }
+
+        for (method, uri) in [
+            ("GET", "/healthz"),
+            ("GET", "/readyz"),
+            ("GET", "/openapi.json"),
+            ("GET", "/batches/abc"),
+            ("POST", "/geocode"),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert!(reply.headers.get(header::CACHE_CONTROL).is_none(), "{uri}");
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn a_zero_max_age_sends_no_cache_headers() {
+        let pack = temp_path("etag-off");
+        write_pack(&pack);
+        let router = edge_router(
+            &pack,
+            EdgeOptions {
+                cache_max_age: 0,
+                ..EdgeOptions::default()
+            },
+        );
+        let reply = send(router, request("GET", "/search?q=King%20Street")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(reply.headers.get(header::CACHE_CONTROL).is_none());
+        assert!(reply.headers.get(header::ETAG).is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

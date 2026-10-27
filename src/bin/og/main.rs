@@ -191,6 +191,7 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             demo: None,
             bind,
             basemap: None,
+            edge: Default::default(),
         }))
         .map_err(Into::into)
 }

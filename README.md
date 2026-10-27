@@ -118,6 +118,12 @@ og serve canada-ontario
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 
+`open-geocode serve` takes three edge options:
+
+- `--cors-origin <ORIGIN>`: let a browser page on that origin call the API; repeat it, or pass `*` for any. Off by default: no CORS headers.
+- `--cache-max-age <SECS>`: `Cache-Control: public, max-age` and an `ETag` on `/search`, `/autocomplete`, `/geocode` and `/reverse` answers; an `If-None-Match` hit is a `304` that skips the lookup. Default 3600; `0` sends neither. Errors and `/batches` are never cached.
+- Responses over 32 bytes are gzip- or zstd-compressed when `Accept-Encoding` allows it.
+
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 
 ## Use Cases
