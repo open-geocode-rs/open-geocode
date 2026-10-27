@@ -1,0 +1,99 @@
+{
+ "meta": {
+  "suite": "pelias/acceptance-tests",
+  "url": "https://github.com/pelias/acceptance-tests",
+  "licence": "MIT (package.json); Copyright (c) Pelias contributors",
+  "commit": "5b11c3b0d8ac89363d9cb3dd87900027408c010b",
+  "queries": "verbatim from the suite",
+  "truth": "the point of the suite's expected address in that country's register, read as its register key reads it",
+  "registers": {
+   "nad": {
+    "register": "National Address Database",
+    "release": "Release 24, compiled 2026-09-30"
+   },
+   "oda": {
+    "register": "Open Database of Addresses",
+    "release": "v1.0, 2021"
+   },
+   "ryhti": {
+    "register": "Ryhti building addresses (successor of DVV Rakennusten osoitetiedot)",
+    "release": "2026-10-27"
+   },
+   "gnaf": {
+    "register": "G-NAF",
+    "release": "AUG 2026, GDA2020"
+   },
+   "ban": {
+    "register": "Base Adresse Nationale",
+    "release": "2026-10-27"
+   },
+   "juso": {
+    "register": "도로명주소 주소DB and 위치정보요약DB",
+    "release": "2026-09-30 (September 2026 full release)"
+   },
+   "gurs": {
+    "register": "Register naslovov",
+    "release": "2026-10-25"
+   },
+   "bag": {
+    "register": "Basisregistratie Adressen en Gebouwen (BAG)",
+    "release": "2026-10-08"
+   },
+   "dar": {
+    "register": "Danmarks Adresseregister (DAR)",
+    "release": "2026-10-27"
+   }
+  },
+  "same_place_m": 50.0,
+  "cases_read": 847,
+  "dropped": {
+   "needs a caller position": 2,
+   "no country stated": 36,
+   "no house expected": 434,
+   "no register for DE": 2,
+   "no register for ES": 1,
+   "no register for IT": 2,
+   "not a search": 313,
+   "not in register": 19,
+   "repeated query": 1,
+   "several places in register": 2,
+   "suite expects several places": 2
+  },
+  "rebuild": "python scripts/fixtures/suites.py pelias --suite <checkout> --cache <dir>"
+ },
+ "cases": [
+  {"name": "address_parsing.json#1", "q": "101 saint marks pl 10009", "form": "verbatim", "cohort": "address_parsing", "expect_lat": 40.7273317, "expect_lon": -73.9843996},
+  {"name": "address_parsing.json#5", "q": "455 43rd st new york ny 11232", "form": "verbatim", "cohort": "address_parsing", "expect_lat": 40.6495906, "expect_lon": -74.0069179},
+  {"name": "address_parsing.json#6", "q": "1 main st ny 11201", "form": "verbatim", "cohort": "address_parsing", "expect_lat": 40.7037725, "expect_lon": -73.9904517},
+  {"name": "address_parsing.json#7", "q": "186 Tuskegee St SE Atlanta GA", "form": "verbatim", "cohort": "address_parsing", "expect_lat": 33.7287581, "expect_lon": -84.3817657},
+  {"name": "admin_lookup.json#20", "q": "1 Hämeenkatu, Tampere, Finland", "form": "verbatim", "cohort": "admin_lookup", "expect_lat": 61.4982708, "expect_lon": 23.771495},
+  {"name": "australian_addresses.json#1", "q": "38 carrington st, deakin, ACT, australia", "form": "verbatim", "cohort": "australian_addresses", "expect_lat": -35.3179934, "expect_lon": 149.1011953},
+  {"name": "australian_addresses.json#3", "q": "41 Tristania St, rivett, ACT", "form": "verbatim", "cohort": "australian_addresses", "expect_lat": -35.3447902, "expect_lon": 149.044862},
+  {"name": "australian_addresses.json#4", "q": "160 Harbachs Rd, Dysart, TAS 7030", "form": "verbatim", "cohort": "australian_addresses", "expect_lat": -42.5853166, "expect_lon": 147.2410315},
+  {"name": "australian_addresses.json#4.1", "q": "160 Harbachs Rd, Dysart, Tasmania 7030", "form": "verbatim", "cohort": "australian_addresses", "expect_lat": -42.5853166, "expect_lon": 147.2410315},
+  {"name": "australian_addresses.json#5", "q": "113 Bargara Road, Bundaberg East, QLD, AUS", "form": "verbatim", "cohort": "australian_addresses", "expect_lat": -24.8540333, "expect_lon": 152.377722},
+  {"name": "confidence_score.json#1", "q": "1 West 72nd St, New York, NY, 10023", "form": "verbatim", "cohort": "confidence_score", "expect_lat": 40.7765547, "expect_lon": -73.976331},
+  {"name": "french_addresses.json#1", "q": "7 Rue Pointeau du Ronceray Rennes", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.116803, "expect_lon": -1.6656},
+  {"name": "french_addresses.json#2", "q": "20 Boulevard Saint-Martin, Paris", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.869011, "expect_lon": 2.356402},
+  {"name": "french_addresses.json#2-no-hyphen", "q": "20 Boulevard Saint Martin, Paris", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.869011, "expect_lon": 2.356402},
+  {"name": "french_addresses.json#2-no-hyphen-correct-format", "q": "Boulevard Saint Martin 20, Paris", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.869011, "expect_lon": 2.356402},
+  {"name": "french_addresses.json#2-abbrev", "q": "20 bd saint-martin paris", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.869011, "expect_lon": 2.356402},
+  {"name": "french_addresses.json#2-abbrev-hyphen", "q": "20 bd st martin paris", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.869011, "expect_lon": 2.356402},
+  {"name": "french_addresses.json#9", "q": "160 avenue aristide briand bagneux", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.796484, "expect_lon": 2.321376},
+  {"name": "french_addresses.json#10", "q": "40 Rue De L'arsenal, Bordeaux, France", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 44.852948, "expect_lon": -0.588163},
+  {"name": "french_addresses.json#10.1", "q": "40 Rue De L arsenal, Bordeaux, France", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 44.852948, "expect_lon": -0.588163},
+  {"name": "french_addresses.json#10.2", "q": "40 Rue De arsenal, Bordeaux, France", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 44.852948, "expect_lon": -0.588163},
+  {"name": "french_addresses.json#11", "q": "20 boulevard saint germain, paris, france", "form": "verbatim", "cohort": "french_addresses", "expect_lat": 48.849614, "expect_lon": 2.353642},
+  {"name": "korean_addresses.json#6", "q": "독서당로39길 22", "form": "verbatim", "cohort": "korean_addresses", "expect_lat": 37.5399693, "expect_lon": 127.0101217},
+  {"name": "missing_postcodes.json#1", "q": "267 e 10th st, new york, ny 10010", "form": "verbatim", "cohort": "missing_postcodes", "expect_lat": 40.7283597, "expect_lon": -73.9831874},
+  {"name": "search_alphanumeric_housenumber.json#5", "q": "Ulica ob starem zidovju 10a Izola Slovenia", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 45.5380791, "expect_lon": 13.6614668},
+  {"name": "search_alphanumeric_housenumber.json#5.1", "q": "10a Ulica ob starem zidovju Izola Slovenia", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 45.5380791, "expect_lon": 13.6614668},
+  {"name": "search_alphanumeric_housenumber.json#6", "q": "kinkerstraat 175F, amsterdam", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 52.365774, "expect_lon": 4.8673879},
+  {"name": "search_alphanumeric_housenumber.json#6.1", "q": "kinkerstraat 175 F, amsterdam", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 52.365774, "expect_lon": 4.8673879},
+  {"name": "search_alphanumeric_housenumber.json#7", "q": "Vanadiumweg 11C, Amersfoort", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 52.1714795, "expect_lon": 5.3609462},
+  {"name": "search_postal_cities.json#4", "q": "hobrovej 18, 9510, denmark", "form": "verbatim", "cohort": "search_postal_cities", "expect_lat": 56.7713561, "expect_lon": 9.8143534},
+  {"name": "search_postal_cities.json#5", "q": "15364 Kensington Park Dr, Woodbridge, VA", "form": "verbatim", "cohort": "search_postal_cities", "expect_lat": 38.624117, "expect_lon": -77.2821749},
+  {"name": "search_postal_cities.json#6", "q": "211 Knapp Rd, Syracuse, NY", "form": "verbatim", "cohort": "search_postal_cities", "expect_lat": 43.0408421, "expect_lon": -76.1976579},
+  {"name": "search_street_centroids.json#7", "q": "621 Martin Luther King Blvd portland or", "form": "verbatim", "cohort": "search_street_centroids", "expect_lat": 45.5185424, "expect_lon": -122.6621924}
+ ]
+}

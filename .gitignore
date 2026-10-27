@@ -36,5 +36,8 @@ data/
 # Python bytecode
 __pycache__/
 
-# Local scripts: fixture generators, baselines and vendoring helpers.
-/scripts/
+# Local scripts: baselines and vendoring helpers. Fixture generators are
+# committed so every answer key can be rebuilt.
+/scripts/*
+!/scripts/fixtures/
+node_modules/
