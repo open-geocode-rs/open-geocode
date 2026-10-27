@@ -12,6 +12,7 @@
 //! bundled Runtime serves the basemap file raw as a local-dev convenience.
 
 pub(crate) mod batch;
+pub(crate) mod batches;
 pub(crate) mod bounds;
 pub(crate) mod health;
 pub(crate) mod method;
