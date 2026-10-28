@@ -29,6 +29,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
+    rc::Rc,
     sync::{Arc, OnceLock},
     time::Instant,
 };
@@ -1580,8 +1581,9 @@ const REGION_AND_GROUP_SHARE: f64 = 0.2;
 struct Renderer<'a> {
     pack: &'a Reader,
     tagger: &'a LatticeTagger,
-    /// Every name of each area record, its `name` first.
-    names: HashMap<RecordId, Vec<String>>,
+    /// Every name of each area record, its `name` first. Shared, not cloned,
+    /// to each of the many draws from the same few areas.
+    names: FxHashMap<RecordId, Rc<[String]>>,
     /// The words a unit is written with: the Pack's unit words, PO box
     /// words and level words.
     unit_words: [Vec<String>; 3],
@@ -1597,7 +1599,7 @@ impl<'a> Renderer<'a> {
         Self {
             pack,
             tagger,
-            names: HashMap::new(),
+            names: FxHashMap::default(),
             // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
@@ -2238,15 +2240,15 @@ impl<'a> Renderer<'a> {
     }
 
     /// Every name of an area, its `name` first.
-    fn names(&mut self, id: Option<RecordId>) -> Result<Vec<String>> {
+    fn names(&mut self, id: Option<RecordId>) -> Result<Rc<[String]>> {
         let Some(id) = id else {
-            return Ok(Vec::new());
+            return Ok(Rc::default());
         };
         if let Some(names) = self.names.get(&id) {
-            return Ok(names.clone());
+            return Ok(Rc::clone(names));
         }
-        let names = self.pack.records().names(id)?;
-        self.names.insert(id, names.clone());
+        let names = Rc::<[String]>::from(self.pack.records().names(id)?);
+        self.names.insert(id, Rc::clone(&names));
         Ok(names)
     }
 }
