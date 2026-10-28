@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use crate::error::{Error, Result};
@@ -12,7 +13,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, Request, State, rejection::QueryRejection},
     handler::{Handler, HandlerWithoutStateExt},
-    middleware,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{MethodFilter, MethodRouter, on},
 };
@@ -29,6 +30,7 @@ use crate::{
         bounds, health, method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
+        shutdown::shutdown_signal,
     },
     pack::Reader,
     record::Layer,
@@ -38,6 +40,16 @@ use crate::{
     util::hilbert::hilbert_key,
 };
 
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
+/// Seconds a request that timed out is told to wait.
+const TIMEOUT_RETRY_AFTER_SECONDS: u32 = 1;
+
+/// How long a stopping server waits for running batches to record that they
+/// stopped. Each looks at its cancel flag every window of rows.
+const BATCH_SETTLE: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub pack: PathBuf,
@@ -46,6 +58,12 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    /// Longest a lookup or a `QUERY`/`POST` batch may take before it is
+    /// answered `503`. Zero for no limit.
+    pub request_timeout: Duration,
+    /// Longest to let in-flight requests finish once Ctrl-C or SIGTERM
+    /// arrives. Zero drops them at once.
+    pub shutdown_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -58,6 +76,7 @@ pub(crate) struct AppState {
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
     batches: Arc<BatchStore>,
+    request_timeout: Duration,
 }
 
 impl AppState {
@@ -90,7 +109,13 @@ impl AppState {
             // than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
             batches: Arc::new(BatchStore::open(batches.to_path_buf())?),
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
         })
+    }
+
+    pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     pub(crate) fn batches(&self) -> &BatchStore {
@@ -224,9 +249,14 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
+    let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?
+        .with_request_timeout(options.request_timeout);
     tokio::spawn(batches::sweep_forever(state.clone()));
-    let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
+    let app = build_router(
+        state.clone(),
+        options.demo.as_deref(),
+        options.basemap.as_deref(),
+    );
 
     let listener = TcpListener::bind(options.bind)
         .await
@@ -240,7 +270,77 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         options.pack.display(),
         options.bind
     );
-    axum::serve(listener, app).await.map_err(Error::from)
+    run(
+        listener,
+        app,
+        state,
+        shutdown_signal(),
+        options.shutdown_timeout,
+    )
+    .await
+}
+
+/// Serve until `stop` resolves, then drain for at most `drain`.
+///
+/// Split out from [`serve`] so a test can stop it without a signal.
+async fn run(
+    listener: TcpListener,
+    app: Router,
+    state: AppState,
+    stop: impl Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> Result<()> {
+    let ready = Arc::clone(&state.ready);
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            stop.await;
+            ready.store(false, Ordering::Release);
+            eprintln!(
+                "Shutting down: finishing in-flight requests, for at most {} s",
+                drain.as_secs()
+            );
+            let _ = stopping_tx.send(());
+        })
+        .into_future();
+    tokio::pin!(server);
+    // axum waits for open connections with no bound of its own, and a batch
+    // upload can hold one for minutes. The clock starts at the signal, not at
+    // startup.
+    let deadline = async {
+        if stopping_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        result = &mut server => result.map_err(Error::from)?,
+        () = deadline => eprintln!("Shutdown timeout reached; dropping open connections"),
+    }
+    // A batch can outlive its request (`Prefer: respond-async`), and its
+    // blocking thread would otherwise hold the process open until it ends.
+    state.batches().stop_running(BATCH_SETTLE).await;
+    eprintln!("Stopped");
+    Ok(())
+}
+
+/// Answer `503` to a request that outlives the request timeout.
+///
+/// Dropping the handler's future cancels what runs on the async side only. A
+/// batch stops for real: `batch::answer` holds a `StopOnDrop`, which the drop
+/// sets, so its items not yet started are skipped and its batch slot frees.
+/// A single lookup runs on `spawn_blocking`, which cannot be interrupted: it
+/// finishes in the background and its answer is discarded. The client is
+/// freed on time; the CPU is not.
+async fn deadline(State(limit): State<Duration>, request: Request, next: Next) -> Response {
+    if limit.is_zero() {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => Problem::timed_out(TIMEOUT_RETRY_AFTER_SECONDS).into_response(),
+    }
 }
 
 /// Assemble the public-demo router with its boundary policy: method-restricted
@@ -260,6 +360,13 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", batchable(geocode, geocode_batch))
         .route("/reverse", batchable(reverse, reverse_batch))
+        // `route_layer` covers the four routes above and no later one:
+        // `/batches` streams for minutes under its own stall cutoff, and the
+        // probes and the spec must answer however slow the lookups are.
+        .route_layer(middleware::from_fn_with_state(
+            state.request_timeout,
+            deadline,
+        ))
         .route(
             "/batches",
             only(MethodFilter::POST, "POST", batches::create),
@@ -443,6 +550,10 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "The lookup ran past the server's request \
+                                      timeout. Retry after the `Retry-After` \
+                                      header's seconds.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
 pub(crate) async fn search(
@@ -520,6 +631,10 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
                                       parameter is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "The lookup ran past the server's request \
+                                      timeout. Retry after the `Retry-After` \
+                                      header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -613,6 +728,10 @@ pub(crate) async fn autocomplete(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "The lookup ran past the server's request \
+                                      timeout. Retry after the `Retry-After` \
+                                      header's seconds.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
 pub(crate) async fn geocode(
@@ -683,8 +802,9 @@ pub(crate) async fn geocode(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The batch failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the \
-                                      `Retry-After` header's seconds.",
+        (status = 503, description = "Every batch slot is taken, or the batch ran \
+                                      past the server's request timeout. Retry \
+                                      after the `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -774,6 +894,10 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "The lookup ran past the server's request \
+                                      timeout. Retry after the `Retry-After` \
+                                      header's seconds.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
 pub(crate) async fn reverse(
@@ -823,8 +947,9 @@ pub(crate) async fn reverse(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The batch failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the \
-                                      `Retry-After` header's seconds.",
+        (status = 503, description = "Every batch slot is taken, or the batch ran \
+                                      past the server's request timeout. Retry \
+                                      after the `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -2087,5 +2212,397 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    fn raw_get(addr: SocketAddr, path: &str) -> std::io::Result<(u16, String)> {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+        )?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+        let status = reply
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .ok_or_else(|| std::io::Error::other(format!("no status in {reply:?}")))?;
+        let body = reply.split("\r\n\r\n").nth(1).unwrap_or_default();
+        Ok((status, body.to_string()))
+    }
+
+    /// `/slow` answers after a while and `/hang` never does; `started` is
+    /// told when either is entered.
+    fn drain_app(state: AppState, started: Arc<tokio::sync::Notify>) -> Router {
+        use axum::routing::get;
+        let on_slow = Arc::clone(&started);
+        Router::new()
+            .route(
+                "/slow",
+                get(move || async move {
+                    on_slow.notify_one();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "done"
+                }),
+            )
+            .route(
+                "/hang",
+                get(move || async move {
+                    started.notify_one();
+                    std::future::pending::<&str>().await
+                }),
+            )
+            .route("/readyz", get(health::readyz))
+            .with_state(state)
+    }
+
+    /// After the stop signal the server is not ready and takes no new
+    /// connection, and the request it was answering still completes.
+    #[tokio::test]
+    async fn shutdown_lets_an_in_flight_request_finish() {
+        let pack = temp_path("shutdown-drain");
+        write_pack(&pack);
+        let state = state_for(&pack, true);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app = drain_app(state.clone(), Arc::clone(&started));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(run(
+            listener,
+            app.clone(),
+            state.clone(),
+            async move {
+                let _ = stopped.await;
+            },
+            Duration::from_secs(10),
+        ));
+
+        let client = task::spawn_blocking(move || raw_get(addr, "/slow"));
+        started.notified().await;
+        assert!(state.is_ready());
+        stop.send(()).expect("stop");
+        while state.is_ready() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let readyz = send(app, request("GET", "/readyz")).await;
+        assert_eq!(readyz.status, StatusCode::SERVICE_UNAVAILABLE);
+        let mut refused = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(addr).is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(refused, "the listener is still accepting");
+
+        let (status, body) = client.await.expect("client").expect("reply");
+        assert_eq!((status, body.as_str()), (200, "done"));
+        server.await.expect("server").expect("clean stop");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A request that never ends cannot hold the server past the drain
+    /// timeout.
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_stuck_request_after_the_drain_timeout() {
+        use std::io::Write;
+        let pack = temp_path("shutdown-timeout");
+        write_pack(&pack);
+        let state = state_for(&pack, true);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app = drain_app(state.clone(), Arc::clone(&started));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(run(
+            listener,
+            app,
+            state.clone(),
+            async move {
+                started.notified().await;
+            },
+            Duration::from_millis(300),
+        ));
+        let mut stuck = std::net::TcpStream::connect(addr).expect("connect");
+        write!(stuck, "GET /hang HTTP/1.1\r\nHost: test\r\n\r\n").expect("send");
+
+        let began = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("shutdown is bounded")
+            .expect("server")
+            .expect("clean stop");
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert!(!state.is_ready());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A batch still running at shutdown is cancelled, keeping the rows it
+    /// answered, even when its upload then ends as if it were complete. It
+    /// is not left `running` for the next start to fail, nor recorded as
+    /// `completed` with rows missing.
+    #[tokio::test]
+    async fn shutdown_cancels_a_running_batch() {
+        let pack = temp_path("shutdown-batch");
+        write_pack(&pack);
+        let spool = pack.with_extension("batches");
+        let _ = std::fs::remove_dir_all(&spool);
+        let state = state_for(&pack, true);
+        let router = build_router(state.clone(), None, None);
+
+        // Past the 64 KiB the reader sniffs before it answers, then held open.
+        let rows = format!("street\n{}", "10 King Street\n".repeat(6000));
+        let (feed, chunks) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        feed.send(rows.into_bytes()).await.expect("first chunk");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/batches")
+                    .header(header::CONTENT_TYPE, "text/csv")
+                    .body(streamed(chunks))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .expect("location")
+            .to_string();
+        let status = || async { send(router.clone(), request("GET", &location)).await.json() };
+        // The reader answers whole windows of 256 rows and then waits for the
+        // rest of the next one, so 23 windows in it is parked on the upload.
+        let answered = 23 * 256;
+        let mut running = status().await;
+        for _ in 0..1000 {
+            if running["summary"]["total"].as_u64() >= Some(answered) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            running = status().await;
+        }
+        assert_eq!(running["status"], "running");
+        assert_eq!(running["summary"]["total"], answered);
+
+        state
+            .batches()
+            .stop_running(Duration::from_millis(100))
+            .await;
+        drop(feed);
+        let mut stopped = status().await;
+        for _ in 0..500 {
+            if stopped["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stopped = status().await;
+        }
+        assert_eq!(stopped["status"], "cancelled");
+        assert!(stopped["completed_at"].is_u64());
+        assert!(stopped["summary"]["total"].as_u64() >= Some(answered));
+        let record = std::fs::read_to_string(
+            spool.join(format!("{}.json", stopped["id"].as_str().expect("id"))),
+        )
+        .expect("record on disk");
+        assert!(record.contains("\"cancelled\""), "{record}");
+
+        drop(response);
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// A request body that goes on for as long as `chunks` stays open.
+    fn streamed(chunks: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Body {
+        Body::from_stream(futures_util::stream::unfold(chunks, |mut chunks| async {
+            let chunk = chunks.recv().await?;
+            Some((Ok::<_, std::io::Error>(chunk), chunks))
+        }))
+    }
+
+    /// A lookup that outruns the timeout is answered with the 503 Problem
+    /// and a `Retry-After`; the probes are not held to it.
+    ///
+    /// The blocking pool is cut to one thread and that thread parked, so a
+    /// lookup waits for it for as long as the test says, with no clock in
+    /// the test beyond the timeout itself.
+    #[test]
+    fn a_lookup_slower_than_the_timeout_gets_a_503_problem() {
+        let pack = temp_path("timeout-single");
+        write_pack(&pack);
+        let state = state_for(&pack, true).with_request_timeout(Duration::from_millis(100));
+        let router = build_router(state, None, None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let blocker = task::spawn_blocking(move || {
+                let _ = parked.recv();
+            });
+            for route in [
+                "/search?q=10%20King%20Street",
+                "/autocomplete?q=10%20King",
+                "/geocode?address=10%20King%20Street",
+                "/reverse?lon=-79&lat=43",
+            ] {
+                let reply = send(router.clone(), request("GET", route)).await;
+                assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{route}");
+                assert_eq!(reply.content_type(), "application/problem+json");
+                assert_eq!(reply.json()["error_code"], "timeout", "{route}");
+                assert!(reply.json()["request_id"].is_string());
+                assert_eq!(header_value(&reply, "retry-after"), Some("1"));
+            }
+            for route in ["/healthz", "/readyz", "/openapi.json"] {
+                let reply = send(router.clone(), request("GET", route)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{route}");
+            }
+
+            release.send(()).expect("release");
+            blocker.await.expect("blocker");
+            let reply = send(
+                router.clone(),
+                request("GET", "/geocode?address=10%20King%20Street"),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::OK);
+        });
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A timeout of zero is no timeout.
+    #[test]
+    fn a_zero_timeout_never_expires() {
+        let pack = temp_path("timeout-zero");
+        write_pack(&pack);
+        let state = state_for(&pack, true).with_request_timeout(Duration::ZERO);
+        let router = build_router(state, None, None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let blocker = task::spawn_blocking(move || {
+                let _ = parked.recv();
+            });
+            let lookup = tokio::spawn(send(
+                router.clone(),
+                request("GET", "/geocode?address=10%20King%20Street"),
+            ));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            release.send(()).expect("release");
+            blocker.await.expect("blocker");
+            assert_eq!(lookup.await.expect("lookup").status, StatusCode::OK);
+        });
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    static SLOW_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn slow_answer(state: &AppState, query: String) -> Result<ForwardCollection> {
+        SLOW_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        api::forward_collection(&state.pack, query, Vec::new())
+    }
+
+    /// A batch past the timeout gets the 503, and its work stops: items not
+    /// yet started are skipped and the batch slot comes back.
+    #[tokio::test]
+    async fn a_batch_past_the_timeout_is_stopped() {
+        let pack = temp_path("timeout-batch");
+        write_pack(&pack);
+        let state = state_for(&pack, true).with_request_timeout(Duration::from_millis(100));
+        let slots = Arc::clone(state.batch_slots());
+        let all_slots = slots.available_permits();
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::post(
+                    |State(state): State<AppState>, request: Request<Body>| async move {
+                        let lookup = Lookup {
+                            route: "/slow",
+                            prepare: |params: PanicParams| Ok(params.q),
+                            place: |_: &String| (),
+                            answer: slow_answer,
+                        };
+                        batch::run(state, lookup, request).await
+                    },
+                ),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.request_timeout,
+                deadline,
+            ))
+            .with_state(state);
+
+        let items = (0..MAX_BATCH_ITEMS)
+            .map(|index| format!(r#"{{"q": "street {index}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let reply = send(router, batch_request("POST", "/slow", format!("[{items}]"))).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.json()["error_code"], "timeout");
+        assert_eq!(header_value(&reply, "retry-after"), Some("1"));
+
+        for _ in 0..500 {
+            if slots.available_permits() == all_slots {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(slots.available_permits(), all_slots, "the slot is held");
+        let calls = SLOW_CALLS.load(Ordering::SeqCst);
+        assert!(calls < MAX_BATCH_ITEMS, "{calls} items ran");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(SLOW_CALLS.load(Ordering::SeqCst), calls, "work went on");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// An upload that takes longer than the timeout is not cut short by it.
+    #[tokio::test]
+    async fn batches_are_not_held_to_the_request_timeout() {
+        let pack = temp_path("timeout-batches");
+        write_pack(&pack);
+        let spool = pack.with_extension("batches");
+        let _ = std::fs::remove_dir_all(&spool);
+        let state = state_for(&pack, true).with_request_timeout(Duration::from_millis(50));
+        let router = build_router(state, None, None);
+
+        let (feed, chunks) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let rows = format!("street\n{}", "10 King Street\n".repeat(6000));
+        feed.send(rows.into_bytes()).await.expect("first chunk");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = feed.send(b"10 King Street\n".to_vec()).await;
+        });
+        let mut slow = Request::builder()
+            .method("POST")
+            .uri("/batches")
+            .header(header::CONTENT_TYPE, "text/csv")
+            .body(streamed(chunks))
+            .unwrap();
+        slow.headers_mut()
+            .insert("prefer", header::HeaderValue::from_static("respond-async"));
+        let began = std::time::Instant::now();
+        let reply = send(router, slow).await;
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
     }
 }
