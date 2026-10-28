@@ -1140,15 +1140,14 @@ impl ProjectionBuilder {
         self.projected.name = (!name_parts.is_empty()).then(|| name_parts.join(" "));
         let content_parts = unique_parts(self.content_parts);
         self.projected.content_text = content_parts.join(" ");
-        let context = self
-            .context_parts
-            .iter()
-            .map(String::as_str)
-            .chain(context_names.iter().copied())
-            .filter_map(search_text)
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.projected.context_text = unique_words(&context).unwrap_or_default();
+        self.projected.context_text = context_text(
+            &self
+                .context_parts
+                .iter()
+                .map(String::as_str)
+                .chain(context_names.iter().copied())
+                .collect::<Vec<_>>(),
+        );
         let autocomplete_subject_parts = unique_parts(self.autocomplete_subject_parts);
         self.projected.autocomplete_subject_text = autocomplete_subject_parts.join(" ");
         self.projected
@@ -1216,26 +1215,32 @@ pub(crate) const STREET_TYPE_ABBREVIATIONS: &[(&str, &str)] = &[
 /// finds the other. An initial or post-number "st" is left alone: there it is
 /// usually "Saint" ("St Clair Avenue", "12 St George Street").
 pub(crate) fn expand_address_abbreviations(value: &str) -> String {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
-    let mut expanded: Vec<&str> = Vec::with_capacity(tokens.len());
-    for (index, token) in tokens.iter().enumerate() {
-        let replacement = match *token {
-            "st" if index == 0 || is_numeric_token(tokens[index - 1]) => None,
+    let mut expanded = String::with_capacity(value.len() + 8);
+    let mut previous: Option<&str> = None;
+    let mut last_word: Option<&str> = None;
+    for token in value.split_whitespace() {
+        let replacement = match token {
+            "st" if previous.is_none_or(is_numeric_token) => None,
             _ => STREET_TYPE_ABBREVIATIONS
                 .iter()
-                .find(|(abbreviation, _)| abbreviation == token)
+                .find(|(abbreviation, _)| *abbreviation == token)
                 .map(|(_, word)| *word)
                 .or_else(|| {
-                    expanded
-                        .last()
-                        .is_some_and(|word| is_street_type(word))
+                    last_word
+                        .is_some_and(is_street_type)
                         .then(|| direction_word(token))
                         .flatten()
                 }),
         };
-        expanded.push(replacement.unwrap_or(*token));
+        let word = replacement.unwrap_or(token);
+        if previous.is_some() {
+            expanded.push(' ');
+        }
+        expanded.push_str(word);
+        previous = Some(token);
+        last_word = Some(word);
     }
-    expanded.join(" ")
+    expanded
 }
 
 /// A street name as the street field indexes it: like [`search_text`], and a
@@ -1243,12 +1248,17 @@ pub(crate) fn expand_address_abbreviations(value: &str) -> String {
 /// ("The Donway E" is "the donway east"). A query's street is expanded alike
 /// (see [`expand_final_direction`]).
 pub(crate) fn street_search_text(value: &str) -> Option<String> {
-    let mut words = search_text(value)?
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    expand_final_direction(&mut words);
-    Some(words.join(" "))
+    let text = search_text(value)?;
+    let mut street = String::with_capacity(text.len() + 4);
+    let mut words = text.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if !street.is_empty() {
+            street.push(' ');
+        }
+        let last = words.peek().is_none();
+        street.push_str(last.then(|| direction_word(word)).flatten().unwrap_or(word));
+    }
+    Some(street)
 }
 
 /// Expand a direction abbreviation that is the last of a street's words.
@@ -1414,13 +1424,63 @@ fn search_text(value: &str) -> Option<String> {
 fn unique_words(value: &str) -> Option<String> {
     let normalized = search_key(value)?;
     let mut seen = BTreeSet::new();
-    Some(
-        normalized
-            .split_whitespace()
-            .filter(|word| seen.insert(*word))
+    let mut words = String::with_capacity(normalized.len());
+    for word in normalized.split_whitespace() {
+        if seen.insert(word) {
+            if !words.is_empty() {
+                words.push(' ');
+            }
+            words.push_str(word);
+        }
+    }
+    Some(words)
+}
+
+/// Words of the area and context names, each name expanded on its own, each
+/// word once.
+///
+/// Records come in Hilbert order, so a thread's next record mostly repeats
+/// the names of its last. Normalizing them was most of a record's indexing
+/// time. The text depends on the names alone, so each thread keeps recent
+/// ones.
+fn context_text(names: &[&str]) -> String {
+    const SLOTS: usize = 1 << 10;
+    type Slot = Option<(Vec<String>, String)>;
+    thread_local! {
+        static RECENT: std::cell::RefCell<Vec<Slot>> =
+            std::cell::RefCell::new(vec![None; SLOTS]);
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for name in names {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+    }
+    let slot = hasher.digest() as usize % SLOTS;
+    let made = RECENT.with(|recent| {
+        recent.borrow()[slot]
+            .as_ref()
+            .filter(|(key, _)| key.iter().map(String::as_str).eq(names.iter().copied()))
+            .map(|(_, text)| text.clone())
+    });
+    if let Some(text) = made {
+        return text;
+    }
+    let text = unique_words(
+        &names
+            .iter()
+            .copied()
+            .filter_map(search_text)
             .collect::<Vec<_>>()
             .join(" "),
     )
+    .unwrap_or_default();
+    RECENT.with(|recent| {
+        recent.borrow_mut()[slot] = Some((
+            names.iter().map(|name| (*name).to_string()).collect(),
+            text.clone(),
+        ));
+    });
+    text
 }
 
 fn unique_parts(parts: Vec<String>) -> Vec<String> {
