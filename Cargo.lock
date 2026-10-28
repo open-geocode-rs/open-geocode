@@ -1926,6 +1926,7 @@ dependencies = [
  "rayon",
  "regex",
  "rstar 0.12.2",
+ "rustc-hash",
  "serde",
  "serde_json",
  "serde_urlencoded",

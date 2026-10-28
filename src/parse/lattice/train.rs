@@ -35,6 +35,7 @@ use std::{
 
 use crate::error::{Error, Result};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -945,7 +946,7 @@ fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
 /// transition table (`None` the global one) by previous and next state.
 #[derive(Debug, Default)]
 struct Gradient {
-    edge: HashMap<usize, f32>,
+    edge: FxHashMap<usize, f32>,
     transitions: HashMap<Option<CountryCode>, Vec<f32>>,
 }
 
