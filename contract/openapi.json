@@ -284,7 +284,8 @@
           "body_too_large",
           "unsupported_media_type",
           "internal_error",
-          "busy"
+          "busy",
+          "timeout"
         ],
         "type": "string"
       },
@@ -982,6 +983,25 @@
               }
             },
             "description": "Internal server error.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The lookup ran past the server's request timeout. Retry after the `Retry-After` header's seconds.",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
@@ -1842,6 +1862,39 @@
                 }
               }
             }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The lookup ran past the server's request timeout. Retry after the `Retry-After` header's seconds.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Geocode a structured address",
@@ -2145,7 +2198,7 @@
                 }
               }
             },
-            "description": "Every batch slot is taken. Retry after the `Retry-After` header's seconds.",
+            "description": "Every batch slot is taken, or the batch ran past the server's request timeout. Retry after the `Retry-After` header's seconds.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -2506,6 +2559,39 @@
                 }
               }
             }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The lookup ran past the server's request timeout. Retry after the `Retry-After` header's seconds.",
+            "headers": {
+              "Accept-Query": {
+                "description": "The media type a QUERY body is read as.",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "Allow": {
+                "description": "Methods the route accepts.",
+                "schema": {
+                  "example": "GET, QUERY, POST",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Reverse geocode a point",
@@ -2763,7 +2849,7 @@
                 }
               }
             },
-            "description": "Every batch slot is taken. Retry after the `Retry-After` header's seconds.",
+            "description": "Every batch slot is taken, or the batch ran past the server's request timeout. Retry after the `Retry-After` header's seconds.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -2937,6 +3023,25 @@
               }
             },
             "description": "Internal server error.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The lookup ran past the server's request timeout. Retry after the `Retry-After` header's seconds.",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",

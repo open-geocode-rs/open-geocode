@@ -36,7 +36,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
+    runtime::{DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -91,6 +91,11 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// Seconds a lookup or QUERY/POST batch may take before it is
+        /// answered 503. 0 for no limit. Does not apply to /batches.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
+        request_timeout: u64,
 
         /// Seconds to let in-flight requests finish after Ctrl-C or SIGTERM
         /// before dropping them. 0 drops them at once.
@@ -757,6 +762,7 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            request_timeout,
             shutdown_timeout,
         } => {
             serve(ServeOptions {
@@ -764,6 +770,7 @@ async fn main() -> Result<()> {
                 demo: Some(demo),
                 bind,
                 basemap: Some(basemap),
+                request_timeout: Duration::from_secs(request_timeout),
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;

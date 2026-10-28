@@ -125,6 +125,7 @@ Run `og` with no arguments for the interactive interface: pick a region, build i
 - Ctrl-C or SIGTERM stops accepting connections, makes `/readyz` answer `503`, lets in-flight requests finish, and exits `0`.
 - `open-geocode serve --shutdown-timeout <SECS>` (default 30) bounds that drain; open connections are dropped after it. `0` drops them at once. `og serve` always uses 30.
 - Batches still running when the server stops are cancelled and keep the rows answered so far (`GET /batches/{id}` says `cancelled`). A crash instead fails them on the next start.
+- `open-geocode serve --request-timeout <SECS>` (default 30, `0` for none) answers `503` with `Retry-After: 1` (`error_code: timeout`) to a `/search`, `/autocomplete`, `/geocode` or `/reverse` lookup, or a `QUERY`/`POST` batch, that runs longer. `/batches`, `/healthz`, `/readyz` and `/openapi.json` are exempt. A timed-out batch stops; a single lookup still runs to its end in the background. `og serve` always uses 30.
 
 ## Use Cases
 

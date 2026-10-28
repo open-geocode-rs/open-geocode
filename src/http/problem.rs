@@ -53,6 +53,7 @@ pub(crate) enum ErrorCode {
     UnsupportedMediaType,
     InternalError,
     Busy,
+    Timeout,
 }
 
 impl ErrorCode {
@@ -70,6 +71,7 @@ impl ErrorCode {
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::InternalError => "internal_error",
             Self::Busy => "busy",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -275,6 +277,16 @@ impl Problem {
         problem
     }
 
+    /// The request ran past the server's per-request limit. A 503 rather than
+    /// a 504: no upstream is involved, and the same request may well fit
+    /// next time.
+    pub(crate) fn timed_out(retry_after: u32) -> Self {
+        let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Timeout)
+            .with_detail("the request took longer than the server allows; retry shortly");
+        problem.0.retry_after = Some(retry_after);
+        problem
+    }
+
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
     pub(crate) fn internal(cause: anyhow::Error) -> Self {
@@ -400,7 +412,7 @@ mod tests {
         assert!(value.get("instance").is_none());
     }
 
-    const ALL_CODES: [ErrorCode; 12] = [
+    const ALL_CODES: [ErrorCode; 13] = [
         ErrorCode::InvalidQuery,
         ErrorCode::InvalidCoordinate,
         ErrorCode::LimitTooLarge,
@@ -413,6 +425,7 @@ mod tests {
         ErrorCode::UnsupportedMediaType,
         ErrorCode::InternalError,
         ErrorCode::Busy,
+        ErrorCode::Timeout,
     ];
 
     /// `type` is either RFC 9457's `about:blank` or a URI that can actually be

@@ -194,6 +194,9 @@ pub(crate) enum ErrorCode {
     /// Every batch slot was taken. Retry after the `Retry-After` header's
     /// seconds.
     Busy,
+    /// The lookup or batch ran past the server's request timeout. Retry
+    /// after the `Retry-After` header's seconds.
+    Timeout,
 }
 
 // Mirrors [`crate::http::problem::InvalidParam`] for the schema.
@@ -699,6 +702,7 @@ mod tests {
             RuntimeErrorCode::UnsupportedMediaType,
             RuntimeErrorCode::InternalError,
             RuntimeErrorCode::Busy,
+            RuntimeErrorCode::Timeout,
         ] {
             assert!(
                 documented.contains(code.as_str()),
