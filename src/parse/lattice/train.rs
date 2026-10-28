@@ -1151,10 +1151,15 @@ fn previous_states(start: usize) -> std::ops::Range<usize> {
 
 fn log_add(left: f64, right: f64) -> f64 {
     let high = left.max(right);
-    if high == f64::NEG_INFINITY {
+    // `abs` and not `min`: a NaN input must stay NaN, as it did.
+    let gap = -(left - right).abs();
+    // The higher term's exp is exactly 1. Below -37.5 the lower term is under
+    // half an ulp of it, so the sum is 1 and its ln 0: the same bits as the
+    // full formula without two exp and an ln. Most sums are like this.
+    if high == f64::NEG_INFINITY || gap < -37.5 {
         return high;
     }
-    high + ((left - high).exp() + (right - high).exp()).ln()
+    high + (1.0 + gap.exp()).ln()
 }
 
 fn log_sum(values: impl Iterator<Item = f64>) -> f64 {
