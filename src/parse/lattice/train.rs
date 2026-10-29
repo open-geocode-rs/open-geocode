@@ -29,12 +29,14 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
+    rc::Rc,
     sync::{Arc, OnceLock},
     time::Instant,
 };
 
 use crate::error::{Error, Result};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -940,7 +942,7 @@ fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
 /// transition table (`None` the global one) by previous and next state.
 #[derive(Debug, Default)]
 struct Gradient {
-    edge: HashMap<usize, f32>,
+    edge: FxHashMap<usize, f32>,
     transitions: HashMap<Option<CountryCode>, Vec<f32>>,
 }
 
@@ -950,9 +952,10 @@ impl Gradient {
         let readings = countries
             .iter()
             .map(|country| {
+                let edges = span_edges(lattice, weights, *country);
                 (
-                    Reading::new(lattice, weights, *country, None),
-                    Reading::new(lattice, weights, *country, Some(gold)),
+                    Reading::new(lattice, weights, *country, None, edges.clone()),
+                    Reading::new(lattice, weights, *country, Some(gold), edges),
                 )
             })
             .collect::<Vec<_>>();
@@ -982,6 +985,20 @@ impl Gradient {
     }
 }
 
+/// The score of every span for every label, decoded as `country`. Both
+/// readings of a country share them.
+fn span_edges(
+    lattice: &Lattice,
+    weights: &Weights,
+    country: Option<CountryCode>,
+) -> Vec<[f64; LABELS]> {
+    lattice
+        .spans
+        .iter()
+        .map(|span| weights.edges(span, country).map(f64::from))
+        .collect()
+}
+
 /// Forward-backward over a lattice decoded as one country, over every
 /// labelling or only those that give each unit its gold label.
 struct Reading<'a> {
@@ -1003,6 +1020,7 @@ impl<'a> Reading<'a> {
         weights: &Weights,
         country: Option<CountryCode>,
         gold: Option<&'a [Label]>,
+        edges: Vec<[f64; LABELS]>,
     ) -> Self {
         let table = weights.transitions(country);
         let mut transitions = [[0.0; STATES]; STATES];
@@ -1011,11 +1029,6 @@ impl<'a> Reading<'a> {
                 *value = f64::from(table.get(previous, next));
             }
         }
-        let edges = lattice
-            .spans
-            .iter()
-            .map(|span| Label::ALL.map(|label| f64::from(weights.edge(span, label, country))))
-            .collect::<Vec<_>>();
         let allowed = |span: &decode::Span, label: Label| {
             gold.is_none_or(|gold| gold[span.start..span.end].iter().all(|gold| *gold == label))
         };
@@ -1024,6 +1037,9 @@ impl<'a> Reading<'a> {
         alpha[0][START] = 0.0;
         let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
         order.sort_by_key(|index| lattice.spans[*index].end);
+        // Spans are visited by end, so `alpha[start]` is final by the first
+        // span that starts there, and every later one reads the same sum.
+        let mut sums = vec![[None; LABELS]; len + 1];
         for &index in &order {
             let span = &lattice.spans[index];
             for label in Label::ALL {
@@ -1031,10 +1047,12 @@ impl<'a> Reading<'a> {
                     continue;
                 }
                 let next = label as usize;
-                let incoming = log_sum(
-                    previous_states(span.start)
-                        .map(|previous| alpha[span.start][previous] + transitions[previous][next]),
-                );
+                let incoming =
+                    *sums[span.start][next].get_or_insert_with(|| {
+                        log_sum(previous_states(span.start).map(|previous| {
+                            alpha[span.start][previous] + transitions[previous][next]
+                        }))
+                    });
                 let value = incoming + edges[index][next];
                 alpha[span.end][next] = log_add(alpha[span.end][next], value);
             }
@@ -1145,10 +1163,15 @@ fn previous_states(start: usize) -> std::ops::Range<usize> {
 
 fn log_add(left: f64, right: f64) -> f64 {
     let high = left.max(right);
-    if high == f64::NEG_INFINITY {
+    // `abs` and not `min`: a NaN input must stay NaN, as it did.
+    let gap = -(left - right).abs();
+    // The higher term's exp is exactly 1. Below -37.5 the lower term is under
+    // half an ulp of it, so the sum is 1 and its ln 0: the same bits as the
+    // full formula without two exp and an ln. Most sums are like this.
+    if high == f64::NEG_INFINITY || gap < -37.5 {
         return high;
     }
-    high + ((left - high).exp() + (right - high).exp()).ln()
+    high + (1.0 + gap.exp()).ln()
 }
 
 fn log_sum(values: impl Iterator<Item = f64>) -> f64 {
@@ -1554,8 +1577,9 @@ const REGION_AND_GROUP_SHARE: f64 = 0.2;
 struct Renderer<'a> {
     pack: &'a Reader,
     tagger: &'a LatticeTagger,
-    /// Every name of each area record, its `name` first.
-    names: HashMap<RecordId, Vec<String>>,
+    /// Every name of each area record, its `name` first. Shared, not cloned,
+    /// to each of the many draws from the same few areas.
+    names: FxHashMap<RecordId, Rc<[String]>>,
     /// The words a unit is written with: the Pack's unit words, PO box
     /// words and level words.
     unit_words: [Vec<String>; 3],
@@ -1571,7 +1595,7 @@ impl<'a> Renderer<'a> {
         Self {
             pack,
             tagger,
-            names: HashMap::new(),
+            names: FxHashMap::default(),
             // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
@@ -2212,15 +2236,15 @@ impl<'a> Renderer<'a> {
     }
 
     /// Every name of an area, its `name` first.
-    fn names(&mut self, id: Option<RecordId>) -> Result<Vec<String>> {
+    fn names(&mut self, id: Option<RecordId>) -> Result<Rc<[String]>> {
         let Some(id) = id else {
-            return Ok(Vec::new());
+            return Ok(Rc::default());
         };
         if let Some(names) = self.names.get(&id) {
-            return Ok(names.clone());
+            return Ok(Rc::clone(names));
         }
-        let names = self.pack.records().names(id)?;
-        self.names.insert(id, names.clone());
+        let names = Rc::<[String]>::from(self.pack.records().names(id)?);
+        self.names.insert(id, Rc::clone(&names));
         Ok(names)
     }
 }
@@ -2711,7 +2735,8 @@ mod tests {
         let paths = decode::decode(&lattice, &weights, None, LABELS * LABELS, None);
         assert_eq!(paths.len(), LABELS * LABELS);
         let brute = log_sum(paths.iter().map(|path| f64::from(path.score)));
-        let reading = Reading::new(&lattice, &weights, None, None);
+        let edges = span_edges(&lattice, &weights, None);
+        let reading = Reading::new(&lattice, &weights, None, None, edges);
         assert!(
             (reading.log_z - brute).abs() < 1e-3,
             "{} {brute}",

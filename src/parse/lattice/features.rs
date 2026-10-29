@@ -499,6 +499,10 @@ fn has_street_type_suffix(word: &str, dictionaries: &Dictionaries) -> bool {
 /// The script block of a letter, by its Unicode Script property.
 fn script(character: char) -> usize {
     use unicode_script::{Script, UnicodeScript};
+    // The script table is a binary search, and most letters are these.
+    if character.is_ascii_alphabetic() {
+        return 0;
+    }
     match character.script() {
         Script::Latin => 0,
         Script::Greek => 1,

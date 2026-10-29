@@ -68,6 +68,10 @@ rayon = "1.12"
 # Per-country postcode patterns in the parser.
 regex = "1.12"
 rstar = "0.12"
+# Hashes the integer keys of hot maps (a training gradient's feature ids)
+# without SipHash's cost; nothing here hashes input an attacker controls.
+# Already in the tree through Tantivy.
+rustc-hash = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Reads a batch item as the query string its `GET` would carry, with the

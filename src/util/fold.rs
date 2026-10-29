@@ -79,7 +79,36 @@ fn join(value: &str, key: Key) -> Option<String> {
 /// before it. Composed first, so a decomposed "wa\u{304}naka" is one word,
 /// and a mark with no precomposed letter ("m\u{303}", a virama) still does not
 /// cut its word in two.
-fn split(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
+fn split(value: &str, key: Key, piece: impl FnMut(Piece<'_>)) {
+    if value.is_ascii() {
+        split_ascii(value, piece);
+    } else {
+        split_unicode(value, key, piece);
+    }
+}
+
+/// [`split_unicode`] for ASCII text, which is most of what a build folds:
+/// ASCII is its own NFKC and NFC, has no marks, and needs no Latin-ASCII
+/// fold, so both keys come to its lower-case alphanumeric runs.
+fn split_ascii(value: &str, mut piece: impl FnMut(Piece<'_>)) {
+    let lower = value.to_ascii_lowercase();
+    let mut start = 0;
+    for (index, byte) in lower.bytes().enumerate() {
+        if byte.is_ascii_alphanumeric() {
+            continue;
+        }
+        if start < index {
+            piece(Piece::Word(&lower[start..index]));
+        }
+        piece(Piece::Gap(char::from(byte)));
+        start = index + 1;
+    }
+    if start < lower.len() {
+        piece(Piece::Word(&lower[start..]));
+    }
+}
+
+fn split_unicode(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
     let normalized = match key {
         Key::Search => ComposingNormalizerBorrowed::new_nfkc().normalize(value),
         Key::Exact => ComposingNormalizerBorrowed::new_nfc().normalize(value),
@@ -194,6 +223,37 @@ mod tests {
         );
         assert_eq!(search_key("\u{fffd}\u{fffd}"), None);
         assert_eq!(replaced_characters("ari\u{fffd}ge"), 1);
+    }
+
+    #[test]
+    fn the_ascii_path_cuts_as_the_unicode_path_does() {
+        let pieces = |value: &str, ascii: bool| {
+            let mut cut = Vec::new();
+            let keep = |found: Piece<'_>| {
+                cut.push(match found {
+                    Piece::Word(word) => (Some(word.to_string()), ' '),
+                    Piece::Gap(gap) => (None, gap),
+                })
+            };
+            if ascii {
+                split_ascii(value, keep);
+            } else {
+                split_unicode(value, Key::Search, keep);
+            }
+            cut
+        };
+        for value in [
+            "",
+            " ",
+            "12A King St.",
+            "  Main--STREET (rear) ",
+            "A1/B2,C3;d4\te5\nf6",
+            "O'Brien & Sons #7",
+            "x",
+            "!",
+        ] {
+            assert_eq!(pieces(value, true), pieces(value, false), "{value:?}");
+        }
     }
 
     #[test]

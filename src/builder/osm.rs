@@ -125,7 +125,7 @@ use checkpoint::{
     PostcodePoint, ScanCounts, State, Step,
 };
 use containment::Shapes;
-use emitted::Emitted;
+use emitted::{Emitted, Ready};
 pub(crate) use locations::{
     CHUNK_BYTES as NODE_SET_CHUNK_BYTES, LOCATION_BYTES as NODE_SLOT_BYTES, LoadStats,
     TABLE_BYTES as NODE_SET_TABLE_BYTES,
@@ -864,7 +864,8 @@ impl<'a> Run<'a> {
             BuildStage::Scan,
             None,
             |offset, block| {
-                let output = scan_block(&block);
+                let mut output = scan_block(&block);
+                output.emitted.prepare()?;
                 for (_, refs) in &output.ways {
                     nodes.mark(refs)?;
                 }
@@ -1069,7 +1070,11 @@ impl<'a> Run<'a> {
             &self.progress,
             BuildStage::AssembleWays,
             Some(&input.kept_blobs),
-            |_, block| Ok(emit::assemble(&block, locations, &input.members)),
+            |_, block| {
+                let mut assembled = emit::assemble(&block, locations, &input.members);
+                assembled.output.emitted.prepare()?;
+                Ok(assembled)
+            },
             |assembled| {
                 let resolution = &mut build.report.geometry_resolution;
                 resolution.resolved_node_refs += assembled.resolved;
@@ -1974,11 +1979,22 @@ impl Build {
         let Emitted {
             report,
             records,
+            ready,
             rejections,
         } = emitted;
         self.report.merge(report);
         for rejection in &rejections {
             self.audit.write(rejection)?;
+        }
+        for item in ready {
+            match item {
+                Ready::Address(mut address) => {
+                    address.seq = self.seq;
+                    self.seq += 1;
+                    open(&mut self.addresses, "addresses")?.push(address)?;
+                }
+                Ready::Record(record) => self.push(*record, None)?,
+            }
         }
         for record in records {
             self.push(record, None)?;

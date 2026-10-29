@@ -46,6 +46,16 @@ impl<A> CountingAlloc<A> {
     }
 }
 
+// A store of the same value still takes the cache line exclusive, and every
+// allocation of every thread stores here: test first.
+#[inline]
+fn mark_installed() {
+    if !INSTALLED.load(Ordering::Relaxed) {
+        INSTALLED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[inline]
 fn count(bytes: isize) {
     let flushed = DELTA.try_with(|delta| {
         let next = delta.get() + bytes;
@@ -72,7 +82,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
         // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
         let pointer = unsafe { self.inner.alloc(layout) };
         if !pointer.is_null() {
-            INSTALLED.store(true, Ordering::Relaxed);
+            mark_installed();
             count(layout.size() as isize);
         }
         pointer
@@ -82,7 +92,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
         // SAFETY: as for `alloc`.
         let pointer = unsafe { self.inner.alloc_zeroed(layout) };
         if !pointer.is_null() {
-            INSTALLED.store(true, Ordering::Relaxed);
+            mark_installed();
             count(layout.size() as isize);
         }
         pointer

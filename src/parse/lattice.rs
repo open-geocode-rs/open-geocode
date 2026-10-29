@@ -219,6 +219,11 @@ const UNSPACED_SCRIPTS: [Script; 7] = [
 /// the prolonged sound mark "ー" and the iteration mark "々" are, as kana and
 /// Han are, and a character of every script (a digit) is not.
 pub fn is_unspaced(character: char) -> bool {
+    // No ASCII character is in an unspaced script, and the script table is a
+    // binary search.
+    if character.is_ascii() {
+        return false;
+    }
     let scripts = character.script_extension();
     !scripts.is_common()
         && !scripts.is_inherited()
@@ -297,6 +302,11 @@ pub fn mask_numerals(key: &str) -> Option<String> {
 /// writes it.
 pub fn dictionary_key(name: &str) -> Option<String> {
     let normalized = search_key(name)?;
+    // ASCII has no unspaced script, so no unit is glued and the key is the
+    // words as they are.
+    if normalized.is_ascii() {
+        return Some(normalized);
+    }
     let words = normalized.split(' ').collect::<Vec<_>>();
     let units = Units::of(&Tokens::from_words(&words));
     Some(units.key(0, units.len()))
