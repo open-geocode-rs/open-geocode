@@ -36,6 +36,7 @@
 - { name: "ci:planet-build", color: "0e8a16", description: "Maintainer runs a planet Pack build on this pull request." }
 
 - { name: "triage:passed", color: "0e8a16", description: "Set by triage. Opens Devin Review." }
+- { name: "triage:held", color: "fbca04", description: "Set by the PR gate while it holds a pull request as a draft." }
 - { name: "needs-evidence", color: "e99695", description: "Verification does not show the change works." }
 - { name: "needs-split", color: "e99695", description: "More than one problem in one pull request." }
 - { name: "needs-citation", color: "e99695", description: "Experimental work without a cited source." }
