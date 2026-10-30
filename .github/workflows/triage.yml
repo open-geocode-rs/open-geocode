@@ -40,7 +40,9 @@ jobs:
               return;
             }
             const problems = require(rules);
-            const pr = context.payload.pull_request;
+            // The event's copy of the body can predate the edit that started
+            // this run, so read the pull request as it is now.
+            const pr = (await github.rest.pulls.get({ ...context.repo, pull_number: context.payload.pull_request.number })).data;
             const found = problems({ title: pr.title, body: pr.body, labels: pr.labels.map((label) => label.name) });
             if (found.length) {
               await core.summary.addHeading('Triage').addList(found).write();
