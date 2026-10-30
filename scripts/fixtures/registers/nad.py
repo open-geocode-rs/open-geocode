@@ -13,12 +13,14 @@ SOURCE = {
     "attribution": "National Address Database (NAD), US Department of Transportation",
     "url": "https://data.transportation.gov/download/fc2s-wawr/application/x-zip-compressed",
     "notes": (
-        "TXT release, Longitude and Latitude as published (WGS84 degrees); retired records dropped: "
-        "Lifecycle Retired, Inactive or Not Active in any case, or an Expire date from 1971 to the "
+        "TXT release, Longitude and Latitude as published (WGS84 degrees); records not current dropped: "
+        "Lifecycle Retired, Inactive, Not Active, Proposed or Pending in any case, or an Expire date from "
+        "1971 to the "
         "compilation date (earlier ones are 1899, 1900, 1969 and 1970 zero-date sentinels);Placement Linear Geocode marked estimated, every other Placement (Unknown, "
         "Structure, Site, Property Access, Parcel, Other) kept; any of Building, Floor, Unit, Room, Seat, "
         "Addtl_Loc or SubAddress marks a unit; house number AddNo_Full; road StNam_Full; postcode Zip_Code; "
-        "city is Post_City, else Inc_Muni when Post_City is 'Not stated', never the placeholders 'Not "
+        "city is Post_City, else Inc_Muni without its legal prefix (City of, Village of, Town of, Township of, "
+        "Borough of) when Post_City is 'Not stated', never the placeholders 'Not "
         "stated' or 'Unincorporated'; state the two-letter State; words of road and city written in capitals "
         "title-cased (sources mix capital names with mixed-case types), route and direction codes kept;the archive is Deflate64 and is read through 7-Zip"
     ),
@@ -27,12 +29,15 @@ COMPILED = "2026-09-30"
 RELEASE = f"Release 24, compiled {COMPILED}"
 # Only Linear Geocode is placed along the street rather than at the address.
 ESTIMATED = {"Linear Geocode"}
-RETIRED = {"retired", "inactive", "not active"}
+NOT_CURRENT = {"retired", "inactive", "not active", "proposed", "pending"}
 SUBADDRESS = ("Building", "Floor", "Unit", "Room", "Seat", "Addtl_Loc", "SubAddress")
 # Route and direction codes that stay in capitals when a value is title-cased.
 UPPER = {"NE", "NW", "SE", "SW", "US", "SR", "CR", "FM", "RM", "RR"}
 ROMAN = re.compile(r"\b(?=[ivx]{2,}\b)[ivx]+\b", re.IGNORECASE)
 MEMBER = "TXT/NAD_r24.txt"
+# Inc_Muni is the legal name ('Village of Monticello'); people and USPS write
+# the place name alone.
+LEGAL = "^(city|village|town|township|borough) of +"
 
 
 COLUMNS = ("UUID", "Lifecycle", "Expire", "Placement", "Latitude", "Longitude", "AddNo_Full", "StNam_Full",
@@ -87,10 +92,11 @@ def query(files):
                ({subaddress}) as unit, Placement = '{next(iter(ESTIMATED))}' as estimated,
                AddNo_Full as house_number, StNam_Full as road, Zip_Code as postcode,
                coalesce(case when lower(trim(Post_City)) not in {placeholder} then trim(Post_City) end,
-                        case when lower(trim(Inc_Muni)) not in {placeholder} then trim(Inc_Muni) end) as city,
+                        case when lower(trim(Inc_Muni)) not in {placeholder}
+                             then regexp_replace(trim(Inc_Muni), '{LEGAL}', '', 'i') end) as city,
                State as state
         from read_parquet('{parquet}')
-        where lower(trim(coalesce(Lifecycle, ''))) not in {tuple(sorted(RETIRED))}
+        where lower(trim(coalesce(Lifecycle, ''))) not in {tuple(sorted(NOT_CURRENT))}
           and not (regexp_matches(coalesce(Expire, ''), '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}')
                    and left(Expire, 10) between '1971' and '{COMPILED}')
     """

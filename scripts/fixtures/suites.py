@@ -1,5 +1,7 @@
 """Write a `geocode bench` answer key from another geocoder's own test suite.
 
+    pip install -r scripts/fixtures/requirements.txt
+    npm ci --prefix scripts/fixtures            # Node 22 or later
     python scripts/fixtures/suites.py pelias --suite <acceptance-tests checkout> --cache <dir>
     python scripts/fixtures/suites.py photon --suite <geocoder-tester checkout> --cache <dir>
 
@@ -7,8 +9,8 @@ Every search case that names one house keeps its query word for word. The
 suite says which address is right by its fields; that country's register,
 read through the same adapter its own answer key uses, says where it is. A
 case is kept only when the register holds exactly one place for it. Cases that
-need a caller position (location bias) are dropped, so every case is a plain
-query as in the register keys.
+need a caller position (location bias) or a search filter are dropped, so
+every case is a plain query as in the register keys.
 """
 
 import argparse
@@ -26,6 +28,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import duckdb
+import yaml
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -94,12 +97,13 @@ def street_key(text):
 
 
 def same_place(expected, register):
-    """One name's words within the other's: the suite's "Paris" is BAN's
-    "Paris 10e Arrondissement"."""
+    """One name opening the other, word for word: the suite's "Paris" is
+    BAN's "Paris 10e Arrondissement", but "York" is not "New York"."""
     for a in expected:
         for b in register:
-            words_a, words_b = set(a.split()), set(b.split())
-            if words_a <= words_b or words_b <= words_a:
+            words_a, words_b = a.split(), b.split()
+            shorter = min(len(words_a), len(words_b))
+            if words_a[:shorter] == words_b[:shorter]:
                 return True
     return False
 
@@ -117,7 +121,8 @@ def metres(a, b):
     return math.hypot((a[0] - b[0]) * 111_320 * math.cos(lat), (a[1] - b[1]) * 110_540)
 
 
-def case(ref, query, country, number, street, localities=(), postcode="", focus=False, cohort=""):
+def case(ref, query, country, number, street, localities=(), postcode="", regions=(), needs="", cohort=""):
+    """`needs` names what the query cannot be run without, if anything."""
     return {
         "ref": ref,
         "q": query,
@@ -126,7 +131,8 @@ def case(ref, query, country, number, street, localities=(), postcode="", focus=
         "street": street,
         "localities": {fold(name) for name in localities if name},
         "postcode": fold(postcode).replace(" ", ""),
-        "focus": focus,
+        "regions": {fold(name) for name in regions if name},
+        "needs": needs,
         "cohort": cohort,
     }
 
@@ -164,7 +170,8 @@ def pelias(checkout):
                     street,
                     [first.get(key) for key in ("locality", "localadmin", "borough", "neighbourhood")],
                     str(first.get("postalcode") or ""),
-                    "focus.point.lat" in given,
+                    [first.get("region"), first.get("region_a")],
+                    "a caller position" if "focus.point.lat" in given else "",
                     path.stem,
                 )
             )
@@ -172,10 +179,44 @@ def pelias(checkout):
 
 
 def photon(checkout):
-    """CSV cases expecting a house: the expected housenumber, or, when the
-    expectation stops at the street, the number the query opens with."""
+    """CSV and YAML cases expecting a house: the expected housenumber, or,
+    when the expectation stops at the street, the number the query opens
+    with. A YAML case may name the house as one `name` ('1 Chemin des
+    Falaises')."""
     world = checkout / "geocoder_tester" / "world"
     cases, dropped = [], Counter()
+    for path in sorted(world.rglob("*.yml")):
+        relative = path.relative_to(world).as_posix()
+        for name, spec in yaml.safe_load(path.read_text(encoding="utf-8")).items():
+            expected = spec.get("expected") or {}
+            query = str(spec.get("query", name)).strip()
+            number, street = str(expected.get("housenumber") or "").strip(), str(expected.get("street") or "").strip()
+            if not (number and street):
+                named = NAMED_HOUSE.match(str(expected.get("name") or ""))
+                if named:
+                    number, street = named.groups()
+            if not (query and street and number):
+                dropped["no house expected"] += 1
+                continue
+            needs = ""
+            if spec.get("lat") is not None and spec.get("lon") is not None:
+                needs = "a caller position"
+            elif "citycode" in spec:
+                needs = "a search filter"
+            cases.append(
+                case(
+                    f"{relative}:{name}",
+                    query,
+                    PHOTON_COUNTRIES.get(relative.split("/", 1)[0]),
+                    number,
+                    street,
+                    [str(expected.get("city") or "")],
+                    str(expected.get("postcode") or ""),
+                    [str(expected.get("state") or "")],
+                    needs,
+                    Path(relative).stem.removeprefix("test_"),
+                )
+            )
     for path in sorted(world.rglob("*.csv")):
         relative = path.relative_to(world).as_posix()
         text = path.read_text(encoding="utf-8")
@@ -201,7 +242,8 @@ def photon(checkout):
                     street,
                     [row.get("expected_city")],
                     row.get("expected_postcode") or "",
-                    bool((row.get("lat") or "").strip() and (row.get("lon") or "").strip()),
+                    [row.get("expected_state")],
+                    "a caller position" if (row.get("lat") or "").strip() and (row.get("lon") or "").strip() else "",
                     Path(relative).stem.removeprefix("test_"),
                 )
             )
@@ -234,6 +276,7 @@ def resolve(cases, cache, rules):
     for country, keys in wanted.items():
         name, module = found[country]
         directory = cache / name
+        directory.mkdir(parents=True, exist_ok=True)
         files, release = module.download(directory)
         used[name] = {"register": module.SOURCE["register"], "release": release}
         numbers = sorted({key[1][0] for key in keys})
@@ -255,6 +298,9 @@ def resolve(cases, cache, rules):
                     continue
                 if not item["postcode"] and item["localities"] and not same_place(item["localities"], places):
                     continue
+                region = {fold(row["state"]), fold(row["state_code"])} - {""}
+                if item["regions"] and region and not region & item["regions"]:
+                    continue
                 points[index].append(row)
     return points, found, used
 
@@ -274,8 +320,8 @@ def main():
     for index, item in enumerate(cases):
         rows = points.get(index, [])
         places = [(row["lon"], row["lat"]) for row in rows]
-        if item["focus"]:
-            dropped["needs a caller position"] += 1
+        if item["needs"]:
+            dropped[f"needs {item['needs']}"] += 1
         elif item["country"] is None:
             dropped["no country stated"] += 1
         elif item["country"] not in found:

@@ -26,8 +26,8 @@ SOURCE = {
     "url": BASE,
     "notes": (
         "all 27 UF files; SIRGAS 2000 (EPSG:4674, per Nota metodologica n. 01) to WGS84 by PROJ; "
-        "NV_GEO_COORD 4 (block face midpoint), 5 (localidade) and 6 (census tract centroid) marked estimated, "
-        "1 to 3 kept as Nota metodologica n. 01 classes them as geocoded at the address; any complemento "
+        "NV_GEO_COORD 3 (estimated for an address with no or an invalid field coordinate), 4 (block face "
+        "midpoint), 5 (localidade) and 6 (census tract centroid) marked estimated, 1 and 2 kept; any complemento "
         "element marks a unit; DSC_MODIFICADOR SN means no number (so 97% of DF, which IBGE records as SN), "
         "KM gives 'KM <n>', any other modifier follows the number as IBGE says it complements it; road is "
         "tipo, titulo and nome of the logradouro, without IBGE's pseudo-tipo EDF (Endereco do Distrito Federal); "
@@ -37,7 +37,7 @@ SOURCE = {
     ),
 }
 # NV_GEO_COORD levels that are not the address's own point.
-ESTIMATED = ("4", "5", "6")
+ESTIMATED = ("3", "4", "5", "6")
 PARTICLES = {"a", "o", "as", "os", "da", "de", "do", "das", "dos", "e", "em", "na", "no", "nas", "nos"}
 UF = {code.split("_")[1] for code in STATES} | {"BR"}
 ROMAN = {"II", "III", "IV", "VI", "VII", "VIII", "IX", "XI", "XII", "XIII", "XIV", "XV", "XX", "XXI", "XXIII"}

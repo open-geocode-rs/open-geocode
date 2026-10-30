@@ -3,7 +3,9 @@
 An adapter has `SOURCE`, `download(cache) -> (files, release)` and
 `query(files) -> SQL`. The SQL yields one row per register address with any
 of the columns in COLUMNS; `unit` and `estimated` are booleans, `x`/`y` are in
-the `crs` the row names. An adapter may add `finish(row)`, which recases the
+the `crs` the row names, and `country` overrides SOURCE's country for a row
+the world files under another code. `state_code` is only matched against, by
+suites.py, where a suite names the region by its code; it is never formatted. An adapter may add `finish(row)`, which recases the
 values of a drawn row: it runs on the draw only and must not empty a field,
 since eligibility was decided in SQL.
 """
@@ -18,8 +20,9 @@ from pathlib import Path
 import duckdb
 
 COLUMNS = (
-    "id", "x", "y", "crs", "unit", "estimated",
+    "id", "x", "y", "crs", "country", "unit", "estimated",
     "house_number", "road", "postcode", "city", "town", "village", "suburb", "hamlet", "municipality", "state",
+    "state_code",
 )
 LOCALITY = ("city", "town", "village", "suburb", "hamlet", "municipality")
 

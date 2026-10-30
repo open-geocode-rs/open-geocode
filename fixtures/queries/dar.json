@@ -6,15 +6,13 @@
   "licence": "CC BY 4.0",
   "attribution": "Indeholder data fra Klimadatastyrelsen, Danmarks Adresseregister (DAR)",
   "url": "ftp://ftp3.datafordeler.dk/DAR_Aktuelt_Totaludtraek_JSON_HF_<timestamp>.zip",
-  "notes": "Datafordeleren's anonymous daily current extract; one row per husnummer (access address), so floor and door addresses are not read; husnumre with status nedlagt (4) or henlagt (5) excluded, foreløbig (2) kept; id is the husnummer id_lokalId; point is its adgangspunkt, EPSG:25832 transformed to EPSG:4326 with pyproj; points with nøjagtighedsklasse U (not placed at the address) marked estimated; house_number is husnummertekst; road is the full vejnavn; city is the postnummer navn, supplerende bynavn not used",
+  "notes": "Datafordeleren's anonymous daily current extract; one row per husnummer (access address), so floor and door addresses are not read; only husnumre with status gældende (3), so foreløbig (2), nedlagt (4) and henlagt (5) excluded; id is the husnummer id_lokalId; point is its adgangspunkt, EPSG:25832 transformed to EPSG:4326 with pyproj; points with nøjagtighedsklasse U (not placed at the address) marked estimated; house_number is husnummertekst; road is the full vejnavn; city is the postnummer navn, supplerende bynavn not used",
   "release": "2026-10-27",
   "files": {
    "DAR_Aktuelt_Totaludtraek_JSON_HF_20261027180013.zip": "52891cd7a0bce24aa28dedb1e5e1c68214e0a8a50051870642883bc9e530a2ba"
   },
-  "rows": 2618810,
-  "dropped": {
-   "no house number": 5
-  },
+  "rows": 2615752,
+  "dropped": {},
   "seed": 2026,
   "sample": 2000,
   "draw": "lowest sha256('2026:' || register id) among eligible rows",
@@ -23,6 +21,12 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:25832": "Inverse of UTM zone 32N + ETRS89 to WGS 84 (1) + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py dar --cache <dir>"
  },
  "cases": [
@@ -3082,8 +3086,6 @@
   {"name": "0a3f507a-c6bd-32b8-e044-0003ba298018:messy", "q": "Møllegade 23A, København N", "form": "messy", "cohort": "address", "expect_lat": 55.691638, "expect_lon": 12.5569726},
   {"name": "0a3f5095-7b90-32b8-e044-0003ba298018:full", "q": "Padborgvej 62, 8600 Silkeborg, Denmark", "form": "full", "cohort": "address", "expect_lat": 56.1732754, "expect_lon": 9.4928609},
   {"name": "0a3f5095-7b90-32b8-e044-0003ba298018:messy", "q": "Padborgvej 62, Silkeborg", "form": "messy", "cohort": "address", "expect_lat": 56.1732754, "expect_lon": 9.4928609},
-  {"name": "91f3a068-29de-4791-ad2a-fb1071b00fd0:full", "q": "Fiskene 31, 7500 Holstebro, Denmark", "form": "full", "cohort": "address", "expect_lat": 56.3738014, "expect_lon": 8.6542421},
-  {"name": "91f3a068-29de-4791-ad2a-fb1071b00fd0:messy", "q": "Fiskene 31, Holstebro", "form": "messy", "cohort": "address", "expect_lat": 56.3738014, "expect_lon": 8.6542421},
   {"name": "0a3f507c-71e9-32b8-e044-0003ba298018:full", "q": "Krokusstien 10, 2600 Glostrup, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.7044092, "expect_lon": 12.3949883},
   {"name": "0a3f507c-71e9-32b8-e044-0003ba298018:messy", "q": "Krokusstien 10, Glostrup", "form": "messy", "cohort": "address", "expect_lat": 55.7044092, "expect_lon": 12.3949883},
   {"name": "0a3f5080-d3a0-32b8-e044-0003ba298018:full", "q": "Korshøj 211, 3670 Veksø Sjælland, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.7519513, "expect_lon": 12.2458482},
@@ -3590,8 +3592,6 @@
   {"name": "0a3f5083-0c68-32b8-e044-0003ba298018:messy", "q": "Marielunden 6, Haslev", "form": "messy", "cohort": "address", "expect_lat": 55.331997, "expect_lon": 11.9701318},
   {"name": "5ba710e3-d79f-5980-e044-0003ba298018:full", "q": "Fjordhusene 89, 4736 Karrebæksminde, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.1735366, "expect_lon": 11.6601219},
   {"name": "5ba710e3-d79f-5980-e044-0003ba298018:messy", "q": "Fjordhusene 89, Karrebæksminde", "form": "messy", "cohort": "address", "expect_lat": 55.1735366, "expect_lon": 11.6601219},
-  {"name": "4a3860e0-6188-45b9-8744-843d13d0fd28:full", "q": "Arkaderne 73, 2700 Brønshøj, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.7210383, "expect_lon": 12.4843871},
-  {"name": "4a3860e0-6188-45b9-8744-843d13d0fd28:messy", "q": "Arkaderne 73, Brønshøj", "form": "messy", "cohort": "address", "expect_lat": 55.7210383, "expect_lon": 12.4843871},
   {"name": "0a3f507e-7eee-32b8-e044-0003ba298018:full", "q": "Storevang 26, 3460 Birkerød, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.8548082, "expect_lon": 12.4443883},
   {"name": "0a3f507e-7eee-32b8-e044-0003ba298018:messy", "q": "Storevang 26, Birkerød", "form": "messy", "cohort": "address", "expect_lat": 55.8548082, "expect_lon": 12.4443883},
   {"name": "0a3f508c-b7d1-32b8-e044-0003ba298018:full", "q": "Værftvej 24, 6270 Tønder, Denmark", "form": "full", "cohort": "address", "expect_lat": 54.9460489, "expect_lon": 8.883833},
@@ -4025,6 +4025,10 @@
   {"name": "0a3f508d-891c-32b8-e044-0003ba298018:full", "q": "Havbakken 169, 6710 Esbjerg V, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.5161849, "expect_lon": 8.3768031},
   {"name": "0a3f508d-891c-32b8-e044-0003ba298018:messy", "q": "Havbakken 169, Esbjerg V", "form": "messy", "cohort": "address", "expect_lat": 55.5161849, "expect_lon": 8.3768031},
   {"name": "0a3f5085-79bc-32b8-e044-0003ba298018:full", "q": "Skipperstræde 4, 4941 Bandholm, Denmark", "form": "full", "cohort": "address", "expect_lat": 54.8374539, "expect_lon": 11.4837599},
-  {"name": "0a3f5085-79bc-32b8-e044-0003ba298018:messy", "q": "Skipperstræde 4, Bandholm", "form": "messy", "cohort": "address", "expect_lat": 54.8374539, "expect_lon": 11.4837599}
+  {"name": "0a3f5085-79bc-32b8-e044-0003ba298018:messy", "q": "Skipperstræde 4, Bandholm", "form": "messy", "cohort": "address", "expect_lat": 54.8374539, "expect_lon": 11.4837599},
+  {"name": "0a3f507f-4fe9-32b8-e044-0003ba298018:full", "q": "Strandager 16, 3250 Gilleleje, Denmark", "form": "full", "cohort": "address", "expect_lat": 56.1239272, "expect_lon": 12.2831459},
+  {"name": "0a3f507f-4fe9-32b8-e044-0003ba298018:messy", "q": "Strandager 16, Gilleleje", "form": "messy", "cohort": "address", "expect_lat": 56.1239272, "expect_lon": 12.2831459},
+  {"name": "0a3f507e-240d-32b8-e044-0003ba298018:full", "q": "Valmuebakken 29, 2625 Vallensbæk, Denmark", "form": "full", "cohort": "address", "expect_lat": 55.6519655, "expect_lon": 12.3639448},
+  {"name": "0a3f507e-240d-32b8-e044-0003ba298018:messy", "q": "Valmuebakken 29, Vallensbæk", "form": "messy", "cohort": "address", "expect_lat": 55.6519655, "expect_lon": 12.3639448}
  ]
 }
