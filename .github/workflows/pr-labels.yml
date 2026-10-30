@@ -1,0 +1,73 @@
+name: PR labels
+
+# pull_request_target so fork pull requests can be labelled. It reads the file
+# list and the title through the API and never checks out or runs PR code.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  area:
+    name: Area
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          sync-labels: true
+
+  size-and-type:
+    name: Size and type
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const issue = { ...context.repo, issue_number: pr.number };
+
+            // Tests and fixtures do not make a change harder to review.
+            const skipped = (path) =>
+              path === 'Cargo.lock' ||
+              path.startsWith('fixtures/') ||
+              path.startsWith('tests/') ||
+              /(^|\/)tests?\.rs$/.test(path) ||
+              path.includes('/tests/');
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo, pull_number: pr.number, per_page: 100,
+            });
+            const lines = files
+              .filter((file) => !skipped(file.filename))
+              .reduce((sum, file) => sum + file.additions + file.deletions, 0);
+            const size =
+              lines < 10 ? 'size:XS' :
+              lines < 30 ? 'size:S' :
+              lines < 100 ? 'size:M' :
+              lines < 500 ? 'size:L' :
+              lines < 1000 ? 'size:XL' : 'size:XXL';
+
+            const kind = /^(\w+)(\([^)]*\))?!?:/.exec(pr.title)?.[1];
+            const types = { fix: 'type:fix', feat: 'type:feat', perf: 'type:perf', refactor: 'type:refactor' };
+            const chores = ['chore', 'ci', 'docs', 'build', 'test', 'style', 'revert'];
+            const type = types[kind] ?? (chores.includes(kind) ? 'type:chore' : null);
+
+            const current = pr.labels.map((label) => label.name);
+            const wanted = [size, type].filter(Boolean);
+            const stale = current.filter(
+              (name) => (name.startsWith('size:') || name.startsWith('type:')) && !wanted.includes(name),
+            );
+            for (const name of stale) {
+              await github.rest.issues.removeLabel({ ...issue, name });
+            }
+            const missing = wanted.filter((name) => !current.includes(name));
+            if (missing.length) {
+              await github.rest.issues.addLabels({ ...issue, labels: missing });
+            }
+            core.info(`${lines} lines, ${wanted.join(', ')}`);

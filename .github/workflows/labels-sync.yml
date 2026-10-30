@@ -1,0 +1,45 @@
+name: Sync labels
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/labels.yml]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    name: Sync labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/labels.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Read labels.yml
+        run: yq -o=json '.' .github/labels.yml > "$RUNNER_TEMP/labels.json"
+
+      - name: Create or update every label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const wanted = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/labels.json`, 'utf8'));
+            const existing = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              ...context.repo, per_page: 100,
+            });
+            const byName = new Map(existing.map((label) => [label.name, label]));
+            for (const label of wanted) {
+              const have = byName.get(label.name);
+              const body = { ...context.repo, name: label.name, color: label.color, description: label.description };
+              if (!have) {
+                await github.rest.issues.createLabel(body);
+                core.info(`created ${label.name}`);
+              } else if (have.color !== label.color || (have.description ?? '') !== label.description) {
+                await github.rest.issues.updateLabel(body);
+                core.info(`updated ${label.name}`);
+              }
+            }
