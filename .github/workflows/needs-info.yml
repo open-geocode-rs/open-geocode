@@ -1,0 +1,34 @@
+name: Close unanswered issues
+
+# An issue labelled needs-info waits on its reporter. With no activity for
+# 14 days it is marked stale, and 7 days later it is closed. Any comment
+# resets the clock and drops the needs-info label.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  close:
+    name: Close unanswered issues
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Close issues waiting on their reporter
+        uses: actions/stale@v11
+        with:
+          only-labels: needs-info
+          days-before-stale: 14
+          days-before-close: 7
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-message: >
+            We haven't heard back in two weeks, so this will close in 7 days.
+            Reply anytime and it stays open.
+          close-issue-message: >
+            Closing for now since we didn't hear back.
+            Feel free to reopen with more details anytime.
+          labels-to-remove-when-unstale: needs-info

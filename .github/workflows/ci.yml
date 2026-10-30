@@ -2,13 +2,22 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  merge_group:
   push:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  rust:
-    name: Rust
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -32,5 +41,72 @@ jobs:
       - name: Check lints with the og interface
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per shipped target's platform: Linux x64, macOS Apple
+        # silicon, macOS Intel, Windows x64.
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Run tests
         run: cargo test --all-features
+
+  binary-size:
+    name: Binary size
+    # Pull requests only. In the merge queue and on main the job is skipped,
+    # and a skipped job satisfies a required check.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # Growth over this fraction of main's size fails unless a maintainer
+      # adds the accept:space label.
+      MAX_GROWTH: "0.01"
+      ACCEPTED: ${{ contains(github.event.pull_request.labels.*.name, 'accept:space') }}
+
+    steps:
+      - name: Checkout this pull request
+        uses: actions/checkout@v4
+        with:
+          path: pr
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the shipped binary of both
+        run: |
+          cargo build --profile dist --bin open-geocode --manifest-path main/Cargo.toml
+          cargo build --profile dist --bin open-geocode --manifest-path pr/Cargo.toml
+
+      - name: Compare
+        run: |
+          main=$(stat -c %s main/target/dist/open-geocode)
+          pr=$(stat -c %s pr/target/dist/open-geocode)
+          growth=$(awk -v a="$main" -v b="$pr" 'BEGIN { printf "%.4f", (b - a) / a }')
+          echo "| | main | this PR | change |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| open-geocode | $main B | $pr B | $growth |" >> "$GITHUB_STEP_SUMMARY"
+          echo "open-geocode: main $main bytes, this PR $pr bytes, change $growth"
+          if awk -v g="$growth" -v m="$MAX_GROWTH" 'BEGIN { exit !(g > m) }'; then
+            if [ "$ACCEPTED" = "true" ]; then
+              echo "Growth accepted by the accept:space label."
+            else
+              echo "::error::open-geocode grew by $growth of main's size, over $MAX_GROWTH. Cut the growth, or ask a maintainer to add the accept:space label."
+              exit 1
+            fi
+          fi
