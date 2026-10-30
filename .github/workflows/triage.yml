@@ -10,18 +10,22 @@ name: Triage
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, ready_for_review, labeled, unlabeled]
+  # Triage is a required check, and the merge queue waits for every required
+  # check on its own commit. There the job is skipped, which counts as passing.
+  merge_group:
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: triage-${{ github.event.pull_request.number }}
+  group: triage-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   triage:
     name: Triage
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
