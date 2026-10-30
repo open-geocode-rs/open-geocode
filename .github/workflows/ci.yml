@@ -87,22 +87,29 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # The Linux release ships the musl build, so that is the one measured.
       - name: Build the shipped binary of both
         run: |
-          cargo build --profile dist --bin open-geocode --manifest-path main/Cargo.toml
-          cargo build --profile dist --bin open-geocode --manifest-path pr/Cargo.toml
+          cargo build --profile dist --bin open-geocode --target x86_64-unknown-linux-musl --manifest-path main/Cargo.toml
+          cargo build --profile dist --bin open-geocode --target x86_64-unknown-linux-musl --manifest-path pr/Cargo.toml
 
       - name: Compare
         run: |
-          main=$(stat -c %s main/target/dist/open-geocode)
-          pr=$(stat -c %s pr/target/dist/open-geocode)
+          main=$(stat -c %s main/target/x86_64-unknown-linux-musl/dist/open-geocode)
+          pr=$(stat -c %s pr/target/x86_64-unknown-linux-musl/dist/open-geocode)
           growth=$(awk -v a="$main" -v b="$pr" 'BEGIN { printf "%.4f", (b - a) / a }')
           echo "| | main | this PR | change |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| open-geocode | $main B | $pr B | $growth |" >> "$GITHUB_STEP_SUMMARY"
           echo "open-geocode: main $main bytes, this PR $pr bytes, change $growth"
-          if awk -v g="$growth" -v m="$MAX_GROWTH" 'BEGIN { exit !(g > m) }'; then
+          # Compared on the exact sizes; $growth is rounded, for display only.
+          if awk -v a="$main" -v b="$pr" -v m="$MAX_GROWTH" 'BEGIN { exit !((b - a) / a > m) }'; then
             if [ "$ACCEPTED" = "true" ]; then
               echo "Growth accepted by the accept:space label."
             else
