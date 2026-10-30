@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@fragaria/address-formatter": "7.1.2"
+  }
+}

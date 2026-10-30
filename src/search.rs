@@ -6303,8 +6303,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    /// The `ontario-poi` cases on a Pack of one street: a POI named after
-    /// the street, a shop at one of its addresses and a park off it.
+    /// A Pack of one street: a POI named after the street, a shop at one of
+    /// its addresses and a park off it.
     #[test]
     fn addresses_rank_above_pois_unless_a_poi_confirms_the_address() {
         let temp_dir = temp_pack_path("search-addresses-beat-pois");
