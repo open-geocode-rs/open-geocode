@@ -1,0 +1,48 @@
+name: Triage
+
+# Gate 1, the required check: the title is a conventional commit and the
+# template is filled. pull_request, so the result lands on the PR's own commit;
+# the token is read-only. The rules come from main's .github/scripts/triage.js.
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize, ready_for_review, labeled, unlabeled]
+  # The merge queue waits for every required check on its own commit. There
+  # the job is skipped, which counts as passing.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: triage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    name: Triage
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const rules = `${process.env.GITHUB_WORKSPACE}/.github/scripts/triage.js`;
+            // Until the rules reach main there is nothing to judge by; the PR
+            // that adds them must not judge itself.
+            if (!require('fs').existsSync(rules)) {
+              core.notice('main has no triage rules yet');
+              return;
+            }
+            const problems = require(rules);
+            const pr = context.payload.pull_request;
+            const found = problems({ title: pr.title, body: pr.body, labels: pr.labels.map((label) => label.name) });
+            if (found.length) {
+              await core.summary.addHeading('Triage').addList(found).write();
+              core.setFailed(found.join('\n'));
+            }

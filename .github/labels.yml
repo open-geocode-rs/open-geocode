@@ -1,0 +1,53 @@
+# Every label of the repository. labels-sync.yml creates and updates them from
+# this file; it never deletes a label, so one removed here is deleted by hand.
+
+- { name: "type:fix", color: "d73a4a", description: "Pull request title type: fix." }
+- { name: "type:feat", color: "a2eeef", description: "Pull request title type: feat." }
+- { name: "type:perf", color: "fbca04", description: "Pull request title type: perf." }
+- { name: "type:refactor", color: "c5def5", description: "Pull request title type: refactor." }
+- { name: "type:chore", color: "ededed", description: "Pull request title type: chore, ci, docs, build or test." }
+
+- { name: "area:parse", color: "1d76db", description: "Touches the query parser." }
+- { name: "area:search", color: "1d76db", description: "Touches retrieval, ranking or confidence." }
+- { name: "area:reverse", color: "1d76db", description: "Touches reverse geocoding." }
+- { name: "area:autocomplete", color: "1d76db", description: "Touches autocomplete. Set by hand: it shares files with search." }
+- { name: "area:batch", color: "1d76db", description: "Touches batch geocoding." }
+- { name: "area:builder", color: "1d76db", description: "Touches the Pack builder." }
+- { name: "area:pack", color: "1d76db", description: "Touches the Pack format or its reader." }
+- { name: "area:api", color: "1d76db", description: "Touches the HTTP API or its contract." }
+- { name: "area:ci", color: "1d76db", description: "Touches CI or repository automation." }
+- { name: "area:fixtures", color: "1d76db", description: "Touches fixtures or their generators." }
+
+- { name: "size:XS", color: "c2e0c6", description: "0-9 changed lines, tests and fixtures excluded." }
+- { name: "size:S", color: "c2e0c6", description: "10-29 changed lines, tests and fixtures excluded." }
+- { name: "size:M", color: "fef2c0", description: "30-99 changed lines, tests and fixtures excluded." }
+- { name: "size:L", color: "fef2c0", description: "100-499 changed lines, tests and fixtures excluded." }
+- { name: "size:XL", color: "f9d0c4", description: "500-999 changed lines, tests and fixtures excluded." }
+- { name: "size:XXL", color: "f9d0c4", description: "1,000+ changed lines, tests and fixtures excluded." }
+
+- { name: "accept:accuracy", color: "b60205", description: "Maintainer accepts an accuracy drop on purpose." }
+- { name: "accept:time", color: "b60205", description: "Maintainer accepts a slower result on purpose." }
+- { name: "accept:space", color: "b60205", description: "Maintainer accepts a larger Pack or binary on purpose." }
+- { name: "rebuild-needed", color: "5319e7", description: "The change needs a new Pack." }
+- { name: "api-breaking", color: "5319e7", description: "Changes a response field, parameter or error of the API contract." }
+- { name: "experimental", color: "5319e7", description: "New idea in parsing, retrieval, ranking or confidence; must cite its source." }
+
+- { name: "ci:full-suite", color: "0e8a16", description: "Maintainer runs the full fixture suite on this pull request." }
+- { name: "ci:planet-build", color: "0e8a16", description: "Maintainer runs a planet Pack build on this pull request." }
+
+- { name: "triage:passed", color: "0e8a16", description: "Set by triage. Opens Devin Review." }
+- { name: "needs-evidence", color: "e99695", description: "Verification does not show the change works." }
+- { name: "needs-split", color: "e99695", description: "More than one problem in one pull request." }
+- { name: "needs-citation", color: "e99695", description: "Experimental work without a cited source." }
+- { name: "slop", color: "000000", description: "Maintainer only. Devin explains which rules it breaks, then it closes." }
+- { name: "do-not-merge", color: "000000", description: "Not to be merged as it stands." }
+
+- { name: "bug", color: "d73a4a", description: "Issue: something is broken or wrong." }
+- { name: "enhancement", color: "a2eeef", description: "Issue: a new capability." }
+- { name: "documentation", color: "0075ca", description: "Issue: docs are missing or wrong." }
+- { name: "question", color: "d876e3", description: "Issue: a question." }
+- { name: "duplicate", color: "cfd3d7", description: "Issue or pull request already exists." }
+- { name: "wontfix", color: "ffffff", description: "Will not be worked on." }
+- { name: "good first issue", color: "7057ff", description: "Good for newcomers." }
+- { name: "help wanted", color: "008672", description: "Extra attention is needed." }
+- { name: "needs-info", color: "fbca04", description: "Waiting on the reporter; closes after 21 days without a reply." }
