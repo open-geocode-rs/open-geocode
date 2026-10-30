@@ -24,7 +24,7 @@ use open_geocode::{
     },
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
-    openaddresses::OpenAddresses,
+    openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
     parse::{
         bench::{
@@ -154,6 +154,13 @@ enum PackCommand {
         /// <PACK>/openaddresses for the next build.
         #[arg(long)]
         openaddresses: bool,
+
+        /// Add the OpenAddresses points of the countries the Pack covers,
+        /// as --openaddresses does, read from a collection archive
+        /// downloaded from batch.openaddresses.io (`collection-global.zip`)
+        /// instead: no token, and nothing unpacked.
+        #[arg(long, value_name = "ZIP", conflicts_with = "openaddresses")]
+        openaddresses_zip: Option<PathBuf>,
 
         /// Add the address points of a file: OpenAddresses GeoJSON, one
         /// feature per line, or CSV with LON, LAT, NUMBER and STREET columns,
@@ -561,11 +568,17 @@ async fn main() -> Result<()> {
             resume,
             fresh,
             openaddresses,
+            openaddresses_zip,
             address_files,
         }) => {
             resources::opt_out_of_power_throttling();
             resources::yield_to_interactive_programs();
-            let addresses = address_sources(&pack, openaddresses, &address_files)?;
+            let addresses = address_sources(
+                &pack,
+                openaddresses,
+                openaddresses_zip.as_deref(),
+                &address_files,
+            )?;
             let options = BuildOsmOptions {
                 inputs,
                 pack,
@@ -751,11 +764,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// What `--openaddresses` and `--addresses` add to a build, `None` for
-/// neither.
+/// What `--openaddresses`, `--openaddresses-zip` and `--addresses` add to a
+/// build, `None` for none of them.
 fn address_sources(
     pack: &Path,
     openaddresses: bool,
+    collection: Option<&Path>,
     files: &[String],
 ) -> Result<Option<Arc<dyn AddressSource>>> {
     let mut sources: Vec<Arc<dyn AddressSource>> = Vec::new();
@@ -763,6 +777,9 @@ fn address_sources(
         sources.push(Arc::new(OpenAddresses::from_env(
             pack.join("openaddresses"),
         )?));
+    }
+    if let Some(collection) = collection {
+        sources.push(Arc::new(Collection::new(collection)));
     }
     if !files.is_empty() {
         sources.push(Arc::new(AddressFiles(address_files_of(files)?)));
@@ -796,7 +813,11 @@ fn address_files_of(files: &[String]) -> Result<Vec<AddressFile>> {
                     (name, path)
                 }
             };
-            Ok(AddressFile { dataset, path })
+            Ok(AddressFile {
+                dataset,
+                path,
+                entry: None,
+            })
         })
         .collect()
 }

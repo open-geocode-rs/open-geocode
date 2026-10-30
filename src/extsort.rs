@@ -803,8 +803,10 @@ impl<T> IndexedSpoolFile<T> {
         let file = ScratchFile::reopen(scratch, &state.label, &state.file.0, state.file.1)?;
         let saved = ScratchFile::reopen(scratch, &state.label, &state.offsets.0, state.offsets.1)?;
         let offsets = std::fs::read(saved.path())?
-            .chunks_exact(8)
-            .map(|offset| u64::from_le_bytes(offset.try_into().expect("8 bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|offset| u64::from_le_bytes(*offset))
             .collect();
         Self::map(file, offsets, Some(saved))
     }
