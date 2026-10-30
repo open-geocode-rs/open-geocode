@@ -300,8 +300,9 @@ impl Scratch {
         {
             let mut pins = scratch.pins.lock().expect("pins lock");
             pins.held = true;
+            let pins = &mut *pins;
             pins.files = files.iter().cloned().collect();
-            pins.synced = pins.files.clone();
+            pins.synced.clone_from(&pins.files);
         }
         Ok(Arc::new(scratch))
     }

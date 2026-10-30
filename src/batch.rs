@@ -250,10 +250,9 @@ pub fn audit_columns() -> Vec<String> {
 
 /// [`audit_columns`] one per line, as `contract/` records them.
 pub fn audit_columns_text() -> String {
-    audit_columns()
-        .into_iter()
-        .map(|column| format!("{column}\n"))
-        .collect()
+    let mut text = audit_columns().join("\n");
+    text.push('\n');
+    text
 }
 
 /// Rows read, geocoded and written per chunk. Chunks keep memory flat for
@@ -267,7 +266,7 @@ const BATCH_CHUNK_ROWS: usize = 50_000;
 /// The output and the audit carry the input's own bytes, row for row, with
 /// the coordinates written in: only the columns a lookup reads are decoded,
 /// so text in another encoding than UTF-8 comes out as it went in.
-pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
+pub fn run_batch_geocode(options: &GeocodeOptions) -> Result<GeocodeReport> {
     if options.address_field_groups.is_empty() == options.join.is_none() {
         return Err(Error::BadOptions(
             "provide either --address-fields or --join-coordinates-from, but not both".into(),
@@ -294,7 +293,7 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
         unnamed_columns(&options.input)?.iter().collect()
     };
     let original_headers = cells(&header);
-    let fields = Fields::resolve(&options, &original_headers)?;
+    let fields = Fields::resolve(options, &original_headers)?;
     let mut output_headers = original_headers.clone();
     let coordinate_columns = ensure_coordinate_columns(
         &mut output_headers,
@@ -320,9 +319,9 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
                 })?,
         },
         None => {
-            let path = options.pack.as_ref().ok_or(Error::BadOptions(
-                "--pack is required when geocoding address fields".into(),
-            ))?;
+            let path = options.pack.as_ref().ok_or_else(|| {
+                Error::BadOptions("--pack is required when geocoding address fields".into())
+            })?;
             let open = || -> Result<(Arc<Reader>, TextSearcher)> {
                 let pack = Arc::new(Reader::open(path)?);
                 let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
@@ -362,7 +361,7 @@ pub fn run_batch_geocode(options: GeocodeOptions) -> Result<GeocodeReport> {
         if chunk.is_empty() {
             break;
         }
-        let audits = resolver.resolve(&options, &fields, &chunk, report.rows)?;
+        let audits = resolver.resolve(options, &fields, &chunk, report.rows)?;
         for (row, row_audit) in chunk.iter().zip(audits) {
             let resolved = !row_audit.lat.trim().is_empty() && !row_audit.lon.trim().is_empty();
             output.write_record(&output_record(
@@ -620,7 +619,7 @@ fn geocode_row(
         let Some(address) = compose_query(row, group) else {
             continue;
         };
-        let response = searcher.geocode_address(AddressGeocodeOptions {
+        let response = searcher.geocode_address(&AddressGeocodeOptions {
             address: address.clone(),
             locality: locality.clone(),
             region: region.clone(),
@@ -709,7 +708,7 @@ fn create_csv(
     }
     let file_name = path
         .file_name()
-        .ok_or(Error::BadOptions("output is not a file path".into()))?
+        .ok_or_else(|| Error::BadOptions("output is not a file path".into()))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let mut file = File::create(&temporary).map_err(|source| Error::IoPath {
@@ -1080,7 +1079,7 @@ mod tests {
             "id,street\na,20 Queen St\nb,nowhere at all\nc,10 King Street\n",
         )
         .expect("input");
-        let report = run_batch_geocode(GeocodeOptions {
+        let report = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input,
             output: root.join("out.csv"),
@@ -1132,7 +1131,7 @@ mod tests {
         let bare = root.join("bare.csv");
         std::fs::write(&bare, "a,20 Queen St\nb,nowhere at all\n").expect("input");
         let rows = Arc::new(Rows(std::sync::Mutex::new(Vec::new())));
-        let report = run_batch_geocode(GeocodeOptions {
+        let report = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input: bare.clone(),
             output: root.join("bare-out.csv"),
@@ -1150,7 +1149,7 @@ mod tests {
         assert_eq!(output.headers, vec!["column_1", "column_2", "lat", "lon"]);
 
         // A run asked to stop writes nothing.
-        let error = run_batch_geocode(GeocodeOptions {
+        let error = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input: bare,
             output: root.join("stopped.csv"),
@@ -1171,7 +1170,7 @@ mod tests {
         bytes.extend_from_slice(b"1;20 Queen St;Z\xfcrich\n2;10 King Street\n");
         std::fs::write(&messy, bytes).expect("input");
         assert_eq!(detect_delimiter(&messy).expect("delimiter"), b';');
-        let report = run_batch_geocode(GeocodeOptions {
+        let report = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input: messy,
             output: root.join("messy-out.csv"),
@@ -1190,7 +1189,7 @@ mod tests {
         // name the file does not have is an error.
         let twins = root.join("twins.csv");
         std::fs::write(&twins, "street,street,\nnowhere,10 King Street,x\n").expect("input");
-        let report = run_batch_geocode(GeocodeOptions {
+        let report = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input: twins.clone(),
             output: root.join("twins-out.csv"),
@@ -1199,7 +1198,7 @@ mod tests {
         })
         .expect("batch by place");
         assert_eq!(report.resolved, 1);
-        let error = run_batch_geocode(GeocodeOptions {
+        let error = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input: twins,
             output: root.join("twins-missing.csv"),
@@ -1259,7 +1258,7 @@ a,43.6,-79.4
             (root.join("out.csv"), same),
             (root.join("out.csv"), root.join("out.csv")),
         ] {
-            let error = run_batch_geocode(options(output, audit)).expect_err("same file");
+            let error = run_batch_geocode(&options(output, audit)).expect_err("same file");
             assert!(format!("{error:#}").contains("same file"), "{error:#}");
             assert_eq!(std::fs::read_to_string(&input).expect("input"), contents);
         }

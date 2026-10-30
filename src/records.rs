@@ -1395,7 +1395,7 @@ impl Reader {
         let mut value = serde_json::to_value(&record)?;
         let object = value
             .as_object_mut()
-            .ok_or(Error::BadGeometry("record JSON must be an object".into()))?;
+            .ok_or_else(|| Error::BadGeometry("record JSON must be an object".into()))?;
         object.insert("layer".to_string(), json!(record.layer().as_str()));
         Ok(value)
     }

@@ -188,7 +188,9 @@ pub(crate) struct Fields<'a> {
 impl<'a> Fields<'a> {
     /// What the house number is on, as [`AddressComponents::subject`].
     pub(crate) fn subject(&self) -> Option<&'a str> {
-        self.street.or(self.place).or(self.areas.last().copied())
+        self.street
+            .or(self.place)
+            .or_else(|| self.areas.last().copied())
     }
 
     fn parse(order: &'a [u8]) -> Result<Self> {
@@ -248,7 +250,7 @@ impl<'a> Fields<'a> {
 }
 
 impl PendingAddress {
-    pub(super) fn new(record: AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
+    pub(super) fn new(record: &AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
         let point = crate::util::geo::point_lon_lat(&record.geometry)
             .ok_or_else(|| Error::BadGeometry(format!("address {} has no point", record.id())))?;
         debug_assert!(!record.disputed && record.street_postcodes.is_empty());
@@ -1763,7 +1765,7 @@ mod tests {
                 ObjectType::Row => datasets.id(&record.source.dataset),
                 _ => 0,
             };
-            let pending = PendingAddress::new(record.clone(), seq as u64, dataset).expect("new");
+            let pending = PendingAddress::new(&record.clone(), seq as u64, dataset).expect("new");
             assert_eq!(pending.record(&datasets).expect("record"), record);
             round_trip(&pending);
             let mut out = Vec::new();
@@ -1860,7 +1862,7 @@ mod tests {
         let pending = records
             .iter()
             .enumerate()
-            .map(|(seq, record)| PendingAddress::new(record.clone(), seq as u64, 0).expect("new"))
+            .map(|(seq, record)| PendingAddress::new(&record.clone(), seq as u64, 0).expect("new"))
             .collect::<Vec<_>>();
         let mut compact = (0..pending.len()).collect::<Vec<_>>();
         compact.sort_by(|left, right| pending[*left].cmp(&pending[*right]));
@@ -1903,7 +1905,7 @@ mod tests {
         let mut pending = rows
             .into_iter()
             .enumerate()
-            .map(|(seq, row)| PendingAddress::new(row, seq as u64, 0).expect("pending"))
+            .map(|(seq, row)| PendingAddress::new(&row, seq as u64, 0).expect("pending"))
             .collect::<Vec<_>>();
         let street = pending.iter().map(run_bytes).sum::<usize>();
         let resident = pending.iter().map(Spill::resident_bytes).sum::<usize>();

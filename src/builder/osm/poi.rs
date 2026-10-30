@@ -99,7 +99,7 @@ pub(crate) fn poi_tags(
 }
 
 /// Emit a POI from its kept tags; their `addr:*` tags are already validated.
-pub(crate) fn emit_poi(candidate: PoiCandidate, out: &mut Emitted) {
+pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let tags = &candidate.tags;
     let (Some(name), Some(category)) = (poi_name(tags), poi_category(tags)) else {
         return;
@@ -164,7 +164,7 @@ mod tests {
     fn emit(pairs: &[(&str, &str)]) -> Emitted {
         let mut out = Emitted::default();
         emit_poi(
-            PoiCandidate {
+            &PoiCandidate {
                 object_type: ObjectType::Node,
                 object_id: 7,
                 lat: 43.65,
@@ -258,7 +258,7 @@ mod tests {
             ("addr:postcode", "M5V 1A1"),
         ]);
         emit_poi(
-            PoiCandidate {
+            &PoiCandidate {
                 object_type: ObjectType::Way,
                 object_id: 9,
                 lat: 43.65,
