@@ -363,7 +363,7 @@ impl AddressComponents {
         self.street
             .as_deref()
             .or(self.place.as_deref())
-            .or(self.areas.last().map(String::as_str))
+            .or_else(|| self.areas.last().map(String::as_str))
     }
 }
 

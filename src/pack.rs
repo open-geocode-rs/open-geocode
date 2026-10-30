@@ -317,10 +317,10 @@ pub struct BuildStats {
 
 impl Writer {
     pub fn create(destination: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with(destination, WriterOptions::default())
+        Self::create_with(destination, &WriterOptions::default())
     }
 
-    pub fn create_with(destination: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
+    pub fn create_with(destination: impl AsRef<Path>, options: &WriterOptions) -> Result<Self> {
         let mut generation = Generation::create(destination)?;
         let scratch = generation.create_scratch(None, None)?;
         Self::create_in(generation, scratch, options)
@@ -330,7 +330,7 @@ impl Writer {
     pub fn create_in(
         generation: Generation,
         scratch: Arc<Scratch>,
-        options: WriterOptions,
+        options: &WriterOptions,
     ) -> Result<Self> {
         Ok(Self {
             records: records::Writer::create(&scratch, &options.memory)?,
@@ -899,7 +899,9 @@ impl Reader {
     pub fn locality(&self, record_id: RecordId) -> Result<Option<String>> {
         let Some(area_id) = self.boundary_context(record_id)?.and_then(|context| {
             let tuple = &context.admin_context;
-            tuple.locality_record_id().or(tuple.district_record_id())
+            tuple
+                .locality_record_id()
+                .or_else(|| tuple.district_record_id())
         }) else {
             return Ok(None);
         };
@@ -972,9 +974,7 @@ impl Reader {
             .path
             .parent()
             .map(|dir| dir.join(AUDIT_DIR).join(REJECTIONS_FILE))
-            .ok_or(Error::Inconsistent(
-                "Pack file has no parent directory".into(),
-            ))?;
+            .ok_or_else(|| Error::Inconsistent("Pack file has no parent directory".into()))?;
         let file = fs::File::open(&path).map_err(|source| Error::IoPath {
             action: "failed to open build audit",
             path: path.clone(),
@@ -1129,7 +1129,7 @@ mod tests {
     fn first_hit(root: &Path, query: &str) -> Option<String> {
         TextSearcher::open(root)
             .expect("searcher")
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: query.into(),
                 limit: 1,
                 layer: None,
@@ -1199,7 +1199,7 @@ mod tests {
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let generations = fs::read_dir(root.join("generations")).expect("dir").count();
 
-        let result = crate::builder::build_osm_pack(crate::builder::BuildOsmOptions {
+        let result = crate::builder::build_osm_pack(&crate::builder::BuildOsmOptions {
             inputs: vec![root.join("missing.osm.pbf")],
             pack: root.clone(),
             ..crate::builder::BuildOsmOptions::default()
@@ -1233,7 +1233,7 @@ mod tests {
             "osm:node:1"
         );
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "king".into(),
                 limit: 5,
                 layer: None,
@@ -1318,7 +1318,7 @@ mod tests {
         let memory = Budget::new(64 << 20);
         let mut writer = Writer::create_with(
             &root,
-            WriterOptions {
+            &WriterOptions {
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
             },

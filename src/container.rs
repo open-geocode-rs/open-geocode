@@ -218,7 +218,7 @@ impl Writer {
         let section = self
             .open
             .take()
-            .ok_or(Error::Inconsistent("no open Pack section".into()))?;
+            .ok_or_else(|| Error::Inconsistent("no open Pack section".into()))?;
         self.sections.insert(
             section.name,
             SectionInfo {
@@ -411,9 +411,9 @@ impl Container {
     }
 
     fn info(&self, name: &str) -> Result<&SectionInfo> {
-        self.sections.get(name).ok_or(Error::Inconsistent(format!(
-            "Pack is missing section {name}"
-        )))
+        self.sections
+            .get(name)
+            .ok_or_else(|| Error::Inconsistent(format!("Pack is missing section {name}")))
     }
 
     fn bytes_of(&self, info: &SectionInfo) -> Bytes {
@@ -440,9 +440,7 @@ fn parse_toc(bytes: &[u8]) -> Result<BTreeMap<String, SectionInfo>> {
     let toc_end = toc_offset
         .checked_add(toc_len)
         .filter(|end| *end == trailer)
-        .ok_or(Error::Inconsistent(
-            "Pack table of contents is out of bounds".into(),
-        ))?;
+        .ok_or_else(|| Error::Inconsistent("Pack table of contents is out of bounds".into()))?;
     let mut input = &bytes[toc_offset..toc_end];
     let count = get_u64(&mut input)?;
     let mut sections = BTreeMap::new();
@@ -457,7 +455,7 @@ fn parse_toc(bytes: &[u8]) -> Result<BTreeMap<String, SectionInfo>> {
         let end = info
             .offset
             .checked_add(info.len)
-            .ok_or(Error::Inconsistent("Pack section bounds overflow".into()))?;
+            .ok_or_else(|| Error::Inconsistent("Pack section bounds overflow".into()))?;
         if info.offset < HEADER_BYTES || end > toc_offset as u64 {
             return Err(Error::SectionOutOfBounds { section: name });
         }
@@ -500,7 +498,7 @@ fn advise(mmap: &Mmap, prefault: bool) {
     };
     // SAFETY: the range is the live mapping, which the call only reads in.
     unsafe {
-        PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+        PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const range, 0);
     }
 }
 

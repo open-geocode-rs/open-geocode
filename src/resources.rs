@@ -168,7 +168,7 @@ mod platform {
             ..unsafe { std::mem::zeroed() }
         };
         // SAFETY: `status` is a MEMORYSTATUSEX with its length set.
-        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+        if unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0 {
             resources.total_memory_bytes = status.ullTotalPhys;
             resources.available_memory_bytes = status.ullAvailPhys;
             resources.memory_limit = "available physical memory".to_string();
@@ -196,8 +196,9 @@ mod platform {
         let all = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
         let (mut process, mut system) = (0usize, 0usize);
         // SAFETY: both out-pointers are valid for the call.
-        let masked =
-            unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) } != 0;
+        let masked = unsafe {
+            GetProcessAffinityMask(GetCurrentProcess(), &raw mut process, &raw mut system)
+        } != 0;
         let (mut cpus, mut limit) = if masked && process != system {
             (process.count_ones() as usize, "affinity mask".to_string())
         } else {
@@ -210,7 +211,7 @@ mod platform {
             QueryInformationJobObject(
                 std::ptr::null_mut(),
                 JobObjectCpuRateControlInformation,
-                (&mut rate as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                (&raw mut rate).cast(),
                 std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
                 std::ptr::null_mut(),
             )
@@ -238,7 +239,7 @@ mod platform {
             QueryInformationJobObject(
                 std::ptr::null_mut(),
                 JobObjectExtendedLimitInformation,
-                (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                (&raw mut info).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 std::ptr::null_mut(),
             )
@@ -265,11 +266,7 @@ mod platform {
         // SAFETY: the EX counters start with the plain ones, and `cb` says
         // which were passed.
         let read = unsafe {
-            K32GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
-                counters.cb,
-            )
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), counters.cb)
         } != 0;
         if read {
             counters.PrivateUsage as u64
@@ -279,9 +276,9 @@ mod platform {
     }
 
     /// Kernel plus user time, from FILETIMEs in 100 ns ticks.
-    fn busy(kernel: &FILETIME, user: &FILETIME) -> std::time::Duration {
+    fn busy(kernel: FILETIME, user: FILETIME) -> std::time::Duration {
         let ticks =
-            |time: &FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
+            |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
         std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
     }
 
@@ -291,7 +288,7 @@ mod platform {
         // SAFETY: four valid FILETIME out-pointers for the current process.
         let read =
             unsafe { GetProcessTimes(GetCurrentProcess(), created, exited, kernel, user) } != 0;
-        read.then(|| busy(kernel, user))
+        read.then(|| busy(*kernel, *user))
     }
 
     /// A handle to a thread, opened to read its times.
@@ -317,7 +314,7 @@ mod platform {
             let [created, exited, kernel, user] = &mut times;
             // SAFETY: an open thread handle and four valid out-pointers.
             let read = unsafe { GetThreadTimes(self.0, created, exited, kernel, user) } != 0;
-            read.then(|| busy(kernel, user))
+            read.then(|| busy(*kernel, *user))
         }
     }
 
@@ -334,11 +331,7 @@ mod platform {
         counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         // SAFETY: as in `private_bytes`.
         let read = unsafe {
-            K32GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
-                counters.cb,
-            )
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), counters.cb)
         } != 0;
         read.then_some(counters.WorkingSetSize as u64)
     }
@@ -354,7 +347,7 @@ mod platform {
         let read = unsafe {
             GetDiskFreeSpaceExW(
                 wide.as_ptr(),
-                &mut free,
+                &raw mut free,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -393,7 +386,7 @@ mod platform {
             SetProcessInformation(
                 GetCurrentProcess(),
                 ProcessPowerThrottling,
-                (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+                (&raw const state).cast(),
                 std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
             );
         }

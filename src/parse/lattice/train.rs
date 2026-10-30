@@ -591,7 +591,7 @@ struct LatticeCache {
 /// One shard's rows with their lattices, built.
 enum Lattices {
     Memory(Vec<Learned>, Reservation),
-    File(IndexedSpoolFile<Learned>),
+    File(Box<IndexedSpoolFile<Learned>>),
 }
 
 impl LatticeCache {
@@ -629,7 +629,7 @@ impl LatticeCache {
 
     fn finish(self) -> Result<Lattices> {
         Ok(match self.file {
-            Some(file) => Lattices::File(file.finish()?),
+            Some(file) => Lattices::File(Box::new(file.finish()?)),
             None => Lattices::Memory(self.rows, self.reservation.into_reservation()),
         })
     }
@@ -766,9 +766,14 @@ impl Spill for Row {
             let break_before = get_u8(input)? != 0;
             let joiner = match get_u64(input)? {
                 0 => None,
-                code => Some(u32::try_from(code).ok().and_then(char::from_u32).ok_or(
-                    Error::BadFixtureRow("invalid joiner in a training row".into()),
-                )?),
+                code => Some(
+                    u32::try_from(code)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| {
+                            Error::BadFixtureRow("invalid joiner in a training row".into())
+                        })?,
+                ),
             };
             tokens.words.push(word);
             tokens.breaks.push(break_before);
@@ -1747,7 +1752,7 @@ impl<'a> Renderer<'a> {
                     short.to_vec()
                 };
                 if !other.is_empty() {
-                    *word = other[random.below(other.len() as u64) as usize].clone();
+                    word.clone_from(&other[random.below(other.len() as u64) as usize]);
                 }
             }
         }
