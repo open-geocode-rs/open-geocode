@@ -123,7 +123,7 @@ impl PackReverseGeocoder {
     }
 
     pub fn reverse(&self, options: GeocodeOptions) -> Result<GeocodeResponse> {
-        let mut context   =   Context::default();
+        let mut context = Context::default();
         let mut context_record_ids = Vec::new();
 
         let mut result = self.explicit_address(options, &mut context, &mut context_record_ids)?;
