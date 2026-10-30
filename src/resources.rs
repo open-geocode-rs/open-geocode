@@ -417,7 +417,7 @@ mod platform {
                 rlim_max: 0,
             };
             // SAFETY: `limit` is valid for the call.
-            if unsafe { libc::getrlimit(resource, &mut limit) } == 0
+            if unsafe { libc::getrlimit(resource, &raw mut limit) } == 0
                 && limit.rlim_cur != libc::RLIM_INFINITY
             {
                 // `rlim_t` is 32 bits on some targets.
@@ -535,7 +535,7 @@ mod platform {
         // the call.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
         // SAFETY: `usage` is valid for the call.
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
             return None;
         }
         let time = |value: libc::timeval| {
@@ -554,7 +554,8 @@ mod platform {
         pub(super) fn current() -> Option<Self> {
             let mut clock: libc::clockid_t = 0;
             // SAFETY: the calling thread exists; `clock` is valid for the call.
-            let found = unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock) };
+            let found =
+                unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &raw mut clock) };
             (found == 0).then_some(Self(clock))
         }
 
@@ -570,7 +571,7 @@ mod platform {
             };
             // SAFETY: a clock id from `pthread_getcpuclockid` and a valid
             // out-pointer.
-            (unsafe { libc::clock_gettime(self.0, &mut time) } == 0).then(|| {
+            (unsafe { libc::clock_gettime(self.0, &raw mut time) } == 0).then(|| {
                 std::time::Duration::new(time.tv_sec.max(0) as u64, time.tv_nsec.max(0) as u32)
             })
         }
@@ -596,7 +597,7 @@ mod platform {
         // all-zero bit pattern is a valid value; `statvfs` overwrites it.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is NUL-terminated and `stat` valid for the call.
-        (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0)
+        (unsafe { libc::statvfs(path.as_ptr(), &raw mut stat) } == 0)
             .then(|| (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
     }
 
