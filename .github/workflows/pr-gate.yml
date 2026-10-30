@@ -54,7 +54,9 @@ jobs:
               return;
             }
             const reconcile = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/gate.js`);
-            const drafts = getOctokit(process.env.TRIAGE_TOKEN);
+            // A second client of the same class as `github`, signed with the
+            // token allowed to change draft state.
+            const drafts = new github.constructor({ auth: process.env.TRIAGE_TOKEN });
 
             let numbers;
             if (context.eventName === 'pull_request_target') {
