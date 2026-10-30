@@ -32,6 +32,11 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: actions/github-script@v7
+        env:
+          # The Actions token may not change a pull request's draft state.
+          # Only the round trip uses this token; labels and comments stay
+          # with the Actions bot.
+          TRIAGE_TOKEN: ${{ secrets.TRIAGE_TOKEN }}
         with:
           script: |
             const rules = `${process.env.GITHUB_WORKSPACE}/.github/scripts/triage.js`;
@@ -68,6 +73,7 @@ jobs:
             // A draft opens Devin when its author marks it ready; only a ready
             // pull request needs the round trip through draft.
             if (!pr.draft) {
-              await github.graphql(`mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }`, { id: pr.node_id });
-              await github.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }`, { id: pr.node_id });
+              const drafts = getOctokit(process.env.TRIAGE_TOKEN);
+              await drafts.graphql(`mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }`, { id: pr.node_id });
+              await drafts.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }`, { id: pr.node_id });
             }

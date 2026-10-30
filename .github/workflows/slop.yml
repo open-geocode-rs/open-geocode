@@ -22,13 +22,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
+        env:
+          # The Actions token may not change a pull request's draft state.
+          TRIAGE_TOKEN: ${{ secrets.TRIAGE_TOKEN }}
         with:
           script: |
+            const drafts = getOctokit(process.env.TRIAGE_TOKEN);
             const id = context.payload.pull_request.node_id;
             if (!context.payload.pull_request.draft) {
-              await github.graphql(`mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }`, { id });
+              await drafts.graphql(`mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }`, { id });
             }
-            await github.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }`, { id });
+            await drafts.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }`, { id });
 
   close:
     name: Close with the findings
