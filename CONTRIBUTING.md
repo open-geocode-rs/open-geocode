@@ -88,6 +88,7 @@ Every pull request passes two gates before a maintainer reviews it.
 
 1. **Triage**, a GitHub Action: the title is a conventional commit, the template's sections are filled, the Impact rows are present, and an `experimental` pull request links a source.
    It reruns on every push and edit.
+   A pull request that fails triage is held as a draft, and returns to ready once it passes.
 2. **Devin Review**, once triage passes: bugs and security against [`REVIEW.md`](REVIEW.md), and a contribution check against this file.
 
 Only maintainers can start a Devin review by hand with `/devin review`.
