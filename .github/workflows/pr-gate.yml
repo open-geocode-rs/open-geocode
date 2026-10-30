@@ -30,6 +30,9 @@ concurrency:
 jobs:
   gate:
     name: PR gate
+    # TRIAGE_TOKEN lives in this environment, which only main may use: a
+    # workflow pushed on another branch of the repository cannot read it.
+    environment: triage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
