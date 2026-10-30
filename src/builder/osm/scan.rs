@@ -57,7 +57,7 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                     node.id(),
                     node.lat(),
                     node.lon(),
-                    collect_clean_tags(node.tags()),
+                    &collect_clean_tags(node.tags()),
                 );
             }
             Element::Node(node) => {
@@ -68,7 +68,7 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                     node.id(),
                     node.lat(),
                     node.lon(),
-                    collect_clean_tags(node.tags()),
+                    &collect_clean_tags(node.tags()),
                 );
             }
             Element::Way(way) => {
@@ -81,7 +81,7 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                         &mut output.ways,
                         Some(&mut output.emitted),
                         way.id(),
-                        tags,
+                        &tags,
                         || {
                             refs.get_or_init(|| way.refs().collect::<Vec<_>>())
                                 .as_slice()
@@ -107,7 +107,7 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                 scan_relation(
                     &mut output,
                     relation.id(),
-                    collect_clean_tags(relation.tags()),
+                    &collect_clean_tags(relation.tags()),
                     members,
                 );
             }
@@ -121,32 +121,32 @@ fn scan_node(
     object_id: i64,
     lat: f64,
     lon: f64,
-    all_tags: BTreeMap<String, String>,
+    all_tags: &BTreeMap<String, String>,
 ) {
     if all_tags.is_empty() {
         return;
     }
     let out = &mut output.emitted;
-    if has_place_tag(&all_tags) {
-        emit_place_node(object_id, lat, lon, &all_tags, out);
+    if has_place_tag(all_tags) {
+        emit_place_node(object_id, lat, lon, all_tags, out);
     }
 
-    let address = node_address_tags(object_id, &all_tags, out);
-    if is_poi(&all_tags) {
+    let address = node_address_tags(object_id, all_tags, out);
+    if is_poi(all_tags) {
         emit_poi(
-            PoiCandidate {
+            &PoiCandidate {
                 object_type: ObjectType::Node,
                 object_id,
                 lat,
                 lon,
                 location_precision: LocationPrecision::Point,
-                tags: poi_tags(&all_tags, address.as_ref()),
+                tags: poi_tags(all_tags, address.as_ref()),
             },
             out,
         );
     } else if let Some(tags) = address {
         emit_address(
-            AddressCandidate {
+            &AddressCandidate {
                 object_type: ObjectType::Node,
                 object_id,
                 lat,
@@ -201,7 +201,7 @@ fn node_address_tags(
 /// classifies it, without counting what it rejects again.
 pub(crate) fn way_features<'a>(
     object_id: i64,
-    all_tags: BTreeMap<String, String>,
+    all_tags: &BTreeMap<String, String>,
     refs: impl Fn() -> &'a [i64],
 ) -> Vec<(WayFeature, Vec<i64>)> {
     let mut ways = Vec::new();
@@ -215,7 +215,7 @@ fn scan_way<'a>(
     ways: &mut Vec<(WayFeature, Vec<i64>)>,
     mut out: Option<&mut Emitted>,
     object_id: i64,
-    all_tags: BTreeMap<String, String>,
+    all_tags: &BTreeMap<String, String>,
     refs: impl Fn() -> &'a [i64],
 ) {
     let feature = |kind, tags| {
@@ -229,39 +229,39 @@ fn scan_way<'a>(
         )
     };
 
-    if has_area_tags(&all_tags) && !refs().is_empty() {
-        ways.push(feature(WayKind::Boundary, boundary_tags(&all_tags)));
+    if has_area_tags(all_tags) && !refs().is_empty() {
+        ways.push(feature(WayKind::Boundary, boundary_tags(all_tags)));
     }
 
-    if has_highway_tag(&all_tags) {
-        if street_name(&all_tags).is_some() {
+    if has_highway_tag(all_tags) {
+        if street_name(all_tags).is_some() {
             if refs().is_empty() {
                 if let Some(out) = out.as_deref_mut() {
                     out.reject(
                         CandidateIssue::StreetUnresolvedGeometry,
                         ObjectType::Way,
                         object_id,
-                        &all_tags,
+                        all_tags,
                         Some(&BTreeMap::new()),
                         Some("street"),
                     );
                 }
             } else {
-                ways.push(feature(WayKind::Street, street_tags(&all_tags)));
+                ways.push(feature(WayKind::Street, street_tags(all_tags)));
             }
         } else if let Some(out) = out.as_deref_mut() {
             out.reject_in_report(
-                missing_street_name_issue(&all_tags),
+                missing_street_name_issue(all_tags),
                 ObjectType::Way,
                 object_id,
-                &all_tags,
+                all_tags,
                 None,
                 None,
             );
         }
     }
 
-    let tags = collect_addr_tags_from_map(&all_tags);
+    let tags = collect_addr_tags_from_map(all_tags);
     if has_interpolation_tag(&tags) {
         if refs().is_empty() {
             if let Some(out) = out.as_deref_mut() {
@@ -269,7 +269,7 @@ fn scan_way<'a>(
                     CandidateIssue::InterpolationWayWithoutNodes,
                     ObjectType::Way,
                     object_id,
-                    &all_tags,
+                    all_tags,
                     Some(&tags),
                     Some("interpolation"),
                 );
@@ -288,7 +288,7 @@ fn scan_way<'a>(
                 issue,
                 ObjectType::Way,
                 object_id,
-                &all_tags,
+                all_tags,
                 Some(&tags),
                 Some("address"),
             );
@@ -298,8 +298,8 @@ fn scan_way<'a>(
         Some(tags)
     };
 
-    let (kind, tags, layer_hint) = if is_poi(&all_tags) {
-        (WayKind::Poi, poi_tags(&all_tags, address.as_ref()), "poi")
+    let (kind, tags, layer_hint) = if is_poi(all_tags) {
+        (WayKind::Poi, poi_tags(all_tags, address.as_ref()), "poi")
     } else if let Some(tags) = address {
         (WayKind::Address, tags, "address")
     } else {
@@ -311,7 +311,7 @@ fn scan_way<'a>(
                 CandidateIssue::WayWithoutResolvedNodes,
                 ObjectType::Way,
                 object_id,
-                &all_tags,
+                all_tags,
                 None,
                 Some(layer_hint),
             );
@@ -335,21 +335,21 @@ fn is_area_relation(tags: &BTreeMap<String, String>) -> bool {
 fn scan_relation(
     output: &mut ScanOutput,
     object_id: i64,
-    all_tags: BTreeMap<String, String>,
+    all_tags: &BTreeMap<String, String>,
     members: Vec<BoundaryRelationMember>,
 ) {
-    if has_area_tags(&all_tags) && is_area_relation(&all_tags) {
+    if has_area_tags(all_tags) && is_area_relation(all_tags) {
         if !members.is_empty() {
             output.relations.push(BoundaryRelationStub {
                 object_id,
                 members,
-                tags: boundary_tags(&all_tags),
+                tags: boundary_tags(all_tags),
             });
         }
         return;
     }
 
-    let tags = collect_addr_tags_from_map(&all_tags);
+    let tags = collect_addr_tags_from_map(all_tags);
     if tags.is_empty() {
         return;
     }
@@ -366,7 +366,7 @@ fn scan_relation(
         issue,
         ObjectType::Relation,
         object_id,
-        &all_tags,
+        all_tags,
         Some(&tags),
         Some(layer_hint),
     );

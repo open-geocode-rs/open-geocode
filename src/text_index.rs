@@ -1019,7 +1019,7 @@ impl ProjectionBuilder {
         if let Some(text) = search_text(value) {
             self.projected
                 .name_words
-                .get_or_insert(text.split_whitespace().count() as u64);
+                .get_or_insert_with(|| text.split_whitespace().count() as u64);
             self.name_parts.push(text);
         }
         self.add_content_text(value);

@@ -360,7 +360,7 @@ pub(crate) async fn search(
         bbox,
     };
     let collection = blocking(move || {
-        let hits = state.searcher.search(options)?;
+        let hits = state.searcher.search(&options)?;
         api::forward_collection(&state.pack, query, hits)
     })
     .await?;
@@ -439,7 +439,7 @@ pub(crate) async fn autocomplete(
         bbox,
     };
     let collection = blocking(move || {
-        let hits = state.searcher.autocomplete(options)?;
+        let hits = state.searcher.autocomplete(&options)?;
         api::forward_collection(&state.pack, query, hits)
     })
     .await?;
@@ -538,7 +538,7 @@ pub(crate) async fn geocode(
         countries,
     };
     let collection = blocking(move || {
-        let found = state.searcher.geocode_address(options)?;
+        let found = state.searcher.geocode_address(&options)?;
         let (query, hits) = match found {
             Some(found) => (found.query, vec![found.hit]),
             None => (address, Vec::new()),

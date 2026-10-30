@@ -414,7 +414,7 @@ fn address(
             street: Some(street),
             place: None,
             unit: text(properties.unit),
-            locality: text(properties.city).or(text(properties.district)),
+            locality: text(properties.city).or_else(|| text(properties.district)),
             areas: Vec::new(),
             region: text(properties.region),
             postcode: text(properties.postcode),

@@ -217,7 +217,7 @@ fn row_examples(
     for _ in 0..options.variants {
         let query = messy_query(row, names, |word| searcher.describes_street(word), rng);
         queries += 1;
-        take(searcher.search(TextSearchOptions {
+        take(searcher.search(&TextSearchOptions {
             query,
             limit: ANSWERS_PER_QUERY,
             layer: None,
@@ -228,7 +228,7 @@ fn row_examples(
     }
     if let Some(prefix) = typed_prefix(row, rng) {
         queries += 1;
-        take(searcher.autocomplete(TextAutocompleteOptions {
+        take(searcher.autocomplete(&TextAutocompleteOptions {
             query: prefix,
             limit: ANSWERS_PER_QUERY,
             layer: None,
@@ -471,7 +471,7 @@ mod tests {
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         assert!(searcher.confidence_model().is_some());
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "4 King Street West".into(),
                 limit: 3,
                 layer: None,

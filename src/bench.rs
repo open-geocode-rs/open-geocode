@@ -201,7 +201,7 @@ pub struct ReverseQueryFixture {
     pub lat: f64,
 }
 
-pub fn benchmark_pack(options: PackBenchmarkOptions) -> Result<PackBenchmarkReport> {
+pub fn benchmark_pack(options: &PackBenchmarkOptions) -> Result<PackBenchmarkReport> {
     let iterations = options.iterations.max(1);
     let warmup = options.warmup;
     let fixture = read_fixture(options.queries.as_deref())?;
@@ -296,7 +296,7 @@ fn read_build_report(pack_file: &Path) -> Result<Option<BuilderReport>> {
     };
     let file = fs::File::open(&path).map_err(|source| Error::IoPath {
         action: "failed to open",
-        path: path.to_path_buf(),
+        path: path.clone(),
         source,
     })?;
     Ok(Some(serde_json::from_reader(file)?))
@@ -324,7 +324,7 @@ fn benchmark_search_cases(
     warmup: usize,
 ) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
     benchmark_text_cases(cases, iterations, warmup, |case, limit| {
-        searcher.search(TextSearchOptions {
+        searcher.search(&TextSearchOptions {
             query: case.query.clone(),
             limit,
             layer: case.layer.clone(),
@@ -342,7 +342,7 @@ fn benchmark_autocomplete_cases(
     warmup: usize,
 ) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
     benchmark_text_cases(cases, iterations, warmup, |case, limit| {
-        searcher.autocomplete(TextAutocompleteOptions {
+        searcher.autocomplete(&TextAutocompleteOptions {
             query: case.query.clone(),
             limit,
             layer: case.layer.clone(),
@@ -483,7 +483,7 @@ pub struct PoiFixtureOptions {
 /// whose name is unique within their locality, each queried as
 /// "<name>, <locality>" and expected to find that POI. The locality is the
 /// one [`Reader::locality`] names; POIs without one are not drawn.
-pub fn sample_poi_fixture(options: PoiFixtureOptions) -> Result<BenchmarkFixture> {
+pub fn sample_poi_fixture(options: &PoiFixtureOptions) -> Result<BenchmarkFixture> {
     let reader = Reader::open(&options.pack)?;
     let mut candidates = Vec::new();
     // POIs per (area, name), over both the locality and the district a POI
@@ -715,7 +715,7 @@ mod tests {
         );
 
         let sample = |seed| {
-            sample_poi_fixture(PoiFixtureOptions {
+            sample_poi_fixture(&PoiFixtureOptions {
                 pack: temp_dir.clone(),
                 count: 10,
                 seed,
@@ -761,7 +761,7 @@ mod tests {
             serde_json::to_vec(&fixture).expect("fixture json"),
         )
         .expect("write fixture");
-        let report = benchmark_pack(PackBenchmarkOptions {
+        let report = benchmark_pack(&PackBenchmarkOptions {
             pack: temp_dir.clone(),
             queries: Some(fixture_path),
             iterations: 1,
@@ -785,7 +785,7 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         write_test_pack(&temp_dir);
 
-        let report = benchmark_pack(PackBenchmarkOptions {
+        let report = benchmark_pack(&PackBenchmarkOptions {
             pack: temp_dir.clone(),
             queries: None,
             iterations: 2,
@@ -825,7 +825,7 @@ mod tests {
         )
         .expect("write fixture");
 
-        let report = benchmark_pack(PackBenchmarkOptions {
+        let report = benchmark_pack(&PackBenchmarkOptions {
             pack: temp_dir.clone(),
             queries: Some(fixture_path),
             iterations: 2,

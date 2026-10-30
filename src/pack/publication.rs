@@ -140,7 +140,7 @@ pub(super) fn publish(
         "{}",
         generation
             .file_name()
-            .ok_or(Error::Inconsistent("missing generation name".into()))?
+            .ok_or_else(|| Error::Inconsistent("missing generation name".into()))?
             .to_string_lossy()
     )?;
     file.sync_all()?;

@@ -74,7 +74,7 @@ pub enum Attribution {
     OpenStreetMap,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ForwardGeocoding {
     pub version: Version,
     /// Query as received, trimmed, with each run of whitespace collapsed to
@@ -138,7 +138,7 @@ pub enum PointType {
 // [`ReverseProperties`], which add the field each direction ranks by, so both
 // are one flat object on the wire.
 /// Properties shared by forward and reverse results.
-#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Common {
     /// Stable ID from the source data, such as `osm:node:123`.
     pub id: String,
@@ -577,12 +577,12 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
             };
         }
         if let Some(id) = &result.id {
-            summary.id = id.clone();
+            summary.id.clone_from(id);
         }
         if let Some(layer) = &result.layer {
-            summary.layer = layer.clone();
+            summary.layer.clone_from(layer);
         }
-        summary.label = result.label.clone();
+        summary.label.clone_from(&result.label);
         let properties = ReverseProperties {
             common: common(&mut contexts, record_id, summary, accuracy)?,
             distance_m: result.distance_m,
