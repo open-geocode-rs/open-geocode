@@ -1,8 +1,9 @@
 name: Comment cop
 
-# Flags multi-line `//` comments a pull request adds in src/, the rule in
-# AGENTS.md. Doc comments (`///`, `//!`) and groups holding a SAFETY: marker
-# are left alone. Reads the diff through the API; PR code is never checked out.
+# Flags `//` comments of three or more lines a pull request adds in src/.
+# AGENTS.md's own examples run to two lines, so two pass. Doc comments
+# (`///`, `//!`) and groups holding a SAFETY: marker are left alone. Reads the
+# diff through the API; PR code is never checked out.
 on:
   pull_request_target:
     types: [opened, reopened, synchronize]
@@ -25,7 +26,7 @@ jobs:
           script: |
             const crypto = require('crypto');
             const pr = context.payload.pull_request;
-            const MIN_LINES = 2;
+            const MIN_LINES = 3;
 
             const isComment = (line) => {
               const text = line.trimStart();
@@ -81,7 +82,7 @@ jobs:
             for (const g of found.filter((g) => !flagged.has(key(g)))) {
               const body =
                 `<!-- comment-cop:${key(g)} -->\n` +
-                'This comment runs over several lines. [AGENTS.md](../blob/main/AGENTS.md) asks comments to say why, briefly. ' +
+                `This comment runs over several lines. [AGENTS.md](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/AGENTS.md) asks comments to say why, briefly. ` +
                 'If it explains a workaround, a change to the code may say it better.';
               const params = { ...context.repo, pull_number: pr.number, commit_id: pr.head.sha, path: g.path, line: g.end, side: 'RIGHT', body };
               if (g.end > g.start) Object.assign(params, { start_line: g.start, start_side: 'RIGHT' });

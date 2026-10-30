@@ -35,7 +35,8 @@ jobs:
     if: >
       github.event_name == 'status' &&
       github.event.context == 'Devin Review / Slop' &&
-      github.event.state != 'pending'
+      github.event.state != 'pending' &&
+      github.event.sender.login == 'devin-ai-integration[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +55,9 @@ jobs:
               core.info(`no open pull request labelled slop at ${sha}`);
               return;
             }
-            const findings = target_url ? `[Devin Review / Slop](${target_url})` : 'see the **Devin Review / Slop** check on this pull request';
-            const body = fs.readFileSync('.github/slop.md', 'utf8').replace('{{findings}}', findings);
+            const devin = typeof target_url === 'string' && target_url.startsWith('https://app.devin.ai/');
+            const findings = devin ? `[Devin Review / Slop](${target_url})` : 'see the **Devin Review / Slop** check on this pull request';
+            const guide = `https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/CONTRIBUTING.md`;
+            const body = fs.readFileSync('.github/slop.md', 'utf8').replace('{{findings}}', findings).replace('{{guide}}', guide);
             await github.rest.issues.createComment({ ...context.repo, issue_number: pr.number, body });
             await github.rest.pulls.update({ ...context.repo, pull_number: pr.number, state: 'closed' });
