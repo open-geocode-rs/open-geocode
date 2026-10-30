@@ -18,7 +18,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/crates/l/open-geocode.svg?style=flat-square" alt="license"></a>
 </p>
 
-<p align="center"><a href="https://opengeocode.com"><b>opengeocode.com</b></a></p>
+<p align="center">
+  <a href="https://opengeocode.com/docs/"><b>Docs</b></a> •
+  <a href="https://opengeocode.com/docs/quickstart/"><b>Quickstart</b></a> •
+  <a href="https://opengeocode.com/docs/api/"><b>API</b></a> •
+  <a href="https://opengeocode.com/docs/benchmarks/"><b>Benchmarks</b></a>
+</p>
 
 `open-geocode` is a self-hosted address geocoding engine built entirely on open data (OpenStreetMap and OpenAddresses).
 Forward, autocomplete, reverse and batch geocoding, served from one file.
