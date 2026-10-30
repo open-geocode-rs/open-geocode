@@ -193,7 +193,9 @@ impl TreeWriter {
         let saved = ScratchFile::reopen(scratch, LABEL, &state.parents.0, state.parents.1)?;
         let bytes = std::fs::read(saved.path())?;
         let parents = bytes
-            .chunks_exact(BOX_BYTES)
+            .as_chunks::<BOX_BYTES>()
+            .0
+            .iter()
             .map(|bbox| {
                 std::array::from_fn(|at| {
                     i32::from_le_bytes(bbox[at * 4..at * 4 + 4].try_into().expect("4 bytes"))

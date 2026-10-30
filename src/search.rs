@@ -2261,7 +2261,7 @@ impl TextSearcher {
                     if settlements.is_none() {
                         settlements = Some(self.near_settlements(hit)?);
                     }
-                    agrees = settlements.as_deref().is_some_and(&agrees_with);
+                    agrees = settlements.as_deref().is_some_and(agrees_with);
                 }
             }
             if !agrees {

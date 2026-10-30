@@ -1,6 +1,7 @@
 //! OpenAddresses as an [`AddressSource`]: the address files of the countries
 //! a Pack covers, fetched from the OpenAddresses batch service and kept in a
-//! cache between builds.
+//! cache between builds, or read from a collection archive downloaded whole
+//! ([`Collection`]).
 //!
 //! Listing the sources is open, but downloading their data needs an
 //! OpenAddresses account: its API token is read from [`TOKEN_VARIABLE`], or
@@ -169,22 +170,129 @@ impl AddressSource for OpenAddresses {
         sources
             .iter()
             .map(|source| {
-                // The name tells data sets of one source apart, when it has several.
-                let shared = sources
-                    .iter()
-                    .filter(|other| other.source == source.source)
-                    .count()
-                    > 1;
                 Ok(AddressFile {
-                    dataset: if shared {
-                        format!("{DATASET_PREFIX}{}/{}", source.source, source.name)
-                    } else {
-                        format!("{DATASET_PREFIX}{}", source.source)
-                    },
+                    dataset: dataset_of(source, &sources),
                     path: self.download(source)?,
+                    entry: None,
                 })
             })
             .collect()
+    }
+}
+
+/// The dataset a source's records name: its path, and its name too when the
+/// source has several data sets.
+fn dataset_of(source: &Source, sources: &[Source]) -> String {
+    let shared = sources
+        .iter()
+        .filter(|other| other.source == source.source)
+        .count()
+        > 1;
+    if shared {
+        format!("{DATASET_PREFIX}{}/{}", source.source, source.name)
+    } else {
+        format!("{DATASET_PREFIX}{}", source.source)
+    }
+}
+
+/// An OpenAddresses collection archive, such as `collection-global.zip` from
+/// <https://batch.openaddresses.io/data>: every source's output as a
+/// `.geojson` entry beside a `.geojson.meta` that names it. The address
+/// entries of the Pack's countries are read straight from the archive, with
+/// no token and nothing unpacked; its parcels, buildings and other layers
+/// are left alone.
+#[derive(Debug, Clone)]
+pub struct Collection {
+    path: PathBuf,
+}
+
+/// What a `.geojson.meta` entry says of its source.
+#[derive(Debug, Deserialize)]
+struct EntryMeta {
+    /// The source's path, `nz/countrywide`.
+    source_name: String,
+    layer: String,
+    #[serde(default)]
+    name: String,
+    /// The job that made the output.
+    id: u64,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+impl Collection {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Every address source in the archive, with the entry that holds it.
+    fn listed(&self) -> Result<Vec<(Source, String)>> {
+        let file = File::open(&self.path)
+            .map_err(|error| io_error("failed to open", &self.path, error))?;
+        let bad = |detail: String| Error::BadInput(format!("{}: {detail}", self.path.display()));
+        let mut archive = zip::ZipArchive::new(io::BufReader::new(file))
+            .map_err(|error| bad(format!("not a readable zip archive: {error}")))?;
+        let metas = archive
+            .file_names()
+            .filter(|name| name.ends_with(".geojson.meta"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut listed = Vec::new();
+        for meta in metas {
+            let entry = meta.trim_end_matches(".meta").to_string();
+            if archive.index_for_name(&entry).is_none() {
+                continue;
+            }
+            let read = archive
+                .by_name(&meta)
+                .map_err(|error| bad(format!("cannot read {meta}: {error}")))?;
+            let meta: EntryMeta = serde_json::from_reader(read)
+                .map_err(|error| bad(format!("{meta} is not an OpenAddresses job: {error}")))?;
+            if meta.layer != "addresses" {
+                continue;
+            }
+            listed.push((
+                Source {
+                    source: meta.source_name,
+                    name: meta.name,
+                    job: meta.id,
+                    size: meta.size,
+                },
+                entry,
+            ));
+        }
+        Ok(listed)
+    }
+}
+
+impl AddressSource for Collection {
+    fn files(&self, coverage: &Coverage) -> Result<Vec<AddressFile>> {
+        let listed = self.listed()?;
+        let sources = select(
+            listed.iter().map(|(source, _)| source.clone()).collect(),
+            coverage,
+        );
+        let entries = listed
+            .into_iter()
+            .map(|(source, entry)| {
+                (
+                    (source.source.clone(), source.name.clone(), source.job),
+                    entry,
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(sources
+            .iter()
+            .filter_map(|source| {
+                let entry =
+                    entries.get(&(source.source.clone(), source.name.clone(), source.job))?;
+                Some(AddressFile {
+                    dataset: dataset_of(source, &sources),
+                    path: self.path.clone(),
+                    entry: Some(entry.clone()),
+                })
+            })
+            .collect())
     }
 }
 
@@ -383,5 +491,101 @@ mod tests {
             ],
             "not ca/countrywide, which holds Quebec too"
         );
+    }
+
+    /// An archive laid out as OpenAddresses' collections are: each job's
+    /// output beside its `.meta`, deflated, in several layers.
+    fn collection(dir: &Path) -> PathBuf {
+        use std::io::Write;
+        let path = dir.join("collection.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&path).expect("zip"));
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let feature = |number: &str, street: &str, lon: f64| {
+            format!(
+                "{{\"type\":\"Feature\",\"properties\":{{\"number\":\"{number}\",\"street\":\"{street}\",\"city\":\"Wellington\"}},\"geometry\":{{\"type\":\"Point\",\"coordinates\":[{lon},-41.29]}}}}\n"
+            )
+        };
+        let entries = [
+            (
+                "nz/countrywide-addresses-country",
+                "nz/countrywide",
+                "addresses",
+                7,
+                feature("1", "Lambton Quay", 174.77) + &feature("3", "Lambton Quay", 174.771),
+            ),
+            (
+                "nz/countrywide-parcels-country",
+                "nz/countrywide",
+                "parcels",
+                8,
+                feature("9", "Parcel", 174.7),
+            ),
+            (
+                "au/countrywide-addresses-country",
+                "au/countrywide",
+                "addresses",
+                9,
+                feature("5", "George Street", 151.2),
+            ),
+        ];
+        for (name, source, layer, job, body) in entries {
+            zip.start_file(format!("{name}.geojson"), deflated)
+                .expect("entry");
+            zip.write_all(body.as_bytes()).expect("write");
+            zip.start_file(format!("{name}.geojson.meta"), deflated)
+                .expect("meta");
+            write!(
+                zip,
+                "{{\"id\":{job},\"source_name\":\"{source}\",\"layer\":\"{layer}\",\"name\":\"country\"}}"
+            )
+            .expect("write");
+        }
+        zip.finish().expect("finish");
+        path
+    }
+
+    #[test]
+    fn reads_the_address_entries_of_the_covered_countries_from_a_collection() {
+        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let coverage = Coverage {
+            countries: BTreeSet::from(["NZ".to_string()]),
+            ..Coverage::default()
+        };
+        let files = Collection::new(collection(&dir))
+            .files(&coverage)
+            .expect("files");
+        assert_eq!(
+            files.len(),
+            1,
+            "only New Zealand's address layer: {files:?}"
+        );
+        assert_eq!(files[0].dataset, "openaddresses:nz/countrywide");
+        assert_eq!(
+            files[0].entry.as_deref(),
+            Some("nz/countrywide-addresses-country.geojson")
+        );
+        let mut streets = Vec::new();
+        let report = crate::builder::addresses::read_file(&files[0], |record| {
+            streets.push((record.address.number, record.address.street));
+            Ok(None)
+        })
+        .expect("read");
+        assert_eq!(report.rows, 2);
+        assert!(
+            report.bytes > 0
+                && report
+                    .path
+                    .ends_with("!nz/countrywide-addresses-country.geojson")
+        );
+        assert_eq!(
+            streets,
+            [
+                ("1".to_string(), Some("Lambton Quay".to_string())),
+                ("3".to_string(), Some("Lambton Quay".to_string())),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
