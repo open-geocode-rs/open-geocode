@@ -12,7 +12,9 @@
    "Adresse_Relationale_Tabellen_Stichtagsdaten.zip": "3696f8de70d69847d9f305330500f45836cea3e59884693bdd52fa6220f8f0e1"
   },
   "rows": 2511669,
-  "dropped": {},
+  "dropped": {
+   "no house number": 1798
+  },
   "seed": 2026,
   "sample": 2000,
   "draw": "lowest sha256('2026:' || register id) among eligible rows",
@@ -21,6 +23,14 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:31254": "axis order change (2D) + Inverse of Austria Gauss-Kruger West + MGI to WGS 84 (3) + axis order change (2D)",
+    "EPSG:31255": "axis order change (2D) + Inverse of Austria Gauss-Kruger Central + MGI to WGS 84 (3) + axis order change (2D)",
+    "EPSG:31256": "axis order change (2D) + Inverse of Austria Gauss-Kruger East + MGI to WGS 84 (3) + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py bev --cache <dir>"
  },
  "cases": [
@@ -56,8 +66,6 @@
   {"name": "5818705:messy", "q": "Hochenegg 9, Ilz", "form": "messy", "cohort": "address", "expect_lat": 47.085415, "expect_lon": 15.868743},
   {"name": "5677400:full", "q": "Breitenberg 72, 5630 Bad Hofgastein, Austria", "form": "full", "cohort": "address", "expect_lat": 47.1934262, "expect_lon": 13.0970938},
   {"name": "5677400:messy", "q": "Breitenberg 72, Bad Hofgastein", "form": "messy", "cohort": "address", "expect_lat": 47.1934262, "expect_lon": 13.0970938},
-  {"name": "6991957:full", "q": "KLG Sonnenschein Parz., 1020 Wien, Austria", "form": "full", "cohort": "address", "expect_lat": 48.2018345, "expect_lon": 16.4322188},
-  {"name": "6991957:messy", "q": "KLG Sonnenschein Parz., Wien", "form": "messy", "cohort": "address", "expect_lat": 48.2018345, "expect_lon": 16.4322188},
   {"name": "5710280:full", "q": "Schmittenrain 4, 5722 Niedernsill, Austria", "form": "full", "cohort": "address", "expect_lat": 47.2869053, "expect_lon": 12.6427712},
   {"name": "5710280:messy", "q": "Schmittenrain 4, Niedernsill", "form": "messy", "cohort": "address", "expect_lat": 47.2869053, "expect_lon": 12.6427712},
   {"name": "6451883:full", "q": "Hochfeldstraße 12, 3376 St.Martin-Karlsbach, Austria", "form": "full", "cohort": "address", "expect_lat": 48.1649576, "expect_lon": 15.0245967},
@@ -650,8 +658,6 @@
   {"name": "7031052:messy", "q": "Kohlackergasse 2, Aigen", "form": "messy", "cohort": "address", "expect_lat": 47.8996727, "expect_lon": 16.1241629},
   {"name": "5326904:full", "q": "Lechnerstraße 11, 5134 Schwand/Innkreis, Austria", "form": "full", "cohort": "address", "expect_lat": 48.1772087, "expect_lon": 12.97229},
   {"name": "5326904:messy", "q": "Lechnerstraße 11, Schwand/Innkreis", "form": "messy", "cohort": "address", "expect_lat": 48.1772087, "expect_lon": 12.97229},
-  {"name": "6863842:full", "q": "Hauptstraße S, 1140 Wien, Austria", "form": "full", "cohort": "address", "expect_lat": 48.2047498, "expect_lon": 16.2355691},
-  {"name": "6863842:messy", "q": "Hauptstraße S, Wien", "form": "messy", "cohort": "address", "expect_lat": 48.2047498, "expect_lon": 16.2355691},
   {"name": "7064550:full", "q": "Sonnegg 4, 9133 Sittersdorf, Austria", "form": "full", "cohort": "address", "expect_lat": 46.5606183, "expect_lon": 14.6390666},
   {"name": "7064550:messy", "q": "Sonnegg 4, Sittersdorf", "form": "messy", "cohort": "address", "expect_lat": 46.5606183, "expect_lon": 14.6390666},
   {"name": "5606896:full", "q": "Am Abtswald 14, 5023 Salzburg, Austria", "form": "full", "cohort": "address", "expect_lat": 47.8254471, "expect_lon": 13.0776371},
@@ -884,8 +890,6 @@
   {"name": "7693824:messy", "q": "Franz-Sichlrader-Straße 18, Steyr", "form": "messy", "cohort": "address", "expect_lat": 48.0397988, "expect_lon": 14.4468251},
   {"name": "7048650:full", "q": "Irdgasse 12, 2620 Ternitz, Austria", "form": "full", "cohort": "address", "expect_lat": 47.7572329, "expect_lon": 16.0402607},
   {"name": "7048650:messy", "q": "Irdgasse 12, Ternitz", "form": "messy", "cohort": "address", "expect_lat": 47.7572329, "expect_lon": 16.0402607},
-  {"name": "6794180:full", "q": "Babenbergerpassage P, 1010 Wien, Austria", "form": "full", "cohort": "address", "expect_lat": 48.2037523, "expect_lon": 16.3636696},
-  {"name": "6794180:messy", "q": "Babenbergerpassage P, Wien", "form": "messy", "cohort": "address", "expect_lat": 48.2037523, "expect_lon": 16.3636696},
   {"name": "6218376:full", "q": "Schulring 9, 3361 Aschbach-Markt, Austria", "form": "full", "cohort": "address", "expect_lat": 48.0705617, "expect_lon": 14.753098},
   {"name": "6218376:messy", "q": "Schulring 9, Aschbach-Markt", "form": "messy", "cohort": "address", "expect_lat": 48.0705617, "expect_lon": 14.753098},
   {"name": "5698075:full", "q": "Am Göra 41, 5580 Tamsweg, Austria", "form": "full", "cohort": "address", "expect_lat": 47.1323922, "expect_lon": 13.811132},
@@ -4023,6 +4027,12 @@
   {"name": "7404515:full", "q": "Otterthal 104, 2880 Otterthal, Austria", "form": "full", "cohort": "address", "expect_lat": 47.6219142, "expect_lon": 15.9348905},
   {"name": "7404515:messy", "q": "Otterthal 104, Otterthal", "form": "messy", "cohort": "address", "expect_lat": 47.6219142, "expect_lon": 15.9348905},
   {"name": "7078310:full", "q": "Hinterberg 44, 4573 Hinterstoder, Austria", "form": "full", "cohort": "address", "expect_lat": 47.6644241, "expect_lon": 14.1063646},
-  {"name": "7078310:messy", "q": "Hinterberg 44, Hinterstoder", "form": "messy", "cohort": "address", "expect_lat": 47.6644241, "expect_lon": 14.1063646}
+  {"name": "7078310:messy", "q": "Hinterberg 44, Hinterstoder", "form": "messy", "cohort": "address", "expect_lat": 47.6644241, "expect_lon": 14.1063646},
+  {"name": "5610680:full", "q": "Franz-Ofner-Straße 20, 5020 Salzburg, Austria", "form": "full", "cohort": "address", "expect_lat": 47.8221677, "expect_lon": 13.0364383},
+  {"name": "5610680:messy", "q": "Franz-Ofner-Straße 20, Salzburg", "form": "messy", "cohort": "address", "expect_lat": 47.8221677, "expect_lon": 13.0364383},
+  {"name": "5124941:full", "q": "Sageweg 9, 6633 Biberwier, Austria", "form": "full", "cohort": "address", "expect_lat": 47.3839887, "expect_lon": 10.8955361},
+  {"name": "5124941:messy", "q": "Sageweg 9, Biberwier", "form": "messy", "cohort": "address", "expect_lat": 47.3839887, "expect_lon": 10.8955361},
+  {"name": "5624494:full", "q": "Thumegger Bezirk 7, 5020 Salzburg, Austria", "form": "full", "cohort": "address", "expect_lat": 47.7868941, "expect_lon": 13.0453661},
+  {"name": "5624494:messy", "q": "Thumegger Bezirk 7, Salzburg", "form": "messy", "cohort": "address", "expect_lat": 47.7868941, "expect_lon": 13.0453661}
  ]
 }

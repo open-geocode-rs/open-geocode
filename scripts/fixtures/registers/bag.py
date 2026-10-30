@@ -100,8 +100,10 @@ def parse(task):
     tag = OBJECTEN + KINDS[kind]
     with zipfile.ZipFile(path) as zipped, zipped.open(member) as handle, open(out, "w", encoding="utf-8", newline="") as sink:
         writer = csv.writer(sink, delimiter="\t")
-        for _, element in ET.iterparse(handle):
-            if element.tag != tag:
+        events = ET.iterparse(handle, events=("start", "end"))
+        _, root = next(events)
+        for event, element in events:
+            if event != "end" or element.tag != tag:
                 continue
             if current(element, stand):
                 ident = element.findtext(f"{OBJECTEN}identificatie")
@@ -126,7 +128,9 @@ def parse(task):
                     writer.writerow((ident, element.findtext(f"{OBJECTEN}naam") or "", element.findtext(f".//{REF}WoonplaatsRef") or ""))
                 else:
                     writer.writerow((ident, element.findtext(f"{OBJECTEN}naam") or ""))
-            element.clear()
+            # Clearing the object alone leaves it attached to its parent, so a
+            # member's millions of objects would stay in memory until EOF.
+            root.clear()
     return out
 
 

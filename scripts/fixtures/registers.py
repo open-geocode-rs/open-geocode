@@ -1,5 +1,7 @@
 """Write a `geocode bench` answer key from a national address register.
 
+    pip install -r scripts/fixtures/requirements.txt
+    npm ci --prefix scripts/fixtures            # Node 22 or later
     python scripts/fixtures/registers.py <register> --cache <dir>
 
 Every eligible row is ranked by sha256('<seed>:<register id>') and the lowest
@@ -9,6 +11,8 @@ in one parallel pass. Each drawn row is written twice, as OpenCage's postal
 template formats it (`full`) and with postcode, region and country dropped and
 words abbreviated by OpenCage's lists (`messy`). The truth is the register's
 own point, converted to WGS84 by PROJ when the register uses another CRS.
+PROJ fetches the grids it needs from its CDN and must use the best operation,
+so every machine converts through the same grids.
 """
 
 import argparse
@@ -21,7 +25,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import duckdb
+import pyproj
 from pyproj import Transformer
+from pyproj.transformer import TransformerGroup
+from pyproj.network import set_network_enabled
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -30,12 +37,13 @@ SAMPLE = 2000
 FORMATTER = "@fragaria/address-formatter 7.1.2"
 COMPONENTS = ("house_number", "road", "postcode", "city", "town", "village", "suburb", "hamlet", "municipality", "state")
 
+# BeST writes `0 0` for an address it has not placed.
 REASON = """
     case
-        when x is null or y is null or isnan(x) or isnan(y) then 'no point'
+        when x is null or y is null or isnan(x) or isnan(y) or (x = 0 and y = 0) then 'no point'
         when estimated then 'estimated point'
         when unit then 'unit'
-        when house_number is null then 'no house number'
+        when house_number is null or not regexp_matches(house_number, '[0-9]') then 'no house number'
         when road is null then 'no street'
         when coalesce(city, town, village, suburb, hamlet, municipality) is null then 'no locality'
     end
@@ -58,8 +66,19 @@ def draw(rows):
     con = duckdb.connect()
     counts = dict(con.sql(f"select coalesce({REASON}, 'kept'), count(*) from {rows} group by all").fetchall())
     seen = sum(counts.values())
+    columns = ", ".join(("id", "x", "y", "crs", "country", *COMPONENTS))
+    # Counted over the whole register, in rows, as every other reason is.
+    (several,) = con.sql(f"""
+        select count(*) from {rows}
+        where {REASON} is null and id in (
+            select id from (select distinct {columns} from {rows} where {REASON} is null)
+            group by id having count(*) > 1
+        )
+    """).fetchone()
+    counts["kept"] = counts.get("kept", 0) - several
+    if several:
+        counts["several points"] = several
     dropped = {reason: count for reason, count in sorted(counts.items()) if reason != "kept"}
-    columns = ", ".join(("id", "x", "y", "crs", *COMPONENTS))
     limit = 2 * SAMPLE
     while True:
         result = con.sql(f"""
@@ -83,37 +102,45 @@ def draw(rows):
             break
         limit *= 2
     kept = single[:SAMPLE]
-    cutoff = order.index(kept[-1]) if kept else 0
-    several = sum(1 for rid in order[: cutoff + 1] if len(by_id[rid]) > 1)
-    if several:
-        dropped["several points"] = several
     return [dict(next(iter(by_id[rid]))) for rid in kept], seen, dropped
 
 
 def to_wgs84(rows):
+    """Each row's lon and lat, and the PROJ operation used per CRS. Without
+    `only_best`, PROJ quietly falls back to a coarser Helmert shift when a
+    grid is not installed, so two machines would write different truths."""
+    set_network_enabled(True)
     by_crs = defaultdict(list)
     for row in rows:
         by_crs[row["crs"] or "EPSG:4326"].append(row)
-    for crs, group in by_crs.items():
-        lons, lats = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(
-            [row["x"] for row in group], [row["y"] for row in group]
-        )
+    operations = {}
+    for crs, group in sorted(by_crs.items()):
+        transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True, only_best=True)
+        lons, lats = transformer.transform([row["x"] for row in group], [row["y"] for row in group], errcheck=True)
+        # A transformer holding several candidate operations describes none,
+        # so the best candidate, the one only_best uses, is named instead.
+        operations[crs] = TransformerGroup(crs, "EPSG:4326", always_xy=True).transformers[0].description
         for row, lon, lat in zip(group, lons, lats):
             row["lon"], row["lat"] = lon, lat
+    return operations
 
 
 def formatted(rows, country):
     lines = "".join(
         json.dumps(
-            {"id": row["id"], "countryCode": country, **{key: row[key] for key in COMPONENTS if row[key]}},
+            {
+                "id": row["id"],
+                "countryCode": row.get("country") or country,
+                **{key: row[key] for key in COMPONENTS if row[key]},
+            },
             ensure_ascii=False,
         )
         + "\n"
         for row in rows
     )
-    result = subprocess.run(
-        ["node", str(HERE / "format.mjs")], input=lines.encode(), capture_output=True, check=True, cwd=HERE
-    )
+    result = subprocess.run(["node", str(HERE / "format.mjs")], input=lines.encode(), capture_output=True, cwd=HERE)
+    if result.returncode:
+        sys.exit(f"format.mjs failed:\n{result.stderr.decode()}")
     return {item["id"]: item for item in map(json.loads, result.stdout.decode().splitlines())}
 
 
@@ -134,6 +161,8 @@ def main():
 
     from registers import standard
 
+    if not (HERE / "node_modules" / "@fragaria" / "address-formatter").is_dir():
+        sys.exit("the formatter is not installed: npm ci --prefix scripts/fixtures")
     module = importlib.import_module(f"registers.{args.register}")
     cache = args.cache / args.register
     cache.mkdir(parents=True, exist_ok=True)
@@ -145,7 +174,7 @@ def main():
     for row in rows:
         if finish:
             finish(row)
-    to_wgs84(rows)
+    operations = to_wgs84(rows)
     text = formatted(rows, module.SOURCE["country"])
 
     cases = []
@@ -175,6 +204,7 @@ def main():
             "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists",
         },
         "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+        "proj": {"version": pyproj.proj_version_str, "operations": operations},
         "rebuild": f"python scripts/fixtures/registers.py {args.register} --cache <dir>",
     }
     out = REPO / "fixtures" / "queries" / f"{args.register}.json"

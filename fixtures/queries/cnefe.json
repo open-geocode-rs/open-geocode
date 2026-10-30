@@ -6,7 +6,7 @@
   "licence": "Public domain on condition the source is cited (IBGE), Brazilian federal open data (Decreto 8.777/2016)",
   "attribution": "Fonte: IBGE, Cadastro Nacional de Enderecos para Fins Estatisticos, Censo Demografico 2022",
   "url": "https://ftp.ibge.gov.br/Cadastro_Nacional_de_Enderecos_para_Fins_Estatisticos/Censo_Demografico_2022/Arquivos_CNEFE/CSV/UF/",
-  "notes": "all 27 UF files; SIRGAS 2000 (EPSG:4674, per Nota metodologica n. 01) to WGS84 by PROJ; NV_GEO_COORD 4 (block face midpoint), 5 (localidade) and 6 (census tract centroid) marked estimated, 1 to 3 kept as Nota metodologica n. 01 classes them as geocoded at the address; any complemento element marks a unit; DSC_MODIFICADOR SN means no number (so 97% of DF, which IBGE records as SN), KM gives 'KM <n>', any other modifier follows the number as IBGE says it complements it; road is tipo, titulo and nome of the logradouro, without IBGE's pseudo-tipo EDF (Endereco do Distrito Federal); suburb is DSC_LOCALIDADE, city is the municipality name from IBGE DTB 2022 by COD_MUNICIPIO, state is the UF code of the file name; rows of one COD_UNICO_ENDERECO listed once per especie with identical address fields are one address; CNEFE's capitals title-cased, Portuguese particles lower-cased",
+  "notes": "all 27 UF files; SIRGAS 2000 (EPSG:4674, per Nota metodologica n. 01) to WGS84 by PROJ; NV_GEO_COORD 3 (estimated for an address with no or an invalid field coordinate), 4 (block face midpoint), 5 (localidade) and 6 (census tract centroid) marked estimated, 1 and 2 kept; any complemento element marks a unit; DSC_MODIFICADOR SN means no number (so 97% of DF, which IBGE records as SN), KM gives 'KM <n>', any other modifier follows the number as IBGE says it complements it; road is tipo, titulo and nome of the logradouro, without IBGE's pseudo-tipo EDF (Endereco do Distrito Federal); suburb is DSC_LOCALIDADE, city is the municipality name from IBGE DTB 2022 by COD_MUNICIPIO, state is the UF code of the file name; rows of one COD_UNICO_ENDERECO listed once per especie with identical address fields are one address; CNEFE's capitals title-cased, Portuguese particles lower-cased",
   "release": "Censo Demografico 2022, files of 2024-06-12",
   "files": {
    "11_RO.zip": "24af73415134f23fed8bb587f1ae64721510e9efea546706b18f4c3afac5f36a",
@@ -40,9 +40,9 @@
   },
   "rows": 111102875,
   "dropped": {
-   "estimated point": 358038,
-   "no house number": 16690990,
-   "unit": 44690502
+   "estimated point": 1105314,
+   "no house number": 16671030,
+   "unit": 44066365
   },
   "seed": 2026,
   "sample": 2000,
@@ -52,6 +52,12 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:4674": "axis order change (2D) + SIRGAS 2000 to WGS 84 (1) + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py cnefe --cache <dir>"
  },
  "cases": [
@@ -269,8 +275,6 @@
   {"name": "205790288:messy", "q": "R dos Uirapurus, 165, Parque das Cigarreiras, Taboão da Serra", "form": "messy", "cohort": "address", "expect_lat": -23.604694, "expect_lon": -46.784434},
   {"name": "111473215:full", "q": "Estrada Nova Passagem, 46 Funasa, Nova Passagem, Capistrano - CE, 62748-000, Brazil", "form": "full", "cohort": "address", "expect_lat": -4.47221, "expect_lon": -38.846616},
   {"name": "111473215:messy", "q": "Estr Nova Passagem, 46 Funasa, Nova Passagem, Capistrano", "form": "messy", "cohort": "address", "expect_lat": -4.47221, "expect_lon": -38.846616},
-  {"name": "69664715:full", "q": "Rua Sebastiao Humberto Pieri, 546, Santo Antonio, Criciúma - SC, 88809-180, Brazil", "form": "full", "cohort": "address", "expect_lat": -28.682107, "expect_lon": -49.388038},
-  {"name": "69664715:messy", "q": "R Sebastiao Humberto Pieri, 546, Santo Antonio, Criciúma", "form": "messy", "cohort": "address", "expect_lat": -28.682107, "expect_lon": -49.388038},
   {"name": "102135976:full", "q": "Travessa Quatro, 9, Centro, Vitória do Xingu - PA, 68383-000, Brazil", "form": "full", "cohort": "address", "expect_lat": -2.895659, "expect_lon": -52.011423},
   {"name": "102135976:messy", "q": "Tv Quatro, 9, Centro, Vitória do Xingu", "form": "messy", "cohort": "address", "expect_lat": -2.895659, "expect_lon": -52.011423},
   {"name": "72927299:full", "q": "Rua Mario Quintana, 482, Parque Ipiranga, Gravataí - RS, 94130-180, Brazil", "form": "full", "cohort": "address", "expect_lat": -29.90775, "expect_lon": -51.058107},
@@ -1321,8 +1325,6 @@
   {"name": "108654214:messy", "q": "Av Jose Hoio Pelaio, 82, Cdhu, Arco-Íris", "form": "messy", "cohort": "address", "expect_lat": -21.774397, "expect_lon": -50.462183},
   {"name": "27700856:full", "q": "Rua Manoel Volusiano a de Souza, 76 Sms, Centro, Maragogipe - BA, 44420-000, Brazil", "form": "full", "cohort": "address", "expect_lat": -12.780769, "expect_lon": -38.917172},
   {"name": "27700856:messy", "q": "R Manoel Volusiano a de Souza, 76 Sms, Centro, Maragogipe", "form": "messy", "cohort": "address", "expect_lat": -12.780769, "expect_lon": -38.917172},
-  {"name": "106212239:full", "q": "Rua Maria Irene de Oliveira Silva, 272, Jardim Saint Moritz, Taboão da Serra - SP, 06787-610, Brazil", "form": "full", "cohort": "address", "expect_lat": -23.62114, "expect_lon": -46.801112},
-  {"name": "106212239:messy", "q": "R Maria Irene de Oliveira Silva, 272, Jardim Saint Moritz, Taboão da Serra", "form": "messy", "cohort": "address", "expect_lat": -23.62114, "expect_lon": -46.801112},
   {"name": "95078840:full", "q": "Rua Oito, 480, Rio Fiorita, Siderópolis - SC, 88860-000, Brazil", "form": "full", "cohort": "address", "expect_lat": -28.581235, "expect_lon": -49.429911},
   {"name": "95078840:messy", "q": "R Oito, 480, Rio Fiorita, Siderópolis", "form": "messy", "cohort": "address", "expect_lat": -28.581235, "expect_lon": -49.429911},
   {"name": "6201148:full", "q": "Avenida Jatoba, 7, Vila Macarrao, Tailândia - PA, 68695-000, Brazil", "form": "full", "cohort": "address", "expect_lat": -2.93149, "expect_lon": -48.940408},
@@ -4054,6 +4056,10 @@
   {"name": "212082268:full", "q": "Rua Genaro Homem de Mello, 481, Jardim Tatiana, Sorocaba - SP, 18052-540, Brazil", "form": "full", "cohort": "address", "expect_lat": -23.538896, "expect_lon": -47.492146},
   {"name": "212082268:messy", "q": "R Genaro Homem de Mello, 481, Jardim Tatiana, Sorocaba", "form": "messy", "cohort": "address", "expect_lat": -23.538896, "expect_lon": -47.492146},
   {"name": "218272129:full", "q": "Rua Sem Denominacao 19, 391 Sms, Malhada da Areia, Juazeiro - BA, 48909-571, Brazil", "form": "full", "cohort": "address", "expect_lat": -9.444878, "expect_lon": -40.503501},
-  {"name": "218272129:messy", "q": "R Sem Denominacao 19, 391 Sms, Malhada da Areia, Juazeiro", "form": "messy", "cohort": "address", "expect_lat": -9.444878, "expect_lon": -40.503501}
+  {"name": "218272129:messy", "q": "R Sem Denominacao 19, 391 Sms, Malhada da Areia, Juazeiro", "form": "messy", "cohort": "address", "expect_lat": -9.444878, "expect_lon": -40.503501},
+  {"name": "54999939:full", "q": "Rua Doze de Marco, 970, Centro, Paraguaçu Paulista - SP, 19700-047, Brazil", "form": "full", "cohort": "address", "expect_lat": -22.411503, "expect_lon": -50.582467},
+  {"name": "54999939:messy", "q": "R Doze de Marco, 970, Centro, Paraguaçu Paulista", "form": "messy", "cohort": "address", "expect_lat": -22.411503, "expect_lon": -50.582467},
+  {"name": "188131266:full", "q": "Rua Caxambu, 268, Nossa Senhora de Conceicao, Paulista - PE, 53429-790, Brazil", "form": "full", "cohort": "address", "expect_lat": -7.884347, "expect_lon": -34.836405},
+  {"name": "188131266:messy", "q": "R Caxambu, 268, Nossa Senhora de Conceicao, Paulista", "form": "messy", "cohort": "address", "expect_lat": -7.884347, "expect_lon": -34.836405}
  ]
 }

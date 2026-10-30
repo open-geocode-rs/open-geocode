@@ -6,7 +6,7 @@
   "licence": "Open G-NAF End User Licence Agreement (CC BY 4.0 with a no-mailing restriction)",
   "attribution": "Incorporates or developed using G-NAF (c) Geoscape Australia licensed by the Commonwealth of Australia under the Open Geo-coded National Address File (G-NAF) End User Licence Agreement",
   "url": "https://data.gov.au/data/dataset/19432f89-dc3a-4ef3-b943-5326ef1dbecc/resource/b023544a-5836-4d43-b6d8-da2f73e8d2bf/download/g-naf_aug26_allstates_gda2020_psv_110.zip",
-  "notes": "principal, unretired addresses with their default geocode, estimated geocodes (GG, STL, LOC) dropped; names title-cased from G-NAF's capitals; GDA2020 (EPSG:7844) to WGS84 by PROJ",
+  "notes": "principal, unretired addresses with their default geocode, estimated geocodes (GG, STL, LOC) dropped; street suffix written as its STREET_SUFFIX_AUT word (EAST, not E); names title-cased from G-NAF's capitals; GDA2020 (EPSG:7844) to WGS84 by PROJ",
   "release": "AUG 2026, GDA2020",
   "files": {
    "g-naf_aug26_allstates_gda2020_psv_110.zip": "16820cc91c3ea32a3997b88024c8d0e576c1db10fe8645380be49b457e952df5"
@@ -25,6 +25,12 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:7844": "axis order change (2D) + GDA2020 to WGS 84 (2) + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py gnaf --cache <dir>"
  },
  "cases": [
@@ -1356,8 +1362,8 @@
   {"name": "GANSW706562535:messy", "q": "3 Wyee St, Kogarah Bay", "form": "messy", "cohort": "address", "expect_lat": -33.9845996, "expect_lon": 151.1232109},
   {"name": "GANSW704275078:full", "q": "40 Wrench Street, Cambridge Park NSW 2747, Australia", "form": "full", "cohort": "address", "expect_lat": -33.749563, "expect_lon": 150.7306987},
   {"name": "GANSW704275078:messy", "q": "40 Wrench St, Cambridge Park", "form": "messy", "cohort": "address", "expect_lat": -33.749563, "expect_lon": 150.7306987},
-  {"name": "GANSW712764039:full", "q": "25 Sladen Street E, Henty NSW 2658, Australia", "form": "full", "cohort": "address", "expect_lat": -35.5174138, "expect_lon": 147.0392843},
-  {"name": "GANSW712764039:messy", "q": "25 Sladen St E, Henty", "form": "messy", "cohort": "address", "expect_lat": -35.5174138, "expect_lon": 147.0392843},
+  {"name": "GANSW712764039:full", "q": "25 Sladen Street East, Henty NSW 2658, Australia", "form": "full", "cohort": "address", "expect_lat": -35.5174138, "expect_lon": 147.0392843},
+  {"name": "GANSW712764039:messy", "q": "25 Sladen St East, Henty", "form": "messy", "cohort": "address", "expect_lat": -35.5174138, "expect_lon": 147.0392843},
   {"name": "GANSW716803775:full", "q": "15798 Kamilaroi Highway, Baan Baa NSW 2390, Australia", "form": "full", "cohort": "address", "expect_lat": -30.5702542, "expect_lon": 149.957783},
   {"name": "GANSW716803775:messy", "q": "15798 Kamilaroi HWY, Baan Baa", "form": "messy", "cohort": "address", "expect_lat": -30.5702542, "expect_lon": 149.957783},
   {"name": "GAQLD425385110:full", "q": "199 Grey Street, South Brisbane QLD 4101, Australia", "form": "full", "cohort": "address", "expect_lat": -27.4806876, "expect_lon": 153.0226446},
@@ -1660,8 +1666,8 @@
   {"name": "GANSW704088043:messy", "q": "3537 Snowy Mountains HWY, Bemboka", "form": "messy", "cohort": "address", "expect_lat": -36.6231499, "expect_lon": 149.5128571},
   {"name": "GAVIC411259457:full", "q": "367 Old Dandenong Road, Dingley Village VIC 3172, Australia", "form": "full", "cohort": "address", "expect_lat": -37.9708363, "expect_lon": 145.1170682},
   {"name": "GAVIC411259457:messy", "q": "367 Old Dandenong Rd, Dingley Village", "form": "messy", "cohort": "address", "expect_lat": -37.9708363, "expect_lon": 145.1170682},
-  {"name": "GAVIC424453436:full", "q": "620 Ripon Street S, Redan VIC 3350, Australia", "form": "full", "cohort": "address", "expect_lat": -37.5741953, "expect_lon": 143.8385543},
-  {"name": "GAVIC424453436:messy", "q": "620 Ripon St S, Redan", "form": "messy", "cohort": "address", "expect_lat": -37.5741953, "expect_lon": 143.8385543},
+  {"name": "GAVIC424453436:full", "q": "620 Ripon Street South, Redan VIC 3350, Australia", "form": "full", "cohort": "address", "expect_lat": -37.5741953, "expect_lon": 143.8385543},
+  {"name": "GAVIC424453436:messy", "q": "620 Ripon St South, Redan", "form": "messy", "cohort": "address", "expect_lat": -37.5741953, "expect_lon": 143.8385543},
   {"name": "GAVIC420847923:full", "q": "15 Dandarriga Way, Delahey VIC 3037, Australia", "form": "full", "cohort": "address", "expect_lat": -37.7131258, "expect_lon": 144.769296},
   {"name": "GAVIC420847923:messy", "q": "15 Dandarriga Way, Delahey", "form": "messy", "cohort": "address", "expect_lat": -37.7131258, "expect_lon": 144.769296},
   {"name": "GASA_425449119:full", "q": "1-39 Radar Road, St Kilda SA 5110, Australia", "form": "full", "cohort": "address", "expect_lat": -34.7302482, "expect_lon": 138.5408726},
@@ -1784,8 +1790,8 @@
   {"name": "GAVIC421475601:messy", "q": "53 Mercury Cres, Newcomb", "form": "messy", "cohort": "address", "expect_lat": -38.1635574, "expect_lon": 144.3986075},
   {"name": "GAQLD425119865:full", "q": "32 Drewett Avenue, Redbank Plains QLD 4301, Australia", "form": "full", "cohort": "address", "expect_lat": -27.6592469, "expect_lon": 152.8447488},
   {"name": "GAQLD425119865:messy", "q": "32 Drewett Ave, Redbank Plains", "form": "messy", "cohort": "address", "expect_lat": -27.6592469, "expect_lon": 152.8447488},
-  {"name": "GATAS718385914:full", "q": "3A Esplanade E, Triabunna TAS 7190, Australia", "form": "full", "cohort": "address", "expect_lat": -42.5104836, "expect_lon": 147.9194753},
-  {"name": "GATAS718385914:messy", "q": "3A Esp E, Triabunna", "form": "messy", "cohort": "address", "expect_lat": -42.5104836, "expect_lon": 147.9194753},
+  {"name": "GATAS718385914:full", "q": "3A Esplanade East, Triabunna TAS 7190, Australia", "form": "full", "cohort": "address", "expect_lat": -42.5104836, "expect_lon": 147.9194753},
+  {"name": "GATAS718385914:messy", "q": "3A Esp East, Triabunna", "form": "messy", "cohort": "address", "expect_lat": -42.5104836, "expect_lon": 147.9194753},
   {"name": "GAQLD155421592:full", "q": "41 Rosina Street, Kangaroo Point QLD 4169, Australia", "form": "full", "cohort": "address", "expect_lat": -27.4796769, "expect_lon": 153.0393038},
   {"name": "GAQLD155421592:messy", "q": "41 Rosina St, Kangaroo Point", "form": "messy", "cohort": "address", "expect_lat": -27.4796769, "expect_lon": 153.0393038},
   {"name": "GANSW703974831:full", "q": "25 Moore Street, Austinmer NSW 2515, Australia", "form": "full", "cohort": "address", "expect_lat": -34.306999, "expect_lon": 150.9324428},
@@ -2146,8 +2152,8 @@
   {"name": "GANSW719020335:messy", "q": "1529 Collombatti Rd, Collombatti", "form": "messy", "cohort": "address", "expect_lat": -30.964904, "expect_lon": 152.7689607},
   {"name": "GANSW706309336:full", "q": "33 Dalwood Street, Woodberry NSW 2322, Australia", "form": "full", "cohort": "address", "expect_lat": -32.7891863, "expect_lon": 151.6686753},
   {"name": "GANSW706309336:messy", "q": "33 Dalwood St, Woodberry", "form": "messy", "cohort": "address", "expect_lat": -32.7891863, "expect_lon": 151.6686753},
-  {"name": "GANSW706370131:full", "q": "134 Skyline Road S, Wyrallah NSW 2480, Australia", "form": "full", "cohort": "address", "expect_lat": -28.8624367, "expect_lon": 153.3193815},
-  {"name": "GANSW706370131:messy", "q": "134 Skyline Rd S, Wyrallah", "form": "messy", "cohort": "address", "expect_lat": -28.8624367, "expect_lon": 153.3193815},
+  {"name": "GANSW706370131:full", "q": "134 Skyline Road South, Wyrallah NSW 2480, Australia", "form": "full", "cohort": "address", "expect_lat": -28.8624367, "expect_lon": 153.3193815},
+  {"name": "GANSW706370131:messy", "q": "134 Skyline Rd South, Wyrallah", "form": "messy", "cohort": "address", "expect_lat": -28.8624367, "expect_lon": 153.3193815},
   {"name": "GAWA_148236364:full", "q": "23 Morrison Road, Woodbridge WA 6056, Australia", "form": "full", "cohort": "address", "expect_lat": -31.8884137, "expect_lon": 115.9970825},
   {"name": "GAWA_148236364:messy", "q": "23 Morrison Rd, Woodbridge", "form": "messy", "cohort": "address", "expect_lat": -31.8884137, "expect_lon": 115.9970825},
   {"name": "GAVIC420670398:full", "q": "130 Layard Road, Modewarre VIC 3240, Australia", "form": "full", "cohort": "address", "expect_lat": -38.2723146, "expect_lon": 144.126394},
@@ -2204,8 +2210,8 @@
   {"name": "GANSW704219423:messy", "q": "117 Jacaranda Ave, Bradbury", "form": "messy", "cohort": "address", "expect_lat": -34.0881536, "expect_lon": 150.8131244},
   {"name": "GAWA_720487467:full", "q": "40 Brierfield Street, Wellard WA 6170, Australia", "form": "full", "cohort": "address", "expect_lat": -32.2701755, "expect_lon": 115.8128223},
   {"name": "GAWA_720487467:messy", "q": "40 Brierfield St, Wellard", "form": "messy", "cohort": "address", "expect_lat": -32.2701755, "expect_lon": 115.8128223},
-  {"name": "GANSW706235033:full", "q": "15 Third Avenue N, Warrawong NSW 2502, Australia", "form": "full", "cohort": "address", "expect_lat": -34.4815448, "expect_lon": 150.8809442},
-  {"name": "GANSW706235033:messy", "q": "15 Third Ave N, Warrawong", "form": "messy", "cohort": "address", "expect_lat": -34.4815448, "expect_lon": 150.8809442},
+  {"name": "GANSW706235033:full", "q": "15 Third Avenue North, Warrawong NSW 2502, Australia", "form": "full", "cohort": "address", "expect_lat": -34.4815448, "expect_lon": 150.8809442},
+  {"name": "GANSW706235033:messy", "q": "15 Third Ave North, Warrawong", "form": "messy", "cohort": "address", "expect_lat": -34.4815448, "expect_lon": 150.8809442},
   {"name": "GAVIC421142404:full", "q": "51 Moorabool Street, Geelong VIC 3220, Australia", "form": "full", "cohort": "address", "expect_lat": -38.1460928, "expect_lon": 144.361659},
   {"name": "GAVIC421142404:messy", "q": "51 Moorabool St, Geelong", "form": "messy", "cohort": "address", "expect_lat": -38.1460928, "expect_lon": 144.361659},
   {"name": "GASA_720707101:full", "q": "6A Melrose Avenue, Clearview SA 5085, Australia", "form": "full", "cohort": "address", "expect_lat": -34.8482709, "expect_lon": 138.6119011},
@@ -2690,8 +2696,8 @@
   {"name": "GAWA_146639210:messy", "q": "116 Edward St, Perth", "form": "messy", "cohort": "address", "expect_lat": -31.9471046, "expect_lon": 115.8687418},
   {"name": "GASA_415325521:full", "q": "2 Peter Crescent, Morphett Vale SA 5162, Australia", "form": "full", "cohort": "address", "expect_lat": -35.1085965, "expect_lon": 138.5301147},
   {"name": "GASA_415325521:messy", "q": "2 Peter Cres, Morphett Vale", "form": "messy", "cohort": "address", "expect_lat": -35.1085965, "expect_lon": 138.5301147},
-  {"name": "GAVIC420602553:full", "q": "229 Mackenzie Street W, Kangaroo Flat VIC 3555, Australia", "form": "full", "cohort": "address", "expect_lat": -36.7876865, "expect_lon": 144.2416041},
-  {"name": "GAVIC420602553:messy", "q": "229 Mackenzie St W, Kangaroo Flat", "form": "messy", "cohort": "address", "expect_lat": -36.7876865, "expect_lon": 144.2416041},
+  {"name": "GAVIC420602553:full", "q": "229 Mackenzie Street West, Kangaroo Flat VIC 3555, Australia", "form": "full", "cohort": "address", "expect_lat": -36.7876865, "expect_lon": 144.2416041},
+  {"name": "GAVIC420602553:messy", "q": "229 Mackenzie St West, Kangaroo Flat", "form": "messy", "cohort": "address", "expect_lat": -36.7876865, "expect_lon": 144.2416041},
   {"name": "GAVIC424626861:full", "q": "13 Oxford Street, Chiltern VIC 3683, Australia", "form": "full", "cohort": "address", "expect_lat": -36.1492444, "expect_lon": 146.6061795},
   {"name": "GAVIC424626861:messy", "q": "13 Oxford St, Chiltern", "form": "messy", "cohort": "address", "expect_lat": -36.1492444, "expect_lon": 146.6061795},
   {"name": "GAWA_163245841:full", "q": "9 Redheart Court, Karakin WA 6044, Australia", "form": "full", "cohort": "address", "expect_lat": -31.060079, "expect_lon": 115.4003558},

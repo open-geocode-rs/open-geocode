@@ -56,7 +56,7 @@
    "not a search": 313,
    "not in register": 19,
    "repeated query": 1,
-   "several places in register": 2,
+   "several places in register": 1,
    "suite expects several places": 2
   },
   "rebuild": "python scripts/fixtures/suites.py pelias --suite <checkout> --cache <dir>"
@@ -91,6 +91,7 @@
   {"name": "search_alphanumeric_housenumber.json#6", "q": "kinkerstraat 175F, amsterdam", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 52.365774, "expect_lon": 4.8673879},
   {"name": "search_alphanumeric_housenumber.json#6.1", "q": "kinkerstraat 175 F, amsterdam", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 52.365774, "expect_lon": 4.8673879},
   {"name": "search_alphanumeric_housenumber.json#7", "q": "Vanadiumweg 11C, Amersfoort", "form": "verbatim", "cohort": "search_alphanumeric_housenumber", "expect_lat": 52.1714795, "expect_lon": 5.3609462},
+  {"name": "search_iso2_to_iso3.json#3", "q": "23 Avenue Duquesne, 75007 Paris, Fr", "form": "verbatim", "cohort": "search_iso2_to_iso3", "expect_lat": 48.852651, "expect_lon": 2.309012},
   {"name": "search_postal_cities.json#4", "q": "hobrovej 18, 9510, denmark", "form": "verbatim", "cohort": "search_postal_cities", "expect_lat": 56.7713561, "expect_lon": 9.8143534},
   {"name": "search_postal_cities.json#5", "q": "15364 Kensington Park Dr, Woodbridge, VA", "form": "verbatim", "cohort": "search_postal_cities", "expect_lat": 38.624117, "expect_lon": -77.2821749},
   {"name": "search_postal_cities.json#6", "q": "211 Knapp Rd, Syracuse, NY", "form": "verbatim", "cohort": "search_postal_cities", "expect_lat": 43.0408421, "expect_lon": -76.1976579},

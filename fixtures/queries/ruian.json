@@ -24,6 +24,12 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:5514": "Inverse of Krovak East North (Greenwich) + S-JTSK to WGS 84 (3) + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py ruian --cache <dir>"
  },
  "cases": [

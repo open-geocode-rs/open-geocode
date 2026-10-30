@@ -13,7 +13,7 @@ SOURCE = {
     "licence": "CC BY 4.0",
     "attribution": "Indeholder data fra Klimadatastyrelsen, Danmarks Adresseregister (DAR)",
     "url": "ftp://ftp3.datafordeler.dk/DAR_Aktuelt_Totaludtraek_JSON_HF_<timestamp>.zip",
-    "notes": "Datafordeleren's anonymous daily current extract; one row per husnummer (access address), so floor and door addresses are not read; husnumre with status nedlagt (4) or henlagt (5) excluded, foreløbig (2) kept; id is the husnummer id_lokalId; point is its adgangspunkt, EPSG:25832 transformed to EPSG:4326 with pyproj; points with nøjagtighedsklasse U (not placed at the address) marked estimated; house_number is husnummertekst; road is the full vejnavn; city is the postnummer navn, supplerende bynavn not used",
+    "notes": "Datafordeleren's anonymous daily current extract; one row per husnummer (access address), so floor and door addresses are not read; only husnumre with status gældende (3), so foreløbig (2), nedlagt (4) and henlagt (5) excluded; id is the husnummer id_lokalId; point is its adgangspunkt, EPSG:25832 transformed to EPSG:4326 with pyproj; points with nøjagtighedsklasse U (not placed at the address) marked estimated; house_number is husnummertekst; road is the full vejnavn; city is the postnummer navn, supplerende bynavn not used",
 }
 FOLDER = "ftp://ftp3.datafordeler.dk/"
 PATTERN = re.compile(r"DAR_Aktuelt_Totaludtraek_JSON_HF_(\d{14})\.zip")
@@ -24,7 +24,7 @@ KEEP = {
     "NavngivenVejList": ("id_lokalId", "vejnavn"),
     "PostnummerList": ("id_lokalId", "postnr", "navn"),
 }
-RETIRED = ("4", "5")
+CURRENT = "3"
 
 
 def latest():
@@ -62,7 +62,10 @@ def extract(archive, out):
 
 
 def download(cache):
-    stamp = latest()
+    # A cached extract is reused, so a rebuild reads the release the key was
+    # drawn from; the FTP keeps only a week of files.
+    cached = sorted(PATTERN.fullmatch(path.name).group(1) for path in cache.glob("DAR_Aktuelt_Totaludtraek_JSON_HF_*.zip"))
+    stamp = cached[-1] if cached else latest()
     archive, _ = fetch(f"{FOLDER}DAR_Aktuelt_Totaludtraek_JSON_HF_{stamp}.zip", cache / f"DAR_Aktuelt_Totaludtraek_JSON_HF_{stamp}.zip")
     out = cache / f"lists_{stamp}"
     if not out.is_dir():
@@ -90,5 +93,5 @@ def query(files):
         left join {table('AdressepunktList')} a on a.id_lokalId = h.adgangspunkt
         left join {table('NavngivenVejList')} v on v.id_lokalId = h.navngivenVej
         left join {table('PostnummerList')} p on p.id_lokalId = h.postnummer
-        where h.status not in {RETIRED}
+        where h.status = '{CURRENT}'
     """

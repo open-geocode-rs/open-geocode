@@ -14,7 +14,7 @@
   "rows": 179699,
   "dropped": {
    "no house number": 16,
-   "several points": 4
+   "several points": 1120
   },
   "seed": 2026,
   "sample": 2000,
@@ -24,6 +24,12 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:4326": "axis order change (2D) + Null geographic offset from WGS 84 to WGS 84 + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py caclr --cache <dir>"
  },
  "cases": [

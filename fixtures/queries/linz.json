@@ -6,14 +6,14 @@
   "licence": "CC BY 4.0",
   "attribution": "Contains data sourced from the LINZ Data Service licensed for reuse under CC BY 4.0",
   "url": "https://hub.arcgis.com/api/v3/datasets/3632c8130f034ff8bbfb122a50533550_0/downloads/data?format=csv&spatialRefId=2193&where=1%3D1",
-  "notes": "LDS layer 123113 as LINZ's own public ArcGIS Online feature service (LINZ_NZ_Addresses) exports it, the keyless bulk route, since LDS exports need an account; NZTM (EPSG:2193) reprojected to WGS84 with pyproj; house_number is full_address_number, road full_road_name, suburb suburb_locality, city town_city; unit_value rows are units; Current and Proposed lifecycles both kept, NZ Addresses lists no retired ones; no postcode or region in the register",
+  "notes": "LDS layer 123113 as LINZ's own public ArcGIS Online feature service (LINZ_NZ_Addresses) exports it, the keyless bulk route, since LDS exports need an account; NZTM (EPSG:2193) reprojected to WGS84 with pyproj; house_number is full_address_number, road full_road_name, suburb suburb_locality, city town_city; unit_value rows are units; Current lifecycle only, so Proposed addresses dropped; no postcode or region in the register",
   "release": "2026-08-16",
   "files": {
    "LINZ_NZ_Addresses.csv": "32fdd7657e5d0fa4f8d35dca21e9adf34f3126e76bc8a34354976eae849a535a"
   },
-  "rows": 2422517,
+  "rows": 2419822,
   "dropped": {
-   "unit": 362447
+   "unit": 360807
   },
   "seed": 2026,
   "sample": 2000,
@@ -23,6 +23,12 @@
    "messy": "same, without postcode, region and country, abbreviated by OpenCage's lists"
   },
   "truth": "the register's point, converted to WGS84 by PROJ where the register uses another CRS",
+  "proj": {
+   "version": "9.5.1",
+   "operations": {
+    "EPSG:2193": "axis order change (2D) + Inverse of New Zealand Transverse Mercator 2000 + NZGD2000 to WGS 84 (1) + axis order change (2D)"
+   }
+  },
   "rebuild": "python scripts/fixtures/registers.py linz --cache <dir>"
  },
  "cases": [
@@ -2314,8 +2320,6 @@
   {"name": "389789:messy", "q": "12 Kekerenga St, Strathmore Park, Wellington", "form": "messy", "cohort": "address", "expect_lat": -41.3357088, "expect_lon": 174.8155395},
   {"name": "2385487:full", "q": "8B Gillam Crescent, Springfield, Rotorua, New Zealand", "form": "full", "cohort": "address", "expect_lat": -38.1611487, "expect_lon": 176.222744},
   {"name": "2385487:messy", "q": "8B Gillam Cres, Springfield, Rotorua", "form": "messy", "cohort": "address", "expect_lat": -38.1611487, "expect_lon": 176.222744},
-  {"name": "2268625:full", "q": "23C MacAulay Street, Addington, Christchurch, New Zealand", "form": "full", "cohort": "address", "expect_lat": -43.5461011, "expect_lon": 172.6150537},
-  {"name": "2268625:messy", "q": "23C MacAulay St, Addington, Christchurch", "form": "messy", "cohort": "address", "expect_lat": -43.5461011, "expect_lon": 172.6150537},
   {"name": "82386:full", "q": "1328 Otautau Drummond Road, Gladfield, Otautau, New Zealand", "form": "full", "cohort": "address", "expect_lat": -46.1550084, "expect_lon": 168.1182495},
   {"name": "82386:messy", "q": "1328 Otautau Drummond Rd, Gladfield, Otautau", "form": "messy", "cohort": "address", "expect_lat": -46.1550084, "expect_lon": 168.1182495},
   {"name": "748059:full", "q": "104A Tirohanga Drive, Whangamatā, New Zealand", "form": "full", "cohort": "address", "expect_lat": -37.1947956, "expect_lon": 175.8575561},
@@ -4025,6 +4029,8 @@
   {"name": "1372218:full", "q": "4364 Main South Road, Bankside, New Zealand", "form": "full", "cohort": "address", "expect_lat": -43.6967031, "expect_lon": 172.08739},
   {"name": "1372218:messy", "q": "4364 Main South Rd, Bankside", "form": "messy", "cohort": "address", "expect_lat": -43.6967031, "expect_lon": 172.08739},
   {"name": "2105938:full", "q": "1 Pembrook Close, Rangiora, New Zealand", "form": "full", "cohort": "address", "expect_lat": -43.2999973, "expect_lon": 172.5682877},
-  {"name": "2105938:messy", "q": "1 Pembrook Close, Rangiora", "form": "messy", "cohort": "address", "expect_lat": -43.2999973, "expect_lon": 172.5682877}
+  {"name": "2105938:messy", "q": "1 Pembrook Close, Rangiora", "form": "messy", "cohort": "address", "expect_lat": -43.2999973, "expect_lon": 172.5682877},
+  {"name": "2381330:full", "q": "6A Roberts Terrace, Onekawa, Napier, New Zealand", "form": "full", "cohort": "address", "expect_lat": -39.5099007, "expect_lon": 176.8953804},
+  {"name": "2381330:messy", "q": "6A Roberts Tce, Onekawa, Napier", "form": "messy", "cohort": "address", "expect_lat": -39.5099007, "expect_lon": 176.8953804}
  ]
 }
