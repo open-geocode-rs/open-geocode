@@ -19,6 +19,8 @@ const PASSED = 'triage:passed';
 const HELD = 'triage:held';
 const SLOP = 'slop';
 const DEVIN = 'devin-ai-integration[bot]';
+// The Actions bot posts the gate's comments; only its comments are the gate's.
+const GATE = 'github-actions[bot]';
 const SLOP_CHECK = 'Devin Review / Slop';
 
 module.exports = async function reconcile({ github, drafts, context, core, number }) {
@@ -84,17 +86,24 @@ module.exports = async function reconcile({ github, drafts, context, core, numbe
   };
 
   const comments = await github.paginate(github.rest.issues.listComments, { ...issue, per_page: 100 });
-  const ours = (marker) => comments.find((c) => c.user.type === 'Bot' && c.body.startsWith(marker));
+  const ours = (marker) => comments.filter((c) => c.user.login === GATE && c.body.startsWith(marker));
   const guide = `https://github.com/${repo.owner}/${repo.repo}/blob/main/CONTRIBUTING.md`;
 
   if (labels.has(SLOP)) {
+    // Only a review of this slop request counts: Devin's newest Slop status,
+    // finished, and posted after the label was last added. A status from an
+    // earlier request on the same commit does not.
+    const labelled = timeline.findLast((e) => e.event === 'labeled' && e.label?.name === SLOP)?.created_at;
     const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { ...repo, ref: pr.head.sha, per_page: 100 });
-    const done = statuses.find((s) => s.context === SLOP_CHECK && s.creator?.login === DEVIN && s.state !== 'pending');
+    const newest = statuses
+      .filter((s) => s.context === SLOP_CHECK && s.creator?.login === DEVIN)
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+    const done = labelled && newest && newest.state !== 'pending' && Date.parse(newest.created_at) > Date.parse(labelled) ? newest : null;
     if (!done) {
       await readyEventAfter(SLOP);
       return;
     }
-    if (!ours(SLOP_MARKER)) {
+    if (!ours(SLOP_MARKER).some((c) => Date.parse(c.created_at) > Date.parse(labelled))) {
       const findings = typeof done.target_url === 'string' && done.target_url.startsWith('https://app.devin.ai/')
         ? `[${SLOP_CHECK}](${done.target_url})`
         : `see the **${SLOP_CHECK}** check on this pull request`;
@@ -107,7 +116,10 @@ module.exports = async function reconcile({ github, drafts, context, core, numbe
   }
 
   const found = problems({ title: pr.title, body: pr.body, labels: [...labels] });
-  const mine = ours(MARKER);
+  // Runs from different triggers can overlap and each post the comment; the
+  // oldest is kept and any other is removed.
+  const [mine, ...extra] = ours(MARKER).sort((a, b) => a.id - b.id);
+  for (const c of extra) await github.rest.issues.deleteComment({ ...repo, comment_id: c.id });
 
   if (found.length) {
     const message = `${MARKER}\nTriage found a few things to fix before review:\n\n${found.map((p) => `- ${p}`).join('\n')}\n\nThe templates and rules are in [CONTRIBUTING.md](${guide}). This pull request stays a draft until they pass; it reruns when you push or edit the description.`;
