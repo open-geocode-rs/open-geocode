@@ -606,7 +606,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 source: SourceProvenance::osm(ObjectType::Way, 13),
             }
             .into(),
-            context.clone(),
+            context,
         )
         .expect("interpolation");
     writer.finish().expect("finish");

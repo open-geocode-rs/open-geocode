@@ -889,7 +889,7 @@ impl Reader {
             .segments
             .iter()
             .find(|segment| target <= segment.end_length)
-            .or(line.segments.last())
+            .or_else(|| line.segments.last())
         else {
             return Ok(None);
         };

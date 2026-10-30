@@ -356,7 +356,7 @@ impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
         let tuples = container.section(SECTION_TUPLES, CONTEXT_VERSION)?;
         let count = read_u64_le(&tuples, 0)
-            .ok_or(Error::Inconsistent("context table is truncated".into()))?;
+            .ok_or_else(|| Error::Inconsistent("context table is truncated".into()))?;
         let truncated = || Error::Inconsistent("context table is truncated".into());
         let mut offsets = Vec::with_capacity(count as usize);
         let mut offset = 8usize;
