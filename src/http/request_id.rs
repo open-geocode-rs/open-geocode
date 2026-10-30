@@ -51,10 +51,10 @@ impl ErrorLog {
             .unwrap_or_default()
     }
 
-    fn write(&self, line: String) {
+    fn write(&self, line: &str) {
         #[cfg(test)]
         if let Some(lines) = &self.captured {
-            lines.lock().expect("log lock").push(line);
+            lines.lock().expect("log lock").push(line.to_owned());
             return;
         }
         eprintln!("{line}");
@@ -95,7 +95,7 @@ pub(crate) async fn propagate(
             .and_then(Problem::cause)
             .map(|cause| format!("{cause:#}"));
         log.write(
-            serde_json::json!({
+            &serde_json::json!({
                 "level": "error",
                 "message": "internal error",
                 "request_id": id,

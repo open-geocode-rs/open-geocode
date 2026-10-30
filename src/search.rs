@@ -399,7 +399,7 @@ impl TextSearcher {
         }
     }
 
-    pub fn search(&self, options: TextSearchOptions) -> Result<Vec<TextSearchHit>> {
+    pub fn search(&self, options: &TextSearchOptions) -> Result<Vec<TextSearchHit>> {
         let limit = effective_limit(options.limit);
         if limit == 0 {
             return Ok(Vec::new());
@@ -415,14 +415,14 @@ impl TextSearcher {
         let (_, mut hits) = self.search_variants(
             query_text,
             &[],
-            filters,
+            &filters,
             options.focus,
             limit + 1,
             Parses::All,
             |_, _, _| Ok(true),
         )?;
         if hits.is_empty() && filters.layer.is_none() {
-            hits = self.fallback(query_text, &[], filters, options.focus, limit + 1)?;
+            hits = self.fallback(query_text, &[], &filters, options.focus, limit + 1)?;
         }
         self.rate(&mut hits);
         hits.truncate(limit);
@@ -431,7 +431,7 @@ impl TextSearcher {
 
     pub fn geocode_address(
         &self,
-        options: AddressGeocodeOptions,
+        options: &AddressGeocodeOptions,
     ) -> Result<Option<AddressGeocodeHit>> {
         let limit = effective_limit(options.limit);
         if limit == 0 {
@@ -483,7 +483,7 @@ impl TextSearcher {
         let (query, mut hits) = self.search_variants(
             address,
             &context,
-            Filters::new(options.layer.as_deref(), &options.countries, None),
+            &Filters::new(options.layer.as_deref(), &options.countries, None),
             None,
             limit.max(2),
             // A weaker parse that reads the number as a unit or a word finds
@@ -533,7 +533,7 @@ impl TextSearcher {
         )?;
         if hits.is_empty() && options.layer.is_none() {
             let filters = Filters::new(None, &options.countries, None);
-            hits = self.fallback(address, &context, filters, None, 2)?;
+            hits = self.fallback(address, &context, &filters, None, 2)?;
         }
         self.rate(&mut hits);
         Ok(hits
@@ -542,7 +542,7 @@ impl TextSearcher {
             .map(|hit| AddressGeocodeHit { query, hit }))
     }
 
-    pub fn autocomplete(&self, options: TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
+    pub fn autocomplete(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
         let limit = effective_autocomplete_limit(options.limit);
         if limit == 0 {
             return Ok(Vec::new());
@@ -561,7 +561,7 @@ impl TextSearcher {
         }
 
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
-        let Some(query) = self.build_autocomplete_query(&query_text, filters)? else {
+        let Some(query) = self.build_autocomplete_query(&query_text, &filters)? else {
             return Ok(Vec::new());
         };
         let tokens = autocomplete_query_tokens(&query_text);
@@ -600,7 +600,7 @@ impl TextSearcher {
         &self,
         plan: &QueryPlan,
         pass: Pass,
-        filters: Filters<'_>,
+        filters: &Filters<'_>,
         areas: &AreaWords,
     ) -> Result<Box<dyn Query>> {
         let mut clauses = Vec::new();
@@ -1664,7 +1664,7 @@ impl TextSearcher {
         &self,
         query_text: &str,
         context: &[ContextPart],
-        filters: Filters<'_>,
+        filters: &Filters<'_>,
         focus: Option<[f64; 2]>,
         limit: usize,
         parses: Parses,
@@ -1695,7 +1695,7 @@ impl TextSearcher {
         let search = Search {
             placed: &placed,
             query_words: &query_words,
-            filters,
+            filters: *filters,
             focus,
             limit,
         };
@@ -1811,7 +1811,7 @@ impl TextSearcher {
                         pass,
                         edits,
                         search.query_words,
-                        search.filters,
+                        &search.filters,
                         search.focus,
                         search.limit,
                         &mut *accept,
@@ -1902,7 +1902,7 @@ impl TextSearcher {
         &self,
         query_text: &str,
         context: &[ContextPart],
-        filters: Filters<'_>,
+        filters: &Filters<'_>,
         focus: Option<[f64; 2]>,
         limit: usize,
     ) -> Result<Vec<TextSearchHit>> {
@@ -1920,7 +1920,7 @@ impl TextSearcher {
                 for layer in layers {
                     let filters = Filters {
                         layer: Some(layer.as_str()),
-                        ..filters
+                        ..*filters
                     };
                     for edits in Edits::TIERS {
                         let Some(spelt) = self.spelt(&area, edits)? else {
@@ -1932,7 +1932,7 @@ impl TextSearcher {
                             Pass::Strict,
                             edits,
                             &query_words,
-                            filters,
+                            &filters,
                             focus,
                             limit,
                             &mut |_, _, _| Ok(true),
@@ -1976,7 +1976,7 @@ impl TextSearcher {
         pass: Pass,
         edits: Edits,
         query_words: &QueryWords,
-        filters: Filters<'_>,
+        filters: &Filters<'_>,
         focus: Option<[f64; 2]>,
         limit: usize,
         accept: &mut impl FnMut(&QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
@@ -2041,9 +2041,9 @@ impl TextSearcher {
         let filters = match filters.countries.is_empty() {
             true => Filters {
                 countries: &countries,
-                ..filters
+                ..*filters
             },
-            false => filters,
+            false => *filters,
         };
         // A word of a country the Pack knows is held to that country, not to
         // the names of the hit's areas: "ES" read first as a locality and
@@ -2081,7 +2081,7 @@ impl TextSearcher {
         {
             candidates.push(estimate);
         }
-        let query = self.build_query(plan, pass, filters, &areas)?;
+        let query = self.build_query(plan, pass, &filters, &areas)?;
         candidates.extend(self.ranked_hits(&query, &ranking, limit, &mut keep)?);
         let sought = plan
             .subject
@@ -2679,7 +2679,7 @@ impl TextSearcher {
     fn build_autocomplete_query(
         &self,
         query_text: &str,
-        filters: Filters<'_>,
+        filters: &Filters<'_>,
     ) -> Result<Option<Box<dyn Query>>> {
         let tokens = autocomplete_query_tokens(query_text);
         if tokens.is_empty() {
@@ -3032,14 +3032,13 @@ impl TextSearcher {
     /// The first record a document stands for, and how many.
     fn document_records(&self, searcher: &Searcher, doc: DocAddress) -> Result<(RecordId, u64)> {
         let columns = self.segment_columns(searcher, doc.segment_ord)?;
-        let record_id =
-            columns
-                .record_id
-                .values_for_doc(doc.doc_id)
-                .next()
-                .ok_or(Error::Inconsistent(
-                    "text index hit is missing fast record_id".into(),
-                ))?;
+        let record_id = columns
+            .record_id
+            .values_for_doc(doc.doc_id)
+            .next()
+            .ok_or_else(|| {
+                Error::Inconsistent("text index hit is missing fast record_id".into())
+            })?;
         let count = columns.record_count.first(doc.doc_id).unwrap_or(1);
         Ok((record_id, count))
     }
@@ -3326,9 +3325,7 @@ impl TextSearcher {
     fn segment_columns(&self, searcher: &Searcher, segment_ord: u32) -> Result<&SegmentColumns> {
         self.columns
             .get(&searcher.segment_reader(segment_ord).segment_id())
-            .ok_or(Error::Inconsistent(
-                "text index segment has no fast fields".into(),
-            ))
+            .ok_or_else(|| Error::Inconsistent("text index segment has no fast fields".into()))
     }
 
     /// Whether a street record named `street` (as [`street_search_text`]
@@ -5332,7 +5329,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "342 Albert Street".to_string(),
                 limit: 3,
                 layer: None,
@@ -5392,7 +5389,7 @@ mod tests {
         writer.finish().expect("finish");
         let search = |searcher: &TextSearcher, query: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.to_string(),
                     limit: 5,
                     layer: None,
@@ -5432,7 +5429,7 @@ mod tests {
             }
         }
         let suggestions = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "10 King St".to_string(),
                 limit: 5,
                 layer: None,
@@ -5471,7 +5468,7 @@ mod tests {
         bbox: Option<BoundingBox>,
     ) -> Vec<String> {
         searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: query.to_string(),
                 limit,
                 layer: None,
@@ -5667,7 +5664,7 @@ mod tests {
                     Pass::Strict,
                     Edits::None,
                     &QueryWords::new(&query),
-                    Filters::default(),
+                    &Filters::default(),
                     None,
                     5,
                     &mut |_, _, _| Ok(true),
@@ -5752,7 +5749,7 @@ mod tests {
             "house 5 lies past the east edge, though its group's extent meets the box"
         );
         let suggestions = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "2 Mill".to_string(),
                 limit: 5,
                 layer: None,
@@ -5778,7 +5775,7 @@ mod tests {
         postcode: Option<&str>,
     ) -> Option<String> {
         searcher
-            .geocode_address(AddressGeocodeOptions {
+            .geocode_address(&AddressGeocodeOptions {
                 address: address.to_string(),
                 locality: locality.map(str::to_string),
                 region: None,
@@ -5856,7 +5853,7 @@ mod tests {
 
         for limit in [1, 10] {
             let hit = searcher
-                .geocode_address(AddressGeocodeOptions {
+                .geocode_address(&AddressGeocodeOptions {
                     address: "10 King Street".to_string(),
                     locality: None,
                     region: None,
@@ -5924,7 +5921,7 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         let hit = searcher
-            .geocode_address(AddressGeocodeOptions {
+            .geocode_address(&AddressGeocodeOptions {
                 address: "10 King Street".to_string(),
                 locality: None,
                 region: None,
@@ -6282,7 +6279,7 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let top = |query: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.to_string(),
                     limit: 5,
                     layer: None,
@@ -6350,7 +6347,7 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let layers = |query: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.to_string(),
                     limit: 5,
                     layer: None,
@@ -6503,7 +6500,7 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         let error = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "(".to_string(),
                 limit: 5,
                 layer: None,
@@ -6554,7 +6551,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "King Street Toronto".to_string(),
                 limit: 5,
                 layer: None,
@@ -6599,7 +6596,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "King Street".to_string(),
                 limit: 10,
                 layer: Some("street".to_string()),
@@ -6638,7 +6635,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "M5V".to_string(),
                 limit: 5,
                 layer: Some("postcode".to_string()),
@@ -6693,7 +6690,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "kin".to_string(),
                 limit: 5,
                 layer: None,
@@ -6734,7 +6731,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "king st".to_string(),
                 limit: 5,
                 layer: None,
@@ -6777,7 +6774,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "kin".to_string(),
                 limit: 10,
                 layer: Some("street".to_string()),
@@ -6818,7 +6815,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let postcode_hits = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "nw16".to_string(),
                 limit: 5,
                 layer: None,
@@ -6828,7 +6825,7 @@ mod tests {
             })
             .expect("postcode autocomplete");
         let number_hits = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "221".to_string(),
                 limit: 5,
                 layer: None,
@@ -6869,7 +6866,7 @@ mod tests {
 
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let hits = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "221 bak".to_string(),
                 limit: 5,
                 layer: None,
@@ -6911,7 +6908,7 @@ mod tests {
 
         assert!(
             searcher
-                .autocomplete(TextAutocompleteOptions {
+                .autocomplete(&TextAutocompleteOptions {
                     query: " ".to_string(),
                     limit: 5,
                     layer: None,
@@ -6924,7 +6921,7 @@ mod tests {
         );
         assert!(
             searcher
-                .autocomplete(TextAutocompleteOptions {
+                .autocomplete(&TextAutocompleteOptions {
                     query: "k".to_string(),
                     limit: 5,
                     layer: None,
@@ -6937,7 +6934,7 @@ mod tests {
         );
         assert!(
             searcher
-                .autocomplete(TextAutocompleteOptions {
+                .autocomplete(&TextAutocompleteOptions {
                     query: "ki".to_string(),
                     limit: 5,
                     layer: None,
@@ -6958,7 +6955,7 @@ mod tests {
 
     fn top_ids_limited(searcher: &TextSearcher, query: &str, limit: usize) -> Vec<String> {
         searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: query.to_string(),
                 limit,
                 layer: None,
@@ -7170,7 +7167,7 @@ mod tests {
         );
 
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "50 Queen Street".to_string(),
                 limit: 5,
                 layer: None,
@@ -7555,7 +7552,7 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
         let top = |query: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.to_string(),
                     limit: 5,
                     layer: None,
@@ -7950,7 +7947,7 @@ mod tests {
         assert_eq!(toronto[0], "osm:node:4", "the stated unit ranks first");
         assert_eq!(toronto.len(), 2);
         let autocomplete = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "13 queen".to_string(),
                 limit: 5,
                 layer: None,
@@ -8179,7 +8176,7 @@ mod tests {
                     pass,
                     Edits::None,
                     &QueryWords::new(&plan.text()),
-                    Filters::default(),
+                    &Filters::default(),
                     None,
                     5,
                     &mut |_, _, _| Ok(true),
@@ -8385,7 +8382,7 @@ mod tests {
         // state, though the street states none.
         let geocode_in = |address: &str, region: &str| {
             searcher
-                .geocode_address(AddressGeocodeOptions {
+                .geocode_address(&AddressGeocodeOptions {
                     address: address.to_string(),
                     locality: Some("Highlands".to_string()),
                     region: Some(region.to_string()),
@@ -8443,7 +8440,7 @@ mod tests {
             ContextPart::of(Label::Region, Some("NC")).expect("part"),
         ];
         let fallback = searcher
-            .fallback("999 Nowhere Lane", &context, Filters::default(), None, 5)
+            .fallback("999 Nowhere Lane", &context, &Filters::default(), None, 5)
             .expect("fallback");
         assert_eq!(
             fallback
@@ -8456,7 +8453,7 @@ mod tests {
         let nowhere = [ContextPart::of(Label::Locality, Some("Atlantis")).expect("part")];
         assert!(
             searcher
-                .fallback("999 Nowhere Lane", &nowhere, Filters::default(), None, 5)
+                .fallback("999 Nowhere Lane", &nowhere, &Filters::default(), None, 5)
                 .expect("fallback")
                 .is_empty(),
             "a town the Pack does not know is no answer"
@@ -8938,7 +8935,7 @@ mod tests {
                 Pass::Strict,
                 Edits::One,
                 &QueryWords::new("131 impasse de la nor\u{fffd}a"),
-                Filters::default(),
+                &Filters::default(),
                 None,
                 5,
                 &mut |_, _, _| Ok(true),
@@ -9068,7 +9065,7 @@ mod tests {
             .fallback(
                 "Ponsonby Road",
                 &[ContextPart::of(Label::Locality, Some("Christchurch")).expect("part")],
-                Filters::default(),
+                &Filters::default(),
                 None,
                 5,
             )

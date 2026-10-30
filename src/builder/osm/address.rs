@@ -22,8 +22,8 @@ pub(crate) struct AddressCandidate {
 }
 
 /// Turn a candidate into an address record, or count why it was not one.
-pub(crate) fn emit_address(candidate: AddressCandidate, out: &mut Emitted) {
-    match address_record_from_candidate(&candidate) {
+pub(crate) fn emit_address(candidate: &AddressCandidate, out: &mut Emitted) {
+    match address_record_from_candidate(candidate) {
         Ok(record) => {
             out.report
                 .accept_address_with_tags(&record, Some(&candidate.tags));
@@ -271,14 +271,14 @@ mod tests {
     fn emits_records_and_report_counts() {
         let mut out = Emitted::default();
         emit_address(
-            candidate(&[
+            &candidate(&[
                 ("addr:housenumber", "10"),
                 ("addr:street", "King Street"),
                 ("addr:postcode", "m5v 1a1"),
             ]),
             &mut out,
         );
-        emit_address(candidate(&[("addr:housenumber", "10")]), &mut out);
+        emit_address(&candidate(&[("addr:housenumber", "10")]), &mut out);
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.report.accepted.node_addresses, 1);
         assert_eq!(out.report.rejected.total, 1);

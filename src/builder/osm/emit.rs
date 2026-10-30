@@ -96,7 +96,7 @@ pub(crate) fn assemble(
         };
         let tags = collect_clean_tags(way.tags());
         if !tags.is_empty() {
-            for (feature, way_refs) in way_features(way.id(), tags, refs) {
+            for (feature, way_refs) in way_features(way.id(), &tags, refs) {
                 let (nodes, found) =
                     resolve(&way_refs, locations, feature.kind == WayKind::Interpolation);
                 assembled.resolved += found;
@@ -139,7 +139,7 @@ pub(crate) fn emit_feature(
             let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
             match center {
                 Some((lat, lon)) => emit_address(
-                    AddressCandidate {
+                    &AddressCandidate {
                         object_type: ObjectType::Way,
                         object_id: feature.way_id,
                         lat,
@@ -163,7 +163,7 @@ pub(crate) fn emit_feature(
             let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
             match center {
                 Some((lat, lon)) => emit_poi(
-                    PoiCandidate {
+                    &PoiCandidate {
                         object_type: ObjectType::Way,
                         object_id: feature.way_id,
                         lat,
