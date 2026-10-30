@@ -34,7 +34,12 @@ jobs:
       - uses: actions/github-script@v7
         with:
           script: |
-            const problems = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/triage.js`);
+            const rules = `${process.env.GITHUB_WORKSPACE}/.github/scripts/triage.js`;
+            if (!require('fs').existsSync(rules)) {
+              core.notice('main has no triage rules yet');
+              return;
+            }
+            const problems = require(rules);
             const MARKER = '<!-- og-triage -->';
             const PASSED = 'triage:passed';
             // Fresh state: a queued run may start after the event it was for.
