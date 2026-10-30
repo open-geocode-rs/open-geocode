@@ -1,0 +1,21 @@
+name: Feature request
+description: Something og cannot do today.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Need
+      description: Who needs it and what they cannot do today.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: A request and the answer you would want back.
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: The workaround, or the other tool you use for it.

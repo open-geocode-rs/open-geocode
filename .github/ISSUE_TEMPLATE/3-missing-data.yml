@@ -1,0 +1,25 @@
+name: Missing data
+description: An address, street or place that og cannot find, though it exists.
+labels: [bug]
+body:
+  - type: input
+    id: what
+    attributes:
+      label: What is missing
+      placeholder: "4 Hameau des Prés, 74300 Cluses, France"
+    validations:
+      required: true
+  - type: input
+    id: proof
+    attributes:
+      label: Where it exists
+      description: An OSM link, an official register, or a map link.
+    validations:
+      required: true
+  - type: input
+    id: pack
+    attributes:
+      label: Pack
+      placeholder: "France, OSM + BAN"
+    validations:
+      required: true
