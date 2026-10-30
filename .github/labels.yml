@@ -45,6 +45,7 @@
 
 - { name: "bug", color: "d73a4a", description: "Issue: something is broken or wrong." }
 - { name: "enhancement", color: "a2eeef", description: "Issue: a new capability." }
+- { name: "performance", color: "fbca04", description: "Issue: a query or build is slow, or uses too much memory or disk." }
 - { name: "documentation", color: "0075ca", description: "Issue: docs are missing or wrong." }
 - { name: "question", color: "d876e3", description: "Issue: a question." }
 - { name: "duplicate", color: "cfd3d7", description: "Issue or pull request already exists." }
