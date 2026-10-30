@@ -1,0 +1,27 @@
+area:parse:
+  - changed-files:
+      - any-glob-to-any-file: ["src/parse/**", "src/labels.rs"]
+area:search:
+  - changed-files:
+      - any-glob-to-any-file: ["src/search.rs", "src/text_index.rs", "src/confidence.rs", "src/calibration.rs", "src/context.rs"]
+area:reverse:
+  - changed-files:
+      - any-glob-to-any-file: ["src/reverse.rs", "src/spatial_index.rs"]
+area:batch:
+  - changed-files:
+      - any-glob-to-any-file: ["src/batch.rs", "src/bin/og/batch.rs"]
+area:builder:
+  - changed-files:
+      - any-glob-to-any-file: ["src/builder/**", "src/builder.rs", "src/extsort/**", "src/extsort.rs", "src/openaddresses.rs"]
+area:pack:
+  - changed-files:
+      - any-glob-to-any-file: ["src/pack/**", "src/pack.rs", "src/container.rs", "src/record.rs", "src/records.rs"]
+area:api:
+  - changed-files:
+      - any-glob-to-any-file: ["src/http/**", "src/api.rs", "contract/**"]
+area:ci:
+  - changed-files:
+      - any-glob-to-any-file: [".github/**"]
+area:fixtures:
+  - changed-files:
+      - any-glob-to-any-file: ["fixtures/**", "scripts/fixtures/**"]

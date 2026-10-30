@@ -1,0 +1,111 @@
+name: Triage
+
+# Gate 1. Checks that a pull request is well formed before Devin reviews it.
+# On the first pass it labels the pull request `triage:passed` and takes it to
+# draft and back to ready: Devin's rule starts on "PR is ready" and requires
+# that label, so Devin's one review runs only on a well-formed pull request.
+#
+# pull_request_target so fork pull requests can be labelled. The body and
+# title are read as data through the API; PR code is never checked out.
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: triage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    name: Triage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MARKER = '<!-- og-triage -->';
+            const PASSED = 'triage:passed';
+            const pr = (await github.rest.pulls.get({ ...context.repo, pull_number: context.payload.pull_request.number })).data;
+            const issue = { ...context.repo, issue_number: pr.number };
+            const labels = pr.labels.map((label) => label.name);
+            const problems = [];
+
+            const kind = /^(fix|feat|perf|refactor|chore|ci|docs|build|test)(\([^)]*\))?!?: \S/.exec(pr.title)?.[1];
+            if (!kind) {
+              problems.push('The title is not a conventional commit, such as `fix(search): a house number with a letter finds its address`.');
+            }
+
+            const body = (pr.body ?? '').replace(/<!--[\s\S]*?-->/g, '');
+            const sections = new Map();
+            let current = null;
+            for (const line of body.split(/\r?\n/)) {
+              const heading = /^##\s+(.+?)\s*$/.exec(line);
+              if (heading) {
+                current = heading[1].toLowerCase();
+                sections.set(current, []);
+              } else if (current) {
+                sections.get(current).push(line);
+              }
+            }
+            const text = (name) => (sections.get(name) ?? []).join('\n').trim();
+
+            const impact = ['impact', 'downsides'];
+            const required = {
+              fix: ['problem', 'change', 'example', 'verification', ...impact],
+              feat: ['need', 'change', 'example', 'verification', ...impact],
+              perf: ['problem', 'change', 'verification', ...impact],
+              refactor: ['reason', 'change', 'behavior', 'verification', ...impact],
+            }[kind] ?? ['change', 'verification'];
+            for (const name of required) {
+              if (!sections.has(name)) {
+                problems.push(`The **${name}** section is missing. Use the \`${kind ?? 'chore'}\` template from CONTRIBUTING.md.`);
+              } else if (!text(name)) {
+                problems.push(`The **${name}** section is empty.`);
+              }
+            }
+
+            if (required.includes('impact') && sections.has('impact')) {
+              const block = text('impact');
+              for (const field of ['Pack', 'Machine', 'Rebuild needed', 'API contract changed']) {
+                const value = new RegExp(`^${field}:[ \\t]*(.*)$`, 'mi').exec(block)?.[1]?.trim();
+                if (!value) problems.push(`Impact: **${field}** is not filled.`);
+              }
+              for (const row of ['Accuracy', 'Time', 'Space']) {
+                const cells = new RegExp(`^\\|\\s*${row}\\s*\\|(.*)$`, 'mi').exec(block)?.[1]
+                  ?.split('|').map((cell) => cell.trim()).filter((cell, at, all) => at < all.length - 1 || cell);
+                if (!cells || cells.length < 2 || cells.some((cell) => !cell)) {
+                  problems.push(`Impact: the **${row}** row needs a value for main and for this PR.`);
+                }
+              }
+            }
+
+            if (labels.includes('experimental') && !/https?:\/\/\S+/.test(body)) {
+              problems.push('An `experimental` pull request links at least one source: a paper, a journal article, or another geocoder\'s documented design.');
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, { ...issue, per_page: 100 });
+            const mine = comments.find((comment) => comment.user.type === 'Bot' && comment.body.startsWith(MARKER));
+
+            if (problems.length) {
+              const message = `${MARKER}\nTriage found a few things to fix before review:\n\n${problems.map((p) => `- ${p}`).join('\n')}\n\nThe templates and rules are in [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md). This check reruns when you push or edit the description.`;
+              if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body: message });
+              else await github.rest.issues.createComment({ ...issue, body: message });
+              if (labels.includes(PASSED)) await github.rest.issues.removeLabel({ ...issue, name: PASSED });
+              core.setFailed(`${problems.length} triage problem(s)`);
+              return;
+            }
+
+            if (mine) await github.rest.issues.deleteComment({ ...context.repo, comment_id: mine.id });
+            if (labels.includes(PASSED)) return;
+
+            await github.rest.issues.addLabels({ ...issue, labels: [PASSED] });
+            // A draft opens Devin when its author marks it ready; only a ready
+            // pull request needs the round trip through draft.
+            if (!pr.draft) {
+              await github.graphql(`mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }`, { id: pr.node_id });
+              await github.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }`, { id: pr.node_id });
+            }
