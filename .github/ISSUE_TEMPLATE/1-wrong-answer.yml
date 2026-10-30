@@ -1,0 +1,41 @@
+name: Wrong answer
+description: A query returns the wrong place, a poor match, or nothing.
+labels: [bug]
+body:
+  - type: input
+    id: query
+    attributes:
+      label: Query
+      description: Exactly as sent, with the endpoint.
+      placeholder: "/search?q=12 Rue de la Paix 75002 Paris"
+    validations:
+      required: true
+  - type: textarea
+    id: got
+    attributes:
+      label: What og returned
+      description: The top answer, or the JSON.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What it should return
+      description: The right place, with a source that shows it (a map link, an official register).
+    validations:
+      required: true
+  - type: input
+    id: pack
+    attributes:
+      label: Pack
+      description: Region or planet, and how it was built.
+      placeholder: "planet, og build 0.3.0, OSM + OpenAddresses"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: og version
+      placeholder: "og --version"
+    validations:
+      required: true

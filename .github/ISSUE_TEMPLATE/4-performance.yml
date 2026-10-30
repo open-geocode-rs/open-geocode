@@ -1,0 +1,38 @@
+name: Performance or resources
+description: A query or build is slow, or uses too much memory or disk.
+labels: [performance]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What is slow or large
+      description: Name the command or query set, and what you measured.
+      placeholder: "og build of Germany peaks at 28 GB RAM"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: A number, and where it comes from.
+  - type: input
+    id: pack
+    attributes:
+      label: Pack
+      placeholder: "Germany, OSM only"
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: CPU, cores, RAM, disk type.
+      placeholder: "8 cores, 32 GB, NVMe"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: og version
+    validations:
+      required: true
