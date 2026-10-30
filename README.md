@@ -1,11 +1,29 @@
-# open-geocode
+<p align="center">
+  <a href="https://opengeocode.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+      <img src="assets/logo-light.png" alt="open-geocode" width="220">
+    </picture>
+  </a>
+</p>
 
-Fast, lightweight, self-hosted geocoding in pure Rust.
+<h1 align="center">open-geocode</h1>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/open-geocode-rs/open-geocode/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/open-geocode-rs/open-geocode/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/open-geocode.svg?style=flat-square)](https://crates.io/crates/open-geocode)
-[![docs.rs](https://img.shields.io/docsrs/open-geocode?style=flat-square)](https://docs.rs/open-geocode)
-[![license](https://img.shields.io/crates/l/open-geocode.svg?style=flat-square)](LICENSE)
+<p align="center">Fast, lightweight, self-hosted geocoding in pure Rust.</p>
+
+<p align="center">
+  <a href="https://github.com/open-geocode-rs/open-geocode/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/open-geocode-rs/open-geocode/ci.yml?branch=main&style=flat-square&label=ci" alt="CI"></a>
+  <a href="https://crates.io/crates/open-geocode"><img src="https://img.shields.io/crates/v/open-geocode.svg?style=flat-square" alt="crates.io"></a>
+  <a href="https://docs.rs/open-geocode"><img src="https://img.shields.io/docsrs/open-geocode?style=flat-square" alt="docs.rs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/crates/l/open-geocode.svg?style=flat-square" alt="license"></a>
+</p>
+
+<p align="center">
+  <a href="https://opengeocode.com/docs/"><b>Docs</b></a> •
+  <a href="https://opengeocode.com/docs/quickstart/"><b>Quickstart</b></a> •
+  <a href="https://opengeocode.com/docs/api/"><b>API</b></a> •
+  <a href="https://opengeocode.com/docs/benchmarks/"><b>Benchmarks</b></a>
+</p>
 
 `open-geocode` is a self-hosted address geocoding engine built entirely on open data (OpenStreetMap and OpenAddresses).
 Forward, autocomplete, reverse and batch geocoding, served from one file.
