@@ -2,6 +2,7 @@
 //! extract itself, and the checksum it is published with.
 
 use std::{
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -235,7 +236,7 @@ fn fetch(
             }
         }
     }
-    let total = total.or(length.map(|length| length + start));
+    let total = total.or_else(|| length.map(|length| length + start));
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -330,11 +331,13 @@ pub(crate) fn check_md5(
         done += read as u64;
         progress(done);
     }
-    let sum: String = hasher
+    let sum = hasher
         .finalize()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+        .fold(String::new(), |mut sum, byte| {
+            let _ = write!(sum, "{byte:02x}");
+            sum
+        });
     if sum != expected {
         bail!(
             "{} does not match its published checksum ({sum}, expected {expected})",

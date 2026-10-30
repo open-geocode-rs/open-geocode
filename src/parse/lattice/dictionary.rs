@@ -952,13 +952,7 @@ impl Builder {
             return;
         };
         self.contexts.insert(tuple.clone());
-        let groups = tuple
-            .region_record_id()
-            .and_then(|region| self.region_groups.get(&region))
-            .into_iter()
-            .flatten()
-            .map(|group| (Field::Region, level::REGION, Some(*group)))
-            .collect::<Vec<_>>();
+
         // Walked rather than listed per tier, so a tier added to the chain is
         // indexed without a second place to remember.
         // An area that is two tiers is indexed under both: Berlin has to be
@@ -969,7 +963,14 @@ impl Builder {
                 (field, level, Some(entry.record_id))
             })
         });
-        for (field, level, area) in groups.into_iter().chain(tiers) {
+        for (field, level, area) in tuple
+            .region_record_id()
+            .and_then(|region| self.region_groups.get(&region))
+            .into_iter()
+            .flatten()
+            .map(|group| (Field::Region, level::REGION, Some(*group)))
+            .chain(tiers)
+        {
             if let Some(area) = area {
                 self.areas
                     .entry(area)

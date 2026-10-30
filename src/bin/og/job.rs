@@ -515,7 +515,7 @@ fn run(
         .build()
         .context("failed to start the build's worker threads")?;
     let started = Instant::now();
-    let report = pool.install(|| build_planned_osm_pack(options, plan))?;
+    let report = pool.install(|| build_planned_osm_pack(&options, plan))?;
     let build_secs = started.elapsed().as_secs_f64();
     let pack = PackInfo::read(&request.pack)
         .with_context(|| format!("the new Pack at {} cannot be read", request.pack.display()))?;

@@ -385,7 +385,7 @@ impl BatchFile {
     /// Where a run writes: `<stem>.geocoded.csv` beside the file, numbered
     /// when that name is taken, so nothing is written over.
     fn output_path(&self) -> PathBuf {
-        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
         let mut path = dir.join(format!("{}.geocoded.csv", self.stem()));
         let mut number = 2;
         while path.exists() {
@@ -668,7 +668,7 @@ impl BatchSession {
             ..GeocodeOptions::default()
         };
         let handle =
-            thread::spawn(move || run_batch_geocode(options).map(|_| ()).map_err(Into::into));
+            thread::spawn(move || run_batch_geocode(&options).map(|_| ()).map_err(Into::into));
         self.summary = None;
         self.run = Some(Run {
             stats,

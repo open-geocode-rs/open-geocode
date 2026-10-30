@@ -580,7 +580,7 @@ pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<R
         },
         Record::Street(_) | Record::Postcode(_) => SourceContext::default(),
     };
-    Some(index.context_for_point(lon, lat, source))
+    Some(index.context_for_point(lon, lat, &source))
 }
 
 pub(crate) fn boundary_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -620,7 +620,7 @@ impl BoundaryIndex {
         &self,
         lon: f64,
         lat: f64,
-        source_context: SourceContext<'_>,
+        source_context: &SourceContext<'_>,
     ) -> RecordContext {
         if self.boundaries.is_empty() || !lon.is_finite() || !lat.is_finite() {
             return RecordContext::default();
@@ -757,7 +757,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<(BuiltBoundary, Vec<u8>)> {
     if polygon.unsigned_area() <= f64::EPSILON {
         return None;
     }
-    built(parts, &way.tags, MultiPolygon::new(vec![polygon]))
+    built(parts, &way.tags, &MultiPolygon::new(vec![polygon]))
 }
 
 fn boundary_from_relation(
@@ -787,7 +787,7 @@ fn boundary_from_relation(
     let Some(geometry) = multipolygon_from_rings(outer_rings, inner_rings) else {
         return Ok(None);
     };
-    Ok(built(parts, &stub.tags, geometry))
+    Ok(built(parts, &stub.tags, &geometry))
 }
 
 /// The boundary an area's tags and geometry make, and the block of its
@@ -796,7 +796,7 @@ fn boundary_from_relation(
 fn built(
     parts: AreaParts,
     tags: &BTreeMap<String, String>,
-    geometry: MultiPolygon<f64>,
+    geometry: &MultiPolygon<f64>,
 ) -> Option<(BuiltBoundary, Vec<u8>)> {
     let AreaParts {
         layer,
@@ -807,10 +807,10 @@ fn built(
         place_layer,
         designation,
     } = parts;
-    let representative_point = representative_point(&geometry)?;
+    let representative_point = representative_point(geometry)?;
     let bounds = geometry.bounding_rect()?;
     let mut block = Vec::new();
-    encode_shape(&geometry, &mut block);
+    encode_shape(geometry, &mut block);
     Some((
         BuiltBoundary {
             layer,
@@ -1528,7 +1528,7 @@ fn compare_boundary(
     layer: PlaceLayer,
     left: &AcceptedBoundary,
     right: &AcceptedBoundary,
-    source_context: SourceContext<'_>,
+    source_context: &SourceContext<'_>,
 ) -> Ordering {
     let source_value = source_value_for_layer(layer, source_context);
     let left_match = source_value
@@ -1559,7 +1559,7 @@ fn compare_boundary(
 
 fn source_value_for_layer<'a>(
     layer: PlaceLayer,
-    source_context: SourceContext<'a>,
+    source_context: &SourceContext<'a>,
 ) -> Option<&'a str> {
     // A sub-tier is a subdivision of the tier above and the source address
     // states it in the same field, so both read one value.
@@ -1820,7 +1820,7 @@ mod tests {
         );
         let index = test_index(vec![toronto, oakville]);
 
-        let assignment = index.context_for_point(-79.5, 43.5, SourceContext::default());
+        let assignment = index.context_for_point(-79.5, 43.5, &SourceContext::default());
 
         assert_eq!(assignment.admin_context.locality_record_id(), Some(1));
         assert_eq!(assignment.flags, 0);
@@ -1832,7 +1832,7 @@ mod tests {
         let right = square_boundary(11, "Right", PlaceLayer::Locality, 0.0, -1.0, 1.0, 1.0);
         let index = test_index(vec![right, left]);
 
-        let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+        let assignment = index.context_for_point(0.0, 0.0, &SourceContext::default());
 
         assert_eq!(assignment.admin_context.locality_record_id(), Some(10));
         assert_eq!(assignment.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);
@@ -1855,7 +1855,7 @@ mod tests {
             vec![mid, small, big]
         }] {
             let index = test_index(order);
-            let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+            let assignment = index.context_for_point(0.0, 0.0, &SourceContext::default());
             assert_eq!(
                 assignment.admin_context.locality_record_id(),
                 Some(2),
@@ -1878,7 +1878,7 @@ mod tests {
             .collect();
         let index = test_index(vec![germany, berlin]);
 
-        let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+        let assignment = index.context_for_point(0.0, 0.0, &SourceContext::default());
 
         let tuple = &assignment.admin_context;
         assert_eq!(tuple.get(PlaceLayer::Region), Some(2), "Berlin the state");
@@ -1973,7 +1973,7 @@ mod tests {
         let suburb = square_boundary(2, "Dickson", PlaceLayer::SubLocality, -0.5, -0.5, 0.5, 0.5);
         let index = test_index(vec![district, suburb]);
 
-        let assignment = index.context_for_point(0.0, 0.0, SourceContext::default());
+        let assignment = index.context_for_point(0.0, 0.0, &SourceContext::default());
 
         let tuple = &assignment.admin_context;
         assert_eq!(tuple.get(PlaceLayer::Locality), Some(1), "the district");
@@ -2337,7 +2337,7 @@ mod tests {
         region.inferred_country_record_id = Some(7);
         let index = test_index(vec![region]);
 
-        let assignment = index.context_for_point(-79.0, 43.0, SourceContext::default());
+        let assignment = index.context_for_point(-79.0, 43.0, &SourceContext::default());
 
         assert_eq!(assignment.admin_context.country_record_id(), Some(7));
         assert_eq!(assignment.admin_context.region_record_id(), Some(20));
@@ -2455,7 +2455,7 @@ mod tests {
         assert_eq!(report.accepted.place_nodes, 2);
 
         let index = set.into_index(&[5], &HashMap::from([("CA".to_string(), 4)]));
-        let context = index.context_for_point(-75.0, 45.0, SourceContext::default());
+        let context = index.context_for_point(-75.0, 45.0, &SourceContext::default());
         assert_eq!(context.admin_context.region_record_id(), Some(5));
         assert_eq!(context.admin_context.country_record_id(), Some(4));
     }
