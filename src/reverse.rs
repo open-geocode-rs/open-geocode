@@ -123,7 +123,7 @@ impl PackReverseGeocoder {
     }
 
     pub fn reverse(&self, options: GeocodeOptions) -> Result<GeocodeResponse> {
-        let mut context = Context::default();
+        let mut context   =   Context::default();
         let mut context_record_ids = Vec::new();
 
         let mut result = self.explicit_address(options, &mut context, &mut context_record_ids)?;
@@ -397,6 +397,9 @@ fn apply_context_record(context: &mut Context, record: &ContextRecord) -> bool {
     }
 }
 
+// Throwaway line one of a test comment for the review pipeline.
+// Throwaway line two of a test comment for the review pipeline.
+// Throwaway line three of a test comment for the review pipeline.
 fn compose_label(primary: &str, context: &Context) -> String {
     let mut parts = vec![primary.to_string()];
     for part in [
