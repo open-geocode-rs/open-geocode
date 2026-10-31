@@ -929,13 +929,15 @@ struct Gradient {
 impl Gradient {
     fn of(lattice: &Lattice, weights: &Weights, gold: &[Label]) -> Self {
         let countries = decode::countries(lattice);
+        let order = span_order(lattice);
+        let golds = gold_labels(lattice, gold);
         let readings = countries
             .iter()
             .map(|country| {
                 let edges = span_edges(lattice, weights, *country);
                 (
-                    Reading::new(lattice, weights, *country, None, edges.clone()),
-                    Reading::new(lattice, weights, *country, Some(gold), edges),
+                    Reading::new(lattice, weights, *country, None, &order, edges.clone()),
+                    Reading::new(lattice, weights, *country, Some(&golds), &order, edges),
                 )
             })
             .collect::<Vec<_>>();
@@ -979,10 +981,36 @@ fn span_edges(
         .collect()
 }
 
+/// The lattice's span indices by where the spans end, the order the forward
+/// pass visits them in.
+fn span_order(lattice: &Lattice) -> Vec<usize> {
+    let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| lattice.spans[*index].end);
+    order
+}
+
+/// Per span, the labels a gold labelling may give it, one bit per label: the
+/// label every unit of the span has in `gold`, or none when they differ.
+fn gold_labels(lattice: &Lattice, gold: &[Label]) -> Vec<u8> {
+    lattice
+        .spans
+        .iter()
+        .map(|span| {
+            let units = &gold[span.start..span.end];
+            match units.first() {
+                None => u8::MAX,
+                Some(first) if units.iter().all(|unit| unit == first) => 1 << *first as u8,
+                Some(_) => 0,
+            }
+        })
+        .collect()
+}
+
 /// Forward-backward over a lattice decoded as one country, over every
 /// labelling or only those that give each unit its gold label.
 struct Reading<'a> {
-    gold: Option<&'a [Label]>,
+    /// [`gold_labels`] of the lattice, when only gold labellings count.
+    golds: Option<&'a [u8]>,
     /// `edges[span][label]`.
     edges: Vec<[f64; LABELS]>,
     transitions: [[f64; STATES]; STATES],
@@ -999,7 +1027,8 @@ impl<'a> Reading<'a> {
         lattice: &Lattice,
         weights: &Weights,
         country: Option<CountryCode>,
-        gold: Option<&'a [Label]>,
+        golds: Option<&'a [u8]>,
+        order: &[usize],
         edges: Vec<[f64; LABELS]>,
     ) -> Self {
         let table = weights.transitions(country);
@@ -1009,21 +1038,16 @@ impl<'a> Reading<'a> {
                 *value = f64::from(table.get(previous, next));
             }
         }
-        let allowed = |span: &decode::Span, label: Label| {
-            gold.is_none_or(|gold| gold[span.start..span.end].iter().all(|gold| *gold == label))
-        };
         let len = lattice.len;
         let mut alpha = vec![[f64::NEG_INFINITY; STATES]; len + 1];
         alpha[0][START] = 0.0;
-        let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
-        order.sort_by_key(|index| lattice.spans[*index].end);
         // Spans are visited by end, so `alpha[start]` is final by the first
         // span that starts there, and every later one reads the same sum.
         let mut sums = vec![[None; LABELS]; len + 1];
-        for &index in &order {
+        for &index in order {
             let span = &lattice.spans[index];
             for label in Label::ALL {
-                if !allowed(span, label) {
+                if !allowed(golds, index, label) {
                     continue;
                 }
                 let next = label as usize;
@@ -1044,7 +1068,7 @@ impl<'a> Reading<'a> {
         for &index in order.iter().rev() {
             let span = &lattice.spans[index];
             for label in Label::ALL {
-                if !allowed(span, label) {
+                if !allowed(golds, index, label) {
                     continue;
                 }
                 let next = label as usize;
@@ -1059,7 +1083,7 @@ impl<'a> Reading<'a> {
         }
         let log_z = log_sum((0..LABELS).map(|label| alpha[len][label] + beta[len][label]));
         Self {
-            gold,
+            golds,
             edges,
             transitions,
             alpha,
@@ -1084,9 +1108,7 @@ impl<'a> Reading<'a> {
         for (index, span) in lattice.spans.iter().enumerate() {
             for label in Label::ALL {
                 let next = label as usize;
-                if self.gold.is_some_and(|gold| {
-                    gold[span.start..span.end].iter().any(|gold| *gold != label)
-                }) {
+                if !allowed(self.golds, index, label) {
                     continue;
                 }
                 let onward = self.edges[index][next] + self.beta[span.end][next] - self.log_z;
@@ -1130,6 +1152,12 @@ impl<'a> Reading<'a> {
             }
         }
     }
+}
+
+/// Whether a reading over `golds` (every labelling when `None`) may give span
+/// `index` the label `label`.
+fn allowed(golds: Option<&[u8]>, index: usize, label: Label) -> bool {
+    golds.is_none_or(|golds| golds[index] & (1 << label as u8) != 0)
 }
 
 /// The states a segment starting at `start` can follow.
@@ -2716,7 +2744,8 @@ mod tests {
         assert_eq!(paths.len(), LABELS * LABELS);
         let brute = log_sum(paths.iter().map(|path| f64::from(path.score)));
         let edges = span_edges(&lattice, &weights, None);
-        let reading = Reading::new(&lattice, &weights, None, None, edges);
+        let order = span_order(&lattice);
+        let reading = Reading::new(&lattice, &weights, None, None, &order, edges);
         assert!(
             (reading.log_z - brute).abs() < 1e-3,
             "{} {brute}",
