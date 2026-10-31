@@ -27,6 +27,7 @@
 //! while the build's pool grants it, else from a scratch file.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     path::Path,
     rc::Rc,
@@ -1616,6 +1617,12 @@ struct Renderer<'a> {
     /// Every name of each area record, its `name` first. Shared, not cloned,
     /// to each of the many draws from the same few areas.
     names: FxHashMap<RecordId, Rc<[String]>>,
+    /// The country code each country record's `name` reads as, looked up
+    /// once for the many rows drawn in one country.
+    country_codes: FxHashMap<RecordId, Option<CountryCode>>,
+    /// Whether each area name names a locality, by its words: rows draw the
+    /// same few area names over and over.
+    localities: RefCell<FxHashMap<String, bool>>,
     /// The words a unit is written with: the Pack's unit words, PO box
     /// words and level words.
     unit_words: [Vec<String>; 3],
@@ -1632,6 +1639,8 @@ impl<'a> Renderer<'a> {
             pack,
             tagger,
             names: FxHashMap::default(),
+            country_codes: FxHashMap::default(),
+            localities: RefCell::default(),
             // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
@@ -1988,9 +1997,18 @@ impl<'a> Renderer<'a> {
     /// Whether the dictionaries know `name` as the place an address names:
     /// a locality name addresses state or a city is drawn as.
     fn names_a_locality(&self, name: Option<&Tokens>) -> bool {
-        name.and_then(|name| dictionary_key(&name.words.join(" ")))
+        let Some(name) = name else {
+            return false;
+        };
+        let name = name.words.join(" ");
+        if let Some(&known) = self.localities.borrow().get(&name) {
+            return known;
+        }
+        let known = dictionary_key(&name)
             .and_then(|key| self.tagger.dictionaries().get(Field::Locality, &key))
-            .is_some_and(|entry| entry.levels & level::LOCALITY != 0)
+            .is_some_and(|entry| entry.levels & level::LOCALITY != 0);
+        self.localities.borrow_mut().insert(name, known);
+        known
     }
 
     /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
@@ -2203,11 +2221,7 @@ impl<'a> Renderer<'a> {
             });
         }
         let countries = self.names(tuple.country_record_id())?;
-        let country_code = countries
-            .first()
-            .and_then(|name| search_key(name))
-            .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
-            .and_then(|entry| entry.country);
+        let country_code = self.country_code(tuple.country_record_id(), &countries);
         let country = pick_name(&countries, random).map(str::to_string);
         Ok(Areas {
             locality,
@@ -2236,6 +2250,27 @@ impl<'a> Renderer<'a> {
         }
         let group = groups[random.below(groups.len() as u64) as usize];
         self.admin_name(Some(RecordId::from(group)), Field::Region, random)
+    }
+
+    /// The country code the `name` of country record `id` reads as, its
+    /// names being `names`.
+    fn country_code(&mut self, id: Option<RecordId>, names: &[String]) -> Option<CountryCode> {
+        let read = || {
+            names
+                .first()
+                .and_then(|name| search_key(name))
+                .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
+                .and_then(|entry| entry.country)
+        };
+        let Some(id) = id else {
+            return read();
+        };
+        if let Some(&code) = self.country_codes.get(&id) {
+            return code;
+        }
+        let code = read();
+        self.country_codes.insert(id, code);
+        code
     }
 
     /// One name of an area, as [`pick_name`] picks it.
