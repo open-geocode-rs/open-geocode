@@ -852,10 +852,16 @@ impl Model {
         // A token's label is the label of every unit of it.
         let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
-        for (index, value) in gradient.edge {
-            let delta = adagrad(&mut self.squares.edge[index], value);
-            self.weights.edge[index] += delta;
-            self.totals.edge[index] += delta * self.step;
+        for (feature, (values, set)) in gradient.edge {
+            for (label, value) in values.into_iter().enumerate() {
+                if set & (1 << label) == 0 {
+                    continue;
+                }
+                let index = feature * LABELS + label;
+                let delta = adagrad(&mut self.squares.edge[index], value);
+                self.weights.edge[index] += delta;
+                self.totals.edge[index] += delta * self.step;
+            }
         }
         for (country, values) in gradient.transitions {
             for (index, value) in values.into_iter().enumerate() {
@@ -918,11 +924,12 @@ fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
     }
 }
 
-/// The gradient of one row's log-likelihood: per edge weight index, and per
-/// transition table (`None` the global one) by previous and next state.
+/// The gradient of one row's log-likelihood: per feature, its value for each
+/// label and a bit for each label it has one for; and per transition table
+/// (`None` the global one) by previous and next state.
 #[derive(Debug, Default)]
 struct Gradient {
-    edge: FxHashMap<usize, f32>,
+    edge: FxHashMap<usize, ([f32; LABELS], u8)>,
     transitions: HashMap<Option<CountryCode>, Vec<f32>>,
 }
 
@@ -1106,6 +1113,8 @@ impl<'a> Reading<'a> {
         }
         let mut transitions = vec![0.0f64; STATES * STATES];
         for (index, span) in lattice.spans.iter().enumerate() {
+            let mut values = [0.0f32; LABELS];
+            let mut set = 0u8;
             for label in Label::ALL {
                 let next = label as usize;
                 if !allowed(self.golds, index, label) {
@@ -1125,12 +1134,22 @@ impl<'a> Reading<'a> {
                 if value.abs() < MIN_GRADIENT {
                     continue;
                 }
-                for feature in span.features_in(country) {
-                    *gradient
-                        .edge
-                        .entry(feature as usize * LABELS + next)
-                        .or_default() += value as f32;
+                values[next] = value as f32;
+                set |= 1 << next;
+            }
+            if set == 0 {
+                continue;
+            }
+            // One entry per feature for all its labels: each label's sum
+            // still takes the spans in the same order.
+            for feature in span.features_in(country) {
+                let (sums, seen) = gradient.edge.entry(feature as usize).or_default();
+                for (label, value) in values.iter().enumerate() {
+                    if set & (1 << label) != 0 {
+                        sums[label] += value;
+                    }
                 }
+                *seen |= set;
             }
         }
         let len = lattice.len;
@@ -2756,8 +2775,10 @@ mod tests {
         let mut gradient = Gradient::default();
         reading.add_expectations(&lattice, None, 1.0, &mut gradient);
         let bias = super::super::features::by_name("bias:bias") as usize;
+        let (values, set) = gradient.edge[&bias];
         let total = (0..LABELS)
-            .filter_map(|label| gradient.edge.get(&(bias * LABELS + label)))
+            .filter(|label| set & (1 << label) != 0)
+            .map(|label| values[label])
             .sum::<f32>();
         assert!((total - 2.0).abs() < 1e-3, "{total}");
     }
