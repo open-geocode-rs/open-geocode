@@ -133,10 +133,6 @@ pub struct Report {
     pub sample_bytes: u64,
     pub shards: usize,
     pub epochs: usize,
-    /// Training rows the model got wrong in the last epoch. Only the last
-    /// epoch decodes each row before learning it: the count is all the
-    /// decode is for, and it costs a pass of Viterbi per row.
-    pub last_epoch_errors: usize,
     /// Countries with their own transition table.
     pub countries: Vec<String>,
     /// Whether the Pack carries the trained weights; without them it parses
@@ -484,8 +480,6 @@ pub fn train(
             .map(|(shard, cache)| -> Result<_> {
                 let mut order = Random::new(SEED ^ ((epoch as u64) << 32 | shard as u64));
                 let mut model = Model::from_weights(mixed.clone());
-                let mut errors = 0;
-                let count = epoch + 1 == EPOCHS;
                 let at = Instant::now();
                 for (seen, index) in shuffled_order(cache.len(), &mut order)
                     .into_iter()
@@ -495,23 +489,14 @@ pub fn train(
                         scratch.check_cancelled()?;
                     }
                     cache.visit(index as usize, |row| {
-                        if count {
-                            errors += usize::from(model.is_wrong(&row.lattice, &row.gold));
-                        }
                         model.learn(&row.lattice, &row.gold);
                     })?;
                 }
-                Ok((
-                    model.averaged(),
-                    model.weights,
-                    errors,
-                    at.elapsed().as_secs_f64(),
-                ))
+                Ok((model.averaged(), model.weights, at.elapsed().as_secs_f64()))
             })
             .collect::<Result<Vec<_>>>()?;
         // Per-shard seconds, spread over the shards that ran side by side.
-        report.learn_seconds += results.iter().map(|result| result.3).sum::<f64>() / shards as f64;
-        report.last_epoch_errors = results.iter().map(|result| result.2).sum();
+        report.learn_seconds += results.iter().map(|result| result.2).sum::<f64>() / shards as f64;
         mixed = Weights::mean(results.iter().map(|result| &result.1));
         averages.push(Weights::mean(results.iter().map(|result| &result.0)));
     }
@@ -860,16 +845,6 @@ impl Model {
             squares: Weights::zero(),
             step: 1.0,
         }
-    }
-
-    /// Whether the best labelling of a row, labelled `gold` by token, is
-    /// wrong under the current weights.
-    fn is_wrong(&self, lattice: &Lattice, gold: &[Label]) -> bool {
-        let predicted = decode::best(lattice, &self.weights, 1)
-            .into_iter()
-            .next()
-            .expect("a lattice with tokens has a path");
-        predicted.labels(lattice) != lattice.units.expand(gold)
     }
 
     /// Learn from one row, labelled `gold` by token.
