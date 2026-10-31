@@ -864,13 +864,22 @@ impl Model {
             }
         }
         for (country, values) in gradient.transitions {
+            let kept = |value: f32| f64::from(value).abs() >= MIN_GRADIENT;
+            // A country's tables are made by its first kept value, so a
+            // country with none must not make them.
+            if !values.iter().any(|value| kept(*value)) {
+                continue;
+            }
+            let squares = table(&mut self.squares, country);
+            let weights = table(&mut self.weights, country);
+            let totals = table(&mut self.totals, country);
             for (index, value) in values.into_iter().enumerate() {
-                if f64::from(value).abs() < MIN_GRADIENT {
+                if !kept(value) {
                     continue;
                 }
-                let delta = adagrad(&mut table(&mut self.squares, country)[index], value);
-                table(&mut self.weights, country)[index] += delta;
-                table(&mut self.totals, country)[index] += delta * self.step;
+                let delta = adagrad(&mut squares[index], value);
+                weights[index] += delta;
+                totals[index] += delta * self.step;
             }
         }
         self.step += 1.0;
