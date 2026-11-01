@@ -1020,6 +1020,7 @@ impl LatticeTagger {
                     evidence = true;
                 }
                 let mut area = false;
+                let mut street = false;
                 // The field of names the most records use the span in.
                 let mut dominant: Option<(Field, u64)> = None;
                 for field in Field::NAMES {
@@ -1028,6 +1029,7 @@ impl LatticeTagger {
                     }
                     if let Some((hit, name)) = self.lookup(field, &mut key) {
                         evidence = true;
+                        street |= field == Field::Street;
                         if let (Some(name), Some(label)) = (name, field_label(field)) {
                             corrections.push((start, end, label, name));
                         }
@@ -1053,6 +1055,20 @@ impl LatticeTagger {
                 }
                 if let Some((field, _)) = dominant {
                     set.dominant_field(field);
+                }
+                if !street && !suppression.hides(Field::Street, start, end) {
+                    let held = |field: Field| {
+                        [&key.key, &key.expanded]
+                            .into_iter()
+                            .any(|key| self.dictionaries.contains(field, key))
+                    };
+                    if held(Field::StreetBare) {
+                        evidence = true;
+                        set.street_alias(false);
+                    } else if held(Field::StreetTail) {
+                        evidence = true;
+                        set.street_alias(true);
+                    }
                 }
                 if area {
                     let ids = [&key.key, &key.expanded]

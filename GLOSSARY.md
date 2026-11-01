@@ -39,6 +39,10 @@ _Avoid_: parse, interpretation, labelling
 The words of a reading that say what the sought record is: its street, or its name.
 _Avoid_: required words
 
+**Street alias**:
+A street's name without its type words ("pintor ribera" of "calle pintor ribera"), or its last name words ("łokietka" of "władysława łokietka"), as queries write it; the parser takes a span its street dictionary holds only this way as evidence of a street.
+_Avoid_: bare street, short name
+
 **Unplaced word**:
 A query word the parser could not label; it ranks the answers, and only a query with no subject needs most of its unplaced words matched.
 _Avoid_: other, unknown token, catch-all

@@ -178,10 +178,17 @@ pub enum Field {
     /// Kinds of place a query asks for ("bäckerei", "hotels"), from
     /// libpostal.
     Category,
+    /// Street names without their type words ("pintor ribera" of "calle
+    /// pintor ribera"): a query often drops the type.
+    StreetBare,
+    /// The last name words of a street of several ("łokietka" of
+    /// "władysława łokietka"), without its type: a query often drops a
+    /// given name.
+    StreetTail,
 }
 
 impl Field {
-    pub const ALL: [Field; 14] = [
+    pub const ALL: [Field; 16] = [
         Field::Locality,
         Field::Region,
         Field::Street,
@@ -196,6 +203,8 @@ impl Field {
         Field::Directional,
         Field::Near,
         Field::Category,
+        Field::StreetBare,
+        Field::StreetTail,
     ];
     /// The fields of names that a whole span of a query can be.
     pub const NAMES: [Field; 5] = [
@@ -237,6 +246,8 @@ impl Field {
             Field::Directional => "parse/directional",
             Field::Near => "parse/near",
             Field::Category => "parse/category",
+            Field::StreetBare => "parse/street_bare",
+            Field::StreetTail => "parse/street_tail",
         }
     }
 
@@ -621,6 +632,10 @@ fn empty_map() -> Map<Bytes> {
     let bytes = build_fst(&BTreeMap::new()).expect("empty FST");
     Map::new(Bytes::new(bytes)).expect("valid empty FST")
 }
+
+/// The fewest characters a street's last name words are keyed by alone:
+/// fewer name too many streets.
+const MIN_TAIL_CHARS: usize = 4;
 
 fn build_fst(entries: &BTreeMap<String, Entry>) -> Result<Vec<u8>> {
     let mut builder = MapBuilder::memory();
@@ -1125,6 +1140,12 @@ impl Builder {
             fields[field.index()].insert(name.clone(), stats.entry());
         }
         fields[Field::StreetType.index()] = street_types(&fields[Field::Street.index()]);
+        let (bare, tail) = street_aliases(
+            &fields[Field::Street.index()],
+            &fields[Field::StreetType.index()],
+        );
+        fields[Field::StreetBare.index()] = bare;
+        fields[Field::StreetTail.index()] = tail;
         let mut units = vocabulary(UNIT_WORDS);
         units.extend(vocabulary(LIBPOSTAL_UNIT_TYPES));
         units.extend(vocabulary(LIBPOSTAL_STAIRCASES));
@@ -1431,6 +1452,46 @@ pub(super) fn admin_aliases(key: &str) -> Vec<String> {
 }
 
 /// The words that start or end many street names, with the vendored types.
+/// The streets of `streets` keyed without their words `types` holds
+/// ([`Field::StreetBare`]), and a street of several name words by its last
+/// ones ([`Field::StreetTail`]): a query often drops a street's type, or a
+/// given name before its last.
+fn street_aliases(
+    streets: &BTreeMap<String, Entry>,
+    types: &BTreeMap<String, Entry>,
+) -> (BTreeMap<String, Entry>, BTreeMap<String, Entry>) {
+    let merge = |map: &mut BTreeMap<String, Entry>, key: String, entry: Entry| {
+        map.entry(key)
+            .and_modify(|held| {
+                if entry.count > held.count {
+                    held.country = entry.country;
+                }
+                held.count = held.count.saturating_add(entry.count);
+                held.levels |= entry.levels;
+            })
+            .or_insert(entry);
+    };
+    let mut bare = BTreeMap::new();
+    let mut tail = BTreeMap::new();
+    for (key, entry) in streets {
+        let words = key
+            .split_whitespace()
+            .filter(|word| !types.contains_key(*word))
+            .collect::<Vec<_>>();
+        let named = words.join(" ");
+        if !named.is_empty() && named != *key {
+            merge(&mut bare, named, *entry);
+        }
+        for start in 1..words.len() {
+            let last = words[start..].join(" ");
+            if last.chars().count() >= MIN_TAIL_CHARS {
+                merge(&mut tail, last, *entry);
+            }
+        }
+    }
+    (bare, tail)
+}
+
 fn street_types(streets: &BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
     let mut ends = HashMap::<&str, u64>::new();
     for name in streets.keys() {
@@ -1662,6 +1723,42 @@ mod tests {
         assert_eq!(
             dictionaries.country_weight(CountryCode::parse("CA").unwrap()),
             0.0
+        );
+    }
+
+    #[test]
+    fn a_street_is_keyed_without_its_type_and_by_its_last_words() {
+        let entry = |count| Entry {
+            count,
+            country: None,
+            levels: 0,
+        };
+        let streets = BTreeMap::from([
+            ("calle pintor ribera".to_string(), entry(3)),
+            ("pintor ribera".to_string(), entry(2)),
+            ("king street".to_string(), entry(5)),
+            ("main".to_string(), entry(1)),
+            ("rue de la paix".to_string(), entry(4)),
+        ]);
+        let types = BTreeMap::from([
+            ("calle".to_string(), entry(0)),
+            ("street".to_string(), entry(0)),
+            ("rue".to_string(), entry(0)),
+        ]);
+        let (bare, tail) = street_aliases(&streets, &types);
+        assert_eq!(
+            bare.iter()
+                .map(|(key, entry)| (key.as_str(), entry.count))
+                .collect::<Vec<_>>(),
+            [("de la paix", 4), ("king", 5), ("pintor ribera", 3)],
+            "a street without a type word has no alias; one alias of two streets adds up"
+        );
+        assert_eq!(
+            tail.iter()
+                .map(|(key, entry)| (key.as_str(), entry.count))
+                .collect::<Vec<_>>(),
+            [("la paix", 4), ("paix", 4), ("ribera", 5)],
+            "last words of four letters or more; \"de\" alone is too short"
         );
     }
 

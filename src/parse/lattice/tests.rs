@@ -763,6 +763,37 @@ fn every_token_of_the_normalized_query_gets_one_label_in_order() {
 }
 
 #[test]
+fn a_span_known_only_as_a_street_alias_is_evidence_of_a_street() {
+    let dictionaries = Dictionaries::from_entries([
+        (Field::StreetBare, "pintor ribera", entry(3, "ES")),
+        (Field::StreetTail, "lokietka", entry(2, "PL")),
+        (Field::Street, "lokietka street", entry(1, "PL")),
+    ]);
+    let tagger = LatticeTagger::new(dictionaries, Weights::zero());
+    let lattice = tagger.lattice(
+        &Tokens::new("pintor ribera 5 lokietka"),
+        &Suppression::default(),
+    );
+    let features = |start, end| {
+        &lattice
+            .spans
+            .iter()
+            .find(|span| (span.start, span.end) == (start, end))
+            .expect("span")
+            .features
+    };
+    let [bare, tail] = ["bare", "tail"].map(|name| by_name(&format!("street_alias:{name}")));
+    assert!(features(0, 2).contains(&bare));
+    assert!(!features(0, 2).contains(&tail));
+    assert!(features(3, 4).contains(&tail));
+    assert!(!features(3, 4).contains(&bare));
+    assert!(
+        !features(0, 1).contains(&bare),
+        "a word of the alias is no alias"
+    );
+}
+
+#[test]
 fn vocabulary_phrases_are_spans_and_tell_their_neighbours() {
     let dictionaries = Dictionaries::from_entries(
         dictionary::vocabulary("post office box|po box|p o box\n私 書 箱|shishobako")
