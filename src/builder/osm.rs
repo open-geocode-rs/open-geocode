@@ -1520,9 +1520,9 @@ impl<'a> Run<'a> {
                     Some(Book::create(&self.scratch, "address-book")?),
                 );
                 // Slash numbers are read before the addresses are placed.
-                slash::read_slash_numbers(
-                    addresses.finish()?,
-                    &mut self.build.report.slash_numbers,
+                let slash_numbers = &mut self.build.report.slash_numbers;
+                overlapped(
+                    |emit| slash::read_slash_numbers(addresses.finish()?, slash_numbers, emit),
                     |address| runs.push(address, None),
                 )?;
                 let (postcodes, lent, book) = runs.finish()?;
@@ -2359,21 +2359,24 @@ fn join_streets(
     let mut runs = Vec::<Vec<StreetRecord>>::new();
     let mut ways = 0;
     let mut name = None::<Vec<u8>>;
-    for pending in streets.finish()? {
-        let pending = pending?;
-        if name.as_deref() != Some(pending.name_key()) {
-            if ways >= WRITE_BATCH_RECORDS {
-                flush(&mut runs)?;
-                ways = 0;
+    overlapped(
+        |emit| streets.finish()?.try_for_each(|pending| emit(pending?)),
+        |pending: PendingStreet| {
+            if name.as_deref() != Some(pending.name_key()) {
+                if ways >= WRITE_BATCH_RECORDS {
+                    flush(&mut runs)?;
+                    ways = 0;
+                }
+                name = Some(pending.name_key().to_vec());
+                runs.push(Vec::new());
             }
-            name = Some(pending.name_key().to_vec());
-            runs.push(Vec::new());
-        }
-        ways += 1;
-        runs.last_mut()
-            .expect("a run was started")
-            .push(pending.into_street());
-    }
+            ways += 1;
+            runs.last_mut()
+                .expect("a run was started")
+                .push(pending.into_street());
+            Ok(())
+        },
+    )?;
     flush(&mut runs)?;
     Ok(count)
 }
@@ -2410,9 +2413,10 @@ fn write_address_book(
     slash_numbers: &mut SlashNumberCounts,
 ) -> Result<BookFile<PendingAddress>> {
     let mut book = Book::create(scratch, "address-book")?;
-    slash::read_slash_numbers(addresses.finish()?, slash_numbers, |address| {
-        book.push(address).map(drop)
-    })?;
+    overlapped(
+        |emit| slash::read_slash_numbers(addresses.finish()?, slash_numbers, emit),
+        |address| book.push(address).map(drop),
+    )?;
     book.finish()
 }
 
@@ -2732,6 +2736,44 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
             _ => None,
         })
         .collect()
+}
+
+/// Run `read` on a thread of its own and hand what it emits to `take` on
+/// this one, in order, a batch at a time: a sorter's merge is read and
+/// decoded on one thread, and would otherwise wait while what it read is
+/// placed or joined, and that wait while the merge is read.
+fn overlapped<T: Send>(
+    read: impl FnOnce(&mut dyn FnMut(T) -> Result<()>) -> Result<()> + Send,
+    mut take: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    let stopped = || Error::Inconsistent("a merge reader lost the thread taking its items".into());
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<T>>(1);
+        let reader = scope.spawn(move || -> Result<()> {
+            let mut batch = Vec::with_capacity(WRITE_BATCH_RECORDS);
+            read(&mut |item| {
+                batch.push(item);
+                if batch.len() == WRITE_BATCH_RECORDS {
+                    sender
+                        .send(std::mem::take(&mut batch))
+                        .map_err(|_| stopped())?;
+                }
+                Ok(())
+            })?;
+            if !batch.is_empty() {
+                sender.send(batch).map_err(|_| stopped())?;
+            }
+            Ok(())
+        });
+        // Dropping the receiver on an error here stops the reader at its
+        // next batch.
+        for batch in receiver {
+            batch.into_iter().try_for_each(&mut take)?;
+        }
+        reader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// Write sorted records in batches, computing admin context in parallel, and
