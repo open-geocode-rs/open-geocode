@@ -372,15 +372,26 @@ pub struct Writer {
     strings: StringTable,
     body: Vec<u8>,
     /// The address run the next address may continue, within the open block.
-    run: Option<AddressRun>,
+    run: AddressRun,
     /// The imported datasets addresses come from, in order of first use.
     datasets: Vec<String>,
 }
 
 /// The last address written in the open block, and the anchor of its run.
-#[derive(Debug)]
+/// One is kept for the whole store and refilled as each run starts, so its
+/// strings reuse their buffers instead of being cloned anew.
+#[derive(Debug, Default)]
 struct AddressRun {
-    shared: AddressComponents,
+    /// Whether an address of the open block started it: off before the
+    /// block's first address and after a record of another layer.
+    open: bool,
+    street: Option<String>,
+    place: Option<String>,
+    locality: Option<String>,
+    region: Option<String>,
+    postcode: Option<String>,
+    country: Option<String>,
+    areas: Vec<String>,
     street_postcodes: Vec<String>,
     /// The imported dataset of the run, `None` for OSM addresses.
     dataset: Option<String>,
@@ -393,18 +404,44 @@ struct AddressRun {
 
 impl AddressRun {
     fn continues(&self, record: &AddressRecord, context: Option<ContextRef>) -> bool {
-        let shared = &self.shared;
         let address = &record.address;
-        self.dataset.as_deref() == imported_dataset(record)
+        self.open
+            && self.dataset.as_deref() == imported_dataset(record)
             && self.context == context
-            && shared.street == address.street
-            && shared.place == address.place
-            && shared.locality == address.locality
-            && shared.region == address.region
-            && shared.postcode == address.postcode
-            && shared.country == address.country
-            && shared.areas == address.areas
+            && self.street == address.street
+            && self.place == address.place
+            && self.locality == address.locality
+            && self.region == address.region
+            && self.postcode == address.postcode
+            && self.country == address.country
+            && self.areas == address.areas
             && self.street_postcodes == record.street_postcodes
+    }
+
+    /// Start a run at `record`.
+    fn start(&mut self, record: &AddressRecord, context: Option<ContextRef>, point: (i32, i32)) {
+        let address = &record.address;
+        self.open = true;
+        self.street.clone_from(&address.street);
+        self.place.clone_from(&address.place);
+        self.locality.clone_from(&address.locality);
+        self.region.clone_from(&address.region);
+        self.postcode.clone_from(&address.postcode);
+        self.country.clone_from(&address.country);
+        self.areas.clone_from(&address.areas);
+        self.street_postcodes.clone_from(&record.street_postcodes);
+        match imported_dataset(record) {
+            Some(dataset) => {
+                let held = self.dataset.get_or_insert_default();
+                held.clear();
+                held.push_str(dataset);
+            }
+            None => self.dataset = None,
+        }
+        self.context = context;
+        self.point = point;
+        self.object_id = record.source.object_id;
+        self.number = plain_number(&address.number).unwrap_or(0);
     }
 }
 
@@ -512,7 +549,7 @@ impl Writer {
                 ends: create("records-string-ends.bin")?,
             },
             body: Vec::new(),
-            run: None,
+            run: AddressRun::default(),
             datasets: Vec::new(),
         })
     }
@@ -598,7 +635,7 @@ impl Writer {
                 ends: reopen(&state.string_ends)?,
             },
             body: Vec::new(),
-            run: None,
+            run: AddressRun::default(),
             datasets: state.datasets.clone(),
         })
     }
@@ -629,7 +666,7 @@ impl Writer {
             }
             self.flush_block()?;
             self.block_base = point;
-            self.run = None;
+            self.run.open = false;
         }
 
         let mut body = std::mem::take(&mut self.body);
@@ -641,12 +678,7 @@ impl Writer {
             self.disputed |= slot;
         }
         match record {
-            Record::Address(address)
-                if self
-                    .run
-                    .as_ref()
-                    .is_some_and(|run| run.continues(address, context)) =>
-            {
+            Record::Address(address) if self.run.continues(address, context) => {
                 self.encode_continuation(&mut body, address, point)?;
                 self.continued |= slot;
                 if address.location_precision == LocationPrecision::Centroid {
@@ -665,18 +697,10 @@ impl Writer {
                         .map_err(|_| Error::Inconsistent("record block exceeds 4 GiB".into()))?,
                 );
                 self.encode_body(&mut body, record, point, context)?;
-                self.run = match record {
-                    Record::Address(address) => Some(AddressRun {
-                        shared: address.address.clone(),
-                        street_postcodes: address.street_postcodes.clone(),
-                        dataset: imported_dataset(address).map(str::to_string),
-                        context,
-                        point,
-                        object_id: address.source.object_id,
-                        number: plain_number(&address.address.number).unwrap_or(0),
-                    }),
-                    _ => None,
-                };
+                match record {
+                    Record::Address(address) => self.run.start(address, context, point),
+                    _ => self.run.open = false,
+                }
             }
         }
         self.block.extend_from_slice(&body);
@@ -831,7 +855,7 @@ impl Writer {
         record: &AddressRecord,
         point: (i32, i32),
     ) -> Result<()> {
-        let run = self.run.as_mut().expect("a continuation has a run");
+        let run = &mut self.run;
         put_i64(out, i64::from(point.0) - i64::from(run.point.0));
         put_i64(out, i64::from(point.1) - i64::from(run.point.1));
         put_i64(out, record.source.object_id.wrapping_sub(run.object_id));
