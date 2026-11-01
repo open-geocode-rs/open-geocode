@@ -23,9 +23,11 @@ pub mod record;
 pub mod records;
 pub mod resources;
 pub mod reverse;
+mod road;
 pub mod runtime;
 pub mod search;
 pub mod spatial_index;
+pub mod structured;
 pub mod text_index;
 mod util;
 

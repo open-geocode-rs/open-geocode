@@ -525,6 +525,24 @@ impl Dictionaries {
         listed(&self.regions, &self.region_ids, key)
     }
 
+    /// Every area name key and region key with the areas it names, in key
+    /// order, areas first.
+    pub fn area_lists(&self) -> Vec<(String, Vec<u32>)> {
+        let mut lists = Vec::new();
+        for (map, ids) in [
+            (&self.areas, &self.area_ids),
+            (&self.regions, &self.region_ids),
+        ] {
+            let mut stream = map.keys();
+            while let Some(key) = stream.next() {
+                let key = String::from_utf8_lossy(key).into_owned();
+                let areas = listed(map, ids, &key);
+                lists.push((key, areas));
+            }
+        }
+        lists
+    }
+
     /// Whether `key` is a way of writing a direction ("n", "nord").
     pub fn is_direction(&self, key: &str) -> bool {
         self.contains(Field::Directional, key)

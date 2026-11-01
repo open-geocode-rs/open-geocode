@@ -523,9 +523,11 @@ impl Writer {
         })
     }
 
-    /// Seal and publish.
+    /// Seal, add the structured index, and publish.
     pub fn finish(self) -> Result<Manifest> {
-        self.seal()?.0.publish()
+        let (mut sealed, _) = self.seal()?;
+        crate::structured::add_to(&mut sealed)?;
+        sealed.publish()
     }
 }
 
@@ -795,6 +797,17 @@ impl SealedPack {
     pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
         let mut pack = container::Writer::append(self.path())?;
         pack.add(name, version, bytes)?;
+        self.bytes = pack.finish()?;
+        Ok(())
+    }
+
+    /// Add sections made from the sealed Pack, each copied from a file, such
+    /// as its structured index (see [`crate::structured::add_to`]).
+    pub fn add_section_files(&mut self, sections: &[(&str, u32, PathBuf)]) -> Result<()> {
+        let mut pack = container::Writer::append(self.path())?;
+        for (name, version, path) in sections {
+            pack.add_file(name, *version, path)?;
+        }
         self.bytes = pack.finish()?;
         Ok(())
     }

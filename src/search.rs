@@ -10,10 +10,11 @@ use std::{
 };
 
 use crate::error::{Error, Result};
+use crate::structured::{self, Place, StructuredIndex};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
 use serde::Serialize;
 use tantivy::{
-    DocAddress, DocId, IndexReader, Score, Searcher, SegmentReader, Term,
+    DocAddress, DocId, DocSet, IndexReader, Score, Searcher, SegmentReader, Term,
     collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
     columnar::{Column, StrColumn},
     index::SegmentId,
@@ -33,7 +34,7 @@ use crate::{
         lattice::{
             self, CountryCode, Explanation, LabelSet, LatticeTagger, Tokens, automaton_builder,
             dictionary::{Field as NameField, designates_unit},
-            dictionary_key,
+            dictionary_key, glued_stem,
         },
         types::{Label, Tagged},
     },
@@ -43,14 +44,15 @@ use crate::{
         PlaceLayer, PoiRecord, Prominence, Record, place_rank,
     },
     records::{dequantize, quantize},
+    road,
     spatial_index::{self, haversine_m},
     text_index::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
-        INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD, MIN_LAT_FIELD, MIN_LON_FIELD,
-        NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M, RANK_POSTCODE_FIELD,
-        RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS, address_number_terms, base_house_number,
-        compact_postcode, expand_address_abbreviations, expand_final_direction, flat_number_term,
-        is_numeric_token, open_text_index, street_search_text,
+        INTERPOLATION_END_FIELD, INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD,
+        MIN_LAT_FIELD, MIN_LON_FIELD, NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M,
+        RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS, address_number_terms,
+        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
+        flat_number_term, is_numeric_token, open_text_index, street_search_text,
     },
     util::fold::{exact_key, replaced_characters, search_key},
 };
@@ -73,6 +75,12 @@ pub struct TextSearcher {
     ranker: Option<Ranker>,
     /// How long one query searches before it answers with what it found.
     budget: Duration,
+    /// The structured index that answers a house number on a known street without a
+    /// text search.
+    structured: Option<Arc<StructuredIndex>>,
+    /// Each segment with the first and one past the last of its documents'
+    /// ids across the index, as the structured index numbers them.
+    segments: Arc<Vec<(SegmentId, DocId, DocId)>>,
 }
 
 impl fmt::Debug for TextSearcher {
@@ -89,6 +97,7 @@ struct SegmentColumns {
     record_count: Column<u64>,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
+    interpolation_end: Column<u64>,
     rank_postcode: Option<StrColumn>,
     area_postcode: Option<StrColumn>,
     country_code: Option<StrColumn>,
@@ -332,6 +341,12 @@ const NEIGHBOUR_DOCUMENTS: usize = 256;
 /// while a point placed between addresses on two different streets of one
 /// name lies far from both.
 const NEIGHBOUR_STREET_RADIUS_M: f64 = 100.0;
+/// How far a neighbour, and the point placed between two, may lie from the
+/// line of its road. A divided road's line runs down its median, so the
+/// lots along either carriageway sit further from it than a plain street's
+/// (100 to 200 m on the widest); the pair is still held to
+/// one road by name and nearness (see [`road::same_road_near`]).
+const ROAD_SETBACK_M: f64 = 200.0;
 /// A POI this near an address stands at it: a building's entrances, its
 /// shops and its parcel lie within a lot's depth of its address point, the
 /// depth [`NEIGHBOUR_STREET_RADIUS_M`] allows an address from its street.
@@ -358,8 +373,16 @@ impl TextSearcher {
         let reader = index.reader()?;
         let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         let tagger = Arc::new(LatticeTagger::from_container(pack.container())?);
+        // Every query looks names up all over the parser's dictionaries.
+        pack.container().prefault_sections(
+            "parse/",
+            crate::resources::Resources::probe().available_memory_bytes,
+        );
         let mut columns = HashMap::new();
+        let mut segments = Vec::new();
         for segment in reader.searcher().segment_readers() {
+            let base = segments.last().map_or(0, |(_, _, end)| *end);
+            segments.push((segment.segment_id(), base, base + segment.max_doc()));
             let fast_fields = segment.fast_fields();
             columns.insert(
                 segment.segment_id(),
@@ -368,6 +391,7 @@ impl TextSearcher {
                     record_count: fast_fields.u64(RECORD_COUNT_FIELD)?,
                     house_number: fast_fields.u64(HOUSE_NUMBER_FIELD)?,
                     interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
+                    interpolation_end: fast_fields.u64(INTERPOLATION_END_FIELD)?,
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
                     area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
                     country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
@@ -382,6 +406,7 @@ impl TextSearcher {
         }
         let confidence = confidence::Model::load(&pack)?;
         let ranker = Ranker::load(&pack)?;
+        let structured = StructuredIndex::open(pack.container())?.map(Arc::new);
         Ok(Self {
             spatial,
             pack,
@@ -392,7 +417,17 @@ impl TextSearcher {
             confidence,
             ranker,
             budget: SEARCH_BUDGET,
+            structured,
+            segments: Arc::new(segments),
         })
+    }
+
+    /// The same searcher without its structured index: every query runs the text
+    /// search, to compare the two.
+    #[cfg(test)]
+    fn without_structured(mut self) -> Self {
+        self.structured = None;
+        self
     }
 
     /// Search each query for at most `budget` before answering with what
@@ -449,25 +484,32 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        let query_text = options.query.trim();
-        if query_text.is_empty() {
+        let written = options.query.trim();
+        if written.is_empty() {
             return Err(Error::EmptyQuery);
         }
+        let cleaned = clean_query(written);
+        let query_text = cleaned.as_str();
 
-        // One hit past the limit, so the last one asked for has a margin.
+        // One hit past the limit, so the last one asked for has a margin;
+        // [`CHOOSER_HITS`] at least, so the answer is chosen among them.
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
         let (_, mut hits) = self.search_variants(
             query_text,
             &[],
             &filters,
             options.focus,
-            limit + 1,
+            (limit + 1).max(CHOOSER_HITS),
             Parses::All,
             None,
+            Some(limit),
             |_, _, _, _| Ok(true),
         )?;
         if hits.is_empty() && filters.layer.is_none() {
             hits = self.fallback(query_text, &[], &filters, options.focus, limit + 1)?;
+        }
+        if let Some(named) = NAMED.with(RefCell::take) {
+            named.choose(&mut hits);
         }
         self.rate(&mut hits);
         hits.truncate(limit);
@@ -496,6 +538,7 @@ impl TextSearcher {
             limit + 1,
             Parses::All,
             Some(&mut pooled),
+            None,
             |_, _, _, _| Ok(true),
         )?;
         hits.truncate(limit);
@@ -563,6 +606,7 @@ impl TextSearcher {
             // what the query never asked for: another house, or a POI on the
             // street. Search lists such hits; a geocoded row would give one.
             Parses::Numbered,
+            None,
             None,
             |session, plan, postcode, hit| {
                 // A geocoded row names its postcode as a field, so a hit
@@ -1696,16 +1740,19 @@ impl TextSearcher {
         limit: usize,
         parses: Parses,
         pooled: Option<&mut Vec<TextSearchHit>>,
+        structured_limit: Option<usize>,
         mut accept: impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let session = Session::new(self.budget);
-        let (plans, scores, explanation) = self.readings(query_text, context, parses)?;
+        let (plans, scores, pieces, explanation, text_count) =
+            self.readings(query_text, context, parses)?;
         let Some(first_plan) = plans.first() else {
             return Err(Error::UnparsableQuery {
                 query: query_text.to_string(),
             });
         };
         let first_query = first_plan.text();
+        NAMED.with(|named| named.replace(Some(choose::Named::of(first_plan))));
         // Where the best reading says the record is holds in every reading:
         // a later one that reads "Christchurch" of "Ponsonby Road
         // Christchurch" as a region, which only ranks, must not answer with
@@ -1731,12 +1778,17 @@ impl TextSearcher {
         let mut readings = plans
             .into_iter()
             .zip(scores)
-            .map(|(plan, score)| Reading {
+            .zip(pieces)
+            .map(|((plan, score), pieces)| Reading {
                 text: plan.text(),
                 plan,
                 score,
+                pieces,
             })
             .collect::<Vec<_>>();
+        // Readings past the parser's usual best only widen the structured stage:
+        // the text search reads as many as it always has.
+        let extra = readings.split_off(text_count.min(readings.len()));
         let parsed = readings.len();
         for index in 0..parsed {
             if let Some(plan) = self.trimmed(&readings[index].plan)
@@ -1746,8 +1798,44 @@ impl TextSearcher {
                     text: plan.text(),
                     plan,
                     score: readings[index].score,
+                    pieces: readings[index].pieces.clone(),
                 });
             }
+        }
+        let mut first = None;
+        if let Some(wanted) = structured_limit
+            && let Some(structured) = &self.structured
+        {
+            let structured_readings = readings[..parsed]
+                .iter()
+                .cloned()
+                .chain(extra)
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            let cx = StructuredContext {
+                structured,
+                readings: &structured_readings,
+                parsed: structured_readings.len(),
+                search: &search,
+                session: &session,
+                explanation: explanation.as_ref(),
+                probabilities: explanation
+                    .as_ref()
+                    .map(|explanation| self.tagger.place_probabilities(explanation))
+                    .unwrap_or_default(),
+            };
+            let answer = self.structured_stage(&cx, &mut accept)?;
+            let spent = start.elapsed();
+            match answer {
+                Some(answer) if answer.1.len() >= wanted => return Ok(answer),
+                // Fewer answers than asked for: they come first, and the text
+                // search gives the rest.
+                Some(answer) => first = Some(answer),
+                None => {}
+            }
+            // The text search keeps its whole budget: the structured stage's time
+            // is its own.
+            session.extend(spent);
         }
         let spellings = self.spellings(readings.iter().map(|reading| &reading.plan))?;
         for reading in &mut readings {
@@ -1776,6 +1864,12 @@ impl TextSearcher {
             self.explain(explanation, &session, &mut pool)?;
         }
         pool.weigh(&readings);
+        if let Some(structured) = &self.structured
+            && let Some(reading) = readings.first()
+        {
+            let named = self.named_places(structured, reading);
+            Self::pool_named(structured, &named, &mut pool);
+        }
         if let Some(pooled) = pooled {
             pooled.clear();
             for candidate in &pool.candidates {
@@ -1787,11 +1881,1884 @@ impl TextSearcher {
                 }
             }
         }
-        Ok(match &self.ranker {
+        let (query, hits) = match &self.ranker {
             Some(ranker) => pool.ranked(ranker, &readings, limit),
             None => pool.chosen(&readings, limit),
         }
-        .unwrap_or((first_query, Vec::new())))
+        .unwrap_or((first_query, Vec::new()));
+        Ok(match first {
+            Some((query, mut first)) => {
+                for hit in hits {
+                    if !first.iter().any(|held| held.record_id == hit.record_id) {
+                        first.push(hit);
+                    }
+                }
+                first.truncate(limit);
+                (query, first)
+            }
+            None => (query, hits),
+        })
+    }
+
+    /// Answer an address or a street from the structured index `structured`, before any
+    /// text search (see [`crate::structured`]).
+    ///
+    /// Every reading that names a street and a number, best first, finds
+    /// the documents of its street holding the number inside the most places
+    /// it names, a spot each, the best of each spot hydrated; a number the
+    /// street lacks there is placed between its neighbours, else the street
+    /// answers. A query no reading numbers is answered by its street. The
+    /// parser scores each candidate against the whole query by joint
+    /// decoding, as [`Self::explain`] scores the text search's hits, plus
+    /// [`STRUCTURED_W`] for each place word holding it. The best answers when two
+    /// fitted models say it is likelier within 100 m than the text search's
+    /// answer by [`STRUCTURED_DELTA`]; else `None`, and the text search runs as it
+    /// always has.
+    fn structured_stage(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
+    ) -> Result<Option<(String, Vec<TextSearchHit>)>> {
+        let streets = cx.readings[..cx.parsed]
+            .iter()
+            .enumerate()
+            .filter(|(_, reading)| !reading.plan.subject.is_empty())
+            .collect::<Vec<_>>();
+        let numbered = streets
+            .iter()
+            .filter(|(_, reading)| reading.plan.house_number.is_some())
+            .copied()
+            .collect::<Vec<_>>();
+        let Some(explanation) = cx.explanation else {
+            return Ok(None);
+        };
+        let (readings, numbers) = match numbered.is_empty() {
+            true => (streets, false),
+            false => (numbered, true),
+        };
+        let (mut found, candidates) = match readings.is_empty() {
+            true => (Vec::new(), 0),
+            false => self.structured_found(cx, &readings, numbers, accept)?,
+        };
+        let named = cx
+            .readings
+            .first()
+            .map(|reading| self.named_places(cx.structured, reading))
+            .unwrap_or_default();
+        Self::structured_named(cx.structured, &named, &mut found);
+        if found.is_empty() {
+            let all = cx.readings[..cx.parsed]
+                .iter()
+                .enumerate()
+                .collect::<Vec<_>>();
+            found = self.structured_areas(cx, &all)?;
+            Self::structured_named(cx.structured, &named, &mut found);
+        }
+        let Some(explained) = self.structured_explained(cx, explanation, found)? else {
+            return Ok(None);
+        };
+        let best = &explained.scored[0];
+        let margin = best.score - explained.second;
+        #[cfg(test)]
+        LAST_STRUCTURED.with(|last| {
+            last.set(StructuredTrace {
+                answered: false,
+                support: best.found.support,
+                gap: best.gap,
+            });
+        });
+        let features = structured_features(
+            best.found.form,
+            best.found.lever,
+            best.gap,
+            margin,
+            best.found.support,
+            best.found.reading,
+            explained.spots,
+            candidates,
+        );
+        if best.found.form == FORM_STREET && best.found.support == 0 {
+            return Ok(None);
+        }
+        // Two spots of one street explained alike: either may be the town.
+        if best.found.form == FORM_STREET && margin <= 0.0 {
+            return Ok(None);
+        }
+        // A street answer is judged row by row by the hand-off models; the
+        // coarser types stay with the text search.
+        if best.found.form < STRUCTURED_MIN_FORM && best.found.form != FORM_STREET {
+            return Ok(None);
+        }
+        if logistic(&P_STRUCTURED, &features) - logistic(&P_TEXT, &features) < STRUCTURED_DELTA {
+            return Ok(None);
+        }
+        let reading = &cx.readings[best.found.reading];
+        // A lone name may be a street, a place or a business: the text
+        // search ranks one against the other.
+        let lone_name = reading.plan.context.is_empty()
+            && !reading
+                .plan
+                .subject
+                .iter()
+                .any(|word| self.describes_street(&word.text));
+        if best.found.form == FORM_STREET && lone_name {
+            return Ok(None);
+        }
+        let hits = explained
+            .scored
+            .into_iter()
+            .map(|scored| scored.found.hit)
+            .take(cx.search.limit)
+            .collect();
+        let (hits, towns_known) = self.structured_judged(&reading.plan, hits, cx)?;
+        if !self.verified(&hits[0], towns_known, cx) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        LAST_STRUCTURED.with(|last| {
+            last.set(StructuredTrace {
+                answered: true,
+                ..last.get()
+            });
+        });
+        Ok(Some((reading.text.clone(), hits)))
+    }
+
+    /// The structured stage's answers to `plan`, in its order, each with the
+    /// [`Features`] the text search would give it (see [`Self::judged`]),
+    /// and whether the Pack knows every town `plan` states.
+    fn structured_judged(
+        &self,
+        plan: &QueryPlan,
+        hits: Vec<TextSearchHit>,
+        cx: &StructuredContext<'_, '_>,
+    ) -> Result<(Vec<TextSearchHit>, bool)> {
+        let postcode = self.query_postcode(plan)?;
+        let stated = (!postcode.forms.is_empty()).then(|| postcode.exact.clone());
+        let (_, localities) = self.localities_stated(plan, stated.as_deref())?;
+        let towns_known = localities.iter().all(Option::is_some);
+        let ranking = self.plan_ranking(plan, cx.search.query_words, cx.search.focus, postcode);
+        let order = hits.iter().map(|hit| hit.record_id).collect::<Vec<_>>();
+        let (kept, contradicted) = self.judged(
+            plan,
+            Scope::Scoped,
+            &ranking,
+            &localities,
+            hits,
+            cx.session,
+            usize::MAX,
+        )?;
+        let mut hits = kept.into_iter().chain(contradicted).collect::<Vec<_>>();
+        hits.sort_by_key(|hit| order.iter().position(|id| *id == hit.record_id));
+        Ok((hits, towns_known))
+    }
+
+    /// The finest area each of `readings` names, when the structured stage finds
+    /// no street: its postcode, else its town, district or neighbourhood,
+    /// else its region, each an area the Pack holds that nests with every
+    /// other place the reading names (see [`Dictionaries::nest`]), as the
+    /// text search's [`Self::fallback`] requires. Its point is the Pack's
+    /// own point of the area; its layer says what it is.
+    fn structured_areas(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        readings: &[(usize, &Reading)],
+    ) -> Result<Vec<StructuredFound>> {
+        let dictionaries = self.tagger.dictionaries();
+        let mut found = Vec::new();
+        for &(index, reading) in readings {
+            let mut parts = Vec::<(Label, Vec<RecordId>)>::new();
+            for part in &reading.plan.context {
+                let Some(key) = lattice::dictionary_key(&part.words.join(" ")) else {
+                    continue;
+                };
+                let ids = match part.label {
+                    Label::Postcode => match compact_postcode(&part.words.join(" ")) {
+                        Some(postcode) => self.postcode_records(&[postcode], AREA_ANSWERS)?,
+                        None => Vec::new(),
+                    },
+                    Label::Locality => dictionaries
+                        .areas(&key)
+                        .into_iter()
+                        .map(RecordId::from)
+                        .collect(),
+                    Label::Region => dictionaries
+                        .regions(&key)
+                        .into_iter()
+                        .chain(dictionaries.areas(&key))
+                        .map(RecordId::from)
+                        .collect(),
+                    _ => continue,
+                };
+                if !ids.is_empty() {
+                    parts.push((part.label, ids));
+                }
+            }
+            for finest in [Label::Postcode, Label::Locality, Label::Region] {
+                let Some(at) = parts.iter().position(|(label, _)| *label == finest) else {
+                    continue;
+                };
+                let mut kept = Vec::new();
+                for &id in &parts[at].1 {
+                    let mut nests = true;
+                    for (other, (label, ids)) in parts.iter().enumerate() {
+                        if other == at || *label == Label::Postcode {
+                            continue;
+                        }
+                        let holds = match finest {
+                            Label::Postcode => self.postcode_in(id, ids)?,
+                            _ => dictionaries.nest(
+                                &[u32::try_from(id).unwrap_or(u32::MAX)],
+                                &ids.iter()
+                                    .filter_map(|id| u32::try_from(*id).ok())
+                                    .collect::<Vec<_>>(),
+                            ),
+                        };
+                        nests &= holds;
+                    }
+                    if nests {
+                        kept.push(id);
+                    }
+                }
+                if finest == Label::Postcode
+                    && !kept.is_empty()
+                    && let Some(street) = self.street_in_postcode(cx, reading, index)?
+                {
+                    found.push(street);
+                    break;
+                }
+                for id in kept.into_iter().take(AREA_ANSWERS) {
+                    let record = self.pack.record_summary(id)?;
+                    let Some(point) = record.point else {
+                        continue;
+                    };
+                    let form = match Layer::parse(&record.layer) {
+                        Some(Layer::Postcode) => FORM_POSTCODE,
+                        Some(Layer::Region | Layer::Country) => FORM_REGION,
+                        _ => FORM_TOWN,
+                    };
+                    let hit = TextSearchHit {
+                        record_id: id,
+                        score: 0.0,
+                        record,
+                        features: Features::default(),
+                        confidence: None,
+                        fallback: false,
+                        signals: Signals::default(),
+                    };
+                    if !cx.search.filters.admit(&hit) {
+                        continue;
+                    }
+                    found.push(StructuredFound {
+                        hit,
+                        point: [point.lon, point.lat],
+                        support: 1000 * (parts.len() - 1),
+                        form,
+                        reading: index,
+                        entry: "area",
+                        lever: LEVER_T,
+                    });
+                }
+                break;
+            }
+        }
+        // A street the query names found inside the postcode it names says
+        // more than any area alone, which would only tie with it.
+        if found.iter().any(|found| found.entry == "postcode-street") {
+            found.retain(|found| found.entry == "postcode-street");
+        }
+        Ok(found)
+    }
+
+    /// The street of `reading` inside the footprint of the postcode it
+    /// names, found by its words as [`Self::street_matches`] finds one in a
+    /// town: its record, or the address stating the reading's number, at
+    /// the record's point. A postcode names a few streets; the one the query
+    /// writes says where in it the answer is.
+    fn street_in_postcode(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        reading: &Reading,
+        index: usize,
+    ) -> Result<Option<StructuredFound>> {
+        let structured = cx.structured;
+        let plan = &reading.plan;
+        let words = plan
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .collect::<Vec<_>>();
+        let Some(key) = self.street_keys(&words).into_iter().next() else {
+            return Ok(None);
+        };
+        let query = key.split_whitespace().collect::<Vec<_>>();
+        let countries = self.structured_countries(plan, &cx.search.filters);
+        let mut cells = Vec::new();
+        for part in plan
+            .context
+            .iter()
+            .filter(|part| part.label == Label::Postcode)
+        {
+            let Some(postcode) = compact_postcode(&part.words.join(" ")) else {
+                continue;
+            };
+            for place in structured.places(&postcode, &countries, false) {
+                cells.extend(structured.place_cells(&place));
+            }
+        }
+        cells.sort_unstable();
+        cells.dedup();
+        if cells.is_empty() || cells.len() > MATCH_CELLS {
+            return Ok(None);
+        }
+        let place_words = context_words(plan);
+        let mut names = structured
+            .streets_in(&cells, &countries)
+            .into_iter()
+            .filter_map(|name| {
+                let describes = |word: &str| self.describes_street(word);
+                Some((
+                    street_words_match(&query, &name, describes)
+                        .or_else(|| street_named_in(&query, &name, describes, &place_words))?,
+                    name,
+                ))
+            })
+            .collect::<Vec<_>>();
+        names.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        let searcher = self.reader.searcher();
+        for (_, name) in names.into_iter().take(MATCHED_STREETS) {
+            let mut docs = Vec::new();
+            for list in structured.street_lists(&name, &countries) {
+                for &cell in &cells {
+                    let (from, to) =
+                        structured.list_range(&list, cell, cell, &|doc| self.doc_cell(doc));
+                    docs.extend((from..to).map(|at| structured.list_doc(&list, at)));
+                }
+            }
+            if docs.is_empty() {
+                continue;
+            }
+            let numbered = match plan.house_number {
+                Some(_) => self.number_forms(&searcher, &docs, plan, None)?,
+                None => Vec::new(),
+            };
+            let (doc, form) = match numbered.iter().max_by_key(|(_, form, _)| *form) {
+                Some(&(doc, form, _)) => (doc, form),
+                None => (docs[0], FORM_STREET),
+            };
+            let Some(address) = self.doc_address(doc) else {
+                continue;
+            };
+            let street_plan = QueryPlan {
+                house_number: None,
+                ..plan.clone()
+            };
+            let ranking = self.plan_ranking(
+                match form {
+                    FORM_STREET => &street_plan,
+                    _ => plan,
+                },
+                cx.search.query_words,
+                cx.search.focus,
+                self.query_postcode_unplaced(plan)?,
+            );
+            let hit = self
+                .rank_documents(
+                    &searcher,
+                    vec![(RankKey::text(0.0), address)],
+                    &ranking,
+                    1,
+                    &mut |hit| Ok(cx.search.filters.admit(hit)),
+                )?
+                .into_iter()
+                .next();
+            if let Some(mut hit) = hit
+                && let Some(point) = hit.record.point
+            {
+                if form == FORM_STREET && hit.record.layer != Layer::Street.as_str() {
+                    continue;
+                }
+                let mut point = [point.lon, point.lat];
+                if form == FORM_STREET
+                    && let Some(middle) = self.postcode_road_middle(plan, &docs)
+                {
+                    point = middle;
+                    street_at(&mut hit.record, middle);
+                }
+                return Ok(Some(StructuredFound {
+                    hit,
+                    point,
+                    support: 1000,
+                    form,
+                    reading: index,
+                    entry: "postcode-street",
+                    lever: LEVER_T,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The middle of the road of `docs` (see [`road::road_middle`]) inside
+    /// the postcode `plan` names: of the addresses that state it, else of
+    /// all those in its cells. `None` when none has a point.
+    fn postcode_road_middle(&self, plan: &QueryPlan, docs: &[DocId]) -> Option<[f64; 2]> {
+        let wanted = plan
+            .context
+            .iter()
+            .filter(|part| part.label == Label::Postcode)
+            .filter_map(|part| compact_postcode(&part.words.join(" ")))
+            .map(|postcode| postcode_letters(&postcode))
+            .collect::<Vec<_>>();
+        let mut inside = Vec::new();
+        let mut near = Vec::new();
+        for &doc in docs {
+            if self.doc_layer(doc) != Some(structured::LAYER_ADDRESS) {
+                continue;
+            }
+            let Some([lon, lat]) = self.doc_point(doc) else {
+                continue;
+            };
+            let point = [dequantize(lon), dequantize(lat)];
+            near.push(point);
+            if wanted.contains(&postcode_letters(&self.doc_postcodes(doc).0)) {
+                inside.push(point);
+            }
+        }
+        road::road_middle(match inside.is_empty() {
+            true => &near,
+            false => &inside,
+        })
+    }
+
+    /// Whether the postcode record `postcode` lies in one of the areas
+    /// `areas`, or its chain says nothing either way.
+    fn postcode_in(&self, postcode: RecordId, areas: &[RecordId]) -> Result<bool> {
+        let Some(context) = self.pack.boundary_context(postcode)? else {
+            return Ok(true);
+        };
+        let chain = context
+            .admin_context
+            .entries()
+            .iter()
+            .map(|entry| entry.record_id)
+            .collect::<Vec<_>>();
+        Ok(chain.is_empty() || chain.iter().any(|id| areas.contains(id)))
+    }
+
+    /// The spot bests of every one of `readings`, and how many documents of
+    /// their streets they were chosen from.
+    fn structured_found(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        readings: &[(usize, &Reading)],
+        numbered: bool,
+        accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
+    ) -> Result<(Vec<StructuredFound>, usize)> {
+        let mut found = Vec::new();
+        let mut candidates = 0;
+        for &(index, reading) in readings {
+            let (more, documents) =
+                self.structured_reading(cx, index, reading, numbered, accept)?;
+            found.extend(more);
+            candidates += documents;
+        }
+        Ok((found, candidates))
+    }
+
+    /// One reading's candidates: its street's documents (found by its key,
+    /// else by its words among the streets of the places it names), those
+    /// holding its number (when `numbered`) inside the most of those places,
+    /// a spot each, the best of each spot hydrated, at most [`STRUCTURED_SPOTS`].
+    /// A number none holds there is placed between its neighbours on its
+    /// side, else between any, else the street answers; without a number
+    /// the street answers. Else why there are none.
+    fn structured_reading(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        index: usize,
+        reading: &Reading,
+        numbered: bool,
+        accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
+    ) -> Result<(Vec<StructuredFound>, usize)> {
+        let structured = cx.structured;
+        let plan = &reading.plan;
+        let countries = self.structured_countries(plan, &cx.search.filters);
+        let mut lists = Vec::new();
+        let mut entry = "street";
+        for (street, _) in self.query_street_keys(plan) {
+            lists.extend(structured.street_lists(&street, &countries));
+        }
+        let mut lever = 0;
+        if numbered && plan.number_kept {
+            lever |= LEVER_C;
+        }
+        let subject = plan
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .collect::<Vec<_>>();
+        if !lists.is_empty() && !self.tagger.names_street(&subject) {
+            lever |= LEVER_D;
+        }
+        if !numbered {
+            lever |= LEVER_F;
+        }
+        let places = self.structured_places(structured, reading, &countries, &cx.probabilities);
+        // A street alone answers only where every place the reading names
+        // holds it: a street of the name in one of them but not the others
+        // is most often another town's.
+        let placed = places.weights.iter().sum::<usize>().max(1);
+        if lists.is_empty() {
+            lists = self.street_matches(structured, plan, &places, &countries);
+            if lists.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            entry = "place";
+            lever |= LEVER_A;
+        }
+        lists
+            .retain(|list| places.countries.is_empty() || places.countries.contains(&list.country));
+        let mut raw = lists.iter().map(structured::StreetList::len).sum::<usize>();
+        if raw == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let mut supported = Vec::new();
+        for list in &lists {
+            self.list_support(
+                structured,
+                list,
+                &places.words,
+                &places.weights,
+                &mut supported,
+            );
+        }
+        // The street the key names lies in none of the places the query
+        // names: one of their own streets whose words the query writes
+        // otherwise ("Łokietka" of "Władysława Łokietka") is likelier.
+        if supported.is_empty() && !places.words.is_empty() && lever & LEVER_A == 0 {
+            let mut more = self.street_matches(structured, plan, &places, &countries);
+            more.retain(|list| {
+                !lists.contains(list)
+                    && (places.countries.is_empty() || places.countries.contains(&list.country))
+            });
+            let mut found = Vec::new();
+            for list in &more {
+                self.list_support(structured, list, &places.words, &places.weights, &mut found);
+            }
+            if !found.is_empty() {
+                raw += more.iter().map(structured::StreetList::len).sum::<usize>();
+                lists.extend(more);
+                supported = found;
+                lever |= LEVER_A;
+                entry = "place";
+            }
+        }
+        // A document under two keys of the street counts once, at its best.
+        supported.sort_unstable_by(|left: &(DocId, usize), right| {
+            left.0.cmp(&right.0).then(right.1.cmp(&left.1))
+        });
+        supported.dedup_by_key(|(doc, _)| *doc);
+        let most = supported.iter().map(|(_, support)| *support).max();
+        let all_docs = || {
+            lists
+                .iter()
+                .flat_map(|list| (0..list.len()).map(move |at| structured.list_doc(list, at)))
+                .collect::<Vec<_>>()
+        };
+        let searcher = self.reader.searcher();
+        let base_plan = plan.with_base_house_number();
+        let ranking = self.plan_ranking(
+            plan,
+            cx.search.query_words,
+            cx.search.focus,
+            self.query_postcode_unplaced(plan)?,
+        );
+        let base_ranking = match &base_plan {
+            Some(base) => Some(self.plan_ranking(
+                base,
+                cx.search.query_words,
+                cx.search.focus,
+                self.query_postcode_unplaced(plan)?,
+            )),
+            None => None,
+        };
+        let street_plan = QueryPlan {
+            house_number: None,
+            ..plan.clone()
+        };
+        let street_ranking = self.plan_ranking(
+            &street_plan,
+            cx.search.query_words,
+            cx.search.focus,
+            self.query_postcode_unplaced(plan)?,
+        );
+        let descriptors = self.descriptors(plan.subject.iter().map(|word| word.text.as_str()));
+        let mut keep = |hit: &TextSearchHit| -> Result<bool> {
+            if !cx.search.filters.admit(hit) || self.street_contradicts(&descriptors, hit) {
+                return Ok(false);
+            }
+            accept(cx.session, plan, &ranking.postcode, hit)
+        };
+        let postcode = |doc: DocId, ranking: &Ranking| -> u8 {
+            if ranking.postcode.forms.is_empty() {
+                return 0;
+            }
+            let (own, area) = self.doc_postcodes(doc);
+            let own = match own.is_empty() {
+                true => Vec::new(),
+                false => vec![own],
+            };
+            let area = (!area.is_empty()).then_some(area.as_str());
+            ranking.postcode.rank_of(&own, area)
+        };
+        let spots_of = |candidates: Vec<(DocId, usize, u8, bool)>| {
+            let mut keyed = candidates
+                .into_iter()
+                .filter_map(|(doc, support, form, base)| {
+                    let [lon, lat] = self.doc_point(doc)?;
+                    let layer = self.doc_layer(doc)?;
+                    let ranking = match base {
+                        true => base_ranking.as_ref()?,
+                        false => &ranking,
+                    };
+                    // A street answer is the street's own record before any
+                    // one address on it.
+                    let street = form == FORM_STREET && layer == structured::LAYER_STREET;
+                    Some(Keyed {
+                        order: (support, form, street, postcode(doc, ranking)),
+                        doc,
+                        base,
+                        address: layer == structured::LAYER_ADDRESS,
+                        point: [dequantize(lon), dequantize(lat)],
+                    })
+                })
+                .collect::<Vec<_>>();
+            keyed
+                .sort_by(|left, right| right.order.cmp(&left.order).then(left.doc.cmp(&right.doc)));
+            let mut spots = Vec::<Spot>::new();
+            for item in keyed {
+                let room = spots.len() < STRUCTURED_SPOTS;
+                let near = spots.iter_mut().find(|spot| {
+                    haversine_m(
+                        spot.head.point[0],
+                        spot.head.point[1],
+                        item.point[0],
+                        item.point[1],
+                    ) <= SPOT_M
+                });
+                match near {
+                    Some(spot) => {
+                        if spot.docs.len() < NEIGHBOUR_DOCUMENTS {
+                            spot.docs.push(item.doc);
+                        }
+                        if item.address && spot.points.len() < SPOT_POINTS {
+                            spot.points.push(item.point);
+                        }
+                    }
+                    None if room => spots.push(Spot {
+                        docs: vec![item.doc],
+                        points: match item.address {
+                            true => vec![item.point],
+                            false => Vec::new(),
+                        },
+                        head: item,
+                    }),
+                    None => {}
+                }
+            }
+            spots
+        };
+        let mut candidates = Vec::<(DocId, usize, u8, bool)>::new();
+        if numbered {
+            let docs = supported.iter().map(|(doc, _)| *doc).collect::<Vec<_>>();
+            let forms = self.number_forms(&searcher, &docs, plan, base_plan.as_ref())?;
+            let support_of = |doc: DocId| {
+                supported
+                    .binary_search_by_key(&doc, |(held, _)| *held)
+                    .map_or(0, |at| supported[at].1)
+            };
+            let numbered_most = forms.iter().map(|(doc, _, _)| support_of(*doc)).max();
+            candidates.extend(
+                forms
+                    .iter()
+                    .filter(|(doc, _, _)| Some(support_of(*doc)) == numbered_most)
+                    .map(|&(doc, form, base)| (doc, support_of(doc), form, base)),
+            );
+            if candidates.is_empty()
+                && let Some(most) = most
+            {
+                let best = supported
+                    .iter()
+                    .filter(|(_, support)| *support == most)
+                    .map(|&(doc, support)| (doc, support, FORM_STREET, false))
+                    .collect::<Vec<_>>();
+                let best_docs = best.iter().map(|(doc, ..)| *doc).collect::<Vec<_>>();
+                let spots = spots_of(best);
+                let mut found = Vec::new();
+                for spot in &spots {
+                    if let Some(hit) = self.structured_side(plan, &ranking, &spot.docs)?
+                        && keep(&hit)?
+                        && let Some(point) = hit.record.point
+                    {
+                        found.push(StructuredFound {
+                            hit,
+                            point: [point.lon, point.lat],
+                            support: most,
+                            form: FORM_INTERPOLATION,
+                            reading: index,
+                            entry,
+                            lever: lever | LEVER_G,
+                        });
+                    }
+                }
+                if found.is_empty()
+                    && let Some(hit) = self.structured_neighbour(plan, &ranking, &best_docs)?
+                    && keep(&hit)?
+                    && let Some(point) = hit.record.point
+                {
+                    found.push(StructuredFound {
+                        hit,
+                        point: [point.lon, point.lat],
+                        support: most,
+                        form: FORM_NEIGHBOUR,
+                        reading: index,
+                        entry,
+                        lever,
+                    });
+                }
+                if found.is_empty() {
+                    let mut pieces = Vec::new();
+                    for spot in &spots {
+                        if let Some(street) =
+                            self.street_answer(&searcher, spot, &street_ranking, &mut keep)?
+                        {
+                            let found = StructuredFound {
+                                point: [
+                                    street.record.point.map_or(0.0, |point| point.lon),
+                                    street.record.point.map_or(0.0, |point| point.lat),
+                                ],
+                                hit: street,
+                                support: most,
+                                form: FORM_STREET,
+                                reading: index,
+                                entry,
+                                lever: lever | LEVER_G,
+                            };
+                            pieces.push((found, spot.points.clone()));
+                        }
+                    }
+                    found = self.join_road_pieces(pieces);
+                    self.postcode_stretch(plan, &best_docs, &mut found);
+                }
+                found.retain(|found| found.form != FORM_STREET || found.support >= placed);
+                if !found.is_empty() {
+                    return Ok((found, raw));
+                }
+            }
+            if candidates.is_empty() {
+                if raw > STRUCTURED_CANDIDATES {
+                    return Ok((Vec::new(), raw));
+                }
+                let forms = self.number_forms(&searcher, &all_docs(), plan, base_plan.as_ref())?;
+                candidates.extend(
+                    forms
+                        .into_iter()
+                        .map(|(doc, form, base)| (doc, 0, form, base)),
+                );
+            }
+            if candidates.is_empty() {
+                return Ok((Vec::new(), raw));
+            }
+        } else {
+            match most {
+                Some(most) => candidates.extend(
+                    supported
+                        .iter()
+                        .filter(|(_, support)| *support == most)
+                        .map(|&(doc, support)| (doc, support, FORM_STREET, false)),
+                ),
+                None if raw <= STRUCTURED_CANDIDATES => candidates.extend(
+                    all_docs()
+                        .into_iter()
+                        .map(|doc| (doc, 0, FORM_STREET, false)),
+                ),
+                None => return Ok((Vec::new(), raw)),
+            }
+            candidates.sort_unstable_by_key(|(doc, _, _, _)| *doc);
+            candidates.dedup_by_key(|(doc, _, _, _)| *doc);
+        }
+        let candidate_docs = candidates.iter().map(|(doc, ..)| *doc).collect::<Vec<_>>();
+        let spots = spots_of(candidates);
+        let mut found = Vec::new();
+        let mut pieces = Vec::new();
+        for spot in &spots {
+            let (support, form, _, agreement) = spot.head.order;
+            let hit = match form {
+                FORM_STREET => self.street_answer(&searcher, spot, &street_ranking, &mut keep)?,
+                _ => {
+                    let Some(address) = self.doc_address(spot.head.doc) else {
+                        continue;
+                    };
+                    let ranking = match spot.head.base {
+                        true => base_ranking
+                            .as_ref()
+                            .expect("a base ranking for a base number"),
+                        false => &ranking,
+                    };
+                    let mut key = RankKey::text(0.0);
+                    key.stated = form >= FORM_RANGE_START;
+                    key.postcode_agreement = agreement;
+                    self.rank_documents(&searcher, vec![(key, address)], ranking, 1, &mut keep)?
+                        .into_iter()
+                        .next()
+                }
+            };
+            if let Some(hit) = hit
+                && let Some(point) = hit.record.point
+            {
+                let one = StructuredFound {
+                    hit,
+                    point: [point.lon, point.lat],
+                    support,
+                    form,
+                    reading: index,
+                    entry,
+                    lever,
+                };
+                match form {
+                    FORM_STREET => pieces.push((one, spot.points.clone())),
+                    _ => found.push(one),
+                }
+            }
+        }
+        found.extend(self.join_road_pieces(pieces));
+        self.postcode_stretch(plan, &candidate_docs, &mut found);
+        found.retain(|found| found.form != FORM_STREET || found.support >= placed);
+        Ok((found, raw))
+    }
+
+    /// The street of `spot` as an answer: its best record hydrated, at the
+    /// centre of the densest [`STREET_DISK_M`] disk of the spot's address
+    /// points, the point likeliest within that distance of any one address
+    /// on it; at the record's own point when the spot has none.
+    fn street_answer(
+        &self,
+        searcher: &Searcher,
+        spot: &Spot,
+        ranking: &Ranking,
+        keep: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
+    ) -> Result<Option<TextSearchHit>> {
+        let Some(address) = self.doc_address(spot.head.doc) else {
+            return Ok(None);
+        };
+        let mut key = RankKey::text(0.0);
+        key.postcode_agreement = spot.head.order.3;
+        let Some(mut hit) = self
+            .rank_documents(searcher, vec![(key, address)], ranking, 1, keep)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        // An answer's id names the record it describes: an address on the
+        // street is no answer for the street.
+        if hit.record.layer != Layer::Street.as_str() {
+            return Ok(None);
+        }
+        let record = &mut hit.record;
+        let point =
+            densest(&spot.points).or_else(|| record.point.map(|point| [point.lon, point.lat]));
+        let Some(point) = point else {
+            return Ok(None);
+        };
+        street_at(record, point);
+        Ok(Some(hit))
+    }
+
+    /// The street answers `pieces` (each with its spot's address points)
+    /// with the pieces of one road joined (see [`road::road_groups`]): one
+    /// answer, the first piece's record at the middle of the points of
+    /// them all, which lie in the places the query names. Two pieces of one
+    /// road are one answer, not a tie between two.
+    fn join_road_pieces(
+        &self,
+        pieces: Vec<(StructuredFound, Vec<[f64; 2]>)>,
+    ) -> Vec<StructuredFound> {
+        let named = pieces
+            .iter()
+            .map(|(found, points)| {
+                let mut points = points.clone();
+                if points.is_empty() {
+                    points.push(found.point);
+                }
+                (road::RoadName::of(&found.hit.record.name), points)
+            })
+            .collect::<Vec<_>>();
+        let groups = road::road_groups(&named);
+        let mut pieces = pieces.into_iter().map(Some).collect::<Vec<_>>();
+        let mut joined = Vec::with_capacity(groups.len());
+        for group in groups {
+            let Some((mut found, _)) = pieces[group[0]].take() else {
+                continue;
+            };
+            let points = group
+                .iter()
+                .flat_map(|&at| named[at].1.iter().copied())
+                .collect::<Vec<_>>();
+            if group.len() > 1
+                && let Some([lon, lat]) = road::road_middle(&points)
+            {
+                found.point = [lon, lat];
+                found.hit.record.point = Some(Point {
+                    lon,
+                    lat,
+                    precision: PointPrecision::Estimated,
+                });
+            }
+            joined.push(found);
+        }
+        joined
+    }
+
+    /// The number of `plan` placed between its stated neighbours on its own
+    /// side of the street of `docs` (odd or even), inside the range of the
+    /// numbers they state: on most streets the numbers of one side rise
+    /// along it. Its layer says it is interpolated.
+    fn structured_side(
+        &self,
+        plan: &QueryPlan,
+        ranking: &Ranking,
+        docs: &[DocId],
+    ) -> Result<Option<TextSearchHit>> {
+        let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
+            return Ok(None);
+        };
+        let searcher = self.reader.searcher();
+        let docs = docs
+            .iter()
+            .filter(|&&doc| {
+                matches!(
+                    self.doc_layer(doc),
+                    Some(structured::LAYER_ADDRESS | structured::LAYER_POI)
+                )
+            })
+            .filter_map(|&doc| self.doc_address(doc))
+            .take(NEIGHBOUR_DOCUMENTS)
+            .collect::<Vec<_>>();
+        let (mut lower, mut higher) = self.neighbours_of(&searcher, docs, ranking, number)?;
+        held_to_places(plan, &mut lower, &mut higher);
+        let side = |neighbour: &Neighbour| neighbour.number % 2 == number % 2;
+        let lower = lower.into_iter().filter(side).collect::<Vec<_>>();
+        let higher = higher
+            .into_iter()
+            .filter(|neighbour| side(neighbour) && neighbour.number > number)
+            .collect::<Vec<_>>();
+        let mut hit = self.place_between(number, &lower, &higher, ROAD_SETBACK_M)?;
+        if let Some(hit) = &mut hit {
+            hit.record.layer = Layer::Interpolation.as_str().to_string();
+        }
+        Ok(hit)
+    }
+
+    /// The streets in the cells of the places `places` names whose words
+    /// the reading's street words name: each word of four or more letters
+    /// that is not a type or direction as written or a typo away, a short
+    /// word its letters in order from the first ("pg" of "passeig"), a word
+    /// of up to three letters without a digit perhaps not at all; in any
+    /// order, the street perhaps with words more. At most
+    /// [`MATCHED_STREETS`] of them, those naming the most query letters.
+    fn street_matches(
+        &self,
+        structured: &StructuredIndex,
+        plan: &QueryPlan,
+        places: &PlaceWords,
+        countries: &[String],
+    ) -> Vec<structured::StreetList> {
+        let words = plan
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .collect::<Vec<_>>();
+        let Some(key) = self.street_keys(&words).into_iter().next() else {
+            return Vec::new();
+        };
+        let query = key.split_whitespace().collect::<Vec<_>>();
+        let mut per_word = Vec::new();
+        for places in &places.words {
+            let cells = match places.iter().all(|place| !place.capped()) {
+                true => {
+                    let mut cells = places
+                        .iter()
+                        .flat_map(|place| structured.place_cells(place))
+                        .flat_map(structured::ring)
+                        .collect::<Vec<_>>();
+                    cells.sort_unstable();
+                    cells.dedup();
+                    Some(cells)
+                }
+                false => places
+                    .iter()
+                    .map(|place| structured::box_cells(place.extent, MATCH_CELLS))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|cells| cells.concat()),
+            };
+            if let Some(cells) = cells.filter(|cells| !cells.is_empty()) {
+                per_word.push(cells);
+            }
+        }
+        let mut cells = per_word.concat();
+        cells.sort_unstable();
+        cells.dedup();
+        if cells.len() > MATCH_CELLS {
+            cells = per_word
+                .into_iter()
+                .min_by_key(Vec::len)
+                .filter(|cells| cells.len() <= MATCH_CELLS)
+                .unwrap_or_default();
+        }
+        if cells.is_empty() {
+            return Vec::new();
+        }
+        let countries = match places.countries.is_empty() {
+            true => countries,
+            false => &places.countries,
+        };
+        let place_words = context_words(plan);
+        let mut matched = structured
+            .streets_in(&cells, countries)
+            .into_iter()
+            .filter_map(|name| {
+                let describes = |word: &str| self.describes_street(word);
+                let letters = street_words_match(&query, &name, describes)
+                    .or_else(|| street_named_in(&query, &name, describes, &place_words))?;
+                Some((letters, name))
+            })
+            .collect::<Vec<_>>();
+        matched.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then(left.1.len().cmp(&right.1.len()))
+                .then(left.1.cmp(&right.1))
+        });
+        matched.truncate(MATCHED_STREETS);
+        matched
+            .into_iter()
+            .flat_map(|(_, name)| structured.street_lists(&name, countries))
+            .collect()
+    }
+
+    /// Of `docs`, those holding the number of `plan`, each with its
+    /// [`form_name`] and whether the base of the number (`base_plan`)
+    /// holds it rather than the number as written.
+    fn number_forms(
+        &self,
+        searcher: &Searcher,
+        docs: &[DocId],
+        plan: &QueryPlan,
+        base_plan: Option<&QueryPlan>,
+    ) -> Result<Vec<(DocId, u8, bool)>> {
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let number = plan.house_number.as_ref().expect("a numbered reading");
+        let unit = plan.unit.as_deref();
+        let mut forms = HashMap::<DocId, (u8, bool)>::new();
+        for (doc, stated) in self.numbered_docs(searcher, docs, number, unit)? {
+            let form = match stated {
+                true => FORM_EXACT,
+                false => FORM_RANGE,
+            };
+            forms.insert(doc, (form, false));
+        }
+        if let Some(base_plan) = base_plan {
+            let base = base_plan.house_number.as_ref().expect("a base number");
+            for (doc, stated) in self.numbered_docs(searcher, docs, base, unit)? {
+                let form = match stated {
+                    true => FORM_RANGE_START,
+                    false => FORM_RANGE,
+                };
+                match forms.entry(doc) {
+                    Entry::Occupied(mut held) if held.get().0 < form => {
+                        held.insert((form, true));
+                    }
+                    Entry::Occupied(_) => {}
+                    Entry::Vacant(free) => {
+                        free.insert((form, true));
+                    }
+                }
+            }
+        }
+        let mut forms = forms
+            .into_iter()
+            .map(|(doc, (form, base))| (doc, form, base))
+            .collect::<Vec<_>>();
+        forms.sort_unstable_by_key(|(doc, _, _)| *doc);
+        Ok(forms)
+    }
+
+    /// `found`, one per record at its best support and number form, each
+    /// with its gap: the parser's score of the query read as the record
+    /// reads it (see [`Self::explain`]) less its best reading's, and its
+    /// score, the gap and [`STRUCTURED_W`] for each place word holding it; best
+    /// first (ties by number form, then support); with the best score of a
+    /// record in another spot. `None` when the parser explains none.
+    fn structured_explained(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        explanation: &Explanation,
+        found: Vec<StructuredFound>,
+    ) -> Result<Option<StructuredExplained>> {
+        let mut unique = Vec::<StructuredFound>::new();
+        for found in found {
+            match unique
+                .iter_mut()
+                .find(|held| held.hit.record_id == found.hit.record_id)
+            {
+                Some(held) if (found.support, found.form) > (held.support, held.form) => {
+                    *held = found;
+                }
+                Some(_) => {}
+                None => unique.push(found),
+            }
+        }
+        let dictionaries = self.tagger.dictionaries();
+        let mut scored = Vec::with_capacity(unique.len());
+        for found in unique {
+            let parts = self.parts(&found.hit, cx.session)?;
+            let joint = self.tagger.explain(explanation, |word| {
+                parts.labels(word, |word| {
+                    dictionaries
+                        .regions(word)
+                        .into_iter()
+                        .map(RecordId::from)
+                        .collect()
+                })
+            });
+            if let Some(joint) = joint {
+                let gap = joint - explanation.best;
+                scored.push(Scored {
+                    gap,
+                    score: gap + STRUCTURED_W * found.support as f32 / 1000.0,
+                    found,
+                });
+            }
+        }
+        if scored.is_empty() {
+            return Ok(None);
+        }
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then(right.found.form.cmp(&left.found.form))
+                .then(right.found.support.cmp(&left.found.support))
+                .then(left.found.hit.record_id.cmp(&right.found.hit.record_id))
+        });
+        let best = scored[0].found.point;
+        let second = scored[1..]
+            .iter()
+            .filter(|scored| {
+                haversine_m(
+                    best[0],
+                    best[1],
+                    scored.found.point[0],
+                    scored.found.point[1],
+                ) > SPOT_M
+            })
+            .map(|scored| scored.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut heads = Vec::<[f64; 2]>::new();
+        for scored in &scored {
+            let at = scored.found.point;
+            if !heads
+                .iter()
+                .any(|head| haversine_m(head[0], head[1], at[0], at[1]) <= SPOT_M)
+            {
+                heads.push(at);
+            }
+        }
+        Ok(Some(StructuredExplained {
+            scored,
+            second,
+            spots: heads.len(),
+        }))
+    }
+
+    /// The keys a reading's street may have in the structured index, each with how
+    /// it was written: as the query writes it, its ambiguous abbreviations
+    /// read as a type (see [`Self::street_keys`]), and as the parser
+    /// corrected it.
+    fn query_street_keys(&self, plan: &QueryPlan) -> Vec<(String, &'static str)> {
+        let words = plan
+            .subject
+            .iter()
+            .map(|word| word.text.clone())
+            .collect::<Vec<_>>();
+        let mut keys = self
+            .street_keys(&words)
+            .into_iter()
+            .zip(["exact", "variant"])
+            .collect::<Vec<_>>();
+        if plan.subject.iter().any(|word| word.corrected.is_some()) {
+            let corrected = plan
+                .subject
+                .iter()
+                .map(|word| word.corrected.clone().unwrap_or_else(|| word.text.clone()))
+                .collect::<Vec<_>>();
+            for key in self.street_keys(&corrected) {
+                if !keys.iter().any(|(held, _)| *held == key) {
+                    keys.push((key, "spelling"));
+                }
+            }
+        }
+        keys
+    }
+
+    /// The places the words of `reading` may name: each word the reading
+    /// leaves to no street, number, unit or country whose probability of
+    /// naming a place, over every labelling the parser weighs
+    /// (`probabilities`, one per word), is at least [`PLACE_FLOOR`]. Each
+    /// run of such words is read longest first, as written and, for a
+    /// postcode, without its spaces; then what is left one edit off, when
+    /// one place alone is that near. A place counts by the mean probability
+    /// of its words, so a word only the best reading calls a town, or a
+    /// unit word it calls one, weighs what the parser thinks of it.
+    fn structured_places(
+        &self,
+        structured: &StructuredIndex,
+        reading: &Reading,
+        countries: &[String],
+        probabilities: &[f32],
+    ) -> PlaceWords {
+        let probability = |at: usize, piece: &Tagged| {
+            probabilities.get(at).copied().unwrap_or(match piece.label {
+                Label::Locality | Label::Region | Label::Postcode => 1.0,
+                _ => 0.0,
+            })
+        };
+        let free = |at: usize, piece: &Tagged| {
+            !matches!(
+                piece.label,
+                Label::Street | Label::HouseNumber | Label::Unit | Label::Country
+            ) && probability(at, piece) >= PLACE_FLOOR
+        };
+        let mut runs = Vec::<Vec<(String, Label, f32)>>::new();
+        let mut open = false;
+        for (at, piece) in reading.pieces.iter().enumerate() {
+            let word = (piece.token.clone(), piece.label, probability(at, piece));
+            match (free(at, piece), open) {
+                (true, true) => runs.last_mut().expect("an open run").push(word),
+                (true, false) => runs.push(vec![word]),
+                (false, _) => {}
+            }
+            open = free(at, piece);
+        }
+        let has_digit = |words: &[String]| {
+            words
+                .iter()
+                .any(|word| word.chars().any(|character| character.is_ascii_digit()))
+        };
+        let exact = |words: &[String]| {
+            let places = structured.places(&words.join(" "), countries, false);
+            match places.is_empty() && has_digit(words) && words.len() > 1 {
+                true => structured.places(&words.concat(), countries, false),
+                false => places,
+            }
+        };
+        let fuzzy = |words: &[String]| {
+            let key = words.join(" ");
+            if has_digit(words) || key.chars().count() < FUZZY_PLACE_CHARS {
+                return Vec::new();
+            }
+            let places = structured.places(&key, countries, true);
+            match places.iter().all(|place| place.name == places[0].name) {
+                true => places,
+                false => Vec::new(),
+            }
+        };
+        let mut found = PlaceWords::default();
+        let mut log = Vec::new();
+        for labelled in &runs {
+            let run = labelled
+                .iter()
+                .map(|(word, ..)| word.clone())
+                .collect::<Vec<_>>();
+            let mut taken = vec![false; run.len()];
+            for (lookup, is_fuzzy) in [
+                (&exact as &dyn Fn(&[String]) -> Vec<Place>, false),
+                (&fuzzy, true),
+            ] {
+                let mut at = 0;
+                'start: while at < run.len() {
+                    if taken[at] {
+                        at += 1;
+                        continue;
+                    }
+                    let mut end = at;
+                    while end < run.len() && !taken[end] {
+                        end += 1;
+                    }
+                    for stop in (at + 1..=end).rev() {
+                        let places = lookup(&run[at..stop]);
+                        if places.is_empty() {
+                            continue;
+                        }
+                        taken[at..stop].fill(true);
+                        found.digits.push(has_digit(&run[at..stop]));
+                        found.words.push(places);
+                        let weight = labelled[at..stop]
+                            .iter()
+                            .map(|(_, _, probability)| f64::from(*probability))
+                            .sum::<f64>()
+                            / (stop - at) as f64;
+                        found.weights.push((weight * 1000.0).round() as usize);
+                        found.fuzzy += usize::from(is_fuzzy);
+                        at = stop;
+                        continue 'start;
+                    }
+                    at += 1;
+                }
+            }
+            found.skipped += (0..run.len())
+                .filter(|&at| !taken[at] && (at == 0 || taken[at - 1]))
+                .count();
+            for ((word, label, probability), taken) in labelled.iter().zip(&taken) {
+                log.push(format!(
+                    "{word}/{label:?}/{}/{probability:.2}",
+                    u8::from(*taken)
+                ));
+            }
+        }
+        found.log = log.join(",");
+        if countries.is_empty() {
+            for (places, digits) in found.words.iter().zip(&found.digits) {
+                if *digits {
+                    for place in places {
+                        if !found.countries.contains(&place.country) {
+                            found.countries.push(place.country.clone());
+                        }
+                    }
+                }
+            }
+            if !found.countries.is_empty() {
+                let wanted = found.countries.clone();
+                for places in &mut found.words {
+                    places.retain(|place| wanted.contains(&place.country));
+                }
+                let kept = found
+                    .words
+                    .iter()
+                    .map(|places| !places.is_empty())
+                    .collect::<Vec<_>>();
+                found.words = filter_by(std::mem::take(&mut found.words), |at| kept[at]);
+                found.weights = filter_by(std::mem::take(&mut found.weights), |at| kept[at]);
+            }
+        }
+        found
+    }
+
+    /// Add to `supported` each document of `list` inside a place of any of
+    /// `words`, with how many of `words` hold it. Only the documents near a
+    /// place kept as cells are read, as ranges of the list (it is sorted by
+    /// cell); a place kept only as its extent (a region, a large city) is
+    /// checked on those documents and never read through, unless no word
+    /// names a smaller place: then its extent is read when it holds at most
+    /// [`EXTENT_READ`] of the list.
+    fn list_support(
+        &self,
+        structured: &StructuredIndex,
+        list: &structured::StreetList,
+        words: &[Vec<Place>],
+        weights: &[usize],
+        supported: &mut Vec<(DocId, usize)>,
+    ) {
+        let (here, weights): (Vec<_>, Vec<_>) = words
+            .iter()
+            .zip(weights)
+            .map(|(places, weight)| {
+                (
+                    places
+                        .iter()
+                        .filter(|place| place.country == list.country)
+                        .collect::<Vec<_>>(),
+                    *weight,
+                )
+            })
+            .filter(|(places, _)| !places.is_empty())
+            .unzip();
+        if here.is_empty() {
+            return;
+        }
+        let mut ranges = Vec::<(usize, usize)>::new();
+        let mut cells = here
+            .iter()
+            .filter(|places| places.iter().all(|place| !place.capped()))
+            .flat_map(|places| {
+                places
+                    .iter()
+                    .flat_map(|place| structured.place_cells(place))
+            })
+            .flat_map(structured::ring)
+            .collect::<Vec<_>>();
+        if !cells.is_empty() {
+            cells.sort_unstable();
+            cells.dedup();
+            if cells.len() >= list.len() {
+                ranges.push((0, list.len()));
+            } else {
+                for cell in cells {
+                    ranges.push(structured.list_range(list, cell, cell, &|doc| self.doc_cell(doc)));
+                }
+            }
+        } else {
+            let extent = |places: &Vec<&Place>| {
+                places
+                    .iter()
+                    .flat_map(|place| {
+                        structured::box_rows(place.extent).map(|(row, west, east)| {
+                            structured.list_range(
+                                list,
+                                row << 16 | west,
+                                row << 16 | east,
+                                &|doc| self.doc_cell(doc),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let smallest = here
+                .iter()
+                .map(extent)
+                .min_by_key(|ranges| ranges.iter().map(|(from, to)| to - from).sum::<usize>());
+            if let Some(smallest) = smallest
+                && smallest.iter().map(|(from, to)| to - from).sum::<usize>() <= EXTENT_READ
+            {
+                ranges = smallest;
+            }
+        }
+        ranges.retain(|(from, to)| from < to);
+        ranges.sort_unstable();
+        let mut merged = Vec::<(usize, usize)>::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            match merged.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        for (from, to) in merged {
+            for at in from..to {
+                let doc = structured.list_doc(list, at);
+                let cell = self.doc_cell(doc);
+                let Some([lon, lat]) = self.doc_point(doc) else {
+                    continue;
+                };
+                let support = here
+                    .iter()
+                    .zip(&weights)
+                    .filter(|(places, _)| {
+                        places
+                            .iter()
+                            .any(|place| structured.place_holds(place, cell, lon, lat))
+                    })
+                    .map(|(_, weight)| *weight)
+                    .sum::<usize>();
+                if support > 0 {
+                    supported.push((doc, support));
+                }
+            }
+        }
+    }
+
+    /// Whether the structured stage may give `hit`, its best answer, judged
+    /// (see [`Self::structured_judged`]): only when the rules the text search
+    /// ranks by hold, as the text search's own best would. It is not a
+    /// business, which the text search weighs by its name; its postcode
+    /// does not contradict the stated one; it lies in the stated towns when
+    /// the Pack knows them all (`towns_known`); it states the unit asked
+    /// for; and its street's type or direction does not contradict the
+    /// query's. Else the text search answers.
+    fn verified(
+        &self,
+        hit: &TextSearchHit,
+        towns_known: bool,
+        cx: &StructuredContext<'_, '_>,
+    ) -> bool {
+        let features = &hit.features;
+        let in_towns = match features.area {
+            Agreement::Agrees | Agreement::Unstated => true,
+            Agreement::Unknown => !towns_known,
+            Agreement::Contradicts => false,
+        };
+        let descriptors = self.descriptors(cx.search.query_words.search.iter().map(String::as_str));
+        hit.record.layer != Layer::Poi.as_str()
+            && features.postcode != Agreement::Contradicts
+            && in_towns
+            && features.unit != Some(false)
+            && !self.street_contradicts(&descriptors, hit)
+    }
+
+    /// The countries a structured-stage lookup is held to: those the caller asks
+    /// for, else those the plan names; any when neither names one.
+    fn structured_countries(&self, plan: &QueryPlan, filters: &Filters<'_>) -> Vec<String> {
+        match filters.countries.is_empty() {
+            true => self
+                .stated_places(&plan.context)
+                .countries
+                .iter()
+                .map(|country| country.as_str().to_string())
+                .collect(),
+            false => filters
+                .countries
+                .iter()
+                .map(|country| country.trim().to_ascii_uppercase())
+                .collect(),
+        }
+    }
+
+    /// The number of `plan` placed between its stated neighbours on the
+    /// street of `docs`, as [`Self::place_between_neighbours`] places it
+    /// from the documents a text search finds. Every document of the road
+    /// is read, up to [`STRUCTURED_CANDIDATES`]: the numbers nearest the query's
+    /// may be under any spelling of it and anywhere along it, not in the
+    /// first documents by id.
+    fn structured_neighbour(
+        &self,
+        plan: &QueryPlan,
+        ranking: &Ranking,
+        docs: &[DocId],
+    ) -> Result<Option<TextSearchHit>> {
+        let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
+            return Ok(None);
+        };
+        let searcher = self.reader.searcher();
+        let docs = docs
+            .iter()
+            .filter(|&&doc| {
+                matches!(
+                    self.doc_layer(doc),
+                    Some(structured::LAYER_ADDRESS | structured::LAYER_POI)
+                )
+            })
+            .filter_map(|&doc| self.doc_address(doc))
+            .take(STRUCTURED_CANDIDATES)
+            .collect::<Vec<_>>();
+        let (mut lower, mut higher) = self.neighbours_of(&searcher, docs, ranking, number)?;
+        held_to_places(plan, &mut lower, &mut higher);
+        self.place_between(number, &lower, &higher, ROAD_SETBACK_M)
+    }
+
+    /// The document of id `doc` across the index, as the structured index numbers it.
+    fn doc_address(&self, doc: DocId) -> Option<DocAddress> {
+        let ord = self.segments.iter().position(|(_, _, end)| doc < *end)?;
+        Some(DocAddress::new(ord as u32, doc - self.segments[ord].1))
+    }
+
+    /// Of `docs`, those that state `number` (or its flat with `unit`) or
+    /// hold it on a range, what [`Self::house_number_query`] matches in its
+    /// strict pass, each with whether it states it.
+    fn numbered_docs(
+        &self,
+        searcher: &Searcher,
+        docs: &[DocId],
+        number: &HouseNumber,
+        unit: Option<&str>,
+    ) -> Result<Vec<(DocId, bool)>> {
+        let mut docs = docs.to_vec();
+        docs.sort_unstable();
+        docs.dedup();
+        let mut terms = vec![number.text.clone()];
+        terms.extend(unit.map(|unit| number.flat_text(unit)));
+        let plain = number.plain().map(u64::from);
+        let mut numbered = Vec::new();
+        for (ord, &(_, base, end)) in self.segments.iter().enumerate() {
+            let local = segment_docs(&docs, base, end);
+            if local.is_empty() {
+                continue;
+            }
+            let ord = ord as u32;
+            let segment = searcher.segment_reader(ord);
+            let columns = self.segment_columns(searcher, ord)?;
+            let index = segment.inverted_index(self.fields.address_number)?;
+            let mut postings = Vec::new();
+            for text in &terms {
+                let term = Term::from_field_text(self.fields.address_number, text);
+                if let Some(found) = index.read_postings(&term, IndexRecordOption::Basic)? {
+                    postings.push(found);
+                }
+            }
+            for doc in local {
+                let mut stated = false;
+                for found in &mut postings {
+                    if found.doc() < doc {
+                        found.seek(doc);
+                    }
+                    stated |= found.doc() == doc;
+                }
+                let ranged = plain.is_some_and(|number| {
+                    columns
+                        .interpolation_start
+                        .first(doc)
+                        .is_some_and(|start| start <= number)
+                        && columns
+                            .interpolation_end
+                            .first(doc)
+                            .is_some_and(|end| number <= end)
+                });
+                if stated || ranged {
+                    numbered.push((base + doc, stated));
+                }
+            }
+        }
+        Ok(numbered)
+    }
+
+    /// The columns of the segment holding document `doc`, and its id there.
+    fn doc_columns(&self, doc: DocId) -> Option<(&SegmentColumns, DocId)> {
+        let &(segment, base, _) = self.segments.iter().find(|(_, _, end)| doc < *end)?;
+        Some((self.columns.get(&segment)?, doc - base))
+    }
+
+    /// The layer of document `doc` as the structured index tells layers apart (see
+    /// [`structured_layer`]): its first record's.
+    pub(crate) fn doc_layer(&self, doc: DocId) -> Option<u8> {
+        let (columns, doc) = self.doc_columns(doc)?;
+        let record_id = columns.record_id.first(doc)?;
+        let layer = self.pack.records().header(record_id).ok()?.layer;
+        Some(structured_layer(layer))
+    }
+
+    /// The middle of document `doc`'s extent in 1e-7 degrees, `None` when
+    /// it has none.
+    pub(crate) fn doc_point(&self, doc: DocId) -> Option<[i32; 2]> {
+        let (columns, doc) = self.doc_columns(doc)?;
+        let bound = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
+        let extent = [
+            bound(&columns.min_lon)?,
+            bound(&columns.min_lat)?,
+            bound(&columns.max_lon)?,
+            bound(&columns.max_lat)?,
+        ];
+        Some(extent_middle(extent)).filter(|point| *point != [0, 0])
+    }
+
+    /// The cell of document `doc`, as the structured index sorted its street lists
+    /// by: of the middle of its extent.
+    pub(crate) fn doc_cell(&self, doc: DocId) -> u32 {
+        let [lon, lat] = self.doc_point(doc).unwrap_or([0, 0]);
+        structured::cell(lon, lat)
+    }
+
+    /// Document `doc`'s own postcode and its nearest centroid's, compacted
+    /// as the rank columns hold them; empty when it has none.
+    pub(crate) fn doc_postcodes(&self, doc: DocId) -> (String, String) {
+        let Some((columns, doc)) = self.doc_columns(doc) else {
+            return (String::new(), String::new());
+        };
+        let first = |column: &Option<StrColumn>| {
+            let mut text = String::new();
+            if let Some(column) = column
+                && let Some(ord) = column.term_ords(doc).next()
+                && column.ord_to_str(ord, &mut text).is_err()
+            {
+                text.clear();
+            }
+            text
+        };
+        (first(&columns.rank_postcode), first(&columns.area_postcode))
+    }
+
+    /// The text index's segments and their document counts, in the order
+    /// the structured index numbers documents by.
+    pub(crate) fn structured_segments(&self) -> Vec<(String, u32)> {
+        self.segments
+            .iter()
+            .map(|(segment, base, end)| (segment.uuid_string(), end - base))
+            .collect()
+    }
+
+    /// A street's keys in the structured index, from its words as the parser writes
+    /// a query's street (see [`expand_street_words`]): the words that name
+    /// it, without those that only describe it, its type, a direction or a
+    /// qualifier, as a query's street requires only the former (see
+    /// [`SubjectWord::required`]). A type glued onto a name is left out
+    /// alike, so "Hauptstr", "Hauptstraße" and "Haupt Straße" key as one.
+    /// An abbreviation the parser's tables expand is keyed as its full form.
+    ///
+    /// An abbreviation of both a type and a name ("st", "dr") cannot be
+    /// read one way for every street: "Main St" is "Main Street", "St Johns"
+    /// is "Saint Johns". So a street has a second key where such a word is
+    /// left out as a type, and record and query alike are keyed both ways.
+    /// The second, when there is one, is last; empty for no words.
+    pub(crate) fn street_keys(&self, words: &[String]) -> Vec<String> {
+        street_keys_of(words, &|word| self.describes_street(word))
+    }
+
+    /// What the structured index keys of document `doc` (see [`crate::structured`]).
+    /// An address, interpolation, street or POI: the keys of each street it
+    /// is on (or is), its record, and the places it states or lies in, in
+    /// its cell. An area or a postcode: its names, in the cells of its
+    /// extent.
+    pub(crate) fn structured_keys(&self, doc: DocId) -> Result<structured::Keyed> {
+        let mut keyed = structured::Keyed::default();
+        let Some(&(segment, base, _)) = self.segments.iter().find(|(_, _, end)| doc < *end) else {
+            return Ok(keyed);
+        };
+        let Some(columns) = self.columns.get(&segment) else {
+            return Ok(keyed);
+        };
+        let doc = doc - base;
+        let Some(record_id) = columns.record_id.first(doc) else {
+            return Ok(keyed);
+        };
+        let records = self.pack.records();
+        let header_layer = records.header(record_id)?.layer;
+        if header_layer == Layer::Country {
+            return Ok(keyed);
+        }
+        let layer = structured_layer(header_layer);
+        let first = |column: &Option<StrColumn>| -> Result<String> {
+            let mut text = String::new();
+            if let Some(column) = column
+                && let Some(ord) = column.term_ords(doc).next()
+            {
+                column.ord_to_str(ord, &mut text)?;
+            }
+            Ok(text)
+        };
+        keyed.country = first(&columns.country_code)?;
+        let bound = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
+        let extent = match (
+            bound(&columns.min_lon),
+            bound(&columns.min_lat),
+            bound(&columns.max_lon),
+            bound(&columns.max_lat),
+        ) {
+            (Some(west), Some(south), Some(east), Some(north)) => Some([west, south, east, north]),
+            _ => None,
+        };
+        let record = records.record(record_id)?;
+        let postcode_keys = |postcode: &str, names: &mut Vec<String>| {
+            let Some(key) = search_key(postcode) else {
+                return;
+            };
+            names.push(key.split_whitespace().collect());
+            if key.contains(' ') {
+                names.extend(key.split_whitespace().next().map(str::to_string));
+            }
+        };
+        if layer == 0 {
+            let Some([west, south, east, north]) = extent else {
+                return Ok(keyed);
+            };
+            keyed.cells = structured::box_cells([west, south, east, north], structured::AREA_CELLS)
+                .unwrap_or_else(|| {
+                    let mut corners = vec![
+                        structured::cell(west, south),
+                        structured::cell(east, south),
+                        structured::cell(west, north),
+                        structured::cell(east, north),
+                    ];
+                    corners.sort_unstable();
+                    corners.dedup();
+                    corners
+                });
+            match &record {
+                Record::Postcode(postcode) => postcode_keys(&postcode.postcode, &mut keyed.names),
+                _ => keyed
+                    .names
+                    .extend(record.names().into_iter().filter_map(search_key)),
+            }
+            keyed.areas.extend(u32::try_from(record_id).ok());
+            keyed.names.sort_unstable();
+            keyed.names.dedup();
+            return Ok(keyed);
+        }
+        let (names, postcode): (Vec<&str>, Option<&str>) = match &record {
+            Record::Address(address) => (
+                address.address.subject().into_iter().collect(),
+                address.address.postcode.as_deref(),
+            ),
+            Record::Poi(poi) => (
+                poi.address
+                    .as_ref()
+                    .and_then(AddressComponents::subject)
+                    .into_iter()
+                    .collect(),
+                poi.address
+                    .as_ref()
+                    .and_then(|address| address.postcode.as_deref()),
+            ),
+            Record::Interpolation(interpolation) => (
+                interpolation
+                    .address
+                    .street
+                    .as_deref()
+                    .or(interpolation.address.place.as_deref())
+                    .into_iter()
+                    .collect(),
+                interpolation.address.postcode.as_deref(),
+            ),
+            Record::Street(street) => (
+                std::iter::once(&street.name)
+                    .chain(&street.alt_names)
+                    .map(String::as_str)
+                    .collect(),
+                None,
+            ),
+            _ => (Vec::new(), None),
+        };
+        for name in names {
+            let mut words = expand_street_words(&Tokens::new(name).words);
+            expand_final_direction(&mut words);
+            let keys = self.street_keys(&words);
+            keyed.second_keys += u64::from(keys.len() > 1);
+            if let Some(canonical) = keys.last()
+                && !keyed.canonical.contains(canonical)
+            {
+                keyed.canonical.push(canonical.clone());
+            }
+            for key in keys {
+                if !keyed.streets.contains(&key) {
+                    keyed.streets.push(key);
+                }
+            }
+        }
+        if keyed.streets.is_empty() {
+            return Ok(keyed);
+        }
+        let [lon, lat] = extent.map_or([0, 0], extent_middle);
+        keyed.cell = structured::cell(lon, lat);
+        if (lon, lat) == (0, 0) {
+            return Ok(keyed);
+        }
+        keyed.cells = match (header_layer, extent) {
+            (Layer::Street, Some(extent)) => structured::box_cells(extent, STREET_CELLS)
+                .unwrap_or_else(|| vec![structured::cell(lon, lat)]),
+            _ => vec![structured::cell(lon, lat)],
+        };
+        let areas = self.record_areas(record_id, &record)?;
+        keyed.names.extend(areas.localities.iter().cloned());
+        keyed.names.extend(areas.regions.iter().cloned());
+        if let Some(postcode) = postcode {
+            postcode_keys(postcode, &mut keyed.names);
+        }
+        keyed.names.sort_unstable();
+        keyed.names.dedup();
+        keyed.names.retain(|name| !name.is_empty());
+        keyed.areas = areas
+            .chain
+            .iter()
+            .filter_map(|id| u32::try_from(*id).ok())
+            .collect();
+        Ok(keyed)
+    }
+
+    /// Every area name key and region key the parser's dictionaries list,
+    /// with the areas it names.
+    pub(crate) fn area_names(&self) -> Vec<(String, Vec<u32>)> {
+        self.tagger.dictionaries().area_lists()
     }
 
     /// Search `readings[range]` into `pool`, best first, each search only
@@ -1892,11 +3859,15 @@ impl TextSearcher {
         query_text: &str,
         context: &[ContextPart],
         parses: Parses,
-    ) -> Result<(Vec<QueryPlan>, Vec<f32>, Option<Explanation>)> {
+    ) -> Result<Readings> {
         let mut plans = Vec::<QueryPlan>::new();
         let mut scores = Vec::<f32>::new();
-        let (parsed, explanation) = self.tagger.parse_explained(query_text);
-        for parsed in parsed {
+        let mut pieces = Vec::<Vec<Tagged>>::new();
+        let (parsed, explanation) = self
+            .tagger
+            .parse_explained_n(query_text, STRUCTURED_READINGS);
+        let mut from_text = Vec::<bool>::new();
+        for (index, parsed) in parsed.into_iter().enumerate() {
             if let Some(plan) =
                 QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, context, |word| {
                     self.tagger.dictionaries().describes_street(word)
@@ -1905,6 +3876,8 @@ impl TextSearcher {
             {
                 plans.push(plan);
                 scores.push(parsed.score);
+                pieces.push(parsed.pieces);
+                from_text.push(index < lattice::N_BEST);
             }
         }
         if parses == Parses::Numbered
@@ -1912,13 +3885,18 @@ impl TextSearcher {
                 .first()
                 .is_some_and(|plan| plan.house_number.is_some())
         {
-            (plans, scores) = plans
-                .into_iter()
-                .zip(scores)
-                .filter(|(plan, _)| plan.house_number.is_some())
-                .unzip();
+            let kept = plans
+                .iter()
+                .map(|plan| plan.house_number.is_some())
+                .collect::<Vec<_>>();
+            let keep = |index: usize| kept[index];
+            plans = filter_by(plans, keep);
+            scores = filter_by(scores, keep);
+            pieces = filter_by(pieces, keep);
+            from_text = filter_by(from_text, keep);
         }
-        Ok((plans, scores, explanation))
+        let text_count = from_text.iter().take_while(|from| **from).count();
+        Ok((plans, scores, pieces, explanation, text_count))
     }
 
     /// Score each distinct record of `pool` by how well the parser reads
@@ -1975,7 +3953,8 @@ impl TextSearcher {
         limit: usize,
     ) -> Result<Vec<TextSearchHit>> {
         let session = Session::new(self.budget);
-        let (plans, _, _) = self.readings(query_text, context, Parses::All)?;
+        let (mut plans, _, _, _, text_count) = self.readings(query_text, context, Parses::All)?;
+        plans.truncate(text_count);
         let query_words = QueryWords::new(query_text);
         let no_places = HashSet::new();
         for plan in &plans {
@@ -2096,92 +4075,28 @@ impl TextSearcher {
         accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(Vec<TextSearchHit>, Vec<TextSearchHit>)> {
         let pass = scope.pass();
-        let ranking = Ranking {
-            query_words: query_words.clone(),
-            house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
-            number_text: plan.house_number.as_ref().map(|number| number.text.clone()),
-            flat_text: plan
-                .house_number
-                .as_ref()
-                .zip(plan.unit.as_deref())
-                .map(|(number, unit)| number.flat_text(unit)),
-            unit: plan.unit.clone().or_else(|| {
-                let number = plan.house_number.as_ref()?;
-                Some(number.text.split_once(' ')?.0.to_string())
-            }),
-            numbered: plan.house_number.is_some(),
-            postcode: self.query_postcode(plan)?,
-            focus,
-            sought: plan
-                .subject
-                .iter()
-                .map(|word| Word {
-                    text: word.text.clone(),
-                    corrected: word.corrected.clone(),
-                })
-                .chain(plan.unplaced.iter().cloned())
-                .collect(),
-        };
-        let localities = plan
-            .context
-            .iter()
-            .filter(|part| part.label == Label::Locality)
-            .collect::<Vec<_>>();
-        let areas = AreaWords {
-            known: self.known_area_words(localities.iter().flat_map(|part| &part.words))?,
-            postcodes: self.postcode_weights(&plan.area_terms())?,
-            stand_ins: self.stand_in_weights(plan)?,
-        };
+        let ranking = self.plan_ranking(plan, query_words, focus, self.query_postcode(plan)?);
         // Every stated locality, known or not, for what the hits rest on.
         let postcode =
             (!ranking.postcode.forms.is_empty()).then_some(ranking.postcode.exact.as_str());
-        let mut localities_stated = Vec::with_capacity(localities.len());
-        for part in &localities {
-            localities_stated.push(self.stated_area(part, &areas.known, postcode)?);
-        }
+        let (known, localities_stated) = self.localities_stated(plan, postcode)?;
+        let areas = AreaWords {
+            known,
+            postcodes: self.postcode_weights(&plan.area_terms())?,
+            stand_ins: self.stand_in_weights(plan)?,
+        };
         let stated = if pass.requires_locality() {
             Vec::new()
         } else {
             localities_stated.iter().flatten().cloned().collect()
         };
-        let places = self.stated_places(&plan.context);
-        // A country the query names narrows retrieval as a filter would, so
-        // the rank window holds its records and not a namesake abroad.
-        let countries = places
-            .countries
-            .iter()
-            .map(|country| country.as_str().to_string())
-            .collect::<Vec<_>>();
-        let filters = match filters.countries.is_empty() {
-            true => Filters {
-                countries: &countries,
-                ..*filters
-            },
-            false => *filters,
-        };
-        // A word of a country the Pack knows is held to that country, not to
-        // the names of the hit's areas: "ES" read first as a locality and
-        // then as Spain is Spain.
-        let relabelled = plan
-            .context
-            .iter()
-            .filter(|part| !matches!(part.label, Label::Locality | Label::Postcode))
-            .flat_map(|part| &part.words)
-            .filter(|word| placed.contains(*word) && !places.country_words.contains(word))
-            .cloned();
-        let unplaced = match plan.subject.is_empty() {
-            true => HashSet::new(),
-            false => self.known_area_words(plan.unplaced.iter().map(|word| &word.text))?,
-        };
-        let mut loose = unplaced.into_iter().chain(relabelled).collect::<Vec<_>>();
-        loose.sort();
-        loose.dedup();
+        let checks = self.plan_checks(plan, placed, stated)?;
+        let filters = checks.filters(filters);
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
-            Ok(filters.admit(hit)
-                && self.region_agreement(hit, &places, session)? != Some(false)
-                && self.area_agreement(hit, &stated, &ranking.postcode, session)? != Some(false)
-                && self.in_loose_areas(hit, &loose, session)?
-                && accept(session, plan, &ranking.postcode, hit)?)
+            Ok(
+                self.kept(&checks, &filters, hit, &ranking.postcode, session)?
+                    && accept(session, plan, &ranking.postcode, hit)?,
+            )
         };
         let query = self.build_query(plan, pass, &filters, &areas)?;
         let mut candidates = self.ranked_hits(&query, &ranking, limit, &mut keep)?;
@@ -2201,6 +4116,149 @@ impl TextSearcher {
         {
             candidates.insert(0, estimate);
         }
+        self.judged(
+            plan,
+            scope,
+            &ranking,
+            &localities_stated,
+            candidates,
+            session,
+            limit,
+        )
+    }
+
+    /// What a search's ranking reads of `plan`: its words, number, unit
+    /// and `postcode`, and the caller's `focus`.
+    fn plan_ranking(
+        &self,
+        plan: &QueryPlan,
+        query_words: &QueryWords,
+        focus: Option<[f64; 2]>,
+        postcode: QueryPostcode,
+    ) -> Ranking {
+        Ranking {
+            query_words: query_words.clone(),
+            house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
+            number_text: plan.house_number.as_ref().map(|number| number.text.clone()),
+            flat_text: plan
+                .house_number
+                .as_ref()
+                .zip(plan.unit.as_deref())
+                .map(|(number, unit)| number.flat_text(unit)),
+            unit: plan.unit.clone().or_else(|| {
+                let number = plan.house_number.as_ref()?;
+                Some(number.text.split_once(' ')?.0.to_string())
+            }),
+            numbered: plan.house_number.is_some(),
+            postcode,
+            focus,
+            sought: plan
+                .subject
+                .iter()
+                .map(|word| Word {
+                    text: word.text.clone(),
+                    corrected: word.corrected.clone(),
+                })
+                .chain(plan.unplaced.iter().cloned())
+                .collect(),
+        }
+    }
+
+    /// The words of `plan`'s localities the Pack knows, and each locality
+    /// as stated (see [`Self::stated_area`]), `None` for one it knows no
+    /// word of. `postcode`, as the postcode field indexes it, lets a stated
+    /// town be its postal town.
+    fn localities_stated(
+        &self,
+        plan: &QueryPlan,
+        postcode: Option<&str>,
+    ) -> Result<(HashSet<String>, Vec<Option<StatedArea>>)> {
+        let localities = plan
+            .context
+            .iter()
+            .filter(|part| part.label == Label::Locality)
+            .collect::<Vec<_>>();
+        let known = self.known_area_words(localities.iter().flat_map(|part| &part.words))?;
+        let mut stated = Vec::with_capacity(localities.len());
+        for part in &localities {
+            stated.push(self.stated_area(part, &known, postcode)?);
+        }
+        Ok((known, stated))
+    }
+
+    /// What every hit of a search of `plan` is checked against (see
+    /// [`Self::kept`]): the countries and regions it names, the localities
+    /// in `stated`, and the words it states without requiring them.
+    fn plan_checks(
+        &self,
+        plan: &QueryPlan,
+        placed: &HashSet<String>,
+        stated: Vec<StatedArea>,
+    ) -> Result<Checks> {
+        let places = self.stated_places(&plan.context);
+        // A country the query names narrows retrieval as a filter would, so
+        // the rank window holds its records and not a namesake abroad.
+        let countries = places
+            .countries
+            .iter()
+            .map(|country| country.as_str().to_string())
+            .collect::<Vec<_>>();
+        // A word of a country the Pack knows is held to that country, not to
+        // the names of the hit's areas: "ES" read first as a locality and
+        // then as Spain is Spain.
+        let relabelled = plan
+            .context
+            .iter()
+            .filter(|part| !matches!(part.label, Label::Locality | Label::Postcode))
+            .flat_map(|part| &part.words)
+            .filter(|word| placed.contains(*word) && !places.country_words.contains(word))
+            .cloned();
+        let unplaced = match plan.subject.is_empty() {
+            true => HashSet::new(),
+            false => self.known_area_words(plan.unplaced.iter().map(|word| &word.text))?,
+        };
+        let mut loose = unplaced.into_iter().chain(relabelled).collect::<Vec<_>>();
+        loose.sort();
+        loose.dedup();
+        Ok(Checks {
+            places,
+            stated,
+            loose,
+            countries,
+        })
+    }
+
+    /// Whether `hit` passes `filters` and lies where `checks` say: not in
+    /// another country or region, nor in another of the stated localities,
+    /// and in the areas of the loose words.
+    fn kept(
+        &self,
+        checks: &Checks,
+        filters: &Filters<'_>,
+        hit: &TextSearchHit,
+        postcode: &QueryPostcode,
+        session: &Session,
+    ) -> Result<bool> {
+        Ok(filters.admit(hit)
+            && self.region_agreement(hit, &checks.places, session)? != Some(false)
+            && self.area_agreement(hit, &checks.stated, postcode, session)? != Some(false)
+            && self.in_loose_areas(hit, &checks.loose, session)?)
+    }
+
+    /// `candidates`, ranked hits of a search of `plan` in `scope`, each with
+    /// the [`Features`] of what found it, at most `limit`; apart from them
+    /// those whose own postcode or street contradicts the plan.
+    #[allow(clippy::too_many_arguments)]
+    fn judged(
+        &self,
+        plan: &QueryPlan,
+        scope: Scope,
+        ranking: &Ranking,
+        localities_stated: &[Option<StatedArea>],
+        candidates: Vec<TextSearchHit>,
+        session: &Session,
+        limit: usize,
+    ) -> Result<(Vec<TextSearchHit>, Vec<TextSearchHit>)> {
         let sought = plan
             .subject
             .iter()
@@ -2264,7 +4322,7 @@ impl TextSearcher {
             features.unit = plan
                 .unit
                 .as_ref()
-                .map(|_| unit_rank(&hit.record, &ranking) == 0);
+                .map(|_| unit_rank(&hit.record, ranking) == 0);
             features.dropped_words = count(sought.iter().filter(|(text, corrected)| {
                 !label.iter().any(|label| {
                     label == *text
@@ -2591,8 +4649,13 @@ impl TextSearcher {
     }
 
     fn read_areas(&self, record_id: RecordId) -> Result<RecordAreas> {
+        let record = self.pack.records().record(record_id)?;
+        self.record_areas(record_id, &record)
+    }
+
+    fn record_areas(&self, record_id: RecordId, record: &Record) -> Result<RecordAreas> {
         let mut areas = RecordAreas::default();
-        match self.pack.records().record(record_id)? {
+        match record {
             Record::Address(AddressRecord { address, .. })
             | Record::Poi(PoiRecord {
                 address: Some(address),
@@ -2629,6 +4692,7 @@ impl TextSearcher {
             if !(region || below_region) {
                 continue;
             }
+            areas.chain.push(entry.record_id);
             let Some(record) = self.pack.context_record(entry.record_id)? else {
                 continue;
             };
@@ -2713,6 +4777,15 @@ impl TextSearcher {
     /// the code it starts with, when the Pack holds that: "45415-3457", a
     /// ZIP+4, is the 45415 its addresses state.
     fn query_postcode(&self, plan: &QueryPlan) -> Result<QueryPostcode> {
+        let mut postcode = self.query_postcode_unplaced(plan)?;
+        if !postcode.forms.is_empty() {
+            postcode.areas = self.postcode_areas(&postcode.exact)?;
+        }
+        Ok(postcode)
+    }
+
+    /// [`Self::query_postcode`] before it is placed.
+    fn query_postcode_unplaced(&self, plan: &QueryPlan) -> Result<QueryPostcode> {
         let mut postcode = plan.postcode();
         if postcode.forms.is_empty() {
             return Ok(postcode);
@@ -2725,7 +4798,6 @@ impl TextSearcher {
         {
             postcode = QueryPostcode::of(&[first.to_string()]);
         }
-        postcode.areas = self.postcode_areas(&postcode.exact)?;
         Ok(postcode)
     }
 
@@ -2989,12 +5061,6 @@ impl TextSearcher {
             .saturating_mul(RANK_WINDOW_FACTOR)
             .min(MAX_RANK_WINDOW)
             .max(limit);
-        let query_words = ranking
-            .query_words
-            .search
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
         // Collected by text score alone, so the index skips the documents
         // that cannot make the window (block-max WAND), and only the window
         // is keyed: a house number's term, a range's and a postcode's are
@@ -3011,6 +5077,18 @@ impl TextSearcher {
         if tie(&scored, window) && window < TIE_WINDOW {
             scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
         }
+        let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
+        top_docs.truncate(window);
+        self.rank_documents(&searcher, top_docs, ranking, limit, accept)
+    }
+
+    /// Each scored document with its [`RankKey`], best first.
+    fn keyed_documents(
+        &self,
+        searcher: &Searcher,
+        scored: Vec<(Score, DocAddress)>,
+        ranking: &Ranking,
+    ) -> Result<Vec<(RankKey, DocAddress)>> {
         let keys = RankKeys {
             ranking,
             columns: &self.columns,
@@ -3030,7 +5108,25 @@ impl TextSearcher {
         top_docs.sort_by(|(left, _), (right, _)| {
             right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
         });
-        top_docs.truncate(window);
+        Ok(top_docs)
+    }
+
+    /// The best `limit` hits of `top_docs`, keyed documents best first, that
+    /// `accept` keeps, ranked by [`RankKey`] and equal keys by [`TieBreak`].
+    fn rank_documents(
+        &self,
+        searcher: &Searcher,
+        top_docs: Vec<(RankKey, DocAddress)>,
+        ranking: &Ranking,
+        limit: usize,
+        accept: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let query_words = ranking
+            .query_words
+            .search
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         // Without a house number no document is left out for its number, so
         // once `limit` hits are kept only the documents that tie the last of
         // them need hydrating. The cutoff is the last kept hit's, not the
@@ -3047,8 +5143,8 @@ impl TextSearcher {
             {
                 break;
             }
-            let (first, count) = self.document_records(&searcher, doc)?;
-            let country = self.document_country(&searcher, doc)?;
+            let (first, count) = self.document_records(searcher, doc)?;
+            let country = self.document_country(searcher, doc)?;
             for record_id in self.hit_records(first, count, ranking)? {
                 let mut record = self.pack.record_summary(record_id)?;
                 if let Some(number) = ranking.house_number
@@ -3307,7 +5403,7 @@ impl TextSearcher {
             .values_for_doc(doc.doc_id)
             .next()
             .ok_or_else(|| {
-                Error::Inconsistent("text index hit is missing fast record_id".into())
+                Error::Inconsistent("text index hit is missing structured record_id".into())
             })?;
         let count = columns.record_count.first(doc.doc_id).unwrap_or(1);
         Ok((record_id, count))
@@ -3430,6 +5526,21 @@ impl TextSearcher {
             return Ok(None);
         };
         let (lower, higher) = self.neighbours(plan, pass, ranking, areas, number)?;
+        self.place_between(number, &lower, &higher, NEIGHBOUR_STREET_RADIUS_M)
+    }
+
+    /// `number` placed between the nearest of its neighbours `lower` and
+    /// `higher` (see [`Self::place_between_neighbours`]), each of them and
+    /// the point within `setback_m` of their road: [`ROAD_SETBACK_M`] for
+    /// the documents of a road inside the named places, the nearer
+    /// [`NEIGHBOUR_STREET_RADIUS_M`] for those a text search finds anywhere.
+    fn place_between(
+        &self,
+        number: u32,
+        lower: &[Neighbour],
+        higher: &[Neighbour],
+        setback_m: f64,
+    ) -> Result<Option<TextSearchHit>> {
         if lower.is_empty() {
             return Ok(None);
         }
@@ -3437,7 +5548,16 @@ impl TextSearcher {
         let mut pairs = lower
             .iter()
             .flat_map(|low| higher.iter().map(move |high| (low, high)))
-            .filter(|(low, high)| low.street == high.street)
+            .filter(|(low, high)| {
+                low.street == high.street
+                    || road::same_road_near(
+                        &low.street,
+                        low.point,
+                        &high.street,
+                        high.point,
+                        road::ROAD_LINK_M,
+                    )
+            })
             .collect::<Vec<_>>();
         pairs.sort_by_key(|(low, high)| {
             (
@@ -3452,9 +5572,11 @@ impl TextSearcher {
             for neighbour in [low, high] {
                 let on = match on_street.entry(neighbour.record_id) {
                     Entry::Occupied(entry) => *entry.get(),
-                    Entry::Vacant(entry) => {
-                        *entry.insert(self.on_named_street(neighbour.point, &neighbour.street)?)
-                    }
+                    Entry::Vacant(entry) => *entry.insert(self.on_road(
+                        neighbour.point,
+                        &neighbour.street,
+                        setback_m,
+                    )?),
                 };
                 neighbours_on_street &= on;
             }
@@ -3466,7 +5588,7 @@ impl TextSearcher {
                 low.point[0] + fraction * (high.point[0] - low.point[0]),
                 low.point[1] + fraction * (high.point[1] - low.point[1]),
             ];
-            if self.on_named_street(point, &low.street)? {
+            if self.on_road(point, &low.street, setback_m)? {
                 return Ok(Some(self.neighbour_estimate(number, low, high, point)?));
             }
         }
@@ -3491,10 +5613,27 @@ impl TextSearcher {
             &BooleanQuery::new(clauses),
             &TopDocs::with_limit(NEIGHBOUR_DOCUMENTS),
         )?;
+        self.neighbours_of(
+            &searcher,
+            docs.into_iter().map(|(_, doc)| doc).collect(),
+            ranking,
+            number,
+        )
+    }
+
+    /// The stated house numbers of `docs` nearest `number` (see
+    /// [`Self::neighbours`]).
+    fn neighbours_of(
+        &self,
+        searcher: &Searcher,
+        docs: Vec<DocAddress>,
+        ranking: &Ranking,
+        number: u32,
+    ) -> Result<(Vec<Neighbour>, Vec<Neighbour>)> {
         let mut lower = Vec::new();
         let mut higher = Vec::new();
-        for (_, doc) in docs {
-            let columns = self.segment_columns(&searcher, doc.segment_ord)?;
+        for doc in docs {
+            let columns = self.segment_columns(searcher, doc.segment_ord)?;
             let postcodes = |column: &Option<StrColumn>| -> Result<Vec<String>> {
                 let Some(column) = column else {
                     return Ok(Vec::new());
@@ -3524,7 +5663,7 @@ impl TextSearcher {
                     side.push((base, record_id, postcode_agreement));
                 }
             };
-            let (first, count) = self.document_records(&searcher, doc)?;
+            let (first, count) = self.document_records(searcher, doc)?;
             match self.pack.records().record(first)? {
                 Record::Address(_) => {
                     self.pack
@@ -3618,6 +5757,28 @@ impl TextSearcher {
         Ok(false)
     }
 
+    /// Whether a street record of the road `street` names (see
+    /// [`road::same_road`]) passes within `within_m` of `point`: the
+    /// sources of a Pack spell one road differently.
+    fn on_road(&self, [lon, lat]: [f64; 2], street: &str, within_m: f64) -> Result<bool> {
+        let Some(road) = road::RoadName::of(street) else {
+            return Ok(false);
+        };
+        let mut seen = HashSet::new();
+        for candidate in self
+            .spatial
+            .segment_candidates(lon, lat, Layer::Street, within_m, 0)?
+        {
+            if seen.insert(candidate.record_id)
+                && road::RoadName::of(&self.pack.records().summary(candidate.record_id)?.name)
+                    .is_some_and(|other| other.same_road(&road))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The hit for `number` placed at `point` between `low` and `high`,
     /// labelled like the nearer of the two with the number in its place. It
     /// stands on the nearer record for the context checks of a geocoded row.
@@ -3684,6 +5845,8 @@ impl TextSearcher {
 struct RecordAreas {
     regions: Vec<String>,
     localities: Vec<String>,
+    /// The areas of its chain these names come from.
+    chain: Vec<RecordId>,
 }
 
 impl RecordAreas {
@@ -4419,18 +6582,611 @@ impl Evidence {
 }
 
 /// A reading of the query searched as one plan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Reading {
     text: String,
     plan: QueryPlan,
     /// The parser's score of the labelling it plans.
     score: f32,
+    /// The query's words with the labels of that labelling.
+    pieces: Vec<Tagged>,
+}
+
+/// The plans of a query's readings, the parser's score and labelled words
+/// of each, and the explanation of the best.
+type Readings = (
+    Vec<QueryPlan>,
+    Vec<f32>,
+    Vec<Vec<Tagged>>,
+    Option<Explanation>,
+    usize,
+);
+
+/// The items of `items` whose index `keep` keeps.
+fn filter_by<T>(items: Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<T> {
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| keep(*index))
+        .map(|(_, item)| item)
+        .collect()
 }
 
 /// Searches one query runs at most, whatever its budget: the readings, each
 /// in and out of its localities and with the base of its house number, and
 /// then the same with their streets trimmed.
 const MAX_SEARCHES: usize = 16;
+
+thread_local! {
+    /// What the best reading of the query being searched names, for
+    /// [`choose::Named::choose`].
+    static NAMED: RefCell<Option<choose::Named>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What the structured stage made of the last query it weighed, for tests.
+    static LAST_STRUCTURED: Cell<StructuredTrace> = const {
+        Cell::new(StructuredTrace {
+            answered: false,
+            support: 0,
+            gap: f32::NAN,
+        })
+    };
+}
+
+/// Whether the structured stage answered the last query it weighed, and its best
+/// candidate's place support and gap to the parser's best reading.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct StructuredTrace {
+    answered: bool,
+    support: usize,
+    gap: f32,
+}
+
+/// Documents of the structured index's matching keys a structured-stage search ranks at
+/// most. A street that common needs the text search's ranking to choose.
+const STRUCTURED_CANDIDATES: usize = 4_000;
+
+/// Of `docs`, ids across the index and sorted, those from `base` to `end`,
+/// as ids in their segment.
+fn segment_docs(docs: &[DocId], base: DocId, end: DocId) -> Vec<DocId> {
+    let from = docs.partition_point(|doc| *doc < base);
+    let to = docs.partition_point(|doc| *doc < end);
+    docs[from..to].iter().map(|doc| doc - base).collect()
+}
+
+/// `query` as the parser should read it. A run of two or more words written
+/// twice in a row is read once ("191 Beaufort Street 191 Beaufort Street").
+/// Words glued across letters and digits ("Choranche2865") or a lower and
+/// an upper case letter ("EmbarcadèreRue") are split where each side is a
+/// word of its own: three letters or more before a digit, four or more
+/// after one, four or more lower case before an upper case letter, so a
+/// postcode ("T5H"), an ordinal ("18th"), a suffix ("116bis") or a name
+/// such as "DeKalb" stays whole. A replacement character is dropped, and
+/// typo tolerance reads the word it broke as one letter short.
+fn clean_query(query: &str) -> String {
+    let query = query.replace('\u{fffd}', "");
+    let mut words = Vec::<String>::new();
+    for word in query.split_whitespace() {
+        let characters = word.chars().collect::<Vec<_>>();
+        let mut piece = String::new();
+        for (at, &character) in characters.iter().enumerate() {
+            if at > 0 {
+                let before = characters[at - 1];
+                let run_before = characters[..at]
+                    .iter()
+                    .rev()
+                    .take_while(|character| character.is_alphabetic())
+                    .count();
+                let run_after = characters[at..]
+                    .iter()
+                    .take_while(|character| character.is_alphabetic())
+                    .count();
+                let lower_before = characters[..at]
+                    .iter()
+                    .rev()
+                    .take_while(|character| character.is_lowercase())
+                    .count();
+                // Hangul and the scripts written without spaces glue numbers
+                // into names ("달구벌대로530길"): only a word of a spaced
+                // alphabet is split from a digit.
+                let spaced = |character: char| {
+                    use unicode_script::{Script, UnicodeScript};
+                    !lattice::is_unspaced(character) && character.script() != Script::Hangul
+                };
+                let split = (before.is_alphabetic()
+                    && spaced(before)
+                    && character.is_ascii_digit()
+                    && run_before >= 3)
+                    || (before.is_ascii_digit()
+                        && character.is_alphabetic()
+                        && spaced(character)
+                        && run_after >= 4)
+                    || (before.is_lowercase() && character.is_uppercase() && lower_before >= 4);
+                if split && !piece.is_empty() {
+                    words.push(std::mem::take(&mut piece));
+                }
+            }
+            piece.push(character);
+        }
+        if !piece.is_empty() {
+            words.push(piece);
+        }
+    }
+    let key = |word: &String| {
+        word.chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let mut at = 0;
+    while at < words.len() {
+        let longest = (words.len() - at) / 2;
+        let repeated = (2..=longest).rev().find(|&len| {
+            (0..len).all(|offset| {
+                let word = key(&words[at + offset]);
+                !word.is_empty() && word == key(&words[at + len + offset])
+            })
+        });
+        match repeated {
+            Some(len) => {
+                words.drain(at + len..at + 2 * len);
+            }
+            None => at += 1,
+        }
+    }
+    words.join(" ")
+}
+
+/// A word the parser thinks names a place at least this likely is read as
+/// one: below it, a footprint lookup costs more than the word can add.
+const PLACE_FLOOR: f32 = 0.1;
+/// Areas of one reading answered when no street is found, at most.
+const AREA_ANSWERS: usize = 8;
+/// Readings of a query the structured stage tries, best first: more than the text
+/// search's, as each costs it only structured index lookups.
+const STRUCTURED_READINGS: usize = 5;
+/// Spots a reading's candidates are explained in at most, the best by
+/// support and number form: each costs a Pack record and a decode.
+const STRUCTURED_SPOTS: usize = 8;
+/// Hits a search gathers to choose its answers among, whatever it returns.
+const CHOOSER_HITS: usize = 10;
+/// Address points of a spot kept for its street answer.
+const SPOT_POINTS: usize = 256;
+/// A street answer's point is the centre of the disk of this radius that
+/// holds the most of the street's address points: an answer within 100 m
+/// is the goal, and that disk's centre is likeliest to be.
+const STREET_DISK_M: f64 = 100.0;
+/// Weight of each place word holding a candidate in its score, on the
+/// parser's scale. Chosen with [`STRUCTURED_DELTA`] and
+/// [`STRUCTURED_MIN_FORM`] so the structured stage answers as often as it
+/// can while its answers are as often within 100 m and 600 m as the text
+/// search's, and seldom in a town the query does not name.
+const STRUCTURED_W: f32 = 8.00;
+/// The coarsest answer type the structured stage answers with, chosen with
+/// [`STRUCTURED_W`]: coarser ones (a street, a postcode, a town or a region
+/// alone) are left to the text search.
+const STRUCTURED_MIN_FORM: u8 = 4;
+/// The least lead of [`P_STRUCTURED`] over [`P_TEXT`] the structured stage answers
+/// with. Chosen with [`STRUCTURED_W`].
+const STRUCTURED_DELTA: f32 = -0.02;
+/// Inputs of the hand-off models, [`structured_features`].
+const FEATURES: usize = 19;
+/// A margin larger than this says no more.
+const MARGIN_CAP: f32 = 30.0;
+/// Logistic model, intercept first, of whether the structured answer is within
+/// 100 m of the truth; fit with [`STRUCTURED_W`].
+const P_STRUCTURED: [f32; FEATURES + 1] = [
+    -1.09688,
+    1.46787,
+    0.667334,
+    -0.0810829,
+    0.370718,
+    0.256462,
+    -0.274775,
+    -3.07266,
+    -3.1685,
+    -6.63367,
+    0.00502387,
+    -1.11694,
+    -0.103215,
+    0.0490169,
+    0.0940121,
+    -1.193,
+    0.0575686,
+    -0.0909365,
+    -0.110694,
+    -0.000170834,
+];
+/// The same of the text search's answer.
+const P_TEXT: [f32; FEATURES + 1] = [
+    -0.171209, 0.889543, 0.330719, -0.515181, 0.00348658, -0.398113, -0.715066, -1.04156, -1.86512,
+    -1.13006, -0.412767, -1.01375, -0.260571, 0.0460241, 0.0421718, -0.324983, -0.0255055,
+    -0.0191589, -0.0539111, 0.0151013,
+];
+/// A place kept only as its extent is read through for support only when
+/// it holds at most this many documents of the street.
+const EXTENT_READ: usize = 4_000;
+/// Cells a street is looked for in by its words at most.
+const MATCH_CELLS: usize = 1_024;
+/// Streets found by their words that are read at most.
+const MATCHED_STREETS: usize = 16;
+/// Survivors farther than this from the best are another spot: the structured
+/// tier cannot tell which the query means.
+const SPOT_M: f64 = 200.0;
+/// A place name shorter than this is not read one edit off: most short
+/// names are that near several others.
+const FUZZY_PLACE_CHARS: usize = 4;
+/// A street record adds the cells of its extent to the streets of each,
+/// up to this many; a longer one only its middle.
+const STREET_CELLS: usize = 64;
+
+/// What one query's structured stage reads.
+struct StructuredContext<'a, 'b> {
+    structured: &'a StructuredIndex,
+    readings: &'a [Reading],
+    /// The readings the parser gave, before the trimmed ones.
+    parsed: usize,
+    search: &'a Search<'b>,
+    session: &'a Session,
+    /// The query's lattice, to score each candidate against the whole query.
+    explanation: Option<&'a Explanation>,
+    /// Per query word, the parser's probability that it names a place.
+    probabilities: Vec<f32>,
+}
+
+/// One spot's best record of a reading, hydrated (see
+/// [`TextSearcher::structured_reading`]).
+struct StructuredFound {
+    hit: TextSearchHit,
+    point: [f64; 2],
+    /// How many of the reading's place words hold it.
+    support: usize,
+    form: u8,
+    reading: usize,
+    /// street or place: what found the street.
+    entry: &'static str,
+    /// The changes that found it, `LEVER_*` bits.
+    lever: u8,
+}
+
+/// A structured index document ranked for its spot before any Pack record is read.
+struct Keyed {
+    /// Support, number form, whether it is the street's own record, and
+    /// postcode agreement: larger is better.
+    order: (usize, u8, bool, u8),
+    doc: DocId,
+    base: bool,
+    address: bool,
+    point: [f64; 2],
+}
+
+/// The candidates of one reading within [`SPOT_M`] of the best of them.
+struct Spot {
+    head: Keyed,
+    docs: Vec<DocId>,
+    /// Address points, at most [`SPOT_POINTS`].
+    points: Vec<[f64; 2]>,
+}
+
+/// A candidate with its gap and score (see
+/// [`TextSearcher::structured_explained`]).
+struct Scored {
+    gap: f32,
+    score: f32,
+    found: StructuredFound,
+}
+
+/// The candidates of a structured stage, explained (see
+/// [`TextSearcher::structured_explained`]).
+struct StructuredExplained {
+    /// Best score first.
+    scored: Vec<Scored>,
+    /// The best score in a spot other than the best's, `-inf` when none.
+    second: f32,
+    spots: usize,
+}
+
+/// How the structured index tells a record's layer apart: an address, an
+/// interpolation, a street or a POI, else 0.
+fn structured_layer(layer: Layer) -> u8 {
+    match layer {
+        Layer::Address => structured::LAYER_ADDRESS,
+        Layer::Interpolation => structured::LAYER_INTERPOLATION,
+        Layer::Street => structured::LAYER_STREET,
+        Layer::Poi => structured::LAYER_POI,
+        Layer::Country
+        | Layer::Region
+        | Layer::District
+        | Layer::Locality
+        | Layer::Neighbourhood
+        | Layer::Place
+        | Layer::Postcode => 0,
+    }
+}
+
+/// The middle of `[west, south, east, north]`.
+fn extent_middle([west, south, east, north]: [i32; 4]) -> [i32; 2] {
+    [
+        ((i64::from(west) + i64::from(east)) / 2) as i32,
+        ((i64::from(south) + i64::from(north)) / 2) as i32,
+    ]
+}
+
+/// Answer types, better first by value.
+const FORM_EXACT: u8 = 8;
+const FORM_RANGE_START: u8 = 7;
+const FORM_RANGE: u8 = 6;
+const FORM_INTERPOLATION: u8 = 5;
+const FORM_NEIGHBOUR: u8 = 4;
+const FORM_STREET: u8 = 3;
+const FORM_POSTCODE: u8 = 2;
+/// A locality, district, neighbourhood or place.
+const FORM_TOWN: u8 = 1;
+const FORM_REGION: u8 = 0;
+
+/// What found a structured answer, which the hand-off models weigh: a street by
+/// its words (A), a number the plan once dropped (C), a street the parser's
+/// dictionary lacks (D), a street answer (F), an answer placed on its side
+/// or the street's for a number it lacks (G).
+const LEVER_A: u8 = 1;
+const LEVER_C: u8 = 4;
+const LEVER_D: u8 = 8;
+const LEVER_F: u8 = 16;
+const LEVER_G: u8 = 32;
+/// The finest area the query names, when no street answers.
+const LEVER_T: u8 = 64;
+
+/// Inputs of the two hand-off models (see [`P_STRUCTURED`]), in order: one per
+/// answer type exact, range-start, range, interpolation, neighbour,
+/// street, postcode, town and region; levers A, C and D; the gap; the margin, at most
+/// [`MARGIN_CAP`]; whether one spot alone was found; support, spots and
+/// reading index; the log of one more than the documents read.
+#[allow(clippy::too_many_arguments)]
+fn structured_features(
+    form: u8,
+    lever: u8,
+    gap: f32,
+    margin: f32,
+    support: usize,
+    reading: usize,
+    spots: usize,
+    candidates: usize,
+) -> [f32; FEATURES] {
+    let flag = |on: bool| f32::from(u8::from(on));
+    [
+        flag(form == FORM_EXACT),
+        flag(form == FORM_RANGE_START),
+        flag(form == FORM_RANGE),
+        flag(form == FORM_INTERPOLATION),
+        flag(form == FORM_NEIGHBOUR),
+        flag(form == FORM_STREET),
+        flag(form == FORM_POSTCODE),
+        flag(form == FORM_TOWN),
+        flag(form == FORM_REGION),
+        flag(lever & LEVER_A != 0),
+        flag(lever & LEVER_C != 0),
+        flag(lever & LEVER_D != 0),
+        gap.clamp(-50.0, 10.0),
+        margin.min(MARGIN_CAP),
+        flag(margin.is_infinite()),
+        (support as f32 / 1000.0).min(8.0),
+        spots.min(8) as f32,
+        reading as f32,
+        (1.0 + candidates as f32).ln(),
+    ]
+}
+
+/// The probability a logistic model of `weights` (intercept first) gives
+/// `features`.
+fn logistic(weights: &[f32; FEATURES + 1], features: &[f32; FEATURES]) -> f32 {
+    let z = weights[0]
+        + weights[1..]
+            .iter()
+            .zip(features)
+            .map(|(weight, feature)| weight * feature)
+            .sum::<f32>();
+    1.0 / (1.0 + (-z).exp())
+}
+
+/// `record`, a street's own, as the street's answer at `point`.
+fn street_at(record: &mut Summary, [lon, lat]: [f64; 2]) {
+    record.point = Some(Point {
+        lon,
+        lat,
+        precision: PointPrecision::Estimated,
+    });
+}
+
+/// Of the neighbours `lower` and `higher`, those inside the places `plan`
+/// names by their own fields (see [`choose::Named::holds`]): a road of the
+/// name in another town numbers its houses alike.
+fn held_to_places(plan: &QueryPlan, lower: &mut Vec<Neighbour>, higher: &mut Vec<Neighbour>) {
+    let named = choose::Named::of(plan);
+    for side in [lower, higher] {
+        side.retain(|neighbour| {
+            named.holds(
+                neighbour.address.postcode.as_deref(),
+                neighbour.address.locality.as_deref(),
+            )
+        });
+    }
+}
+
+/// A postcode's letters and digits alone, upper case, to compare two
+/// spellings of it.
+fn postcode_letters(postcode: &str) -> String {
+    postcode
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+/// The centre of the densest disk of [`STREET_DISK_M`] among `points`: the
+/// mean of the points within it of the point with the most such; `None`
+/// for none.
+fn densest(points: &[[f64; 2]]) -> Option<[f64; 2]> {
+    let near = |at: &[f64; 2]| {
+        points
+            .iter()
+            .filter(|other| haversine_m(at[0], at[1], other[0], other[1]) <= STREET_DISK_M)
+            .collect::<Vec<_>>()
+    };
+    let centre = points.iter().max_by_key(|at| near(at).len())?;
+    let near = near(centre);
+    let count = near.len() as f64;
+    Some([
+        near.iter().map(|point| point[0]).sum::<f64>() / count,
+        near.iter().map(|point| point[1]).sum::<f64>() / count,
+    ])
+}
+
+/// How many query letters a street's key `name` accounts for when its words
+/// name every word of `query` (see [`TextSearcher::street_matches`]), `None`
+/// when they do not. Words that only describe a street are left out.
+fn street_words_match(
+    query: &[&str],
+    name: &str,
+    describes_street: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    let mut used = vec![false; words.len()];
+    let mut letters = 0;
+    for word in query {
+        if describes_street(word) {
+            continue;
+        }
+        let chars = word.chars().count();
+        let digit = word.chars().any(|character| character.is_ascii_digit());
+        let names = |other: &str| {
+            other == *word
+                || (chars >= 4 && typo_distance(word, other).is_some())
+                || ((2..=4).contains(&chars) && !digit && abbreviates(word, other))
+        };
+        match (0..words.len()).find(|&at| !used[at] && names(words[at])) {
+            Some(at) => {
+                used[at] = true;
+                letters += chars;
+            }
+            None if chars <= 3 && !digit => {}
+            None => return None,
+        }
+    }
+    (letters >= 4).then_some(letters)
+}
+
+/// How many letters of a street's key `name` the reading's street words
+/// `query` name when every word of the name of four or more letters is
+/// one of them, as written, a typo away or abbreviated: a reading may take
+/// the town or a repeat of the address into its street ("voltaire berlijn
+/// voltaire berlijn"), where every query word cannot be the street's. A
+/// word of up to three letters may be missing ("di san cristoforo" of "di
+/// s. cristoforo"). The name must take the first of the query's words, and
+/// a name only of words the reading names as places (`places`), a street
+/// called after its town, is not named this way.
+fn street_named_in(
+    query: &[&str],
+    name: &str,
+    describes_street: impl Fn(&str) -> bool,
+    places: &[String],
+) -> Option<usize> {
+    let mut used = vec![false; query.len()];
+    let mut letters = 0;
+    let mut own = false;
+    for word in name.split_whitespace() {
+        if describes_street(word) {
+            continue;
+        }
+        let chars = word.chars().count();
+        let names = |written: &str| {
+            written == word
+                || (chars >= 4 && typo_distance(written, word).is_some())
+                || ((2..=4).contains(&written.chars().count()) && abbreviates(written, word))
+        };
+        match (0..query.len()).find(|&at| !used[at] && names(query[at])) {
+            Some(at) => {
+                used[at] = true;
+                letters += chars;
+                own |= !places.iter().any(|place| place.starts_with(word));
+            }
+            None if chars <= 3 => {}
+            None => return None,
+        }
+    }
+    // The street starts the reading's street words; a name matching only
+    // words after it is likelier a place the reading took in.
+    let first = (0..query.len()).find(|&at| !describes_street(query[at]));
+    (own && letters >= 4 && first.is_some_and(|at| used[at])).then_some(letters)
+}
+
+/// The words of the places a reading names apart from its street.
+fn context_words(plan: &QueryPlan) -> Vec<String> {
+    plan.context
+        .iter()
+        .flat_map(|part| part.words.iter().cloned())
+        .collect()
+}
+
+/// Whether `short` is written with letters of `long` in order from its
+/// first, as an abbreviation is ("pg" of "passeig", "brg" of "brigadeiro").
+fn abbreviates(short: &str, long: &str) -> bool {
+    if long.chars().count() <= short.chars().count() || short.chars().next() != long.chars().next()
+    {
+        return false;
+    }
+    let mut rest = long.chars();
+    short
+        .chars()
+        .all(|wanted| rest.by_ref().any(|character| character == wanted))
+}
+
+/// The places the words of a reading name (see
+/// [`TextSearcher::structured_places`]).
+#[derive(Debug, Default)]
+struct PlaceWords {
+    /// Per run of words naming a place, every place it names.
+    words: Vec<Vec<Place>>,
+    /// Per run, whether it holds a digit, as a postcode does.
+    digits: Vec<bool>,
+    /// Runs of words naming no place.
+    skipped: usize,
+    /// Runs naming a place one edit off.
+    fuzzy: usize,
+    /// When the query names no country, those its postcodes are used in.
+    countries: Vec<String>,
+    /// Each word read for a place, `word/label/matched/probability`, for
+    /// the log.
+    log: String,
+    /// Per run, its weight: the mean probability of its words naming a
+    /// place, in thousandths.
+    weights: Vec<usize>,
+}
+
+/// What a search checks each hit of a plan against (see
+/// [`TextSearcher::kept`]).
+struct Checks {
+    places: StatedPlaces,
+    stated: Vec<StatedArea>,
+    loose: Vec<String>,
+    /// The countries the plan names, the filter when the caller names none.
+    countries: Vec<String>,
+}
+
+impl Checks {
+    fn filters<'a>(&'a self, filters: &Filters<'a>) -> Filters<'a> {
+        match filters.countries.is_empty() {
+            true => Filters {
+                countries: &self.countries,
+                ..*filters
+            },
+            false => *filters,
+        }
+    }
+}
+
 /// Records of a pool explained by joint decoding at most.
 const MAX_EXPLAINED: usize = 64;
 
@@ -4438,7 +7194,7 @@ const MAX_EXPLAINED: usize = 64;
 /// learn of the records they find, so a record that several searches find,
 /// or several checks ask about, is read from the Pack once.
 struct Session {
-    deadline: Instant,
+    deadline: Cell<Instant>,
     searches: Cell<usize>,
     areas: RefCell<HashMap<RecordId, Rc<RecordAreas>>>,
     settlements: RefCell<HashMap<RecordId, Rc<Vec<String>>>>,
@@ -4448,7 +7204,7 @@ struct Session {
 impl Session {
     fn new(budget: Duration) -> Self {
         Self {
-            deadline: Instant::now() + budget,
+            deadline: Cell::new(Instant::now() + budget),
             searches: Cell::new(0),
             areas: RefCell::default(),
             settlements: RefCell::default(),
@@ -4456,12 +7212,17 @@ impl Session {
         }
     }
 
+    /// Move the deadline `by` later.
+    fn extend(&self, by: Duration) {
+        self.deadline.set(self.deadline.get() + by);
+    }
+
     /// Whether one more search may run, counting it: the first always does,
     /// so every query is searched; the rest only within the budget. An
     /// anytime search: past the budget the pool answers with what it holds.
     fn allows_search(&self) -> bool {
         let searches = self.searches.get();
-        if searches > 0 && (searches >= MAX_SEARCHES || Instant::now() >= self.deadline) {
+        if searches > 0 && (searches >= MAX_SEARCHES || Instant::now() >= self.deadline.get()) {
             return false;
         }
         self.searches.set(searches + 1);
@@ -5080,6 +7841,9 @@ struct QueryPlan {
     /// What its words may match besides themselves (see
     /// [`TextSearcher::spellings`]).
     spellings: Arc<Spellings>,
+    /// Whether the house number is one the parser labelled that a plain
+    /// reading of its run would drop (see [`labelled_number`]).
+    number_kept: bool,
 }
 
 /// A query word, with the word of the name the parser read it as when it
@@ -5321,12 +8085,7 @@ impl QueryPlan {
     ) -> Option<Self> {
         let mut plan = Self::default();
         let mut street = Vec::new();
-        let expanded = |words: &[String]| {
-            expand_address_abbreviations(&words.join(" "))
-                .split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        };
+        let expanded = |words: &[String]| expand_street_words(words);
         let expanded_run = |words: &[String], corrected: &Option<Vec<String>>| {
             Word::paired(
                 expanded(words),
@@ -5379,6 +8138,16 @@ impl QueryPlan {
                     } else if let Some(number) = HouseNumber::parse(&words[0]) {
                         plan.house_number = Some(number);
                         plan.optional.extend(words.into_iter().skip(1));
+                    } else if let Some((at, number)) = labelled_number(&words) {
+                        plan.house_number = Some(number);
+                        plan.number_kept = true;
+                        plan.optional.extend(
+                            words
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(index, word)| *index != at || !is_numeric_token(word))
+                                .map(|(_, word)| word),
+                        );
                     } else {
                         street.extend(Word::paired(words, None));
                     }
@@ -5717,6 +8486,68 @@ impl HouseNumber {
     }
 }
 
+/// [`TextSearcher::street_keys`], with `describes_street` telling a word
+/// that only describes a street.
+fn street_keys_of(words: &[String], describes_street: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let full = words
+        .iter()
+        .map(|word| lattice::full_form(word).unwrap_or(word).to_string())
+        .collect::<Vec<_>>();
+    let expanded = |at: usize| describes_street(&full[at]);
+    let typed = |at: usize| {
+        describes_street(&full[at])
+            || describes_street(&words[at])
+            || lattice::other_forms(&words[at])
+                .iter()
+                .any(|form| describes_street(form))
+    };
+    let mut keys = Vec::new();
+    for describes in [&expanded as &dyn Fn(usize) -> bool, &typed] {
+        let named = (0..full.len()).any(|at| !describes(at));
+        let key = (0..full.len())
+            .filter(|&at| !named || !describes(at))
+            .map(|at| glued_stem(&full[at]).unwrap_or(&full[at]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !key.is_empty() && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// The house number of a run the parser labelled one that no plain number
+/// starts: its first word that is one ("2" of "no 2", "51" of "nº 51"),
+/// else the digits a word starts with ("116" of "116bis"), with where it
+/// is in the run. A designator or a suffix the parser kept with the number
+/// is no reason to drop the number.
+fn labelled_number(words: &[String]) -> Option<(usize, HouseNumber)> {
+    words
+        .iter()
+        .enumerate()
+        .find_map(|(at, word)| HouseNumber::parse(word).map(|number| (at, number)))
+        .or_else(|| {
+            words.iter().enumerate().find_map(|(at, word)| {
+                let digits = word
+                    .find(|character: char| !character.is_ascii_digit())
+                    .map_or(word.as_str(), |end| &word[..end]);
+                (!digits.is_empty())
+                    .then(|| HouseNumber::parse(digits))
+                    .flatten()
+                    .map(|number| (at, number))
+            })
+        })
+}
+
+/// Street words as a query's are planned, with their abbreviations
+/// expanded as the text index expands them.
+fn expand_street_words(words: &[String]) -> Vec<String> {
+    expand_address_abbreviations(&words.join(" "))
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 fn normalized_for_match(value: Option<&str>) -> Option<String> {
     search_key(value?.trim())
 }
@@ -5759,6 +8590,10 @@ fn is_address_number_token(token: &str) -> bool {
         .next()
         .is_some_and(|character| character.is_ascii_digit())
 }
+
+mod named;
+
+mod choose;
 
 #[cfg(test)]
 mod tests {
@@ -8148,6 +10983,65 @@ mod tests {
     }
 
     #[test]
+    fn a_query_is_read_once_unglued_and_without_replacement_characters() {
+        assert_eq!(
+            clean_query("191 Beaufort Street 191 Beaufort Street ACT 6000 AU"),
+            "191 Beaufort Street ACT 6000 AU"
+        );
+        assert_eq!(
+            clean_query("Site de Choranche2865 route des Grottes"),
+            "Site de Choranche 2865 route des Grottes"
+        );
+        assert_eq!(clean_query("EmbarcadèreRue Haute"), "Embarcadère Rue Haute");
+        assert_eq!(clean_query("rue de Beaus\u{fffd}jour"), "rue de Beausjour");
+        assert_eq!(
+            clean_query("116bis T5H 0W2 18th DeKalb"),
+            "116bis T5H 0W2 18th DeKalb"
+        );
+        assert_eq!(
+            clean_query("Zaragoza Zaragoza 50017"),
+            "Zaragoza Zaragoza 50017"
+        );
+    }
+
+    #[test]
+    fn a_name_of_hangul_or_an_unspaced_script_keeps_its_numbers() {
+        assert_eq!(
+            clean_query("수성구 달구벌대로530길 145-2"),
+            "수성구 달구벌대로530길 145-2"
+        );
+        assert_eq!(clean_query("東橄榄路4081号"), "東橄榄路4081号");
+    }
+
+    #[test]
+    fn a_number_the_parser_labels_is_kept_with_its_designator_or_suffix() {
+        let number = |text: &str| {
+            let plan = QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false).expect("plan");
+            (
+                plan.house_number.map(|number| number.text),
+                plan.number_kept,
+            )
+        };
+        assert_eq!(
+            number("116bis/house_number gracia/street barcelona/locality"),
+            (Some("116".to_string()), true)
+        );
+        assert_eq!(
+            number("no/house_number 2/house_number jalan/street stesen/street"),
+            (Some("2".to_string()), true)
+        );
+        assert_eq!(
+            number("lau/house_number 4/house_number 34a/house_number pham/street"),
+            (Some("4".to_string()), true)
+        );
+        assert_eq!(
+            number("12/house_number main/street street/street"),
+            (Some("12".to_string()), false)
+        );
+        assert_eq!(number("near/house_number megha/street"), (None, false));
+    }
+
+    #[test]
     fn a_unit_is_read_from_a_letter_or_a_word_glued_to_the_number() {
         let unit = |text: &str| {
             QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false)
@@ -9554,6 +12448,131 @@ mod tests {
             ["osm:relation:6"]
         );
         assert!(fallback[0].fallback);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn the_structured_stage_answers_as_the_text_search_does() {
+        let temp_dir = temp_pack_path("search-structured-stage");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, number, street, town, postcode, at) in [
+            (
+                "osm:node:1",
+                "10",
+                "Queen Street",
+                "Toronto",
+                "M5H 2N2",
+                [-79.38, 43.65],
+            ),
+            (
+                "osm:node:2",
+                "12",
+                "Queen Street",
+                "Toronto",
+                "M5H 2N2",
+                [-79.381, 43.65],
+            ),
+            (
+                "osm:node:3",
+                "10",
+                "Queen Street",
+                "Ottawa",
+                "K1P 5G4",
+                [-75.7, 45.42],
+            ),
+            (
+                "osm:node:4",
+                "10",
+                "King Street",
+                "Toronto",
+                "M5V 1A1",
+                [-79.39, 43.64],
+            ),
+            (
+                "osm:node:5",
+                "7",
+                "Hauptstraße",
+                "Berlin",
+                "10115",
+                [13.4, 52.52],
+            ),
+            (
+                "osm:node:6",
+                "64",
+                "Hauptstraße",
+                "Berlin",
+                "10115",
+                [13.41, 52.52],
+            ),
+            (
+                "osm:node:7",
+                "3",
+                "Breite Straße",
+                "Potsdam",
+                "14467",
+                [13.06, 52.4],
+            ),
+        ] {
+            let record = located(
+                address_record(id, "", number, street, Some(town), Some(postcode)),
+                at,
+            );
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let structured = TextSearcher::open(&temp_dir).expect("searcher");
+        assert!(
+            structured.structured.is_some(),
+            "the Pack holds its structured index"
+        );
+        let plain = TextSearcher::open(&temp_dir)
+            .expect("searcher")
+            .without_structured();
+        let ids = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(&TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 1,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        let mut answered = 0;
+        for query in [
+            "10 Queen Street Toronto",
+            "10 Queen St, Ottawa",
+            "10 Queen Street Toronto M5H 2N2",
+            "12 Queen Street",
+            "7 Hauptstr Berlin",
+            "10 Quen Street Toronto",
+        ] {
+            let found = ids(&structured, query);
+            if LAST_STRUCTURED.with(Cell::get).answered {
+                answered += 1;
+            }
+            assert_eq!(found, ids(&plain, query), "{query}");
+        }
+        assert_eq!(answered, 6, "answered by the structured stage");
+        // A street the stated town lacks: the one another town has is held
+        // by no place word, and costs the parser's score of it, not a veto.
+        let query = "64 Hauptstraße Potsdam";
+        ids(&structured, query);
+        let last = LAST_STRUCTURED.with(Cell::get);
+        assert_eq!(last.support, 0);
+        assert!(last.gap < 0.0);
+        // A postcode the hit does not agree with costs it in the parser's
+        // score; the hand-off models decide, and the answer is the text
+        // search's.
+        let query = "10 Queen Street Toronto K1P 5G4";
+        let found = ids(&structured, query);
+        assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

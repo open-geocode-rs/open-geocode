@@ -1883,11 +1883,20 @@ impl<'a> Run<'a> {
         self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
         self.checkpoints.voided = scratch.voided();
         self.progress.finish(BuildStage::Parser);
+        let parser_training_ms = phase.elapsed().as_millis();
+        // The structured index keys the sealed Pack's text index with its
+        // dictionaries, and joins the Pack before it is published.
+        self.progress.start(BuildStage::StructuredIndex, None)?;
+        let structured = Instant::now();
+        crate::structured::add_to(&mut sealed)?;
+        stats.bytes = sealed.bytes();
+        self.progress.finish(BuildStage::StructuredIndex);
         let mut report = self.report();
         report.checkpoints = self.checkpoints.clone();
         self.progress.check()?;
         report.parser_training = training;
-        report.phases.parser_training_ms = phase.elapsed().as_millis();
+        report.phases.parser_training_ms = parser_training_ms;
+        report.phases.structured_index_ms = structured.elapsed().as_millis();
         for (name, sorted) in &self.sorted {
             report.scratch.sorters.insert(name.clone(), sorted.clone());
         }

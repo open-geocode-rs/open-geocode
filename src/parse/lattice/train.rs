@@ -1192,6 +1192,44 @@ fn allowed(golds: Option<&[u8]>, index: usize, label: Label) -> bool {
     golds.is_none_or(|golds| golds[index] & (1 << label as u8) != 0)
 }
 
+/// The probability of each label of each unit of `lattice` under
+/// `weights`: forward-backward over every labelling, in every country the
+/// lattice is decoded as, as learning reads its expected counts.
+pub(super) fn label_marginals(lattice: &Lattice, weights: &Weights) -> Vec<[f64; LABELS]> {
+    let order = span_order(lattice);
+    let readings = decode::countries(lattice)
+        .into_iter()
+        .map(|country| {
+            let edges = span_edges(lattice, weights, country);
+            Reading::new(lattice, weights, country, None, &order, edges)
+        })
+        .collect::<Vec<_>>();
+    let total = log_sum(readings.iter().map(|reading| reading.log_z));
+    let mut marginals = vec![[0.0; LABELS]; lattice.len];
+    if !total.is_finite() {
+        return marginals;
+    }
+    for reading in &readings {
+        for (index, span) in lattice.spans.iter().enumerate() {
+            for label in 0..LABELS {
+                let onward = reading.edges[index][label] + reading.beta[span.end][label] - total;
+                let probability = previous_states(span.start)
+                    .map(|previous| {
+                        (reading.alpha[span.start][previous]
+                            + reading.transitions[previous][label]
+                            + onward)
+                            .exp()
+                    })
+                    .sum::<f64>();
+                for unit in &mut marginals[span.start..span.end] {
+                    unit[label] += probability;
+                }
+            }
+        }
+    }
+    marginals
+}
+
 /// The states a segment starting at `start` can follow.
 fn previous_states(start: usize) -> std::ops::Range<usize> {
     if start == 0 {
