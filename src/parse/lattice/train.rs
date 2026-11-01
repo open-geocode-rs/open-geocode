@@ -151,8 +151,9 @@ pub struct Report {
     pub lattice_memory_bytes: u64,
     pub lattice_file_bytes: u64,
     pub lattice_file_shards: usize,
-    /// Whether the Pack was read into memory up front, as it is when it
-    /// fits in half the memory available.
+    /// Whether the Pack's `parse/*` sections, all training looks up, were
+    /// read into memory up front, as they are when they fit in half the
+    /// memory available.
     pub pack_prefaulted: bool,
 }
 
@@ -321,12 +322,14 @@ pub fn train(
         ..Report::default()
     };
     let pack = Reader::open(pack)?;
-    // Every lattice looks names up all over the dictionaries.
-    report.pack_prefaulted = pack
-        .container()
-        .advise_random_reads(Resources::probe().available_memory_bytes);
+    let dictionaries = pack.container();
+    // Every lattice looks names up all over the dictionaries, and nothing
+    // else of the Pack is read at random: the records drawn are read once,
+    // in Pack order. The whole file need not fit, only them.
+    report.pack_prefaulted =
+        dictionaries.prefault_sections("parse/", Resources::probe().available_memory_bytes) > 0;
     // Only the dictionaries: the weights are what this trains.
-    let tagger = LatticeTagger::new(Dictionaries::open(pack.container())?, Weights::zero());
+    let tagger = LatticeTagger::new(Dictionaries::open(dictionaries)?, Weights::zero());
     let mut random = Random::new(SEED);
 
     // Each country's rows, rendered from its drawn records read in Pack
