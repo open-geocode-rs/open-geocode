@@ -452,7 +452,9 @@ impl Writer {
             self.records.write(&record, context)?;
             match document {
                 text_index::Prepared::Document(document) => self.text.add(document)?,
-                text_index::Prepared::Address(document) => self.text.add_address(document)?,
+                text_index::Prepared::Address(document, numbers) => {
+                    self.text.add_address(document, numbers)?
+                }
             }
             self.spatial.add(record_id, &record)?;
             if let Record::Postcode(postcode) = &record {

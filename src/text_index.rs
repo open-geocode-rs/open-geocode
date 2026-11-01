@@ -99,8 +99,8 @@ pub struct Writer {
     /// Documents a checkpoint committed: a checkpoint commits again only
     /// once there are more, so the directory it synced stays as it was.
     committed: u64,
-    /// The address group the next address may join.
-    group: Option<Document>,
+    /// The address group the next address may join, and its numbers.
+    group: Option<(Document, Numbers)>,
 }
 
 /// What a record adds to the text index: a document of its own, or, for an
@@ -108,7 +108,53 @@ pub struct Writer {
 #[derive(Debug)]
 pub enum Prepared {
     Document(TantivyDocument),
-    Address(Box<Document>),
+    Address(Box<Document>, Numbers),
+}
+
+/// What a document's house numbers and units are indexed as. An address's
+/// are worked out as it is prepared, in parallel, and a group's are its
+/// addresses' joined in order, so the writer, which takes records one at a
+/// time, only joins them.
+#[derive(Debug, Default)]
+pub struct Numbers {
+    /// The units' search texts, in order.
+    units: Vec<String>,
+    /// Every term of every house number, then the flat numbers.
+    terms: Vec<String>,
+    /// The lowest base house number.
+    lowest: Option<u32>,
+}
+
+impl Numbers {
+    fn of(projected: &Document) -> Self {
+        let mut terms = Vec::new();
+        let mut lowest: Option<u32> = None;
+        for number in &projected.address_numbers {
+            terms.extend(address_number_terms(number));
+            if let Some(base) = base_house_number(number) {
+                lowest = Some(lowest.map_or(base, |lowest| lowest.min(base)));
+            }
+        }
+        terms.extend(projected.flat_numbers.iter().cloned());
+        Self {
+            units: projected
+                .units
+                .iter()
+                .filter_map(|unit| search_text(unit))
+                .collect(),
+            terms,
+            lowest,
+        }
+    }
+
+    fn join(&mut self, other: Self) {
+        self.units.extend(other.units);
+        self.terms.extend(other.terms);
+        self.lowest = match (self.lowest, other.lowest) {
+            (Some(lowest), Some(other)) => Some(lowest.min(other)),
+            (lowest, other) => lowest.or(other),
+        };
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -394,8 +440,8 @@ impl Writer {
     /// Index the address `document` projects: into the group of the address
     /// before it when it is the next record and states the same, else into a
     /// group of its own.
-    pub fn add_address(&mut self, document: Box<Document>) -> Result<()> {
-        if let Some(group) = &mut self.group
+    pub fn add_address(&mut self, document: Box<Document>, numbers: Numbers) -> Result<()> {
+        if let Some((group, group_numbers)) = &mut self.group
             && group.record_id + group.record_count == document.record_id
             && group.record_count < MAX_GROUP_RECORDS
             && group.same_group(&document)
@@ -405,19 +451,17 @@ impl Writer {
                 (Some(group), Some(address)) => Some(group.union(address)),
                 (group, address) => group.or(address),
             };
-            group.address_numbers.extend(document.address_numbers);
-            group.flat_numbers.extend(document.flat_numbers);
-            group.units.extend(document.units);
+            group_numbers.join(numbers);
             return Ok(());
         }
         self.close_group()?;
-        self.group = Some(*document);
+        self.group = Some((*document, numbers));
         Ok(())
     }
 
     fn close_group(&mut self) -> Result<()> {
-        if let Some(group) = self.group.take() {
-            let document = self.fields.to_tantivy_document(&group);
+        if let Some((group, numbers)) = self.group.take() {
+            let document = self.fields.to_tantivy_document(&group, numbers);
             self.add_document(document)?;
         }
         Ok(())
@@ -538,26 +582,23 @@ impl Fields {
             postcode_areas,
             country_code,
         );
+        let numbers = Numbers::of(&document);
         match record {
-            Record::Address(_) => Prepared::Address(Box::new(document)),
-            _ => Prepared::Document(self.to_tantivy_document(&document)),
+            Record::Address(_) => Prepared::Address(Box::new(document), numbers),
+            _ => Prepared::Document(self.to_tantivy_document(&document, numbers)),
         }
     }
 
-    fn to_tantivy_document(self, projected: &Document) -> TantivyDocument {
+    /// The document of `projected`, whose numbers and units index as
+    /// `numbers`.
+    fn to_tantivy_document(self, projected: &Document, numbers: Numbers) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
         document.add_u64(self.record_count, projected.record_count);
         for layer in &projected.layers {
             document.add_text(self.layer, layer);
         }
-        let units = unique_parts(
-            projected
-                .units
-                .iter()
-                .filter_map(|unit| search_text(unit))
-                .collect(),
-        );
+        let units = unique_parts(numbers.units);
         let content_text = std::iter::once(projected.content_text.as_str())
             .chain(units.iter().map(String::as_str))
             .filter(|part| !part.is_empty())
@@ -578,19 +619,11 @@ impl Fields {
             self.street_text,
             unique_words(&projected.streets.join(" ")).as_deref(),
         );
-        let mut terms = BTreeSet::new();
-        let mut lowest: Option<u32> = None;
-        for number in &projected.address_numbers {
-            terms.extend(address_number_terms(number));
-            if let Some(base) = base_house_number(number) {
-                lowest = Some(lowest.map_or(base, |lowest| lowest.min(base)));
-            }
-        }
-        terms.extend(projected.flat_numbers.iter().cloned());
+        let terms = numbers.terms.into_iter().collect::<BTreeSet<_>>();
         for term in &terms {
             document.add_text(self.address_number, term);
         }
-        if let Some(base) = lowest {
+        if let Some(base) = numbers.lowest {
             document.add_u64(self.house_number, base.into());
         }
         add_normalized_text_if_present(
