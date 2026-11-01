@@ -1150,18 +1150,24 @@ impl<'a> Run<'a> {
         for part in &self.geometry_saved {
             for item in part.reader()? {
                 let (way_id, line) = match item? {
-                    GeometryItem::Way(way) => {
-                        let line = (way.object_id, Some(way.vertices.clone()));
-                        if boundary::may_be_area(&way) {
+                    GeometryItem::Way(mut way) => {
+                        let way_id = way.object_id;
+                        // Only a way that may close an area is kept beside
+                        // its line; any other gives its vertices up.
+                        let vertices = if boundary::may_be_area(&way) {
                             way_vertices += way.vertices.len();
+                            let vertices = way.vertices.clone();
                             ways.push(way);
-                        }
+                            vertices
+                        } else {
+                            std::mem::take(&mut way.vertices)
+                        };
                         if way_vertices >= batch_vertices {
                             self.progress.check()?;
                             builder.add_ways(&std::mem::take(&mut ways))?;
                             way_vertices = 0;
                         }
-                        line
+                        (way_id, Some(vertices))
                     }
                     GeometryItem::Member(way_id, line) => (way_id, line),
                     GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
@@ -1371,9 +1377,8 @@ impl<'a> Run<'a> {
             settled,
         );
         // An admin area is a settlement too when a settlement of its name
-        // lies in it, as a town's boundary holds the town's point: Nominatim
-        // links the two the same way. A ward or a local board holds none of
-        // its name.
+        // lies in it, as a town's boundary holds the town's point. A ward or a
+        // local board holds none of its name.
         let found = settlements
             .par_iter()
             .filter_map(|(name, [lon, lat])| {
