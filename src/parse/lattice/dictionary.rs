@@ -855,8 +855,6 @@ pub struct Builder {
     names: HashMap<(Field, String), NameStats>,
     /// Records lying in each admin area, by the area's record id.
     areas: HashMap<RecordId, Area>,
-    /// Every admin context a record lies in, for which areas lie in which.
-    contexts: HashSet<AdminContextTuple>,
     /// Each place with the areas its own context places it in, as
     /// [`nesting_pair`]s (see [`Builder::add_place`]).
     area_pairs: Vec<u64>,
@@ -951,8 +949,6 @@ impl Builder {
         let Some(tuple) = tuple else {
             return;
         };
-        self.contexts.insert(tuple.clone());
-
         // Walked rather than listed per tier, so a tier added to the chain is
         // indexed without a second place to remember.
         // An area that is two tiers is indexed under both: Berlin has to be
@@ -992,16 +988,18 @@ impl Builder {
     /// records were counted in, each area's `name` first; every name of an
     /// area is counted for the records lying in it, and so is every name of
     /// a region, district or locality without its type word
-    /// ([`admin_aliases`]) that names no area of another level.
+    /// ([`admin_aliases`]) that names no area of another level. `contexts`
+    /// are the admin contexts the records lie in, each once: the Pack's
+    /// context table holds them already, so they are not collected twice.
     pub fn finish(
         self,
         pack: &mut Writer,
         area_names: &HashMap<RecordId, Vec<String>>,
+        contexts: &[AdminContextTuple],
     ) -> Result<()> {
         let Self {
             mut names,
             areas,
-            contexts,
             area_pairs,
             place_names,
             country_codes,
@@ -1208,7 +1206,7 @@ impl Builder {
             .filter(|pair| !shares_name((pair >> 32) as u32, *pair as u32))
             .collect::<Vec<_>>();
         // A record lies in the groups of its region as well.
-        for context in &contexts {
+        for context in contexts {
             let groups = context
                 .region_record_id()
                 .and_then(|region| region_groups.get(&region))
@@ -1745,7 +1743,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
         let mut pack = Writer::create(&path).expect("pack");
-        builder.finish(&mut pack, &names).expect("finish");
+        builder
+            .finish(&mut pack, &names, &[context.admin_context])
+            .expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
             Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
@@ -1789,9 +1789,11 @@ mod tests {
             ]),
             flags: 0,
         };
-        for (region, locality) in [(1, 2), (3, 4), (3, 5)] {
-            builder.add(RecordNames::default(), Some(&context(region, locality)));
+        let contexts = [(1, 2), (3, 4), (3, 5)].map(|(region, locality)| context(region, locality));
+        for context in &contexts {
+            builder.add(RecordNames::default(), Some(context));
         }
+        let contexts = contexts.map(|context| context.admin_context);
         let names = HashMap::from([
             (1, vec!["愛知県".to_string()]),
             (2, vec!["名古屋市".to_string()]),
@@ -1803,7 +1805,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
         let mut pack = Writer::create(&path).expect("pack");
-        builder.finish(&mut pack, &names).expect("finish");
+        builder
+            .finish(&mut pack, &names, &contexts)
+            .expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
             Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
@@ -1866,7 +1870,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("pack.ogp");
         let mut pack = Writer::create(&path).expect("pack");
-        builder.finish(&mut pack, &HashMap::new()).expect("finish");
+        builder
+            .finish(&mut pack, &HashMap::new(), &[])
+            .expect("finish");
         pack.finish().expect("seal");
         let dictionaries =
             Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");

@@ -501,8 +501,9 @@ impl Writer {
             text: None,
             spatial: None,
         };
-        contexts.finish(&mut pack)?;
-        dictionaries.finish(&mut pack, &context_names)?;
+        let tuples = contexts.finish(&mut pack)?;
+        dictionaries.finish(&mut pack, &context_names, &tuples)?;
+        drop(tuples);
         drop(context_names);
         pack.add(
             POSTCODE_ADDRESSES_SECTION,
