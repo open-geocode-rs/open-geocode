@@ -303,6 +303,17 @@ fn total_input_bytes(inputs: &[PathBuf]) -> Result<u64> {
         .try_fold(0, |total, input| Ok(total + pbf::input_bytes(input)?))
 }
 
+/// The least time between two checkpoints. A checkpoint syncs every scratch
+/// file it names, spills every sorter and saves the node store: seconds a
+/// country's build spends to save it the minutes a crash would cost, while
+/// a planet's steps run longer than this and keep a checkpoint each. Tests
+/// checkpoint every step, to go on from each.
+const CHECKPOINT_EVERY: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(300)
+};
+
 pub fn build_osm_pack(options: &BuildOsmOptions) -> Result<BuilderReport> {
     let plan = plan_osm_build(options)?;
     build_planned_osm_pack(options, plan)
@@ -327,6 +338,7 @@ pub fn build_planned_osm_pack(options: &BuildOsmOptions, plan: BuildPlan) -> Res
         options.observer.warned(warning);
     }
     let mut run = Run::start(options, plan)?;
+    let mut checkpointed = Instant::now();
     for step in Step::all(options.inputs.len()) {
         if run.done.is_some_and(|done| step <= done) {
             continue;
@@ -338,7 +350,10 @@ pub fn build_planned_osm_pack(options: &BuildOsmOptions, plan: BuildPlan) -> Res
                 "injected failure before the checkpoint of {step:?}"
             )));
         }
-        run.checkpoint(step)?;
+        if checkpointed.elapsed() >= CHECKPOINT_EVERY {
+            run.checkpoint(step)?;
+            checkpointed = Instant::now();
+        }
     }
     run.finish()
 }
