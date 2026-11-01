@@ -1611,6 +1611,133 @@ const REGION_GROUP_SHARE: f64 = 0.3;
 const REGION_AND_GROUP_SHARE: f64 = 0.2;
 
 /// Renders training rows from the Pack's records.
+/// Venue names and region names of rows rendered so far, at most
+/// [`SEEN_NAMES`] of each: a query names a venue before an address, or a
+/// region the town is not in.
+#[derive(Debug, Default)]
+struct Seen {
+    venues: Vec<Tokens>,
+    regions: Vec<Tokens>,
+}
+
+impl Seen {
+    /// The noise of queries written by hand rather than by a template: a
+    /// field or the whole address written twice, a unit or floor phrase in
+    /// the middle, a venue's name before the address, a region more, and a
+    /// house number with a letter after it.
+    fn add_noise(
+        &mut self,
+        unit_words: &[Vec<String>; 3],
+        fields: &Fields,
+        groups: &mut Vec<Group>,
+        random: &mut Random,
+    ) {
+        let keep = |seen: &mut Vec<Tokens>, value: &Option<Tokens>, random: &mut Random| {
+            if let Some(value) = value {
+                if seen.len() < SEEN_NAMES {
+                    seen.push(value.clone());
+                } else {
+                    let at = random.below(SEEN_NAMES as u64) as usize;
+                    seen[at] = value.clone();
+                }
+            }
+        };
+        keep(&mut self.venues, &fields.house, random);
+        keep(&mut self.regions, &fields.region, random);
+        if groups.is_empty() {
+            return;
+        }
+        if random.chance(FIELD_TWICE_SHARE)
+            && let Some(at) = groups
+                .iter()
+                .position(|group| matches!(group.label, Label::Locality | Label::Region))
+        {
+            let mut twice = groups[at].clone();
+            twice.joiner = None;
+            groups.insert(at + 1, twice);
+        }
+        if random.chance(ADDRESS_TWICE_SHARE) {
+            let mut again = groups.clone();
+            if let Some(first) = again.first_mut() {
+                first.break_before = true;
+                first.joiner = None;
+            }
+            groups.extend(again);
+        }
+        if groups.len() > 1 && random.chance(MIDDLE_UNIT_SHARE) {
+            let vocabulary = &unit_words[match random.chance(0.5) {
+                true => 0,
+                false => 2,
+            }];
+            if !vocabulary.is_empty()
+                && let Some(mut phrase) =
+                    words(&vocabulary[random.below(vocabulary.len() as u64) as usize])
+            {
+                let number = 1 + random.below(200);
+                let letter = (b'a' + random.below(6) as u8) as char;
+                phrase.push(
+                    match random.chance(0.5) {
+                        true => number.to_string(),
+                        false => letter.to_string(),
+                    },
+                    false,
+                    None,
+                );
+                let at = 1 + random.below(groups.len() as u64 - 1) as usize;
+                groups.insert(
+                    at,
+                    Group {
+                        label: Label::Unit,
+                        words: phrase,
+                        break_before: true,
+                        joiner: None,
+                    },
+                );
+            }
+        }
+        if !self.venues.is_empty() && fields.house.is_none() && random.chance(VENUE_BEFORE_SHARE) {
+            let venue = self.venues[random.below(self.venues.len() as u64) as usize].clone();
+            groups.insert(
+                0,
+                Group {
+                    label: Label::Other,
+                    words: venue,
+                    break_before: false,
+                    joiner: None,
+                },
+            );
+            if let Some(next) = groups.get_mut(1) {
+                next.break_before = true;
+            }
+        }
+        if !self.regions.is_empty() && random.chance(EXTRA_REGION_SHARE) {
+            let region = self.regions[random.below(self.regions.len() as u64) as usize].clone();
+            let at = groups
+                .iter()
+                .position(|group| matches!(group.label, Label::Postcode | Label::Country))
+                .unwrap_or(groups.len());
+            groups.insert(
+                at,
+                Group {
+                    label: Label::Region,
+                    words: region,
+                    break_before: true,
+                    joiner: None,
+                },
+            );
+        }
+        if random.chance(NUMBER_SUFFIX_SHARE)
+            && let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.label == Label::HouseNumber)
+            && let Some(word) = group.words.words.first_mut()
+            && word.chars().all(|character| character.is_ascii_digit())
+        {
+            word.push((b'a' + random.below(6) as u8) as char);
+        }
+    }
+}
+
 struct Renderer<'a> {
     pack: &'a Reader,
     tagger: &'a LatticeTagger,
@@ -1631,6 +1758,7 @@ struct Renderer<'a> {
     /// The kinds of place a query asks for.
     categories: Vec<String>,
     template_countries: Vec<String>,
+    seen: Seen,
 }
 
 impl<'a> Renderer<'a> {
@@ -1647,6 +1775,7 @@ impl<'a> Renderer<'a> {
             near: tagger.dictionaries().keys(Field::Near),
             categories: tagger.dictionaries().keys(Field::Category),
             template_countries: templates().keys().cloned().collect(),
+            seen: Seen::default(),
         }
     }
 
@@ -1761,7 +1890,7 @@ impl<'a> Renderer<'a> {
     /// Drop, render, perturb and label the fields of one row. `None` when
     /// the template writes none of the fields left.
     fn finish(
-        &self,
+        &mut self,
         mut fields: Fields,
         country: Option<CountryCode>,
         random: &mut Random,
@@ -1938,6 +2067,8 @@ impl<'a> Renderer<'a> {
                 },
             );
         }
+        self.seen
+            .add_noise(&self.unit_words, &fields, &mut groups, random);
         let keep_breaks = random.chance(KEEP_BREAKS_SHARE);
         let mut tokens = Tokens::default();
         let mut gold = Vec::new();
@@ -2372,6 +2503,21 @@ enum Draw {
     BlockAddress,
 }
 
+/// Names of each kind [`Seen::add_noise`] keeps to draw from.
+const SEEN_NAMES: usize = 4_096;
+/// Rows with a place written twice ("madrid madrid").
+const FIELD_TWICE_SHARE: f64 = 0.05;
+/// Rows written twice over, as a pasted address repeats.
+const ADDRESS_TWICE_SHARE: f64 = 0.01;
+/// Rows with a unit or floor phrase between two fields.
+const MIDDLE_UNIT_SHARE: f64 = 0.05;
+/// Rows of an address after a venue's name.
+const VENUE_BEFORE_SHARE: f64 = 0.03;
+/// Rows naming one region more, often not the town's.
+const EXTRA_REGION_SHARE: f64 = 0.04;
+/// Rows whose house number has a letter after it.
+const NUMBER_SUFFIX_SHARE: f64 = 0.05;
+
 /// The share of rows of block scheme addresses besides the addresses'.
 const BLOCK_ADDRESS_SHARE: f64 = 0.25;
 
@@ -2614,6 +2760,54 @@ mod tests {
         no_number.house_number = None;
         assert_eq!(rendered("CA", &no_number)[0].0, Street);
         assert!(templates().len() > 200 && templates().contains_key("ZZ"));
+    }
+
+    #[test]
+    fn a_share_of_rows_carries_each_noise_of_hand_written_queries() {
+        use Label::*;
+        let mut seen = Seen::default();
+        let unit_words = [
+            vec!["unit".to_string()],
+            Vec::new(),
+            vec!["floor".to_string()],
+        ];
+        let mut random = Random::new(7);
+        let rows = 4_000;
+        let mut counts = [0; 5];
+        for row in 0..rows {
+            let mut fields = fields();
+            if row == 0 {
+                fields.house = words("Corner Store");
+            }
+            let mut groups = Vec::new();
+            render(&templates()["CA"], &fields, &mut groups, &mut false);
+            seen.add_noise(&unit_words, &fields, &mut groups, &mut random);
+            let labels = groups.iter().map(|group| group.label).collect::<Vec<_>>();
+            let twice = labels
+                .windows(2)
+                .any(|pair| pair[0] == pair[1] && matches!(pair[0], Locality | Region));
+            let suffixed = groups.iter().any(|group| {
+                group.label == HouseNumber
+                    && group.words.words[0].ends_with(|letter: char| letter.is_ascii_lowercase())
+            });
+            for (count, noisy) in counts.iter_mut().zip([
+                twice,
+                labels.contains(&Unit),
+                row > 0 && labels.first() == Some(&Other),
+                labels.iter().filter(|label| **label == Region).count() > 1,
+                suffixed,
+            ]) {
+                *count += usize::from(noisy);
+            }
+        }
+        assert!(
+            counts.iter().all(|&count| count > 0),
+            "every noise occurs: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|&count| count < rows / 5),
+            "each in a small share of rows: {counts:?}"
+        );
     }
 
     #[test]
