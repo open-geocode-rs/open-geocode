@@ -71,7 +71,6 @@
 //! segments.
 
 use std::{
-    collections::HashMap,
     fs::File,
     io::{BufWriter, Write},
     path::PathBuf,
@@ -80,6 +79,7 @@ use std::{
 
 use crate::error::{Error, Result};
 use geojson::{Geometry, GeometryValue};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -426,7 +426,10 @@ fn plain_number(number: &str) -> Option<u32> {
 /// files; only the current segment's dictionary is held in memory.
 #[derive(Debug)]
 struct StringTable {
-    ids: HashMap<Box<str>, u32>,
+    /// FxHash, not SipHash: every string of every record is looked up here,
+    /// on the one thread that writes records in order, and the strings come
+    /// from the build's own input file.
+    ids: FxHashMap<Box<str>, u32>,
     /// The dictionary's memory, held against the build budget. It cannot
     /// spill, but it is bounded by one segment and released at the next.
     memory: Reservation,
@@ -462,7 +465,7 @@ impl StringTable {
     }
 
     fn start_segment(&mut self, first_record: u64) {
-        self.ids = HashMap::new();
+        self.ids = FxHashMap::default();
         self.memory.release_all();
         self.segments.push((first_record, self.count));
     }
@@ -498,7 +501,7 @@ impl Writer {
             block_base: (0, 0),
             record_count: 0,
             strings: StringTable {
-                ids: HashMap::new(),
+                ids: FxHashMap::default(),
                 memory: Reservation::empty(budget),
                 memory_share: budget.limit() / DICTIONARY_BUDGET_FRACTION,
                 segment_records: SEGMENT_RECORDS,
@@ -584,7 +587,7 @@ impl Writer {
             block_base: (0, 0),
             record_count: state.record_count,
             strings: StringTable {
-                ids: HashMap::new(),
+                ids: FxHashMap::default(),
                 memory: Reservation::empty(budget),
                 memory_share: budget.limit() / DICTIONARY_BUDGET_FRACTION,
                 segment_records: SEGMENT_RECORDS,
