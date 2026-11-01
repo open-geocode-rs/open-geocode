@@ -101,6 +101,8 @@ pub struct Writer {
     committed: u64,
     /// The address group the next address may join, and its numbers.
     group: Option<(Document, Numbers)>,
+    /// Whether [`Self::merge`] ran: the index takes no more documents.
+    merged: bool,
 }
 
 /// What a record adds to the text index: a document of its own, or, for an
@@ -343,6 +345,7 @@ impl Writer {
             document_count: 0,
             committed: 0,
             group: None,
+            merged: false,
         })
     }
 
@@ -393,6 +396,7 @@ impl Writer {
             document_count: state.document_count,
             committed: state.document_count,
             group: None,
+            merged: false,
         })
     }
 
@@ -469,34 +473,9 @@ impl Writer {
 
     /// Commit, merge to a single segment and copy the index into the Pack.
     pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
-        self.close_group()?;
-        self.writer()?;
-        let (mut writer, memory) = self.writer.take().expect("writer created");
-        writer.commit()?;
-        // Join the segments the indexing threads wrote into a few, merged side
-        // by side: one merge of every segment runs on one thread, and search
-        // reads a few segments as well as one.
-        let segment_ids = self.index.searchable_segment_ids()?;
-        let groups = segment_ids.len().min(MERGED_SEGMENTS);
-        if segment_ids.len() > groups {
-            let mut merges = vec![Vec::new(); groups];
-            for (index, segment) in segment_ids.into_iter().enumerate() {
-                merges[index % groups].push(segment);
-            }
-            let pending = merges
-                .iter()
-                .filter(|segments| segments.len() > 1)
-                .map(|segments| writer.merge(segments))
-                .collect::<Vec<_>>();
-            for merge in pending {
-                merge.wait()?;
-            }
-            writer.commit()?;
+        if !self.merged {
+            self.merge()?;
         }
-        writer.garbage_collect_files().wait()?;
-        writer.wait_merging_threads()?;
-        drop(memory);
-
         let mut files = fs::read_dir(&self.path)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<io::Result<Vec<_>>>()?;
@@ -533,6 +512,41 @@ impl Writer {
             document_count,
             bytes,
         })
+    }
+
+    /// Commit, and merge the segments into the few [`Self::finish`] copies
+    /// into the Pack. Apart from it, so the merge can run while the part
+    /// sealed before it is copied in.
+    pub fn merge(&mut self) -> Result<()> {
+        self.close_group()?;
+        self.writer()?;
+        let (mut writer, memory) = self.writer.take().expect("writer created");
+        writer.commit()?;
+        // Join the segments the indexing threads wrote into a few, merged side
+        // by side: one merge of every segment runs on one thread, and search
+        // reads a few segments as well as one.
+        let segment_ids = self.index.searchable_segment_ids()?;
+        let groups = segment_ids.len().min(MERGED_SEGMENTS);
+        if segment_ids.len() > groups {
+            let mut merges = vec![Vec::new(); groups];
+            for (index, segment) in segment_ids.into_iter().enumerate() {
+                merges[index % groups].push(segment);
+            }
+            let pending = merges
+                .iter()
+                .filter(|segments| segments.len() > 1)
+                .map(|segments| writer.merge(segments))
+                .collect::<Vec<_>>();
+            for merge in pending {
+                merge.wait()?;
+            }
+            writer.commit()?;
+        }
+        writer.garbage_collect_files().wait()?;
+        writer.wait_merging_threads()?;
+        drop(memory);
+        self.merged = true;
+        Ok(())
     }
 }
 
