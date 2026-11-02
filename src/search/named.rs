@@ -147,28 +147,14 @@ fn hit_country(hit: &TextSearchHit) -> Option<String> {
 }
 
 impl TextSearcher {
-    /// The places `reading` names, each as the structured index's places of its
-    /// words, held to the country most of them agree on.
-    ///
-    /// The country is the query's last words when they name one ("FR",
-    /// "FRANCE", "Duitsland") and the reading does not read them as a
-    /// region ("MA" after Boston), whatever else it reads them as: a
-    /// reading of "Saint-Dizier 52100 FR" that takes "fr" for a town still
-    /// names France. Its postcode, towns and regions are the runs of words
-    /// it reads as each that the structured index knows; a placeholder postcode
-    /// ("00000") names nothing. Each country scores one for the stated
-    /// country and one for each named place it holds a place of; when one
-    /// country scores best it is the country, and each named place keeps
-    /// only its places there, so a postcode another country shares
-    /// ("02130" of France and Boston) is read in the country the rest
-    /// agree on, and a stated country the postcode and town both disagree
-    /// with ("Duisburg 47051 France") gives way to them. A named place the
-    /// country holds none of names nothing.
-    pub(super) fn named_places(
-        &self,
-        structured: &StructuredIndex,
-        reading: &Reading,
-    ) -> NamedPlaces {
+    /// The country `pieces` write, as its code, and the pieces that write
+    /// it: the query's last words when they name a country the Pack covers
+    /// ("FR", "FRANCE", "Duitsland"), or the words before a postcode that
+    /// ends it, and no word of them is read as a region ("MA" after
+    /// Boston), a postcode ("4811 AT"), a street, a number or a unit;
+    /// whatever else they are read as, a town among them ("fr" of
+    /// "Saint-Dizier 52100 FR").
+    pub(super) fn written_country(&self, pieces: &[Tagged]) -> Option<(String, Range<usize>)> {
         let dictionaries = self.tagger.dictionaries();
         let covered = |country: &CountryCode| dictionaries.country_weight(*country) > 0.0;
         let country_of = |pieces: &[Tagged]| {
@@ -182,12 +168,6 @@ impl TextSearcher {
                 .and_then(|entry| entry.country)
                 .filter(covered)
         };
-        let pieces = &reading.pieces;
-        let mut stated = None;
-        let mut stated_at = pieces.len()..pieces.len();
-        // The country ends the query, or comes before its postcode; no word
-        // of it is read as a region ("MA" after Boston) or a postcode
-        // ("4811 AT").
         let mut ends = vec![pieces.len()];
         if pieces.len() > 1
             && matches!(
@@ -197,7 +177,7 @@ impl TextSearcher {
         {
             ends.push(pieces.len() - 1);
         }
-        'ends: for end in ends {
+        for end in ends {
             for take in (1..=3.min(end)).rev() {
                 let window = &pieces[end - take..end];
                 if window.iter().any(|piece| {
@@ -213,12 +193,39 @@ impl TextSearcher {
                     continue;
                 }
                 if let Some(country) = country_of(window) {
-                    stated = Some(country.as_str().to_ascii_uppercase());
-                    stated_at = end - take..end;
-                    break 'ends;
+                    return Some((country.as_str().to_ascii_uppercase(), end - take..end));
                 }
             }
         }
+        None
+    }
+
+    /// The places `reading` names, each as the structured index's places of its
+    /// words, held to the country most of them agree on.
+    ///
+    /// The country is the one the query writes (see
+    /// [`Self::written_country`]), whatever else the reading reads its
+    /// words as: a reading of "Saint-Dizier 52100 FR" that takes "fr" for a
+    /// town still names France. Its postcode, towns and regions are the runs of words
+    /// it reads as each that the structured index knows; a placeholder postcode
+    /// ("00000") names nothing. Each country scores one for the stated
+    /// country and one for each named place it holds a place of; when one
+    /// country scores best it is the country, and each named place keeps
+    /// only its places there, so a postcode another country shares
+    /// ("02130" of France and Boston) is read in the country the rest
+    /// agree on, and a stated country the postcode and town both disagree
+    /// with ("Duisburg 47051 France") gives way to them. A named place the
+    /// country holds none of names nothing.
+    pub(super) fn named_places(
+        &self,
+        structured: &StructuredIndex,
+        reading: &Reading,
+    ) -> NamedPlaces {
+        let pieces = &reading.pieces;
+        let (stated, stated_at) = match self.written_country(pieces) {
+            Some((country, at)) => (Some(country), at),
+            None => (None, pieces.len()..pieces.len()),
+        };
         let mut groups = Vec::<NamedGroup>::new();
         let mut at = 0;
         while at < pieces.len() {

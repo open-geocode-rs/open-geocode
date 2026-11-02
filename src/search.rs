@@ -3853,7 +3853,8 @@ impl TextSearcher {
     /// The plans of the parser's best labellings of `query_text`, best first,
     /// each with `context` after its own parts, the parser's score of each,
     /// and the query's lattice to explain answers with (see
-    /// [`Self::explain`]). `parses` says which are kept.
+    /// [`Self::explain`]). `parses` says which are kept. The country the
+    /// query writes is its country in each (see [`country_not_town`]).
     fn readings(
         &self,
         query_text: &str,
@@ -3868,15 +3869,17 @@ impl TextSearcher {
             .parse_explained_n(query_text, STRUCTURED_READINGS);
         let mut from_text = Vec::<bool>::new();
         for (index, parsed) in parsed.into_iter().enumerate() {
+            let written = self.written_country(&parsed.pieces);
+            let read = country_not_town(parsed.pieces, written, parsed.country);
             if let Some(plan) =
-                QueryPlan::from_tagged(&parsed.pieces, &parsed.corrections, context, |word| {
+                QueryPlan::from_tagged(&read, &parsed.corrections, context, |word| {
                     self.tagger.dictionaries().describes_street(word)
                 })
                 && !plans.contains(&plan)
             {
                 plans.push(plan);
                 scores.push(parsed.score);
-                pieces.push(parsed.pieces);
+                pieces.push(read);
                 from_text.push(index < lattice::N_BEST);
             }
         }
@@ -7394,6 +7397,31 @@ impl Pool {
         }
         Some((readings[reading].text.clone(), hits))
     }
+}
+
+/// `pieces` with the country the query writes (`written`, see
+/// [`TextSearcher::written_country`]) read as its country where the parser
+/// read every word of it as a town, when the parser scored the query by
+/// that country's rules (`parsed`). A code names towns and cantons as well
+/// ("FR" of Fribourg), and a town every answer must lie in would keep only
+/// the places of that name. A country written after a town of another
+/// ("Fribourg FR", scored as Swiss) stays as read.
+fn country_not_town(
+    mut pieces: Vec<Tagged>,
+    written: Option<(String, Range<usize>)>,
+    parsed: Option<CountryCode>,
+) -> Vec<Tagged> {
+    if let Some((country, at)) = written
+        && parsed.is_some_and(|parsed| parsed.as_str().eq_ignore_ascii_case(&country))
+        && pieces[at.clone()]
+            .iter()
+            .all(|piece| piece.label == Label::Locality)
+    {
+        for piece in &mut pieces[at] {
+            piece.label = Label::Country;
+        }
+    }
+    pieces
 }
 
 /// The edits a query word may be from a record's: one for words of
@@ -10980,6 +11008,37 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_country_code_read_as_a_town_is_the_country() {
+        let france = CountryCode::parse("FR");
+        let read = tagged(
+            "12/house_number rue/street paix/street lyon/locality 69002/postcode fr/locality",
+        );
+        let written = Some(("FR".to_string(), 5..6));
+        let last = |pieces: Vec<Tagged>| pieces[5].label;
+        assert_eq!(
+            last(country_not_town(read.clone(), written.clone(), france)),
+            Label::Country
+        );
+        // Scored by Swiss rules, "FR" after a town is its canton, as read.
+        assert_eq!(
+            last(country_not_town(
+                read.clone(),
+                written.clone(),
+                CountryCode::parse("CH")
+            )),
+            Label::Locality
+        );
+        // A word read as a region stays one ("MA" after Boston).
+        let region =
+            tagged("12/house_number rue/street paix/street lyon/locality 69002/postcode fr/region");
+        assert_eq!(
+            last(country_not_town(region, written, france)),
+            Label::Region
+        );
+        assert_eq!(last(country_not_town(read, None, france)), Label::Locality);
     }
 
     #[test]
