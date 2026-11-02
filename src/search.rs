@@ -2379,8 +2379,10 @@ impl TextSearcher {
         Ok(chain.is_empty() || chain.iter().any(|id| areas.contains(id)))
     }
 
-    /// The spot bests of every one of `readings`, and how many documents of
-    /// their streets they were chosen from.
+    /// The spot bests of `readings`, best first, up to the first that finds
+    /// the exact address inside every place it names, and how many documents
+    /// of their streets they were chosen from. The readings after it are the
+    /// parser's less likely ones, and each costs a street lookup.
     fn structured_found(
         &self,
         cx: &StructuredContext<'_, '_>,
@@ -2391,10 +2393,13 @@ impl TextSearcher {
         let mut found = Vec::new();
         let mut candidates = 0;
         for &(index, reading) in readings {
-            let (more, documents) =
+            let (more, documents, settled) =
                 self.structured_reading(cx, index, reading, numbered, accept)?;
             found.extend(more);
             candidates += documents;
+            if settled {
+                break;
+            }
         }
         Ok((found, candidates))
     }
@@ -2405,7 +2410,9 @@ impl TextSearcher {
     /// a spot each, the best of each spot hydrated, at most [`STRUCTURED_SPOTS`].
     /// A number none holds there is placed between its neighbours on its
     /// side, else between any, else the street answers; without a number
-    /// the street answers. Else why there are none.
+    /// the street answers. Else why there are none. With them, how many
+    /// documents its street lists hold, and whether one is the exact
+    /// address inside every place the reading names.
     fn structured_reading(
         &self,
         cx: &StructuredContext<'_, '_>,
@@ -2413,7 +2420,7 @@ impl TextSearcher {
         reading: &Reading,
         numbered: bool,
         accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
-    ) -> Result<(Vec<StructuredFound>, usize)> {
+    ) -> Result<(Vec<StructuredFound>, usize, bool)> {
         let structured = cx.structured;
         let plan = &reading.plan;
         let countries = self.structured_countries(plan, &cx.search.filters);
@@ -2445,7 +2452,7 @@ impl TextSearcher {
         if lists.is_empty() {
             lists = self.street_matches(structured, plan, &places, &countries);
             if lists.is_empty() {
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, false));
             }
             entry = "place";
             lever |= LEVER_A;
@@ -2454,7 +2461,7 @@ impl TextSearcher {
             .retain(|list| places.countries.is_empty() || places.countries.contains(&list.country));
         let mut raw = lists.iter().map(structured::StreetList::len).sum::<usize>();
         if raw == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, false));
         }
         let mut supported = Vec::new();
         for list in &lists {
@@ -2686,12 +2693,12 @@ impl TextSearcher {
                 }
                 found.retain(|found| found.form != FORM_STREET || found.support >= placed);
                 if !found.is_empty() {
-                    return Ok((found, raw));
+                    return Ok((found, raw, false));
                 }
             }
             if candidates.is_empty() {
                 if raw > STRUCTURED_CANDIDATES {
-                    return Ok((Vec::new(), raw));
+                    return Ok((Vec::new(), raw, false));
                 }
                 let forms = self.number_forms(&searcher, &all_docs(), plan, base_plan.as_ref())?;
                 candidates.extend(
@@ -2701,7 +2708,7 @@ impl TextSearcher {
                 );
             }
             if candidates.is_empty() {
-                return Ok((Vec::new(), raw));
+                return Ok((Vec::new(), raw, false));
             }
         } else {
             match most {
@@ -2716,7 +2723,7 @@ impl TextSearcher {
                         .into_iter()
                         .map(|doc| (doc, 0, FORM_STREET, false)),
                 ),
-                None => return Ok((Vec::new(), raw)),
+                None => return Ok((Vec::new(), raw, false)),
             }
             candidates.sort_unstable_by_key(|(doc, _, _, _)| *doc);
             candidates.dedup_by_key(|(doc, _, _, _)| *doc);
@@ -2768,7 +2775,10 @@ impl TextSearcher {
         found.extend(self.join_road_pieces(pieces));
         self.postcode_stretch(plan, &candidate_docs, &mut found);
         found.retain(|found| found.form != FORM_STREET || found.support >= placed);
-        Ok((found, raw))
+        let settled = found
+            .iter()
+            .any(|found| found.form == FORM_EXACT && found.support >= placed);
+        Ok((found, raw, settled))
     }
 
     /// The street of `spot` as an answer: its best record hydrated, at the
