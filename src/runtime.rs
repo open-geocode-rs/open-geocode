@@ -25,8 +25,9 @@ use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
         batch::{self, Lookup},
-        batches::{self, BatchStore},
-        bounds, health, method, openapi,
+        bounds, health,
+        jobs::{self, JobStore},
+        method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
@@ -57,12 +58,12 @@ pub(crate) struct AppState {
     error_log: ErrorLog,
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
-    batches: Arc<BatchStore>,
+    jobs: Arc<JobStore>,
 }
 
 impl AppState {
-    /// Open the Pack at `path`, keeping `/batches` files in `batches`.
-    pub(crate) fn open(path: &Path, batches: &Path) -> Result<Self> {
+    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`.
+    pub(crate) fn open(path: &Path, jobs: &Path) -> Result<Self> {
         let pack = Arc::new(Reader::open(path)?);
         let resources = Resources::probe();
         // Every query looks things up all over the Pack: read it in now
@@ -71,8 +72,9 @@ impl AppState {
             .advise_random_reads(resources.available_memory_bytes);
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
-        // Every CPU, at low priority: batches take all the CPU single
-        // lookups leave idle, and a single lookup never waits for a core.
+        // Every CPU, at low priority: batches and jobs take all the CPU
+        // single lookups leave idle, and a single lookup never waits for a
+        // core.
         let batch_pool = ThreadPoolBuilder::new()
             .num_threads(resources.usable_cpus)
             .thread_name(|index| format!("batch-{index}"))
@@ -86,23 +88,23 @@ impl AppState {
             ready: Arc::new(AtomicBool::new(true)),
             error_log: ErrorLog::default(),
             batch_pool: Arc::new(batch_pool),
-            // Batches share the pool's cores, so running more of them at once
-            // than there are cores only slows each one down.
+            // Batches and jobs share the pool's cores, so running more of them
+            // at once than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
-            batches: Arc::new(BatchStore::open(batches.to_path_buf())?),
+            jobs: Arc::new(JobStore::open(jobs.to_path_buf())?),
         })
     }
 
-    pub(crate) fn batches(&self) -> &BatchStore {
-        &self.batches
+    pub(crate) fn jobs(&self) -> &JobStore {
+        &self.jobs
     }
 
-    /// Where batch items run.
+    /// Where batch items and job rows run.
     pub(crate) fn batch_pool(&self) -> &ThreadPool {
         &self.batch_pool
     }
 
-    /// One permit per batch running; a batch without one is refused.
+    /// One permit per batch or job running; one without a permit is refused.
     pub(crate) fn batch_slots(&self) -> &Arc<Semaphore> {
         &self.batch_slots
     }
@@ -220,8 +222,8 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack, &batches::default_dir(options.bind.port()))?;
-    tokio::spawn(batches::sweep_forever(state.clone()));
+    let state = AppState::open(&options.pack, &jobs::default_dir(options.bind.port()))?;
+    tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
     let listener = TcpListener::bind(options.bind)
@@ -256,26 +258,23 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", batchable(geocode, geocode_batch))
         .route("/reverse", batchable(reverse, reverse_batch))
+        .route("/jobs", only(MethodFilter::POST, "POST", jobs::create))
         .route(
-            "/batches",
-            only(MethodFilter::POST, "POST", batches::create),
-        )
-        .route(
-            "/batches/{id}",
-            on(MethodFilter::GET, batches::status)
-                .on(MethodFilter::DELETE, batches::delete)
+            "/jobs/{id}",
+            on(MethodFilter::GET, jobs::status)
+                .on(MethodFilter::DELETE, jobs::delete)
                 .on(MethodFilter::HEAD, || async {
                     Problem::method_not_allowed("DELETE, GET")
                 })
                 .fallback(|| async { Problem::method_not_allowed("DELETE, GET") }),
         )
         .route(
-            "/batches/{id}/results",
-            only(MethodFilter::GET, "GET", batches::results),
+            "/jobs/{id}/results",
+            only(MethodFilter::GET, "GET", jobs::results),
         )
         .route(
-            "/batches/{id}/cancel",
-            only(MethodFilter::POST, "POST", batches::cancel),
+            "/jobs/{id}/cancel",
+            only(MethodFilter::POST, "POST", jobs::cancel),
         )
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
@@ -686,7 +685,7 @@ pub(crate) async fn geocode(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The batch failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the \
+        (status = 503, description = "Every slot batches and jobs share is taken. Retry after the \
                                       `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
@@ -695,7 +694,7 @@ pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Reques
     batch::run(state, GEOCODE, request).await
 }
 
-/// `/geocode` as a batch item, in `QUERY /geocode` and in `/batches`.
+/// `/geocode` as a batch item, in `QUERY /geocode` and in `/jobs`.
 pub(crate) const GEOCODE: Lookup<
     GeocodeParams,
     AddressGeocodeOptions,
@@ -825,7 +824,7 @@ pub(crate) async fn reverse(
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "The batch failed inside the server.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the \
+        (status = 503, description = "Every slot batches and jobs share is taken. Retry after the \
                                       `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
@@ -834,7 +833,7 @@ pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Reques
     batch::run(state, REVERSE, request).await
 }
 
-/// `/reverse` as a batch item, in `QUERY /reverse` and in `/batches`.
+/// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
 pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollection, u64> = Lookup {
     route: "/reverse",
     prepare: reverse_request,
@@ -922,8 +921,8 @@ mod router_tests {
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {
-        let state = AppState::open(pack_dir, &pack_dir.with_extension("batches"))
-            .expect("open shared pack");
+        let state =
+            AppState::open(pack_dir, &pack_dir.with_extension("jobs")).expect("open shared pack");
         state.ready.store(ready, Ordering::Release);
         state
     }
@@ -1414,10 +1413,10 @@ mod router_tests {
     }
 
     /// A CSV comes back as it went, each row with `geocode batch`'s columns
-    /// holding its `GET` answer, and the batch can be read again by its id.
+    /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]
-    async fn batches_stream_a_csv_back_with_each_rows_answer() {
-        let pack = temp_path("batches-csv");
+    async fn jobs_stream_a_csv_back_with_each_rows_answer() {
+        let pack = temp_path("jobs-csv");
         write_pack(&pack);
         let router = build_router(state_for(&pack, true), None, None);
 
@@ -1429,7 +1428,7 @@ mod router_tests {
         let reply = send(
             router.clone(),
             upload(
-                "/batches?address=street&locality=town&postcode=zip",
+                "/jobs?address=street&locality=town&postcode=zip",
                 "text/csv",
                 body,
             ),
@@ -1491,8 +1490,8 @@ mod router_tests {
     /// JSONL rows are batch items, answered as their `GET` is, each tagged
     /// with its place in the upload.
     #[tokio::test]
-    async fn batches_answer_jsonl_rows_as_their_get() {
-        let pack = temp_path("batches-jsonl");
+    async fn jobs_answer_jsonl_rows_as_their_get() {
+        let pack = temp_path("jobs-jsonl");
         write_pack(&pack);
         let router = build_router(state_for(&pack, true), None, None);
 
@@ -1502,7 +1501,7 @@ mod router_tests {
                     not json\n";
         let reply = send(
             router.clone(),
-            upload("/batches?endpoint=reverse", "application/jsonl", body),
+            upload("/jobs?endpoint=reverse", "application/jsonl", body),
         )
         .await;
         assert_eq!(reply.status, StatusCode::CREATED);
@@ -1529,14 +1528,14 @@ mod router_tests {
     }
 
     /// `Prefer: respond-async` is answered once the upload is in, and the
-    /// results are read from the batch.
+    /// results are read from the job.
     #[tokio::test]
-    async fn batches_answer_at_once_when_asked() {
-        let pack = temp_path("batches-async");
+    async fn jobs_answer_at_once_when_asked() {
+        let pack = temp_path("jobs-async");
         write_pack(&pack);
         let router = build_router(state_for(&pack, true), None, None);
 
-        let mut request_ = upload("/batches", "text/csv", "Address,City\n10 King Street,\n");
+        let mut request_ = upload("/jobs", "text/csv", "Address,City\n10 King Street,\n");
         request_
             .headers_mut()
             .insert("prefer", header::HeaderValue::from_static("respond-async"));
@@ -1545,41 +1544,41 @@ mod router_tests {
         let id = reply.json()["id"].as_str().expect("id").to_string();
         assert_eq!(
             header_value(&reply, "location"),
-            Some(format!("/batches/{id}").as_str())
+            Some(format!("/jobs/{id}").as_str())
         );
 
         let results = send(
             router.clone(),
-            request("GET", &format!("/batches/{id}/results")),
+            request("GET", &format!("/jobs/{id}/results")),
         )
         .await;
         let rows = csv_rows(&results.body);
         assert_eq!(rows[0]["geocode_status"], "resolved");
-        let status = send(router.clone(), request("GET", &format!("/batches/{id}"))).await;
+        let status = send(router.clone(), request("GET", &format!("/jobs/{id}"))).await;
         assert_eq!(status.json()["status"], "completed");
 
-        let deleted = send(router.clone(), request("DELETE", &format!("/batches/{id}"))).await;
+        let deleted = send(router.clone(), request("DELETE", &format!("/jobs/{id}"))).await;
         assert_eq!(deleted.status, StatusCode::NO_CONTENT);
-        let gone = send(router.clone(), request("GET", &format!("/batches/{id}"))).await;
+        let gone = send(router.clone(), request("GET", &format!("/jobs/{id}"))).await;
         assert_eq!(gone.status, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    /// What `/batches` cannot read is refused before it starts.
+    /// What `/jobs` cannot read is refused before it starts.
     #[tokio::test]
-    async fn batches_refuse_what_they_cannot_read() {
-        let pack = temp_path("batches-refused");
+    async fn jobs_refuse_what_they_cannot_read() {
+        let pack = temp_path("jobs-refused");
         write_pack(&pack);
         let router = build_router(state_for(&pack, true), None, None);
         let code = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
 
-        let reply = send(router.clone(), upload("/batches", "application/json", "[]")).await;
+        let reply = send(router.clone(), upload("/jobs", "application/json", "[]")).await;
         assert_eq!(reply.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
         let reply = send(
             router.clone(),
-            upload("/batches", "text/csv", "foo,bar\n1,2\n"),
+            upload("/jobs", "text/csv", "foo,bar\n1,2\n"),
         )
         .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -1592,39 +1591,35 @@ mod router_tests {
 
         let reply = send(
             router.clone(),
-            upload("/batches?address=street", "text/csv", "foo,bar\n1,2\n"),
+            upload("/jobs?address=street", "text/csv", "foo,bar\n1,2\n"),
         )
         .await;
         assert_eq!(code(&reply).as_deref(), Some("malformed_parameter"));
         assert_eq!(reply.json()["invalid_params"][0]["name"], "street");
 
-        let reply = send(
-            router.clone(),
-            upload("/batches", "application/jsonl", "{}\n"),
-        )
-        .await;
+        let reply = send(router.clone(), upload("/jobs", "application/jsonl", "{}\n")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 
         let reply = send(
             router.clone(),
-            upload("/batches?endpoint=search", "application/jsonl", "{}\n"),
+            upload("/jobs?endpoint=search", "application/jsonl", "{}\n"),
         )
         .await;
         assert_eq!(reply.json()["invalid_params"][0]["name"], "endpoint");
 
         for (method, uri) in [
-            ("GET", "/batches/nope"),
-            ("GET", "/batches/nope/results"),
-            ("POST", "/batches/nope/cancel"),
-            ("DELETE", "/batches/nope"),
+            ("GET", "/jobs/nope"),
+            ("GET", "/jobs/nope/results"),
+            ("POST", "/jobs/nope/cancel"),
+            ("DELETE", "/jobs/nope"),
         ] {
             let reply = send(router.clone(), request(method, uri)).await;
             assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
         }
         for (method, uri, allow) in [
-            ("GET", "/batches", "POST"),
-            ("PUT", "/batches/nope", "DELETE, GET"),
-            ("POST", "/batches/nope/results", "GET"),
+            ("GET", "/jobs", "POST"),
+            ("PUT", "/jobs/nope", "DELETE, GET"),
+            ("POST", "/jobs/nope/results", "GET"),
         ] {
             let reply = send(router.clone(), request(method, uri)).await;
             assert_eq!(
@@ -1638,18 +1633,18 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    /// A finished batch is still served after a restart, and one that was
+    /// A finished job is still served after a restart, and one that was
     /// running when the server stopped is failed, not left running forever.
     #[tokio::test]
-    async fn batches_outlive_a_restart() {
-        let pack = temp_path("batches-restart");
+    async fn jobs_outlive_a_restart() {
+        let pack = temp_path("jobs-restart");
         write_pack(&pack);
-        let spool = pack.with_extension("batches");
+        let spool = pack.with_extension("jobs");
         let _ = std::fs::remove_dir_all(&spool);
         let router = build_router(state_for(&pack, true), None, None);
         let reply = send(
             router,
-            upload("/batches", "text/csv", "street\n10 King Street\n"),
+            upload("/jobs", "text/csv", "street\n10 King Street\n"),
         )
         .await;
         let location = header_value(&reply, "location")
@@ -1665,11 +1660,11 @@ mod router_tests {
                 "output_format": "csv",
                 "summary": {"total": 0, "succeeded": 0, "failed": 0},
                 "created_at": 0,
-                "results_url": "/batches/interrupted/results",
+                "results_url": "/jobs/interrupted/results",
             })
             .to_string(),
         )
-        .expect("write a running batch");
+        .expect("write a running job");
 
         let router = build_router(state_for(&pack, true), None, None);
         let status = send(router.clone(), request("GET", &location)).await.json();
@@ -1680,7 +1675,7 @@ mod router_tests {
         )
         .await;
         assert_eq!(results.body, reply.body);
-        let interrupted = send(router, request("GET", "/batches/interrupted"))
+        let interrupted = send(router, request("GET", "/jobs/interrupted"))
             .await
             .json();
         assert_eq!(interrupted["status"], "failed");

@@ -360,7 +360,7 @@ where
                 problem: Problem::unparsable_parameters(),
             };
         }
-        // A `QUERY` body with one is refused whole; a `/batches` line fails
+        // A `QUERY` body with one is refused whole; a `/jobs` line fails
         // alone.
         RawItem::NotAnObject => {
             return Prepared::Failed {

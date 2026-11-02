@@ -1,9 +1,9 @@
-//! `/batches`: a CSV or JSONL file of lookups, answered while it uploads.
+//! `/jobs`: a CSV or JSONL file of lookups, answered while it uploads.
 //!
 //! Rows are looked up as they arrive and their results streamed back in the
 //! same response, so nothing waits for the whole file. The results are also
-//! written to disk as they are made: `GET /batches/{id}/results` streams
-//! them again, live while the batch still runs, to a client that lost its
+//! written to disk as they are made: `GET /jobs/{id}/results` streams
+//! them again, live while the job still runs, to a client that lost its
 //! connection or asked to be answered at once (`Prefer: respond-async`).
 //!
 //! Each row is the item a `QUERY /geocode` or `QUERY /reverse` would carry,
@@ -42,7 +42,7 @@ use crate::{
     batch::{audit_columns, delimiter_of, text},
     http::{
         batch::{self, Item, Lookup, Prepared, RawItem},
-        bounds::{BATCH_RETENTION, MAX_BATCH_ROWS, MAX_BATCH_UPLOAD_BYTES, UPLOAD_STALL_SECONDS},
+        bounds::{JOB_RETENTION, MAX_JOB_ROWS, MAX_JOB_UPLOAD_BYTES, UPLOAD_STALL_SECONDS},
         openapi::{self, PROBLEM_JSON},
         problem::{InvalidParam, Problem},
         request_id::RequestId,
@@ -50,7 +50,7 @@ use crate::{
     runtime::{AppState, GEOCODE, REVERSE},
 };
 
-/// The media types a batch file is read and written as.
+/// The media types a job's file is read and written as.
 const CSV: &str = "text/csv";
 const JSONL: &str = "application/jsonl";
 /// What JSONL went by before it had a name of its own; still common.
@@ -60,8 +60,8 @@ const NDJSON: &str = "application/x-ndjson";
 /// within it, so a window is the reach of that ordering.
 const WINDOW_ROWS: usize = 256;
 
-/// Lookups one batch has queued or running, per pool thread. Enough to keep
-/// every core busy without one batch filling the pool's queue ahead of the
+/// Lookups one job has queued or running, per pool thread. Enough to keep
+/// every core busy without one job filling the pool's queue ahead of the
 /// others.
 const IN_FLIGHT_PER_THREAD: usize = 2;
 
@@ -77,10 +77,10 @@ const SNIFF_BYTES: usize = 64 << 10;
 
 const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 
-/// The lookup every row of a batch runs.
+/// The lookup every row of a job runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-#[schema(as = BatchEndpoint)]
+#[schema(as = JobEndpoint)]
 pub(crate) enum Endpoint {
     Geocode,
     Reverse,
@@ -96,10 +96,10 @@ impl Endpoint {
     }
 }
 
-/// A batch file's format: CSV, or one JSON object a line.
+/// A job's file format: CSV, or one JSON object a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-#[schema(as = BatchFormat)]
+#[schema(as = JobFormat)]
 pub(crate) enum Format {
     Csv,
     Jsonl,
@@ -125,7 +125,7 @@ impl Format {
         }
     }
 
-    /// The first format `Accept` names that a batch can be written as.
+    /// The first format `Accept` names that a job can be written as.
     fn accepted(headers: &HeaderMap) -> Option<Self> {
         headers
             .get(header::ACCEPT)?
@@ -136,10 +136,10 @@ impl Format {
     }
 }
 
-/// Where a batch is: running, or stopped and how.
+/// Where a job is: running, or stopped and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-#[schema(as = BatchState)]
+#[schema(as = JobState)]
 pub(crate) enum Status {
     Running,
     Completed,
@@ -147,34 +147,37 @@ pub(crate) enum Status {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// How a job's rows went.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(as = JobSummary)]
 pub(crate) struct Summary {
     pub(crate) total: usize,
+    /// Rows answered with a 200.
     pub(crate) succeeded: usize,
+    /// Rows answered with an error.
     pub(crate) failed: usize,
 }
 
-/// A batch as `GET /batches/{id}` shows it, and as it is kept on disk.
+/// A job as `GET /jobs/{id}` shows it, and as it is kept on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub(crate) struct BatchStatus {
+pub(crate) struct JobStatus {
     pub(crate) id: String,
     pub(crate) endpoint: Endpoint,
     pub(crate) status: Status,
     pub(crate) input_format: Format,
     pub(crate) output_format: Format,
     /// Rows answered so far.
-    #[schema(value_type = openapi::BatchSummary)]
     pub(crate) summary: Summary,
     /// Unix seconds.
     pub(crate) created_at: u64,
-    /// Unix seconds, once the batch stops.
+    /// Unix seconds, once the job stops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) completed_at: Option<u64>,
-    /// When the results are deleted. Set once the batch stops.
+    /// When the results are deleted. Set once the job stops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expires_at: Option<u64>,
     pub(crate) results_url: String,
-    /// Why a failed batch stopped.
+    /// Why a failed job stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
 }
@@ -186,9 +189,9 @@ struct Progress {
     done: bool,
 }
 
-/// One batch, running or kept.
-pub(crate) struct Batch {
-    status: Mutex<BatchStatus>,
+/// One job, running or kept.
+pub(crate) struct Job {
+    status: Mutex<JobStatus>,
     progress: watch::Sender<Progress>,
     cancel: AtomicBool,
     /// Deleted while running: its files go when it stops.
@@ -197,14 +200,14 @@ pub(crate) struct Batch {
     record: PathBuf,
 }
 
-impl Batch {
-    fn snapshot(&self) -> BatchStatus {
-        self.status.lock().expect("batch status").clone()
+impl Job {
+    fn snapshot(&self) -> JobStatus {
+        self.status.lock().expect("job status").clone()
     }
 
     fn save(&self) {
         let status = self.snapshot();
-        // A status that fails to save leaves the batch served from memory;
+        // A status that fails to save leaves the job served from memory;
         // only a restart loses it.
         if let Ok(json) = serde_json::to_vec(&status) {
             let _ = fs::write(&self.record, json);
@@ -217,20 +220,20 @@ impl Batch {
     }
 }
 
-/// Every batch this server keeps, and the directory that holds their files.
-pub(crate) struct BatchStore {
+/// Every job this server keeps, and the directory that holds their files.
+pub(crate) struct JobStore {
     dir: PathBuf,
-    batches: Mutex<HashMap<String, Arc<Batch>>>,
+    jobs: Mutex<HashMap<String, Arc<Job>>>,
 }
 
-impl BatchStore {
-    /// Open the store in `dir`, keeping the batches a past run left there.
+impl JobStore {
+    /// Open the store in `dir`, keeping the jobs a past run left there.
     /// One that was running then is failed: its upload went with the server.
     pub(crate) fn open(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         let store = Self {
             dir,
-            batches: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(HashMap::new()),
         };
         let now = unix_now();
         let mut kept = Vec::new();
@@ -241,41 +244,41 @@ impl BatchStore {
             }
             let Some(mut status) = fs::read(&path)
                 .ok()
-                .and_then(|bytes| serde_json::from_slice::<BatchStatus>(&bytes).ok())
+                .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
             else {
                 let _ = fs::remove_file(&path);
                 continue;
             };
             if status.status == Status::Running {
                 status.status = Status::Failed;
-                status.error = Some("the server restarted while the batch ran".to_string());
+                status.error = Some("the server restarted while the job ran".to_string());
                 status.completed_at = Some(now);
-                status.expires_at = Some(now + BATCH_RETENTION.as_secs());
+                status.expires_at = Some(now + JOB_RETENTION.as_secs());
             }
-            let batch = store.batch(status);
-            if batch.snapshot().expires_at.is_some_and(|at| at <= now) {
-                batch.remove_files();
+            let job = store.job(status);
+            if job.snapshot().expires_at.is_some_and(|at| at <= now) {
+                job.remove_files();
                 continue;
             }
-            batch.save();
-            let bytes = fs::metadata(&batch.results).map_or(0, |meta| meta.len());
-            batch.progress.send_replace(Progress { bytes, done: true });
-            kept.push(batch);
+            job.save();
+            let bytes = fs::metadata(&job.results).map_or(0, |meta| meta.len());
+            job.progress.send_replace(Progress { bytes, done: true });
+            kept.push(job);
         }
-        let mut batches = store.batches.lock().expect("batches");
-        for batch in kept {
-            let id = batch.snapshot().id;
-            batches.insert(id, batch);
+        let mut jobs = store.jobs.lock().expect("jobs");
+        for job in kept {
+            let id = job.snapshot().id;
+            jobs.insert(id, job);
         }
-        drop(batches);
+        drop(jobs);
         store.remove_orphans();
         Ok(store)
     }
 
-    fn batch(&self, status: BatchStatus) -> Arc<Batch> {
+    fn job(&self, status: JobStatus) -> Arc<Job> {
         let results = self.dir.join(format!("{}.results", status.id));
         let record = self.dir.join(format!("{}.json", status.id));
-        Arc::new(Batch {
+        Arc::new(Job {
             status: Mutex::new(status),
             progress: watch::Sender::new(Progress::default()),
             cancel: AtomicBool::new(false),
@@ -287,7 +290,7 @@ impl BatchStore {
 
     /// Results files no status names, left by a crash between the two.
     fn remove_orphans(&self) {
-        let batches = self.batches.lock().expect("batches");
+        let jobs = self.jobs.lock().expect("jobs");
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
@@ -297,50 +300,46 @@ impl BatchStore {
                 && path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .is_none_or(|id| !batches.contains_key(id));
+                    .is_none_or(|id| !jobs.contains_key(id));
             if orphan {
                 let _ = fs::remove_file(path);
             }
         }
     }
 
-    fn get(&self, id: &str) -> Option<Arc<Batch>> {
-        let batch = self.batches.lock().expect("batches").get(id).cloned()?;
-        if batch
-            .snapshot()
-            .expires_at
-            .is_some_and(|at| at <= unix_now())
-        {
+    fn get(&self, id: &str) -> Option<Arc<Job>> {
+        let job = self.jobs.lock().expect("jobs").get(id).cloned()?;
+        if job.snapshot().expires_at.is_some_and(|at| at <= unix_now()) {
             self.remove(id);
             return None;
         }
-        Some(batch)
+        Some(job)
     }
 
-    fn insert(&self, batch: Arc<Batch>) {
-        let id = batch.snapshot().id;
-        self.batches.lock().expect("batches").insert(id, batch);
+    fn insert(&self, job: Arc<Job>) {
+        let id = job.snapshot().id;
+        self.jobs.lock().expect("jobs").insert(id, job);
     }
 
-    fn remove(&self, id: &str) -> Option<Arc<Batch>> {
-        let batch = self.batches.lock().expect("batches").remove(id)?;
-        batch.deleted.store(true, Ordering::Relaxed);
-        batch.cancel.store(true, Ordering::Relaxed);
-        if batch.progress.borrow().done {
-            batch.remove_files();
+    fn remove(&self, id: &str) -> Option<Arc<Job>> {
+        let job = self.jobs.lock().expect("jobs").remove(id)?;
+        job.deleted.store(true, Ordering::Relaxed);
+        job.cancel.store(true, Ordering::Relaxed);
+        if job.progress.borrow().done {
+            job.remove_files();
         }
-        Some(batch)
+        Some(job)
     }
 
-    /// Delete every batch past its retention.
+    /// Delete every job past its retention.
     pub(crate) fn sweep(&self) {
         let now = unix_now();
         let expired = self
-            .batches
+            .jobs
             .lock()
-            .expect("batches")
+            .expect("jobs")
             .iter()
-            .filter(|(_, batch)| batch.snapshot().expires_at.is_some_and(|at| at <= now))
+            .filter(|(_, job)| job.snapshot().expires_at.is_some_and(|at| at <= now))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in expired {
@@ -502,10 +501,10 @@ impl Columns {
         };
         match endpoint {
             Endpoint::Geocode if columns.address.is_empty() => Err(Problem::malformed_parameter(
-                "a geocode batch needs an address column; name it with ?address=",
+                "a geocode job needs an address column; name it with ?address=",
             )),
             Endpoint::Reverse if !has_point => Err(Problem::malformed_parameter(
-                "a reverse batch needs lat and lon columns; name them with ?lat= and ?lon=",
+                "a reverse job needs lat and lon columns; name them with ?lat= and ?lon=",
             )),
             _ => Ok((endpoint, columns)),
         }
@@ -603,7 +602,7 @@ struct Answered<A> {
     item: Item<A>,
 }
 
-/// How the reader ends, for the batch's status.
+/// How the reader ends, for the job's status.
 enum Ending {
     Read,
     Cancelled,
@@ -656,11 +655,11 @@ impl Plan {
     }
 }
 
-/// The query string of `POST /batches`, as the OpenAPI document lists it.
+/// The query string of `POST /jobs`, as the OpenAPI document lists it.
 #[derive(utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[allow(dead_code)]
-pub(crate) struct BatchQuery {
+pub(crate) struct JobQuery {
     /// The lookup every row runs. Required for JSONL; for CSV, inferred from the columns.
     endpoint: Option<Endpoint>,
     /// CSV only: the column, or comma-separated columns, holding the address.
@@ -698,16 +697,16 @@ pub(crate) struct BatchQuery {
 ///
 /// Every other query-string parameter, such as `country`, applies to every
 /// row. Each row's answer is the one its `GET` returns. Send
-/// `Prefer: respond-async` to be answered with the batch's status once the
+/// `Prefer: respond-async` to be answered with the job's status once the
 /// upload is in, instead of with the results.
 #[utoipa::path(
     post,
-    path = "/batches",
-    tag = "batches",
+    path = "/jobs",
+    tag = "jobs",
     params(
-        BatchQuery,
+        JobQuery,
         ("Prefer" = Option<String>, Header,
-         description = "`respond-async` to be answered with the batch's status once \
+         description = "`respond-async` to be answered with the job's status once \
                         the upload is in.",
          example = "respond-async"),
         ("Accept" = Option<String>, Header,
@@ -724,7 +723,7 @@ pub(crate) struct BatchQuery {
     responses(
         (status = 201, description = "The results, streamed as rows finish.",
          headers(
-             ("Location" = String, description = "The batch."),
+             ("Location" = String, description = "The job."),
              ("Content-Location" = String, description = "The results, kept for 72 hours."),
          ),
          content(
@@ -732,9 +731,9 @@ pub(crate) struct BatchQuery {
              (String = "application/jsonl"),
          )),
         (status = 202, description = "With `Prefer: respond-async`: the upload is in \
-                                      and the batch runs.",
-         body = BatchStatus,
-         headers(("Location" = String, description = "The batch."))),
+                                      and the job runs.",
+         body = JobStatus,
+         headers(("Location" = String, description = "The job."))),
         (status = 400, description = "The CSV has no header row or no column to look \
                                       up, or a parameter is malformed.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
@@ -742,8 +741,8 @@ pub(crate) struct BatchQuery {
          body = openapi::Problem, content_type = PROBLEM_JSON),
         (status = 415, description = "The body is not `text/csv` or `application/jsonl`.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
-        (status = 503, description = "Every batch slot is taken. Retry after the \
-                                      `Retry-After` header's seconds.",
+        (status = 503, description = "Every slot batches and jobs share is taken. \
+                                      Retry after the `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
     ),
 )]
@@ -766,8 +765,8 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    if declared.is_some_and(|length| length > MAX_BATCH_UPLOAD_BYTES) {
-        return Err(Problem::body_too_large(MAX_BATCH_UPLOAD_BYTES as usize));
+    if declared.is_some_and(|length| length > MAX_JOB_UPLOAD_BYTES) {
+        return Err(Problem::body_too_large(MAX_JOB_UPLOAD_BYTES as usize));
     }
     let plan = Plan::read(request.uri().query(), input)?;
     let request_id = request
@@ -787,7 +786,7 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         chunk: Bytes::new(),
     };
 
-    // The header row is read before answering, so a CSV the batch cannot
+    // The header row is read before answering, so a CSV the job cannot
     // read is a 400 rather than a stream that stops.
     let (upload, layout, endpoint, plan) = task::spawn_blocking(move || {
         let (layout, endpoint) = read_layout(&mut upload, input, &plan)?;
@@ -796,8 +795,8 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
     .await??;
 
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let store = state.batches();
-    let batch = store.batch(BatchStatus {
+    let store = state.jobs();
+    let job = store.job(JobStatus {
         id: id.clone(),
         endpoint,
         status: Status::Running,
@@ -807,16 +806,16 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         created_at: unix_now(),
         completed_at: None,
         expires_at: None,
-        results_url: format!("/batches/{id}/results"),
+        results_url: format!("/jobs/{id}/results"),
         error: None,
     });
-    let file = File::create(&batch.results).map_err(|error| Problem::internal(error.into()))?;
-    batch.save();
-    store.insert(Arc::clone(&batch));
+    let file = File::create(&job.results).map_err(|error| Problem::internal(error.into()))?;
+    job.save();
+    store.insert(Arc::clone(&job));
 
     let run = Run {
         state: state.clone(),
-        batch: Arc::clone(&batch),
+        job: Arc::clone(&job),
         shared: plan.shared,
         output,
         request_id,
@@ -827,11 +826,11 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         Endpoint::Reverse => run.go(REVERSE, upload, layout, file, permit),
     });
 
-    let location = HeaderValue::from_str(&format!("/batches/{id}"))
+    let location = HeaderValue::from_str(&format!("/jobs/{id}"))
         .map_err(|error| Problem::internal(error.into()))?;
     if respond_async {
         let _ = uploaded_rx.await;
-        let mut response = (StatusCode::ACCEPTED, axum::Json(batch.snapshot())).into_response();
+        let mut response = (StatusCode::ACCEPTED, axum::Json(job.snapshot())).into_response();
         response.headers_mut().insert(header::LOCATION, location);
         return Ok(response);
     }
@@ -841,10 +840,10 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
             header::CONTENT_TYPE,
             HeaderValue::from_static(output.media_type()),
         )],
-        tail(batch),
+        tail(job),
     )
         .into_response();
-    let results = HeaderValue::from_str(&format!("/batches/{id}/results"))
+    let results = HeaderValue::from_str(&format!("/jobs/{id}/results"))
         .map_err(|error| Problem::internal(error.into()))?;
     response.headers_mut().insert(header::LOCATION, location);
     response
@@ -854,7 +853,7 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
 }
 
 /// `Prefer: respond-async` (RFC 7240): answer once the upload is in, with
-/// the batch's status, instead of streaming its results.
+/// the job's status, instead of streaming its results.
 fn prefers_async(headers: &HeaderMap) -> bool {
     headers
         .get_all("prefer")
@@ -875,7 +874,7 @@ fn read_layout(
     if input == Format::Jsonl {
         let endpoint = plan.endpoint.ok_or_else(|| {
             Problem::malformed_parameter(
-                "a JSONL batch names its lookup: ?endpoint=geocode or ?endpoint=reverse",
+                "a JSONL job names its lookup: ?endpoint=geocode or ?endpoint=reverse",
             )
         })?;
         return Ok((Layout::Jsonl, endpoint));
@@ -950,15 +949,15 @@ async fn forward_upload(
             None => break,
         };
         received += chunk.len() as u64;
-        if received > MAX_BATCH_UPLOAD_BYTES {
+        if received > MAX_JOB_UPLOAD_BYTES {
             let _ = chunks
                 .send(Err(format!(
-                    "the upload is over {MAX_BATCH_UPLOAD_BYTES} bytes"
+                    "the upload is over {MAX_JOB_UPLOAD_BYTES} bytes"
                 )))
                 .await;
             break;
         }
-        // A reader that stopped (the batch was cancelled) ends the upload.
+        // A reader that stopped (the job was cancelled) ends the upload.
         if chunks.send(Ok(chunk)).await.is_err() {
             break;
         }
@@ -966,10 +965,10 @@ async fn forward_upload(
     let _ = uploaded.send(());
 }
 
-/// One running batch's pipeline.
+/// One running job's pipeline.
 struct Run {
     state: AppState,
-    batch: Arc<Batch>,
+    job: Arc<Job>,
     shared: Vec<(String, String)>,
     output: Format,
     request_id: Option<String>,
@@ -977,7 +976,7 @@ struct Run {
 }
 
 impl Run {
-    /// Read, look up and write the whole batch, then record how it ended.
+    /// Read, look up and write the whole job, then record how it ended.
     fn go<P, Q, A, K>(
         self,
         lookup: Lookup<P, Q, A, K>,
@@ -997,16 +996,16 @@ impl Run {
             Layout::Jsonl => None,
         };
         let writer = {
-            let batch = Arc::clone(&self.batch);
+            let job = Arc::clone(&self.job);
             let state = self.state.clone();
             let output = self.output;
             let request_id = self.request_id.clone();
             let started = self.started;
             std::thread::Builder::new()
-                .name("batch-writer".to_string())
+                .name("job-writer".to_string())
                 .spawn(move || {
                     write_results(
-                        &batch,
+                        &job,
                         &state,
                         output,
                         width,
@@ -1059,7 +1058,7 @@ impl Run {
         let mut rows = Rows::new(upload, layout);
         let mut index = 0;
         loop {
-            if self.batch.cancel.load(Ordering::Relaxed) {
+            if self.job.cancel.load(Ordering::Relaxed) {
                 return Ending::Cancelled;
             }
             let mut window = Vec::with_capacity(WINDOW_ROWS);
@@ -1067,9 +1066,9 @@ impl Run {
                 if window.len() == WINDOW_ROWS {
                     break None;
                 }
-                if index == MAX_BATCH_ROWS {
+                if index == MAX_JOB_ROWS {
                     break Some(Ending::Failed(format!(
-                        "a batch holds at most {MAX_BATCH_ROWS} rows; the rest were not read"
+                        "a job holds at most {MAX_JOB_ROWS} rows; the rest were not read"
                     )));
                 }
                 match rows.next() {
@@ -1118,8 +1117,9 @@ impl Run {
             let mut groups = groups.into_iter().collect::<Vec<_>>();
             groups.sort_by(|(_, (left, ..)), (_, (right, ..))| left.cmp(right));
             for (key, (_, query, rows)) in groups {
-                // Waits while this batch already has its share queued, which
-                // leaves the pool to other batches and holds memory flat.
+                // Waits while this job already has its share queued, which
+                // leaves the pool to batches and other jobs and holds memory
+                // flat.
                 if tokens_rx.recv().is_err() {
                     break;
                 }
@@ -1127,9 +1127,9 @@ impl Run {
                 let answers = answers.clone();
                 let tokens = tokens_tx.clone();
                 let repeats = Arc::clone(&repeats);
-                let batch = Arc::clone(&self.batch);
+                let job = Arc::clone(&self.job);
                 self.state.batch_pool().spawn(move || {
-                    if !batch.cancel.load(Ordering::Relaxed) {
+                    if !job.cancel.load(Ordering::Relaxed) {
                         let item = batch::look_up(&state, lookup, None, query);
                         let mut repeats = repeats.lock().expect("repeats");
                         if repeats.len() >= REPEAT_CACHE_ENTRIES {
@@ -1151,7 +1151,7 @@ impl Run {
     fn finish(self, ending: Ending, written: io::Result<()>) {
         let now = unix_now();
         {
-            let mut status = self.batch.status.lock().expect("batch status");
+            let mut status = self.job.status.lock().expect("job status");
             let (state, error) = match (ending, written) {
                 (_, Err(error)) => (
                     Status::Failed,
@@ -1164,14 +1164,14 @@ impl Run {
             status.status = state;
             status.error = error;
             status.completed_at = Some(now);
-            status.expires_at = Some(now + BATCH_RETENTION.as_secs());
+            status.expires_at = Some(now + JOB_RETENTION.as_secs());
         }
-        if self.batch.deleted.load(Ordering::Relaxed) {
-            self.batch.remove_files();
+        if self.job.deleted.load(Ordering::Relaxed) {
+            self.job.remove_files();
         } else {
-            self.batch.save();
+            self.job.save();
         }
-        self.batch
+        self.job
             .progress
             .send_modify(|progress| progress.done = true);
     }
@@ -1251,7 +1251,7 @@ impl Rows {
 /// result about as soon as it exists.
 #[allow(clippy::too_many_arguments)]
 fn write_results<A: Answer>(
-    batch: &Batch,
+    job: &Job,
     state: &AppState,
     output: Format,
     headers: Option<ByteRecord>,
@@ -1279,9 +1279,7 @@ fn write_results<A: Answer>(
     let publish = |sink: &mut Sink| -> io::Result<()> {
         sink.flush()?;
         let bytes = sink.written;
-        batch
-            .progress
-            .send_modify(|progress| progress.bytes = bytes);
+        job.progress.send_modify(|progress| progress.bytes = bytes);
         Ok(())
     };
 
@@ -1289,7 +1287,7 @@ fn write_results<A: Answer>(
         for row in answered.rows {
             let mut item = answered.item.clone();
             item.id.clone_from(&row.id);
-            count(batch, state, &mut item, row.index, request_id, started);
+            count(job, state, &mut item, row.index, request_id, started);
             match &mut csv {
                 Some(pending) => {
                     pending.insert(row.index, csv_row(&row, width, &item)?);
@@ -1318,7 +1316,7 @@ fn write_results<A: Answer>(
         }
         publish(&mut sink)?;
     }
-    // Rows a cancelled batch never answered leave gaps; what was answered
+    // Rows a cancelled job never answered leave gaps; what was answered
     // is still written, in order.
     if let Some(pending) = csv {
         for bytes in pending.into_values() {
@@ -1331,14 +1329,14 @@ fn write_results<A: Answer>(
 /// Count a row in the summary, and log and stamp it if it failed inside the
 /// server.
 fn count<A>(
-    batch: &Batch,
+    job: &Job,
     state: &AppState,
     item: &mut Item<A>,
     index: usize,
     request_id: Option<&str>,
     started: Instant,
 ) {
-    let mut status = batch.status.lock().expect("batch status");
+    let mut status = job.status.lock().expect("job status");
     status.summary.total += 1;
     let Some(error) = item.error.take() else {
         status.summary.succeeded += 1;
@@ -1349,7 +1347,7 @@ fn count<A>(
     if error.status() == StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
         state.error_log().internal_error(
             request_id.unwrap_or("-"),
-            "/batches",
+            "/jobs",
             Some(index),
             started,
             error.cause().map(|cause| format!("{cause:#}")).as_deref(),
@@ -1446,16 +1444,16 @@ impl Sink {
 }
 
 /// The results file as a body: what is written so far, then the rest as it
-/// is written, until the batch stops.
-fn tail(batch: Arc<Batch>) -> Body {
-    let progress = batch.progress.subscribe();
+/// is written, until the job stops.
+fn tail(job: Arc<Job>) -> Body {
+    let progress = job.progress.subscribe();
     let stream = futures_util::stream::unfold(
-        (batch, progress, 0u64, None::<File>),
-        |(batch, mut progress, offset, file)| async move {
+        (job, progress, 0u64, None::<File>),
+        |(job, mut progress, offset, file)| async move {
             loop {
                 let now = *progress.borrow_and_update();
                 if now.bytes > offset {
-                    let path = batch.results.clone();
+                    let path = job.results.clone();
                     let wanted = (now.bytes - offset).min(STREAM_CHUNK_BYTES as u64) as usize;
                     let read = task::spawn_blocking(move || -> io::Result<(File, Vec<u8>)> {
                         let mut file = match file {
@@ -1472,10 +1470,10 @@ fn tail(batch: Arc<Batch>) -> Body {
                     return Some(match read {
                         Ok((file, chunk)) => {
                             let next = offset + chunk.len() as u64;
-                            (Ok(Bytes::from(chunk)), (batch, progress, next, Some(file)))
+                            (Ok(Bytes::from(chunk)), (job, progress, next, Some(file)))
                         }
-                        // The batch was deleted under the reader; end here.
-                        Err(error) => (Err(error), (batch, progress, u64::MAX, None)),
+                        // The job was deleted under the reader; end here.
+                        Err(error) => (Err(error), (job, progress, u64::MAX, None)),
                     });
                 }
                 if now.done || offset == u64::MAX {
@@ -1496,21 +1494,21 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-fn no_such_batch() -> Problem {
-    Problem::not_found().with_detail("no batch with this id; it may have expired")
+fn no_such_job() -> Problem {
+    Problem::not_found().with_detail("no job with this id; it may have expired")
 }
 
-/// Get a batch
+/// Get a job
 ///
-/// Returns a batch's status and how many rows it has answered.
+/// Returns a job's status and how many rows it has answered.
 #[utoipa::path(
     get,
-    path = "/batches/{id}",
-    tag = "batches",
-    params(("id" = String, Path, description = "The batch's id.")),
+    path = "/jobs/{id}",
+    tag = "jobs",
+    params(("id" = String, Path, description = "The job's id.")),
     responses(
-        (status = 200, description = "The batch.", body = BatchStatus),
-        (status = 404, description = "No batch has this id, or it expired.",
+        (status = 200, description = "The job.", body = JobStatus),
+        (status = 404, description = "No job has this id, or it expired.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
     ),
 )]
@@ -1518,26 +1516,26 @@ pub(crate) async fn status(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let batch = state.batches().get(&id).ok_or_else(no_such_batch)?;
-    Ok(axum::Json(batch.snapshot()).into_response())
+    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
+    Ok(axum::Json(job.snapshot()).into_response())
 }
 
-/// Get a batch's results
+/// Get a job's results
 ///
-/// Returns everything the batch has written so far, then the rest as it is
-/// written, until the batch stops.
+/// Returns everything the job has written so far, then the rest as it is
+/// written, until the job stops.
 #[utoipa::path(
     get,
-    path = "/batches/{id}/results",
-    tag = "batches",
-    params(("id" = String, Path, description = "The batch's id.")),
+    path = "/jobs/{id}/results",
+    tag = "jobs",
+    params(("id" = String, Path, description = "The job's id.")),
     responses(
-        (status = 200, description = "The results, in the batch's output format.",
+        (status = 200, description = "The results, in the job's output format.",
          content(
              (String = "text/csv"),
              (String = "application/jsonl"),
          )),
-        (status = 404, description = "No batch has this id, or it expired.",
+        (status = 404, description = "No job has this id, or it expired.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
     ),
 )]
@@ -1545,29 +1543,29 @@ pub(crate) async fn results(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let batch = state.batches().get(&id).ok_or_else(no_such_batch)?;
-    let output = batch.snapshot().output_format;
+    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
+    let output = job.snapshot().output_format;
     Ok((
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static(output.media_type()),
         )],
-        tail(batch),
+        tail(job),
     )
         .into_response())
 }
 
-/// Cancel a batch
+/// Cancel a job
 ///
 /// Stops reading and looking up rows. The rows already answered are kept.
 #[utoipa::path(
     post,
-    path = "/batches/{id}/cancel",
-    tag = "batches",
-    params(("id" = String, Path, description = "The batch's id.")),
+    path = "/jobs/{id}/cancel",
+    tag = "jobs",
+    params(("id" = String, Path, description = "The job's id.")),
     responses(
-        (status = 200, description = "The batch, stopping.", body = BatchStatus),
-        (status = 404, description = "No batch has this id, or it expired.",
+        (status = 200, description = "The job, stopping.", body = JobStatus),
+        (status = 404, description = "No job has this id, or it expired.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
     ),
 )]
@@ -1575,22 +1573,22 @@ pub(crate) async fn cancel(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let batch = state.batches().get(&id).ok_or_else(no_such_batch)?;
-    batch.cancel.store(true, Ordering::Relaxed);
-    Ok(axum::Json(batch.snapshot()).into_response())
+    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
+    job.cancel.store(true, Ordering::Relaxed);
+    Ok(axum::Json(job.snapshot()).into_response())
 }
 
-/// Delete a batch
+/// Delete a job
 ///
-/// Cancels the batch if it is running, and deletes its results.
+/// Cancels the job if it is running, and deletes its results.
 #[utoipa::path(
     delete,
-    path = "/batches/{id}",
-    tag = "batches",
-    params(("id" = String, Path, description = "The batch's id.")),
+    path = "/jobs/{id}",
+    tag = "jobs",
+    params(("id" = String, Path, description = "The job's id.")),
     responses(
         (status = 204, description = "Deleted."),
-        (status = 404, description = "No batch has this id, or it expired.",
+        (status = 404, description = "No job has this id, or it expired.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
     ),
 )]
@@ -1598,23 +1596,23 @@ pub(crate) async fn delete(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    state.batches().remove(&id).ok_or_else(no_such_batch)?;
+    state.jobs().remove(&id).ok_or_else(no_such_job)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Where a server on `port` keeps its batches: under the system's temporary
+/// Where a server on `port` keeps its jobs: under the system's temporary
 /// directory, which it may clear. One directory per port, because a server
-/// starting up fails the batches it finds running, and two servers sharing
+/// starting up fails the jobs it finds running, and two servers sharing
 /// one would fail each other's.
 pub(crate) fn default_dir(port: u16) -> PathBuf {
-    std::env::temp_dir().join(format!("open-geocode-batches-{port}"))
+    std::env::temp_dir().join(format!("open-geocode-jobs-{port}"))
 }
 
-/// Run [`BatchStore::sweep`] every so often, for as long as the server runs.
+/// Run [`JobStore::sweep`] every so often, for as long as the server runs.
 pub(crate) async fn sweep_forever(state: AppState) {
     let mut every = tokio::time::interval(Duration::from_secs(600));
     loop {
         every.tick().await;
-        state.batches().sweep();
+        state.jobs().sweep();
     }
 }

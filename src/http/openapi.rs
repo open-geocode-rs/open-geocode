@@ -78,11 +78,11 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         crate::runtime::geocode_batch,
         crate::runtime::reverse,
         crate::runtime::reverse_batch,
-        crate::http::batches::create,
-        crate::http::batches::status,
-        crate::http::batches::results,
-        crate::http::batches::cancel,
-        crate::http::batches::delete,
+        crate::http::jobs::create,
+        crate::http::jobs::status,
+        crate::http::jobs::results,
+        crate::http::jobs::cancel,
+        crate::http::jobs::delete,
         crate::http::health::healthz,
         crate::http::health::readyz,
         openapi_json,
@@ -124,7 +124,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     )),
     tags(
         (name = "geocoding", description = "Geocode addresses and points."),
-        (name = "batches", description = "Geocode a whole file, streamed back as it uploads."),
+        (name = "jobs", description = "Geocode a whole file, streamed back as it uploads."),
         (name = "operations", description = "Health checks and the OpenAPI document."),
     ),
 )]
@@ -191,8 +191,8 @@ pub(crate) enum ErrorCode {
     /// Something failed inside the server. The cause is in the logs under
     /// `request_id`, never in the body.
     InternalError,
-    /// Every batch slot was taken. Retry after the `Retry-After` header's
-    /// seconds.
+    /// Every slot batches and jobs share was taken. Retry after the
+    /// `Retry-After` header's seconds.
     Busy,
 }
 

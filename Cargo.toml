@@ -99,7 +99,7 @@ dirs = { version = "7.0.0", optional = true }
 fst = "0.4"
 # Reads gzipped address files, the form OpenAddresses publishes.
 flate2 = "1.1"
-# Reads a `/batches` upload as a stream of chunks. Already in the tree
+# Reads a `/jobs` upload as a stream of chunks. Already in the tree
 # through axum.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 geo = "0.33"
