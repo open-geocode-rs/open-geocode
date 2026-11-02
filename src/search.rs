@@ -1803,6 +1803,7 @@ impl TextSearcher {
             }
         }
         let mut first = None;
+        let mut declined = None;
         if let Some(wanted) = structured_limit
             && let Some(structured) = &self.structured
         {
@@ -1824,7 +1825,7 @@ impl TextSearcher {
                     .map(|explanation| self.tagger.place_probabilities(explanation))
                     .unwrap_or_default(),
             };
-            let answer = self.structured_stage(&cx, &mut accept)?;
+            let answer = self.structured_stage(&cx, &mut accept, &mut declined)?;
             let spent = start.elapsed();
             match answer {
                 Some(answer) if answer.1.len() >= wanted => return Ok(answer),
@@ -1886,6 +1887,16 @@ impl TextSearcher {
             None => pool.chosen(&readings, limit),
         }
         .unwrap_or((first_query, Vec::new()));
+        // The text search found nothing: the answer the structured stage left
+        // to it beats the bare area the query names, all that is left.
+        if hits.is_empty()
+            && first.is_none()
+            && let Some(declined) = declined
+        {
+            let (hits, _) =
+                self.structured_judged(&declined.plan, declined.hits, &search, &session)?;
+            return Ok((declined.text, hits));
+        }
         Ok(match first {
             Some((query, mut first)) => {
                 for hit in hits {
@@ -1913,11 +1924,15 @@ impl TextSearcher {
     /// [`STRUCTURED_W`] for each place word holding it. The best answers when two
     /// fitted models say it is likelier within 100 m than the text search's
     /// answer by [`STRUCTURED_DELTA`]; else `None`, and the text search runs as it
-    /// always has.
+    /// always has. An answer left to the text search goes to `declined`,
+    /// unless it is a street held by no place word, two spots of a street
+    /// explained alike, coarser than a street or outside the towns the query
+    /// states.
     fn structured_stage(
         &self,
         cx: &StructuredContext<'_, '_>,
         accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
+        declined: &mut Option<Declined>,
     ) -> Result<Option<(String, Vec<TextSearchHit>)>> {
         let streets = cx.readings[..cx.parsed]
             .iter()
@@ -1989,10 +2004,26 @@ impl TextSearcher {
         if best.found.form < STRUCTURED_MIN_FORM && best.found.form != FORM_STREET {
             return Ok(None);
         }
+        let reading = &cx.readings[best.found.reading];
+        let hits_of = |explained: StructuredExplained| {
+            explained
+                .scored
+                .into_iter()
+                .map(|scored| scored.found.hit)
+                .take(cx.search.limit)
+                .collect::<Vec<_>>()
+        };
+        let decline = |hits: Vec<TextSearchHit>| {
+            Some(Declined {
+                text: reading.text.clone(),
+                plan: reading.plan.clone(),
+                hits,
+            })
+        };
         if logistic(&P_STRUCTURED, &features) - logistic(&P_TEXT, &features) < STRUCTURED_DELTA {
+            *declined = decline(hits_of(explained));
             return Ok(None);
         }
-        let reading = &cx.readings[best.found.reading];
         // A lone name may be a street, a place or a business: the text
         // search ranks one against the other.
         let lone_name = reading.plan.context.is_empty()
@@ -2002,16 +2033,17 @@ impl TextSearcher {
                 .iter()
                 .any(|word| self.describes_street(&word.text));
         if best.found.form == FORM_STREET && lone_name {
+            *declined = decline(hits_of(explained));
             return Ok(None);
         }
-        let hits = explained
-            .scored
-            .into_iter()
-            .map(|scored| scored.found.hit)
-            .take(cx.search.limit)
-            .collect();
-        let (hits, towns_known) = self.structured_judged(&reading.plan, hits, cx)?;
+        let (hits, towns_known) =
+            self.structured_judged(&reading.plan, hits_of(explained), cx.search, cx.session)?;
         if !self.verified(&hits[0], towns_known, cx) {
+            // Outside the towns the query states, an answer is never given,
+            // not even when the text search finds nothing.
+            if Self::in_stated_towns(&hits[0].features, towns_known) {
+                *declined = decline(hits);
+            }
             return Ok(None);
         }
         #[cfg(test)]
@@ -2031,13 +2063,14 @@ impl TextSearcher {
         &self,
         plan: &QueryPlan,
         hits: Vec<TextSearchHit>,
-        cx: &StructuredContext<'_, '_>,
+        search: &Search<'_>,
+        session: &Session,
     ) -> Result<(Vec<TextSearchHit>, bool)> {
         let postcode = self.query_postcode(plan)?;
         let stated = (!postcode.forms.is_empty()).then(|| postcode.exact.clone());
         let (_, localities) = self.localities_stated(plan, stated.as_deref())?;
         let towns_known = localities.iter().all(Option::is_some);
-        let ranking = self.plan_ranking(plan, cx.search.query_words, cx.search.focus, postcode);
+        let ranking = self.plan_ranking(plan, search.query_words, search.focus, postcode);
         let order = hits.iter().map(|hit| hit.record_id).collect::<Vec<_>>();
         let (kept, contradicted) = self.judged(
             plan,
@@ -2045,7 +2078,7 @@ impl TextSearcher {
             &ranking,
             &localities,
             hits,
-            cx.session,
+            session,
             usize::MAX,
         )?;
         let mut hits = kept.into_iter().chain(contradicted).collect::<Vec<_>>();
@@ -6847,6 +6880,15 @@ struct StructuredContext<'a, 'b> {
     explanation: Option<&'a Explanation>,
     /// Per query word, the parser's probability that it names a place.
     probabilities: Vec<f32>,
+}
+
+/// The answers the structured stage left to the text search, given when the
+/// text search finds nothing (see [`TextSearcher::structured_stage`]).
+struct Declined {
+    /// The text of the reading that found them.
+    text: String,
+    plan: QueryPlan,
+    hits: Vec<TextSearchHit>,
 }
 
 /// One spot's best record of a reading, hydrated (see
