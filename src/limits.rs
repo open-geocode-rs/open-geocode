@@ -16,6 +16,11 @@ use crate::http::bounds::BATCH_ITEM_BYTES;
 /// cap: an address with an id and a few columns beside it.
 const JOB_ROW_BYTES: u64 = 256;
 
+/// Single lookups run at once per CPU when the operator sets none. More than
+/// one: a lookup on a Pack larger than memory waits on page faults, and the
+/// core is free meanwhile.
+const LOOKUPS_PER_CPU: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]
 pub struct Limits {
     /// Longest one lookup may run, in milliseconds: a request, a batch item
@@ -23,6 +28,11 @@ pub struct Limits {
     #[arg(long, env = "OG_LOOKUP_TIMEOUT_MS", value_name = "MS",
           default_value_t = Limits::DEFAULT.lookup_timeout_ms)]
     pub lookup_timeout_ms: NonZeroU64,
+
+    /// Most single lookups running at once; one more is refused with 503
+    /// `busy`. Defaults to four per CPU.
+    #[arg(long, env = "OG_MAX_CONCURRENT_LOOKUPS", value_name = "COUNT")]
+    pub max_concurrent_lookups: Option<NonZeroUsize>,
 
     /// Most items one QUERY or POST batch may hold.
     #[arg(long, env = "OG_MAX_BATCH_ITEMS", value_name = "COUNT",
@@ -54,6 +64,7 @@ pub struct Limits {
 impl Limits {
     pub const DEFAULT: Self = Self {
         lookup_timeout_ms: NonZeroU64::new(1000).unwrap(),
+        max_concurrent_lookups: None,
         max_batch_items: NonZeroUsize::new(1000).unwrap(),
         max_job_rows: NonZeroUsize::new(1_000_000).unwrap(),
         max_job_upload_mib: None,
@@ -63,6 +74,13 @@ impl Limits {
 
     pub(crate) fn lookup_timeout(&self) -> Duration {
         Duration::from_millis(self.lookup_timeout_ms.get())
+    }
+
+    pub(crate) fn max_concurrent_lookups(&self, cpus: usize) -> usize {
+        self.max_concurrent_lookups.map_or_else(
+            || cpus.saturating_mul(LOOKUPS_PER_CPU).max(1),
+            NonZeroUsize::get,
+        )
     }
 
     pub(crate) fn max_batch_items(&self) -> usize {
@@ -125,6 +143,7 @@ mod tests {
         assert_eq!(limits.max_job_upload_bytes(), 256_000_000);
         assert_eq!(limits.job_retention(), Duration::from_secs(72 * 3600));
         assert_eq!(limits.max_job_store_bytes(), 10 << 30);
+        assert_eq!(limits.max_concurrent_lookups(8), 32);
     }
 
     #[test]
@@ -140,6 +159,7 @@ mod tests {
     fn a_zero_limit_is_refused() {
         for flag in [
             "--lookup-timeout-ms",
+            "--max-concurrent-lookups",
             "--max-batch-items",
             "--max-job-rows",
             "--max-job-upload-mib",
