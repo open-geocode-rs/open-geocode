@@ -197,7 +197,8 @@ struct Progress {
 pub(crate) struct Job {
     status: Mutex<JobStatus>,
     progress: watch::Sender<Progress>,
-    cancel: AtomicBool,
+    /// Shared with each row's lookup, which it stops.
+    cancel: Arc<AtomicBool>,
     /// Deleted while running: its files go when it stops.
     deleted: AtomicBool,
     results: PathBuf,
@@ -286,7 +287,7 @@ impl JobStore {
         Arc::new(Job {
             status: Mutex::new(status),
             progress: watch::Sender::new(Progress::default()),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             deleted: AtomicBool::new(false),
             results,
             record,
@@ -1164,14 +1165,20 @@ impl Run {
                 let job = Arc::clone(&self.job);
                 self.state.batch_pool().spawn(move || {
                     if !job.cancel.load(Ordering::Relaxed) {
-                        let item = batch::look_up(&state, lookup, None, query);
-                        let mut repeats = repeats.lock().expect("repeats");
-                        if repeats.len() >= REPEAT_CACHE_ENTRIES {
-                            repeats.clear();
+                        let item = batch::look_up(&state, lookup, None, query, &job.cancel);
+                        // A row the cancel stopped was never answered.
+                        if !job.cancel.load(Ordering::Relaxed) {
+                            // Busy or out of time depends on the moment, so a
+                            // repeat of the row is looked up again.
+                            if item.status != StatusCode::SERVICE_UNAVAILABLE.as_u16() {
+                                let mut repeats = repeats.lock().expect("repeats");
+                                if repeats.len() >= REPEAT_CACHE_ENTRIES {
+                                    repeats.clear();
+                                }
+                                repeats.insert(key, item.clone());
+                            }
+                            let _ = answers.send(Answered { rows, item });
                         }
-                        repeats.insert(key, item.clone());
-                        drop(repeats);
-                        let _ = answers.send(Answered { rows, item });
                     }
                     let _ = tokens.send(());
                 });

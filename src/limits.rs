@@ -18,6 +18,12 @@ const JOB_ROW_BYTES: u64 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]
 pub struct Limits {
+    /// Longest one lookup may run, in milliseconds: a request, a batch item
+    /// or a job row. Past it the lookup stops and answers 503 `timeout`.
+    #[arg(long, env = "OG_LOOKUP_TIMEOUT_MS", value_name = "MS",
+          default_value_t = Limits::DEFAULT.lookup_timeout_ms)]
+    pub lookup_timeout_ms: NonZeroU64,
+
     /// Most items one QUERY or POST batch may hold.
     #[arg(long, env = "OG_MAX_BATCH_ITEMS", value_name = "COUNT",
           default_value_t = Limits::DEFAULT.max_batch_items)]
@@ -47,12 +53,17 @@ pub struct Limits {
 
 impl Limits {
     pub const DEFAULT: Self = Self {
+        lookup_timeout_ms: NonZeroU64::new(1000).unwrap(),
         max_batch_items: NonZeroUsize::new(1000).unwrap(),
         max_job_rows: NonZeroUsize::new(1_000_000).unwrap(),
         max_job_upload_mib: None,
         job_retention_hours: NonZeroU64::new(72).unwrap(),
         max_job_store_gib: NonZeroU64::new(10).unwrap(),
     };
+
+    pub(crate) fn lookup_timeout(&self) -> Duration {
+        Duration::from_millis(self.lookup_timeout_ms.get())
+    }
 
     pub(crate) fn max_batch_items(&self) -> usize {
         self.max_batch_items.get()
@@ -109,6 +120,7 @@ mod tests {
     fn no_flags_are_the_defaults() {
         assert_eq!(parse(&[]).expect("parse"), Limits::DEFAULT);
         let limits = Limits::DEFAULT;
+        assert_eq!(limits.lookup_timeout(), Duration::from_secs(1));
         assert_eq!(limits.max_batch_body_bytes(), 1000 * 4096);
         assert_eq!(limits.max_job_upload_bytes(), 256_000_000);
         assert_eq!(limits.job_retention(), Duration::from_secs(72 * 3600));
@@ -127,6 +139,7 @@ mod tests {
     #[test]
     fn a_zero_limit_is_refused() {
         for flag in [
+            "--lookup-timeout-ms",
             "--max-batch-items",
             "--max-job-rows",
             "--max-job-upload-mib",

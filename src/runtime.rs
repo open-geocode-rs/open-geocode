@@ -37,6 +37,7 @@ use crate::{
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{AddressGeocodeOptions, TextAutocompleteOptions, TextSearchOptions, TextSearcher},
+    stop::{self, CancelOnDrop, Stop},
     util::hilbert::hilbert_key,
 };
 
@@ -413,6 +414,20 @@ where
     task::spawn_blocking(work).await?.map_err(Problem::from)
 }
 
+/// Run one lookup under the server's lookup timeout: stopped at its next
+/// check past it, or once this future is dropped, as axum drops it when the
+/// client disconnects.
+async fn lookup<T, F>(state: &AppState, work: F) -> Result<T, Problem>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel = CancelOnDrop(Arc::clone(&cancel));
+    let stop = Stop::new(state.limits.lookup_timeout(), cancel);
+    blocking(move || stop::within(stop, work)).await
+}
+
 fn malformed_parameters(_: QueryRejection) -> Problem {
     Problem::unparsable_parameters()
 }
@@ -470,7 +485,8 @@ pub(crate) async fn search(
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = search_request(params)?;
-    let collection = blocking(move || search_answer(&state, options)).await?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || search_answer(&worker, options)).await?;
     Ok(Json(collection))
 }
 
@@ -572,9 +588,10 @@ pub(crate) async fn autocomplete(
         focus,
         bbox,
     };
-    let collection = blocking(move || {
-        let hits = state.searcher.autocomplete(&options)?;
-        api::forward_collection(&state.pack, query, hits)
+    let worker = state.clone();
+    let collection = lookup(&state, move || {
+        let hits = worker.searcher.autocomplete(&options)?;
+        api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
 
@@ -647,7 +664,8 @@ pub(crate) async fn geocode(
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = geocode_request(params)?;
-    let collection = blocking(move || geocode_answer(&state, options)).await?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
     Ok(Json(collection))
 }
 
@@ -808,7 +826,8 @@ pub(crate) async fn reverse(
 ) -> Result<Json<ReverseCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = reverse_request(params)?;
-    let collection = blocking(move || reverse_answer(&state, options)).await?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
     Ok(Json(collection))
 }
 
@@ -900,6 +919,7 @@ mod router_tests {
     use tower::ServiceExt;
 
     use std::num::{NonZeroU64, NonZeroUsize};
+    use std::time::Duration;
 
     use super::*;
     use crate::pack::Writer;
@@ -2122,6 +2142,91 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// A lookup past the lookup timeout stops at its next check and answers
+    /// 503 `timeout`, with no `Retry-After`: the same lookup takes as long
+    /// the next time.
+    #[tokio::test]
+    async fn a_lookup_past_its_timeout_stops_with_a_503() {
+        let pack = temp_path("lookup-timeout");
+        write_pack(&pack);
+        let limits = limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::MIN);
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|State(state): State<AppState>| async move {
+                    lookup(&state, || -> Result<&'static str> {
+                        std::thread::sleep(Duration::from_millis(20));
+                        stop::check()?;
+                        Ok("answered")
+                    })
+                    .await
+                }),
+            )
+            .with_state(state_with(&pack, true, limits));
+
+        let reply = send(router, request("GET", "/slow")).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.json()["error_code"], "timeout");
+        assert_eq!(
+            reply.json()["detail"],
+            "the lookup took longer than the server allows, 1 ms"
+        );
+        assert!(header_value(&reply, "retry-after").is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn slow_when_asked(state: &AppState, query: String) -> Result<ForwardCollection> {
+        if query == "slow" {
+            std::thread::sleep(Duration::from_millis(20));
+            stop::check()?;
+        }
+        api::forward_collection(&state.pack, query, Vec::new())
+    }
+
+    /// An item past the lookup timeout fails alone with 503 `timeout`, and
+    /// the items around it are answered.
+    #[tokio::test]
+    async fn a_batch_item_past_its_timeout_fails_alone() {
+        let pack = temp_path("batch-timeout");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::new(5).expect("5"));
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::post(
+                    |State(state): State<AppState>, request: Request<Body>| async move {
+                        let lookup = Lookup {
+                            route: "/slow",
+                            prepare: |params: PanicParams| Ok(params.q),
+                            place: |_: &String| (),
+                            answer: slow_when_asked,
+                        };
+                        batch::run(state, lookup, request).await
+                    },
+                ),
+            )
+            .with_state(state_with(&pack, true, limits));
+
+        let body = r#"[{"q": "fast"}, {"q": "slow"}, {"q": "fast"}]"#;
+        let reply = send(router, batch_request("POST", "/slow", body)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let statuses = body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["status"].as_u64().expect("status"))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, [200, 503, 200]);
+        assert_eq!(body["results"][1]["error"]["error_code"], "timeout");
+        assert_eq!(body["summary"]["failed"], 1);
+
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// A job reads at most the server's row cap, then fails naming it, with

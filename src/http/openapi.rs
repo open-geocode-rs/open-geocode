@@ -6,7 +6,7 @@
 //! it, and `contract_tests` fails when the committed
 //! `contract/openapi.json` and the code disagree.
 //!
-//! Four things are adjusted after generation, in [`transform`]:
+//! Five things are adjusted after generation, in [`transform`]:
 //!
 //! 1. `Option<T>` renders as a nullable union, `["string", "null"]`, but this
 //!    API never emits a null: an absent value is an absent key
@@ -15,9 +15,11 @@
 //! 2. Every route answers a method it does not take with a 405, from the
 //!    router's fallbacks rather than from a handler, so there is no
 //!    attribute to carry it.
-//! 3. Every response gains the `X-Request-Id` header it actually returns,
+//! 3. Every single lookup may answer a 503, from the runner all lookups
+//!    share.
+//! 4. Every response gains the `X-Request-Id` header it actually returns,
 //!    and a batchable route's the `Allow` and `Accept-Query` it returns.
-//! 4. A batch body gains its `maxItems`, from the server's limits.
+//! 5. A batch body gains its `maxItems`, from the server's limits.
 //!
 //! OpenAPI 3.1 has no `query` operation, so a batch is documented on its
 //! `post`, whose description says `QUERY` takes the same body.
@@ -196,6 +198,9 @@ pub(crate) enum ErrorCode {
     /// many job results as it keeps. Retry after the `Retry-After` header's
     /// seconds.
     Busy,
+    /// The lookup ran past the server's lookup timeout and stopped. It takes
+    /// as long the next time, so a retry does not help.
+    Timeout,
 }
 
 // Mirrors [`crate::http::problem::InvalidParam`] for the schema.
@@ -356,6 +361,7 @@ pub(crate) fn document(limits: &Limits) -> serde_json::Result<String> {
 fn transform(value: &mut Value, limits: &Limits) {
     drop_nulls(value);
     add_boundary_responses(value);
+    add_lookup_refusals(value);
     add_response_headers(value);
     bound_batch_bodies(value, limits);
 }
@@ -374,6 +380,39 @@ fn bound_batch_bodies(value: &mut Value, limits: &Limits) {
             continue;
         };
         schema.insert("maxItems".to_string(), limits.max_batch_items().into());
+    }
+}
+
+/// Document the 503 every single lookup may answer: stopped past the lookup
+/// timeout. It comes from the shared lookup runner, not from one handler, so
+/// it is added here.
+fn add_lookup_refusals(value: &mut Value) {
+    let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for operations in paths.values_mut() {
+        let Some(get) = operations.get_mut("get") else {
+            continue;
+        };
+        if !get["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "geocoding"))
+        {
+            continue;
+        }
+        let Some(responses) = get.get_mut("responses").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        responses.entry("503").or_insert_with(|| {
+            serde_json::json!({
+                "description": "The lookup ran past the server's lookup timeout (`timeout`).",
+                "content": {
+                    PROBLEM_JSON: {
+                        "schema": { "$ref": "#/components/schemas/Problem" },
+                    },
+                },
+            })
+        });
     }
 }
 

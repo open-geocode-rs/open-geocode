@@ -53,6 +53,7 @@ pub(crate) enum ErrorCode {
     UnsupportedMediaType,
     InternalError,
     Busy,
+    Timeout,
 }
 
 impl ErrorCode {
@@ -70,6 +71,7 @@ impl ErrorCode {
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::InternalError => "internal_error",
             Self::Busy => "busy",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -275,6 +277,15 @@ impl Problem {
         problem
     }
 
+    /// A lookup that ran past the server's lookup timeout, and stopped. No
+    /// `Retry-After`: the same lookup takes as long the next time.
+    pub(crate) fn timed_out(after: std::time::Duration) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Timeout).with_detail(format!(
+            "the lookup took longer than the server allows, {} ms",
+            after.as_millis()
+        ))
+    }
+
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
     pub(crate) fn internal(cause: anyhow::Error) -> Self {
@@ -341,7 +352,9 @@ impl IntoResponse for Problem {
 /// classified there rather than by matching on its message here.
 impl From<crate::Error> for Problem {
     fn from(error: crate::Error) -> Self {
-        if error.is_caller_error() {
+        if let crate::Error::TimedOut { after } = error {
+            Problem::timed_out(after)
+        } else if error.is_caller_error() {
             Problem::invalid_query(error.to_string())
         } else {
             Problem::internal(anyhow::Error::new(error))
@@ -400,7 +413,7 @@ mod tests {
         assert!(value.get("instance").is_none());
     }
 
-    const ALL_CODES: [ErrorCode; 12] = [
+    const ALL_CODES: [ErrorCode; 13] = [
         ErrorCode::InvalidQuery,
         ErrorCode::InvalidCoordinate,
         ErrorCode::LimitTooLarge,
@@ -413,6 +426,7 @@ mod tests {
         ErrorCode::UnsupportedMediaType,
         ErrorCode::InternalError,
         ErrorCode::Busy,
+        ErrorCode::Timeout,
     ];
 
     /// `type` is either RFC 9457's `about:blank` or a URI that can actually be
