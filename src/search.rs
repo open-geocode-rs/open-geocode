@@ -3375,10 +3375,10 @@ impl TextSearcher {
     /// (see [`Self::structured_judged`]): only when the rules the text search
     /// ranks by hold, as the text search's own best would. It is not a
     /// business, which the text search weighs by its name; its postcode
-    /// does not contradict the stated one; it lies in the stated towns when
-    /// the Pack knows them all (`towns_known`); it states the unit asked
-    /// for; and its street's type or direction does not contradict the
-    /// query's. Else the text search answers.
+    /// does not contradict the stated one; it lies in the stated towns (see
+    /// [`Self::in_stated_towns`]); it states the unit asked for; and its
+    /// street's type or direction does not contradict the query's. Else the
+    /// text search answers.
     fn verified(
         &self,
         hit: &TextSearchHit,
@@ -3386,17 +3386,26 @@ impl TextSearcher {
         cx: &StructuredContext<'_, '_>,
     ) -> bool {
         let features = &hit.features;
-        let in_towns = match features.area {
-            Agreement::Agrees | Agreement::Unstated => true,
-            Agreement::Unknown => !towns_known,
-            Agreement::Contradicts => false,
-        };
         let descriptors = self.descriptors(cx.search.query_words.search.iter().map(String::as_str));
         hit.record.layer != Layer::Poi.as_str()
             && features.postcode != Agreement::Contradicts
-            && in_towns
+            && Self::in_stated_towns(features, towns_known)
             && features.unit != Some(false)
             && !self.street_contradicts(&descriptors, hit)
+    }
+
+    /// Whether an answer with `features` lies in the towns its query states,
+    /// as far as the Pack knows them all (`towns_known`). A stated postcode
+    /// it agrees with outweighs a town it does not: its street and number
+    /// already agree, and a query may name a postal or a neighbouring town;
+    /// the town it does not lie in still costs it in the structured stage's
+    /// score.
+    fn in_stated_towns(features: &Features, towns_known: bool) -> bool {
+        match features.area {
+            Agreement::Agrees | Agreement::Unstated => true,
+            Agreement::Unknown => !towns_known,
+            Agreement::Contradicts => features.postcode == Agreement::Agrees,
+        }
     }
 
     /// The countries a structured-stage lookup is held to: those the caller asks
@@ -12631,6 +12640,79 @@ mod tests {
         // search's.
         let query = "10 Queen Street Toronto K1P 5G4";
         let found = ids(&structured, query);
+        assert_eq!(found, ids(&plain, query));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_stated_postcode_outweighs_a_town_the_answer_is_not_in() {
+        let temp_dir = temp_pack_path("search-postcode-over-town");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, number, street, town, postcode, at) in [
+            (
+                "osm:node:1",
+                "10",
+                "Queen Street",
+                "Toronto",
+                "M5H 2N2",
+                [-79.38, 43.65],
+            ),
+            (
+                "osm:node:2",
+                "12",
+                "Queen Street",
+                "Toronto",
+                "M5H 2N2",
+                [-79.381, 43.65],
+            ),
+            (
+                "osm:node:3",
+                "5",
+                "Dundas Street",
+                "Mississauga",
+                "L5B 1M2",
+                [-79.64, 43.59],
+            ),
+        ] {
+            let record = located(
+                address_record(id, "", number, street, Some(town), Some(postcode)),
+                at,
+            );
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let structured = TextSearcher::open(&temp_dir).expect("searcher");
+        let plain = TextSearcher::open(&temp_dir)
+            .expect("searcher")
+            .without_structured();
+        let ids = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(&TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 1,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        // The town is another and the postcode the address's own: the
+        // address the postcode, street and number agree on.
+        assert_eq!(
+            ids(&structured, "10 Queen Street Mississauga M5H 2N2"),
+            ["osm:node:1"]
+        );
+        assert!(LAST_STRUCTURED.with(Cell::get).answered);
+        // The other town alone still holds it: the text search answers, and
+        // never with the address in another town.
+        let query = "10 Queen Street Mississauga";
+        let found = ids(&structured, query);
+        assert!(!LAST_STRUCTURED.with(Cell::get).answered);
         assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
