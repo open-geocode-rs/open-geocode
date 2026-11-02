@@ -17,7 +17,7 @@
 //!    attribute to carry it.
 //! 3. Every response gains the `X-Request-Id` header it actually returns,
 //!    and a batchable route's the `Allow` and `Accept-Query` it returns.
-//! 4. A batch body gains its `maxItems`.
+//! 4. A batch body gains its `maxItems`, from the server's limits.
 //!
 //! OpenAPI 3.1 has no `query` operation, so a batch is documented on its
 //! `post`, whose description says `QUERY` takes the same body.
@@ -26,9 +26,8 @@
 //! the attribute macro cannot read a constant. `bounds_match_the_constants`
 //! keeps them honest.
 
-use std::sync::LazyLock;
-
 use axum::{
+    extract::State,
     http::{HeaderValue, header},
     response::{IntoResponse, Response},
 };
@@ -42,9 +41,11 @@ use crate::{
         LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
         ReverseProperties, Version,
     },
-    http::{batch, bounds::MAX_BATCH_ITEMS},
+    http::batch,
+    limits::Limits,
     record::{Layer, ObjectType},
     records::Source,
+    runtime::AppState,
 };
 
 /// The media type every error is served as (RFC 9457).
@@ -182,7 +183,7 @@ pub(crate) enum ErrorCode {
     /// The route exists but does not take this method. The `Allow` header
     /// lists the ones it does.
     MethodNotAllowed,
-    /// A batch held more than 1000 items.
+    /// A batch held more items than the server allows.
     TooManyItems,
     /// A batch body was over its cap.
     BodyTooLarge,
@@ -191,8 +192,9 @@ pub(crate) enum ErrorCode {
     /// Something failed inside the server. The cause is in the logs under
     /// `request_id`, never in the body.
     InternalError,
-    /// Every slot batches and jobs share was taken. Retry after the
-    /// `Retry-After` header's seconds.
+    /// Every slot batches and jobs share was taken, or the server holds as
+    /// many job results as it keeps. Retry after the `Retry-After` header's
+    /// seconds.
     Busy,
 }
 
@@ -316,8 +318,8 @@ pub(crate) struct BatchSummary {
     pub failed: usize,
 }
 
-// The same bytes as the committed `contract/openapi.json`, which the
-// contract tests hold to the code.
+// With the default limits, the same bytes as the committed
+// `contract/openapi.json`, which the contract tests hold to the code.
 /// Get the OpenAPI document
 ///
 /// Returns the OpenAPI 3.1 document describing this server's API.
@@ -330,8 +332,8 @@ pub(crate) struct BatchSummary {
          content_type = "application/json"),
     ),
 )]
-pub(crate) async fn openapi_json() -> Response {
-    let mut response = spec().clone().into_response();
+pub(crate) async fn openapi_json(State(state): State<AppState>) -> Response {
+    let mut response = state.spec().to_string().into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -339,33 +341,28 @@ pub(crate) async fn openapi_json() -> Response {
     response
 }
 
-/// The spec as served, built once.
-pub(crate) fn spec() -> &'static String {
-    static SPEC: LazyLock<String> = LazyLock::new(|| document().expect("the spec serializes"));
-    &SPEC
-}
-
-/// The spec as a canonical JSON string: the one text both `/openapi.json` and
-/// `contract/openapi.json` are.
-pub(crate) fn document() -> serde_json::Result<String> {
+/// The spec as a canonical JSON string, with the bounds `limits` sets:
+/// `/openapi.json` serves it for the server's own, and
+/// `contract/openapi.json` is it for [`Limits::DEFAULT`].
+pub(crate) fn document(limits: &Limits) -> serde_json::Result<String> {
     let mut value = serde_json::to_value(ApiDoc::openapi())?;
-    transform(&mut value);
+    transform(&mut value, limits);
     let mut text = serde_json::to_string_pretty(&value)?;
     text.push('\n');
     Ok(text)
 }
 
 /// Adjust the generated spec to describe what the API actually does.
-fn transform(value: &mut Value) {
+fn transform(value: &mut Value, limits: &Limits) {
     drop_nulls(value);
     add_boundary_responses(value);
     add_response_headers(value);
-    bound_batch_bodies(value);
+    bound_batch_bodies(value, limits);
 }
 
 /// Give every batch body its item cap, which a `request_body` attribute has
 /// no way to say.
-fn bound_batch_bodies(value: &mut Value) {
+fn bound_batch_bodies(value: &mut Value, limits: &Limits) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
     };
@@ -376,7 +373,7 @@ fn bound_batch_bodies(value: &mut Value) {
         else {
             continue;
         };
-        schema.insert("maxItems".to_string(), MAX_BATCH_ITEMS.into());
+        schema.insert("maxItems".to_string(), limits.max_batch_items().into());
     }
 }
 
@@ -598,7 +595,8 @@ mod tests {
     /// away from the constants the handlers actually enforce.
     #[test]
     fn bounds_match_the_constants() {
-        let spec: Value = serde_json::from_str(&document().expect("spec")).expect("JSON");
+        let spec: Value =
+            serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
 
         for path in ["/search", "/autocomplete"] {
             assert_eq!(
@@ -652,7 +650,8 @@ mod tests {
             .map(String::as_str)
             .collect();
 
-        let spec: Value = serde_json::from_str(&document().expect("spec")).expect("JSON");
+        let spec: Value =
+            serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
         let documented: std::collections::BTreeSet<&str> = spec["components"]["schemas"]["Problem"]
             ["properties"]
             .as_object()
@@ -677,7 +676,8 @@ mod tests {
     /// Every error the server can construct is a value the contract lists.
     #[test]
     fn every_error_code_is_in_the_contract() {
-        let spec: Value = serde_json::from_str(&document().expect("spec")).expect("JSON");
+        let spec: Value =
+            serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
         let documented: std::collections::BTreeSet<String> =
             spec["components"]["schemas"]["ErrorCode"]["enum"]
                 .as_array()

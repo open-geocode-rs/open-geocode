@@ -31,6 +31,7 @@ use crate::{
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
+    limits::Limits,
     pack::Reader,
     record::Layer,
     resources::Resources,
@@ -47,6 +48,10 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    /// Where job results are kept: one directory per port under the
+    /// system's temporary directory when not given.
+    pub job_dir: Option<PathBuf>,
+    pub limits: Limits,
 }
 
 #[derive(Clone)]
@@ -59,11 +64,15 @@ pub(crate) struct AppState {
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
     jobs: Arc<JobStore>,
+    limits: Limits,
+    /// `/openapi.json` for this server's limits, built once.
+    spec: Arc<str>,
 }
 
 impl AppState {
-    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`.
-    pub(crate) fn open(path: &Path, jobs: &Path) -> Result<Self> {
+    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`, under
+    /// `limits`.
+    pub(crate) fn open(path: &Path, jobs: &Path, limits: Limits) -> Result<Self> {
         let pack = Arc::new(Reader::open(path)?);
         let resources = Resources::probe();
         // Every query looks things up all over the Pack: read it in now
@@ -91,12 +100,22 @@ impl AppState {
             // Batches and jobs share the pool's cores, so running more of them
             // at once than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
-            jobs: Arc::new(JobStore::open(jobs.to_path_buf())?),
+            jobs: Arc::new(JobStore::open(jobs.to_path_buf(), limits.job_retention())?),
+            spec: openapi::document(&limits)?.into(),
+            limits,
         })
     }
 
     pub(crate) fn jobs(&self) -> &JobStore {
         &self.jobs
+    }
+
+    pub(crate) fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub(crate) fn spec(&self) -> &str {
+        &self.spec
     }
 
     /// Where batch items and job rows run.
@@ -222,7 +241,11 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack, &jobs::default_dir(options.bind.port()))?;
+    let jobs_dir = options
+        .job_dir
+        .clone()
+        .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
+    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
     tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
@@ -253,11 +276,12 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
     // on the lookup routes. axum would otherwise route HEAD to the GET
     // handler automatically, so both register an explicit HEAD responder that
     // returns 405. Other methods fall through to a 405.
+    let max_body = state.limits().max_batch_body_bytes();
     let mut app: Router<AppState> = Router::new()
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
-        .route("/geocode", batchable(geocode, geocode_batch))
-        .route("/reverse", batchable(reverse, reverse_batch))
+        .route("/geocode", batchable(geocode, geocode_batch, max_body))
+        .route("/reverse", batchable(reverse, reverse_batch, max_body))
         .route("/jobs", only(MethodFilter::POST, "POST", jobs::create))
         .route(
             "/jobs/{id}",
@@ -336,7 +360,7 @@ where
 /// A route that answers one lookup on GET and a batch of them on QUERY or
 /// POST. axum filters only the standard methods, so QUERY reaches the batch
 /// through the route's fallback, which turns every other method away.
-fn batchable<H, T, B, U>(single: H, batch: B) -> MethodRouter<AppState>
+fn batchable<H, T, B, U>(single: H, batch: B, max_body: usize) -> MethodRouter<AppState>
 where
     H: Handler<T, AppState>,
     B: Handler<U, AppState>,
@@ -357,7 +381,7 @@ where
             },
         )
         // After the fallback, so the limit covers QUERY as well as POST.
-        .layer(DefaultBodyLimit::max(bounds::MAX_BATCH_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::map_response(batch::advertise))
 }
 
@@ -629,10 +653,11 @@ pub(crate) async fn geocode(
 
 /// Geocode many addresses whose parts are already apart in one request.
 ///
-/// The body is a JSON array of up to 1000 items, each taking the parameters
-/// `GET /geocode` takes, plus an optional `id` echoed in its result. The
-/// request's own query-string parameters apply to every item, and an item's
-/// own fields override them: `?country=CA` scopes every item to Canada.
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /geocode` takes, plus an
+/// optional `id` echoed in its result. The request's own query-string
+/// parameters apply to every item, and an item's own fields override them:
+/// `?country=CA` scopes every item to Canada.
 /// `QUERY` takes the same body and answers the same: `POST` is for clients
 /// that cannot send `QUERY`.
 ///
@@ -679,7 +704,7 @@ pub(crate) async fn geocode(
         (status = 400, description = "The body is not a JSON array of objects, or the \
                                       query string did not parse.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 413, description = "More than 1000 items, or a body over its cap.",
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 415, description = "The body was not sent as `application/json`.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -789,8 +814,9 @@ pub(crate) async fn reverse(
 
 /// Find the places at many points in one request.
 ///
-/// The body is a JSON array of up to 1000 items, each taking the parameters
-/// `GET /reverse` takes, plus an optional `id` echoed in its result.
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /reverse` takes, plus an
+/// optional `id` echoed in its result.
 /// `QUERY` takes the same body and answers the same: `POST` is for clients
 /// that cannot send `QUERY`.
 ///
@@ -818,7 +844,7 @@ pub(crate) async fn reverse(
         (status = 400, description = "The body is not a JSON array of objects, or the \
                                       query string did not parse.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 413, description = "More than 1000 items, or a body over its cap.",
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 415, description = "The body was not sent as `application/json`.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -873,8 +899,9 @@ mod router_tests {
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
+    use std::num::{NonZeroU64, NonZeroUsize};
+
     use super::*;
-    use crate::http::bounds::{MAX_BATCH_BODY_BYTES, MAX_BATCH_ITEMS};
     use crate::pack::Writer;
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
@@ -921,10 +948,20 @@ mod router_tests {
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {
-        let state =
-            AppState::open(pack_dir, &pack_dir.with_extension("jobs")).expect("open shared pack");
+        state_with(pack_dir, ready, Limits::DEFAULT)
+    }
+
+    fn state_with(pack_dir: &Path, ready: bool, limits: Limits) -> AppState {
+        let state = AppState::open(pack_dir, &pack_dir.with_extension("jobs"), limits)
+            .expect("open shared pack");
         state.ready.store(ready, Ordering::Release);
         state
+    }
+
+    fn limits_with(change: impl FnOnce(&mut Limits)) -> Limits {
+        let mut limits = Limits::DEFAULT;
+        change(&mut limits);
+        limits
     }
 
     fn request(method: &str, uri: &str) -> Request<Body> {
@@ -1836,7 +1873,9 @@ mod router_tests {
     async fn batch_rejects_a_bad_request_whole() {
         let pack = temp_path("batch-request-errors");
         write_pack(&pack);
-        let router = build_router(state_for(&pack, true), None, None);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(3).expect("3"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
         let error = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
 
         for body in [r#"{"q": "King"}"#, "[1, 2]", "[{}, \"q\"]", "not json", ""] {
@@ -1848,7 +1887,7 @@ mod router_tests {
 
         let too_many = format!(
             "[{}]",
-            vec![r#"{"address": "King"}"#; MAX_BATCH_ITEMS + 1].join(",")
+            vec![r#"{"address": "King"}"#; limits.max_batch_items() + 1].join(",")
         );
         let reply = send(router.clone(), batch_request("POST", "/geocode", too_many)).await;
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -1856,7 +1895,7 @@ mod router_tests {
 
         let full = format!(
             "[{}]",
-            vec![r#"{"address": "King"}"#; MAX_BATCH_ITEMS].join(",")
+            vec![r#"{"address": "King"}"#; limits.max_batch_items()].join(",")
         );
         let reply = send(router.clone(), batch_request("POST", "/geocode", full)).await;
         assert_eq!(reply.status, StatusCode::OK);
@@ -1865,14 +1904,14 @@ mod router_tests {
         let mut declared = batch_request("POST", "/geocode", "[]");
         declared.headers_mut().insert(
             header::CONTENT_LENGTH,
-            header::HeaderValue::from(MAX_BATCH_BODY_BYTES + 1),
+            header::HeaderValue::from(limits.max_batch_body_bytes() + 1),
         );
         let reply = send(router.clone(), declared).await;
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error(&reply).as_deref(), Some("body_too_large"));
 
         // And on what arrives, when no length is declared.
-        let oversized = " ".repeat(MAX_BATCH_BODY_BYTES + 1);
+        let oversized = " ".repeat(limits.max_batch_body_bytes() + 1);
         for method in ["POST", "QUERY"] {
             let request = batch_request(method, "/geocode", oversized.clone());
             let reply = send(router.clone(), request).await;
@@ -2083,5 +2122,128 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// A job reads at most the server's row cap, then fails naming it, with
+    /// the rows it read answered.
+    #[tokio::test]
+    async fn a_job_stops_reading_at_the_row_cap() {
+        let pack = temp_path("jobs-row-cap");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        let limits = limits_with(|limits| limits.max_job_rows = NonZeroUsize::new(2).expect("2"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let rows = "street\n10 King Street\n12 King Street\n14 King Street\n";
+        let reply = send(router.clone(), upload("/jobs", "text/csv", rows)).await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(csv_rows(&reply.body).len(), 2);
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+        let status = send(router, request("GET", &location)).await.json();
+        assert_eq!(status["status"], "failed");
+        assert_eq!(status["summary"]["total"], 2);
+        assert_eq!(
+            status["error"],
+            "a job holds at most 2 rows; the rest were not read"
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// An upload declared over the server's upload limit is refused before
+    /// a byte of it is read.
+    #[tokio::test]
+    async fn a_job_upload_over_the_limit_is_refused() {
+        let pack = temp_path("jobs-upload-cap");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let limits = limits_with(|limits| limits.max_job_upload_mib = Some(NonZeroU64::MIN));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let mut declared = upload("/jobs", "text/csv", "street\n10 King Street\n");
+        declared.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from((1u64 << 20) + 1),
+        );
+        let reply = send(router, declared).await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(reply.json()["error_code"], "body_too_large");
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// While the results kept fill the job store, a new job is refused with
+    /// 503 `busy`, and the kept ones are still served.
+    #[tokio::test]
+    async fn a_full_job_store_refuses_new_jobs() {
+        let pack = temp_path("jobs-store-full");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        std::fs::create_dir_all(&spool).expect("spool");
+        // Sparse: the store counts the length, and the disk holds none of it.
+        std::fs::File::create(spool.join("kept.results"))
+            .expect("results")
+            .set_len(1 << 30)
+            .expect("length");
+        std::fs::write(
+            spool.join("kept.json"),
+            serde_json::json!({
+                "id": "kept",
+                "endpoint": "geocode",
+                "status": "completed",
+                "input_format": "csv",
+                "output_format": "csv",
+                "summary": {"total": 0, "succeeded": 0, "failed": 0},
+                "created_at": 0,
+                "results_url": "/jobs/kept/results",
+            })
+            .to_string(),
+        )
+        .expect("write a kept job");
+        let limits = limits_with(|limits| limits.max_job_store_gib = NonZeroU64::MIN);
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let reply = send(
+            router.clone(),
+            upload("/jobs", "text/csv", "street\n10 King Street\n"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.json()["error_code"], "busy");
+        assert_eq!(header_value(&reply, "retry-after"), Some("60"));
+        let kept = send(router, request("GET", "/jobs/kept")).await;
+        assert_eq!(kept.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// `/openapi.json` states the batch item cap this server was started
+    /// with.
+    #[tokio::test]
+    async fn the_served_spec_states_the_servers_limits() {
+        let pack = temp_path("spec-limits");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(7).expect("7"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let spec = send(router, request("GET", "/openapi.json")).await.json();
+        for path in ["/geocode", "/reverse"] {
+            assert_eq!(
+                spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["maxItems"],
+                7,
+                "{path}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }
