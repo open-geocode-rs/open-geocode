@@ -88,6 +88,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         crate::http::jobs::delete,
         crate::http::health::healthz,
         crate::http::health::readyz,
+        crate::http::version::version,
         openapi_json,
     ),
     components(schemas(
@@ -128,7 +129,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     tags(
         (name = "geocoding", description = "Geocode addresses and points."),
         (name = "jobs", description = "Geocode a whole file, streamed back as it uploads."),
-        (name = "operations", description = "Health checks and the OpenAPI document."),
+        (name = "operations", description = "Health checks, the server and Pack versions, and the OpenAPI document."),
     ),
 )]
 pub(crate) struct ApiDoc;

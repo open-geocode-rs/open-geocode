@@ -129,6 +129,7 @@ og serve canada-ontario
 ```
 
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
+`GET /version` returns the server version and the Pack it serves: content id, schema version, and which og version built it and when.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.

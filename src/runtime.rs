@@ -30,6 +30,7 @@ use crate::{
         method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
+        version,
     },
     limits::Limits,
     pack::Reader,
@@ -142,6 +143,10 @@ impl AppState {
 
     pub(crate) fn error_log(&self) -> &ErrorLog {
         &self.error_log
+    }
+
+    pub(crate) fn pack(&self) -> &Reader {
+        &self.pack
     }
 
     /// True once the Pack is loaded and the Runtime can answer API traffic
@@ -314,7 +319,8 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         )
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
-        .route("/readyz", get_only(health::readyz));
+        .route("/readyz", get_only(health::readyz))
+        .route("/version", get_only(version::version));
 
     // The basemap PMTiles lives with the other data artifacts (not in the demo
     // dir), so serve it explicitly. ServeFile honors HTTP range requests, which
@@ -1079,6 +1085,42 @@ mod router_tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn version_names_the_build_and_the_pack() {
+        let pack = temp_path("version");
+        write_pack(&pack);
+        let reader = Reader::open(&pack).expect("pack");
+        let manifest = reader.manifest();
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let reply = send(router.clone(), request("GET", "/version")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.content_type(), "application/json");
+        assert_eq!(
+            reply.json(),
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "pack": {
+                    "id": format!("{:016x}", reader.container().fingerprint()),
+                    "schema_version": manifest.schema_version,
+                    "built_by": manifest.crate_version,
+                    "built_at_unix": manifest.built_at_unix,
+                },
+            })
+        );
+        let body = String::from_utf8_lossy(&reply.body);
+        for path in [pack.as_path(), reader.path()] {
+            let path = path.to_string_lossy();
+            assert!(!body.contains(path.as_ref()), "{path} in {body}");
+        }
+
+        assert_eq!(
+            send(router, request("HEAD", "/version")).await.status,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 
