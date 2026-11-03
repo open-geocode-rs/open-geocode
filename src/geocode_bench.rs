@@ -137,7 +137,7 @@ pub struct WorstCase {
     pub distance_m: Option<f64>,
 }
 
-pub fn benchmark_geocode(options: GeocodeBenchmarkOptions) -> Result<GeocodeBenchmarkReport> {
+pub fn benchmark_geocode(options: &GeocodeBenchmarkOptions) -> Result<GeocodeBenchmarkReport> {
     let fixture: GeocodeFixture = {
         let text = std::fs::read_to_string(&options.fixture)
             .with_context(|| format!("failed to read fixture {}", options.fixture.display()))?;
@@ -151,7 +151,7 @@ pub fn benchmark_geocode(options: GeocodeBenchmarkOptions) -> Result<GeocodeBenc
     let mut groups: BTreeMap<String, GroupAccumulator> = BTreeMap::new();
     for case in &fixture.cases {
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: case.query.clone(),
                 limit,
                 layer: None,

@@ -109,6 +109,7 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ),
     ("glued_phrase", &["unit", "po_box", "level", "admin_type"]),
     ("dict_dominant", &DICT_FIELDS),
+    ("street_alias", &["bare", "tail"]),
     (
         "grounding",
         &["no_locality", "no_region", "no_country", "no_postcode"],
@@ -260,6 +261,7 @@ enum Block {
     DictLevel,
     GluedPhrase,
     DictDominant,
+    StreetAlias,
     Grounding,
 }
 
@@ -499,6 +501,10 @@ fn has_street_type_suffix(word: &str, dictionaries: &Dictionaries) -> bool {
 /// The script block of a letter, by its Unicode Script property.
 fn script(character: char) -> usize {
     use unicode_script::{Script, UnicodeScript};
+    // The script table is a binary search, and most letters are these.
+    if character.is_ascii_alphabetic() {
+        return 0;
+    }
     match character.script() {
         Script::Latin => 0,
         Script::Greek => 1,
@@ -739,6 +745,13 @@ impl FeatureSet {
         if let Some(index) = field_index(field) {
             self.push(Block::DictDominant, index);
         }
+    }
+
+    /// The span is a street name without its type words (`tail` false) or
+    /// the last name words of one, which the street dictionary does not
+    /// hold as written.
+    pub(super) fn street_alias(&mut self, tail: bool) {
+        self.push(Block::StreetAlias, usize::from(tail));
     }
 
     /// The span is one number written in parts: "993.5", "1384 1/2".

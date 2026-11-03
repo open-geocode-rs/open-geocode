@@ -59,7 +59,7 @@ impl ErrorLog {
         route: &str,
         item: Option<usize>,
         started: Instant,
-        cause: Option<String>,
+        cause: Option<&str>,
     ) {
         let mut line = serde_json::json!({
             "level": "error",
@@ -73,13 +73,13 @@ impl ErrorLog {
         if let Some(item) = item {
             line["item"] = item.into();
         }
-        self.write(line.to_string());
+        self.write(&line.to_string());
     }
 
-    fn write(&self, line: String) {
+    fn write(&self, line: &str) {
         #[cfg(test)]
         if let Some(lines) = &self.captured {
-            lines.lock().expect("log lock").push(line);
+            lines.lock().expect("log lock").push(line.to_owned());
             return;
         }
         eprintln!("{line}");
@@ -130,7 +130,7 @@ pub(crate) async fn propagate(
             .as_ref()
             .and_then(Problem::cause)
             .map(|cause| format!("{cause:#}"));
-        log.internal_error(&id, &route, None, started, cause);
+        log.internal_error(&id, &route, None, started, cause.as_deref());
     }
     if let Ok(value) = HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);

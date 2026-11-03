@@ -1,0 +1,78 @@
+name: PR gate
+
+# Brings each pull request to the state its triage result and labels call for:
+# .github/scripts/gate.js. Runs on every pull request event, when Devin posts a
+# status, and every 15 minutes over all open pull requests, so a run that
+# stops halfway is finished by the next.
+#
+# pull_request_target and status run main's code with write access. PR code is
+# never checked out or run; titles and bodies are read as data.
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft, labeled, unlabeled]
+  status:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: read
+
+# Queued, never cancelled. Every step is safe to repeat, so runs that overlap
+# across groups agree on the state they bring a pull request to.
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number || github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: PR gate
+    # TRIAGE_TOKEN lives in this environment, which only main may use: a
+    # workflow pushed on another branch of the repository cannot read it.
+    environment: triage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/github-script@v7
+        env:
+          # The Actions token may not change a pull request's draft state, so
+          # draft changes use this token; labels and comments stay with the
+          # Actions bot. Fine-grained, Pull requests: read and write, this
+          # repository only.
+          TRIAGE_TOKEN: ${{ secrets.TRIAGE_TOKEN }}
+        with:
+          script: |
+            if (!process.env.TRIAGE_TOKEN) {
+              core.setFailed('The TRIAGE_TOKEN secret is missing; the gate cannot draft or ready pull requests without it.');
+              return;
+            }
+            const reconcile = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/gate.js`);
+            const drafts = getOctokit(process.env.TRIAGE_TOKEN);
+
+            let numbers;
+            if (context.eventName === 'pull_request_target') {
+              numbers = [context.payload.pull_request.number];
+            } else {
+              const open = await github.paginate(github.rest.pulls.list, { ...context.repo, state: 'open', per_page: 100 });
+              numbers = open
+                .filter((pr) => context.eventName !== 'status' || pr.head.sha === context.payload.sha)
+                .map((pr) => pr.number);
+            }
+
+            let failed = 0;
+            for (const number of numbers) {
+              try {
+                await reconcile({ github, drafts, context, core, number });
+              } catch (error) {
+                failed++;
+                core.error(`#${number}: ${error.message}`);
+              }
+            }
+            if (failed) core.setFailed(`${failed} pull request(s) not reconciled; the next run retries them`);

@@ -125,7 +125,7 @@ use checkpoint::{
     PostcodePoint, ScanCounts, State, Step,
 };
 use containment::Shapes;
-use emitted::Emitted;
+use emitted::{Emitted, Ready};
 pub(crate) use locations::{
     CHUNK_BYTES as NODE_SET_CHUNK_BYTES, LOCATION_BYTES as NODE_SLOT_BYTES, LoadStats,
     TABLE_BYTES as NODE_SET_TABLE_BYTES,
@@ -303,8 +303,19 @@ fn total_input_bytes(inputs: &[PathBuf]) -> Result<u64> {
         .try_fold(0, |total, input| Ok(total + pbf::input_bytes(input)?))
 }
 
-pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
-    let plan = plan_osm_build(&options)?;
+/// The least time between two checkpoints. A checkpoint syncs every scratch
+/// file it names, spills every sorter and saves the node store: seconds a
+/// country's build spends to save it the minutes a crash would cost, while
+/// a planet's steps run longer than this and keep a checkpoint each. Tests
+/// checkpoint every step, to go on from each.
+const CHECKPOINT_EVERY: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(300)
+};
+
+pub fn build_osm_pack(options: &BuildOsmOptions) -> Result<BuilderReport> {
+    let plan = plan_osm_build(options)?;
     build_planned_osm_pack(options, plan)
 }
 
@@ -322,11 +333,12 @@ thread_local! {
 /// Build with a plan made by [`plan_osm_build`]. The caller sizes the
 /// process's rayon pool to `plan.threads` before any parallel work, since
 /// one pool serves every stage.
-pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
+pub fn build_planned_osm_pack(options: &BuildOsmOptions, plan: BuildPlan) -> Result<BuilderReport> {
     for warning in plan.shortfalls.iter().chain(&plan.warnings) {
         options.observer.warned(warning);
     }
-    let mut run = Run::start(&options, plan)?;
+    let mut run = Run::start(options, plan)?;
+    let mut checkpointed = Instant::now();
     for step in Step::all(options.inputs.len()) {
         if run.done.is_some_and(|done| step <= done) {
             continue;
@@ -338,7 +350,10 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
                 "injected failure before the checkpoint of {step:?}"
             )));
         }
-        run.checkpoint(step)?;
+        if checkpointed.elapsed() >= CHECKPOINT_EVERY {
+            run.checkpoint(step)?;
+            checkpointed = Instant::now();
+        }
     }
     run.finish()
 }
@@ -661,7 +676,9 @@ impl<'a> Run<'a> {
                 .into(),
             ));
         }
-        fingerprint.imported = manifest.fingerprint.imported.clone();
+        fingerprint
+            .imported
+            .clone_from(&manifest.fingerprint.imported);
         let state = manifest.state;
         let files = manifest
             .files
@@ -864,7 +881,8 @@ impl<'a> Run<'a> {
             BuildStage::Scan,
             None,
             |offset, block| {
-                let output = scan_block(&block);
+                let mut output = scan_block(&block);
+                output.emitted.prepare()?;
                 for (_, refs) in &output.ways {
                     nodes.mark(refs)?;
                 }
@@ -914,7 +932,7 @@ impl<'a> Run<'a> {
         )?;
         self.build.report.geometry_passes.scan_read_bytes += read;
         self.build.report.phases.scan_ms += phase.elapsed().as_millis();
-        self.save_geometry(part)?;
+        self.save_geometry(&part)?;
         self.input = Some(InputPasses {
             index,
             nodes: Some(nodes),
@@ -1006,7 +1024,7 @@ impl<'a> Run<'a> {
             read_bytes: scanned.read_bytes,
             heap_bytes: alloc::live_bytes().map(|bytes| bytes as u64),
             tracked_bytes: self.memory.used() as u64,
-            resources: resources.clone(),
+            resources,
         })?;
         for warning in self.plan.shortfalls.iter().chain(&self.plan.warnings) {
             self.options.observer.warned(warning);
@@ -1069,7 +1087,11 @@ impl<'a> Run<'a> {
             &self.progress,
             BuildStage::AssembleWays,
             Some(&input.kept_blobs),
-            |_, block| Ok(emit::assemble(&block, locations, &input.members)),
+            |_, block| {
+                let mut assembled = emit::assemble(&block, locations, &input.members);
+                assembled.output.emitted.prepare()?;
+                Ok(assembled)
+            },
             |assembled| {
                 let resolution = &mut build.report.geometry_resolution;
                 resolution.resolved_node_refs += assembled.resolved;
@@ -1092,14 +1114,14 @@ impl<'a> Run<'a> {
         self.build.report.geometry_passes.way_read_bytes += read;
         self.build.report.phases.feature_emission_ms += phase.elapsed().as_millis();
         drop(input);
-        self.save_geometry(part)
+        self.save_geometry(&part)
     }
 
     /// Keep an input's part of the boundary geometry on disk until the
     /// boundary stage, for a run that goes on after it.
-    fn save_geometry(&mut self, part: Vec<GeometryItem>) -> Result<()> {
+    fn save_geometry(&mut self, part: &[GeometryItem]) -> Result<()> {
         let mut spool = Spool::create(&self.scratch, "geometry")?;
-        for item in &part {
+        for item in part {
             spool.write(item)?;
         }
         self.geometry_saved.push(spool.finish()?);
@@ -1143,18 +1165,24 @@ impl<'a> Run<'a> {
         for part in &self.geometry_saved {
             for item in part.reader()? {
                 let (way_id, line) = match item? {
-                    GeometryItem::Way(way) => {
-                        let line = (way.object_id, Some(way.vertices.clone()));
-                        if boundary::may_be_area(&way) {
+                    GeometryItem::Way(mut way) => {
+                        let way_id = way.object_id;
+                        // Only a way that may close an area is kept beside
+                        // its line; any other gives its vertices up.
+                        let vertices = if boundary::may_be_area(&way) {
                             way_vertices += way.vertices.len();
+                            let vertices = way.vertices.clone();
                             ways.push(way);
-                        }
+                            vertices
+                        } else {
+                            std::mem::take(&mut way.vertices)
+                        };
                         if way_vertices >= batch_vertices {
                             self.progress.check()?;
                             builder.add_ways(&std::mem::take(&mut ways))?;
                             way_vertices = 0;
                         }
-                        line
+                        (way_id, Some(vertices))
                     }
                     GeometryItem::Member(way_id, line) => (way_id, line),
                     GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
@@ -1364,15 +1392,14 @@ impl<'a> Run<'a> {
             settled,
         );
         // An admin area is a settlement too when a settlement of its name
-        // lies in it, as a town's boundary holds the town's point: Nominatim
-        // links the two the same way. A ward or a local board holds none of
-        // its name.
+        // lies in it, as a town's boundary holds the town's point. A ward or a
+        // local board holds none of its name.
         let found = settlements
             .par_iter()
             .filter_map(|(name, [lon, lat])| {
                 let locality = contexts
                     .index
-                    .context_for_point(*lon, *lat, Default::default())
+                    .context_for_point(*lon, *lat, &Default::default())
                     .admin_context
                     .locality_record_id()?;
                 contexts
@@ -1493,9 +1520,9 @@ impl<'a> Run<'a> {
                     Some(Book::create(&self.scratch, "address-book")?),
                 );
                 // Slash numbers are read before the addresses are placed.
-                slash::read_slash_numbers(
-                    addresses.finish()?,
-                    &mut self.build.report.slash_numbers,
+                let slash_numbers = &mut self.build.report.slash_numbers;
+                overlapped(
+                    |emit| slash::read_slash_numbers(addresses.finish()?, slash_numbers, emit),
                     |address| runs.push(address, None),
                 )?;
                 let (postcodes, lent, book) = runs.finish()?;
@@ -1567,8 +1594,11 @@ impl<'a> Run<'a> {
             .generation
             .take()
             .ok_or_else(|| missing("the Pack generation"))?;
-        let mut writer =
-            Writer::create_in(generation, Arc::clone(&self.scratch), self.writer_options())?;
+        let mut writer = Writer::create_in(
+            generation,
+            Arc::clone(&self.scratch),
+            &self.writer_options(),
+        )?;
         writer.set_context_names(area_names);
         writer.set_country_codes(country_codes);
         writer.set_region_groups(region_groups);
@@ -1798,7 +1828,7 @@ impl<'a> Run<'a> {
     /// The report as it stands, every run's stages in it.
     fn report(&self) -> BuilderReport {
         let mut report = self.build.report.clone();
-        report.stages = self.stages_before.clone();
+        report.stages.clone_from(&self.stages_before);
         report.stages.extend(self.progress.stages());
         report
     }
@@ -1853,11 +1883,20 @@ impl<'a> Run<'a> {
         self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
         self.checkpoints.voided = scratch.voided();
         self.progress.finish(BuildStage::Parser);
+        let parser_training_ms = phase.elapsed().as_millis();
+        // The structured index keys the sealed Pack's text index with its
+        // dictionaries, and joins the Pack before it is published.
+        self.progress.start(BuildStage::StructuredIndex, None)?;
+        let structured = Instant::now();
+        crate::structured::add_to(&mut sealed)?;
+        stats.bytes = sealed.bytes();
+        self.progress.finish(BuildStage::StructuredIndex);
         let mut report = self.report();
         report.checkpoints = self.checkpoints.clone();
         self.progress.check()?;
         report.parser_training = training;
-        report.phases.parser_training_ms = phase.elapsed().as_millis();
+        report.phases.parser_training_ms = parser_training_ms;
+        report.phases.structured_index_ms = structured.elapsed().as_millis();
         for (name, sorted) in &self.sorted {
             report.scratch.sorters.insert(name.clone(), sorted.clone());
         }
@@ -1974,11 +2013,22 @@ impl Build {
         let Emitted {
             report,
             records,
+            ready,
             rejections,
         } = emitted;
         self.report.merge(report);
         for rejection in &rejections {
             self.audit.write(rejection)?;
+        }
+        for item in ready {
+            match item {
+                Ready::Address(mut address) => {
+                    address.seq = self.seq;
+                    self.seq += 1;
+                    open(&mut self.addresses, "addresses")?.push(address)?;
+                }
+                Ready::Record(record) => self.push(*record, None)?,
+            }
         }
         for record in records {
             self.push(record, None)?;
@@ -1994,7 +2044,7 @@ impl Build {
             };
             self.seq += 1;
             return open(&mut self.addresses, "addresses")?.push(PendingAddress::new(
-                address,
+                &address,
                 self.seq - 1,
                 dataset,
             )?);
@@ -2131,7 +2181,7 @@ impl<'a> AddressRuns<'a> {
                     place: fields.place,
                     ..SourceContext::default()
                 };
-                let context = self.index.context_for_point(lon, lat, source);
+                let context = self.index.context_for_point(lon, lat, &source);
                 let country = context.admin_context.country_record_id()?;
                 self.country_codes.get(&country).copied()
             })
@@ -2222,7 +2272,9 @@ impl AddressBook {
                         record.disputed = placed.disputed;
                         if let Some(at) = placed.postcodes {
                             let chunk = &postcodes[&BookFile::<Postcodes>::chunk_of(at)];
-                            record.street_postcodes = BookFile::pick(chunk, at)?.0.clone();
+                            record
+                                .street_postcodes
+                                .clone_from(&BookFile::pick(chunk, at)?.0);
                         }
                         Record::Address(record)
                     }
@@ -2273,12 +2325,12 @@ fn join_streets(
                 let mut areas = Vec::<(Option<RecordId>, Option<String>, Vec<StreetRecord>)>::new();
                 for way in run {
                     let [lon, lat] = way.representative_point;
-                    let context = index.context_for_point(lon, lat, Default::default());
+                    let context = index.context_for_point(lon, lat, &Default::default());
                     let tuple = &context.admin_context;
                     let locality = tuple.locality_record_id();
                     let area = locality
                         .filter(|locality| settled.contains(locality))
-                        .or(tuple.district_record_id())
+                        .or_else(|| tuple.district_record_id())
                         .or(locality);
                     match areas.iter_mut().find(|(at, ..)| *at == area) {
                         Some((.., members)) => members.push(way),
@@ -2316,21 +2368,24 @@ fn join_streets(
     let mut runs = Vec::<Vec<StreetRecord>>::new();
     let mut ways = 0;
     let mut name = None::<Vec<u8>>;
-    for pending in streets.finish()? {
-        let pending = pending?;
-        if name.as_deref() != Some(pending.name_key()) {
-            if ways >= WRITE_BATCH_RECORDS {
-                flush(&mut runs)?;
-                ways = 0;
+    overlapped(
+        |emit| streets.finish()?.try_for_each(|pending| emit(pending?)),
+        |pending: PendingStreet| {
+            if name.as_deref() != Some(pending.name_key()) {
+                if ways >= WRITE_BATCH_RECORDS {
+                    flush(&mut runs)?;
+                    ways = 0;
+                }
+                name = Some(pending.name_key().to_vec());
+                runs.push(Vec::new());
             }
-            name = Some(pending.name_key().to_vec());
-            runs.push(Vec::new());
-        }
-        ways += 1;
-        runs.last_mut()
-            .expect("a run was started")
-            .push(pending.into_street());
-    }
+            ways += 1;
+            runs.last_mut()
+                .expect("a run was started")
+                .push(pending.into_street());
+            Ok(())
+        },
+    )?;
     flush(&mut runs)?;
     Ok(count)
 }
@@ -2367,9 +2422,10 @@ fn write_address_book(
     slash_numbers: &mut SlashNumberCounts,
 ) -> Result<BookFile<PendingAddress>> {
     let mut book = Book::create(scratch, "address-book")?;
-    slash::read_slash_numbers(addresses.finish()?, slash_numbers, |address| {
-        book.push(address).map(drop)
-    })?;
+    overlapped(
+        |emit| slash::read_slash_numbers(addresses.finish()?, slash_numbers, emit),
+        |address| book.push(address).map(drop),
+    )?;
     book.finish()
 }
 
@@ -2689,6 +2745,44 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
             _ => None,
         })
         .collect()
+}
+
+/// Run `read` on a thread of its own and hand what it emits to `take` on
+/// this one, in order, a batch at a time: a sorter's merge is read and
+/// decoded on one thread, and would otherwise wait while what it read is
+/// placed or joined, and that wait while the merge is read.
+fn overlapped<T: Send>(
+    read: impl FnOnce(&mut dyn FnMut(T) -> Result<()>) -> Result<()> + Send,
+    mut take: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    let stopped = || Error::Inconsistent("a merge reader lost the thread taking its items".into());
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<T>>(1);
+        let reader = scope.spawn(move || -> Result<()> {
+            let mut batch = Vec::with_capacity(WRITE_BATCH_RECORDS);
+            read(&mut |item| {
+                batch.push(item);
+                if batch.len() == WRITE_BATCH_RECORDS {
+                    sender
+                        .send(std::mem::take(&mut batch))
+                        .map_err(|_| stopped())?;
+                }
+                Ok(())
+            })?;
+            if !batch.is_empty() {
+                sender.send(batch).map_err(|_| stopped())?;
+            }
+            Ok(())
+        });
+        // Dropping the receiver on an error here stops the reader at its
+        // next batch.
+        for batch in receiver {
+            batch.into_iter().try_for_each(&mut take)?;
+        }
+        reader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// Write sorted records in batches, computing admin context in parallel, and
@@ -3091,7 +3185,7 @@ mod tests {
         let searcher = TextSearcher::from_pack(Arc::clone(&reader)).expect("searcher");
         let search = |countries: Vec<String>| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: "King Street".to_string(),
                     limit: 20,
                     layer: None,
@@ -3155,7 +3249,7 @@ mod tests {
         inputs: &[&Path],
         memory_budget_bytes: Option<usize>,
     ) -> BuilderReport {
-        build_osm_pack(BuildOsmOptions {
+        build_osm_pack(&BuildOsmOptions {
             inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
             pack: root.to_path_buf(),
             memory_budget_bytes,
@@ -3205,7 +3299,7 @@ mod tests {
             }],
             ..RecordingSource::default()
         });
-        let report = build_osm_pack(BuildOsmOptions {
+        let report = build_osm_pack(&BuildOsmOptions {
             inputs: vec![input],
             pack: dir.join("pack"),
             addresses: Some(Arc::clone(&source) as Arc<dyn AddressSource>),
@@ -3235,7 +3329,7 @@ mod tests {
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let top = |query: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.to_string(),
                     limit: 1,
                     layer: None,
@@ -3272,7 +3366,7 @@ mod tests {
              -79.40,43.596,10,King Street,Toronto,K7L 1A1\n",
         )
         .expect("csv");
-        let report = build_osm_pack(BuildOsmOptions {
+        let report = build_osm_pack(&BuildOsmOptions {
             inputs: vec![input],
             pack: dir.join("pack"),
             addresses: Some(Arc::new(addresses::AddressFiles(vec![
@@ -3369,7 +3463,7 @@ mod tests {
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let top = |query: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.to_string(),
                     limit: 1,
                     layer: None,
@@ -3384,7 +3478,7 @@ mod tests {
         };
         let geocode = |address: &str| {
             searcher
-                .geocode_address(crate::search::AddressGeocodeOptions {
+                .geocode_address(&crate::search::AddressGeocodeOptions {
                     countries: Vec::new(),
                     address: address.to_string(),
                     locality: None,
@@ -3532,7 +3626,7 @@ mod tests {
 
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "10 King Street".into(),
                 limit: 1,
                 layer: Some("address".into()),
@@ -3592,7 +3686,7 @@ mod tests {
         assert!(generation.join(AUDIT_DIR).join(BUILD_REPORT_FILE).is_file());
 
         // The benchmark reads the build report back.
-        let bench = crate::bench::benchmark_pack(crate::bench::PackBenchmarkOptions {
+        let bench = crate::bench::benchmark_pack(&crate::bench::PackBenchmarkOptions {
             pack: dir.join("pack"),
             queries: None,
             iterations: 1,
@@ -3686,7 +3780,7 @@ mod tests {
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let first = |query: &str, layer: &str| {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.into(),
                     limit: 1,
                     layer: Some(layer.into()),
@@ -3938,7 +4032,7 @@ mod tests {
         let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
         let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
             searcher
-                .search(TextSearchOptions {
+                .search(&TextSearchOptions {
                     query: query.into(),
                     limit: 5,
                     layer: layer.map(str::to_string),
@@ -3987,7 +4081,7 @@ mod tests {
         assert!(search("Memorial Bench", None).is_empty());
 
         let suggestions = searcher
-            .autocomplete(TextAutocompleteOptions {
+            .autocomplete(&TextAutocompleteOptions {
                 query: "riverdale fa".into(),
                 limit: 5,
                 layer: None,
@@ -4210,13 +4304,13 @@ mod tests {
             ..BuildOsmOptions::default()
         };
         // The plan sees the budget cannot hold the build before it starts.
-        let refused = build_osm_pack(options.clone());
+        let refused = build_osm_pack(&options);
         let Err(Error::OutOfResources(message)) = refused else {
             panic!("expected the plan to refuse the scratch budget, got {refused:?}");
         };
         assert!(message.contains("--scratch-budget-mb"), "{message}");
         // Forced past the plan, the ledger stops it at the first write.
-        let failed = build_osm_pack(BuildOsmOptions {
+        let failed = build_osm_pack(&BuildOsmOptions {
             force: true,
             ..options
         });
@@ -4246,7 +4340,7 @@ mod tests {
                 )],
             ],
         );
-        let error = build_osm_pack(BuildOsmOptions {
+        let error = build_osm_pack(&BuildOsmOptions {
             inputs: vec![input],
             pack: dir.join("pack"),
             ..BuildOsmOptions::default()
@@ -4290,7 +4384,7 @@ mod tests {
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let recorder = Arc::new(Recorder::default());
-        let report = build_osm_pack(BuildOsmOptions {
+        let report = build_osm_pack(&BuildOsmOptions {
             inputs: vec![input.clone()],
             pack: dir.join("pack"),
             input_sources: vec!["town".into()],
@@ -4350,7 +4444,7 @@ mod tests {
         let dir = temp_dir("cancelled");
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
-        let error = build_osm_pack(BuildOsmOptions {
+        let error = build_osm_pack(&BuildOsmOptions {
             inputs: vec![input],
             pack: dir.join("pack"),
             cancel: Arc::new(AtomicBool::new(true)),
@@ -4450,7 +4544,7 @@ mod tests {
         files: Vec<addresses::AddressFile>,
         budget: Option<usize>,
     ) -> Vec<String> {
-        let report = build_osm_pack(BuildOsmOptions {
+        let report = build_osm_pack(&BuildOsmOptions {
             inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
             pack: root.to_path_buf(),
             memory_budget_bytes: budget,
@@ -4512,7 +4606,7 @@ mod tests {
         let spilled = pack_contents(&dir.join("spilled"), &[&input], files.clone(), Some(4));
         assert_eq!(in_memory, spilled);
 
-        let report = build_osm_pack(BuildOsmOptions {
+        let report = build_osm_pack(&BuildOsmOptions {
             inputs: vec![input],
             pack: dir.join("pack"),
             addresses: Some(Arc::new(addresses::AddressFiles(files))),
@@ -4630,7 +4724,7 @@ mod tests {
 
     /// Build `options`, failing just before the checkpoint of `step` as a
     /// crash there would.
-    fn fail_before(options: BuildOsmOptions, step: Step) -> Error {
+    fn fail_before(options: &BuildOsmOptions, step: Step) -> Error {
         FAIL_BEFORE_CHECKPOINT.set(Some(step));
         let failed = build_osm_pack(options);
         FAIL_BEFORE_CHECKPOINT.set(None);
@@ -4650,7 +4744,7 @@ mod tests {
                 force: budget.is_some(),
                 ..resumable_inputs(&dir)
             };
-            let whole = build_osm_pack(BuildOsmOptions {
+            let whole = build_osm_pack(&BuildOsmOptions {
                 pack: dir.join("whole"),
                 ..options.clone()
             })
@@ -4665,7 +4759,7 @@ mod tests {
                     pack: pack.clone(),
                     ..options.clone()
                 };
-                let error = fail_before(options.clone(), *step);
+                let error = fail_before(&options.clone(), *step);
                 assert!(format!("{error}").contains("injected"), "{error}");
                 let found = resume::find(&pack).expect("find");
                 if at == 0 {
@@ -4676,7 +4770,7 @@ mod tests {
                     assert!(found[0].bytes > 0);
                     assert!(!pack.join("CURRENT").exists());
                 }
-                let resumed = build_osm_pack(BuildOsmOptions {
+                let resumed = build_osm_pack(&BuildOsmOptions {
                     leftover: Leftover::Resume,
                     ..options
                 })
@@ -4709,10 +4803,10 @@ mod tests {
                 ..options.clone()
             };
             FAIL_BEFORE_TRAINING.set(true);
-            let failed = build_osm_pack(options.clone());
+            let failed = build_osm_pack(&options.clone());
             FAIL_BEFORE_TRAINING.set(false);
             assert!(failed.is_err());
-            let resumed = build_osm_pack(BuildOsmOptions {
+            let resumed = build_osm_pack(&BuildOsmOptions {
                 leftover: Leftover::Resume,
                 ..options
             })
@@ -4734,10 +4828,10 @@ mod tests {
             pack: dir.join("pack"),
             ..resumable_inputs(&dir)
         };
-        fail_before(options.clone(), Step::Contexts);
+        fail_before(&options, Step::Contexts);
 
         // Neither resumed nor cleared, it is reported, with both commands.
-        let refused = build_osm_pack(options.clone()).expect_err("refused");
+        let refused = build_osm_pack(&options).expect_err("refused");
         let message = refused.to_string();
         assert!(message.contains("import addresses"), "{message}");
         assert!(
@@ -4747,7 +4841,7 @@ mod tests {
 
         // An input that changed since refuses to resume, naming it.
         write_pbf(&options.inputs[1], &town());
-        let changed = build_osm_pack(BuildOsmOptions {
+        let changed = build_osm_pack(&BuildOsmOptions {
             leftover: Leftover::Resume,
             ..options.clone()
         })
@@ -4758,7 +4852,7 @@ mod tests {
         assert_eq!(resume::find(&options.pack).expect("find").len(), 1);
 
         // Cleared, the build starts over and nothing is left.
-        let fresh = build_osm_pack(BuildOsmOptions {
+        let fresh = build_osm_pack(&BuildOsmOptions {
             leftover: Leftover::Clear,
             ..options.clone()
         })

@@ -128,12 +128,15 @@ impl PackReverseGeocoder {
 
         let mut result = self.explicit_address(options, &mut context, &mut context_record_ids)?;
         if result.is_none() {
+            crate::stop::check()?;
             result = self.estimated_address(options, &mut context, &mut context_record_ids)?;
         }
         if result.is_none() {
+            crate::stop::check()?;
             result = self.nearest_street(options, &mut context, &mut context_record_ids)?;
         }
         if result.is_none() {
+            crate::stop::check()?;
             result = self.context_only(options, &mut context, &mut context_record_ids)?;
         }
 
@@ -207,6 +210,7 @@ impl PackReverseGeocoder {
             INTERPOLATION_RADIUS_M,
             CANDIDATE_LIMIT,
         )? {
+            crate::stop::check()?;
             let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
                 continue;
             };
@@ -330,6 +334,7 @@ impl PackReverseGeocoder {
             CONTEXT_RADIUS_M,
             CANDIDATE_LIMIT,
         )? {
+            crate::stop::check()?;
             if !seen.insert(candidate.record_id) {
                 continue;
             }

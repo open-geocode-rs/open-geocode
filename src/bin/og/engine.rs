@@ -108,7 +108,7 @@ impl Engine {
     pub(crate) fn search(&self, query: &str) -> Result<Answer> {
         let started = Instant::now();
         let query = query.trim().to_string();
-        let hits = self.searcher.search(TextSearchOptions {
+        let hits = self.searcher.search(&TextSearchOptions {
             query: query.clone(),
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
@@ -141,7 +141,7 @@ impl Engine {
     pub(crate) fn geocode_address(&self, address: &str) -> Result<Answer> {
         let started = Instant::now();
         let address = address.trim().to_string();
-        let found = self.searcher.geocode_address(AddressGeocodeOptions {
+        let found = self.searcher.geocode_address(&AddressGeocodeOptions {
             address: address.clone(),
             locality: None,
             region: None,

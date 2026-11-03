@@ -1,11 +1,29 @@
-# open-geocode
+<p align="center">
+  <a href="https://opengeocode.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+      <img src="assets/logo-light.png" alt="open-geocode" width="220">
+    </picture>
+  </a>
+</p>
 
-Fast, lightweight, self-hosted geocoding in pure Rust.
+<h1 align="center">open-geocode</h1>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/open-geocode-rs/open-geocode/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/open-geocode-rs/open-geocode/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/open-geocode.svg?style=flat-square)](https://crates.io/crates/open-geocode)
-[![docs.rs](https://img.shields.io/docsrs/open-geocode?style=flat-square)](https://docs.rs/open-geocode)
-[![license](https://img.shields.io/crates/l/open-geocode.svg?style=flat-square)](LICENSE)
+<p align="center">Fast, lightweight, self-hosted geocoding in pure Rust.</p>
+
+<p align="center">
+  <a href="https://github.com/open-geocode-rs/open-geocode/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/open-geocode-rs/open-geocode/ci.yml?branch=main&style=flat-square&label=ci" alt="CI"></a>
+  <a href="https://crates.io/crates/open-geocode"><img src="https://img.shields.io/crates/v/open-geocode.svg?style=flat-square" alt="crates.io"></a>
+  <a href="https://docs.rs/open-geocode"><img src="https://img.shields.io/docsrs/open-geocode?style=flat-square" alt="docs.rs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/crates/l/open-geocode.svg?style=flat-square" alt="license"></a>
+</p>
+
+<p align="center">
+  <a href="https://opengeocode.com/docs/"><b>Docs</b></a> •
+  <a href="https://opengeocode.com/docs/quickstart/"><b>Quickstart</b></a> •
+  <a href="https://opengeocode.com/docs/api/"><b>API</b></a> •
+  <a href="https://opengeocode.com/docs/benchmarks/"><b>Benchmarks</b></a>
+</p>
 
 `open-geocode` is a self-hosted address geocoding engine built entirely on open data (OpenStreetMap and OpenAddresses).
 Forward, autocomplete, reverse and batch geocoding, served from one file.
@@ -19,11 +37,6 @@ og is an alternative to commercial API quotas and to the days-long builds of Pel
 - **Search:** Tantivy index and FST dictionaries, with Levenshtein-automata typo tolerance and Unicode transliteration across scripts. Free-form or structured input.
 - **Reverse:** Hilbert-packed R-trees and point-in-polygon on real admin boundaries, returning the nearest address with its full locality, region and country.
 - **Results:** calibrated confidence, plus a rooftop, interpolated or street-level accuracy tier.
-
-<img src="assets/og-demo.gif" alt="Building the Luxembourg Pack in og, then geocoding a CSV of 4,000 addresses" width="100%">
-
-Building the Luxembourg Pack, then geocoding a CSV of 4,000 addresses:
-every row matched in about a second, p50 1.6 ms and p99 5.4 ms.
 
 ## Why open-geocode?
 
@@ -116,6 +129,7 @@ og serve canada-ontario
 ```
 
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
+`GET /version` returns the server version and the Pack it serves: content id, schema version, and which og version built it and when.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.

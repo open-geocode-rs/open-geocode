@@ -64,6 +64,8 @@ pub enum BuildStage {
     Indexes,
     /// Train the address parser on the Pack. No measure.
     Parser,
+    /// Key the Pack's streets and places for the structured index. No measure.
+    StructuredIndex,
 }
 
 /// What a stage's work is counted in.
@@ -77,7 +79,7 @@ pub enum StageUnit {
 }
 
 impl BuildStage {
-    pub const ALL: [BuildStage; 10] = [
+    pub const ALL: [BuildStage; 11] = [
         BuildStage::Scan,
         BuildStage::BoundaryMembers,
         BuildStage::NodeJoin,
@@ -88,6 +90,7 @@ impl BuildStage {
         BuildStage::Records,
         BuildStage::Indexes,
         BuildStage::Parser,
+        BuildStage::StructuredIndex,
     ];
 
     /// What the stage's work is counted in, as the build report names it.
@@ -105,7 +108,9 @@ impl BuildStage {
             Self::Scan | Self::ImportAddresses => StageUnit::Bytes,
             Self::BoundaryMembers | Self::NodeJoin | Self::AssembleWays => StageUnit::Blocks,
             Self::ContextRecords | Self::Records => StageUnit::Records,
-            Self::Boundaries | Self::Indexes | Self::Parser => StageUnit::None,
+            Self::Boundaries | Self::Indexes | Self::Parser | Self::StructuredIndex => {
+                StageUnit::None
+            }
         }
     }
 
@@ -122,6 +127,7 @@ impl BuildStage {
             Self::Records => "write records",
             Self::Indexes => "finish Pack indexes",
             Self::Parser => "train address parser",
+            Self::StructuredIndex => "build the structured index",
         }
     }
 

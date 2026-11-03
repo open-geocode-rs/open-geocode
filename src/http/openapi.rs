@@ -6,7 +6,7 @@
 //! it, and `contract_tests` fails when the committed
 //! `contract/openapi.json` and the code disagree.
 //!
-//! Four things are adjusted after generation, in [`transform`]:
+//! Five things are adjusted after generation, in [`transform`]:
 //!
 //! 1. `Option<T>` renders as a nullable union, `["string", "null"]`, but this
 //!    API never emits a null: an absent value is an absent key
@@ -15,9 +15,11 @@
 //! 2. Every route answers a method it does not take with a 405, from the
 //!    router's fallbacks rather than from a handler, so there is no
 //!    attribute to carry it.
-//! 3. Every response gains the `X-Request-Id` header it actually returns,
+//! 3. Every single lookup may answer a 503, from the runner all lookups
+//!    share.
+//! 4. Every response gains the `X-Request-Id` header it actually returns,
 //!    and a batchable route's the `Allow` and `Accept-Query` it returns.
-//! 4. A batch body gains its `maxItems`.
+//! 5. A batch body gains its `maxItems`, from the server's limits.
 //!
 //! OpenAPI 3.1 has no `query` operation, so a batch is documented on its
 //! `post`, whose description says `QUERY` takes the same body.
@@ -26,9 +28,8 @@
 //! the attribute macro cannot read a constant. `bounds_match_the_constants`
 //! keeps them honest.
 
-use std::sync::LazyLock;
-
 use axum::{
+    extract::State,
     http::{HeaderValue, header},
     response::{IntoResponse, Response},
 };
@@ -42,9 +43,11 @@ use crate::{
         LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
         ReverseProperties, Version,
     },
-    http::{batch, bounds::MAX_BATCH_ITEMS},
+    http::batch,
+    limits::Limits,
     record::{Layer, ObjectType},
     records::Source,
+    runtime::AppState,
 };
 
 /// The media type every error is served as (RFC 9457).
@@ -78,13 +81,14 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         crate::runtime::geocode_batch,
         crate::runtime::reverse,
         crate::runtime::reverse_batch,
-        crate::http::batches::create,
-        crate::http::batches::status,
-        crate::http::batches::results,
-        crate::http::batches::cancel,
-        crate::http::batches::delete,
+        crate::http::jobs::create,
+        crate::http::jobs::status,
+        crate::http::jobs::results,
+        crate::http::jobs::cancel,
+        crate::http::jobs::delete,
         crate::http::health::healthz,
         crate::http::health::readyz,
+        crate::http::version::version,
         openapi_json,
     ),
     components(schemas(
@@ -124,8 +128,8 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     )),
     tags(
         (name = "geocoding", description = "Geocode addresses and points."),
-        (name = "batches", description = "Geocode a whole file, streamed back as it uploads."),
-        (name = "operations", description = "Health checks and the OpenAPI document."),
+        (name = "jobs", description = "Geocode a whole file, streamed back as it uploads."),
+        (name = "operations", description = "Health checks, the server and Pack versions, and the OpenAPI document."),
     ),
 )]
 pub(crate) struct ApiDoc;
@@ -182,7 +186,7 @@ pub(crate) enum ErrorCode {
     /// The route exists but does not take this method. The `Allow` header
     /// lists the ones it does.
     MethodNotAllowed,
-    /// A batch held more than 1000 items.
+    /// A batch held more items than the server allows.
     TooManyItems,
     /// A batch body was over its cap.
     BodyTooLarge,
@@ -191,9 +195,13 @@ pub(crate) enum ErrorCode {
     /// Something failed inside the server. The cause is in the logs under
     /// `request_id`, never in the body.
     InternalError,
-    /// Every batch slot was taken. Retry after the `Retry-After` header's
-    /// seconds.
+    /// The server runs as many lookups, batches or jobs as it allows, or
+    /// holds as many job results as it keeps. Retry after the `Retry-After`
+    /// header's seconds.
     Busy,
+    /// The lookup ran past the server's lookup timeout and stopped. It takes
+    /// as long the next time, so a retry does not help.
+    Timeout,
 }
 
 // Mirrors [`crate::http::problem::InvalidParam`] for the schema.
@@ -316,8 +324,8 @@ pub(crate) struct BatchSummary {
     pub failed: usize,
 }
 
-// The same bytes as the committed `contract/openapi.json`, which the
-// contract tests hold to the code.
+// With the default limits, the same bytes as the committed
+// `contract/openapi.json`, which the contract tests hold to the code.
 /// Get the OpenAPI document
 ///
 /// Returns the OpenAPI 3.1 document describing this server's API.
@@ -330,8 +338,8 @@ pub(crate) struct BatchSummary {
          content_type = "application/json"),
     ),
 )]
-pub(crate) async fn openapi_json() -> Response {
-    let mut response = spec().clone().into_response();
+pub(crate) async fn openapi_json(State(state): State<AppState>) -> Response {
+    let mut response = state.spec().to_string().into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -339,33 +347,29 @@ pub(crate) async fn openapi_json() -> Response {
     response
 }
 
-/// The spec as served, built once.
-pub(crate) fn spec() -> &'static String {
-    static SPEC: LazyLock<String> = LazyLock::new(|| document().expect("the spec serializes"));
-    &SPEC
-}
-
-/// The spec as a canonical JSON string: the one text both `/openapi.json` and
-/// `contract/openapi.json` are.
-pub(crate) fn document() -> serde_json::Result<String> {
+/// The spec as a canonical JSON string, with the bounds `limits` sets:
+/// `/openapi.json` serves it for the server's own, and
+/// `contract/openapi.json` is it for [`Limits::DEFAULT`].
+pub(crate) fn document(limits: &Limits) -> serde_json::Result<String> {
     let mut value = serde_json::to_value(ApiDoc::openapi())?;
-    transform(&mut value);
+    transform(&mut value, limits);
     let mut text = serde_json::to_string_pretty(&value)?;
     text.push('\n');
     Ok(text)
 }
 
 /// Adjust the generated spec to describe what the API actually does.
-fn transform(value: &mut Value) {
+fn transform(value: &mut Value, limits: &Limits) {
     drop_nulls(value);
     add_boundary_responses(value);
+    add_lookup_refusals(value);
     add_response_headers(value);
-    bound_batch_bodies(value);
+    bound_batch_bodies(value, limits);
 }
 
 /// Give every batch body its item cap, which a `request_body` attribute has
 /// no way to say.
-fn bound_batch_bodies(value: &mut Value) {
+fn bound_batch_bodies(value: &mut Value, limits: &Limits) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
     };
@@ -376,7 +380,44 @@ fn bound_batch_bodies(value: &mut Value) {
         else {
             continue;
         };
-        schema.insert("maxItems".to_string(), MAX_BATCH_ITEMS.into());
+        schema.insert("maxItems".to_string(), limits.max_batch_items().into());
+    }
+}
+
+/// Document the 503 every single lookup may answer: refused while the server
+/// runs as many as it allows, or stopped past the lookup timeout. Both come
+/// from the shared lookup runner, not from one handler, so it is added here.
+fn add_lookup_refusals(value: &mut Value) {
+    let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for operations in paths.values_mut() {
+        let Some(get) = operations.get_mut("get") else {
+            continue;
+        };
+        if !get["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "geocoding"))
+        {
+            continue;
+        }
+        let Some(responses) = get.get_mut("responses").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        responses.entry("503").or_insert_with(|| {
+            serde_json::json!({
+                "description": concat!(
+                    "The server runs as many lookups as it allows (`busy`; retry after the ",
+                    "`Retry-After` header's seconds), or the lookup ran past the server's ",
+                    "lookup timeout (`timeout`)."
+                ),
+                "content": {
+                    PROBLEM_JSON: {
+                        "schema": { "$ref": "#/components/schemas/Problem" },
+                    },
+                },
+            })
+        });
     }
 }
 
@@ -552,7 +593,7 @@ fn add_response_headers(value: &mut Value) {
 
 fn allow_header(methods: &str) -> Value {
     serde_json::json!({
-        "description": "Methods the route accepts.",
+        "description": "The methods this route accepts.",
         "schema": { "type": "string", "example": methods },
     })
 }
@@ -598,7 +639,8 @@ mod tests {
     /// away from the constants the handlers actually enforce.
     #[test]
     fn bounds_match_the_constants() {
-        let spec: Value = serde_json::from_str(&document().expect("spec")).expect("JSON");
+        let spec: Value =
+            serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
 
         for path in ["/search", "/autocomplete"] {
             assert_eq!(
@@ -652,7 +694,8 @@ mod tests {
             .map(String::as_str)
             .collect();
 
-        let spec: Value = serde_json::from_str(&document().expect("spec")).expect("JSON");
+        let spec: Value =
+            serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
         let documented: std::collections::BTreeSet<&str> = spec["components"]["schemas"]["Problem"]
             ["properties"]
             .as_object()
@@ -677,7 +720,8 @@ mod tests {
     /// Every error the server can construct is a value the contract lists.
     #[test]
     fn every_error_code_is_in_the_contract() {
-        let spec: Value = serde_json::from_str(&document().expect("spec")).expect("JSON");
+        let spec: Value =
+            serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
         let documented: std::collections::BTreeSet<String> =
             spec["components"]["schemas"]["ErrorCode"]["enum"]
                 .as_array()

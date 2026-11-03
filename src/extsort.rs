@@ -672,6 +672,7 @@ pub struct IndexedSpool<T> {
     bytes: u64,
     offsets: Vec<u64>,
     buffer: Vec<u8>,
+    prefix: Vec<u8>,
     _marker: PhantomData<T>,
 }
 
@@ -690,6 +691,7 @@ impl<T: Spill> IndexedSpool<T> {
             bytes: 0,
             offsets: Vec::new(),
             buffer: Vec::new(),
+            prefix: Vec::with_capacity(10),
             _marker: PhantomData,
         })
     }
@@ -698,11 +700,11 @@ impl<T: Spill> IndexedSpool<T> {
         self.offsets.push(self.bytes);
         self.buffer.clear();
         item.encode(&mut self.buffer);
-        let mut prefix = Vec::with_capacity(10);
-        put_u64(&mut prefix, self.buffer.len() as u64);
-        self.file.write_all(&prefix)?;
+        self.prefix.clear();
+        put_u64(&mut self.prefix, self.buffer.len() as u64);
+        self.file.write_all(&self.prefix)?;
         self.file.write_all(&self.buffer)?;
-        self.bytes += (prefix.len() + self.buffer.len()) as u64;
+        self.bytes += (self.prefix.len() + self.buffer.len()) as u64;
         Ok(())
     }
 

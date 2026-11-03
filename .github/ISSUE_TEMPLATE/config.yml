@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/open-geocode-rs/open-geocode/security/advisories/new
+    about: Report privately, not in a public issue.
+  - name: Docs and questions
+    url: https://opengeocode.com/docs/
+    about: How to build a Pack, serve it and call the API.

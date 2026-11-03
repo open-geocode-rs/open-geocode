@@ -232,7 +232,7 @@ impl Model {
     pub fn fit(examples: &[Example]) -> Self {
         let mut free = [POOLED_RIDGE; FEATURES];
         free[0] = 0.0;
-        let pooled = fit_logistic(examples.iter(), &[0.0; FEATURES], &free);
+        let pooled = fit_logistic(&examples.iter(), &[0.0; FEATURES], &free);
         let mut by_country = BTreeMap::<CountryCode, Vec<&Example>>::new();
         for example in examples {
             if let Some(country) = example.features.country {
@@ -243,7 +243,7 @@ impl Model {
             .into_iter()
             .map(|(country, examples)| {
                 let weights =
-                    fit_logistic(examples.into_iter(), &pooled, &[COUNTRY_PRIOR; FEATURES]);
+                    fit_logistic(&examples.into_iter(), &pooled, &[COUNTRY_PRIOR; FEATURES]);
                 (country, weights)
             })
             .collect();
@@ -362,7 +362,7 @@ fn sigmoid(value: f64) -> f64 {
 /// strength positive but the bias's the problem is strictly concave, so the
 /// steps converge from the prior.
 fn fit_logistic<'a>(
-    examples: impl Iterator<Item = &'a Example> + Clone,
+    examples: &(impl Iterator<Item = &'a Example> + Clone),
     prior: &Weights,
     strength: &Weights,
 ) -> Weights {
@@ -537,7 +537,7 @@ mod tests {
         let pooled = model.rate(&features);
         let new_zealand = model.rate(&Features {
             country: nz,
-            ..features.clone()
+            ..features
         });
         let canada = model.rate(&Features {
             country: ca,

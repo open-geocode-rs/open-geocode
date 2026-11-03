@@ -233,10 +233,7 @@ impl Layer {
 /// conventional five. Germany maps nine admin levels, three of them
 /// `state_district` and two `city_district`; with one tier each those
 /// collapse and all but one boundary of each is dropped from every German
-/// address. The names follow the commercial geocoders, which hit the same
-/// wall and answered it the same way: HERE and AWS prefix `sub`, TomTom
-/// counts `secondary`/`tertiary`, Google numbers `administrative_area_level_N`
-/// up to 7 and `sublocality_level_N` up to 5.
+/// address.
 ///
 /// Ordering is the hierarchy, outermost to innermost, and is relied on: a
 /// chain is sorted by it. `Place` sorts last because it is no admin tier at
@@ -363,7 +360,7 @@ impl AddressComponents {
         self.street
             .as_deref()
             .or(self.place.as_deref())
-            .or(self.areas.last().map(String::as_str))
+            .or_else(|| self.areas.last().map(String::as_str))
     }
 }
 
@@ -754,9 +751,8 @@ impl PlaceRecord {
 
 /// How large a place of `place_type` is, smaller being larger: twice an
 /// `admin_level`, and each `place=` value at the rank of the admin unit it
-/// usually stands beside, as Nominatim's search ranks place them. One scale
-/// for every country, read from what mappers tagged. None for an area of
-/// unknown kind.
+/// usually stands beside. One scale for every country, read from what
+/// mappers tagged. None for an area of unknown kind.
 pub fn place_rank(place_type: &str) -> Option<u8> {
     if let Some(level) = place_type.strip_prefix("admin_level:") {
         return level

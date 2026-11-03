@@ -46,6 +46,16 @@ impl<A> CountingAlloc<A> {
     }
 }
 
+// A store of the same value still takes the cache line exclusive, and every
+// allocation of every thread stores here: test first.
+#[inline]
+fn mark_installed() {
+    if !INSTALLED.load(Ordering::Relaxed) {
+        INSTALLED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[inline]
 fn count(bytes: isize) {
     let flushed = DELTA.try_with(|delta| {
         let next = delta.get() + bytes;
@@ -60,8 +70,11 @@ fn count(bytes: isize) {
     // A thread being torn down has no local delta left; count directly.
     let flush = flushed.unwrap_or(bytes);
     if flush != 0 {
-        let live = LIVE.fetch_add(flush, Ordering::Relaxed) + flush;
-        PEAK.fetch_max(live.max(0) as usize, Ordering::Relaxed);
+        let live = (LIVE.fetch_add(flush, Ordering::Relaxed) + flush).max(0) as usize;
+        // Read first, as for `INSTALLED`: the peak rarely moves.
+        if PEAK.load(Ordering::Relaxed) < live {
+            PEAK.fetch_max(live, Ordering::Relaxed);
+        }
     }
 }
 
@@ -72,7 +85,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
         // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
         let pointer = unsafe { self.inner.alloc(layout) };
         if !pointer.is_null() {
-            INSTALLED.store(true, Ordering::Relaxed);
+            mark_installed();
             count(layout.size() as isize);
         }
         pointer
@@ -82,7 +95,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
         // SAFETY: as for `alloc`.
         let pointer = unsafe { self.inner.alloc_zeroed(layout) };
         if !pointer.is_null() {
-            INSTALLED.store(true, Ordering::Relaxed);
+            mark_installed();
             count(layout.size() as isize);
         }
         pointer
