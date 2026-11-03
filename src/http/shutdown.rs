@@ -1,8 +1,6 @@
-//! Graceful shutdown for `serve`.
-
-/// Resolves on Ctrl-C, or on SIGTERM (what Docker, Kubernetes and systemd send to stop a
-/// service) on unix. If a signal cannot be listened for, that branch never resolves, so the
-/// server keeps running rather than stopping at once.
+/// Ctrl-C, or SIGTERM on unix: what Docker, Kubernetes and systemd send to
+/// stop a service. A signal that cannot be listened for never resolves, so
+/// the server keeps running rather than stopping at once.
 pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {

@@ -309,11 +309,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     .await
 }
 
-/// Serve until `stop` resolves, then drain for at most `drain`.
-///
-/// Split out from [`serve`] so a test can stop it without a signal.
-/// Serve until `stop` resolves, then stop within `budget`: running jobs are
-/// cancelled, new connections are refused, and requests in flight finish.
+/// Split from [`serve`] so a test can stop it without a signal.
 async fn run(
     listener: TcpListener,
     app: Router,
@@ -331,8 +327,8 @@ async fn run(
         () = stop => {}
     }
     eprintln!("Shutting down, for at most {} s", budget.as_secs());
-    // Jobs first: a job's upload is a request that lasts as long as the job,
-    // so the requests can only drain once the jobs have stopped.
+    // Jobs first: a job's upload is a request as long as the job, so requests
+    // drain only once jobs stop.
     state.jobs().cancel_running();
     stopping.cancel();
     let stopped = tokio::time::timeout(budget, async {
@@ -2562,8 +2558,6 @@ mod router_tests {
             .with_state(state)
     }
 
-    /// After the stop signal the server takes no new connection, and the
-    /// request it was answering still completes.
     #[tokio::test]
     async fn shutdown_lets_an_in_flight_request_finish() {
         let pack = temp_path("shutdown-drain");
@@ -2604,10 +2598,8 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    /// A request that never ends cannot hold the server past the shutdown
-    /// timeout.
     #[tokio::test]
-    async fn shutdown_gives_up_on_a_stuck_request_after_the_drain_timeout() {
+    async fn shutdown_gives_up_on_a_stuck_request_after_its_timeout() {
         use std::io::Write;
         let pack = temp_path("shutdown-timeout");
         write_pack(&pack);
@@ -2639,11 +2631,6 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    /// A job still running at shutdown is cancelled at the signal, keeping
-    /// the rows it answered, and its upload, a request as long as the job,
-    /// then ends: the server stops at once rather than at its timeout. The
-    /// job is not left `running` for the next start to fail, nor recorded as
-    /// `completed` with rows missing.
     #[tokio::test]
     async fn shutdown_cancels_a_running_job_and_stops_at_once() {
         let pack = temp_path("shutdown-job");
@@ -2665,9 +2652,7 @@ mod router_tests {
             Duration::from_secs(30),
         ));
 
-        // A chunked upload past the 64 KiB the reader sniffs before it
-        // answers, then held open. Blocking socket work stays off the
-        // runtime the server runs on.
+        // Past the 64 KiB the reader sniffs before it answers, then held open.
         let (upload, location) = task::spawn_blocking(move || {
             use std::io::{Read, Write};
             let rows = format!("street\n{}", "10 King Street\n".repeat(6000));
@@ -2688,6 +2673,11 @@ mod router_tests {
                 .find_map(|line| line.strip_prefix("location: "))
                 .expect("location")
                 .to_string();
+            // The response streams the results. A client that stops reading
+            // holds the stop until its timeout: small socket buffers fill on
+            // macOS and Windows.
+            let mut results = upload.try_clone().expect("results");
+            std::thread::spawn(move || std::io::copy(&mut results, &mut std::io::sink()));
             (upload, location)
         })
         .await

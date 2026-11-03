@@ -21,7 +21,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio_util::sync::CancellationToken;
 
 use axum::{
     body::{Body, Bytes},
@@ -37,6 +36,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, mpsc as channel, oneshot, watch},
     task,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
@@ -365,17 +365,14 @@ impl JobStore {
         }
     }
 
-    /// Cancel every running job. Each stops at its next window of rows and
-    /// records `cancelled`, keeping the rows it answered; one left `running`
-    /// on disk would only be failed by the next start, with no sign of how
-    /// far it got.
+    /// Each job records `cancelled` with its rows; one left `running` would
+    /// be failed by the next start, with no sign of how far it got.
     pub(crate) fn cancel_running(&self) {
         for job in self.running() {
             job.cancel.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Wait until no job is running.
     pub(crate) async fn stopped(&self) {
         for job in self.running() {
             let _ = job
@@ -988,8 +985,7 @@ fn read_layout(
 
 /// Pass the request body to the reader, a chunk at a time, refusing one that
 /// grows past `max_bytes` or stalls. Tells `uploaded` once it is all in.
-/// Stops when the server does: the reader then sees the upload end, and the
-/// job, already cancelled, records `cancelled`.
+/// Ends with the server, so a reader parked on a slow upload stops too.
 async fn forward_upload(
     body: Body,
     max_bytes: u64,
@@ -1233,8 +1229,7 @@ impl Run {
         let now = unix_now();
         {
             let mut status = self.job.status.lock().expect("job status");
-            // A cancelled job whose upload then ends early (the server is
-            // stopping and drops the connection) reads as a finished one.
+            // A cancelled job's upload, cut short, reads as complete.
             let ending = match ending {
                 Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
                 other => other,
