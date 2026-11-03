@@ -584,10 +584,11 @@
         "type": "string"
       },
       "PackInfo": {
-        "description": "What the Pack's manifest says, and which content it is.",
+        "description": "Which Pack is served, and how it was built.",
         "properties": {
           "built_at_unix": {
             "description": "When the Pack was built, in seconds since the Unix epoch.",
+            "example": 1793074078,
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -599,27 +600,12 @@
           },
           "id": {
             "description": "Identifies the Pack's content: equal ids, same Pack.",
-            "example": "9f2c4d1e7a3b5c60",
+            "example": "ebd8ae77aea58c01",
             "type": "string"
           },
-          "layer_counts": {
-            "additionalProperties": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "description": "Records per layer.",
-            "propertyNames": {
-              "type": "string"
-            },
-            "type": "object"
-          },
-          "record_count": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
           "schema_version": {
+            "description": "Version of the Pack file format.",
+            "example": 10,
             "format": "int32",
             "minimum": 0,
             "type": "integer"
@@ -629,9 +615,7 @@
           "id",
           "schema_version",
           "built_by",
-          "built_at_unix",
-          "record_count",
-          "layer_counts"
+          "built_at_unix"
         ],
         "type": "object"
       },
@@ -3156,7 +3140,7 @@
     },
     "/version": {
       "get": {
-        "description": "Returns the server's version and what identifies the Pack it serves: a\ncontent id, the schema version, who built it and when, and its record\ncounts. It names no path.",
+        "description": "Returns the server's version and what identifies the Pack it serves: a\ncontent id, the schema version, and which build made it and when. It\nnames no path.",
         "operationId": "version",
         "responses": {
           "200": {

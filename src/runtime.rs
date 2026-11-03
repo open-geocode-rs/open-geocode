@@ -1092,31 +1092,30 @@ mod router_tests {
     async fn version_names_the_build_and_the_pack() {
         let pack = temp_path("version");
         write_pack(&pack);
+        let reader = Reader::open(&pack).expect("pack");
+        let manifest = reader.manifest();
         let router = build_router(state_for(&pack, true), None, None);
 
         let reply = send(router.clone(), request("GET", "/version")).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.content_type(), "application/json");
-        let body = reply.json();
-        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
-            body["pack"]["schema_version"],
-            crate::pack::PACK_SCHEMA_VERSION
+            reply.json(),
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "pack": {
+                    "id": format!("{:016x}", reader.container().fingerprint()),
+                    "schema_version": manifest.schema_version,
+                    "built_by": manifest.crate_version,
+                    "built_at_unix": manifest.built_at_unix,
+                },
+            })
         );
-        assert_eq!(body["pack"]["built_by"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(body["pack"]["record_count"], 1);
-        assert_eq!(body["pack"]["layer_counts"]["address"], 1);
-        assert!(
-            body["pack"]["built_at_unix"]
-                .as_u64()
-                .expect("built_at_unix")
-                > 0
-        );
-        assert_eq!(body["pack"]["id"].as_str().expect("id").len(), 16);
-        assert!(
-            !String::from_utf8_lossy(&reply.body).contains("open-geocode-http"),
-            "no path in the body"
-        );
+        let body = String::from_utf8_lossy(&reply.body);
+        for path in [pack.as_path(), reader.path()] {
+            let path = path.to_string_lossy();
+            assert!(!body.contains(path.as_ref()), "{path} in {body}");
+        }
 
         assert_eq!(
             send(router, request("HEAD", "/version")).await.status,
