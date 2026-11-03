@@ -70,9 +70,33 @@ pub(crate) enum Body {
 }
 
 impl From<Record> for Body {
-    fn from(record: Record) -> Self {
+    fn from(mut record: Record) -> Self {
+        as_spilled(geometry_mut(&mut record));
         Self::Record(Box::new(record))
     }
+}
+
+fn geometry_mut(record: &mut Record) -> &mut Geometry {
+    match record {
+        Record::Address(record) => &mut record.geometry,
+        Record::Interpolation(record) => &mut record.geometry,
+        Record::Street(record) => &mut record.geometry,
+        Record::Postcode(record) => &mut record.geometry,
+        Record::Place(_, record) => &mut record.geometry,
+        Record::Poi(record) => &mut record.geometry,
+    }
+}
+
+/// Give `geometry` the value a spill reads back. Line vertices spill in 1e-7
+/// degree steps and read back by a division that the node store's conversion
+/// does not always match to the last bit, so a record a sorter kept in memory
+/// would otherwise differ from one it spilled: a street joined from it gets
+/// another representative point, and near a border another context.
+fn as_spilled(geometry: &mut Geometry) {
+    let mut bytes = Vec::new();
+    encode_geometry(&mut bytes, geometry);
+    *geometry = decode_geometry(&mut bytes.as_slice())
+        .expect("a geometry reads back as it was just written");
 }
 
 /// Addresses group by street within a grid cell this many degrees wide
@@ -700,7 +724,8 @@ pub(crate) struct PendingStreet {
 }
 
 impl PendingStreet {
-    pub(super) fn new(record: StreetRecord, seq: u64) -> Result<Self> {
+    pub(super) fn new(mut record: StreetRecord, seq: u64) -> Result<Self> {
+        as_spilled(&mut record.geometry);
         let mut order = Vec::new();
         put_order_text(
             &mut order,

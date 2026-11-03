@@ -27,14 +27,17 @@
 //! while the build's pool grants it, else from a scratch file.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     path::Path,
+    rc::Rc,
     sync::{Arc, OnceLock},
     time::Instant,
 };
 
 use crate::error::{Error, Result};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -131,10 +134,6 @@ pub struct Report {
     pub sample_bytes: u64,
     pub shards: usize,
     pub epochs: usize,
-    /// Training rows the model got wrong in the last epoch. Only the last
-    /// epoch decodes each row before learning it: the count is all the
-    /// decode is for, and it costs a pass of Viterbi per row.
-    pub last_epoch_errors: usize,
     /// Countries with their own transition table.
     pub countries: Vec<String>,
     /// Whether the Pack carries the trained weights; without them it parses
@@ -482,8 +481,6 @@ pub fn train(
             .map(|(shard, cache)| -> Result<_> {
                 let mut order = Random::new(SEED ^ ((epoch as u64) << 32 | shard as u64));
                 let mut model = Model::from_weights(mixed.clone());
-                let mut errors = 0;
-                let count = epoch + 1 == EPOCHS;
                 let at = Instant::now();
                 for (seen, index) in shuffled_order(cache.len(), &mut order)
                     .into_iter()
@@ -493,23 +490,14 @@ pub fn train(
                         scratch.check_cancelled()?;
                     }
                     cache.visit(index as usize, |row| {
-                        if count {
-                            errors += usize::from(model.is_wrong(&row.lattice, &row.gold));
-                        }
                         model.learn(&row.lattice, &row.gold);
                     })?;
                 }
-                Ok((
-                    model.averaged(),
-                    model.weights,
-                    errors,
-                    at.elapsed().as_secs_f64(),
-                ))
+                Ok((model.averaged(), model.weights, at.elapsed().as_secs_f64()))
             })
             .collect::<Result<Vec<_>>>()?;
         // Per-shard seconds, spread over the shards that ran side by side.
-        report.learn_seconds += results.iter().map(|result| result.3).sum::<f64>() / shards as f64;
-        report.last_epoch_errors = results.iter().map(|result| result.2).sum();
+        report.learn_seconds += results.iter().map(|result| result.2).sum::<f64>() / shards as f64;
         mixed = Weights::mean(results.iter().map(|result| &result.1));
         averages.push(Weights::mean(results.iter().map(|result| &result.0)));
     }
@@ -860,34 +848,39 @@ impl Model {
         }
     }
 
-    /// Whether the best labelling of a row, labelled `gold` by token, is
-    /// wrong under the current weights.
-    fn is_wrong(&self, lattice: &Lattice, gold: &[Label]) -> bool {
-        let predicted = decode::best(lattice, &self.weights, 1)
-            .into_iter()
-            .next()
-            .expect("a lattice with tokens has a path");
-        predicted.labels(lattice) != lattice.units.expand(gold)
-    }
-
     /// Learn from one row, labelled `gold` by token.
     fn learn(&mut self, lattice: &Lattice, gold: &[Label]) {
         // A token's label is the label of every unit of it.
         let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
-        for (index, value) in gradient.edge {
-            let delta = adagrad(&mut self.squares.edge[index], value);
-            self.weights.edge[index] += delta;
-            self.totals.edge[index] += delta * self.step;
-        }
-        for (country, values) in gradient.transitions {
-            for (index, value) in values.into_iter().enumerate() {
-                if f64::from(value).abs() < MIN_GRADIENT {
+        for (feature, (values, set)) in gradient.edge {
+            for (label, value) in values.into_iter().enumerate() {
+                if set & (1 << label) == 0 {
                     continue;
                 }
-                let delta = adagrad(&mut table(&mut self.squares, country)[index], value);
-                table(&mut self.weights, country)[index] += delta;
-                table(&mut self.totals, country)[index] += delta * self.step;
+                let index = feature * LABELS + label;
+                let delta = adagrad(&mut self.squares.edge[index], value);
+                self.weights.edge[index] += delta;
+                self.totals.edge[index] += delta * self.step;
+            }
+        }
+        for (country, values) in gradient.transitions {
+            let kept = |value: f32| f64::from(value).abs() >= MIN_GRADIENT;
+            // A country's tables are made by its first kept value, so a
+            // country with none must not make them.
+            if !values.iter().any(|value| kept(*value)) {
+                continue;
+            }
+            let squares = table(&mut self.squares, country);
+            let weights = table(&mut self.weights, country);
+            let totals = table(&mut self.totals, country);
+            for (index, value) in values.into_iter().enumerate() {
+                if !kept(value) {
+                    continue;
+                }
+                let delta = adagrad(&mut squares[index], value);
+                weights[index] += delta;
+                totals[index] += delta * self.step;
             }
         }
         self.step += 1.0;
@@ -941,23 +934,27 @@ fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
     }
 }
 
-/// The gradient of one row's log-likelihood: per edge weight index, and per
-/// transition table (`None` the global one) by previous and next state.
+/// The gradient of one row's log-likelihood: per feature, its value for each
+/// label and a bit for each label it has one for; and per transition table
+/// (`None` the global one) by previous and next state.
 #[derive(Debug, Default)]
 struct Gradient {
-    edge: HashMap<usize, f32>,
+    edge: FxHashMap<usize, ([f32; LABELS], u8)>,
     transitions: HashMap<Option<CountryCode>, Vec<f32>>,
 }
 
 impl Gradient {
     fn of(lattice: &Lattice, weights: &Weights, gold: &[Label]) -> Self {
         let countries = decode::countries(lattice);
+        let order = span_order(lattice);
+        let golds = gold_labels(lattice, gold);
         let readings = countries
             .iter()
             .map(|country| {
+                let edges = span_edges(lattice, weights, *country);
                 (
-                    Reading::new(lattice, weights, *country, None),
-                    Reading::new(lattice, weights, *country, Some(gold)),
+                    Reading::new(lattice, weights, *country, None, &order, edges.clone()),
+                    Reading::new(lattice, weights, *country, Some(&golds), &order, edges),
                 )
             })
             .collect::<Vec<_>>();
@@ -987,10 +984,50 @@ impl Gradient {
     }
 }
 
+/// The score of every span for every label, decoded as `country`. Both
+/// readings of a country share them.
+fn span_edges(
+    lattice: &Lattice,
+    weights: &Weights,
+    country: Option<CountryCode>,
+) -> Vec<[f64; LABELS]> {
+    lattice
+        .spans
+        .iter()
+        .map(|span| weights.edges(span, country).map(f64::from))
+        .collect()
+}
+
+/// The lattice's span indices by where the spans end, the order the forward
+/// pass visits them in.
+fn span_order(lattice: &Lattice) -> Vec<usize> {
+    let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| lattice.spans[*index].end);
+    order
+}
+
+/// Per span, the labels a gold labelling may give it, one bit per label: the
+/// label every unit of the span has in `gold`, or none when they differ.
+fn gold_labels(lattice: &Lattice, gold: &[Label]) -> Vec<u8> {
+    lattice
+        .spans
+        .iter()
+        .map(|span| {
+            let units = &gold[span.start..span.end];
+            match units.first() {
+                None => u8::MAX,
+                Some(first) if units.iter().all(|unit| unit == first) => 1 << *first as u8,
+                Some(_) => 0,
+            }
+        })
+        .collect()
+}
+
 /// Forward-backward over a lattice decoded as one country, over every
 /// labelling or only those that give each unit its gold label.
 struct Reading<'a> {
-    gold: Option<&'a [Label]>,
+    /// [`gold_labels`] of the lattice, when only gold labellings count.
+    golds: Option<&'a [u8]>,
     /// `edges[span][label]`.
     edges: Vec<[f64; LABELS]>,
     transitions: [[f64; STATES]; STATES],
@@ -1007,7 +1044,9 @@ impl<'a> Reading<'a> {
         lattice: &Lattice,
         weights: &Weights,
         country: Option<CountryCode>,
-        gold: Option<&'a [Label]>,
+        golds: Option<&'a [u8]>,
+        order: &[usize],
+        edges: Vec<[f64; LABELS]>,
     ) -> Self {
         let table = weights.transitions(country);
         let mut transitions = [[0.0; STATES]; STATES];
@@ -1016,30 +1055,25 @@ impl<'a> Reading<'a> {
                 *value = f64::from(table.get(previous, next));
             }
         }
-        let edges = lattice
-            .spans
-            .iter()
-            .map(|span| Label::ALL.map(|label| f64::from(weights.edge(span, label, country))))
-            .collect::<Vec<_>>();
-        let allowed = |span: &decode::Span, label: Label| {
-            gold.is_none_or(|gold| gold[span.start..span.end].iter().all(|gold| *gold == label))
-        };
         let len = lattice.len;
         let mut alpha = vec![[f64::NEG_INFINITY; STATES]; len + 1];
         alpha[0][START] = 0.0;
-        let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
-        order.sort_by_key(|index| lattice.spans[*index].end);
-        for &index in &order {
+        // Spans are visited by end, so `alpha[start]` is final by the first
+        // span that starts there, and every later one reads the same sum.
+        let mut sums = vec![[None; LABELS]; len + 1];
+        for &index in order {
             let span = &lattice.spans[index];
             for label in Label::ALL {
-                if !allowed(span, label) {
+                if !allowed(golds, index, label) {
                     continue;
                 }
                 let next = label as usize;
-                let incoming = log_sum(
-                    previous_states(span.start)
-                        .map(|previous| alpha[span.start][previous] + transitions[previous][next]),
-                );
+                let incoming =
+                    *sums[span.start][next].get_or_insert_with(|| {
+                        log_sum(previous_states(span.start).map(|previous| {
+                            alpha[span.start][previous] + transitions[previous][next]
+                        }))
+                    });
                 let value = incoming + edges[index][next];
                 alpha[span.end][next] = log_add(alpha[span.end][next], value);
             }
@@ -1051,7 +1085,7 @@ impl<'a> Reading<'a> {
         for &index in order.iter().rev() {
             let span = &lattice.spans[index];
             for label in Label::ALL {
-                if !allowed(span, label) {
+                if !allowed(golds, index, label) {
                     continue;
                 }
                 let next = label as usize;
@@ -1066,7 +1100,7 @@ impl<'a> Reading<'a> {
         }
         let log_z = log_sum((0..LABELS).map(|label| alpha[len][label] + beta[len][label]));
         Self {
-            gold,
+            golds,
             edges,
             transitions,
             alpha,
@@ -1089,11 +1123,11 @@ impl<'a> Reading<'a> {
         }
         let mut transitions = vec![0.0f64; STATES * STATES];
         for (index, span) in lattice.spans.iter().enumerate() {
+            let mut values = [0.0f32; LABELS];
+            let mut set = 0u8;
             for label in Label::ALL {
                 let next = label as usize;
-                if self.gold.is_some_and(|gold| {
-                    gold[span.start..span.end].iter().any(|gold| *gold != label)
-                }) {
+                if !allowed(self.golds, index, label) {
                     continue;
                 }
                 let onward = self.edges[index][next] + self.beta[span.end][next] - self.log_z;
@@ -1110,12 +1144,22 @@ impl<'a> Reading<'a> {
                 if value.abs() < MIN_GRADIENT {
                     continue;
                 }
-                for feature in span.features_in(country) {
-                    *gradient
-                        .edge
-                        .entry(feature as usize * LABELS + next)
-                        .or_default() += value as f32;
+                values[next] = value as f32;
+                set |= 1 << next;
+            }
+            if set == 0 {
+                continue;
+            }
+            // One entry per feature for all its labels: each label's sum
+            // still takes the spans in the same order.
+            for feature in span.features_in(country) {
+                let (sums, seen) = gradient.edge.entry(feature as usize).or_default();
+                for (label, value) in values.iter().enumerate() {
+                    if set & (1 << label) != 0 {
+                        sums[label] += value;
+                    }
                 }
+                *seen |= set;
             }
         }
         let len = lattice.len;
@@ -1139,6 +1183,12 @@ impl<'a> Reading<'a> {
     }
 }
 
+/// Whether a reading over `golds` (every labelling when `None`) may give span
+/// `index` the label `label`.
+fn allowed(golds: Option<&[u8]>, index: usize, label: Label) -> bool {
+    golds.is_none_or(|golds| golds[index] & (1 << label as u8) != 0)
+}
+
 /// The states a segment starting at `start` can follow.
 fn previous_states(start: usize) -> std::ops::Range<usize> {
     if start == 0 {
@@ -1150,10 +1200,15 @@ fn previous_states(start: usize) -> std::ops::Range<usize> {
 
 fn log_add(left: f64, right: f64) -> f64 {
     let high = left.max(right);
-    if high == f64::NEG_INFINITY {
+    // `abs` and not `min`: a NaN input must stay NaN, as it did.
+    let gap = -(left - right).abs();
+    // The higher term's exp is exactly 1. Below -37.5 the lower term is under
+    // half an ulp of it, so the sum is 1 and its ln 0: the same bits as the
+    // full formula without two exp and an ln. Most sums are like this.
+    if high == f64::NEG_INFINITY || gap < -37.5 {
         return high;
     }
-    high + ((left - high).exp() + (right - high).exp()).ln()
+    high + (1.0 + gap.exp()).ln()
 }
 
 fn log_sum(values: impl Iterator<Item = f64>) -> f64 {
@@ -1559,8 +1614,15 @@ const REGION_AND_GROUP_SHARE: f64 = 0.2;
 struct Renderer<'a> {
     pack: &'a Reader,
     tagger: &'a LatticeTagger,
-    /// Every name of each area record, its `name` first.
-    names: HashMap<RecordId, Vec<String>>,
+    /// Every name of each area record, its `name` first. Shared, not cloned,
+    /// to each of the many draws from the same few areas.
+    names: FxHashMap<RecordId, Rc<[String]>>,
+    /// The country code each country record's `name` reads as, looked up
+    /// once for the many rows drawn in one country.
+    country_codes: FxHashMap<RecordId, Option<CountryCode>>,
+    /// Whether each area name names a locality, by its words: rows draw the
+    /// same few area names over and over.
+    localities: RefCell<FxHashMap<String, bool>>,
     /// The words a unit is written with: the Pack's unit words, PO box
     /// words and level words.
     unit_words: [Vec<String>; 3],
@@ -1576,7 +1638,9 @@ impl<'a> Renderer<'a> {
         Self {
             pack,
             tagger,
-            names: HashMap::new(),
+            names: FxHashMap::default(),
+            country_codes: FxHashMap::default(),
+            localities: RefCell::default(),
             // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
@@ -1933,9 +1997,18 @@ impl<'a> Renderer<'a> {
     /// Whether the dictionaries know `name` as the place an address names:
     /// a locality name addresses state or a city is drawn as.
     fn names_a_locality(&self, name: Option<&Tokens>) -> bool {
-        name.and_then(|name| dictionary_key(&name.words.join(" ")))
+        let Some(name) = name else {
+            return false;
+        };
+        let name = name.words.join(" ");
+        if let Some(&known) = self.localities.borrow().get(&name) {
+            return known;
+        }
+        let known = dictionary_key(&name)
             .and_then(|key| self.tagger.dictionaries().get(Field::Locality, &key))
-            .is_some_and(|entry| entry.levels & level::LOCALITY != 0)
+            .is_some_and(|entry| entry.levels & level::LOCALITY != 0);
+        self.localities.borrow_mut().insert(name, known);
+        known
     }
 
     /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
@@ -2148,11 +2221,7 @@ impl<'a> Renderer<'a> {
             });
         }
         let countries = self.names(tuple.country_record_id())?;
-        let country_code = countries
-            .first()
-            .and_then(|name| search_key(name))
-            .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
-            .and_then(|entry| entry.country);
+        let country_code = self.country_code(tuple.country_record_id(), &countries);
         let country = pick_name(&countries, random).map(str::to_string);
         Ok(Areas {
             locality,
@@ -2181,6 +2250,27 @@ impl<'a> Renderer<'a> {
         }
         let group = groups[random.below(groups.len() as u64) as usize];
         self.admin_name(Some(RecordId::from(group)), Field::Region, random)
+    }
+
+    /// The country code the `name` of country record `id` reads as, its
+    /// names being `names`.
+    fn country_code(&mut self, id: Option<RecordId>, names: &[String]) -> Option<CountryCode> {
+        let read = || {
+            names
+                .first()
+                .and_then(|name| search_key(name))
+                .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
+                .and_then(|entry| entry.country)
+        };
+        let Some(id) = id else {
+            return read();
+        };
+        if let Some(&code) = self.country_codes.get(&id) {
+            return code;
+        }
+        let code = read();
+        self.country_codes.insert(id, code);
+        code
     }
 
     /// One name of an area, as [`pick_name`] picks it.
@@ -2217,15 +2307,15 @@ impl<'a> Renderer<'a> {
     }
 
     /// Every name of an area, its `name` first.
-    fn names(&mut self, id: Option<RecordId>) -> Result<Vec<String>> {
+    fn names(&mut self, id: Option<RecordId>) -> Result<Rc<[String]>> {
         let Some(id) = id else {
-            return Ok(Vec::new());
+            return Ok(Rc::default());
         };
         if let Some(names) = self.names.get(&id) {
-            return Ok(names.clone());
+            return Ok(Rc::clone(names));
         }
-        let names = self.pack.records().names(id)?;
-        self.names.insert(id, names.clone());
+        let names = Rc::<[String]>::from(self.pack.records().names(id)?);
+        self.names.insert(id, Rc::clone(&names));
         Ok(names)
     }
 }
@@ -2716,7 +2806,9 @@ mod tests {
         let paths = decode::decode(&lattice, &weights, None, LABELS * LABELS, None);
         assert_eq!(paths.len(), LABELS * LABELS);
         let brute = log_sum(paths.iter().map(|path| f64::from(path.score)));
-        let reading = Reading::new(&lattice, &weights, None, None);
+        let edges = span_edges(&lattice, &weights, None);
+        let order = span_order(&lattice);
+        let reading = Reading::new(&lattice, &weights, None, None, &order, edges);
         assert!(
             (reading.log_z - brute).abs() < 1e-3,
             "{} {brute}",
@@ -2727,8 +2819,10 @@ mod tests {
         let mut gradient = Gradient::default();
         reading.add_expectations(&lattice, None, 1.0, &mut gradient);
         let bias = super::super::features::by_name("bias:bias") as usize;
+        let (values, set) = gradient.edge[&bias];
         let total = (0..LABELS)
-            .filter_map(|label| gradient.edge.get(&(bias * LABELS + label)))
+            .filter(|label| set & (1 << label) != 0)
+            .map(|label| values[label])
             .sum::<f32>();
         assert!((total - 2.0).abs() < 1e-3, "{total}");
     }

@@ -374,6 +374,20 @@ impl Weights {
             .sum()
     }
 
+    /// The score of `span` for every label, decoded as `country`: each
+    /// label's sum in the order [`Weights::edge`] adds it, from one walk of
+    /// the span's features, whose weights lie side by side.
+    pub(super) fn edges(&self, span: &Span, country: Option<CountryCode>) -> [f32; LABELS] {
+        let mut sums = [0.0; LABELS];
+        for feature in span.features_in(country) {
+            let row = &self.edge[feature as usize * LABELS..][..LABELS];
+            for (sum, weight) in sums.iter_mut().zip(row) {
+                *sum += weight;
+            }
+        }
+        sums
+    }
+
     /// The weights a Pack carries, `None` when it carries none.
     pub fn from_container(container: &Container) -> Result<Option<Self>> {
         if !container.sections().contains_key(WEIGHTS_SECTION) {

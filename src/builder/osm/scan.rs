@@ -29,10 +29,30 @@ use super::{
     emitted::Emitted,
     interpolation::has_interpolation_tag,
     place::{emit_place_node, has_place_tag},
-    poi::{PoiCandidate, emit_poi, is_poi, poi_tags},
+    poi::{POI_KEYS, PoiCandidate, emit_poi, is_poi, poi_tags},
     spill::{WayFeature, WayKind},
     street::{has_highway_tag, missing_street_name_issue, street_name, street_tags},
 };
+
+/// Whether an element tagged with `keys` may be anything the scan keeps or
+/// reports: a place, an address, a street, an area, or a POI, which needs a
+/// name and a POI key. It reads the keys alone, before any tag is copied,
+/// and is looser than the classifiers it guards: an element it stops is one
+/// they would drop, and most tagged elements (buildings, trees, unnamed
+/// paths) are.
+pub(crate) fn may_matter<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
+    let (mut named, mut category) = (false, false);
+    for key in keys {
+        match key {
+            "place" | "highway" | "boundary" => return true,
+            "name" => named = true,
+            key if key.starts_with("addr:") => return true,
+            key if POI_KEYS.contains(&key) => category = true,
+            _ => {}
+        }
+    }
+    named && category
+}
 
 /// Classification of one PBF block.
 #[derive(Debug, Default)]
@@ -52,28 +72,35 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
             Element::DenseNode(node) => {
                 output.has_nodes = true;
                 output.emitted.report.scanned.dense_nodes += 1;
-                scan_node(
-                    &mut output,
-                    node.id(),
-                    node.lat(),
-                    node.lon(),
-                    &collect_clean_tags(node.tags()),
-                );
+                if may_matter(node.tags().map(|(key, _)| key)) {
+                    scan_node(
+                        &mut output,
+                        node.id(),
+                        node.lat(),
+                        node.lon(),
+                        &collect_clean_tags(node.tags()),
+                    );
+                }
             }
             Element::Node(node) => {
                 output.has_nodes = true;
                 output.emitted.report.scanned.nodes += 1;
-                scan_node(
-                    &mut output,
-                    node.id(),
-                    node.lat(),
-                    node.lon(),
-                    &collect_clean_tags(node.tags()),
-                );
+                if may_matter(node.tags().map(|(key, _)| key)) {
+                    scan_node(
+                        &mut output,
+                        node.id(),
+                        node.lat(),
+                        node.lon(),
+                        &collect_clean_tags(node.tags()),
+                    );
+                }
             }
             Element::Way(way) => {
                 output.has_ways = true;
                 output.emitted.report.scanned.ways += 1;
+                if !may_matter(way.tags().map(|(key, _)| key)) {
+                    continue;
+                }
                 let tags = collect_clean_tags(way.tags());
                 if !tags.is_empty() {
                     let refs = OnceCell::new();
@@ -91,6 +118,9 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
             }
             Element::Relation(relation) => {
                 output.emitted.report.scanned.relations += 1;
+                if !may_matter(relation.tags().map(|(key, _)| key)) {
+                    continue;
+                }
                 let members = relation
                     .members()
                     .filter_map(|member| {

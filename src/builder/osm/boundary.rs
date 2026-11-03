@@ -1110,11 +1110,8 @@ const PLACE_TAG_AGREEMENT: f64 = 0.8;
 /// locality layer that address queries match on; a German extract fills 8, 9
 /// and 10, so 8 keeps locality and 9 settles below it.
 ///
-/// Nominatim arrives at the same behaviour from the other side, with a default
-/// number-to-rank table plus a per-country override list, and a rank that
-/// shifts when a boundary of the same rank already contains it. Filling gaps
-/// and reading tags needs no table to maintain, so a country nobody has
-/// written an override for still gets a locality layer.
+/// Filling gaps and reading tags needs no per-country table to maintain, so
+/// a country nobody has looked at still gets a locality layer.
 ///
 /// Gaps are counted **per country**, because a level means different things on
 /// either side of a border, and per country rather than per individual chain so

@@ -146,6 +146,11 @@ impl Budget {
         {
             return false;
         }
+        // Nothing to add: only whether the pool is within its limit, as the
+        // loop would answer, without writing to the pool's cache line.
+        if bytes == 0 {
+            return self.used() <= self.limit;
+        }
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.limit) else {
@@ -156,8 +161,8 @@ impl Budget {
                 .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
             {
                 Ok(_) => {
-                    self.peak.fetch_max(next, Ordering::Relaxed);
-                    self.stage_peak.fetch_max(next, Ordering::Relaxed);
+                    raise(&self.peak, next);
+                    raise(&self.stage_peak, next);
                     if spillable {
                         self.spillable_used.fetch_add(bytes, Ordering::Relaxed);
                     }
@@ -175,8 +180,8 @@ impl Budget {
             .used
             .fetch_add(bytes, Ordering::Relaxed)
             .saturating_add(bytes);
-        self.peak.fetch_max(next, Ordering::Relaxed);
-        self.stage_peak.fetch_max(next, Ordering::Relaxed);
+        raise(&self.peak, next);
+        raise(&self.stage_peak, next);
         if spillable {
             self.spillable_used.fetch_add(bytes, Ordering::Relaxed);
         }
@@ -191,6 +196,15 @@ impl Budget {
 }
 
 /// Bytes held from a budget, returned when dropped.
+/// Raise `peak` to `value`. Reading first leaves the cache line shared while
+/// the peak stands, as it does on nearly every call: `fetch_max` takes it
+/// exclusive even when it changes nothing.
+fn raise(peak: &AtomicUsize, value: usize) {
+    if peak.load(Ordering::Relaxed) < value {
+        peak.fetch_max(value, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 pub struct Reservation {
     budget: Arc<Budget>,

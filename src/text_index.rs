@@ -99,8 +99,10 @@ pub struct Writer {
     /// Documents a checkpoint committed: a checkpoint commits again only
     /// once there are more, so the directory it synced stays as it was.
     committed: u64,
-    /// The address group the next address may join.
-    group: Option<Document>,
+    /// The address group the next address may join, and its numbers.
+    group: Option<(Document, Numbers)>,
+    /// Whether [`Self::merge`] ran: the index takes no more documents.
+    merged: bool,
 }
 
 /// What a record adds to the text index: a document of its own, or, for an
@@ -108,7 +110,53 @@ pub struct Writer {
 #[derive(Debug)]
 pub enum Prepared {
     Document(TantivyDocument),
-    Address(Box<Document>),
+    Address(Box<Document>, Numbers),
+}
+
+/// What a document's house numbers and units are indexed as. An address's
+/// are worked out as it is prepared, in parallel, and a group's are its
+/// addresses' joined in order, so the writer, which takes records one at a
+/// time, only joins them.
+#[derive(Debug, Default)]
+pub struct Numbers {
+    /// The units' search texts, in order.
+    units: Vec<String>,
+    /// Every term of every house number, then the flat numbers.
+    terms: Vec<String>,
+    /// The lowest base house number.
+    lowest: Option<u32>,
+}
+
+impl Numbers {
+    fn of(projected: &Document) -> Self {
+        let mut terms = Vec::new();
+        let mut lowest: Option<u32> = None;
+        for number in &projected.address_numbers {
+            terms.extend(address_number_terms(number));
+            if let Some(base) = base_house_number(number) {
+                lowest = Some(lowest.map_or(base, |lowest| lowest.min(base)));
+            }
+        }
+        terms.extend(projected.flat_numbers.iter().cloned());
+        Self {
+            units: projected
+                .units
+                .iter()
+                .filter_map(|unit| search_text(unit))
+                .collect(),
+            terms,
+            lowest,
+        }
+    }
+
+    fn join(&mut self, other: Self) {
+        self.units.extend(other.units);
+        self.terms.extend(other.terms);
+        self.lowest = match (self.lowest, other.lowest) {
+            (Some(lowest), Some(other)) => Some(lowest.min(other)),
+            (lowest, other) => lowest.or(other),
+        };
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -297,6 +345,7 @@ impl Writer {
             document_count: 0,
             committed: 0,
             group: None,
+            merged: false,
         })
     }
 
@@ -347,6 +396,7 @@ impl Writer {
             document_count: state.document_count,
             committed: state.document_count,
             group: None,
+            merged: false,
         })
     }
 
@@ -394,8 +444,8 @@ impl Writer {
     /// Index the address `document` projects: into the group of the address
     /// before it when it is the next record and states the same, else into a
     /// group of its own.
-    pub fn add_address(&mut self, document: Box<Document>) -> Result<()> {
-        if let Some(group) = &mut self.group
+    pub fn add_address(&mut self, document: Box<Document>, numbers: Numbers) -> Result<()> {
+        if let Some((group, group_numbers)) = &mut self.group
             && group.record_id + group.record_count == document.record_id
             && group.record_count < MAX_GROUP_RECORDS
             && group.same_group(&document)
@@ -405,19 +455,17 @@ impl Writer {
                 (Some(group), Some(address)) => Some(group.union(address)),
                 (group, address) => group.or(address),
             };
-            group.address_numbers.extend(document.address_numbers);
-            group.flat_numbers.extend(document.flat_numbers);
-            group.units.extend(document.units);
+            group_numbers.join(numbers);
             return Ok(());
         }
         self.close_group()?;
-        self.group = Some(*document);
+        self.group = Some((*document, numbers));
         Ok(())
     }
 
     fn close_group(&mut self) -> Result<()> {
-        if let Some(group) = self.group.take() {
-            let document = self.fields.to_tantivy_document(&group);
+        if let Some((group, numbers)) = self.group.take() {
+            let document = self.fields.to_tantivy_document(&group, numbers);
             self.add_document(document)?;
         }
         Ok(())
@@ -425,34 +473,9 @@ impl Writer {
 
     /// Commit, merge to a single segment and copy the index into the Pack.
     pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
-        self.close_group()?;
-        self.writer()?;
-        let (mut writer, memory) = self.writer.take().expect("writer created");
-        writer.commit()?;
-        // Join the segments the indexing threads wrote into a few, merged side
-        // by side: one merge of every segment runs on one thread, and search
-        // reads a few segments as well as one.
-        let segment_ids = self.index.searchable_segment_ids()?;
-        let groups = segment_ids.len().min(MERGED_SEGMENTS);
-        if segment_ids.len() > groups {
-            let mut merges = vec![Vec::new(); groups];
-            for (index, segment) in segment_ids.into_iter().enumerate() {
-                merges[index % groups].push(segment);
-            }
-            let pending = merges
-                .iter()
-                .filter(|segments| segments.len() > 1)
-                .map(|segments| writer.merge(segments))
-                .collect::<Vec<_>>();
-            for merge in pending {
-                merge.wait()?;
-            }
-            writer.commit()?;
+        if !self.merged {
+            self.merge()?;
         }
-        writer.garbage_collect_files().wait()?;
-        writer.wait_merging_threads()?;
-        drop(memory);
-
         let mut files = fs::read_dir(&self.path)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<io::Result<Vec<_>>>()?;
@@ -489,6 +512,41 @@ impl Writer {
             document_count,
             bytes,
         })
+    }
+
+    /// Commit, and merge the segments into the few [`Self::finish`] copies
+    /// into the Pack. Apart from it, so the merge can run while the part
+    /// sealed before it is copied in.
+    pub fn merge(&mut self) -> Result<()> {
+        self.close_group()?;
+        self.writer()?;
+        let (mut writer, memory) = self.writer.take().expect("writer created");
+        writer.commit()?;
+        // Join the segments the indexing threads wrote into a few, merged side
+        // by side: one merge of every segment runs on one thread, and search
+        // reads a few segments as well as one.
+        let segment_ids = self.index.searchable_segment_ids()?;
+        let groups = segment_ids.len().min(MERGED_SEGMENTS);
+        if segment_ids.len() > groups {
+            let mut merges = vec![Vec::new(); groups];
+            for (index, segment) in segment_ids.into_iter().enumerate() {
+                merges[index % groups].push(segment);
+            }
+            let pending = merges
+                .iter()
+                .filter(|segments| segments.len() > 1)
+                .map(|segments| writer.merge(segments))
+                .collect::<Vec<_>>();
+            for merge in pending {
+                merge.wait()?;
+            }
+            writer.commit()?;
+        }
+        writer.garbage_collect_files().wait()?;
+        writer.wait_merging_threads()?;
+        drop(memory);
+        self.merged = true;
+        Ok(())
     }
 }
 
@@ -538,26 +596,23 @@ impl Fields {
             postcode_areas,
             country_code,
         );
+        let numbers = Numbers::of(&document);
         match record {
-            Record::Address(_) => Prepared::Address(Box::new(document)),
-            _ => Prepared::Document(self.to_tantivy_document(&document)),
+            Record::Address(_) => Prepared::Address(Box::new(document), numbers),
+            _ => Prepared::Document(self.to_tantivy_document(&document, numbers)),
         }
     }
 
-    fn to_tantivy_document(self, projected: &Document) -> TantivyDocument {
+    /// The document of `projected`, whose numbers and units index as
+    /// `numbers`.
+    fn to_tantivy_document(self, projected: &Document, numbers: Numbers) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
         document.add_u64(self.record_count, projected.record_count);
         for layer in &projected.layers {
             document.add_text(self.layer, layer);
         }
-        let units = unique_parts(
-            projected
-                .units
-                .iter()
-                .filter_map(|unit| search_text(unit))
-                .collect(),
-        );
+        let units = unique_parts(numbers.units);
         let content_text = std::iter::once(projected.content_text.as_str())
             .chain(units.iter().map(String::as_str))
             .filter(|part| !part.is_empty())
@@ -578,19 +633,11 @@ impl Fields {
             self.street_text,
             unique_words(&projected.streets.join(" ")).as_deref(),
         );
-        let mut terms = BTreeSet::new();
-        let mut lowest: Option<u32> = None;
-        for number in &projected.address_numbers {
-            terms.extend(address_number_terms(number));
-            if let Some(base) = base_house_number(number) {
-                lowest = Some(lowest.map_or(base, |lowest| lowest.min(base)));
-            }
-        }
-        terms.extend(projected.flat_numbers.iter().cloned());
+        let terms = numbers.terms.into_iter().collect::<BTreeSet<_>>();
         for term in &terms {
             document.add_text(self.address_number, term);
         }
-        if let Some(base) = lowest {
+        if let Some(base) = numbers.lowest {
             document.add_u64(self.house_number, base.into());
         }
         add_normalized_text_if_present(
@@ -1140,15 +1187,14 @@ impl ProjectionBuilder {
         self.projected.name = (!name_parts.is_empty()).then(|| name_parts.join(" "));
         let content_parts = unique_parts(self.content_parts);
         self.projected.content_text = content_parts.join(" ");
-        let context = self
-            .context_parts
-            .iter()
-            .map(String::as_str)
-            .chain(context_names.iter().copied())
-            .filter_map(search_text)
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.projected.context_text = unique_words(&context).unwrap_or_default();
+        self.projected.context_text = context_text(
+            &self
+                .context_parts
+                .iter()
+                .map(String::as_str)
+                .chain(context_names.iter().copied())
+                .collect::<Vec<_>>(),
+        );
         let autocomplete_subject_parts = unique_parts(self.autocomplete_subject_parts);
         self.projected.autocomplete_subject_text = autocomplete_subject_parts.join(" ");
         self.projected
@@ -1216,26 +1262,32 @@ pub(crate) const STREET_TYPE_ABBREVIATIONS: &[(&str, &str)] = &[
 /// finds the other. An initial or post-number "st" is left alone: there it is
 /// usually "Saint" ("St Clair Avenue", "12 St George Street").
 pub(crate) fn expand_address_abbreviations(value: &str) -> String {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
-    let mut expanded: Vec<&str> = Vec::with_capacity(tokens.len());
-    for (index, token) in tokens.iter().enumerate() {
-        let replacement = match *token {
-            "st" if index == 0 || is_numeric_token(tokens[index - 1]) => None,
+    let mut expanded = String::with_capacity(value.len() + 8);
+    let mut previous: Option<&str> = None;
+    let mut last_word: Option<&str> = None;
+    for token in value.split_whitespace() {
+        let replacement = match token {
+            "st" if previous.is_none_or(is_numeric_token) => None,
             _ => STREET_TYPE_ABBREVIATIONS
                 .iter()
-                .find(|(abbreviation, _)| abbreviation == token)
+                .find(|(abbreviation, _)| *abbreviation == token)
                 .map(|(_, word)| *word)
                 .or_else(|| {
-                    expanded
-                        .last()
-                        .is_some_and(|word| is_street_type(word))
+                    last_word
+                        .is_some_and(is_street_type)
                         .then(|| direction_word(token))
                         .flatten()
                 }),
         };
-        expanded.push(replacement.unwrap_or(*token));
+        let word = replacement.unwrap_or(token);
+        if previous.is_some() {
+            expanded.push(' ');
+        }
+        expanded.push_str(word);
+        previous = Some(token);
+        last_word = Some(word);
     }
-    expanded.join(" ")
+    expanded
 }
 
 /// A street name as the street field indexes it: like [`search_text`], and a
@@ -1243,12 +1295,17 @@ pub(crate) fn expand_address_abbreviations(value: &str) -> String {
 /// ("The Donway E" is "the donway east"). A query's street is expanded alike
 /// (see [`expand_final_direction`]).
 pub(crate) fn street_search_text(value: &str) -> Option<String> {
-    let mut words = search_text(value)?
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    expand_final_direction(&mut words);
-    Some(words.join(" "))
+    let text = search_text(value)?;
+    let mut street = String::with_capacity(text.len() + 4);
+    let mut words = text.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if !street.is_empty() {
+            street.push(' ');
+        }
+        let last = words.peek().is_none();
+        street.push_str(last.then(|| direction_word(word)).flatten().unwrap_or(word));
+    }
+    Some(street)
 }
 
 /// Expand a direction abbreviation that is the last of a street's words.
@@ -1414,13 +1471,63 @@ fn search_text(value: &str) -> Option<String> {
 fn unique_words(value: &str) -> Option<String> {
     let normalized = search_key(value)?;
     let mut seen = BTreeSet::new();
-    Some(
-        normalized
-            .split_whitespace()
-            .filter(|word| seen.insert(*word))
+    let mut words = String::with_capacity(normalized.len());
+    for word in normalized.split_whitespace() {
+        if seen.insert(word) {
+            if !words.is_empty() {
+                words.push(' ');
+            }
+            words.push_str(word);
+        }
+    }
+    Some(words)
+}
+
+/// Words of the area and context names, each name expanded on its own, each
+/// word once.
+///
+/// Records come in Hilbert order, so a thread's next record mostly repeats
+/// the names of its last. Normalizing them was most of a record's indexing
+/// time. The text depends on the names alone, so each thread keeps recent
+/// ones.
+fn context_text(names: &[&str]) -> String {
+    const SLOTS: usize = 1 << 10;
+    type Slot = Option<(Vec<String>, String)>;
+    thread_local! {
+        static RECENT: std::cell::RefCell<Vec<Slot>> =
+            std::cell::RefCell::new(vec![None; SLOTS]);
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for name in names {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+    }
+    let slot = hasher.digest() as usize % SLOTS;
+    let made = RECENT.with(|recent| {
+        recent.borrow()[slot]
+            .as_ref()
+            .filter(|(key, _)| key.iter().map(String::as_str).eq(names.iter().copied()))
+            .map(|(_, text)| text.clone())
+    });
+    if let Some(text) = made {
+        return text;
+    }
+    let text = unique_words(
+        &names
+            .iter()
+            .copied()
+            .filter_map(search_text)
             .collect::<Vec<_>>()
             .join(" "),
     )
+    .unwrap_or_default();
+    RECENT.with(|recent| {
+        recent.borrow_mut()[slot] = Some((
+            names.iter().map(|name| (*name).to_string()).collect(),
+            text.clone(),
+        ));
+    });
+    text
 }
 
 fn unique_parts(parts: Vec<String>) -> Vec<String> {

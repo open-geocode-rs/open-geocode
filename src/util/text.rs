@@ -1,7 +1,15 @@
 /// Collapse runs of whitespace to single spaces and trim; `None` if the value
 /// is empty once normalized.
 pub(crate) fn collapse_whitespace(value: &str) -> Option<String> {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Built in place: every tag of every OSM object goes through here, and
+    // collecting the words first allocated a Vec per value.
+    let mut cleaned = String::with_capacity(value.len());
+    for word in value.split_whitespace() {
+        if !cleaned.is_empty() {
+            cleaned.push(' ');
+        }
+        cleaned.push_str(word);
+    }
     (!cleaned.is_empty()).then_some(cleaned)
 }
 

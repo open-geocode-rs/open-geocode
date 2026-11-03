@@ -452,7 +452,9 @@ impl Writer {
             self.records.write(&record, context)?;
             match document {
                 text_index::Prepared::Document(document) => self.text.add(document)?,
-                text_index::Prepared::Address(document) => self.text.add_address(document)?,
+                text_index::Prepared::Address(document, numbers) => {
+                    self.text.add_address(document, numbers)?
+                }
             }
             self.spatial.add(record_id, &record)?;
             if let Record::Postcode(postcode) = &record {
@@ -501,8 +503,9 @@ impl Writer {
             text: None,
             spatial: None,
         };
-        contexts.finish(&mut pack)?;
-        dictionaries.finish(&mut pack, &context_names)?;
+        let tuples = contexts.finish(&mut pack)?;
+        dictionaries.finish(&mut pack, &context_names, &tuples)?;
+        drop(tuples);
         drop(context_names);
         pack.add(
             POSTCODE_ADDRESSES_SECTION,
@@ -569,7 +572,24 @@ impl Sealing {
     pub fn seal_part(&mut self) -> Result<Option<&'static str>> {
         self.scratch.check_cancelled()?;
         if let Some(records) = self.records.take() {
-            records.finish(&mut self.pack)?;
+            // The text index is sealed next, and merging its segments is most
+            // of that: it merges on threads of its own while the records are
+            // copied in.
+            let (copied, merged) = std::thread::scope(|scope| {
+                let merging = self
+                    .text
+                    .as_mut()
+                    .map(|text| scope.spawn(move || text.merge()));
+                let copied = records.finish(&mut self.pack);
+                let merged = merging.map(|merging| {
+                    merging
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                });
+                (copied, merged)
+            });
+            copied?;
+            merged.transpose()?;
             return Ok(Some("records"));
         }
         if let Some(text) = self.text.take() {
