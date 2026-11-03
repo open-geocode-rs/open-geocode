@@ -70,9 +70,33 @@ pub(crate) enum Body {
 }
 
 impl From<Record> for Body {
-    fn from(record: Record) -> Self {
+    fn from(mut record: Record) -> Self {
+        as_spilled(geometry_mut(&mut record));
         Self::Record(Box::new(record))
     }
+}
+
+fn geometry_mut(record: &mut Record) -> &mut Geometry {
+    match record {
+        Record::Address(record) => &mut record.geometry,
+        Record::Interpolation(record) => &mut record.geometry,
+        Record::Street(record) => &mut record.geometry,
+        Record::Postcode(record) => &mut record.geometry,
+        Record::Place(_, record) => &mut record.geometry,
+        Record::Poi(record) => &mut record.geometry,
+    }
+}
+
+/// Give `geometry` the value a spill reads back. Line vertices spill in 1e-7
+/// degree steps and read back by a division that the node store's conversion
+/// does not always match to the last bit, so a record a sorter kept in memory
+/// would otherwise differ from one it spilled: a street joined from it gets
+/// another representative point, and near a border another context.
+fn as_spilled(geometry: &mut Geometry) {
+    let mut bytes = Vec::new();
+    encode_geometry(&mut bytes, geometry);
+    *geometry = decode_geometry(&mut bytes.as_slice())
+        .expect("a geometry reads back as it was just written");
 }
 
 /// Addresses group by street within a grid cell this many degrees wide
@@ -188,7 +212,9 @@ pub(crate) struct Fields<'a> {
 impl<'a> Fields<'a> {
     /// What the house number is on, as [`AddressComponents::subject`].
     pub(crate) fn subject(&self) -> Option<&'a str> {
-        self.street.or(self.place).or(self.areas.last().copied())
+        self.street
+            .or(self.place)
+            .or_else(|| self.areas.last().copied())
     }
 
     fn parse(order: &'a [u8]) -> Result<Self> {
@@ -248,7 +274,7 @@ impl<'a> Fields<'a> {
 }
 
 impl PendingAddress {
-    pub(super) fn new(record: AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
+    pub(super) fn new(record: &AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
         let point = crate::util::geo::point_lon_lat(&record.geometry)
             .ok_or_else(|| Error::BadGeometry(format!("address {} has no point", record.id())))?;
         debug_assert!(!record.disputed && record.street_postcodes.is_empty());
@@ -698,7 +724,8 @@ pub(crate) struct PendingStreet {
 }
 
 impl PendingStreet {
-    pub(super) fn new(record: StreetRecord, seq: u64) -> Result<Self> {
+    pub(super) fn new(mut record: StreetRecord, seq: u64) -> Result<Self> {
+        as_spilled(&mut record.geometry);
         let mut order = Vec::new();
         put_order_text(
             &mut order,
@@ -1763,7 +1790,7 @@ mod tests {
                 ObjectType::Row => datasets.id(&record.source.dataset),
                 _ => 0,
             };
-            let pending = PendingAddress::new(record.clone(), seq as u64, dataset).expect("new");
+            let pending = PendingAddress::new(&record.clone(), seq as u64, dataset).expect("new");
             assert_eq!(pending.record(&datasets).expect("record"), record);
             round_trip(&pending);
             let mut out = Vec::new();
@@ -1860,7 +1887,7 @@ mod tests {
         let pending = records
             .iter()
             .enumerate()
-            .map(|(seq, record)| PendingAddress::new(record.clone(), seq as u64, 0).expect("new"))
+            .map(|(seq, record)| PendingAddress::new(&record.clone(), seq as u64, 0).expect("new"))
             .collect::<Vec<_>>();
         let mut compact = (0..pending.len()).collect::<Vec<_>>();
         compact.sort_by(|left, right| pending[*left].cmp(&pending[*right]));
@@ -1903,7 +1930,7 @@ mod tests {
         let mut pending = rows
             .into_iter()
             .enumerate()
-            .map(|(seq, row)| PendingAddress::new(row, seq as u64, 0).expect("pending"))
+            .map(|(seq, row)| PendingAddress::new(&row, seq as u64, 0).expect("pending"))
             .collect::<Vec<_>>();
         let street = pending.iter().map(run_bytes).sum::<usize>();
         let resident = pending.iter().map(Spill::resident_bytes).sum::<usize>();

@@ -67,12 +67,18 @@ fn assert_example(name: &str, body: &Value) {
 /// server actually hands out at `/openapi.json`.
 #[tokio::test]
 async fn committed_openapi_is_the_served_contract() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert_committed("openapi.json", &document);
 
     let pack = contract_pack();
     let router = build_router(
-        AppState::open(&pack, &pack.with_extension("batches")).expect("open pack"),
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -110,7 +116,8 @@ async fn committed_openapi_is_the_served_contract() {
 /// serialization, and this notices if one ever does.
 #[test]
 fn the_contract_survives_a_release_version_bump() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     let value: Value = serde_json::from_str(&document).expect("spec is JSON");
     let mut restringified = serde_json::to_string_pretty(&value).expect("re-serializes");
     restringified.push('\n');
@@ -128,7 +135,8 @@ fn the_contract_survives_a_release_version_bump() {
 /// would still parse, and would still be wrong.
 #[test]
 fn every_schema_reference_resolves() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     let spec: Value = serde_json::from_str(&document).expect("spec is JSON");
     let defined: std::collections::BTreeSet<String> = spec["components"]["schemas"]
         .as_object()
@@ -150,7 +158,8 @@ fn every_schema_reference_resolves() {
 /// absent value is an absent key.
 #[test]
 fn the_contract_admits_no_nulls() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert!(
         !document.contains("\"null\""),
         "the contract still allows a null somewhere"
@@ -224,7 +233,12 @@ async fn responses_match_the_committed_examples() {
     ));
     let ids = write_pack(&pack);
     let router = build_router(
-        AppState::open(&pack, &pack.with_extension("batches")).expect("open pack"),
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -454,7 +468,12 @@ struct RawBatch {
 async fn batch_results_are_their_get_answers() {
     let pack = contract_pack();
     let router = build_router(
-        AppState::open(&pack, &pack.with_extension("batches")).expect("open pack"),
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -544,7 +563,8 @@ async fn batch_results_are_their_get_answers() {
 /// holds them to a body the server rendered: every member it sends is one
 /// the contract describes.
 fn batch_schemas_match_the_rendered_body(batch: &Value) {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     let spec: Value = serde_json::from_str(&document).expect("spec is JSON");
     let documented = |schema: &str| -> std::collections::BTreeSet<String> {
         spec["components"]["schemas"][schema]["properties"]
@@ -798,7 +818,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 source: SourceProvenance::osm(ObjectType::Way, 13),
             }
             .into(),
-            context.clone(),
+            context,
         )
         .expect("interpolation");
     writer.finish().expect("finish");

@@ -14,7 +14,7 @@ use crate::{
 pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 22;
 
 /// One extract a build read.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReportInput {
     pub path: String,
     /// What the input is, as the caller named it: a region id for a Pack
@@ -254,7 +254,7 @@ fn merge_samples<T>(
 }
 
 /// What the machine gave the build.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ResourceReport {
     /// The probe, the sizes chosen from it and the pre-flight check.
     pub plan: BuildPlan,
@@ -776,6 +776,9 @@ pub struct PhaseTimings {
     pub pack_seal_ms: u128,
     /// Train the address parser and add its weights to the Pack file.
     pub parser_training_ms: u128,
+    /// Key the Pack's streets and places and add the structured index to it.
+    #[serde(default)]
+    pub structured_index_ms: u128,
     pub total_ms: u128,
 }
 

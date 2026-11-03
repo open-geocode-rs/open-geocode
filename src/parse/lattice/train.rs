@@ -27,14 +27,17 @@
 //! while the build's pool grants it, else from a scratch file.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     path::Path,
+    rc::Rc,
     sync::{Arc, OnceLock},
     time::Instant,
 };
 
 use crate::error::{Error, Result};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -131,10 +134,6 @@ pub struct Report {
     pub sample_bytes: u64,
     pub shards: usize,
     pub epochs: usize,
-    /// Training rows the model got wrong in the last epoch. Only the last
-    /// epoch decodes each row before learning it: the count is all the
-    /// decode is for, and it costs a pass of Viterbi per row.
-    pub last_epoch_errors: usize,
     /// Countries with their own transition table.
     pub countries: Vec<String>,
     /// Whether the Pack carries the trained weights; without them it parses
@@ -152,8 +151,9 @@ pub struct Report {
     pub lattice_memory_bytes: u64,
     pub lattice_file_bytes: u64,
     pub lattice_file_shards: usize,
-    /// Whether the Pack was read into memory up front, as it is when it
-    /// fits in half the memory available.
+    /// Whether the Pack's `parse/*` sections, all training looks up, were
+    /// read into memory up front, as they are when they fit in half the
+    /// memory available.
     pub pack_prefaulted: bool,
 }
 
@@ -322,12 +322,14 @@ pub fn train(
         ..Report::default()
     };
     let pack = Reader::open(pack)?;
-    // Every lattice looks names up all over the dictionaries.
-    report.pack_prefaulted = pack
-        .container()
-        .advise_random_reads(Resources::probe().available_memory_bytes);
+    let dictionaries = pack.container();
+    // Every lattice looks names up all over the dictionaries, and nothing
+    // else of the Pack is read at random: the records drawn are read once,
+    // in Pack order. The whole file need not fit, only them.
+    report.pack_prefaulted =
+        dictionaries.prefault_sections("parse/", Resources::probe().available_memory_bytes) > 0;
     // Only the dictionaries: the weights are what this trains.
-    let tagger = LatticeTagger::new(Dictionaries::open(pack.container())?, Weights::zero());
+    let tagger = LatticeTagger::new(Dictionaries::open(dictionaries)?, Weights::zero());
     let mut random = Random::new(SEED);
 
     // Each country's rows, rendered from its drawn records read in Pack
@@ -482,8 +484,6 @@ pub fn train(
             .map(|(shard, cache)| -> Result<_> {
                 let mut order = Random::new(SEED ^ ((epoch as u64) << 32 | shard as u64));
                 let mut model = Model::from_weights(mixed.clone());
-                let mut errors = 0;
-                let count = epoch + 1 == EPOCHS;
                 let at = Instant::now();
                 for (seen, index) in shuffled_order(cache.len(), &mut order)
                     .into_iter()
@@ -493,23 +493,14 @@ pub fn train(
                         scratch.check_cancelled()?;
                     }
                     cache.visit(index as usize, |row| {
-                        if count {
-                            errors += usize::from(model.is_wrong(&row.lattice, &row.gold));
-                        }
                         model.learn(&row.lattice, &row.gold);
                     })?;
                 }
-                Ok((
-                    model.averaged(),
-                    model.weights,
-                    errors,
-                    at.elapsed().as_secs_f64(),
-                ))
+                Ok((model.averaged(), model.weights, at.elapsed().as_secs_f64()))
             })
             .collect::<Result<Vec<_>>>()?;
         // Per-shard seconds, spread over the shards that ran side by side.
-        report.learn_seconds += results.iter().map(|result| result.3).sum::<f64>() / shards as f64;
-        report.last_epoch_errors = results.iter().map(|result| result.2).sum();
+        report.learn_seconds += results.iter().map(|result| result.2).sum::<f64>() / shards as f64;
         mixed = Weights::mean(results.iter().map(|result| &result.1));
         averages.push(Weights::mean(results.iter().map(|result| &result.0)));
     }
@@ -591,7 +582,7 @@ struct LatticeCache {
 /// One shard's rows with their lattices, built.
 enum Lattices {
     Memory(Vec<Learned>, Reservation),
-    File(IndexedSpoolFile<Learned>),
+    File(Box<IndexedSpoolFile<Learned>>),
 }
 
 impl LatticeCache {
@@ -629,7 +620,7 @@ impl LatticeCache {
 
     fn finish(self) -> Result<Lattices> {
         Ok(match self.file {
-            Some(file) => Lattices::File(file.finish()?),
+            Some(file) => Lattices::File(Box::new(file.finish()?)),
             None => Lattices::Memory(self.rows, self.reservation.into_reservation()),
         })
     }
@@ -766,9 +757,14 @@ impl Spill for Row {
             let break_before = get_u8(input)? != 0;
             let joiner = match get_u64(input)? {
                 0 => None,
-                code => Some(u32::try_from(code).ok().and_then(char::from_u32).ok_or(
-                    Error::BadFixtureRow("invalid joiner in a training row".into()),
-                )?),
+                code => Some(
+                    u32::try_from(code)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| {
+                            Error::BadFixtureRow("invalid joiner in a training row".into())
+                        })?,
+                ),
             };
             tokens.words.push(word);
             tokens.breaks.push(break_before);
@@ -855,34 +851,39 @@ impl Model {
         }
     }
 
-    /// Whether the best labelling of a row, labelled `gold` by token, is
-    /// wrong under the current weights.
-    fn is_wrong(&self, lattice: &Lattice, gold: &[Label]) -> bool {
-        let predicted = decode::best(lattice, &self.weights, 1)
-            .into_iter()
-            .next()
-            .expect("a lattice with tokens has a path");
-        predicted.labels(lattice) != lattice.units.expand(gold)
-    }
-
     /// Learn from one row, labelled `gold` by token.
     fn learn(&mut self, lattice: &Lattice, gold: &[Label]) {
         // A token's label is the label of every unit of it.
         let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
-        for (index, value) in gradient.edge {
-            let delta = adagrad(&mut self.squares.edge[index], value);
-            self.weights.edge[index] += delta;
-            self.totals.edge[index] += delta * self.step;
-        }
-        for (country, values) in gradient.transitions {
-            for (index, value) in values.into_iter().enumerate() {
-                if f64::from(value).abs() < MIN_GRADIENT {
+        for (feature, (values, set)) in gradient.edge {
+            for (label, value) in values.into_iter().enumerate() {
+                if set & (1 << label) == 0 {
                     continue;
                 }
-                let delta = adagrad(&mut table(&mut self.squares, country)[index], value);
-                table(&mut self.weights, country)[index] += delta;
-                table(&mut self.totals, country)[index] += delta * self.step;
+                let index = feature * LABELS + label;
+                let delta = adagrad(&mut self.squares.edge[index], value);
+                self.weights.edge[index] += delta;
+                self.totals.edge[index] += delta * self.step;
+            }
+        }
+        for (country, values) in gradient.transitions {
+            let kept = |value: f32| f64::from(value).abs() >= MIN_GRADIENT;
+            // A country's tables are made by its first kept value, so a
+            // country with none must not make them.
+            if !values.iter().any(|value| kept(*value)) {
+                continue;
+            }
+            let squares = table(&mut self.squares, country);
+            let weights = table(&mut self.weights, country);
+            let totals = table(&mut self.totals, country);
+            for (index, value) in values.into_iter().enumerate() {
+                if !kept(value) {
+                    continue;
+                }
+                let delta = adagrad(&mut squares[index], value);
+                weights[index] += delta;
+                totals[index] += delta * self.step;
             }
         }
         self.step += 1.0;
@@ -936,23 +937,27 @@ fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
     }
 }
 
-/// The gradient of one row's log-likelihood: per edge weight index, and per
-/// transition table (`None` the global one) by previous and next state.
+/// The gradient of one row's log-likelihood: per feature, its value for each
+/// label and a bit for each label it has one for; and per transition table
+/// (`None` the global one) by previous and next state.
 #[derive(Debug, Default)]
 struct Gradient {
-    edge: HashMap<usize, f32>,
+    edge: FxHashMap<usize, ([f32; LABELS], u8)>,
     transitions: HashMap<Option<CountryCode>, Vec<f32>>,
 }
 
 impl Gradient {
     fn of(lattice: &Lattice, weights: &Weights, gold: &[Label]) -> Self {
         let countries = decode::countries(lattice);
+        let order = span_order(lattice);
+        let golds = gold_labels(lattice, gold);
         let readings = countries
             .iter()
             .map(|country| {
+                let edges = span_edges(lattice, weights, *country);
                 (
-                    Reading::new(lattice, weights, *country, None),
-                    Reading::new(lattice, weights, *country, Some(gold)),
+                    Reading::new(lattice, weights, *country, None, &order, edges.clone()),
+                    Reading::new(lattice, weights, *country, Some(&golds), &order, edges),
                 )
             })
             .collect::<Vec<_>>();
@@ -982,10 +987,50 @@ impl Gradient {
     }
 }
 
+/// The score of every span for every label, decoded as `country`. Both
+/// readings of a country share them.
+fn span_edges(
+    lattice: &Lattice,
+    weights: &Weights,
+    country: Option<CountryCode>,
+) -> Vec<[f64; LABELS]> {
+    lattice
+        .spans
+        .iter()
+        .map(|span| weights.edges(span, country).map(f64::from))
+        .collect()
+}
+
+/// The lattice's span indices by where the spans end, the order the forward
+/// pass visits them in.
+fn span_order(lattice: &Lattice) -> Vec<usize> {
+    let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| lattice.spans[*index].end);
+    order
+}
+
+/// Per span, the labels a gold labelling may give it, one bit per label: the
+/// label every unit of the span has in `gold`, or none when they differ.
+fn gold_labels(lattice: &Lattice, gold: &[Label]) -> Vec<u8> {
+    lattice
+        .spans
+        .iter()
+        .map(|span| {
+            let units = &gold[span.start..span.end];
+            match units.first() {
+                None => u8::MAX,
+                Some(first) if units.iter().all(|unit| unit == first) => 1 << *first as u8,
+                Some(_) => 0,
+            }
+        })
+        .collect()
+}
+
 /// Forward-backward over a lattice decoded as one country, over every
 /// labelling or only those that give each unit its gold label.
 struct Reading<'a> {
-    gold: Option<&'a [Label]>,
+    /// [`gold_labels`] of the lattice, when only gold labellings count.
+    golds: Option<&'a [u8]>,
     /// `edges[span][label]`.
     edges: Vec<[f64; LABELS]>,
     transitions: [[f64; STATES]; STATES],
@@ -1002,7 +1047,9 @@ impl<'a> Reading<'a> {
         lattice: &Lattice,
         weights: &Weights,
         country: Option<CountryCode>,
-        gold: Option<&'a [Label]>,
+        golds: Option<&'a [u8]>,
+        order: &[usize],
+        edges: Vec<[f64; LABELS]>,
     ) -> Self {
         let table = weights.transitions(country);
         let mut transitions = [[0.0; STATES]; STATES];
@@ -1011,30 +1058,25 @@ impl<'a> Reading<'a> {
                 *value = f64::from(table.get(previous, next));
             }
         }
-        let edges = lattice
-            .spans
-            .iter()
-            .map(|span| Label::ALL.map(|label| f64::from(weights.edge(span, label, country))))
-            .collect::<Vec<_>>();
-        let allowed = |span: &decode::Span, label: Label| {
-            gold.is_none_or(|gold| gold[span.start..span.end].iter().all(|gold| *gold == label))
-        };
         let len = lattice.len;
         let mut alpha = vec![[f64::NEG_INFINITY; STATES]; len + 1];
         alpha[0][START] = 0.0;
-        let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
-        order.sort_by_key(|index| lattice.spans[*index].end);
-        for &index in &order {
+        // Spans are visited by end, so `alpha[start]` is final by the first
+        // span that starts there, and every later one reads the same sum.
+        let mut sums = vec![[None; LABELS]; len + 1];
+        for &index in order {
             let span = &lattice.spans[index];
             for label in Label::ALL {
-                if !allowed(span, label) {
+                if !allowed(golds, index, label) {
                     continue;
                 }
                 let next = label as usize;
-                let incoming = log_sum(
-                    previous_states(span.start)
-                        .map(|previous| alpha[span.start][previous] + transitions[previous][next]),
-                );
+                let incoming =
+                    *sums[span.start][next].get_or_insert_with(|| {
+                        log_sum(previous_states(span.start).map(|previous| {
+                            alpha[span.start][previous] + transitions[previous][next]
+                        }))
+                    });
                 let value = incoming + edges[index][next];
                 alpha[span.end][next] = log_add(alpha[span.end][next], value);
             }
@@ -1046,7 +1088,7 @@ impl<'a> Reading<'a> {
         for &index in order.iter().rev() {
             let span = &lattice.spans[index];
             for label in Label::ALL {
-                if !allowed(span, label) {
+                if !allowed(golds, index, label) {
                     continue;
                 }
                 let next = label as usize;
@@ -1061,7 +1103,7 @@ impl<'a> Reading<'a> {
         }
         let log_z = log_sum((0..LABELS).map(|label| alpha[len][label] + beta[len][label]));
         Self {
-            gold,
+            golds,
             edges,
             transitions,
             alpha,
@@ -1084,11 +1126,11 @@ impl<'a> Reading<'a> {
         }
         let mut transitions = vec![0.0f64; STATES * STATES];
         for (index, span) in lattice.spans.iter().enumerate() {
+            let mut values = [0.0f32; LABELS];
+            let mut set = 0u8;
             for label in Label::ALL {
                 let next = label as usize;
-                if self.gold.is_some_and(|gold| {
-                    gold[span.start..span.end].iter().any(|gold| *gold != label)
-                }) {
+                if !allowed(self.golds, index, label) {
                     continue;
                 }
                 let onward = self.edges[index][next] + self.beta[span.end][next] - self.log_z;
@@ -1105,12 +1147,22 @@ impl<'a> Reading<'a> {
                 if value.abs() < MIN_GRADIENT {
                     continue;
                 }
-                for feature in span.features_in(country) {
-                    *gradient
-                        .edge
-                        .entry(feature as usize * LABELS + next)
-                        .or_default() += value as f32;
+                values[next] = value as f32;
+                set |= 1 << next;
+            }
+            if set == 0 {
+                continue;
+            }
+            // One entry per feature for all its labels: each label's sum
+            // still takes the spans in the same order.
+            for feature in span.features_in(country) {
+                let (sums, seen) = gradient.edge.entry(feature as usize).or_default();
+                for (label, value) in values.iter().enumerate() {
+                    if set & (1 << label) != 0 {
+                        sums[label] += value;
+                    }
                 }
+                *seen |= set;
             }
         }
         let len = lattice.len;
@@ -1134,6 +1186,50 @@ impl<'a> Reading<'a> {
     }
 }
 
+/// Whether a reading over `golds` (every labelling when `None`) may give span
+/// `index` the label `label`.
+fn allowed(golds: Option<&[u8]>, index: usize, label: Label) -> bool {
+    golds.is_none_or(|golds| golds[index] & (1 << label as u8) != 0)
+}
+
+/// The probability of each label of each unit of `lattice` under
+/// `weights`: forward-backward over every labelling, in every country the
+/// lattice is decoded as, as learning reads its expected counts.
+pub(super) fn label_marginals(lattice: &Lattice, weights: &Weights) -> Vec<[f64; LABELS]> {
+    let order = span_order(lattice);
+    let readings = decode::countries(lattice)
+        .into_iter()
+        .map(|country| {
+            let edges = span_edges(lattice, weights, country);
+            Reading::new(lattice, weights, country, None, &order, edges)
+        })
+        .collect::<Vec<_>>();
+    let total = log_sum(readings.iter().map(|reading| reading.log_z));
+    let mut marginals = vec![[0.0; LABELS]; lattice.len];
+    if !total.is_finite() {
+        return marginals;
+    }
+    for reading in &readings {
+        for (index, span) in lattice.spans.iter().enumerate() {
+            for label in 0..LABELS {
+                let onward = reading.edges[index][label] + reading.beta[span.end][label] - total;
+                let probability = previous_states(span.start)
+                    .map(|previous| {
+                        (reading.alpha[span.start][previous]
+                            + reading.transitions[previous][label]
+                            + onward)
+                            .exp()
+                    })
+                    .sum::<f64>();
+                for unit in &mut marginals[span.start..span.end] {
+                    unit[label] += probability;
+                }
+            }
+        }
+    }
+    marginals
+}
+
 /// The states a segment starting at `start` can follow.
 fn previous_states(start: usize) -> std::ops::Range<usize> {
     if start == 0 {
@@ -1145,10 +1241,15 @@ fn previous_states(start: usize) -> std::ops::Range<usize> {
 
 fn log_add(left: f64, right: f64) -> f64 {
     let high = left.max(right);
-    if high == f64::NEG_INFINITY {
+    // `abs` and not `min`: a NaN input must stay NaN, as it did.
+    let gap = -(left - right).abs();
+    // The higher term's exp is exactly 1. Below -37.5 the lower term is under
+    // half an ulp of it, so the sum is 1 and its ln 0: the same bits as the
+    // full formula without two exp and an ln. Most sums are like this.
+    if high == f64::NEG_INFINITY || gap < -37.5 {
         return high;
     }
-    high + ((left - high).exp() + (right - high).exp()).ln()
+    high + (1.0 + gap.exp()).ln()
 }
 
 fn log_sum(values: impl Iterator<Item = f64>) -> f64 {
@@ -1551,11 +1652,145 @@ const REGION_GROUP_SHARE: f64 = 0.3;
 const REGION_AND_GROUP_SHARE: f64 = 0.2;
 
 /// Renders training rows from the Pack's records.
+/// Venue names and region names of rows rendered so far, at most
+/// [`SEEN_NAMES`] of each: a query names a venue before an address, or a
+/// region the town is not in.
+#[derive(Debug, Default)]
+struct Seen {
+    venues: Vec<Tokens>,
+    regions: Vec<Tokens>,
+}
+
+impl Seen {
+    /// The noise of queries written by hand rather than by a template: a
+    /// field or the whole address written twice, a unit or floor phrase in
+    /// the middle, a venue's name before the address, a region more, and a
+    /// house number with a letter after it.
+    fn add_noise(
+        &mut self,
+        unit_words: &[Vec<String>; 3],
+        fields: &Fields,
+        groups: &mut Vec<Group>,
+        random: &mut Random,
+    ) {
+        let keep = |seen: &mut Vec<Tokens>, value: &Option<Tokens>, random: &mut Random| {
+            if let Some(value) = value {
+                if seen.len() < SEEN_NAMES {
+                    seen.push(value.clone());
+                } else {
+                    let at = random.below(SEEN_NAMES as u64) as usize;
+                    seen[at] = value.clone();
+                }
+            }
+        };
+        keep(&mut self.venues, &fields.house, random);
+        keep(&mut self.regions, &fields.region, random);
+        if groups.is_empty() {
+            return;
+        }
+        if random.chance(FIELD_TWICE_SHARE)
+            && let Some(at) = groups
+                .iter()
+                .position(|group| matches!(group.label, Label::Locality | Label::Region))
+        {
+            let mut twice = groups[at].clone();
+            twice.joiner = None;
+            groups.insert(at + 1, twice);
+        }
+        if random.chance(ADDRESS_TWICE_SHARE) {
+            let mut again = groups.clone();
+            if let Some(first) = again.first_mut() {
+                first.break_before = true;
+                first.joiner = None;
+            }
+            groups.extend(again);
+        }
+        if groups.len() > 1 && random.chance(MIDDLE_UNIT_SHARE) {
+            let vocabulary = &unit_words[match random.chance(0.5) {
+                true => 0,
+                false => 2,
+            }];
+            if !vocabulary.is_empty()
+                && let Some(mut phrase) =
+                    words(&vocabulary[random.below(vocabulary.len() as u64) as usize])
+            {
+                let number = 1 + random.below(200);
+                let letter = (b'a' + random.below(6) as u8) as char;
+                phrase.push(
+                    match random.chance(0.5) {
+                        true => number.to_string(),
+                        false => letter.to_string(),
+                    },
+                    false,
+                    None,
+                );
+                let at = 1 + random.below(groups.len() as u64 - 1) as usize;
+                groups.insert(
+                    at,
+                    Group {
+                        label: Label::Unit,
+                        words: phrase,
+                        break_before: true,
+                        joiner: None,
+                    },
+                );
+            }
+        }
+        if !self.venues.is_empty() && fields.house.is_none() && random.chance(VENUE_BEFORE_SHARE) {
+            let venue = self.venues[random.below(self.venues.len() as u64) as usize].clone();
+            groups.insert(
+                0,
+                Group {
+                    label: Label::Other,
+                    words: venue,
+                    break_before: false,
+                    joiner: None,
+                },
+            );
+            if let Some(next) = groups.get_mut(1) {
+                next.break_before = true;
+            }
+        }
+        if !self.regions.is_empty() && random.chance(EXTRA_REGION_SHARE) {
+            let region = self.regions[random.below(self.regions.len() as u64) as usize].clone();
+            let at = groups
+                .iter()
+                .position(|group| matches!(group.label, Label::Postcode | Label::Country))
+                .unwrap_or(groups.len());
+            groups.insert(
+                at,
+                Group {
+                    label: Label::Region,
+                    words: region,
+                    break_before: true,
+                    joiner: None,
+                },
+            );
+        }
+        if random.chance(NUMBER_SUFFIX_SHARE)
+            && let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.label == Label::HouseNumber)
+            && let Some(word) = group.words.words.first_mut()
+            && word.chars().all(|character| character.is_ascii_digit())
+        {
+            word.push((b'a' + random.below(6) as u8) as char);
+        }
+    }
+}
+
 struct Renderer<'a> {
     pack: &'a Reader,
     tagger: &'a LatticeTagger,
-    /// Every name of each area record, its `name` first.
-    names: HashMap<RecordId, Vec<String>>,
+    /// Every name of each area record, its `name` first. Shared, not cloned,
+    /// to each of the many draws from the same few areas.
+    names: FxHashMap<RecordId, Rc<[String]>>,
+    /// The country code each country record's `name` reads as, looked up
+    /// once for the many rows drawn in one country.
+    country_codes: FxHashMap<RecordId, Option<CountryCode>>,
+    /// Whether each area name names a locality, by its words: rows draw the
+    /// same few area names over and over.
+    localities: RefCell<FxHashMap<String, bool>>,
     /// The words a unit is written with: the Pack's unit words, PO box
     /// words and level words.
     unit_words: [Vec<String>; 3],
@@ -1564,6 +1799,7 @@ struct Renderer<'a> {
     /// The kinds of place a query asks for.
     categories: Vec<String>,
     template_countries: Vec<String>,
+    seen: Seen,
 }
 
 impl<'a> Renderer<'a> {
@@ -1571,13 +1807,16 @@ impl<'a> Renderer<'a> {
         Self {
             pack,
             tagger,
-            names: HashMap::new(),
+            names: FxHashMap::default(),
+            country_codes: FxHashMap::default(),
+            localities: RefCell::default(),
             // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
             near: tagger.dictionaries().keys(Field::Near),
             categories: tagger.dictionaries().keys(Field::Category),
             template_countries: templates().keys().cloned().collect(),
+            seen: Seen::default(),
         }
     }
 
@@ -1692,7 +1931,7 @@ impl<'a> Renderer<'a> {
     /// Drop, render, perturb and label the fields of one row. `None` when
     /// the template writes none of the fields left.
     fn finish(
-        &self,
+        &mut self,
         mut fields: Fields,
         country: Option<CountryCode>,
         random: &mut Random,
@@ -1747,7 +1986,7 @@ impl<'a> Renderer<'a> {
                     short.to_vec()
                 };
                 if !other.is_empty() {
-                    *word = other[random.below(other.len() as u64) as usize].clone();
+                    word.clone_from(&other[random.below(other.len() as u64) as usize]);
                 }
             }
         }
@@ -1869,6 +2108,8 @@ impl<'a> Renderer<'a> {
                 },
             );
         }
+        self.seen
+            .add_noise(&self.unit_words, &fields, &mut groups, random);
         let keep_breaks = random.chance(KEEP_BREAKS_SHARE);
         let mut tokens = Tokens::default();
         let mut gold = Vec::new();
@@ -1928,9 +2169,18 @@ impl<'a> Renderer<'a> {
     /// Whether the dictionaries know `name` as the place an address names:
     /// a locality name addresses state or a city is drawn as.
     fn names_a_locality(&self, name: Option<&Tokens>) -> bool {
-        name.and_then(|name| dictionary_key(&name.words.join(" ")))
+        let Some(name) = name else {
+            return false;
+        };
+        let name = name.words.join(" ");
+        if let Some(&known) = self.localities.borrow().get(&name) {
+            return known;
+        }
+        let known = dictionary_key(&name)
             .and_then(|key| self.tagger.dictionaries().get(Field::Locality, &key))
-            .is_some_and(|entry| entry.levels & level::LOCALITY != 0)
+            .is_some_and(|entry| entry.levels & level::LOCALITY != 0);
+        self.localities.borrow_mut().insert(name, known);
+        known
     }
 
     /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
@@ -2143,11 +2393,7 @@ impl<'a> Renderer<'a> {
             });
         }
         let countries = self.names(tuple.country_record_id())?;
-        let country_code = countries
-            .first()
-            .and_then(|name| search_key(name))
-            .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
-            .and_then(|entry| entry.country);
+        let country_code = self.country_code(tuple.country_record_id(), &countries);
         let country = pick_name(&countries, random).map(str::to_string);
         Ok(Areas {
             locality,
@@ -2176,6 +2422,27 @@ impl<'a> Renderer<'a> {
         }
         let group = groups[random.below(groups.len() as u64) as usize];
         self.admin_name(Some(RecordId::from(group)), Field::Region, random)
+    }
+
+    /// The country code the `name` of country record `id` reads as, its
+    /// names being `names`.
+    fn country_code(&mut self, id: Option<RecordId>, names: &[String]) -> Option<CountryCode> {
+        let read = || {
+            names
+                .first()
+                .and_then(|name| search_key(name))
+                .and_then(|name| self.tagger.dictionaries().get(Field::Country, &name))
+                .and_then(|entry| entry.country)
+        };
+        let Some(id) = id else {
+            return read();
+        };
+        if let Some(&code) = self.country_codes.get(&id) {
+            return code;
+        }
+        let code = read();
+        self.country_codes.insert(id, code);
+        code
     }
 
     /// One name of an area, as [`pick_name`] picks it.
@@ -2212,15 +2479,15 @@ impl<'a> Renderer<'a> {
     }
 
     /// Every name of an area, its `name` first.
-    fn names(&mut self, id: Option<RecordId>) -> Result<Vec<String>> {
+    fn names(&mut self, id: Option<RecordId>) -> Result<Rc<[String]>> {
         let Some(id) = id else {
-            return Ok(Vec::new());
+            return Ok(Rc::default());
         };
         if let Some(names) = self.names.get(&id) {
-            return Ok(names.clone());
+            return Ok(Rc::clone(names));
         }
-        let names = self.pack.records().names(id)?;
-        self.names.insert(id, names.clone());
+        let names = Rc::<[String]>::from(self.pack.records().names(id)?);
+        self.names.insert(id, Rc::clone(&names));
         Ok(names)
     }
 }
@@ -2276,6 +2543,21 @@ enum Draw {
     Layer(Layer),
     BlockAddress,
 }
+
+/// Names of each kind [`Seen::add_noise`] keeps to draw from.
+const SEEN_NAMES: usize = 4_096;
+/// Rows with a place written twice ("madrid madrid").
+const FIELD_TWICE_SHARE: f64 = 0.05;
+/// Rows written twice over, as a pasted address repeats.
+const ADDRESS_TWICE_SHARE: f64 = 0.01;
+/// Rows with a unit or floor phrase between two fields.
+const MIDDLE_UNIT_SHARE: f64 = 0.05;
+/// Rows of an address after a venue's name.
+const VENUE_BEFORE_SHARE: f64 = 0.03;
+/// Rows naming one region more, often not the town's.
+const EXTRA_REGION_SHARE: f64 = 0.04;
+/// Rows whose house number has a letter after it.
+const NUMBER_SUFFIX_SHARE: f64 = 0.05;
 
 /// The share of rows of block scheme addresses besides the addresses'.
 const BLOCK_ADDRESS_SHARE: f64 = 0.25;
@@ -2522,6 +2804,54 @@ mod tests {
     }
 
     #[test]
+    fn a_share_of_rows_carries_each_noise_of_hand_written_queries() {
+        use Label::*;
+        let mut seen = Seen::default();
+        let unit_words = [
+            vec!["unit".to_string()],
+            Vec::new(),
+            vec!["floor".to_string()],
+        ];
+        let mut random = Random::new(7);
+        let rows = 4_000;
+        let mut counts = [0; 5];
+        for row in 0..rows {
+            let mut fields = fields();
+            if row == 0 {
+                fields.house = words("Corner Store");
+            }
+            let mut groups = Vec::new();
+            render(&templates()["CA"], &fields, &mut groups, &mut false);
+            seen.add_noise(&unit_words, &fields, &mut groups, &mut random);
+            let labels = groups.iter().map(|group| group.label).collect::<Vec<_>>();
+            let twice = labels
+                .windows(2)
+                .any(|pair| pair[0] == pair[1] && matches!(pair[0], Locality | Region));
+            let suffixed = groups.iter().any(|group| {
+                group.label == HouseNumber
+                    && group.words.words[0].ends_with(|letter: char| letter.is_ascii_lowercase())
+            });
+            for (count, noisy) in counts.iter_mut().zip([
+                twice,
+                labels.contains(&Unit),
+                row > 0 && labels.first() == Some(&Other),
+                labels.iter().filter(|label| **label == Region).count() > 1,
+                suffixed,
+            ]) {
+                *count += usize::from(noisy);
+            }
+        }
+        assert!(
+            counts.iter().all(|&count| count > 0),
+            "every noise occurs: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|&count| count < rows / 5),
+            "each in a small share of rows: {counts:?}"
+        );
+    }
+
+    #[test]
     fn an_island_is_a_field_between_the_localities_and_the_region() {
         use Label::*;
         let mut with_island = fields();
@@ -2711,7 +3041,9 @@ mod tests {
         let paths = decode::decode(&lattice, &weights, None, LABELS * LABELS, None);
         assert_eq!(paths.len(), LABELS * LABELS);
         let brute = log_sum(paths.iter().map(|path| f64::from(path.score)));
-        let reading = Reading::new(&lattice, &weights, None, None);
+        let edges = span_edges(&lattice, &weights, None);
+        let order = span_order(&lattice);
+        let reading = Reading::new(&lattice, &weights, None, None, &order, edges);
         assert!(
             (reading.log_z - brute).abs() < 1e-3,
             "{} {brute}",
@@ -2722,8 +3054,10 @@ mod tests {
         let mut gradient = Gradient::default();
         reading.add_expectations(&lattice, None, 1.0, &mut gradient);
         let bias = super::super::features::by_name("bias:bias") as usize;
+        let (values, set) = gradient.edge[&bias];
         let total = (0..LABELS)
-            .filter_map(|label| gradient.edge.get(&(bias * LABELS + label)))
+            .filter(|label| set & (1 << label) != 0)
+            .map(|label| values[label])
             .sum::<f32>();
         assert!((total - 2.0).abs() < 1e-3, "{total}");
     }

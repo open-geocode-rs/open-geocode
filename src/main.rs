@@ -25,6 +25,7 @@ use open_geocode::{
     },
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
+    limits::Limits,
     openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
     parse::{
@@ -91,6 +92,14 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// Directory for job results. Defaults to one per port under the
+        /// system's temporary directory, which some systems keep in memory.
+        #[arg(long, env = "OG_JOB_DIR", value_name = "DIR")]
+        job_dir: Option<PathBuf>,
+
+        #[command(flatten)]
+        limits: Limits,
 
         /// Seconds to let in-flight requests finish after Ctrl-C or SIGTERM
         /// before dropping them. 0 drops them at once.
@@ -627,9 +636,9 @@ async fn main() -> Result<()> {
                 found.available_memory_bytes >> 20,
                 found.memory_limit,
             );
-            let report = build_planned_osm_pack(options, plan)?;
+            let report = build_planned_osm_pack(&options, plan)?;
             eprint!("{}", report.stage_table());
-            write_json(serde_json::json!({
+            write_json(&serde_json::json!({
                 "records": report.output.record_count,
                 "rejections": report.output.rejection_count,
                 "pack_bytes": report.output.pack_bytes,
@@ -650,7 +659,7 @@ async fn main() -> Result<()> {
         Commands::Pack(PackCommand::Verify { pack }) => {
             let reader = Reader::open(pack)?;
             reader.verify()?;
-            write_json(serde_json::json!({
+            write_json(&serde_json::json!({
                 "path": reader.path().display().to_string(),
                 "sections": reader.container().sections().len(),
                 "bytes": reader.container().file_size(),
@@ -664,7 +673,7 @@ async fn main() -> Result<()> {
             limit,
         }) => search_pack(pack, query, layer, limit),
         Commands::Pack(PackCommand::Reverse { pack, lon, lat }) => reverse_pack(pack, lon, lat),
-        Commands::Parse(ParseCommand::Query { pack, query }) => parse_query(pack, &query),
+        Commands::Parse(ParseCommand::Query { pack, query }) => parse_query(&pack, &query),
         Commands::Pack(PackCommand::Bench {
             pack,
             queries,
@@ -678,7 +687,7 @@ async fn main() -> Result<()> {
             limit,
             output,
         }) => {
-            let report = benchmark_geocode(GeocodeBenchmarkOptions {
+            let report = benchmark_geocode(&GeocodeBenchmarkOptions {
                 pack,
                 fixture: queries,
                 limit,
@@ -686,9 +695,9 @@ async fn main() -> Result<()> {
             })?;
             let value = serde_json::to_value(report)?;
             if let Some(output) = output {
-                write_json_to_path(&value, output)
+                write_json_to_path(&value, &output)
             } else {
-                write_json(value)
+                write_json(&value)
             }
         }
         Commands::Geocode(GeocodeCommand::Calibrate {
@@ -707,7 +716,7 @@ async fn main() -> Result<()> {
                 seed,
                 radius_m,
             })?;
-            write_json(serde_json::to_value(report)?)
+            write_json(&serde_json::to_value(report)?)
         }
         Commands::Fixture(FixtureCommand::SamplePoi {
             pack,
@@ -715,10 +724,10 @@ async fn main() -> Result<()> {
             seed,
             output,
         }) => {
-            let fixture = sample_poi_fixture(PoiFixtureOptions { pack, count, seed })?;
+            let fixture = sample_poi_fixture(&PoiFixtureOptions { pack, count, seed })?;
             let cases = fixture.search.len();
             write_fixture_to_path(&fixture, &output)?;
-            write_json(serde_json::json!({
+            write_json(&serde_json::json!({
                 "cases": cases,
                 "output": output.display().to_string(),
             }))
@@ -745,7 +754,7 @@ async fn main() -> Result<()> {
                 coverage,
             })?;
             if let Some(json) = json {
-                write_json_to_path(&report, json)?;
+                write_json_to_path(&report, &json)?;
             }
             print!("{}", report.to_markdown());
             Ok(())
@@ -757,6 +766,8 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            job_dir,
+            limits,
             shutdown_timeout,
         } => {
             serve(ServeOptions {
@@ -764,6 +775,8 @@ async fn main() -> Result<()> {
                 demo: Some(demo),
                 bind,
                 basemap: Some(basemap),
+                job_dir,
+                limits,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
@@ -864,7 +877,7 @@ fn parse_fixture(command: ParseFixtureCommand) -> Result<()> {
             })
             .collect(),
     };
-    write_json(serde_json::json!({ "files": files }))
+    write_json(&serde_json::json!({ "files": files }))
 }
 
 fn inspect_pack(
@@ -893,7 +906,7 @@ fn inspect_pack(
         })
     };
 
-    write_json(output)
+    write_json(&output)
 }
 
 fn inspect_record_by_source_id_json(
@@ -962,7 +975,7 @@ fn boundary_context_json(reader: &Reader, record_id: RecordId) -> Result<Value> 
     Ok(Value::Object(object))
 }
 
-fn write_json(value: Value) -> Result<()> {
+fn write_json(value: &Value) -> Result<()> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     serde_json::to_writer_pretty(&mut lock, &value)?;
@@ -995,16 +1008,16 @@ fn create_output_dir(output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_json_to_path(value: &impl serde::Serialize, output: PathBuf) -> Result<()> {
-    create_output_dir(&output)?;
-    let file = File::create(&output)?;
+fn write_json_to_path(value: &impl serde::Serialize, output: &PathBuf) -> Result<()> {
+    create_output_dir(output)?;
+    let file = File::create(output)?;
     serde_json::to_writer_pretty(file, value)?;
     Ok(())
 }
 
 /// Each token with its label, then the n-best labellings with their scores.
-fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
-    let tagger = LatticeTagger::open(&pack)?;
+fn parse_query(pack: &Path, query: &str) -> Result<()> {
+    let tagger = LatticeTagger::open(pack)?;
     let parses = tagger.parse(query);
     let Some(best) = parses.first() else {
         bail!("the query has no words to label");
@@ -1022,7 +1035,7 @@ fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
     for (rank, parse) in parses.iter().enumerate() {
         let country = parse
             .country
-            .map_or("--".to_string(), |code| code.to_string());
+            .map_or_else(|| "--".to_string(), |code| code.to_string());
         let labelled = parse
             .pieces
             .iter()
@@ -1038,7 +1051,7 @@ fn parse_query(pack: PathBuf, query: &str) -> Result<()> {
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
     let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
-    let hits = searcher.search(TextSearchOptions {
+    let hits = searcher.search(&TextSearchOptions {
         query: query.clone(),
         limit,
         layer,
@@ -1046,7 +1059,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
         focus: None,
         bbox: None,
     })?;
-    write_json(serde_json::to_value(api::forward_collection(
+    write_json(&serde_json::to_value(api::forward_collection(
         &pack, query, hits,
     )?)?)
 }
@@ -1056,7 +1069,7 @@ fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
     let response = geocoder.reverse(reverse::GeocodeOptions { lon, lat })?;
-    write_json(serde_json::to_value(api::reverse_collection(
+    write_json(&serde_json::to_value(api::reverse_collection(
         &pack, &response,
     )?)?)
 }
@@ -1068,7 +1081,7 @@ fn bench_pack(
     warmup: usize,
     output: Option<PathBuf>,
 ) -> Result<()> {
-    let report = benchmark_pack(PackBenchmarkOptions {
+    let report = benchmark_pack(&PackBenchmarkOptions {
         pack,
         queries,
         iterations,
@@ -1076,9 +1089,9 @@ fn bench_pack(
     })?;
     let value = serde_json::to_value(report)?;
     if let Some(output) = output {
-        write_json_to_path(&value, output)
+        write_json_to_path(&value, &output)
     } else {
-        write_json(value)
+        write_json(&value)
     }
 }
 
@@ -1114,7 +1127,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     } else {
         None
     };
-    let report = run_batch_geocode(GeocodeOptions {
+    let report = run_batch_geocode(&GeocodeOptions {
         pack,
         input,
         output: output.clone(),
@@ -1131,7 +1144,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         join,
         ..GeocodeOptions::default()
     })?;
-    write_json(serde_json::json!({
+    write_json(&serde_json::json!({
         "rows": report.rows,
         "resolved": report.resolved,
         "fallback": report.fallback,

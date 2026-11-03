@@ -173,7 +173,7 @@ fn node_set_bytes(needed: u64) -> u64 {
 }
 
 /// The sizes a build runs with and what the checks found.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildPlan {
     pub resources: Resources,
     /// The memory budget: every buffer the build tracks, the node store and
@@ -648,7 +648,7 @@ mod tests {
         );
 
         // After the scan, at the spill study's planet counts.
-        let mut counted = planet.clone();
+        let mut counted = planet;
         counted.items = ItemCounts {
             needed_nodes: 1_600_000_000,
             node_set_bytes: node_set_bytes(1_600_000_000),

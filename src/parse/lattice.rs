@@ -219,6 +219,11 @@ const UNSPACED_SCRIPTS: [Script; 7] = [
 /// the prolonged sound mark "ー" and the iteration mark "々" are, as kana and
 /// Han are, and a character of every script (a digit) is not.
 pub fn is_unspaced(character: char) -> bool {
+    // No ASCII character is in an unspaced script, and the script table is a
+    // binary search.
+    if character.is_ascii() {
+        return false;
+    }
     let scripts = character.script_extension();
     !scripts.is_common()
         && !scripts.is_inherited()
@@ -297,6 +302,11 @@ pub fn mask_numerals(key: &str) -> Option<String> {
 /// writes it.
 pub fn dictionary_key(name: &str) -> Option<String> {
     let normalized = search_key(name)?;
+    // ASCII has no unspaced script, so no unit is glued and the key is the
+    // words as they are.
+    if normalized.is_ascii() {
+        return Some(normalized);
+    }
     let words = normalized.split(' ').collect::<Vec<_>>();
     let units = Units::of(&Tokens::from_words(&words));
     Some(units.key(0, units.len()))
@@ -618,6 +628,32 @@ impl ParsedQuery {
     }
 }
 
+/// The lattice of a parsed query, kept for [`LatticeTagger::explain`].
+#[derive(Debug)]
+pub struct Explanation {
+    lattice: Lattice,
+    /// The score of the best labelling the parse returned.
+    pub best: f32,
+}
+
+/// A set of labels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LabelSet(u16);
+
+impl LabelSet {
+    pub fn with(self, label: Label) -> Self {
+        Self(self.0 | 1 << label as u16)
+    }
+
+    pub fn contains(self, label: Label) -> bool {
+        self.0 & 1 << label as u16 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Labels the tokens of free-text address queries from the Pack's own
 /// dictionaries and a learned linear model. Cheap to share across threads.
 pub struct LatticeTagger {
@@ -652,6 +688,26 @@ pub(crate) fn other_forms(word: &str) -> Vec<String> {
         }
     }
     forms
+}
+
+/// The one full form the parser's abbreviation tables give `word`, the
+/// first in order when they give several ("tce" is "terrace"); `None` for
+/// a word that abbreviates nothing.
+pub(crate) fn full_form(word: &str) -> Option<&'static str> {
+    abbreviations::abbreviations()
+        .full_forms(word)
+        .iter()
+        .map(String::as_str)
+        .min()
+}
+
+/// The name `word` holds before a street type glued onto it ("haupt" of
+/// "hauptstr" and of "hauptstrasse"), as a type written apart is left out of
+/// a street's key; `None` when no type is glued onto it.
+pub(crate) fn glued_stem(word: &str) -> Option<&str> {
+    abbreviations::abbreviations()
+        .split_glued(word)
+        .map(|(stem, _)| stem)
 }
 
 impl fmt::Debug for LatticeTagger {
@@ -725,13 +781,37 @@ impl LatticeTagger {
     /// before it ("Peterborough ON" read as a street and a locality); read
     /// apart, the words keep the labels they have without it.
     pub fn parse(&self, query: &str) -> Vec<ParsedQuery> {
+        self.parse_explained(query).0
+    }
+
+    /// [`Self::parse`], with the lattice of the whole query kept to tell how
+    /// well a labelling that agrees with an answer reads it (see
+    /// [`Self::explain`]). `None` when the query has no words.
+    pub fn parse_explained(&self, query: &str) -> (Vec<ParsedQuery>, Option<Explanation>) {
+        self.parse_explained_n(query, N_BEST)
+    }
+
+    /// [`Self::parse_explained`] with the best `n` labellings.
+    pub fn parse_explained_n(
+        &self,
+        query: &str,
+        n: usize,
+    ) -> (Vec<ParsedQuery>, Option<Explanation>) {
         let tokens = Tokens::new(query);
-        let mut parsed = self.parse_tokens(&tokens, N_BEST);
+        if tokens.is_empty() {
+            return (Vec::new(), None);
+        }
+        let lattice = self.lattice(&tokens, &Suppression::default());
+        let mut parsed = self.parse_lattice(&tokens, &lattice, n);
+        let mut explanation = Explanation {
+            best: parsed.first().map_or(0.0, |parse| parse.score),
+            lattice,
+        };
         let Some(at) = self.trailing_country(&tokens) else {
-            return parsed;
+            return (parsed, Some(explanation));
         };
         let country = &tokens.words[at..];
-        for mut reading in self.parse_tokens(&tokens.prefix(at), N_BEST) {
+        for mut reading in self.parse_tokens(&tokens.prefix(at), n) {
             let words = country.iter().map(|word| Tagged {
                 token: word.clone(),
                 label: Label::Country,
@@ -746,8 +826,65 @@ impl LatticeTagger {
             }
         }
         parsed.sort_by(|left, right| right.score.total_cmp(&left.score));
-        parsed.truncate(N_BEST);
-        parsed
+        parsed.truncate(n);
+        if let Some(best) = parsed.first() {
+            explanation.best = best.score;
+        }
+        (parsed, Some(explanation))
+    }
+
+    /// The score of the best labelling of an explained query that gives
+    /// each of its words only a label `labels` allows it, `labels` saying of
+    /// each word (a unit of the lattice, as a search key) the labels an
+    /// answer agrees with; an empty set leaves the word free. Joint
+    /// decoding of the parse and the answer: the parser's own score of the
+    /// query read as the answer reads it. `None` when no labelling does.
+    pub fn explain(
+        &self,
+        explanation: &Explanation,
+        labels: impl Fn(&str) -> LabelSet,
+    ) -> Option<f32> {
+        let lattice = &explanation.lattice;
+        let allowed = lattice
+            .units
+            .tokens
+            .words
+            .iter()
+            .map(|word| labels(word))
+            .collect::<Vec<_>>();
+        let allows = |span: &decode::Span, label: Label| {
+            allowed[span.start..span.end]
+                .iter()
+                .all(|set| set.is_empty() || set.contains(label))
+        };
+        decode::best_allowed(lattice, &self.weights, &allows).map(|path| path.score)
+    }
+
+    /// Per word of an explained query, the parser's probability that it
+    /// names a place: a locality, region or postcode, over every labelling
+    /// it weighs, not only its best.
+    pub fn place_probabilities(&self, explanation: &Explanation) -> Vec<f32> {
+        let lattice = &explanation.lattice;
+        let marginals = train::label_marginals(lattice, &self.weights);
+        let words = lattice
+            .units
+            .token_of
+            .iter()
+            .max()
+            .map_or(0, |last| last + 1);
+        let mut sums = vec![(0.0f64, 0usize); words];
+        for (unit, marginal) in marginals.iter().enumerate() {
+            let place = [Label::Locality, Label::Region, Label::Postcode]
+                .iter()
+                .map(|label| marginal[*label as usize])
+                .sum::<f64>();
+            let token = lattice.units.token_of[unit];
+            sums[token].0 += place;
+            sums[token].1 += 1;
+        }
+        sums.into_iter()
+            .map(|(sum, count)| (sum / count.max(1) as f64).clamp(0.0, 1.0) as f32)
+            .collect()
     }
 
     /// Where the country the query ends in starts: the longest run of its
@@ -774,14 +911,21 @@ impl LatticeTagger {
             return Vec::new();
         }
         let lattice = self.lattice(tokens, &Suppression::default());
-        let mut paths = decode::best(&lattice, &self.weights, n);
+        self.parse_lattice(tokens, &lattice, n)
+    }
+
+    fn parse_lattice(&self, tokens: &Tokens, lattice: &Lattice, n: usize) -> Vec<ParsedQuery> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut paths = decode::best(lattice, &self.weights, n);
         // The best labellings are almost always addresses; only when one is
         // not are more decoded to find those that are. When none is, the
         // best ones still read it.
-        if !paths.iter().all(|path| self.is_one_address(&lattice, path)) {
-            let addresses = decode::best(&lattice, &self.weights, n.max(CONSTRAINED_PATHS))
+        if !paths.iter().all(|path| self.is_one_address(lattice, path)) {
+            let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS))
                 .into_iter()
-                .filter(|path| self.is_one_address(&lattice, path))
+                .filter(|path| self.is_one_address(lattice, path))
                 .collect::<Vec<_>>();
             if !addresses.is_empty() {
                 paths = addresses;
@@ -791,10 +935,10 @@ impl LatticeTagger {
             .into_iter()
             .take(n)
             .map(|path| {
-                let labels = path.labels(&lattice);
+                let labels = path.labels(lattice);
                 let (pieces, corrections) = lattice
                     .units
-                    .corrected_pieces(&path.segments(&lattice), &lattice.corrections);
+                    .corrected_pieces(&path.segments(lattice), &lattice.corrections);
                 ParsedQuery {
                     tokens: tokens
                         .words
@@ -932,6 +1076,7 @@ impl LatticeTagger {
                     evidence = true;
                 }
                 let mut area = false;
+                let mut street = false;
                 // The field of names the most records use the span in.
                 let mut dominant: Option<(Field, u64)> = None;
                 for field in Field::NAMES {
@@ -940,6 +1085,7 @@ impl LatticeTagger {
                     }
                     if let Some((hit, name)) = self.lookup(field, &mut key) {
                         evidence = true;
+                        street |= field == Field::Street;
                         if let (Some(name), Some(label)) = (name, field_label(field)) {
                             corrections.push((start, end, label, name));
                         }
@@ -965,6 +1111,20 @@ impl LatticeTagger {
                 }
                 if let Some((field, _)) = dominant {
                     set.dominant_field(field);
+                }
+                if !street && !suppression.hides(Field::Street, start, end) {
+                    let held = |field: Field| {
+                        [&key.key, &key.expanded]
+                            .into_iter()
+                            .any(|key| self.dictionaries.contains(field, key))
+                    };
+                    if held(Field::StreetBare) {
+                        evidence = true;
+                        set.street_alias(false);
+                    } else if held(Field::StreetTail) {
+                        evidence = true;
+                        set.street_alias(true);
+                    }
                 }
                 if area {
                     let ids = [&key.key, &key.expanded]
@@ -1132,9 +1292,8 @@ impl LatticeTagger {
             matches.extend(self.postcodes.matches(&words.concat()));
         }
         // A postcode written after its country's letters ("D-80331",
-        // "de09496", "CA-M5V 1M9"), as Nominatim reads it and libpostal
-        // writes it: the rest is a postcode of a country whose code starts
-        // with them.
+        // "de09496", "CA-M5V 1M9"): the rest is a postcode of a country
+        // whose code starts with them.
         if let Some((prefix, rest)) = country_prefix(words) {
             let prefix = prefix.to_ascii_uppercase();
             matches.extend(

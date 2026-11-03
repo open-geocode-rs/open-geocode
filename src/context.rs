@@ -51,10 +51,7 @@ const MAX_CHAIN: usize = 32;
 /// country, Washington DC a city and a top-level region. With one tier per
 /// area a query for a city named Berlin and a query for the states of
 /// Germany cannot both be answered -- whichever tier is stored, the other
-/// fact is gone. Google's `address_components` carries the same idea as its
-/// `types` array (`["locality", "administrative_area_level_1"]`); Nominatim
-/// instead keeps the city and drops the state, which is why its address of a
-/// Berlin street has no `state` at all.
+/// fact is gone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TierSet(u16);
 
@@ -330,7 +327,8 @@ impl TupleWriter {
         self.tuples.len() as u64
     }
 
-    pub fn finish(self, pack: &mut Writer) -> Result<()> {
+    /// Write the table, and hand back its tuples.
+    pub fn finish(self, pack: &mut Writer) -> Result<Vec<AdminContextTuple>> {
         let mut bytes = Vec::with_capacity(8 + self.tuples.len() * (1 + 4 * ENTRY_BYTES));
         bytes.extend_from_slice(&(self.tuples.len() as u64).to_le_bytes());
         for tuple in &self.tuples {
@@ -340,7 +338,8 @@ impl TupleWriter {
                 bytes.extend_from_slice(&entry.tiers.bits().to_le_bytes());
             }
         }
-        pack.add(SECTION_TUPLES, CONTEXT_VERSION, &bytes)
+        pack.add(SECTION_TUPLES, CONTEXT_VERSION, &bytes)?;
+        Ok(self.tuples)
     }
 }
 
@@ -356,7 +355,7 @@ impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
         let tuples = container.section(SECTION_TUPLES, CONTEXT_VERSION)?;
         let count = read_u64_le(&tuples, 0)
-            .ok_or(Error::Inconsistent("context table is truncated".into()))?;
+            .ok_or_else(|| Error::Inconsistent("context table is truncated".into()))?;
         let truncated = || Error::Inconsistent("context table is truncated".into());
         let mut offsets = Vec::with_capacity(count as usize);
         let mut offset = 8usize;

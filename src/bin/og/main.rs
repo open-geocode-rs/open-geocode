@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 use open_geocode::{
     alloc::CountingAlloc,
     builder::Leftover,
+    limits::Limits,
     resources,
     runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
 };
@@ -191,12 +192,15 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             demo: None,
             bind,
             basemap: None,
+            job_dir: None,
+            limits: Limits::DEFAULT,
             shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
         }))
         .map_err(Into::into)
 }
 
 /// How `og build` was asked to build.
+#[derive(Clone, Copy)]
 struct Flags {
     memory_budget_bytes: Option<usize>,
     scratch_budget_bytes: Option<u64>,
@@ -419,7 +423,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-                    Event::Paste(text) => app.on_paste(text),
+                    Event::Paste(text) => app.on_paste(&text),
                     _ => {}
                 }
                 if app.quit || !event::poll(Duration::ZERO)? {
@@ -530,7 +534,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let address = "carrer prat de la creu 70, andorra la vella";
         std::fs::write(dir.join("in.csv"), format!("address\n\"{address}\"\n")).unwrap();
-        open_geocode::batch::run_batch_geocode(open_geocode::batch::GeocodeOptions {
+        open_geocode::batch::run_batch_geocode(&open_geocode::batch::GeocodeOptions {
             pack: Some(pack),
             input: dir.join("in.csv"),
             output: dir.join("out.csv"),

@@ -61,7 +61,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 9;
+pub const PACK_SCHEMA_VERSION: u32 = 10;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -317,10 +317,10 @@ pub struct BuildStats {
 
 impl Writer {
     pub fn create(destination: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with(destination, WriterOptions::default())
+        Self::create_with(destination, &WriterOptions::default())
     }
 
-    pub fn create_with(destination: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
+    pub fn create_with(destination: impl AsRef<Path>, options: &WriterOptions) -> Result<Self> {
         let mut generation = Generation::create(destination)?;
         let scratch = generation.create_scratch(None, None)?;
         Self::create_in(generation, scratch, options)
@@ -330,7 +330,7 @@ impl Writer {
     pub fn create_in(
         generation: Generation,
         scratch: Arc<Scratch>,
-        options: WriterOptions,
+        options: &WriterOptions,
     ) -> Result<Self> {
         Ok(Self {
             records: records::Writer::create(&scratch, &options.memory)?,
@@ -452,7 +452,9 @@ impl Writer {
             self.records.write(&record, context)?;
             match document {
                 text_index::Prepared::Document(document) => self.text.add(document)?,
-                text_index::Prepared::Address(document) => self.text.add_address(document)?,
+                text_index::Prepared::Address(document, numbers) => {
+                    self.text.add_address(document, numbers)?
+                }
             }
             self.spatial.add(record_id, &record)?;
             if let Record::Postcode(postcode) = &record {
@@ -501,8 +503,9 @@ impl Writer {
             text: None,
             spatial: None,
         };
-        contexts.finish(&mut pack)?;
-        dictionaries.finish(&mut pack, &context_names)?;
+        let tuples = contexts.finish(&mut pack)?;
+        dictionaries.finish(&mut pack, &context_names, &tuples)?;
+        drop(tuples);
         drop(context_names);
         pack.add(
             POSTCODE_ADDRESSES_SECTION,
@@ -520,9 +523,11 @@ impl Writer {
         })
     }
 
-    /// Seal and publish.
+    /// Seal, add the structured index, and publish.
     pub fn finish(self) -> Result<Manifest> {
-        self.seal()?.0.publish()
+        let (mut sealed, _) = self.seal()?;
+        crate::structured::add_to(&mut sealed)?;
+        sealed.publish()
     }
 }
 
@@ -569,7 +574,24 @@ impl Sealing {
     pub fn seal_part(&mut self) -> Result<Option<&'static str>> {
         self.scratch.check_cancelled()?;
         if let Some(records) = self.records.take() {
-            records.finish(&mut self.pack)?;
+            // The text index is sealed next, and merging its segments is most
+            // of that: it merges on threads of its own while the records are
+            // copied in.
+            let (copied, merged) = std::thread::scope(|scope| {
+                let merging = self
+                    .text
+                    .as_mut()
+                    .map(|text| scope.spawn(move || text.merge()));
+                let copied = records.finish(&mut self.pack);
+                let merged = merging.map(|merging| {
+                    merging
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                });
+                (copied, merged)
+            });
+            copied?;
+            merged.transpose()?;
             return Ok(Some("records"));
         }
         if let Some(text) = self.text.take() {
@@ -779,6 +801,17 @@ impl SealedPack {
         Ok(())
     }
 
+    /// Add sections made from the sealed Pack, each copied from a file, such
+    /// as its structured index (see [`crate::structured::add_to`]).
+    pub fn add_section_files(&mut self, sections: &[(&str, u32, PathBuf)]) -> Result<()> {
+        let mut pack = container::Writer::append(self.path())?;
+        for (name, version, path) in sections {
+            pack.add_file(name, *version, path)?;
+        }
+        self.bytes = pack.finish()?;
+        Ok(())
+    }
+
     /// Validate the Pack with the serving readers, then point `CURRENT` at it.
     pub fn publish(mut self) -> Result<Manifest> {
         publication::publish(
@@ -899,7 +932,9 @@ impl Reader {
     pub fn locality(&self, record_id: RecordId) -> Result<Option<String>> {
         let Some(area_id) = self.boundary_context(record_id)?.and_then(|context| {
             let tuple = &context.admin_context;
-            tuple.locality_record_id().or(tuple.district_record_id())
+            tuple
+                .locality_record_id()
+                .or_else(|| tuple.district_record_id())
         }) else {
             return Ok(None);
         };
@@ -972,9 +1007,7 @@ impl Reader {
             .path
             .parent()
             .map(|dir| dir.join(AUDIT_DIR).join(REJECTIONS_FILE))
-            .ok_or(Error::Inconsistent(
-                "Pack file has no parent directory".into(),
-            ))?;
+            .ok_or_else(|| Error::Inconsistent("Pack file has no parent directory".into()))?;
         let file = fs::File::open(&path).map_err(|source| Error::IoPath {
             action: "failed to open build audit",
             path: path.clone(),
@@ -1129,7 +1162,7 @@ mod tests {
     fn first_hit(root: &Path, query: &str) -> Option<String> {
         TextSearcher::open(root)
             .expect("searcher")
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: query.into(),
                 limit: 1,
                 layer: None,
@@ -1199,7 +1232,7 @@ mod tests {
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let generations = fs::read_dir(root.join("generations")).expect("dir").count();
 
-        let result = crate::builder::build_osm_pack(crate::builder::BuildOsmOptions {
+        let result = crate::builder::build_osm_pack(&crate::builder::BuildOsmOptions {
             inputs: vec![root.join("missing.osm.pbf")],
             pack: root.clone(),
             ..crate::builder::BuildOsmOptions::default()
@@ -1233,7 +1266,7 @@ mod tests {
             "osm:node:1"
         );
         let hits = searcher
-            .search(TextSearchOptions {
+            .search(&TextSearchOptions {
                 query: "king".into(),
                 limit: 5,
                 layer: None,
@@ -1318,7 +1351,7 @@ mod tests {
         let memory = Budget::new(64 << 20);
         let mut writer = Writer::create_with(
             &root,
-            WriterOptions {
+            &WriterOptions {
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
             },
