@@ -46,9 +46,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One runner per shipped target's platform: Linux x64, macOS Apple
-        # silicon, macOS Intel, Windows x64.
-        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
+        # One runner per shipped target's platform: Linux x64, Linux arm64,
+        # macOS Apple silicon, macOS Intel, Windows x64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
