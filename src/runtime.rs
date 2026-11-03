@@ -31,13 +31,19 @@ use crate::{
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
+    limits::Limits,
     pack::Reader,
     record::Layer,
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{AddressGeocodeOptions, TextAutocompleteOptions, TextSearchOptions, TextSearcher},
+    stop::{self, CancelOnDrop, Stop},
     util::hilbert::hilbert_key,
 };
+
+/// Seconds a refused single lookup is told to wait: lookups take
+/// milliseconds, so a slot frees within it.
+const LOOKUP_RETRY_AFTER_SECONDS: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -47,6 +53,10 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    /// Where job results are kept: one directory per port under the
+    /// system's temporary directory when not given.
+    pub job_dir: Option<PathBuf>,
+    pub limits: Limits,
 }
 
 #[derive(Clone)]
@@ -59,11 +69,17 @@ pub(crate) struct AppState {
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
     jobs: Arc<JobStore>,
+    limits: Limits,
+    /// One permit per single lookup running; one without a permit is refused.
+    lookup_slots: Arc<Semaphore>,
+    /// `/openapi.json` for this server's limits, built once.
+    spec: Arc<str>,
 }
 
 impl AppState {
-    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`.
-    pub(crate) fn open(path: &Path, jobs: &Path) -> Result<Self> {
+    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`, under
+    /// `limits`.
+    pub(crate) fn open(path: &Path, jobs: &Path, limits: Limits) -> Result<Self> {
         let pack = Arc::new(Reader::open(path)?);
         let resources = Resources::probe();
         // Every query looks things up all over the Pack: read it in now
@@ -91,12 +107,27 @@ impl AppState {
             // Batches and jobs share the pool's cores, so running more of them
             // at once than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
-            jobs: Arc::new(JobStore::open(jobs.to_path_buf())?),
+            jobs: Arc::new(JobStore::open(jobs.to_path_buf(), limits.job_retention())?),
+            lookup_slots: Arc::new(Semaphore::new(
+                limits
+                    .max_concurrent_lookups(resources.usable_cpus)
+                    .min(Semaphore::MAX_PERMITS),
+            )),
+            spec: openapi::document(&limits)?.into(),
+            limits,
         })
     }
 
     pub(crate) fn jobs(&self) -> &JobStore {
         &self.jobs
+    }
+
+    pub(crate) fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub(crate) fn spec(&self) -> &str {
+        &self.spec
     }
 
     /// Where batch items and job rows run.
@@ -222,7 +253,11 @@ pub(crate) struct ReverseParams {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack, &jobs::default_dir(options.bind.port()))?;
+    let jobs_dir = options
+        .job_dir
+        .clone()
+        .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
+    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
     tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
@@ -253,11 +288,12 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
     // on the lookup routes. axum would otherwise route HEAD to the GET
     // handler automatically, so both register an explicit HEAD responder that
     // returns 405. Other methods fall through to a 405.
+    let max_body = state.limits().max_batch_body_bytes();
     let mut app: Router<AppState> = Router::new()
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
-        .route("/geocode", batchable(geocode, geocode_batch))
-        .route("/reverse", batchable(reverse, reverse_batch))
+        .route("/geocode", batchable(geocode, geocode_batch, max_body))
+        .route("/reverse", batchable(reverse, reverse_batch, max_body))
         .route("/jobs", only(MethodFilter::POST, "POST", jobs::create))
         .route(
             "/jobs/{id}",
@@ -336,7 +372,7 @@ where
 /// A route that answers one lookup on GET and a batch of them on QUERY or
 /// POST. axum filters only the standard methods, so QUERY reaches the batch
 /// through the route's fallback, which turns every other method away.
-fn batchable<H, T, B, U>(single: H, batch: B) -> MethodRouter<AppState>
+fn batchable<H, T, B, U>(single: H, batch: B, max_body: usize) -> MethodRouter<AppState>
 where
     H: Handler<T, AppState>,
     B: Handler<U, AppState>,
@@ -357,7 +393,7 @@ where
             },
         )
         // After the fallback, so the limit covers QUERY as well as POST.
-        .layer(DefaultBodyLimit::max(bounds::MAX_BATCH_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::map_response(batch::advertise))
 }
 
@@ -387,6 +423,30 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
 {
     task::spawn_blocking(work).await?.map_err(Problem::from)
+}
+
+/// Run one lookup under the server's limits: refused with 503 `busy` while
+/// as many run as the server allows, and stopped at its next check past the
+/// lookup timeout, or once this future is dropped, as axum drops it when the
+/// client disconnects.
+async fn lookup<T, F>(state: &AppState, work: F) -> Result<T, Problem>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let Ok(permit) = Arc::clone(&state.lookup_slots).try_acquire_owned() else {
+        return Err(Problem::busy(LOOKUP_RETRY_AFTER_SECONDS));
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel = CancelOnDrop(Arc::clone(&cancel));
+    let stop = Stop::new(state.limits.lookup_timeout(), cancel);
+    // The work holds the slot, not this future: a lookup whose client left
+    // holds it until it stops.
+    blocking(move || {
+        let _permit = permit;
+        stop::within(stop, work)
+    })
+    .await
 }
 
 fn malformed_parameters(_: QueryRejection) -> Problem {
@@ -446,7 +506,8 @@ pub(crate) async fn search(
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = search_request(params)?;
-    let collection = blocking(move || search_answer(&state, options)).await?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || search_answer(&worker, options)).await?;
     Ok(Json(collection))
 }
 
@@ -548,9 +609,10 @@ pub(crate) async fn autocomplete(
         focus,
         bbox,
     };
-    let collection = blocking(move || {
-        let hits = state.searcher.autocomplete(&options)?;
-        api::forward_collection(&state.pack, query, hits)
+    let worker = state.clone();
+    let collection = lookup(&state, move || {
+        let hits = worker.searcher.autocomplete(&options)?;
+        api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
 
@@ -623,16 +685,18 @@ pub(crate) async fn geocode(
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = geocode_request(params)?;
-    let collection = blocking(move || geocode_answer(&state, options)).await?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
     Ok(Json(collection))
 }
 
 /// Geocode many addresses whose parts are already apart in one request.
 ///
-/// The body is a JSON array of up to 1000 items, each taking the parameters
-/// `GET /geocode` takes, plus an optional `id` echoed in its result. The
-/// request's own query-string parameters apply to every item, and an item's
-/// own fields override them: `?country=CA` scopes every item to Canada.
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /geocode` takes, plus an
+/// optional `id` echoed in its result. The request's own query-string
+/// parameters apply to every item, and an item's own fields override them:
+/// `?country=CA` scopes every item to Canada.
 /// `QUERY` takes the same body and answers the same: `POST` is for clients
 /// that cannot send `QUERY`.
 ///
@@ -679,7 +743,7 @@ pub(crate) async fn geocode(
         (status = 400, description = "The body is not a JSON array of objects, or the \
                                       query string did not parse.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 413, description = "More than 1000 items, or a body over its cap.",
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 415, description = "The body was not sent as `application/json`.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -783,14 +847,16 @@ pub(crate) async fn reverse(
 ) -> Result<Json<ReverseCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = reverse_request(params)?;
-    let collection = blocking(move || reverse_answer(&state, options)).await?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
     Ok(Json(collection))
 }
 
 /// Find the places at many points in one request.
 ///
-/// The body is a JSON array of up to 1000 items, each taking the parameters
-/// `GET /reverse` takes, plus an optional `id` echoed in its result.
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /reverse` takes, plus an
+/// optional `id` echoed in its result.
 /// `QUERY` takes the same body and answers the same: `POST` is for clients
 /// that cannot send `QUERY`.
 ///
@@ -818,7 +884,7 @@ pub(crate) async fn reverse(
         (status = 400, description = "The body is not a JSON array of objects, or the \
                                       query string did not parse.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
-        (status = 413, description = "More than 1000 items, or a body over its cap.",
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 415, description = "The body was not sent as `application/json`.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -873,8 +939,10 @@ mod router_tests {
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::time::Duration;
+
     use super::*;
-    use crate::http::bounds::{MAX_BATCH_BODY_BYTES, MAX_BATCH_ITEMS};
     use crate::pack::Writer;
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
@@ -921,10 +989,20 @@ mod router_tests {
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {
-        let state =
-            AppState::open(pack_dir, &pack_dir.with_extension("jobs")).expect("open shared pack");
+        state_with(pack_dir, ready, Limits::DEFAULT)
+    }
+
+    fn state_with(pack_dir: &Path, ready: bool, limits: Limits) -> AppState {
+        let state = AppState::open(pack_dir, &pack_dir.with_extension("jobs"), limits)
+            .expect("open shared pack");
         state.ready.store(ready, Ordering::Release);
         state
+    }
+
+    fn limits_with(change: impl FnOnce(&mut Limits)) -> Limits {
+        let mut limits = Limits::DEFAULT;
+        change(&mut limits);
+        limits
     }
 
     fn request(method: &str, uri: &str) -> Request<Body> {
@@ -1836,7 +1914,9 @@ mod router_tests {
     async fn batch_rejects_a_bad_request_whole() {
         let pack = temp_path("batch-request-errors");
         write_pack(&pack);
-        let router = build_router(state_for(&pack, true), None, None);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(3).expect("3"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
         let error = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
 
         for body in [r#"{"q": "King"}"#, "[1, 2]", "[{}, \"q\"]", "not json", ""] {
@@ -1848,7 +1928,7 @@ mod router_tests {
 
         let too_many = format!(
             "[{}]",
-            vec![r#"{"address": "King"}"#; MAX_BATCH_ITEMS + 1].join(",")
+            vec![r#"{"address": "King"}"#; limits.max_batch_items() + 1].join(",")
         );
         let reply = send(router.clone(), batch_request("POST", "/geocode", too_many)).await;
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -1856,7 +1936,7 @@ mod router_tests {
 
         let full = format!(
             "[{}]",
-            vec![r#"{"address": "King"}"#; MAX_BATCH_ITEMS].join(",")
+            vec![r#"{"address": "King"}"#; limits.max_batch_items()].join(",")
         );
         let reply = send(router.clone(), batch_request("POST", "/geocode", full)).await;
         assert_eq!(reply.status, StatusCode::OK);
@@ -1865,14 +1945,14 @@ mod router_tests {
         let mut declared = batch_request("POST", "/geocode", "[]");
         declared.headers_mut().insert(
             header::CONTENT_LENGTH,
-            header::HeaderValue::from(MAX_BATCH_BODY_BYTES + 1),
+            header::HeaderValue::from(limits.max_batch_body_bytes() + 1),
         );
         let reply = send(router.clone(), declared).await;
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error(&reply).as_deref(), Some("body_too_large"));
 
         // And on what arrives, when no length is declared.
-        let oversized = " ".repeat(MAX_BATCH_BODY_BYTES + 1);
+        let oversized = " ".repeat(limits.max_batch_body_bytes() + 1);
         for method in ["POST", "QUERY"] {
             let request = batch_request(method, "/geocode", oversized.clone());
             let reply = send(router.clone(), request).await;
@@ -2083,5 +2163,249 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// A lookup past the lookup timeout stops at its next check and answers
+    /// 503 `timeout`, with no `Retry-After`: the same lookup takes as long
+    /// the next time.
+    #[tokio::test]
+    async fn a_lookup_past_its_timeout_stops_with_a_503() {
+        let pack = temp_path("lookup-timeout");
+        write_pack(&pack);
+        let limits = limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::MIN);
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|State(state): State<AppState>| async move {
+                    lookup(&state, || -> Result<&'static str> {
+                        std::thread::sleep(Duration::from_millis(20));
+                        stop::check()?;
+                        Ok("answered")
+                    })
+                    .await
+                }),
+            )
+            .with_state(state_with(&pack, true, limits));
+
+        let reply = send(router, request("GET", "/slow")).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.json()["error_code"], "timeout");
+        assert_eq!(
+            reply.json()["detail"],
+            "the lookup took longer than the server allows, 1 ms"
+        );
+        assert!(header_value(&reply, "retry-after").is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// With every lookup slot taken a single lookup is refused at once with
+    /// 503 `busy` and a `Retry-After`, and answers again once a slot frees.
+    #[tokio::test]
+    async fn a_lookup_is_refused_while_every_lookup_slot_is_taken() {
+        let pack = temp_path("lookup-busy");
+        write_pack(&pack);
+        let limits = limits_with(|limits| limits.max_concurrent_lookups = Some(NonZeroUsize::MIN));
+        let state = state_with(&pack, true, limits);
+        let taken = Arc::clone(&state.lookup_slots)
+            .try_acquire_owned()
+            .expect("take the slot");
+        let router = build_router(state, None, None);
+
+        for route in [
+            "/search?q=10%20King%20Street",
+            "/autocomplete?q=10%20King",
+            "/geocode?address=10%20King%20Street",
+            "/reverse?lon=-79&lat=43",
+        ] {
+            let reply = send(router.clone(), request("GET", route)).await;
+            assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{route}");
+            assert_eq!(reply.json()["error_code"], "busy", "{route}");
+            assert_eq!(header_value(&reply, "retry-after"), Some("1"), "{route}");
+        }
+
+        drop(taken);
+        let reply = send(
+            router,
+            request("GET", "/geocode?address=10%20King%20Street"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn slow_when_asked(state: &AppState, query: String) -> Result<ForwardCollection> {
+        if query == "slow" {
+            std::thread::sleep(Duration::from_millis(20));
+            stop::check()?;
+        }
+        api::forward_collection(&state.pack, query, Vec::new())
+    }
+
+    /// An item past the lookup timeout fails alone with 503 `timeout`, and
+    /// the items around it are answered.
+    #[tokio::test]
+    async fn a_batch_item_past_its_timeout_fails_alone() {
+        let pack = temp_path("batch-timeout");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::new(5).expect("5"));
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::post(
+                    |State(state): State<AppState>, request: Request<Body>| async move {
+                        let lookup = Lookup {
+                            route: "/slow",
+                            prepare: |params: PanicParams| Ok(params.q),
+                            place: |_: &String| (),
+                            answer: slow_when_asked,
+                        };
+                        batch::run(state, lookup, request).await
+                    },
+                ),
+            )
+            .with_state(state_with(&pack, true, limits));
+
+        let body = r#"[{"q": "fast"}, {"q": "slow"}, {"q": "fast"}]"#;
+        let reply = send(router, batch_request("POST", "/slow", body)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let statuses = body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["status"].as_u64().expect("status"))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, [200, 503, 200]);
+        assert_eq!(body["results"][1]["error"]["error_code"], "timeout");
+        assert_eq!(body["summary"]["failed"], 1);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A job reads at most the server's row cap, then fails naming it, with
+    /// the rows it read answered.
+    #[tokio::test]
+    async fn a_job_stops_reading_at_the_row_cap() {
+        let pack = temp_path("jobs-row-cap");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        let limits = limits_with(|limits| limits.max_job_rows = NonZeroUsize::new(2).expect("2"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let rows = "street\n10 King Street\n12 King Street\n14 King Street\n";
+        let reply = send(router.clone(), upload("/jobs", "text/csv", rows)).await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(csv_rows(&reply.body).len(), 2);
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+        let status = send(router, request("GET", &location)).await.json();
+        assert_eq!(status["status"], "failed");
+        assert_eq!(status["summary"]["total"], 2);
+        assert_eq!(
+            status["error"],
+            "a job holds at most 2 rows; the rest were not read"
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// An upload declared over the server's upload limit is refused before
+    /// a byte of it is read.
+    #[tokio::test]
+    async fn a_job_upload_over_the_limit_is_refused() {
+        let pack = temp_path("jobs-upload-cap");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let limits = limits_with(|limits| limits.max_job_upload_mib = Some(NonZeroU64::MIN));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let mut declared = upload("/jobs", "text/csv", "street\n10 King Street\n");
+        declared.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from((1u64 << 20) + 1),
+        );
+        let reply = send(router, declared).await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(reply.json()["error_code"], "body_too_large");
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// While the results kept fill the job store, a new job is refused with
+    /// 503 `busy`, and the kept ones are still served.
+    #[tokio::test]
+    async fn a_full_job_store_refuses_new_jobs() {
+        let pack = temp_path("jobs-store-full");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        std::fs::create_dir_all(&spool).expect("spool");
+        // Sparse: the store counts the length, and the disk holds none of it.
+        std::fs::File::create(spool.join("kept.results"))
+            .expect("results")
+            .set_len(1 << 30)
+            .expect("length");
+        std::fs::write(
+            spool.join("kept.json"),
+            serde_json::json!({
+                "id": "kept",
+                "endpoint": "geocode",
+                "status": "completed",
+                "input_format": "csv",
+                "output_format": "csv",
+                "summary": {"total": 0, "succeeded": 0, "failed": 0},
+                "created_at": 0,
+                "results_url": "/jobs/kept/results",
+            })
+            .to_string(),
+        )
+        .expect("write a kept job");
+        let limits = limits_with(|limits| limits.max_job_store_gib = NonZeroU64::MIN);
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let reply = send(
+            router.clone(),
+            upload("/jobs", "text/csv", "street\n10 King Street\n"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.json()["error_code"], "busy");
+        assert_eq!(header_value(&reply, "retry-after"), Some("60"));
+        let kept = send(router, request("GET", "/jobs/kept")).await;
+        assert_eq!(kept.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// `/openapi.json` states the batch item cap this server was started
+    /// with.
+    #[tokio::test]
+    async fn the_served_spec_states_the_servers_limits() {
+        let pack = temp_path("spec-limits");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(7).expect("7"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let spec = send(router, request("GET", "/openapi.json")).await.json();
+        for path in ["/geocode", "/reverse"] {
+            assert_eq!(
+                spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["maxItems"],
+                7,
+                "{path}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

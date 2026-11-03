@@ -8,10 +8,7 @@
 use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -34,11 +31,13 @@ use tokio::task;
 use crate::{
     batch::map_in_order,
     http::{
-        bounds::{MAX_BATCH_BODY_BYTES, MAX_BATCH_ID_CHARS, MAX_BATCH_ITEMS},
+        bounds::MAX_BATCH_ID_CHARS,
         problem::{InvalidParam, Problem},
         request_id::RequestId,
     },
+    limits::Limits,
     runtime::AppState,
+    stop::{self, CancelOnDrop, Stop},
 };
 
 /// The methods a batchable route takes, as its `Allow` header lists them.
@@ -47,8 +46,8 @@ pub(crate) const METHODS: &str = "GET, QUERY, POST";
 /// The one media type a batch body is read as, as `Accept-Query` lists it.
 pub(crate) const MEDIA_TYPE: &str = "application/json";
 
-/// Seconds a refused batch is told to wait. Batches of 1000 items finish in
-/// well under that on a warm Pack.
+/// Seconds a refused batch is told to wait. Batches of a thousand items
+/// finish in well under that on a warm Pack.
 const RETRY_AFTER_SECONDS: u32 = 1;
 
 /// One route's lookup, split where a batch needs it: `prepare` checks
@@ -191,16 +190,6 @@ pub(crate) enum Prepared<Q> {
     },
 }
 
-/// Sets its flag when dropped. axum drops a handler's future when its client
-/// disconnects, and this with it, which stops the items not yet started.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Answer a batch request on `lookup`'s route.
 pub(crate) async fn run<P, Q, A, K>(
     state: AppState,
@@ -236,15 +225,17 @@ where
         .get::<RequestId>()
         .map(|id| id.0.clone());
     let shared = shared_parameters(request.uri().query())?;
-    let items = read_items(request).await?;
+    let items = read_items(request, state.limits()).await?;
     // Taken before any thread is, so a refused batch holds nothing while it
     // waits to be told no.
     let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
         return Err(Problem::busy(RETRY_AFTER_SECONDS));
     };
 
+    // Dropped with this future when the client disconnects, which stops the
+    // items not yet started and the ones running at their next check.
     let cancel = Arc::new(AtomicBool::new(false));
-    let _stop = StopOnDrop(Arc::clone(&cancel));
+    let _cancel = CancelOnDrop(Arc::clone(&cancel));
     let worker = state.clone();
     let body = task::spawn_blocking(move || {
         let _permit = permit;
@@ -271,7 +262,7 @@ fn answer_items<P, Q, A, K>(
     lookup: Lookup<P, Q, A, K>,
     shared: &[(String, String)],
     items: Vec<RawItem>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> crate::Result<Vec<Item<A>>>
 where
     P: DeserializeOwned,
@@ -293,7 +284,7 @@ where
         |_, item| {
             Ok(match item {
                 Prepared::Ready { id, query, .. } => {
-                    look_up(state, lookup, id.clone(), query.clone())
+                    look_up(state, lookup, id.clone(), query.clone(), cancel)
                 }
                 Prepared::Failed { id, problem } => Item::failed(id.clone(), problem.clone()),
             })
@@ -386,16 +377,21 @@ where
     }
 }
 
-/// One item looked up. A panic fails the item, not the batch.
+/// One item looked up, stopped past the server's lookup timeout or once
+/// `cancel` is set. A panic fails the item, not the batch.
 pub(crate) fn look_up<P, Q, A, K>(
     state: &AppState,
     lookup: Lookup<P, Q, A, K>,
     id: Option<String>,
     query: Q,
+    cancel: &Arc<AtomicBool>,
 ) -> Item<A> {
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        (lookup.answer)(state, query).map_err(Problem::from)
-    }))
+    let stop = Stop::new(state.limits().lookup_timeout(), Arc::clone(cancel));
+    let outcome = stop::within(stop, || {
+        catch_unwind(AssertUnwindSafe(|| {
+            (lookup.answer)(state, query).map_err(Problem::from)
+        }))
+    })
     .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
     match outcome {
         Ok(response) => Item {
@@ -469,7 +465,8 @@ fn item_id(item: &[(String, Value)]) -> Result<Option<String>, Problem> {
 }
 
 /// The body's items, checked before any is looked up.
-async fn read_items(request: Request) -> Result<Vec<RawItem>, Problem> {
+async fn read_items(request: Request, limits: &Limits) -> Result<Vec<RawItem>, Problem> {
+    let max_bytes = limits.max_batch_body_bytes();
     if !is_json(request.headers()) {
         return Err(Problem::unsupported_media_type(MEDIA_TYPE));
     }
@@ -480,22 +477,22 @@ async fn read_items(request: Request) -> Result<Vec<RawItem>, Problem> {
         .and_then(|value| value.parse::<u64>().ok());
     // A declared length is refused before a byte is read. A chunked body
     // declares none, and the route's body limit stops it while it is read.
-    if declared.is_some_and(|length| length > MAX_BATCH_BODY_BYTES as u64) {
-        return Err(Problem::body_too_large(MAX_BATCH_BODY_BYTES));
+    if declared.is_some_and(|length| length > max_bytes as u64) {
+        return Err(Problem::body_too_large(max_bytes));
     }
     let bytes = Bytes::from_request(request, &())
         .await
         .map_err(|rejection| match rejection {
             BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
-                Problem::body_too_large(MAX_BATCH_BODY_BYTES)
+                Problem::body_too_large(max_bytes)
             }
             _ => Problem::malformed_body("the body could not be read"),
         })?;
 
     let items: Vec<RawItem> = serde_json::from_slice(&bytes)
         .map_err(|_| Problem::malformed_body("the body must be a JSON array of objects"))?;
-    if items.len() > MAX_BATCH_ITEMS {
-        return Err(Problem::too_many_items(MAX_BATCH_ITEMS));
+    if items.len() > limits.max_batch_items() {
+        return Err(Problem::too_many_items(limits.max_batch_items()));
     }
     if let Some(index) = items
         .iter()

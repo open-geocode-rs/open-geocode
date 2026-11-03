@@ -1751,6 +1751,7 @@ impl TextSearcher {
                 query: query_text.to_string(),
             });
         };
+        crate::stop::check()?;
         let first_query = first_plan.text();
         NAMED.with(|named| named.replace(Some(choose::Named::of(first_plan))));
         // Where the best reading says the record is holds in every reading:
@@ -1838,6 +1839,7 @@ impl TextSearcher {
             // is its own.
             session.extend(spent);
         }
+        crate::stop::check()?;
         let spellings = self.spellings(readings.iter().map(|reading| &reading.plan))?;
         for reading in &mut readings {
             reading.plan = self.spelt(&reading.plan, &spellings)?;
@@ -2535,6 +2537,7 @@ impl TextSearcher {
         );
         let descriptors = self.descriptors(plan.subject.iter().map(|word| word.text.as_str()));
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
+            crate::stop::check()?;
             if !cx.search.filters.admit(hit) || self.street_contradicts(&descriptors, hit) {
                 return Ok(false);
             }
@@ -3840,6 +3843,7 @@ impl TextSearcher {
                     if best.is_some_and(|held| !held.beaten_by(scope.best_pass())) {
                         break;
                     }
+                    crate::stop::check()?;
                     if !session.allows_search() {
                         return Ok(());
                     }
@@ -3964,6 +3968,7 @@ impl TextSearcher {
     fn explain(&self, explanation: &Explanation, session: &Session, pool: &mut Pool) -> Result<()> {
         let mut explained = HashMap::<RecordId, Option<f32>>::new();
         for candidate in &mut pool.candidates {
+            crate::stop::check()?;
             let record_id = candidate.hit.record_id;
             let joint = match explained.get(&record_id) {
                 Some(joint) => *joint,
@@ -4024,6 +4029,7 @@ impl TextSearcher {
             for (area, layers) in areas {
                 let area = self.spelt(&area, &spellings)?;
                 for layer in layers {
+                    crate::stop::check()?;
                     if !session.allows_search() {
                         return Ok(Vec::new());
                     }
@@ -5192,6 +5198,7 @@ impl TextSearcher {
         let mut hits = Vec::new();
         let mut placed = 0;
         for (key, doc) in top_docs {
+            crate::stop::check()?;
             if cutoff
                 .as_ref()
                 .is_some_and(|cutoff| key.cmp_evidence(cutoff).is_lt())

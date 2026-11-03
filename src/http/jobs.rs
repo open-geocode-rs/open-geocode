@@ -42,7 +42,7 @@ use crate::{
     batch::{audit_columns, delimiter_of, text},
     http::{
         batch::{self, Item, Lookup, Prepared, RawItem},
-        bounds::{JOB_RETENTION, MAX_JOB_ROWS, MAX_JOB_UPLOAD_BYTES, UPLOAD_STALL_SECONDS},
+        bounds::UPLOAD_STALL_SECONDS,
         openapi::{self, PROBLEM_JSON},
         problem::{InvalidParam, Problem},
         request_id::RequestId,
@@ -68,6 +68,10 @@ const IN_FLIGHT_PER_THREAD: usize = 2;
 /// Answers kept for rows that repeat a query. Cleared when full: a repeat
 /// then costs one more lookup, never wrong output.
 const REPEAT_CACHE_ENTRIES: usize = 100_000;
+
+/// Seconds a job refused for a full store is told to wait: results free
+/// space only as they expire or are deleted.
+const STORE_FULL_RETRY_AFTER_SECONDS: u32 = 60;
 
 /// Bytes read from the results file per streamed chunk.
 const STREAM_CHUNK_BYTES: usize = 64 << 10;
@@ -193,7 +197,8 @@ struct Progress {
 pub(crate) struct Job {
     status: Mutex<JobStatus>,
     progress: watch::Sender<Progress>,
-    cancel: AtomicBool,
+    /// Shared with each row's lookup, which it stops.
+    cancel: Arc<AtomicBool>,
     /// Deleted while running: its files go when it stops.
     deleted: AtomicBool,
     results: PathBuf,
@@ -228,8 +233,9 @@ pub(crate) struct JobStore {
 
 impl JobStore {
     /// Open the store in `dir`, keeping the jobs a past run left there.
-    /// One that was running then is failed: its upload went with the server.
-    pub(crate) fn open(dir: PathBuf) -> io::Result<Self> {
+    /// One that was running then is failed: its upload went with the server,
+    /// and its results are kept for `retention` from now.
+    pub(crate) fn open(dir: PathBuf, retention: Duration) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         let store = Self {
             dir,
@@ -253,7 +259,7 @@ impl JobStore {
                 status.status = Status::Failed;
                 status.error = Some("the server restarted while the job ran".to_string());
                 status.completed_at = Some(now);
-                status.expires_at = Some(now + JOB_RETENTION.as_secs());
+                status.expires_at = Some(now + retention.as_secs());
             }
             let job = store.job(status);
             if job.snapshot().expires_at.is_some_and(|at| at <= now) {
@@ -281,7 +287,7 @@ impl JobStore {
         Arc::new(Job {
             status: Mutex::new(status),
             progress: watch::Sender::new(Progress::default()),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             deleted: AtomicBool::new(false),
             results,
             record,
@@ -314,6 +320,17 @@ impl JobStore {
             return None;
         }
         Some(job)
+    }
+
+    /// Bytes the results of every kept job take on disk, so far for the
+    /// ones still running.
+    fn used_bytes(&self) -> u64 {
+        self.jobs
+            .lock()
+            .expect("jobs")
+            .values()
+            .map(|job| job.progress.borrow().bytes)
+            .sum()
     }
 
     fn insert(&self, job: Arc<Job>) {
@@ -685,7 +702,8 @@ pub(crate) struct JobQuery {
 /// Geocodes every row of a CSV or JSONL upload. Rows are looked up while the
 /// file uploads, and their results stream back in this response: CSV in the
 /// order rows were sent, JSONL in the order they finish, each line with its
-/// `row`. The results are kept for 72 hours at `Content-Location`.
+/// `row`. The results are kept at `Content-Location` for the server's
+/// retention, 72 hours by default.
 ///
 /// - CSV: name the columns with `address` (several, comma-separated, are
 ///   joined), `locality`, `region` and `postcode`, or `lat` and `lon` for
@@ -724,7 +742,8 @@ pub(crate) struct JobQuery {
         (status = 201, description = "The results, streamed as rows finish.",
          headers(
              ("Location" = String, description = "The job."),
-             ("Content-Location" = String, description = "The results, kept for 72 hours."),
+             ("Content-Location" = String,
+              description = "The results, kept for the server's retention."),
          ),
          content(
              (String = "text/csv"),
@@ -737,11 +756,12 @@ pub(crate) struct JobQuery {
         (status = 400, description = "The CSV has no header row or no column to look \
                                       up, or a parameter is malformed.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
-        (status = 413, description = "The declared body is over 1 GiB.",
+        (status = 413, description = "The declared body is over the server's upload limit.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
         (status = 415, description = "The body is not `text/csv` or `application/jsonl`.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
-        (status = 503, description = "Every slot batches and jobs share is taken. \
+        (status = 503, description = "Every slot batches and jobs share is taken, or \
+                                      the results kept fill the server's job store. \
                                       Retry after the `Retry-After` header's seconds.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
     ),
@@ -765,8 +785,11 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    if declared.is_some_and(|length| length > MAX_JOB_UPLOAD_BYTES) {
-        return Err(Problem::body_too_large(MAX_JOB_UPLOAD_BYTES as usize));
+    let max_upload = state.limits().max_job_upload_bytes();
+    if declared.is_some_and(|length| length > max_upload) {
+        return Err(Problem::body_too_large(
+            usize::try_from(max_upload).unwrap_or(usize::MAX),
+        ));
     }
     let plan = Plan::read(request.uri().query(), input)?;
     let request_id = request
@@ -774,13 +797,25 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         .get::<RequestId>()
         .map(|id| id.0.clone());
 
+    // Checked once, at the start: a job already running may take the store
+    // past its cap, and the next one waits for results to expire.
+    if state.jobs().used_bytes() >= state.limits().max_job_store_bytes() {
+        return Err(Problem::busy(STORE_FULL_RETRY_AFTER_SECONDS).with_detail(
+            "the server keeps as many job results as it can hold; retry once older ones expire",
+        ));
+    }
     let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
         return Err(Problem::busy(1));
     };
 
     let (chunks_tx, chunks_rx) = channel::channel(32);
     let (uploaded_tx, uploaded_rx) = oneshot::channel();
-    tokio::spawn(forward_upload(request.into_body(), chunks_tx, uploaded_tx));
+    tokio::spawn(forward_upload(
+        request.into_body(),
+        max_upload,
+        chunks_tx,
+        uploaded_tx,
+    ));
     let mut upload = Upload {
         chunks: chunks_rx,
         chunk: Bytes::new(),
@@ -919,9 +954,10 @@ fn read_layout(
 }
 
 /// Pass the request body to the reader, a chunk at a time, refusing one that
-/// grows past its cap or stalls. Tells `uploaded` once it is all in.
+/// grows past `max_bytes` or stalls. Tells `uploaded` once it is all in.
 async fn forward_upload(
     body: Body,
+    max_bytes: u64,
     chunks: channel::Sender<Result<Bytes, String>>,
     uploaded: oneshot::Sender<()>,
 ) {
@@ -949,11 +985,9 @@ async fn forward_upload(
             None => break,
         };
         received += chunk.len() as u64;
-        if received > MAX_JOB_UPLOAD_BYTES {
+        if received > max_bytes {
             let _ = chunks
-                .send(Err(format!(
-                    "the upload is over {MAX_JOB_UPLOAD_BYTES} bytes"
-                )))
+                .send(Err(format!("the upload is over {max_bytes} bytes")))
                 .await;
             break;
         }
@@ -1055,6 +1089,7 @@ impl Run {
             let _ = tokens_tx.send(());
         }
         let repeats = Arc::new(Mutex::new(HashMap::<String, Item<A>>::new()));
+        let max_rows = self.state.limits().max_job_rows();
         let mut rows = Rows::new(upload, layout);
         let mut index = 0;
         loop {
@@ -1066,9 +1101,9 @@ impl Run {
                 if window.len() == WINDOW_ROWS {
                     break None;
                 }
-                if index == MAX_JOB_ROWS {
+                if index == max_rows {
                     break Some(Ending::Failed(format!(
-                        "a job holds at most {MAX_JOB_ROWS} rows; the rest were not read"
+                        "a job holds at most {max_rows} rows; the rest were not read"
                     )));
                 }
                 match rows.next() {
@@ -1130,14 +1165,20 @@ impl Run {
                 let job = Arc::clone(&self.job);
                 self.state.batch_pool().spawn(move || {
                     if !job.cancel.load(Ordering::Relaxed) {
-                        let item = batch::look_up(&state, lookup, None, query);
-                        let mut repeats = repeats.lock().expect("repeats");
-                        if repeats.len() >= REPEAT_CACHE_ENTRIES {
-                            repeats.clear();
+                        let item = batch::look_up(&state, lookup, None, query, &job.cancel);
+                        // A row the cancel stopped was never answered.
+                        if !job.cancel.load(Ordering::Relaxed) {
+                            // Busy or out of time depends on the moment, so a
+                            // repeat of the row is looked up again.
+                            if item.status != StatusCode::SERVICE_UNAVAILABLE.as_u16() {
+                                let mut repeats = repeats.lock().expect("repeats");
+                                if repeats.len() >= REPEAT_CACHE_ENTRIES {
+                                    repeats.clear();
+                                }
+                                repeats.insert(key, item.clone());
+                            }
+                            let _ = answers.send(Answered { rows, item });
                         }
-                        repeats.insert(key, item.clone());
-                        drop(repeats);
-                        let _ = answers.send(Answered { rows, item });
                     }
                     let _ = tokens.send(());
                 });
@@ -1164,7 +1205,7 @@ impl Run {
             status.status = state;
             status.error = error;
             status.completed_at = Some(now);
-            status.expires_at = Some(now + JOB_RETENTION.as_secs());
+            status.expires_at = Some(now + self.state.limits().job_retention().as_secs());
         }
         if self.job.deleted.load(Ordering::Relaxed) {
             self.job.remove_files();
