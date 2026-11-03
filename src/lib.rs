@@ -28,6 +28,7 @@ mod road;
 pub mod runtime;
 pub mod search;
 pub mod spatial_index;
+mod stop;
 pub mod structured;
 pub mod text_index;
 mod util;
