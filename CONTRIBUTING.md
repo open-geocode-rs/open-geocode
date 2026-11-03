@@ -81,11 +81,8 @@ og uses edition 2024, minimum Rust 1.88, on the stable toolchain.
 
 ## Review
 
-Every pull request passes two gates before a maintainer reviews it.
-
-1. **Triage**, a GitHub Action: the title is a conventional commit, the template's sections are filled, and the Impact rows are present.
-   It reruns on every push and edit.
-   A pull request that fails triage is held as a draft, and returns to ready once it passes.
-2. **Devin Review**, once triage passes: bugs and security against [`REVIEW.md`](REVIEW.md), and a contribution check against this file.
+Devin Review reviews every pull request when it opens and on each push: bugs and security against [`REVIEW.md`](REVIEW.md), and a contribution check against this file.
+A draft is not reviewed until it is marked ready.
+Then a maintainer reviews it.
 
 Only maintainers can start a Devin review by hand with `/devin review`.

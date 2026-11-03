@@ -35,11 +35,9 @@
 - { name: "ci:full-suite", color: "0e8a16", description: "Maintainer runs the full fixture suite on this pull request." }
 - { name: "ci:planet-build", color: "0e8a16", description: "Maintainer runs a planet Pack build on this pull request." }
 
-- { name: "triage:passed", color: "0e8a16", description: "Set by triage. Opens Devin Review." }
-- { name: "triage:held", color: "fbca04", description: "Set by the PR gate while it holds a pull request as a draft." }
 - { name: "needs-evidence", color: "e99695", description: "Verification does not show the change works." }
 - { name: "needs-split", color: "e99695", description: "More than one problem in one pull request." }
-- { name: "slop", color: "000000", description: "Maintainer only. Devin explains which rules it breaks, then it closes." }
+- { name: "slop", color: "000000", description: "Maintainer only. Closes the pull request with a note." }
 - { name: "do-not-merge", color: "000000", description: "Not to be merged as it stands." }
 
 - { name: "bug", color: "d73a4a", description: "Issue: something is broken or wrong." }

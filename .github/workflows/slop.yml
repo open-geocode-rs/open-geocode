@@ -1,0 +1,36 @@
+name: Slop
+
+# A maintainer's `slop` label closes the pull request with a note.
+# pull_request_target so fork pull requests can be closed; no PR code runs.
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  close:
+    name: Close
+    if: github.event.label.name == 'slop'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const number = context.payload.pull_request.number;
+            const guide = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/main/CONTRIBUTING.md`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: number,
+              body: [
+                'A maintainer closed this pull request because it does not meet the contribution rules yet.',
+                '',
+                `The rules are in [CONTRIBUTING.md](${guide}).`,
+                'Your description is kept as you wrote it.',
+                'Push a fix and reply here, and a maintainer will take another look.',
+              ].join('\n'),
+            });
+            await github.rest.pulls.update({ ...context.repo, pull_number: number, state: 'closed' });
