@@ -1401,7 +1401,7 @@ impl App {
     }
 
     /// Text pasted into the terminal as one piece.
-    pub(crate) fn on_paste(&mut self, text: String) {
+    pub(crate) fn on_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match self.screen {
             Screen::Query if self.mode == Mode::Batch => {

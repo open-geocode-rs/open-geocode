@@ -300,8 +300,9 @@ impl Scratch {
         {
             let mut pins = scratch.pins.lock().expect("pins lock");
             pins.held = true;
+            let pins = &mut *pins;
             pins.files = files.iter().cloned().collect();
-            pins.synced = pins.files.clone();
+            pins.synced.clone_from(&pins.files);
         }
         Ok(Arc::new(scratch))
     }
@@ -498,7 +499,7 @@ impl Scratch {
             }
         };
         let owned = owner.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        owner.peak.fetch_max(owned, Ordering::Relaxed);
+        raise(&owner.peak, owned);
         self.record_peak(next);
         Ok(())
     }
@@ -725,8 +726,10 @@ impl Scratch {
     }
 
     fn record_peak(&self, live: u64) {
-        self.stage_peak.fetch_max(live, Ordering::Relaxed);
-        if self.peak.fetch_max(live, Ordering::Relaxed) >= live {
+        raise(&self.stage_peak, live);
+        if self.peak.load(Ordering::Relaxed) >= live
+            || self.peak.fetch_max(live, Ordering::Relaxed) >= live
+        {
             return;
         }
         // Owners are listed again only once the peak has grown by a step,
@@ -1023,6 +1026,15 @@ impl ScratchFile {
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+}
+
+/// Raise `peak` to `value`, reading first: a written block rarely moves a
+/// peak, and `fetch_max` takes the cache line exclusive even when it does
+/// not.
+fn raise(peak: &AtomicU64, value: u64) {
+    if peak.load(Ordering::Relaxed) < value {
+        peak.fetch_max(value, Ordering::Relaxed);
     }
 }
 

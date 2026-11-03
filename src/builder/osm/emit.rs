@@ -21,7 +21,7 @@ use super::{
     interpolation::{InterpolationNode, emit_interpolation},
     locations::{Location, Locations},
     poi::{PoiCandidate, emit_poi},
-    scan::way_features,
+    scan::{may_matter, way_features},
     spill::{WayFeature, WayKind},
     street::emit_street,
 };
@@ -94,9 +94,13 @@ pub(crate) fn assemble(
             refs.get_or_init(|| way.refs().collect::<Vec<_>>())
                 .as_slice()
         };
-        let tags = collect_clean_tags(way.tags());
+        let tags = if may_matter(way.tags().map(|(key, _)| key)) {
+            collect_clean_tags(way.tags())
+        } else {
+            BTreeMap::new()
+        };
         if !tags.is_empty() {
-            for (feature, way_refs) in way_features(way.id(), tags, refs) {
+            for (feature, way_refs) in way_features(way.id(), &tags, refs) {
                 let (nodes, found) =
                     resolve(&way_refs, locations, feature.kind == WayKind::Interpolation);
                 assembled.resolved += found;
@@ -139,7 +143,7 @@ pub(crate) fn emit_feature(
             let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
             match center {
                 Some((lat, lon)) => emit_address(
-                    AddressCandidate {
+                    &AddressCandidate {
                         object_type: ObjectType::Way,
                         object_id: feature.way_id,
                         lat,
@@ -163,7 +167,7 @@ pub(crate) fn emit_feature(
             let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
             match center {
                 Some((lat, lon)) => emit_poi(
-                    PoiCandidate {
+                    &PoiCandidate {
                         object_type: ObjectType::Way,
                         object_id: feature.way_id,
                         lat,

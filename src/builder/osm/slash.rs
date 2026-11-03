@@ -209,7 +209,7 @@ pub(super) fn read_cell(cell: &mut [PendingAddress], counts: &mut SlashNumberCou
             Fit::Both | Fit::Alone => street_votes[group_index]
                 .settled(STREET_VOTES)
                 .or_else(|| cell_votes.settled(CELL_VOTES))
-                .or((fit == Fit::Both).then_some(Reading::NumberFirst)),
+                .or_else(|| (fit == Fit::Both).then_some(Reading::NumberFirst)),
         };
         match reading {
             Some(Reading::UnitFirst) => {
@@ -284,7 +284,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, id),
         };
-        PendingAddress::new(record, id as u64, 0).expect("pending")
+        PendingAddress::new(&record, id as u64, 0).expect("pending")
     }
 
     /// Read one cell of `(number, street, lat)` and return each address's
