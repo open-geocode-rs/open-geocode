@@ -1026,7 +1026,7 @@
                 }
               }
             },
-            "description": "The lookup ran past the server's lookup timeout (`timeout`).",
+            "description": "The server runs as many lookups as it allows (`busy`; retry after the `Retry-After` header's seconds), or the lookup ran past the server's lookup timeout (`timeout`).",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
@@ -1266,7 +1266,7 @@
                 }
               }
             },
-            "description": "The lookup ran past the server's lookup timeout (`timeout`).",
+            "description": "The server runs as many lookups as it allows (`busy`; retry after the `Retry-After` header's seconds), or the lookup ran past the server's lookup timeout (`timeout`).",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -2593,7 +2593,7 @@
                 }
               }
             },
-            "description": "The lookup ran past the server's lookup timeout (`timeout`).",
+            "description": "The server runs as many lookups as it allows (`busy`; retry after the `Retry-After` header's seconds), or the lookup ran past the server's lookup timeout (`timeout`).",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -3066,7 +3066,7 @@
                 }
               }
             },
-            "description": "The lookup ran past the server's lookup timeout (`timeout`).",
+            "description": "The server runs as many lookups as it allows (`busy`; retry after the `Retry-After` header's seconds), or the lookup ran past the server's lookup timeout (`timeout`).",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",

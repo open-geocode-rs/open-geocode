@@ -41,6 +41,10 @@ use crate::{
     util::hilbert::hilbert_key,
 };
 
+/// Seconds a refused single lookup is told to wait: lookups take
+/// milliseconds, so a slot frees within it.
+const LOOKUP_RETRY_AFTER_SECONDS: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub pack: PathBuf,
@@ -66,6 +70,8 @@ pub(crate) struct AppState {
     batch_slots: Arc<Semaphore>,
     jobs: Arc<JobStore>,
     limits: Limits,
+    /// One permit per single lookup running; one without a permit is refused.
+    lookup_slots: Arc<Semaphore>,
     /// `/openapi.json` for this server's limits, built once.
     spec: Arc<str>,
 }
@@ -102,6 +108,11 @@ impl AppState {
             // at once than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
             jobs: Arc::new(JobStore::open(jobs.to_path_buf(), limits.job_retention())?),
+            lookup_slots: Arc::new(Semaphore::new(
+                limits
+                    .max_concurrent_lookups(resources.usable_cpus)
+                    .min(Semaphore::MAX_PERMITS),
+            )),
             spec: openapi::document(&limits)?.into(),
             limits,
         })
@@ -414,18 +425,28 @@ where
     task::spawn_blocking(work).await?.map_err(Problem::from)
 }
 
-/// Run one lookup under the server's lookup timeout: stopped at its next
-/// check past it, or once this future is dropped, as axum drops it when the
+/// Run one lookup under the server's limits: refused with 503 `busy` while
+/// as many run as the server allows, and stopped at its next check past the
+/// lookup timeout, or once this future is dropped, as axum drops it when the
 /// client disconnects.
 async fn lookup<T, F>(state: &AppState, work: F) -> Result<T, Problem>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
+    let Ok(permit) = Arc::clone(&state.lookup_slots).try_acquire_owned() else {
+        return Err(Problem::busy(LOOKUP_RETRY_AFTER_SECONDS));
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(Arc::clone(&cancel));
     let stop = Stop::new(state.limits.lookup_timeout(), cancel);
-    blocking(move || stop::within(stop, work)).await
+    // The work holds the slot, not this future: a lookup whose client left
+    // holds it until it stops.
+    blocking(move || {
+        let _permit = permit;
+        stop::within(stop, work)
+    })
+    .await
 }
 
 fn malformed_parameters(_: QueryRejection) -> Problem {
@@ -2175,6 +2196,42 @@ mod router_tests {
             "the lookup took longer than the server allows, 1 ms"
         );
         assert!(header_value(&reply, "retry-after").is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// With every lookup slot taken a single lookup is refused at once with
+    /// 503 `busy` and a `Retry-After`, and answers again once a slot frees.
+    #[tokio::test]
+    async fn a_lookup_is_refused_while_every_lookup_slot_is_taken() {
+        let pack = temp_path("lookup-busy");
+        write_pack(&pack);
+        let limits = limits_with(|limits| limits.max_concurrent_lookups = Some(NonZeroUsize::MIN));
+        let state = state_with(&pack, true, limits);
+        let taken = Arc::clone(&state.lookup_slots)
+            .try_acquire_owned()
+            .expect("take the slot");
+        let router = build_router(state, None, None);
+
+        for route in [
+            "/search?q=10%20King%20Street",
+            "/autocomplete?q=10%20King",
+            "/geocode?address=10%20King%20Street",
+            "/reverse?lon=-79&lat=43",
+        ] {
+            let reply = send(router.clone(), request("GET", route)).await;
+            assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{route}");
+            assert_eq!(reply.json()["error_code"], "busy", "{route}");
+            assert_eq!(header_value(&reply, "retry-after"), Some("1"), "{route}");
+        }
+
+        drop(taken);
+        let reply = send(
+            router,
+            request("GET", "/geocode?address=10%20King%20Street"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&pack);
     }

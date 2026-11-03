@@ -194,9 +194,9 @@ pub(crate) enum ErrorCode {
     /// Something failed inside the server. The cause is in the logs under
     /// `request_id`, never in the body.
     InternalError,
-    /// Every slot batches and jobs share was taken, or the server holds as
-    /// many job results as it keeps. Retry after the `Retry-After` header's
-    /// seconds.
+    /// The server runs as many lookups, batches or jobs as it allows, or
+    /// holds as many job results as it keeps. Retry after the `Retry-After`
+    /// header's seconds.
     Busy,
     /// The lookup ran past the server's lookup timeout and stopped. It takes
     /// as long the next time, so a retry does not help.
@@ -383,9 +383,9 @@ fn bound_batch_bodies(value: &mut Value, limits: &Limits) {
     }
 }
 
-/// Document the 503 every single lookup may answer: stopped past the lookup
-/// timeout. It comes from the shared lookup runner, not from one handler, so
-/// it is added here.
+/// Document the 503 every single lookup may answer: refused while the server
+/// runs as many as it allows, or stopped past the lookup timeout. Both come
+/// from the shared lookup runner, not from one handler, so it is added here.
 fn add_lookup_refusals(value: &mut Value) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
@@ -405,7 +405,11 @@ fn add_lookup_refusals(value: &mut Value) {
         };
         responses.entry("503").or_insert_with(|| {
             serde_json::json!({
-                "description": "The lookup ran past the server's lookup timeout (`timeout`).",
+                "description": concat!(
+                    "The server runs as many lookups as it allows (`busy`; retry after the ",
+                    "`Retry-After` header's seconds), or the lookup ran past the server's ",
+                    "lookup timeout (`timeout`)."
+                ),
                 "content": {
                     PROBLEM_JSON: {
                         "schema": { "$ref": "#/components/schemas/Problem" },

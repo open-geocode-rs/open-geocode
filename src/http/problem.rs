@@ -266,13 +266,12 @@ impl Problem {
         .with_detail(format!("the body must be sent as Content-Type: {expected}"))
     }
 
-    /// Every slot batches and jobs share is taken. Refused at once rather
-    /// than queued, so a client learns to come back instead of holding a
-    /// connection open.
+    /// The server runs as much of this kind of work as it allows. Refused at
+    /// once rather than queued, so a client learns to come back instead of
+    /// holding a connection open.
     pub(crate) fn busy(retry_after: u32) -> Self {
-        let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Busy).with_detail(
-            "the server is answering as many batches and jobs as it can; retry shortly",
-        );
+        let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Busy)
+            .with_detail("the server is answering as many requests as it can; retry shortly");
         problem.0.retry_after = Some(retry_after);
         problem
     }
