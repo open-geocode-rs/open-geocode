@@ -134,12 +134,6 @@ Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an A
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 
-### Serving
-
-- Ctrl-C or SIGTERM stops accepting connections, makes `/readyz` answer `503`, lets in-flight requests finish, and exits `0`.
-- `open-geocode serve --shutdown-timeout <SECS>` (default 30) bounds that drain; open connections are dropped after it. `0` drops them at once. `og serve` always uses 30.
-- Jobs still running when the server stops are cancelled and keep the rows answered so far (`GET /jobs/{id}` says `cancelled`). A crash instead fails them on the next start.
-
 ## Use Cases
 
 | Capability | Example use case |

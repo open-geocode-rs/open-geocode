@@ -101,8 +101,8 @@ enum Commands {
         #[command(flatten)]
         limits: Limits,
 
-        /// Seconds to let in-flight requests finish after Ctrl-C or SIGTERM
-        /// before dropping them. 0 drops them at once.
+        /// Longest, in seconds, the server takes to stop after Ctrl-C or
+        /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
         shutdown_timeout: u64,
     },

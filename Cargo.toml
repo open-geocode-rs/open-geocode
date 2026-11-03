@@ -145,6 +145,9 @@ tantivy = "0.25.0"
 tantivy-fst = "0.5"
 thiserror = "2"
 tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Tells the server and its jobs that the process is stopping. Already in the
+# tree through tower-http.
+tokio-util = { version = "0.7", default-features = false }
 tower-http = { version = "0.6", features = ["fs"] }
 # The Unicode Script property: which characters the parser reads as a
 # script written without spaces.
