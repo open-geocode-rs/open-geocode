@@ -689,75 +689,72 @@ fn common(
 /// `geocode batch` writes them. With no feature the same columns come back
 /// empty, so this is also the one list of column names.
 pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, String)> {
-    let properties = feature.map(|feature| &feature.properties);
-    let field = |value: &dyn Fn(&ForwardProperties) -> Option<String>| {
-        properties.and_then(value).unwrap_or_default()
-    };
+    flat(
+        feature.map(|feature| (&feature.properties.common, feature.geometry.coordinates)),
+        feature.map(|feature| feature.properties.score.to_string()),
+        feature.and_then(|feature| feature.properties.confidence.map(|value| value.to_string())),
+    )
+}
+
+/// [`flat_columns`] for a reverse feature. `score` and `confidence` rank
+/// forward results only, so they stay empty.
+pub fn reverse_flat_columns(feature: Option<&ReverseFeature>) -> Vec<(&'static str, String)> {
+    flat(
+        feature.map(|feature| (&feature.properties.common, feature.geometry.coordinates)),
+        None,
+        None,
+    )
+}
+
+fn flat(
+    feature: Option<(&Common, [f64; 2])>,
+    score: Option<String>,
+    confidence: Option<String>,
+) -> Vec<(&'static str, String)> {
+    let common = feature.map(|(common, _)| common);
+    let field =
+        |value: &dyn Fn(&Common) -> Option<String>| common.and_then(value).unwrap_or_default();
     let area = |area: fn(&Context) -> &Option<ContextArea>| {
-        properties
-            .and_then(|properties| area(&properties.common.context).as_ref())
+        common
+            .and_then(|common| area(&common.context).as_ref())
             .map(|area| area.name.clone())
             .unwrap_or_default()
     };
     let coordinate = |index: usize| {
         feature
-            .map(|feature| format!("{:.7}", feature.geometry.coordinates[index]))
+            .map(|(_, coordinates)| format!("{:.7}", coordinates[index]))
             .unwrap_or_default()
     };
     vec![
-        ("score", field(&|p| Some(p.score.to_string()))),
-        (
-            "confidence",
-            field(&|p| p.confidence.map(|confidence| confidence.to_string())),
-        ),
-        (
-            "record_id",
-            field(&|p| Some(p.common.record_id.to_string())),
-        ),
-        ("id", field(&|p| Some(p.common.id.clone()))),
-        (
-            "layer",
-            field(&|p| Some(p.common.layer.as_str().to_string())),
-        ),
+        ("score", score.unwrap_or_default()),
+        ("confidence", confidence.unwrap_or_default()),
+        ("record_id", field(&|p| Some(p.record_id.to_string()))),
+        ("id", field(&|p| Some(p.id.clone()))),
+        ("layer", field(&|p| Some(p.layer.as_str().to_string()))),
         (
             "accuracy",
-            field(&|p| Some(p.common.accuracy.as_str().to_string())),
+            field(&|p| Some(p.accuracy.as_str().to_string())),
         ),
-        ("name", field(&|p| Some(p.common.name.clone()))),
-        ("label", field(&|p| Some(p.common.label.clone()))),
-        ("category", field(&|p| p.common.category.clone())),
+        ("name", field(&|p| Some(p.name.clone()))),
+        ("label", field(&|p| Some(p.label.clone()))),
+        ("category", field(&|p| p.category.clone())),
         ("lat", coordinate(1)),
         ("lon", coordinate(0)),
         (
             "address_housenumber",
-            field(&|p| p.common.address.housenumber.clone()),
+            field(&|p| p.address.housenumber.clone()),
         ),
-        ("address_unit", field(&|p| p.common.address.unit.clone())),
-        (
-            "address_street",
-            field(&|p| p.common.address.street.clone()),
-        ),
-        ("address_place", field(&|p| p.common.address.place.clone())),
+        ("address_unit", field(&|p| p.address.unit.clone())),
+        ("address_street", field(&|p| p.address.street.clone())),
+        ("address_place", field(&|p| p.address.place.clone())),
         (
             "address_areas",
-            field(&|p| Some(p.common.address.areas.join("; "))),
+            field(&|p| Some(p.address.areas.join("; "))),
         ),
-        (
-            "address_locality",
-            field(&|p| p.common.address.locality.clone()),
-        ),
-        (
-            "address_region",
-            field(&|p| p.common.address.region.clone()),
-        ),
-        (
-            "address_postcode",
-            field(&|p| p.common.address.postcode.clone()),
-        ),
-        (
-            "address_country",
-            field(&|p| p.common.address.country.clone()),
-        ),
+        ("address_locality", field(&|p| p.address.locality.clone())),
+        ("address_region", field(&|p| p.address.region.clone())),
+        ("address_postcode", field(&|p| p.address.postcode.clone())),
+        ("address_country", field(&|p| p.address.country.clone())),
         (
             "context_neighbourhood",
             area(|context| &context.neighbourhood),
@@ -767,30 +764,26 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
         ("context_region", area(|context| &context.region)),
         ("context_country", area(|context| &context.country)),
         ("context_place", area(|context| &context.place)),
-        (
-            "source_dataset",
-            field(&|p| Some(p.common.source.dataset.clone())),
-        ),
+        ("source_dataset", field(&|p| Some(p.source.dataset.clone()))),
         (
             "source_object_type",
             field(&|p| {
-                p.common
-                    .source
+                p.source
                     .object_type
                     .map(|kind| labels::object_type_name(kind).to_string())
             }),
         ),
         (
             "source_object_id",
-            field(&|p| p.common.source.object_id.map(|id| id.to_string())),
+            field(&|p| p.source.object_id.map(|id| id.to_string())),
         ),
         (
             "source_derived_from",
-            field(&|p| p.common.source.derived_from.clone()),
+            field(&|p| p.source.derived_from.clone()),
         ),
         (
             "source_record_count",
-            field(&|p| p.common.source.record_count.map(|count| count.to_string())),
+            field(&|p| p.source.record_count.map(|count| count.to_string())),
         ),
     ]
 }

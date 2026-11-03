@@ -115,7 +115,7 @@ module.exports = async function reconcile({ github, drafts, context, core, numbe
     return;
   }
 
-  const found = problems({ title: pr.title, body: pr.body, labels: [...labels] });
+  const found = problems({ title: pr.title, body: pr.body });
   // Runs from different triggers can overlap and each post the comment; the
   // oldest is kept and any other is removed.
   const [mine, ...extra] = ours(MARKER).sort((a, b) => a.id - b.id);

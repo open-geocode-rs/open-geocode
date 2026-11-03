@@ -61,7 +61,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 9;
+pub const PACK_SCHEMA_VERSION: u32 = 10;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -452,7 +452,9 @@ impl Writer {
             self.records.write(&record, context)?;
             match document {
                 text_index::Prepared::Document(document) => self.text.add(document)?,
-                text_index::Prepared::Address(document) => self.text.add_address(document)?,
+                text_index::Prepared::Address(document, numbers) => {
+                    self.text.add_address(document, numbers)?
+                }
             }
             self.spatial.add(record_id, &record)?;
             if let Record::Postcode(postcode) = &record {
@@ -501,8 +503,9 @@ impl Writer {
             text: None,
             spatial: None,
         };
-        contexts.finish(&mut pack)?;
-        dictionaries.finish(&mut pack, &context_names)?;
+        let tuples = contexts.finish(&mut pack)?;
+        dictionaries.finish(&mut pack, &context_names, &tuples)?;
+        drop(tuples);
         drop(context_names);
         pack.add(
             POSTCODE_ADDRESSES_SECTION,
@@ -520,9 +523,11 @@ impl Writer {
         })
     }
 
-    /// Seal and publish.
+    /// Seal, add the structured index, and publish.
     pub fn finish(self) -> Result<Manifest> {
-        self.seal()?.0.publish()
+        let (mut sealed, _) = self.seal()?;
+        crate::structured::add_to(&mut sealed)?;
+        sealed.publish()
     }
 }
 
@@ -569,7 +574,24 @@ impl Sealing {
     pub fn seal_part(&mut self) -> Result<Option<&'static str>> {
         self.scratch.check_cancelled()?;
         if let Some(records) = self.records.take() {
-            records.finish(&mut self.pack)?;
+            // The text index is sealed next, and merging its segments is most
+            // of that: it merges on threads of its own while the records are
+            // copied in.
+            let (copied, merged) = std::thread::scope(|scope| {
+                let merging = self
+                    .text
+                    .as_mut()
+                    .map(|text| scope.spawn(move || text.merge()));
+                let copied = records.finish(&mut self.pack);
+                let merged = merging.map(|merging| {
+                    merging
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                });
+                (copied, merged)
+            });
+            copied?;
+            merged.transpose()?;
             return Ok(Some("records"));
         }
         if let Some(text) = self.text.take() {
@@ -775,6 +797,17 @@ impl SealedPack {
     pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
         let mut pack = container::Writer::append(self.path())?;
         pack.add(name, version, bytes)?;
+        self.bytes = pack.finish()?;
+        Ok(())
+    }
+
+    /// Add sections made from the sealed Pack, each copied from a file, such
+    /// as its structured index (see [`crate::structured::add_to`]).
+    pub fn add_section_files(&mut self, sections: &[(&str, u32, PathBuf)]) -> Result<()> {
+        let mut pack = container::Writer::append(self.path())?;
+        for (name, version, path) in sections {
+            pack.add_file(name, *version, path)?;
+        }
         self.bytes = pack.finish()?;
         Ok(())
     }

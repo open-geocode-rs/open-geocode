@@ -18,7 +18,7 @@ use super::{
 
 /// Keys that make a named object a POI, in category order: an object tagged
 /// `amenity=school` and `building=school` is an `amenity:school`.
-const POI_KEYS: [&str; 12] = [
+pub(crate) const POI_KEYS: [&str; 12] = [
     "amenity",
     "shop",
     "tourism",

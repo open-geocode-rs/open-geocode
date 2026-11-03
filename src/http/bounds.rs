@@ -4,8 +4,9 @@
 //! must still defend itself if edge rules change or a route is exposed
 //! differently — and, since cloudflared connects directly to the Runtime with no
 //! Nginx layer (ADR 0017 amended 2026-06-03b), the Runtime is the only
-//! server-side enforcement point. These are deliberately conservative, hardcoded
-//! limits for the non-commercial public demo.
+//! server-side enforcement point. The bounds here are fixed: they guard
+//! parsing and response size. The capacity limits an operator sets are in
+//! [`crate::limits`].
 
 use crate::http::problem::{InvalidParam, Problem};
 use crate::search::{BoundingBox, MAX_AUTOCOMPLETE_LIMIT};
@@ -16,6 +17,19 @@ pub(crate) const MAX_QUERY_CHARS: usize = 256;
 /// Maximum `limit` a `/search` request may ask for. `search.rs` has no internal
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
+
+/// Bytes of batch body read per item the server allows: an item with every
+/// field at full length is about 1.2 KiB of ASCII, so this leaves room for
+/// escapes and non-Latin text without letting one request hold the server's
+/// memory.
+pub(crate) const BATCH_ITEM_BYTES: usize = 4096;
+
+/// Longest `id` a batch item may carry, in Unicode scalar values.
+pub(crate) const MAX_BATCH_ID_CHARS: usize = 128;
+
+/// Seconds an upload may send nothing before it is cut off, so a client
+/// that stalls does not hold a job slot.
+pub(crate) const UPLOAD_STALL_SECONDS: u64 = 30;
 
 /// Trim and bound a query by length, returning it with each run of
 /// whitespace written as one space. Empty is allowed (autocomplete treats

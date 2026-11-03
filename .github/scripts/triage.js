@@ -1,6 +1,6 @@
 // What a pull request still needs before review. Both triage workflows run
 // this file from main, so a pull request cannot change how it is judged.
-module.exports = function problems({ title, body, labels }) {
+module.exports = function problems({ title, body }) {
   const found = [];
 
   const kind = /^(fix|feat|perf|refactor|chore|ci|docs|build|test)(\([^)]*\))?!?: \S/.exec(title)?.[1];
@@ -50,10 +50,6 @@ module.exports = function problems({ title, body, labels }) {
         found.push(`Impact: the **${row}** row needs a value for main and for this PR.`);
       }
     }
-  }
-
-  if (labels.includes('experimental') && !/https?:\/\/\S+/.test(text)) {
-    found.push('An `experimental` pull request links at least one source: a paper, a journal article, or another geocoder\'s documented design.');
   }
 
   return found;

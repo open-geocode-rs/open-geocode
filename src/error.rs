@@ -124,6 +124,10 @@ pub enum Error {
     #[error("the run was cancelled")]
     Cancelled,
 
+    /// A lookup ran longer than it was given, and stopped.
+    #[error("the lookup took longer than {} ms", after.as_millis())]
+    TimedOut { after: std::time::Duration },
+
     // --- from below -------------------------------------------------------
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

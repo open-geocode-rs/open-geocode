@@ -1,6 +1,7 @@
 //! The response contract checked against what the code produces (ADR 0022):
-//! real `/search`, `/autocomplete` and `/reverse` answers from the router on
-//! a small Pack are the committed examples in `contract/responses/`, and the
+//! real `/search`, `/autocomplete`, `/geocode` and `/reverse` answers, and a
+//! batch, from the router on a small Pack are the committed examples in
+//! `contract/responses/`, and the
 //! geocode batch audit columns are the committed
 //! `contract/batch-audit-columns.txt`. A change to the shape of an answer
 //! fails here until its examples are regenerated, with
@@ -66,12 +67,18 @@ fn assert_example(name: &str, body: &Value) {
 /// server actually hands out at `/openapi.json`.
 #[tokio::test]
 async fn committed_openapi_is_the_served_contract() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert_committed("openapi.json", &document);
 
     let pack = contract_pack();
     let router = build_router(
-        AppState::open(&pack).expect("open pack"),
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -109,7 +116,8 @@ async fn committed_openapi_is_the_served_contract() {
 /// serialization, and this notices if one ever does.
 #[test]
 fn the_contract_survives_a_release_version_bump() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     let value: Value = serde_json::from_str(&document).expect("spec is JSON");
     let mut restringified = serde_json::to_string_pretty(&value).expect("re-serializes");
     restringified.push('\n');
@@ -127,7 +135,8 @@ fn the_contract_survives_a_release_version_bump() {
 /// would still parse, and would still be wrong.
 #[test]
 fn every_schema_reference_resolves() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     let spec: Value = serde_json::from_str(&document).expect("spec is JSON");
     let defined: std::collections::BTreeSet<String> = spec["components"]["schemas"]
         .as_object()
@@ -149,7 +158,8 @@ fn every_schema_reference_resolves() {
 /// absent value is an absent key.
 #[test]
 fn the_contract_admits_no_nulls() {
-    let document = crate::http::openapi::document().expect("spec serializes");
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert!(
         !document.contains("\"null\""),
         "the contract still allows a null somewhere"
@@ -223,7 +233,12 @@ async fn responses_match_the_committed_examples() {
     ));
     let ids = write_pack(&pack);
     let router = build_router(
-        AppState::open(&pack).expect("open pack"),
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -431,6 +446,203 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(unfiltered["features"], filtered["features"]);
 
     let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// One batch result, its answer kept as the bytes it was sent as.
+#[derive(serde::Deserialize)]
+struct RawResult {
+    status: u16,
+    response: Option<Box<serde_json::value::RawValue>>,
+    error: Option<Box<serde_json::value::RawValue>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawBatch {
+    results: Vec<RawResult>,
+}
+
+/// Each batch result is the `GET` of its item, byte for byte: `response`
+/// is that `GET`'s answer and `error` its Problem. `QUERY` and `POST` answer
+/// a batch alike, byte for byte too.
+#[tokio::test]
+async fn batch_results_are_their_get_answers() {
+    let pack = contract_pack();
+    let router = build_router(
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
+    );
+
+    let batches = [
+        (
+            "/geocode",
+            "country=CA",
+            json!([
+                {"id": "row-1", "address": "10 King Street", "postcode": "M5V 1A1"},
+                {"address": "10 King Street", "postcode": "V6B 1A1"},
+                {"id": "row-3", "address": "50 Queen Street", "locality": "Toronto"},
+                {"address": "10 King Street", "country": "FR"},
+                {"address": ""},
+                {"address": "10 King Street", "layer": "bogus"},
+                {"address": "10 King Street", "limit": 51},
+            ]),
+        ),
+        (
+            "/reverse",
+            "",
+            json!([
+                {"lon": -79.0, "lat": 43.0},
+                {"lon": -79.0102, "lat": 43.0005},
+                {"lon": "-79.2", "lat": "43.2"},
+                {"lon": 10.0, "lat": 10.0},
+                {"lon": -79, "lat": 999},
+                {"lat": 43.0},
+            ]),
+        ),
+    ];
+
+    for (route, shared, items) in batches {
+        let uri = if shared.is_empty() {
+            route.to_string()
+        } else {
+            format!("{route}?{shared}")
+        };
+        let body = items.to_string();
+        let (status, post) = send_raw(&router, "POST", &uri, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "POST {uri}");
+        let (_, query) = send_raw(&router, "QUERY", &uri, Some(&body)).await;
+        assert_eq!(post, query, "QUERY and POST {uri} answer differently");
+
+        let batch: RawBatch = serde_json::from_slice(&post).expect("batch is JSON");
+        let items = items.as_array().expect("items");
+        assert_eq!(batch.results.len(), items.len());
+        for (item, result) in items.iter().zip(&batch.results) {
+            let get_uri = format!("{route}?{}", get_query(shared, item));
+            let (status, answer) = send_raw(&router, "GET", &get_uri, None).await;
+            assert_eq!(result.status, status.as_u16(), "GET {get_uri}");
+            let batched = match (&result.response, &result.error) {
+                (Some(response), None) if status == StatusCode::OK => response,
+                (None, Some(error)) if status != StatusCode::OK => error,
+                _ => panic!("{get_uri}: a result holds its answer or its error, not both"),
+            };
+            assert_eq!(
+                batched.get(),
+                std::str::from_utf8(&answer).expect("UTF-8"),
+                "the batch answers GET {get_uri} differently"
+            );
+        }
+    }
+
+    // The committed example of a batch, its answers and its errors alike.
+    let (_, example) = send_raw(
+        &router,
+        "POST",
+        "/geocode?country=CA",
+        Some(
+            &json!([
+                {"id": "row-1", "address": "10 King Street", "postcode": "M5V 1A1"},
+                {"id": "row-2", "address": ""},
+            ])
+            .to_string(),
+        ),
+    )
+    .await;
+    let example: Value = serde_json::from_slice(&example).expect("batch is JSON");
+    assert_example("batch-geocode", &example);
+    batch_schemas_match_the_rendered_body(&example);
+
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// The batch schemas in the contract are mirrors, like `Problem`'s, so this
+/// holds them to a body the server rendered: every member it sends is one
+/// the contract describes.
+fn batch_schemas_match_the_rendered_body(batch: &Value) {
+    let document =
+        crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
+    let spec: Value = serde_json::from_str(&document).expect("spec is JSON");
+    let documented = |schema: &str| -> std::collections::BTreeSet<String> {
+        spec["components"]["schemas"][schema]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema} has no properties"))
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let sent = |value: &Value| -> std::collections::BTreeSet<String> {
+        value.as_object().expect("object").keys().cloned().collect()
+    };
+    assert!(sent(batch).is_subset(&documented("ForwardBatch")));
+    assert!(sent(&batch["summary"]).is_subset(&documented("BatchSummary")));
+    let results = batch["results"].as_array().expect("results");
+    for result in results {
+        let undocumented: Vec<_> = sent(result)
+            .difference(&documented("ForwardResult"))
+            .cloned()
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "a batch result sends members the contract does not describe: {undocumented:?}"
+        );
+    }
+    assert_eq!(documented("ForwardResult"), documented("ReverseResult"));
+}
+
+/// The query string a `GET` of this batch item carries: the shared
+/// parameters, overridden by the item's own, each value as its text.
+fn get_query(shared: &str, item: &Value) -> String {
+    let own = item
+        .as_object()
+        .expect("item")
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            (name.clone(), text)
+        })
+        .collect::<Vec<_>>();
+    let mut pairs: Vec<(String, String)> = serde_urlencoded::from_str(shared).expect("shared");
+    pairs.retain(|(name, _)| !own.iter().any(|(given, _)| given == name));
+    pairs.extend(own);
+    serde_urlencoded::to_string(pairs).expect("query string")
+}
+
+/// Send a request with a fixed request id, so a Problem's bytes do not
+/// differ by it, and return the status and body.
+async fn send_raw(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-request-id", "contract-example");
+    if body.is_some() {
+        request = request.header(axum::http::header::CONTENT_TYPE, "application/json");
+    }
+    let response = router
+        .clone()
+        .oneshot(
+            request
+                .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (status, body.to_vec())
 }
 
 /// A request that is expected to fail, returning its status and problem body.

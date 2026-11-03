@@ -24,6 +24,7 @@ use open_geocode::{
     },
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
+    limits::Limits,
     openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
     parse::{
@@ -90,6 +91,14 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// Directory for job results. Defaults to one per port under the
+        /// system's temporary directory, which some systems keep in memory.
+        #[arg(long, env = "OG_JOB_DIR", value_name = "DIR")]
+        job_dir: Option<PathBuf>,
+
+        #[command(flatten)]
+        limits: Limits,
     },
 }
 
@@ -751,12 +760,16 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            job_dir,
+            limits,
         } => {
             serve(ServeOptions {
                 pack,
                 demo: Some(demo),
                 bind,
                 basemap: Some(basemap),
+                job_dir,
+                limits,
             })
             .await?;
             Ok(())

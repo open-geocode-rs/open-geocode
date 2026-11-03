@@ -10,28 +10,40 @@ use std::{
 use crate::error::{Error, Result};
 use axum::{
     Json, Router,
-    extract::{Query, State, rejection::QueryRejection},
+    extract::{DefaultBodyLimit, Query, Request, State, rejection::QueryRejection},
     handler::{Handler, HandlerWithoutStateExt},
     middleware,
+    response::{IntoResponse, Response},
     routing::{MethodFilter, MethodRouter, on},
 };
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::Deserialize;
-use tokio::{net::TcpListener, task};
+use tokio::{net::TcpListener, sync::Semaphore, task};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
-        bounds, health, method, openapi,
+        batch::{self, Lookup},
+        bounds, health,
+        jobs::{self, JobStore},
+        method, openapi,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
     },
+    limits::Limits,
     pack::Reader,
     record::Layer,
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{AddressGeocodeOptions, TextAutocompleteOptions, TextSearchOptions, TextSearcher},
+    stop::{self, CancelOnDrop, Stop},
+    util::hilbert::hilbert_key,
 };
+
+/// Seconds a refused single lookup is told to wait: lookups take
+/// milliseconds, so a slot frees within it.
+const LOOKUP_RETRY_AFTER_SECONDS: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -41,6 +53,10 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
+    /// Where job results are kept: one directory per port under the
+    /// system's temporary directory when not given.
+    pub job_dir: Option<PathBuf>,
+    pub limits: Limits,
 }
 
 #[derive(Clone)]
@@ -50,24 +66,82 @@ pub(crate) struct AppState {
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
     error_log: ErrorLog,
+    batch_pool: Arc<ThreadPool>,
+    batch_slots: Arc<Semaphore>,
+    jobs: Arc<JobStore>,
+    limits: Limits,
+    /// One permit per single lookup running; one without a permit is refused.
+    lookup_slots: Arc<Semaphore>,
+    /// `/openapi.json` for this server's limits, built once.
+    spec: Arc<str>,
 }
 
 impl AppState {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`, under
+    /// `limits`.
+    pub(crate) fn open(path: &Path, jobs: &Path, limits: Limits) -> Result<Self> {
         let pack = Arc::new(Reader::open(path)?);
+        let resources = Resources::probe();
         // Every query looks things up all over the Pack: read it in now
         // when it fits, so the first queries do not each wait on faults.
         pack.container()
-            .advise_random_reads(Resources::probe().available_memory_bytes);
+            .advise_random_reads(resources.available_memory_bytes);
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
+        // Every CPU, at low priority: batches and jobs take all the CPU
+        // single lookups leave idle, and a single lookup never waits for a
+        // core.
+        let batch_pool = ThreadPoolBuilder::new()
+            .num_threads(resources.usable_cpus)
+            .thread_name(|index| format!("batch-{index}"))
+            .start_handler(|_| crate::resources::lower_this_thread())
+            .build()
+            .map_err(std::io::Error::other)?;
         Ok(Self {
             pack,
             searcher: Arc::new(searcher),
             reverse_geocoder: Arc::new(reverse_geocoder),
             ready: Arc::new(AtomicBool::new(true)),
             error_log: ErrorLog::default(),
+            batch_pool: Arc::new(batch_pool),
+            // Batches and jobs share the pool's cores, so running more of them
+            // at once than there are cores only slows each one down.
+            batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
+            jobs: Arc::new(JobStore::open(jobs.to_path_buf(), limits.job_retention())?),
+            lookup_slots: Arc::new(Semaphore::new(
+                limits
+                    .max_concurrent_lookups(resources.usable_cpus)
+                    .min(Semaphore::MAX_PERMITS),
+            )),
+            spec: openapi::document(&limits)?.into(),
+            limits,
         })
+    }
+
+    pub(crate) fn jobs(&self) -> &JobStore {
+        &self.jobs
+    }
+
+    pub(crate) fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub(crate) fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    /// Where batch items and job rows run.
+    pub(crate) fn batch_pool(&self) -> &ThreadPool {
+        &self.batch_pool
+    }
+
+    /// One permit per batch or job running; one without a permit is refused.
+    pub(crate) fn batch_slots(&self) -> &Arc<Semaphore> {
+        &self.batch_slots
+    }
+
+    pub(crate) fn error_log(&self) -> &ErrorLog {
+        &self.error_log
     }
 
     /// True once the Pack is loaded and the Runtime can answer API traffic
@@ -99,12 +173,9 @@ pub(crate) struct SearchParams {
 
 /// Resolve the `layer` filter, rejecting a layer that does not exist.
 ///
-/// An unknown layer used to pass through to the index and match nothing, so a
-/// typo looked exactly like "no results here" and clients had no way to tell
-/// the two apart. Both comparable open geocoders reject it instead: Pelias
-/// answers `'bogus' is an invalid layers parameter. Valid options: ...` and
-/// Photon `Unknown layer type. Available layers: [...]`, each a 400 listing
-/// what it would have accepted. We do the same.
+/// An unknown layer is a 400 listing the valid ones, not a filter that
+/// matches nothing: a typo would look exactly like "no results here", and a
+/// client could not tell the two apart.
 ///
 /// An empty or whitespace-only value means "no filter", which is what a form
 /// that always sends the key produces.
@@ -127,9 +198,8 @@ fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
 /// alpha-2 codes, upper-cased, naming the countries to answer from.
 ///
 /// A Pack built from one extract covers one country and needs none. One built
-/// from several covers them all, and this narrows a search to part of it —
-/// the same job `country` does on a Pelias or Photon query, where it is also
-/// a filter on one index rather than a route to one of many.
+/// from several covers them all, and this narrows a search to part of it: a
+/// filter on one index, not a route to one of many.
 ///
 /// A code that is not two letters is rejected, like an unknown `layer`: a
 /// typo that silently matched nothing would look exactly like "no results
@@ -176,14 +246,19 @@ pub(crate) struct GeocodeParams {
     country: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub(crate) struct ReverseParams {
     lon: f64,
     lat: f64,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let state = AppState::open(&options.pack)?;
+    let jobs_dir = options
+        .job_dir
+        .clone()
+        .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
+    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
+    tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(state, options.demo.as_deref(), options.basemap.as_deref());
 
     let listener = TcpListener::bind(options.bind)
@@ -209,15 +284,34 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 ///
 /// Split out from [`serve`] so it can be exercised without binding a socket.
 pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option<&Path>) -> Router {
-    // Read-only API and health routes: GET only (Decision 27). axum would
-    // otherwise route HEAD to the GET handler automatically, so `get_only`
-    // registers an explicit HEAD responder that returns 405. Other methods fall
-    // through to `method_not_allowed_fallback`.
+    // Read-only routes: GET only (Decision 27), and QUERY or POST for a batch
+    // on the lookup routes. axum would otherwise route HEAD to the GET
+    // handler automatically, so both register an explicit HEAD responder that
+    // returns 405. Other methods fall through to a 405.
+    let max_body = state.limits().max_batch_body_bytes();
     let mut app: Router<AppState> = Router::new()
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
-        .route("/geocode", get_only(geocode))
-        .route("/reverse", get_only(reverse))
+        .route("/geocode", batchable(geocode, geocode_batch, max_body))
+        .route("/reverse", batchable(reverse, reverse_batch, max_body))
+        .route("/jobs", only(MethodFilter::POST, "POST", jobs::create))
+        .route(
+            "/jobs/{id}",
+            on(MethodFilter::GET, jobs::status)
+                .on(MethodFilter::DELETE, jobs::delete)
+                .on(MethodFilter::HEAD, || async {
+                    Problem::method_not_allowed("DELETE, GET")
+                })
+                .fallback(|| async { Problem::method_not_allowed("DELETE, GET") }),
+        )
+        .route(
+            "/jobs/{id}/results",
+            only(MethodFilter::GET, "GET", jobs::results),
+        )
+        .route(
+            "/jobs/{id}/cancel",
+            only(MethodFilter::POST, "POST", jobs::cancel),
+        )
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz));
@@ -275,6 +369,51 @@ where
     on(MethodFilter::GET, handler).on(MethodFilter::HEAD, method::method_not_allowed)
 }
 
+/// A route that answers one lookup on GET and a batch of them on QUERY or
+/// POST. axum filters only the standard methods, so QUERY reaches the batch
+/// through the route's fallback, which turns every other method away.
+fn batchable<H, T, B, U>(single: H, batch: B, max_body: usize) -> MethodRouter<AppState>
+where
+    H: Handler<T, AppState>,
+    B: Handler<U, AppState>,
+    T: 'static,
+    U: 'static,
+{
+    let query = batch.clone();
+    on(MethodFilter::GET, single)
+        .on(MethodFilter::POST, batch)
+        .on(MethodFilter::HEAD, batch_method_not_allowed)
+        .fallback(
+            move |State(state): State<AppState>, request: Request| async move {
+                if request.method().as_str() == "QUERY" {
+                    query.call(request, state).await
+                } else {
+                    batch_method_not_allowed().await.into_response()
+                }
+            },
+        )
+        // After the fallback, so the limit covers QUERY as well as POST.
+        .layer(DefaultBodyLimit::max(max_body))
+        .layer(middleware::map_response(batch::advertise))
+}
+
+/// A route that takes one method. HEAD is refused too, rather than routed to
+/// a GET handler, and every other method is a 405 naming the one it takes.
+fn only<H, T>(filter: MethodFilter, allow: &'static str, handler: H) -> MethodRouter<AppState>
+where
+    H: Handler<T, AppState>,
+    T: 'static,
+{
+    let refuse = move || async move { Problem::method_not_allowed(allow) };
+    on(filter, handler)
+        .on(MethodFilter::HEAD, refuse)
+        .fallback(refuse)
+}
+
+async fn batch_method_not_allowed() -> Problem {
+    Problem::method_not_allowed(batch::METHODS)
+}
+
 /// Run geocoder work, GeoJSON included, on the blocking pool. Its errors and
 /// a panic both become Problems here, with their cause kept for the log, so a
 /// handler only needs `?`.
@@ -286,9 +425,32 @@ where
     task::spawn_blocking(work).await?.map_err(Problem::from)
 }
 
-/// A query string that does not parse; the rejection's own text is not shown.
+/// Run one lookup under the server's limits: refused with 503 `busy` while
+/// as many run as the server allows, and stopped at its next check past the
+/// lookup timeout, or once this future is dropped, as axum drops it when the
+/// client disconnects.
+async fn lookup<T, F>(state: &AppState, work: F) -> Result<T, Problem>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let Ok(permit) = Arc::clone(&state.lookup_slots).try_acquire_owned() else {
+        return Err(Problem::busy(LOOKUP_RETRY_AFTER_SECONDS));
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel = CancelOnDrop(Arc::clone(&cancel));
+    let stop = Stop::new(state.limits.lookup_timeout(), cancel);
+    // The work holds the slot, not this future: a lookup whose client left
+    // holds it until it stops.
+    blocking(move || {
+        let _permit = permit;
+        stop::within(stop, work)
+    })
+    .await
+}
+
 fn malformed_parameters(_: QueryRejection) -> Problem {
-    Problem::malformed_parameter("could not parse query parameters")
+    Problem::unparsable_parameters()
 }
 
 /// Search addresses
@@ -343,29 +505,38 @@ pub(crate) async fn search(
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
+    let options = search_request(params)?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || search_answer(&worker, options)).await?;
+    Ok(Json(collection))
+}
 
-    let query = bounds::validate_query(params.q.as_deref().unwrap_or_default())?;
-    bounds::validate_search_limit(params.limit)?;
-    let layer = parse_layer(params.layer.as_deref())?;
-    let countries = parse_countries(params.country.as_deref())?;
-    let focus = bounds::parse_focus(params.focus.as_deref())?;
-    let bbox = bounds::parse_bbox(params.bbox.as_deref())?;
-
-    let options = TextSearchOptions {
-        query: query.clone(),
-        limit: params.limit,
-        layer: layer.map(|layer| layer.as_str().to_string()),
-        countries: countries.clone(),
+/// `/search`'s parameters, checked.
+fn search_request(params: SearchParams) -> Result<TextSearchOptions, Problem> {
+    let SearchParams {
+        q,
+        limit,
+        country,
+        layer,
         focus,
         bbox,
-    };
-    let collection = blocking(move || {
-        let hits = state.searcher.search(&options)?;
-        api::forward_collection(&state.pack, query, hits)
+    } = params;
+    let query = bounds::validate_query(q.as_deref().unwrap_or_default())?;
+    bounds::validate_search_limit(limit)?;
+    let layer = parse_layer(layer.as_deref())?;
+    Ok(TextSearchOptions {
+        query,
+        limit,
+        layer: layer.map(|layer| layer.as_str().to_string()),
+        countries: parse_countries(country.as_deref())?,
+        focus: bounds::parse_focus(focus.as_deref())?,
+        bbox: bounds::parse_bbox(bbox.as_deref())?,
     })
-    .await?;
+}
 
-    Ok(Json(collection))
+fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<ForwardCollection> {
+    let hits = state.searcher.search(&options)?;
+    api::forward_collection(&state.pack, options.query, hits)
 }
 
 /// Autocomplete addresses
@@ -438,9 +609,10 @@ pub(crate) async fn autocomplete(
         focus,
         bbox,
     };
-    let collection = blocking(move || {
-        let hits = state.searcher.autocomplete(&options)?;
-        api::forward_collection(&state.pack, query, hits)
+    let worker = state.clone();
+    let collection = lookup(&state, move || {
+        let hits = worker.searcher.autocomplete(&options)?;
+        api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
 
@@ -512,7 +684,95 @@ pub(crate) async fn geocode(
     params: Result<Query<GeocodeParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
+    let options = geocode_request(params)?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
+    Ok(Json(collection))
+}
 
+/// Geocode many addresses whose parts are already apart in one request.
+///
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /geocode` takes, plus an
+/// optional `id` echoed in its result. The request's own query-string
+/// parameters apply to every item, and an item's own fields override them:
+/// `?country=CA` scopes every item to Canada.
+/// `QUERY` takes the same body and answers the same: `POST` is for clients
+/// that cannot send `QUERY`.
+///
+/// Each result's `response` is exactly what `GET` returns for its item, and
+/// its `error` the Problem `GET` would return. Results are in input order,
+/// one per item, and a bad item never fails the batch.
+#[utoipa::path(
+    post,
+    path = "/geocode",
+    tag = "geocoding",
+    params(
+        ("address" = Option<String>, Query,
+         description = "House number and street, without town or postcode. Applies \
+                        to every item; an item's own field overrides it.",
+         max_length = 256),
+        ("locality" = Option<String>, Query,
+         description = "City or town. Applies to every item; an item's own field \
+                        overrides it.",
+         max_length = 256),
+        ("region" = Option<String>, Query,
+         description = "State, province or region. Applies to every item; an \
+                        item's own field overrides it.",
+         max_length = 256),
+        ("postcode" = Option<String>, Query,
+         description = "Postal code. Applies to every item; an item's own field \
+                        overrides it.",
+         max_length = 256),
+        ("limit" = Option<usize>, Query,
+         description = "Number of candidates to consider. Applies to every item; \
+                        an item's own field overrides it.",
+         minimum = 0, maximum = 50),
+        ("layer" = Option<Layer>, Query,
+         description = "Consider only candidates of this layer. Applies to every \
+                        item; an item's own field overrides it."),
+        ("country" = Option<String>, Query,
+         description = "Comma-separated ISO 3166-1 alpha-2 codes. Applies to every \
+                        item; an item's own field overrides it.",
+         example = "CA"),
+    ),
+    request_body(content = Vec<openapi::GeocodeItem>, content_type = "application/json"),
+    responses(
+        (status = 200, description = "One result per item, in input order.",
+         body = openapi::ForwardBatch),
+        (status = 400, description = "The body is not a JSON array of objects, or the \
+                                      query string did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 415, description = "The body was not sent as `application/json`.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The batch failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "Every slot batches and jobs share is taken. Retry after the \
+                                      `Retry-After` header's seconds.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Request) -> Response {
+    batch::run(state, GEOCODE, request).await
+}
+
+/// `/geocode` as a batch item, in `QUERY /geocode` and in `/jobs`.
+pub(crate) const GEOCODE: Lookup<
+    GeocodeParams,
+    AddressGeocodeOptions,
+    ForwardCollection,
+    [String; 3],
+> = Lookup {
+    route: "/geocode",
+    prepare: geocode_request,
+    place: geocode_place,
+    answer: geocode_answer,
+};
+
+/// `/geocode`'s parameters, checked.
+fn geocode_request(params: GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
     let address = bounds::validate_query(params.address.as_deref().unwrap_or_default())
         .map_err(|_| Problem::invalid_query("address must not be empty"))?;
     // The context fields narrow the search rather than drive it, so an empty
@@ -526,28 +786,34 @@ pub(crate) async fn geocode(
     let postcode = context(params.postcode)?;
     bounds::validate_search_limit(params.limit)?;
     let layer = parse_layer(params.layer.as_deref())?;
-    let countries = parse_countries(params.country.as_deref())?;
-
-    let options = AddressGeocodeOptions {
-        address: address.clone(),
+    Ok(AddressGeocodeOptions {
+        address,
         locality,
         region,
         postcode,
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
-        countries,
-    };
-    let collection = blocking(move || {
-        let found = state.searcher.geocode_address(&options)?;
-        let (query, hits) = match found {
-            Some(found) => (found.query, vec![found.hit]),
-            None => (address, Vec::new()),
-        };
-        api::forward_collection(&state.pack, query, hits)
+        countries: parse_countries(params.country.as_deref())?,
     })
-    .await?;
+}
 
-    Ok(Json(collection))
+/// Addresses in one postcode and town read the same part of the Pack, so a
+/// batch looks them up together, as `geocode batch` does its rows.
+fn geocode_place(options: &AddressGeocodeOptions) -> [String; 3] {
+    let field = |value: &Option<String>| value.as_deref().unwrap_or_default().to_lowercase();
+    [
+        field(&options.postcode).replace(' ', ""),
+        field(&options.region),
+        field(&options.locality),
+    ]
+}
+
+fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<ForwardCollection> {
+    let (query, hits) = match state.searcher.geocode_address(&options)? {
+        Some(found) => (found.query, vec![found.hit]),
+        None => (options.address, Vec::new()),
+    };
+    api::forward_collection(&state.pack, query, hits)
 }
 
 /// Reverse geocode a point
@@ -580,19 +846,88 @@ pub(crate) async fn reverse(
     params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-
-    bounds::validate_coords(params.lon, params.lat)?;
-
-    let collection = blocking(move || {
-        let response = state.reverse_geocoder.reverse(GeocodeOptions {
-            lon: params.lon,
-            lat: params.lat,
-        })?;
-        api::reverse_collection(&state.pack, &response)
-    })
-    .await?;
-
+    let options = reverse_request(params)?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
     Ok(Json(collection))
+}
+
+/// Find the places at many points in one request.
+///
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /reverse` takes, plus an
+/// optional `id` echoed in its result.
+/// `QUERY` takes the same body and answers the same: `POST` is for clients
+/// that cannot send `QUERY`.
+///
+/// Each result's `response` is exactly what `GET` returns for its item, and
+/// its `error` the Problem `GET` would return. Results are in input order,
+/// one per item, and a bad item never fails the batch.
+#[utoipa::path(
+    post,
+    path = "/reverse",
+    tag = "geocoding",
+    params(
+        ("lon" = Option<f64>, Query,
+         description = "Longitude in degrees. Applies to every item; an item's own \
+                        field overrides it.",
+         minimum = -180.0, maximum = 180.0),
+        ("lat" = Option<f64>, Query,
+         description = "Latitude in degrees. Applies to every item; an item's own \
+                        field overrides it.",
+         minimum = -90.0, maximum = 90.0),
+    ),
+    request_body(content = Vec<openapi::ReverseItem>, content_type = "application/json"),
+    responses(
+        (status = 200, description = "One result per item, in input order.",
+         body = openapi::ReverseBatch),
+        (status = 400, description = "The body is not a JSON array of objects, or the \
+                                      query string did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 415, description = "The body was not sent as `application/json`.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The batch failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "Every slot batches and jobs share is taken. Retry after the \
+                                      `Retry-After` header's seconds.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Request) -> Response {
+    batch::run(state, REVERSE, request).await
+}
+
+/// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
+pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollection, u64> = Lookup {
+    route: "/reverse",
+    prepare: reverse_request,
+    place: reverse_place,
+    answer: reverse_answer,
+};
+
+/// `/reverse`'s parameters, checked.
+fn reverse_request(params: ReverseParams) -> Result<GeocodeOptions, Problem> {
+    bounds::validate_coords(params.lon, params.lat)?;
+    Ok(GeocodeOptions {
+        lon: params.lon,
+        lat: params.lat,
+    })
+}
+
+/// The Pack stores records in Hilbert order, so points close on this curve
+/// read neighbouring pages.
+fn reverse_place(options: &GeocodeOptions) -> u64 {
+    hilbert_key(
+        (options.lon * 1e7).round() as i32,
+        (options.lat * 1e7).round() as i32,
+    )
+}
+
+fn reverse_answer(state: &AppState, options: GeocodeOptions) -> Result<ReverseCollection> {
+    let response = state.reverse_geocoder.reverse(options)?;
+    api::reverse_collection(&state.pack, &response)
 }
 
 #[cfg(test)]
@@ -603,6 +938,9 @@ mod router_tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
+
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::time::Duration;
 
     use super::*;
     use crate::pack::Writer;
@@ -651,9 +989,20 @@ mod router_tests {
     }
 
     fn state_for(pack_dir: &Path, ready: bool) -> AppState {
-        let state = AppState::open(pack_dir).expect("open shared pack");
+        state_with(pack_dir, ready, Limits::DEFAULT)
+    }
+
+    fn state_with(pack_dir: &Path, ready: bool, limits: Limits) -> AppState {
+        let state = AppState::open(pack_dir, &pack_dir.with_extension("jobs"), limits)
+            .expect("open shared pack");
         state.ready.store(ready, Ordering::Release);
         state
+    }
+
+    fn limits_with(change: impl FnOnce(&mut Limits)) -> Limits {
+        let mut limits = Limits::DEFAULT;
+        change(&mut limits);
+        limits
     }
 
     fn request(method: &str, uri: &str) -> Request<Body> {
@@ -903,7 +1252,7 @@ mod router_tests {
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // POST to a GET-only route -> 405 with Allow: GET.
-        let reply = send(router.clone(), request("POST", "/search")).await;
+        let reply = send(router.clone(), request("POST", "/autocomplete")).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(reply.content_type(), "application/problem+json");
         assert_eq!(
@@ -1080,7 +1429,9 @@ mod router_tests {
             ("GET", "/search?q=", StatusCode::BAD_REQUEST),
             ("GET", "/reverse?lon=999&lat=0", StatusCode::BAD_REQUEST),
             ("GET", "/does-not-exist", StatusCode::NOT_FOUND),
+            ("POST", "/autocomplete", StatusCode::METHOD_NOT_ALLOWED),
             ("POST", "/search", StatusCode::METHOD_NOT_ALLOWED),
+            ("POST", "/geocode", StatusCode::UNSUPPORTED_MEDIA_TYPE),
             ("GET", "/search?q=King%20Street", StatusCode::OK),
         ] {
             let reply = send(router.clone(), request(method, uri)).await;
@@ -1094,6 +1445,693 @@ mod router_tests {
             }
         }
         assert!(log.lines().is_empty());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn batch_request(method: &str, uri: &str, body: impl Into<String>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.into()))
+            .unwrap()
+    }
+
+    fn header_value<'a>(reply: &'a Reply, name: &str) -> Option<&'a str> {
+        reply
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    fn upload(uri: &str, content_type: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn csv_rows(body: &[u8]) -> Vec<BTreeMap<String, String>> {
+        let mut reader = csv::Reader::from_reader(body);
+        let headers = reader.headers().expect("headers").clone();
+        reader
+            .records()
+            .map(|record| {
+                let record = record.expect("record");
+                headers
+                    .iter()
+                    .zip(record.iter())
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A CSV comes back as it went, each row with `geocode batch`'s columns
+    /// holding its `GET` answer, and the job can be read again by its id.
+    #[tokio::test]
+    async fn jobs_stream_a_csv_back_with_each_rows_answer() {
+        let pack = temp_path("jobs-csv");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let body = "ref,street,town,zip\n\
+                    a,10 King Street,,M5V 1A1\n\
+                    b,,,\n\
+                    c,10 King Street,,V6B 1A1\n\
+                    d,10 King Street,,M5V 1A1\n";
+        let reply = send(
+            router.clone(),
+            upload(
+                "/jobs?address=street&locality=town&postcode=zip",
+                "text/csv",
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(reply.content_type(), "text/csv");
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+
+        let rows = csv_rows(&reply.body);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["ref"].as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+        let get = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
+            ),
+        )
+        .await
+        .json();
+        let coordinates = &get["features"][0]["geometry"]["coordinates"];
+        assert_eq!(rows[0]["geocode_status"], "resolved");
+        assert_eq!(
+            rows[0]["geocode_lon"].parse::<f64>().unwrap(),
+            coordinates[0].as_f64().unwrap()
+        );
+        assert_eq!(rows[1]["geocode_status"], "error");
+        assert!(rows[1]["geocode_reason"].starts_with("invalid_query"));
+        assert_eq!(rows[2]["geocode_status"], "unresolved");
+        // The repeat of row a is answered from it, alike.
+        assert_eq!(rows[3]["geocode_lon"], rows[0]["geocode_lon"]);
+
+        let status = send(router.clone(), request("GET", &location)).await.json();
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["endpoint"], "geocode");
+        assert_eq!(
+            status["summary"],
+            serde_json::json!({"total": 4, "succeeded": 3, "failed": 1})
+        );
+        assert!(status["expires_at"].is_u64());
+        let again = send(
+            router.clone(),
+            request("GET", &format!("{location}/results")),
+        )
+        .await;
+        assert_eq!(again.body, reply.body);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// JSONL rows are batch items, answered as their `GET` is, each tagged
+    /// with its place in the upload.
+    #[tokio::test]
+    async fn jobs_answer_jsonl_rows_as_their_get() {
+        let pack = temp_path("jobs-jsonl");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let body = "{\"id\": \"p\", \"lon\": -79.0, \"lat\": 43.0}\n\
+                    \n\
+                    {\"lon\": 999, \"lat\": 0}\n\
+                    not json\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", body),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(reply.content_type(), "application/jsonl");
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 3);
+
+        let get = send(router.clone(), request("GET", "/reverse?lon=-79&lat=43"))
+            .await
+            .json();
+        assert_eq!(lines[0]["id"], "p");
+        assert_eq!(lines[0]["status"], 200);
+        assert_eq!(lines[0]["response"], get);
+        assert_eq!(lines[1]["status"], 400);
+        assert_eq!(lines[1]["error"]["error_code"], "invalid_coordinate");
+        assert_eq!(lines[2]["error"]["error_code"], "malformed_body");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `Prefer: respond-async` is answered once the upload is in, and the
+    /// results are read from the job.
+    #[tokio::test]
+    async fn jobs_answer_at_once_when_asked() {
+        let pack = temp_path("jobs-async");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let mut request_ = upload("/jobs", "text/csv", "Address,City\n10 King Street,\n");
+        request_
+            .headers_mut()
+            .insert("prefer", header::HeaderValue::from_static("respond-async"));
+        let reply = send(router.clone(), request_).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+        let id = reply.json()["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            header_value(&reply, "location"),
+            Some(format!("/jobs/{id}").as_str())
+        );
+
+        let results = send(
+            router.clone(),
+            request("GET", &format!("/jobs/{id}/results")),
+        )
+        .await;
+        let rows = csv_rows(&results.body);
+        assert_eq!(rows[0]["geocode_status"], "resolved");
+        let status = send(router.clone(), request("GET", &format!("/jobs/{id}"))).await;
+        assert_eq!(status.json()["status"], "completed");
+
+        let deleted = send(router.clone(), request("DELETE", &format!("/jobs/{id}"))).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+        let gone = send(router.clone(), request("GET", &format!("/jobs/{id}"))).await;
+        assert_eq!(gone.status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// What `/jobs` cannot read is refused before it starts.
+    #[tokio::test]
+    async fn jobs_refuse_what_they_cannot_read() {
+        let pack = temp_path("jobs-refused");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let code = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
+
+        let reply = send(router.clone(), upload("/jobs", "application/json", "[]")).await;
+        assert_eq!(reply.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let reply = send(
+            router.clone(),
+            upload("/jobs", "text/csv", "foo,bar\n1,2\n"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(
+            reply.json()["detail"]
+                .as_str()
+                .unwrap()
+                .contains("foo, bar")
+        );
+
+        let reply = send(
+            router.clone(),
+            upload("/jobs?address=street", "text/csv", "foo,bar\n1,2\n"),
+        )
+        .await;
+        assert_eq!(code(&reply).as_deref(), Some("malformed_parameter"));
+        assert_eq!(reply.json()["invalid_params"][0]["name"], "street");
+
+        let reply = send(router.clone(), upload("/jobs", "application/jsonl", "{}\n")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=search", "application/jsonl", "{}\n"),
+        )
+        .await;
+        assert_eq!(reply.json()["invalid_params"][0]["name"], "endpoint");
+
+        for (method, uri) in [
+            ("GET", "/jobs/nope"),
+            ("GET", "/jobs/nope/results"),
+            ("POST", "/jobs/nope/cancel"),
+            ("DELETE", "/jobs/nope"),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        for (method, uri, allow) in [
+            ("GET", "/jobs", "POST"),
+            ("PUT", "/jobs/nope", "DELETE, GET"),
+            ("POST", "/jobs/nope/results", "GET"),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(
+                reply.status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri}"
+            );
+            assert_eq!(header_value(&reply, "allow"), Some(allow));
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A finished job is still served after a restart, and one that was
+    /// running when the server stopped is failed, not left running forever.
+    #[tokio::test]
+    async fn jobs_outlive_a_restart() {
+        let pack = temp_path("jobs-restart");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        let router = build_router(state_for(&pack, true), None, None);
+        let reply = send(
+            router,
+            upload("/jobs", "text/csv", "street\n10 King Street\n"),
+        )
+        .await;
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+        std::fs::write(
+            spool.join("interrupted.json"),
+            serde_json::json!({
+                "id": "interrupted",
+                "endpoint": "geocode",
+                "status": "running",
+                "input_format": "csv",
+                "output_format": "csv",
+                "summary": {"total": 0, "succeeded": 0, "failed": 0},
+                "created_at": 0,
+                "results_url": "/jobs/interrupted/results",
+            })
+            .to_string(),
+        )
+        .expect("write a running job");
+
+        let router = build_router(state_for(&pack, true), None, None);
+        let status = send(router.clone(), request("GET", &location)).await.json();
+        assert_eq!(status["status"], "completed");
+        let results = send(
+            router.clone(),
+            request("GET", &format!("{location}/results")),
+        )
+        .await;
+        assert_eq!(results.body, reply.body);
+        let interrupted = send(router, request("GET", "/jobs/interrupted"))
+            .await
+            .json();
+        assert_eq!(interrupted["status"], "failed");
+        assert!(interrupted["error"].as_str().unwrap().contains("restarted"));
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// Each item is answered as its own `GET` would be, a bad item fails
+    /// alone, ids are echoed and the query string scopes every item.
+    #[tokio::test]
+    async fn batch_answers_each_item_alone() {
+        let pack = temp_path("batch-items");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let reply = send(
+            router.clone(),
+            batch_request(
+                "POST",
+                "/geocode?postcode=M5V%201A1",
+                r#"[
+                    {"id": "row-1", "address": "10 King Street"},
+                    {"id": "row-2", "address": ""},
+                    {"address": "10 King Street", "postcode": "V6B 1A1"},
+                    {"id": 7, "address": "10 King Street"},
+                    {"id": "row-5", "address": "10 King Street", "limit": 999},
+                    {"id": "row-6", "address": ["10 King Street"]},
+                    {"id": "row-7", "address": "10 King Street", "postcode": null}
+                ]"#,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.content_type(), "application/json");
+        let body = reply.json();
+        let results = body["results"].as_array().expect("results");
+        assert_eq!(results.len(), 7);
+
+        // The shared postcode applies: the address is in it.
+        assert_eq!(results[0]["id"], "row-1");
+        assert_eq!(results[0]["status"], 200);
+        assert_eq!(
+            results[0]["response"]["features"]
+                .as_array()
+                .expect("features")
+                .len(),
+            1
+        );
+        assert!(results[0].get("error").is_none());
+
+        // Fails as `GET` fails, with the batch's request id, and the batch
+        // goes on.
+        assert_eq!(results[1]["id"], "row-2");
+        assert_eq!(results[1]["status"], 400);
+        assert_eq!(results[1]["error"]["error_code"], "invalid_query");
+        assert_eq!(
+            results[1]["error"]["request_id"].as_str(),
+            reply.request_id().as_deref()
+        );
+        assert!(results[1].get("response").is_none());
+
+        // The item's own postcode overrides the shared one; no id, no `id`.
+        assert!(results[2].get("id").is_none());
+        assert_eq!(results[2]["status"], 200);
+        assert_eq!(results[2]["response"]["features"], serde_json::json!([]));
+
+        // An id that is not a string is the item's error, and is not echoed.
+        assert!(results[3].get("id").is_none());
+        assert_eq!(results[3]["status"], 400);
+        assert_eq!(results[3]["error"]["invalid_params"][0]["name"], "id");
+
+        assert_eq!(results[4]["error"]["error_code"], "limit_too_large");
+        assert_eq!(results[5]["error"]["invalid_params"][0]["name"], "address");
+
+        // A null is an absent field, so the shared postcode still applies.
+        assert_eq!(results[6]["status"], 200);
+        assert_eq!(
+            results[6]["response"]["features"]
+                .as_array()
+                .expect("features")
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            body["summary"],
+            serde_json::json!({"total": 7, "succeeded": 3, "failed": 4})
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// JSON keeps the last of two equal keys, but `GET` refuses a repeated
+    /// parameter, so the item is refused the same way.
+    #[tokio::test]
+    async fn batch_item_with_a_repeated_field_fails_as_get_does() {
+        let pack = temp_path("batch-repeated");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let get = send(
+            router.clone(),
+            request("GET", "/geocode?address=10%20King%20Street&address=x"),
+        )
+        .await;
+        let batch = send(
+            router,
+            batch_request(
+                "POST",
+                "/geocode",
+                r#"[{"address": "10 King Street", "address": "x"}]"#,
+            ),
+        )
+        .await;
+        let result = &batch.json()["results"][0];
+        assert_eq!(result["status"], get.status.as_u16());
+        assert_eq!(result["error"]["error_code"], get.json()["error_code"]);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// With every slot taken a batch is refused at once, told when to retry,
+    /// and single lookups still answer.
+    #[tokio::test]
+    async fn batch_is_refused_when_every_slot_is_taken() {
+        let pack = temp_path("batch-busy");
+        write_pack(&pack);
+        let state = state_for(&pack, true);
+        let slots = Arc::clone(state.batch_slots());
+        let taken = Arc::clone(&slots)
+            .try_acquire_many_owned(slots.available_permits() as u32)
+            .expect("take every slot");
+        let router = build_router(state, None, None);
+
+        let body = r#"[{"address": "10 King Street"}]"#;
+        let reply = send(router.clone(), batch_request("POST", "/geocode", body)).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.json()["error_code"], "busy");
+        assert_eq!(header_value(&reply, "retry-after"), Some("1"));
+
+        let single = send(
+            router.clone(),
+            request("GET", "/geocode?address=10%20King%20Street"),
+        )
+        .await;
+        assert_eq!(single.status, StatusCode::OK);
+
+        drop(taken);
+        let reply = send(router, batch_request("POST", "/geocode", body)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_a_bad_request_whole() {
+        let pack = temp_path("batch-request-errors");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(3).expect("3"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+        let error = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
+
+        for body in [r#"{"q": "King"}"#, "[1, 2]", "[{}, \"q\"]", "not json", ""] {
+            let reply = send(router.clone(), batch_request("POST", "/geocode", body)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(reply.content_type(), "application/problem+json");
+            assert_eq!(error(&reply).as_deref(), Some("malformed_body"), "{body}");
+        }
+
+        let too_many = format!(
+            "[{}]",
+            vec![r#"{"address": "King"}"#; limits.max_batch_items() + 1].join(",")
+        );
+        let reply = send(router.clone(), batch_request("POST", "/geocode", too_many)).await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error(&reply).as_deref(), Some("too_many_items"));
+
+        let full = format!(
+            "[{}]",
+            vec![r#"{"address": "King"}"#; limits.max_batch_items()].join(",")
+        );
+        let reply = send(router.clone(), batch_request("POST", "/geocode", full)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        // Turned away on its declared length, before a byte is read.
+        let mut declared = batch_request("POST", "/geocode", "[]");
+        declared.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from(limits.max_batch_body_bytes() + 1),
+        );
+        let reply = send(router.clone(), declared).await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error(&reply).as_deref(), Some("body_too_large"));
+
+        // And on what arrives, when no length is declared.
+        let oversized = " ".repeat(limits.max_batch_body_bytes() + 1);
+        for method in ["POST", "QUERY"] {
+            let request = batch_request(method, "/geocode", oversized.clone());
+            let reply = send(router.clone(), request).await;
+            assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE, "{method}");
+            assert_eq!(error(&reply).as_deref(), Some("body_too_large"));
+        }
+
+        for content_type in [None, Some("text/plain"), Some("application/jsonx")] {
+            let mut request = batch_request("POST", "/geocode", "[]");
+            match content_type {
+                Some(value) => request.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static(value),
+                ),
+                None => request.headers_mut().remove(header::CONTENT_TYPE),
+            };
+            let reply = send(router.clone(), request).await;
+            assert_eq!(
+                reply.status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type:?}"
+            );
+            assert_eq!(error(&reply).as_deref(), Some("unsupported_media_type"));
+        }
+
+        let mut charset = batch_request("POST", "/geocode", "[]");
+        charset.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("Application/JSON; charset=utf-8"),
+        );
+        let reply = send(router.clone(), charset).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["summary"],
+            serde_json::json!({"total": 0, "succeeded": 0, "failed": 0})
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// QUERY reaches the batch, every answer of a batchable route says how
+    /// to batch, and the methods it does not take are a 405 that lists the
+    /// ones it does.
+    #[tokio::test]
+    async fn batchable_routes_take_query_and_post() {
+        let pack = temp_path("batch-methods");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let body = r#"[{"lon": -79.0, "lat": 43.0}, {"lon": 999, "lat": 0}]"#;
+        let tagged = |method| {
+            let mut request = batch_request(method, "/reverse", body);
+            request
+                .headers_mut()
+                .insert("x-request-id", header::HeaderValue::from_static("same"));
+            request
+        };
+        let query = send(router.clone(), tagged("QUERY")).await;
+        let post = send(router.clone(), tagged("POST")).await;
+        assert_eq!(query.status, StatusCode::OK);
+        assert_eq!(query.json()["results"][0]["status"], 200);
+        assert_eq!(query.json()["results"][1]["status"], 400);
+        assert_eq!(query.body, post.body);
+
+        for route in [
+            "/geocode?address=10%20King%20Street",
+            "/reverse?lon=0&lat=0",
+        ] {
+            let reply = send(router.clone(), request("GET", route)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{route}");
+            assert_eq!(header_value(&reply, "allow"), Some(batch::METHODS));
+            assert_eq!(
+                header_value(&reply, "accept-query"),
+                Some("application/json")
+            );
+        }
+        // A Problem keeps the route's headers when the id is written in.
+        let reply = send(router.clone(), request("GET", "/geocode?address=")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            header_value(&reply, "accept-query"),
+            Some("application/json")
+        );
+        assert!(reply.json()["request_id"].is_string());
+
+        for method in ["HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+            let reply = send(router.clone(), request(method, "/geocode")).await;
+            assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(
+                header_value(&reply, "allow"),
+                Some(batch::METHODS),
+                "{method}"
+            );
+        }
+        // A route without a batch still takes GET only.
+        let reply = send(router.clone(), request("QUERY", "/autocomplete")).await;
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(header_value(&reply, "allow"), Some("GET"));
+        assert!(header_value(&reply, "accept-query").is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PanicParams {
+        q: String,
+    }
+
+    fn panic_on_boom(state: &AppState, query: String) -> Result<ForwardCollection> {
+        assert_ne!(query, "boom", "label {} out of range", 7);
+        api::forward_collection(&state.pack, query, Vec::new())
+    }
+
+    /// A panic fails its item with a bare 500, logged with the item's place,
+    /// and the items around it are answered.
+    #[tokio::test]
+    async fn batch_item_panic_fails_only_that_item() {
+        let pack = temp_path("batch-panic");
+        write_pack(&pack);
+        let log = ErrorLog::capture();
+        let mut state = state_for(&pack, true);
+        state.error_log = log.clone();
+        let router = Router::new()
+            .route(
+                "/boom",
+                axum::routing::post(
+                    |State(state): State<AppState>, request: Request<Body>| async move {
+                        let lookup = Lookup {
+                            route: "/boom",
+                            prepare: |params: PanicParams| Ok(params.q),
+                            place: |_: &String| (),
+                            answer: panic_on_boom,
+                        };
+                        batch::run(state, lookup, request).await
+                    },
+                ),
+            )
+            .layer(middleware::from_fn_with_state(
+                log.clone(),
+                request_id::propagate,
+            ))
+            .with_state(state);
+
+        let mut tagged = batch_request(
+            "POST",
+            "/boom",
+            r#"[{"q": "fine"}, {"id": "x", "q": "boom"}, {"q": "fine"}]"#,
+        );
+        tagged
+            .headers_mut()
+            .insert("cf-ray", header::HeaderValue::from_static("ray-batch"));
+        let reply = send(router, tagged).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let statuses = body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["status"].as_u64().expect("status"))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, [200, 500, 200]);
+        let error = &body["results"][1]["error"];
+        assert_eq!(body["results"][1]["id"], "x");
+        assert_eq!(error["error_code"], "internal_error");
+        assert_eq!(error["request_id"], "ray-batch");
+        assert!(error.get("detail").is_none());
+        assert!(!body.to_string().contains("out of range"));
+
+        let lines = log_lines(&log);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["request_id"], "ray-batch");
+        assert_eq!(lines[0]["route"], "/boom");
+        assert_eq!(lines[0]["item"], 1);
+        assert!(
+            lines[0]["cause"]
+                .as_str()
+                .expect("cause")
+                .contains("label 7 out of range")
+        );
 
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -1125,5 +2163,249 @@ mod router_tests {
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// A lookup past the lookup timeout stops at its next check and answers
+    /// 503 `timeout`, with no `Retry-After`: the same lookup takes as long
+    /// the next time.
+    #[tokio::test]
+    async fn a_lookup_past_its_timeout_stops_with_a_503() {
+        let pack = temp_path("lookup-timeout");
+        write_pack(&pack);
+        let limits = limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::MIN);
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|State(state): State<AppState>| async move {
+                    lookup(&state, || -> Result<&'static str> {
+                        std::thread::sleep(Duration::from_millis(20));
+                        stop::check()?;
+                        Ok("answered")
+                    })
+                    .await
+                }),
+            )
+            .with_state(state_with(&pack, true, limits));
+
+        let reply = send(router, request("GET", "/slow")).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.json()["error_code"], "timeout");
+        assert_eq!(
+            reply.json()["detail"],
+            "the lookup took longer than the server allows, 1 ms"
+        );
+        assert!(header_value(&reply, "retry-after").is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// With every lookup slot taken a single lookup is refused at once with
+    /// 503 `busy` and a `Retry-After`, and answers again once a slot frees.
+    #[tokio::test]
+    async fn a_lookup_is_refused_while_every_lookup_slot_is_taken() {
+        let pack = temp_path("lookup-busy");
+        write_pack(&pack);
+        let limits = limits_with(|limits| limits.max_concurrent_lookups = Some(NonZeroUsize::MIN));
+        let state = state_with(&pack, true, limits);
+        let taken = Arc::clone(&state.lookup_slots)
+            .try_acquire_owned()
+            .expect("take the slot");
+        let router = build_router(state, None, None);
+
+        for route in [
+            "/search?q=10%20King%20Street",
+            "/autocomplete?q=10%20King",
+            "/geocode?address=10%20King%20Street",
+            "/reverse?lon=-79&lat=43",
+        ] {
+            let reply = send(router.clone(), request("GET", route)).await;
+            assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{route}");
+            assert_eq!(reply.json()["error_code"], "busy", "{route}");
+            assert_eq!(header_value(&reply, "retry-after"), Some("1"), "{route}");
+        }
+
+        drop(taken);
+        let reply = send(
+            router,
+            request("GET", "/geocode?address=10%20King%20Street"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn slow_when_asked(state: &AppState, query: String) -> Result<ForwardCollection> {
+        if query == "slow" {
+            std::thread::sleep(Duration::from_millis(20));
+            stop::check()?;
+        }
+        api::forward_collection(&state.pack, query, Vec::new())
+    }
+
+    /// An item past the lookup timeout fails alone with 503 `timeout`, and
+    /// the items around it are answered.
+    #[tokio::test]
+    async fn a_batch_item_past_its_timeout_fails_alone() {
+        let pack = temp_path("batch-timeout");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::new(5).expect("5"));
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::post(
+                    |State(state): State<AppState>, request: Request<Body>| async move {
+                        let lookup = Lookup {
+                            route: "/slow",
+                            prepare: |params: PanicParams| Ok(params.q),
+                            place: |_: &String| (),
+                            answer: slow_when_asked,
+                        };
+                        batch::run(state, lookup, request).await
+                    },
+                ),
+            )
+            .with_state(state_with(&pack, true, limits));
+
+        let body = r#"[{"q": "fast"}, {"q": "slow"}, {"q": "fast"}]"#;
+        let reply = send(router, batch_request("POST", "/slow", body)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let statuses = body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["status"].as_u64().expect("status"))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, [200, 503, 200]);
+        assert_eq!(body["results"][1]["error"]["error_code"], "timeout");
+        assert_eq!(body["summary"]["failed"], 1);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A job reads at most the server's row cap, then fails naming it, with
+    /// the rows it read answered.
+    #[tokio::test]
+    async fn a_job_stops_reading_at_the_row_cap() {
+        let pack = temp_path("jobs-row-cap");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        let limits = limits_with(|limits| limits.max_job_rows = NonZeroUsize::new(2).expect("2"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let rows = "street\n10 King Street\n12 King Street\n14 King Street\n";
+        let reply = send(router.clone(), upload("/jobs", "text/csv", rows)).await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(csv_rows(&reply.body).len(), 2);
+        let location = header_value(&reply, "location")
+            .expect("location")
+            .to_string();
+        let status = send(router, request("GET", &location)).await.json();
+        assert_eq!(status["status"], "failed");
+        assert_eq!(status["summary"]["total"], 2);
+        assert_eq!(
+            status["error"],
+            "a job holds at most 2 rows; the rest were not read"
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// An upload declared over the server's upload limit is refused before
+    /// a byte of it is read.
+    #[tokio::test]
+    async fn a_job_upload_over_the_limit_is_refused() {
+        let pack = temp_path("jobs-upload-cap");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let limits = limits_with(|limits| limits.max_job_upload_mib = Some(NonZeroU64::MIN));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let mut declared = upload("/jobs", "text/csv", "street\n10 King Street\n");
+        declared.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from((1u64 << 20) + 1),
+        );
+        let reply = send(router, declared).await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(reply.json()["error_code"], "body_too_large");
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// While the results kept fill the job store, a new job is refused with
+    /// 503 `busy`, and the kept ones are still served.
+    #[tokio::test]
+    async fn a_full_job_store_refuses_new_jobs() {
+        let pack = temp_path("jobs-store-full");
+        write_pack(&pack);
+        let spool = pack.with_extension("jobs");
+        let _ = std::fs::remove_dir_all(&spool);
+        std::fs::create_dir_all(&spool).expect("spool");
+        // Sparse: the store counts the length, and the disk holds none of it.
+        std::fs::File::create(spool.join("kept.results"))
+            .expect("results")
+            .set_len(1 << 30)
+            .expect("length");
+        std::fs::write(
+            spool.join("kept.json"),
+            serde_json::json!({
+                "id": "kept",
+                "endpoint": "geocode",
+                "status": "completed",
+                "input_format": "csv",
+                "output_format": "csv",
+                "summary": {"total": 0, "succeeded": 0, "failed": 0},
+                "created_at": 0,
+                "results_url": "/jobs/kept/results",
+            })
+            .to_string(),
+        )
+        .expect("write a kept job");
+        let limits = limits_with(|limits| limits.max_job_store_gib = NonZeroU64::MIN);
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let reply = send(
+            router.clone(),
+            upload("/jobs", "text/csv", "street\n10 King Street\n"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.json()["error_code"], "busy");
+        assert_eq!(header_value(&reply, "retry-after"), Some("60"));
+        let kept = send(router, request("GET", "/jobs/kept")).await;
+        assert_eq!(kept.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// `/openapi.json` states the batch item cap this server was started
+    /// with.
+    #[tokio::test]
+    async fn the_served_spec_states_the_servers_limits() {
+        let pack = temp_path("spec-limits");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(7).expect("7"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+
+        let spec = send(router, request("GET", "/openapi.json")).await.json();
+        for path in ["/geocode", "/reverse"] {
+            assert_eq!(
+                spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["maxItems"],
+                7,
+                "{path}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

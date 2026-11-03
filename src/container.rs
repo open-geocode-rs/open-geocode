@@ -359,6 +359,26 @@ impl Container {
         fits
     }
 
+    /// Read in now the sections whose names start with `prefix`, as
+    /// [`Self::advise_random_reads`] reads in a whole Pack, when they fit in
+    /// half of `available_memory_bytes`. A reader that only looks things up
+    /// in them (parser training reads only `parse/*`) need not fit the whole
+    /// file. Returns the bytes read in, zero when they did not fit.
+    pub fn prefault_sections(&self, prefix: &str, available_memory_bytes: u64) -> u64 {
+        let ranges = self
+            .sections
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+            .map(|(_, info)| (info.offset as usize, info.len as usize))
+            .collect::<Vec<_>>();
+        let bytes = ranges.iter().map(|(_, len)| *len as u64).sum::<u64>();
+        if bytes == 0 || bytes > available_memory_bytes / 2 {
+            return 0;
+        }
+        prefault_ranges(&self.bytes.0, &ranges);
+        bytes
+    }
+
     pub fn sections(&self) -> &BTreeMap<String, SectionInfo> {
         &self.sections
     }
@@ -502,6 +522,42 @@ fn advise(mmap: &Mmap, prefault: bool) {
     }
 }
 
+#[cfg(unix)]
+fn prefault_ranges(mmap: &Mmap, ranges: &[(usize, usize)]) {
+    use memmap2::Advice;
+    for &(offset, len) in ranges {
+        #[cfg(target_os = "linux")]
+        if mmap.advise_range(Advice::PopulateRead, offset, len).is_ok() {
+            continue;
+        }
+        let _ = mmap.advise_range(Advice::WillNeed, offset, len);
+    }
+}
+
+#[cfg(windows)]
+fn prefault_ranges(mmap: &Mmap, ranges: &[(usize, usize)]) {
+    use windows_sys::Win32::System::{
+        Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY},
+        Threading::GetCurrentProcess,
+    };
+    let entries = ranges
+        .iter()
+        .filter(|(offset, len)| *len > 0 && offset + len <= mmap.len())
+        .map(|&(offset, len)| WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: mmap[offset..].as_ptr().cast_mut().cast(),
+            NumberOfBytes: len,
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return;
+    }
+    // SAFETY: every entry lies inside the live mapping, which the call only
+    // reads in.
+    unsafe {
+        PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0);
+    }
+}
+
 #[derive(Clone)]
 struct SharedMmap(Arc<Mmap>);
 
@@ -617,6 +673,27 @@ mod tests {
             b"added later"
         );
         assert_eq!(container.sections()["beta"].offset % SECTION_ALIGN, 0);
+    }
+
+    #[test]
+    fn reads_in_the_sections_of_a_prefix_only_when_they_fit() {
+        let path = temp_file("prefault");
+        let mut writer = Writer::create(&path).expect("writer");
+        writer.add("parse/street", 1, &[1; 300]).expect("street");
+        writer
+            .add("parse/locality", 1, &[2; 200])
+            .expect("locality");
+        writer.add("text/postings", 1, &[3; 5000]).expect("text");
+        writer.finish().expect("finish");
+        let container = Container::open(&path).expect("open");
+        assert_eq!(container.prefault_sections("parse/", 1 << 20), 500);
+        assert_eq!(
+            container.prefault_sections("parse/", 999),
+            0,
+            "over half the memory"
+        );
+        assert_eq!(container.prefault_sections("spatial/", 1 << 20), 0);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 use open_geocode::{
     alloc::CountingAlloc,
     builder::Leftover,
+    limits::Limits,
     resources,
     runtime::{ServeOptions, serve},
 };
@@ -191,6 +192,8 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             demo: None,
             bind,
             basemap: None,
+            job_dir: None,
+            limits: Limits::DEFAULT,
         }))
         .map_err(Into::into)
 }

@@ -776,6 +776,9 @@ pub struct PhaseTimings {
     pub pack_seal_ms: u128,
     /// Train the address parser and add its weights to the Pack file.
     pub parser_training_ms: u128,
+    /// Key the Pack's streets and places and add the structured index to it.
+    #[serde(default)]
+    pub structured_index_ms: u128,
     pub total_ms: u128,
 }
 
