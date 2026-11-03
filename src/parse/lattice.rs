@@ -690,6 +690,26 @@ pub(crate) fn other_forms(word: &str) -> Vec<String> {
     forms
 }
 
+/// The one full form the parser's abbreviation tables give `word`, the
+/// first in order when they give several ("tce" is "terrace"); `None` for
+/// a word that abbreviates nothing.
+pub(crate) fn full_form(word: &str) -> Option<&'static str> {
+    abbreviations::abbreviations()
+        .full_forms(word)
+        .iter()
+        .map(String::as_str)
+        .min()
+}
+
+/// The name `word` holds before a street type glued onto it ("haupt" of
+/// "hauptstr" and of "hauptstrasse"), as a type written apart is left out of
+/// a street's key; `None` when no type is glued onto it.
+pub(crate) fn glued_stem(word: &str) -> Option<&str> {
+    abbreviations::abbreviations()
+        .split_glued(word)
+        .map(|(stem, _)| stem)
+}
+
 impl fmt::Debug for LatticeTagger {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -768,12 +788,21 @@ impl LatticeTagger {
     /// well a labelling that agrees with an answer reads it (see
     /// [`Self::explain`]). `None` when the query has no words.
     pub fn parse_explained(&self, query: &str) -> (Vec<ParsedQuery>, Option<Explanation>) {
+        self.parse_explained_n(query, N_BEST)
+    }
+
+    /// [`Self::parse_explained`] with the best `n` labellings.
+    pub fn parse_explained_n(
+        &self,
+        query: &str,
+        n: usize,
+    ) -> (Vec<ParsedQuery>, Option<Explanation>) {
         let tokens = Tokens::new(query);
         if tokens.is_empty() {
             return (Vec::new(), None);
         }
         let lattice = self.lattice(&tokens, &Suppression::default());
-        let mut parsed = self.parse_lattice(&tokens, &lattice, N_BEST);
+        let mut parsed = self.parse_lattice(&tokens, &lattice, n);
         let mut explanation = Explanation {
             best: parsed.first().map_or(0.0, |parse| parse.score),
             lattice,
@@ -782,7 +811,7 @@ impl LatticeTagger {
             return (parsed, Some(explanation));
         };
         let country = &tokens.words[at..];
-        for mut reading in self.parse_tokens(&tokens.prefix(at), N_BEST) {
+        for mut reading in self.parse_tokens(&tokens.prefix(at), n) {
             let words = country.iter().map(|word| Tagged {
                 token: word.clone(),
                 label: Label::Country,
@@ -797,7 +826,7 @@ impl LatticeTagger {
             }
         }
         parsed.sort_by(|left, right| right.score.total_cmp(&left.score));
-        parsed.truncate(N_BEST);
+        parsed.truncate(n);
         if let Some(best) = parsed.first() {
             explanation.best = best.score;
         }
@@ -829,6 +858,33 @@ impl LatticeTagger {
                 .all(|set| set.is_empty() || set.contains(label))
         };
         decode::best_allowed(lattice, &self.weights, &allows).map(|path| path.score)
+    }
+
+    /// Per word of an explained query, the parser's probability that it
+    /// names a place: a locality, region or postcode, over every labelling
+    /// it weighs, not only its best.
+    pub fn place_probabilities(&self, explanation: &Explanation) -> Vec<f32> {
+        let lattice = &explanation.lattice;
+        let marginals = train::label_marginals(lattice, &self.weights);
+        let words = lattice
+            .units
+            .token_of
+            .iter()
+            .max()
+            .map_or(0, |last| last + 1);
+        let mut sums = vec![(0.0f64, 0usize); words];
+        for (unit, marginal) in marginals.iter().enumerate() {
+            let place = [Label::Locality, Label::Region, Label::Postcode]
+                .iter()
+                .map(|label| marginal[*label as usize])
+                .sum::<f64>();
+            let token = lattice.units.token_of[unit];
+            sums[token].0 += place;
+            sums[token].1 += 1;
+        }
+        sums.into_iter()
+            .map(|(sum, count)| (sum / count.max(1) as f64).clamp(0.0, 1.0) as f32)
+            .collect()
     }
 
     /// Where the country the query ends in starts: the longest run of its

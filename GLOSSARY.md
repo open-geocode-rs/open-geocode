@@ -5,8 +5,21 @@ A self-hosted geocoder: it turns written addresses and place names into location
 ## Data
 
 **Pack**:
-One file holding everything og answers from: the records, their text index and their spatial index, built once from an extract.
+One file holding everything og answers from: the records, their text index, their structured index and their spatial index, built once from an extract.
 _Avoid_: database, index (alone), dataset
+
+**Structured index**:
+The part of a Pack that finds a street by its key without a text search: the street index and the gazetteer, keyed from the sealed Pack as the last step of its build.
+A Pack built without one answers every query with the text search.
+_Avoid_: fast path, fast lane, sidecar
+
+**Street index**:
+Each street's key, by country, to its records, in map-cell order, so the records of a street inside a place are a few ranges of the list.
+_Avoid_: street map, street lists
+
+**Gazetteer**:
+Each place name, by country, to its footprint: the map cells where the Pack's records use the name, or only its extent for a place too large to list.
+_Avoid_: place index, places
 
 **Record**:
 One thing a Pack can answer with: an address, a street, a place, a postcode or a point of interest.
@@ -79,6 +92,15 @@ _Avoid_: fuzziness, fuzzy level, typo tier
 How strictly an answer matches its reading: strict (the house number, in the stated localities), street (a nearby number or the street itself standing in for it) and lenient (the stated localities only rank).
 One search in the stated localities finds strict and street answers together; a second, with the localities only ranking, runs only when it could find better evidence.
 _Avoid_: mode, attempt
+
+**Structured stage**:
+The search a query gets first: its readings find the street in the street index inside the places the gazetteer gives, place the number on it, and answer only when the verifier passes the best and two fitted models say it is likelier right than the text search's answer.
+Otherwise the text search runs as it always has; when the structured stage answers fewer than asked for, the text search gives the rest.
+_Avoid_: fast tier, fast lane
+
+**Verifier**:
+The rules a structured-stage answer must pass that the text search ranks by: not a POI, no contradicted postcode, inside the stated localities the Pack knows, the stated unit, no contradicted street type or direction, a street answer only from the street's own record and only for a query that states more than a lone name.
+_Avoid_: checks, guard
 
 **Pool**:
 Every answer the searches of one query found, each with the reading that found it and the evidence it rests on, from which the answers are chosen or ranked.

@@ -151,8 +151,9 @@ pub struct Report {
     pub lattice_memory_bytes: u64,
     pub lattice_file_bytes: u64,
     pub lattice_file_shards: usize,
-    /// Whether the Pack was read into memory up front, as it is when it
-    /// fits in half the memory available.
+    /// Whether the Pack's `parse/*` sections, all training looks up, were
+    /// read into memory up front, as they are when they fit in half the
+    /// memory available.
     pub pack_prefaulted: bool,
 }
 
@@ -321,12 +322,14 @@ pub fn train(
         ..Report::default()
     };
     let pack = Reader::open(pack)?;
-    // Every lattice looks names up all over the dictionaries.
-    report.pack_prefaulted = pack
-        .container()
-        .advise_random_reads(Resources::probe().available_memory_bytes);
+    let dictionaries = pack.container();
+    // Every lattice looks names up all over the dictionaries, and nothing
+    // else of the Pack is read at random: the records drawn are read once,
+    // in Pack order. The whole file need not fit, only them.
+    report.pack_prefaulted =
+        dictionaries.prefault_sections("parse/", Resources::probe().available_memory_bytes) > 0;
     // Only the dictionaries: the weights are what this trains.
-    let tagger = LatticeTagger::new(Dictionaries::open(pack.container())?, Weights::zero());
+    let tagger = LatticeTagger::new(Dictionaries::open(dictionaries)?, Weights::zero());
     let mut random = Random::new(SEED);
 
     // Each country's rows, rendered from its drawn records read in Pack
@@ -1187,6 +1190,44 @@ impl<'a> Reading<'a> {
 /// `index` the label `label`.
 fn allowed(golds: Option<&[u8]>, index: usize, label: Label) -> bool {
     golds.is_none_or(|golds| golds[index] & (1 << label as u8) != 0)
+}
+
+/// The probability of each label of each unit of `lattice` under
+/// `weights`: forward-backward over every labelling, in every country the
+/// lattice is decoded as, as learning reads its expected counts.
+pub(super) fn label_marginals(lattice: &Lattice, weights: &Weights) -> Vec<[f64; LABELS]> {
+    let order = span_order(lattice);
+    let readings = decode::countries(lattice)
+        .into_iter()
+        .map(|country| {
+            let edges = span_edges(lattice, weights, country);
+            Reading::new(lattice, weights, country, None, &order, edges)
+        })
+        .collect::<Vec<_>>();
+    let total = log_sum(readings.iter().map(|reading| reading.log_z));
+    let mut marginals = vec![[0.0; LABELS]; lattice.len];
+    if !total.is_finite() {
+        return marginals;
+    }
+    for reading in &readings {
+        for (index, span) in lattice.spans.iter().enumerate() {
+            for label in 0..LABELS {
+                let onward = reading.edges[index][label] + reading.beta[span.end][label] - total;
+                let probability = previous_states(span.start)
+                    .map(|previous| {
+                        (reading.alpha[span.start][previous]
+                            + reading.transitions[previous][label]
+                            + onward)
+                            .exp()
+                    })
+                    .sum::<f64>();
+                for unit in &mut marginals[span.start..span.end] {
+                    unit[label] += probability;
+                }
+            }
+        }
+    }
+    marginals
 }
 
 /// The states a segment starting at `start` can follow.

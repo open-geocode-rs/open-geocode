@@ -365,6 +365,15 @@ fn build_step(stage: BuildStage) -> Step {
                 "so queries are read the way people here write addresses.",
             ],
         ),
+        BuildStage::StructuredIndex => (
+            "Built",
+            "Building",
+            "structured index",
+            [
+                "Keying every street and place by where it lies,",
+                "so most addresses are found without a text search.",
+            ],
+        ),
     };
     let unit = match stage.unit() {
         StageUnit::Bytes => Unit::Bytes,
