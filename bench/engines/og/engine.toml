@@ -1,0 +1,7 @@
+name = "og"
+port = 7100
+forward = "/search?q={q}&limit=1"
+reverse = "/reverse?lat={lat}&lon={lon}"
+coords = "/features/0/geometry/coordinates"
+data = ["/home/ubuntu/og-bench/data/og/packs/netherlands"]
+images = ["og-bench/og@sha256:133e4fa24486d6c07b10ed0b42e979b7b1d43fb23306621ee64fb50f56494dfa"]

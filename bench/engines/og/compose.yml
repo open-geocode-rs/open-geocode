@@ -1,0 +1,16 @@
+# og serving the Netherlands Pack on 127.0.0.1:7100. og sizes its workers and
+# caches from the cgroup it runs in, so no tuning flags or limits go here;
+# the harness sets CPUs and memory on sut.slice.
+services:
+  og:
+    image: og-bench/og:cad9f81
+    build:
+      context: .
+      additional_contexts:
+        bin: ../../../target/release
+    network_mode: host
+    cgroup_parent: sut.slice
+    volumes:
+      - /home/ubuntu/og-bench/data/og/packs/netherlands:/pack:ro
+    command: ["serve", "/pack", "--bind", "127.0.0.1:7100"]
+    stop_grace_period: 30s
