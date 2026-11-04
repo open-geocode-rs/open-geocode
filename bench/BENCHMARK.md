@@ -151,9 +151,12 @@ Against the better of the other two, og:
 pass rule allows no refusals. At 11,144 req/s og answered 334,223 requests and
 refused 91 (0.03%), with p99 7 ms. The 6,191 is the highest rate with none.
 
-³ A run on the build without the fix measured 42,215 req/s. Reverse lookups
-do not use the cache the fix changes, so the gap is run-to-run variance from a
-single repeat. The full profile's three repeats will put a range on it.
+³ The same rule sets the reverse ceiling. At 33,845 req/s og refused 6
+requests out of about a million, with p99 2.0 ms, so that step failed. An
+earlier run on the build without the fix passed 42,215 req/s with p99 19 ms;
+reverse lookups do not use the cache the fix changes. Whether a burst briefly
+fills every slot within 30 seconds is chance, so og's ceilings vary from run
+to run and understate what it serves.
 
 The memory each engine used on this machine is not in the table. The JVM
 engines are sized to the box (Photon reached 23.5 GiB, Pelias 39.4 GiB, og
