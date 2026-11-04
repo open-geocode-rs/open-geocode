@@ -164,7 +164,7 @@ floor is the fair memory comparison.
 
 | | og | Photon | Pelias |
 |---|---|---|---|
-| Forward | **1 vCPU / 1 GiB** (p99 4.4 ms; 512 MiB fails) | running | running |
+| Forward | **1 vCPU / 1 GiB** (p99 4.4 ms; 512 MiB fails) | 2 vCPU / 4 GiB (p99 75.1 ms; 1 vCPU and 2 GiB fail) | running |
 | Reverse | **1 vCPU / 256 MiB** (p99 9.5 ms; the ladder's lowest step, so og's floor is lower) | running | running |
 
 ## What the benchmark found in og
