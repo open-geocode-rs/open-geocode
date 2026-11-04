@@ -7518,20 +7518,24 @@ fn typo_distance(word: &str, other: &str) -> Option<u8> {
     }
     // Ranking asks of every query word against every word of every hit,
     // and building a two-edit automaton costs far more than running one:
-    // each thread keeps the automata of the words it saw last.
+    // each thread keeps the automata of the words it saw last, and how many
+    // states they hold between them.
     thread_local! {
-        static AUTOMATA: RefCell<HashMap<String, Option<Rc<DFA>>>> = RefCell::default();
+        static AUTOMATA: RefCell<(HashMap<String, Option<Rc<DFA>>>, usize)> = RefCell::default();
     }
     let dfa = AUTOMATA.with(|automata| {
-        let mut automata = automata.borrow_mut();
+        let (automata, states) = &mut *automata.borrow_mut();
         if let Some(dfa) = automata.get(word) {
             return dfa.clone();
         }
-        if automata.len() >= MAX_CACHED_AUTOMATA {
-            automata.clear();
-        }
         let dfa = allowed_edits(word).map(|most| Rc::new(automaton_builder(most).build_dfa(word)));
+        let added = dfa.as_ref().map_or(0, |dfa| dfa.num_states());
+        if automata.len() >= MAX_CACHED_AUTOMATA || *states + added > MAX_CACHED_AUTOMATON_STATES {
+            automata.clear();
+            *states = 0;
+        }
         automata.insert(word.to_string(), dfa.clone());
+        *states += added;
         dfa
     })?;
     match dfa.eval(other) {
@@ -7542,6 +7546,15 @@ fn typo_distance(word: &str, other: &str) -> Option<u8> {
 
 /// Automata of query words each thread keeps for [`typo_distance`].
 const MAX_CACHED_AUTOMATA: usize = 4_096;
+
+/// States those automata may hold between them. A state is a table of 256
+/// `u32`, 1 KiB, and the two-edit automaton of a ten-letter word has about
+/// 250, so 4,096 automata came to a gigabyte a thread. Lookups run on the
+/// server's blocking threads, which come and go, so under load each new
+/// thread filled one more: on 16 CPUs the server ran out of memory and
+/// refused nearly every request until it was restarted. 16 MiB a thread
+/// still holds every word of a query and those of the queries just before.
+const MAX_CACHED_AUTOMATON_STATES: usize = 16 * 1024;
 
 /// The first [`TYPO_PREFIX_CHARS`] characters of `word`, which a typo
 /// keeps as written.
