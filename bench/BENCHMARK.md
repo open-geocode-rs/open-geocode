@@ -150,7 +150,7 @@ Against the better of the other two, og:
 
 - answers forward queries 2.8× faster at p50;
 - answers reverse queries 9× faster at p50;
-- serves at least 4.8× the forward traffic and 17× the reverse traffic ²;
+- serves at least 4.8× the forward traffic and 13× the reverse traffic ²;
 - starts 13× faster;
 - takes 11× less disk.
 
@@ -158,8 +158,8 @@ Against the better of the other two, og:
 run counted a single refusal as a failed step. Its steps already show:
 
 - **Forward:** at 11,144 req/s og answered 99.97% of requests with p99 7 ms.
-- **Reverse:** at 42,215 req/s og answered 100% with p99 19 ms, and at
-  44,560 req/s 99.98%, with p99 28 ms.
+- **Reverse:** at 40,614 req/s og answered 99.95% of requests with p99
+  5.3 ms.
 
 Under overload og stays fast for the requests it takes and turns the rest
 away at once; the other two engines slow down for everyone.
