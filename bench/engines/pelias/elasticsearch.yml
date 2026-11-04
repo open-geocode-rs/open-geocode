@@ -1,0 +1,14 @@
+# The image ships these settings; network.host changes so that with
+# host networking Elasticsearch listens on loopback alone, and the transport
+# port is left to its default range (9300-9400) so it can step past a taken 9300.
+network.host: 127.0.0.1
+http.port: 9200
+node.master: true
+node.data: true
+bootstrap.memory_lock: true
+thread_pool:
+  write:
+    queue_size: 1000
+indices.query.bool.max_clause_count: 4000
+# no background GeoIP database downloads while serving
+ingest.geoip.downloader.enabled: false

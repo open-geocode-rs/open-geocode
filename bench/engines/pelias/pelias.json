@@ -1,0 +1,50 @@
+{
+  "logger": {
+    "level": "info",
+    "timestamp": false
+  },
+  "esclient": {
+    "apiVersion": "7.5",
+    "hosts": [
+      { "host": "127.0.0.1", "port": 9200 }
+    ]
+  },
+  "elasticsearch": {
+    "settings": {
+      "index": {
+        "refresh_interval": "10s",
+        "number_of_replicas": "0",
+        "number_of_shards": "1"
+      }
+    }
+  },
+  "api": {
+    "services": {
+      "pip": { "url": "http://127.0.0.1:4200" },
+      "libpostal": { "url": "http://127.0.0.1:4400" },
+      "placeholder": { "url": "http://127.0.0.1:4100" }
+    }
+  },
+  "imports": {
+    "adminLookup": {
+      "enabled": true
+    },
+    "openstreetmap": {
+      "leveldbpath": "/tmp",
+      "datapath": "/data/openstreetmap",
+      "import": [{
+        "filename": "netherlands-261101.osm.pbf"
+      }]
+    },
+    "polyline": {
+      "datapath": "/data/polylines",
+      "files": [ "extract.0sv" ]
+    },
+    "whosonfirst": {
+      "datapath": "/data/whosonfirst",
+      "countryCode": "NL",
+      "importPostalcodes": false,
+      "importPlace": [ "85633337" ]
+    }
+  }
+}
