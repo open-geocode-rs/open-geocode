@@ -1,0 +1,22 @@
+# Photon 1.3.0 serving the Netherlands database on 127.0.0.1:7200. The jar
+# runs its OpenSearch node in the same JVM, so the heap in .env (written by
+# size.sh) covers both. CPUs and memory are set by the harness on sut.slice.
+services:
+  photon:
+    # eclipse-temurin:21-jre; Photon 1.3.0 targets Java 21.
+    image: eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
+    network_mode: host
+    cgroup_parent: sut.slice
+    user: "1000:1000"
+    environment:
+      HOME: /tmp
+      JDK_JAVA_OPTIONS: ${PHOTON_JAVA_OPTS:?run size.sh first}
+    volumes:
+      # photon-1.3.0.jar, sha256 a89707c0045e4807b2a1180e132e68e108d998709f48b6c94b98a6e281f571a5
+      - /home/ubuntu/og-bench/data/photon/jar/photon-1.3.0.jar:/photon/photon.jar:ro
+      # Holds photon_data/. OpenSearch writes its node lock and translog here,
+      # so the mount is read-write.
+      - /home/ubuntu/og-bench/data/photon/nl:/data
+    command: ["java", "-jar", "/photon/photon.jar", "serve",
+              "-data-dir", "/data", "-listen-ip", "127.0.0.1", "-listen-port", "7200"]
+    stop_grace_period: 60s
