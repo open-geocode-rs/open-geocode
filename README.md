@@ -85,6 +85,8 @@ Other rows are the paper's (public endpoints, June 2026).
   52 inputs are answered with a `fallback` area (postcode, town or country); full answers only, CRR is 94.4%.
   From OpenStreetMap alone (17.9 GB, 233.7M records, built in 2 h 51 min), GH6 is 67.7%.
 
+The rows og was scored on: [bench/data/messy-streets/](bench/data/messy-streets/).
+
 ### Speed
 
 The Netherlands: every address in OpenStreetMap (2026-11-01), each engine alone on the same machine.
