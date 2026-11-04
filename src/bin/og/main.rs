@@ -31,7 +31,7 @@ use open_geocode::{
     builder::Leftover,
     limits::Limits,
     resources,
-    runtime::{ServeOptions, serve},
+    runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
 };
 use ratatui::{
     DefaultTerminal, Terminal, TerminalOptions, Viewport,
@@ -194,6 +194,7 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             basemap: None,
             job_dir: None,
             limits: Limits::DEFAULT,
+            shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
         }))
         .map_err(Into::into)
 }

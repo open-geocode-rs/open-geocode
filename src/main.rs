@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -36,7 +37,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{ServeOptions, serve},
+    runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -99,6 +100,11 @@ enum Commands {
 
         #[command(flatten)]
         limits: Limits,
+
+        /// Longest, in seconds, the server takes to stop after Ctrl-C or
+        /// SIGTERM; what is still open then is dropped. 0 drops it at once.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
+        shutdown_timeout: u64,
     },
 }
 
@@ -762,6 +768,7 @@ async fn main() -> Result<()> {
             basemap,
             job_dir,
             limits,
+            shutdown_timeout,
         } => {
             serve(ServeOptions {
                 pack,
@@ -770,6 +777,7 @@ async fn main() -> Result<()> {
                 basemap: Some(basemap),
                 job_dir,
                 limits,
+                shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
             Ok(())

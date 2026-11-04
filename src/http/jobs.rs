@@ -36,6 +36,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, mpsc as channel, oneshot, watch},
     task,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
@@ -362,6 +363,34 @@ impl JobStore {
         for id in expired {
             self.remove(&id);
         }
+    }
+
+    /// Each job records `cancelled` with its rows; one left `running` would
+    /// be failed by the next start, with no sign of how far it got.
+    pub(crate) fn cancel_running(&self) {
+        for job in self.running() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) async fn stopped(&self) {
+        for job in self.running() {
+            let _ = job
+                .progress
+                .subscribe()
+                .wait_for(|progress| progress.done)
+                .await;
+        }
+    }
+
+    fn running(&self) -> Vec<Arc<Job>> {
+        self.jobs
+            .lock()
+            .expect("jobs")
+            .values()
+            .filter(|job| !job.progress.borrow().done)
+            .cloned()
+            .collect()
     }
 }
 
@@ -813,6 +842,7 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
     tokio::spawn(forward_upload(
         request.into_body(),
         max_upload,
+        state.stopping().clone(),
         chunks_tx,
         uploaded_tx,
     ));
@@ -955,9 +985,11 @@ fn read_layout(
 
 /// Pass the request body to the reader, a chunk at a time, refusing one that
 /// grows past `max_bytes` or stalls. Tells `uploaded` once it is all in.
+/// Ends with the server, so a reader parked on a slow upload stops too.
 async fn forward_upload(
     body: Body,
     max_bytes: u64,
+    stopping: CancellationToken,
     chunks: channel::Sender<Result<Bytes, String>>,
     uploaded: oneshot::Sender<()>,
 ) {
@@ -965,7 +997,11 @@ async fn forward_upload(
     let mut received = 0u64;
     let stall = Duration::from_secs(UPLOAD_STALL_SECONDS);
     loop {
-        let next = match tokio::time::timeout(stall, stream.next()).await {
+        let next = tokio::select! {
+            next = tokio::time::timeout(stall, stream.next()) => next,
+            () = stopping.cancelled() => break,
+        };
+        let next = match next {
             Ok(next) => next,
             Err(_) => {
                 let _ = chunks
@@ -1193,6 +1229,11 @@ impl Run {
         let now = unix_now();
         {
             let mut status = self.job.status.lock().expect("job status");
+            // A cancelled job's upload, cut short, reads as complete.
+            let ending = match ending {
+                Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
+                other => other,
+            };
             let (state, error) = match (ending, written) {
                 (_, Err(error)) => (
                     Status::Failed,
