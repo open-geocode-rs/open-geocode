@@ -1,0 +1,62 @@
+# Pelias serving stack for the Netherlands index built by import.sh.
+# Sizing comes from .env, written by size.sh; CPU and memory limits are set
+# on sut.slice by the harness, so no service here carries its own.
+name: pelias
+
+x-sut: &sut
+  network_mode: host
+  cgroup_parent: sut.slice
+  user: "1000:1000"
+  restart: "no"
+
+services:
+  elasticsearch:
+    <<: *sut
+    image: pelias/elasticsearch:7.17.27@sha256:8aa3c622abd74192eceaf53e9a3dfd51c1a75e50ee7a537d7f912aa7f80bab05
+    environment:
+      ES_JAVA_OPTS: "-Xms${ES_HEAP} -Xmx${ES_HEAP}"
+      node.processors: "${ES_PROCESSORS}"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - ./elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
+      - /home/ubuntu/og-bench/data/pelias/elasticsearch:/usr/share/elasticsearch/data
+
+  libpostal:
+    <<: *sut
+    image: pelias/libpostal-service:latest@sha256:72beeef72e968a7865ad7538854d900de7aa9cf27f3de899f29c00cd4a4d96fe
+    # appended to the image entrypoint; the last -host wins, keeping it on loopback
+    command: ["-host", "127.0.0.1"]
+
+  placeholder:
+    <<: *sut
+    image: pelias/placeholder:v5.11.0@sha256:79a8e55b63d3e0b257f4e72a86250c97d0e33d6880d6f83f4d68bb06a9636ebe
+    environment:
+      HOST: 127.0.0.1
+      PORT: "4100"
+      CPUS: "${PLACEHOLDER_CPUS}"
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+      - /home/ubuntu/og-bench/data/pelias/placeholder:/data/placeholder:ro
+
+  pip:
+    <<: *sut
+    image: pelias/pip-service:v5.0.0@sha256:6bde49c2a5bd5d6ab80b7ec521500b09ad36c05335db0fa720a96d3fc6e6595a
+    environment:
+      HOST: 127.0.0.1
+      PORT: "4200"
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+      - /home/ubuntu/og-bench/data/pelias/whosonfirst:/data/whosonfirst:ro
+
+  api:
+    <<: *sut
+    image: pelias/api:v7.11.0@sha256:7174871a9ecd1343fc0dcb0a0d11848a0b634677de40f9b80ed2ce6b64308080
+    environment:
+      HOST: 127.0.0.1
+      PORT: "7300"
+      CPUS: "${API_CPUS}"
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+    depends_on: [elasticsearch, libpostal, placeholder, pip]

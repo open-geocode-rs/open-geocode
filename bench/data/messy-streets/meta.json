@@ -1,0 +1,10 @@
+{
+  "benchmark": "MESSY STREETS: A Benchmark for Geocoding Real-World Addresses",
+  "paper": "https://arxiv.org/abs/2609.01612",
+  "release": "https://github.com/EdGaere/MessyStreets",
+  "commit": "4a015b2da2bb4f155ccea19dfe3c47cf6c698bc0",
+  "files": "artifact/src/phd/benchmarks/messy_streets/release_gold_geohash{1,4,6}_{1..10}/benchmark.jsonl.gz",
+  "rows_kept": "observations 1-100 of each file, the rows the paper scored",
+  "rows": 3000,
+  "licence": "artifact/LICENSE-DATA in the release: the addresses are Web Data Commons records published for research use"
+}

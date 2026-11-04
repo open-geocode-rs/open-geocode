@@ -1,0 +1,17 @@
+name = "pelias"
+port = 7300
+forward = "/v1/search?text={q}&size=1"
+reverse = "/v1/reverse?point.lat={lat}&point.lon={lon}&size=1"
+coords = "/features/0/geometry/coordinates"   # JSON pointer to [lon, lat] of the first result
+data = [
+  "/home/ubuntu/og-bench/data/pelias/elasticsearch",
+  "/home/ubuntu/og-bench/data/pelias/placeholder",
+  "/home/ubuntu/og-bench/data/pelias/whosonfirst",
+]   # libpostal's model ships inside its image
+images = [
+  "pelias/elasticsearch:7.17.27@sha256:8aa3c622abd74192eceaf53e9a3dfd51c1a75e50ee7a537d7f912aa7f80bab05",
+  "pelias/libpostal-service:latest@sha256:72beeef72e968a7865ad7538854d900de7aa9cf27f3de899f29c00cd4a4d96fe",
+  "pelias/placeholder:v5.11.0@sha256:79a8e55b63d3e0b257f4e72a86250c97d0e33d6880d6f83f4d68bb06a9636ebe",
+  "pelias/pip-service:v5.0.0@sha256:6bde49c2a5bd5d6ab80b7ec521500b09ad36c05335db0fa720a96d3fc6e6595a",
+  "pelias/api:v7.11.0@sha256:7174871a9ecd1343fc0dcb0a0d11848a0b634677de40f9b80ed2ce6b64308080",
+]

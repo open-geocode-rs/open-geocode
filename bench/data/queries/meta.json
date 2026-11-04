@@ -1,0 +1,13 @@
+{
+  "pbf": "/home/ubuntu/og-bench/data/pbf/netherlands-261101.osm.pbf",
+  "pbf_sha256": "323cbbff3f97ffb2962e3c00ce5172752af5a1c9a56c6461ddfe7ec9a2f101d7",
+  "eligible_addresses": 10014021,
+  "seed": 20261101,
+  "per_set": 10000,
+  "jitter_m": 50.0,
+  "osmium": "osmium version 1.19.0",
+  "commands": [
+    "osmium tags-filter /home/ubuntu/og-bench/data/pbf/netherlands-261101.osm.pbf nw/addr:housenumber -o /home/ubuntu/og-bench/data/queries-work/addr.osm.pbf --overwrite",
+    "osmium export /home/ubuntu/og-bench/data/queries-work/addr.osm.pbf -f geojsonseq -x print_record_separator=false -o /home/ubuntu/og-bench/data/queries-work/addr.geojsonseq --overwrite"
+  ]
+}
