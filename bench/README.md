@@ -4,6 +4,9 @@ The speed benchmark harness. It measures the geocoders in `engines/` on the
 same Netherlands extract, one at a time, in a fixed slice of one machine, and
 writes every raw number it saw next to the tables it draws from them.
 
+What the benchmark measures, why it is fair, and its results so far are in
+[BENCHMARK.md](BENCHMARK.md).
+
 ## Running
 
 ```sh
