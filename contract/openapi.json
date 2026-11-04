@@ -1094,7 +1094,7 @@
         },
         "summary": "Autocomplete addresses",
         "tags": [
-          "geocoding"
+          "Geocoding"
         ]
       }
     },
@@ -1348,7 +1348,7 @@
         },
         "summary": "Geocode a structured address",
         "tags": [
-          "geocoding"
+          "Geocoding"
         ]
       },
       "post": {
@@ -1673,9 +1673,9 @@
             }
           }
         },
-        "summary": "Geocode many addresses whose parts are already apart in one request.",
+        "summary": "Geocode a batch of addresses",
         "tags": [
-          "geocoding"
+          "Geocoding"
         ]
       }
     },
@@ -1725,7 +1725,7 @@
         },
         "summary": "Check liveness",
         "tags": [
-          "operations"
+          "Operations"
         ]
       }
     },
@@ -2011,7 +2011,7 @@
         },
         "summary": "Geocode a file",
         "tags": [
-          "jobs"
+          "Jobs"
         ]
       }
     },
@@ -2091,7 +2091,7 @@
         },
         "summary": "Delete a job",
         "tags": [
-          "jobs"
+          "Jobs"
         ]
       },
       "get": {
@@ -2176,7 +2176,7 @@
         },
         "summary": "Get a job",
         "tags": [
-          "jobs"
+          "Jobs"
         ]
       }
     },
@@ -2263,7 +2263,7 @@
         },
         "summary": "Cancel a job",
         "tags": [
-          "jobs"
+          "Jobs"
         ]
       }
     },
@@ -2355,7 +2355,7 @@
         },
         "summary": "Get a job's results",
         "tags": [
-          "jobs"
+          "Jobs"
         ]
       }
     },
@@ -2408,7 +2408,7 @@
         },
         "summary": "Get the OpenAPI document",
         "tags": [
-          "operations"
+          "Operations"
         ]
       }
     },
@@ -2470,7 +2470,7 @@
         },
         "summary": "Check readiness",
         "tags": [
-          "operations"
+          "Operations"
         ]
       }
     },
@@ -2675,7 +2675,7 @@
         },
         "summary": "Reverse geocode a point",
         "tags": [
-          "geocoding"
+          "Geocoding"
         ]
       },
       "post": {
@@ -2954,9 +2954,9 @@
             }
           }
         },
-        "summary": "Find the places at many points in one request.",
+        "summary": "Reverse geocode a batch of points",
         "tags": [
-          "geocoding"
+          "Geocoding"
         ]
       }
     },
@@ -3134,7 +3134,7 @@
         },
         "summary": "Search addresses",
         "tags": [
-          "geocoding"
+          "Geocoding"
         ]
       }
     },
@@ -3191,7 +3191,7 @@
         },
         "summary": "Get the server and Pack versions",
         "tags": [
-          "operations"
+          "Operations"
         ]
       }
     }
@@ -3205,15 +3205,15 @@
   "tags": [
     {
       "description": "Geocode addresses and points.",
-      "name": "geocoding"
+      "name": "Geocoding"
     },
     {
       "description": "Geocode a whole file, streamed back as it uploads.",
-      "name": "jobs"
+      "name": "Jobs"
     },
     {
       "description": "Health checks, the server and Pack versions, and the OpenAPI document.",
-      "name": "operations"
+      "name": "Operations"
     }
   ]
 }

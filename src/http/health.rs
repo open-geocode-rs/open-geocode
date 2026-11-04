@@ -15,7 +15,7 @@ use crate::runtime::AppState;
 #[utoipa::path(
     get,
     path = "/healthz",
-    tag = "operations",
+    tag = "Operations",
     responses((status = 200, description = "The server is running.")),
 )]
 pub(crate) async fn healthz() -> StatusCode {
@@ -29,7 +29,7 @@ pub(crate) async fn healthz() -> StatusCode {
 #[utoipa::path(
     get,
     path = "/readyz",
-    tag = "operations",
+    tag = "Operations",
     responses(
         (status = 200, description = "The Pack is loaded."),
         (status = 503, description = "The Pack is not loaded yet."),

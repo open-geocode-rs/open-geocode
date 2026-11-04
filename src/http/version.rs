@@ -42,7 +42,7 @@ struct PackInfo {
 #[utoipa::path(
     get,
     path = "/version",
-    tag = "operations",
+    tag = "Operations",
     responses(
         (status = 200, description = "The server and the Pack.", body = VersionInfo),
     ),
