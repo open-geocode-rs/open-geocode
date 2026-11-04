@@ -28,7 +28,7 @@
 `open-geocode` is a self-hosted address geocoding engine built entirely on open data (OpenStreetMap and OpenAddresses).
 Forward, autocomplete, reverse and batch geocoding, served from one file.
 
-Country-scale indexes build in minutes and serve 10× the queries per second of Pelias and Nominatim.
+Country-scale indexes build in minutes and serve 6× the forward and over 20× the reverse queries per second of Photon and Pelias, on a quarter of the memory.
 og is an alternative to commercial API quotas and to the days-long builds of Pelias and Nominatim, whether for a single region or for global geocoding.
 
 **Features**
