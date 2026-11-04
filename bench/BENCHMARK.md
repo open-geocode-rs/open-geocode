@@ -140,8 +140,8 @@ it would be alone.
 |---|---:|---:|---:|
 | Forward p50 / p99 / p99.9 | **0.72 / 4.2 / 11.7 ms** | 2.0 / 19.4 / 30.5 ms | 4.7 / 9.6 / 14.3 ms |
 | Reverse p50 / p99 / p99.9 | **0.20 / 0.37 / 0.92 ms** | 1.8 / 3.0 / 3.9 ms | 5.3 / 10.5 / 13.6 ms |
-| **Forward ceiling** | **re-running** ² | 2,194 req/s | 2,323 req/s |
-| **Reverse ceiling** | **re-running** ² | 3,098 req/s | 2,406 req/s |
+| **Forward ceiling** | **14,087 req/s** | 2,194 req/s | 2,323 req/s |
+| **Reverse ceiling** | **≥ 65,606 req/s** ² | 3,098 req/s | 2,406 req/s |
 | Forward: first answer within 100 m | 98.9% | 99.7% | 99.5% |
 | Reverse: first answer within 100 m | 98.8% | 99.9% | 100.0% |
 | Any answer, both directions | 100% | ≥ 99.9% | 100% |
@@ -150,16 +150,14 @@ Against the better of the other two, og:
 
 - answers forward queries 2.8× faster at p50;
 - answers reverse queries 9× faster at p50;
-- serves at least 4.8× the forward traffic and 13× the reverse traffic ²;
+- serves 6× the forward traffic and at least 21× the reverse traffic;
 - starts 13× faster;
 - takes 11× less disk.
 
-² og's ceilings are being measured again under the 99.9% rule. The first
-run counted a single refusal as a failed step. Its steps already show:
-
-- **Forward:** at 11,144 req/s og answered 99.97% of requests with p99 7 ms.
-- **Reverse:** at 40,614 req/s og answered 99.95% of requests with p99
-  5.3 ms.
+² og passed 65,606 req/s with p99 49.8 ms and 99.86% of requests answered.
+That is more than a third of what the load generator itself can send
+(186,880 req/s), so the run stops there: og's own limit is higher. Forward,
+og held 14,087 req/s with p99 8.2 ms and 99.98% answered.
 
 Under overload og stays fast for the requests it takes and turns the rest
 away at once; the other two engines slow down for everyone.
@@ -173,8 +171,8 @@ floor is the fair memory comparison.
 
 | | og | Photon | Pelias |
 |---|---|---|---|
-| Forward | **1 vCPU / 1 GiB** (p99 4.4 ms; 512 MiB fails) | 2 vCPU / 4 GiB (p99 75.1 ms; 1 vCPU and 2 GiB fail) | running |
-| Reverse | **1 vCPU / 256 MiB** (p99 9.5 ms; the ladder's lowest step, so og's floor is lower) | running | running |
+| Forward | **1 vCPU / 1 GiB** (p99 4.4 ms; 512 MiB fails) | 2 vCPU / 4 GiB (p99 75.1 ms; 1 vCPU and 2 GiB fail) | 1 vCPU / 8 GiB (p99 36.4 ms; at 4 GiB the warm-up did not finish in 5 minutes) |
+| Reverse | **1 vCPU / 256 MiB** (p99 9.5 ms; the ladder's lowest step, so og's floor is lower) | 1 vCPU / 4 GiB (p99 10.4 ms; 2 GiB fails) | 1 vCPU / 8 GiB (p99 15.6 ms; at 4 GiB the warm-up did not finish in 5 minutes) |
 
 ## What the benchmark found in og
 
