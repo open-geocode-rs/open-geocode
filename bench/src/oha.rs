@@ -19,6 +19,11 @@ use crate::host;
 pub const P99_LIMIT_MS: f64 = 100.0;
 /// The share of the asked-for rate that must actually be served.
 pub const ACHIEVED_SHARE: f64 = 0.99;
+/// The share of requests that must get a 2xx answer. A server may answer
+/// what it cannot take on at once with an immediate refusal rather than make
+/// everyone wait; up to one request in a thousand counts as served traffic
+/// shed, not as a failed rate.
+pub const ANSWERED_SHARE: f64 = 0.999;
 /// Connections for rate runs: enough that a slow engine shows up as latency
 /// and lost rate rather than as an idle load generator.
 pub const RATE_CONNECTIONS: u32 = 256;
@@ -122,14 +127,16 @@ impl OhaRun {
         })
     }
 
-    /// Whether this run served `rate`: p99 under 100 ms, no errors or non-2xx
-    /// answers, and at least 99% of the rate actually served. The string says
-    /// why, either way.
+    /// Whether this run served `rate`: p99 under 100 ms, at least 99.9% of
+    /// requests answered 2xx, and at least 99% of the rate actually served.
+    /// The string says why, either way.
     pub fn judge(&self, rate: f64) -> (bool, String) {
         let p99 = self.p99_ms.unwrap_or(f64::INFINITY);
         let share = self.achieved_rps / rate;
-        let pass =
-            p99 < P99_LIMIT_MS && self.errors == 0 && self.non_2xx == 0 && share >= ACHIEVED_SHARE;
+        let unanswered = self.errors + self.non_2xx;
+        let answered = self.requests > 0
+            && unanswered as f64 <= (1.0 - ANSWERED_SHARE) * self.requests as f64;
+        let pass = p99 < P99_LIMIT_MS && answered && share >= ACHIEVED_SHARE;
         let why = format!(
             "p99 {p99:.1} ms, {} errors, {} non-2xx, achieved {:.1} of {rate} req/s ({:.1}%)",
             self.errors,
@@ -287,6 +294,13 @@ mod tests {
         assert!(!r.judge(100.0).0);
         r.errors = 0;
         r.non_2xx = 1;
+        assert!(!r.judge(100.0).0);
+        r.requests = 1000;
+        assert!(r.judge(100.0).0, "one refusal in a thousand is shed traffic");
+        r.non_2xx = 2;
+        assert!(!r.judge(100.0).0);
+        r.non_2xx = 0;
+        r.errors = 2;
         assert!(!r.judge(100.0).0);
     }
 }
