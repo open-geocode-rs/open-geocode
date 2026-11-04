@@ -3,7 +3,7 @@
 # the harness sets CPUs and memory on sut.slice.
 services:
   og:
-    image: og-bench/og:cad9f81
+    image: og-bench/og:e4d8834
     build:
       context: .
       additional_contexts:
