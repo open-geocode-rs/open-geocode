@@ -108,7 +108,7 @@ The Netherlands: every address in OpenStreetMap (2026-11-01), each engine alone 
 ³ The most the load generator could send.
 ⁴ The smallest size tried.
 
-How it was measured, and how to run it again: [bench/BENCHMARK.md](bench/BENCHMARK.md).
+How it was measured, and how to run it again: [bench/](bench/).
 
 ## Quickstart
 
