@@ -4040,13 +4040,19 @@ mod tests {
             Some("King Street West")
         );
 
-        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let addresses = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let places = addresses.places();
+        // `poi` asks /places, any other layer /geocode, as the API does.
         let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
+            let searcher = match layer {
+                Some("poi") | None => &places,
+                Some(_) => &addresses,
+            };
             searcher
                 .search(&TextSearchOptions {
                     query: query.into(),
                     limit: 5,
-                    layer: layer.map(str::to_string),
+                    layer: layer.filter(|layer| *layer != "poi").map(str::to_string),
                     countries: Vec::new(),
                     focus: None,
                     bbox: None,
@@ -4090,7 +4096,7 @@ mod tests {
         );
         assert!(search("Memorial Bench", None).is_empty());
 
-        let suggestions = searcher
+        let suggestions = places
             .autocomplete(&TextAutocompleteOptions {
                 query: "riverdale fa".into(),
                 limit: 5,

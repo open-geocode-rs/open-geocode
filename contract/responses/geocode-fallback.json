@@ -10,12 +10,13 @@
       },
       "properties": {
         "accuracy": "centroid",
-        "confidence": 0.76852477,
+        "confidence": 0.0,
+        "fallback": true,
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
         "name": "Toronto",
-        "score": 12.95697,
+        "score": 13.642908,
         "source": {
           "dataset": "osm"
         }
@@ -31,7 +32,7 @@
         "url": "https://www.openstreetmap.org/copyright"
       }
     ],
-    "query": "Toronto",
+    "query": "99 Nowhere Lane, Toronto",
     "version": "1"
   },
   "type": "FeatureCollection"

@@ -38,7 +38,7 @@
               "label": "10 King Street, M5V 1A1",
               "layer": "address",
               "name": "10 King Street",
-              "score": 5.459071,
+              "score": 5.393875,
               "source": {
                 "dataset": "osm"
               }
@@ -63,7 +63,7 @@
     },
     {
       "error": {
-        "detail": "address must not be empty",
+        "detail": "give q, or address with its other fields",
         "error_code": "invalid_query",
         "request_id": "contract-example",
         "status": 400,

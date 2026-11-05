@@ -30,7 +30,7 @@
         "layer": "street",
         "name": "King Street",
         "road_class": "residential",
-        "score": 14.649926,
+        "score": 14.22728,
         "source": {
           "dataset": "osm"
         }
@@ -52,7 +52,7 @@
           "postcode": "M5V 1A1",
           "street": "King Street"
         },
-        "confidence": 0.7413711,
+        "confidence": 0.76852477,
         "context": {
           "country": {
             "id": "osm:relation:1",
@@ -71,49 +71,7 @@
         "label": "10 King Street, M5V 1A1",
         "layer": "address",
         "name": "10 King Street",
-        "score": 14.649926,
-        "source": {
-          "dataset": "osm"
-        }
-      },
-      "type": "Feature"
-    },
-    {
-      "geometry": {
-        "coordinates": [
-          -79.005,
-          43.0
-        ],
-        "type": "Point"
-      },
-      "properties": {
-        "accuracy": "centroid",
-        "address": {
-          "housenumber": "12",
-          "postcode": "M5V 1A1",
-          "street": "King Street"
-        },
-        "category": "shop:bakery",
-        "confidence": 0.4255575,
-        "context": {
-          "country": {
-            "id": "osm:relation:1",
-            "name": "Canada"
-          },
-          "locality": {
-            "id": "osm:relation:3",
-            "name": "Toronto"
-          },
-          "region": {
-            "id": "osm:relation:2",
-            "name": "Ontario"
-          }
-        },
-        "id": "osm:way:11",
-        "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
-        "layer": "poi",
-        "name": "Queen Bakery",
-        "score": 1.7933104,
+        "score": 14.22728,
         "source": {
           "dataset": "osm"
         }

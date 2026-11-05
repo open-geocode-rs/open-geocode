@@ -35,6 +35,7 @@ use open_geocode::{
         },
         lattice::LatticeTagger,
     },
+    record::Layer,
     resources,
     reverse::{self, PackReverseGeocoder},
     runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
@@ -1071,14 +1072,19 @@ fn parse_query(pack: &Path, query: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `/search` answer for `query`, as the Runtime gives it.
+/// The `/geocode?q=` answer for `query`, as the Runtime gives it, or the
+/// `/places?q=` answer with `--layer poi`.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
-    let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
+    let mut searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
+    let places = layer.as_deref() == Some(Layer::Poi.as_str());
+    if places {
+        searcher = searcher.places();
+    }
     let hits = searcher.search(&TextSearchOptions {
         query: query.clone(),
         limit,
-        layer,
+        layer: layer.filter(|_| !places),
         countries: Vec::new(),
         focus: None,
         bbox: None,

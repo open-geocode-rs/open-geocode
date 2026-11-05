@@ -57,6 +57,7 @@ use crate::{
     util::fold::{exact_key, replaced_characters, search_key},
 };
 
+#[derive(Clone)]
 pub struct TextSearcher {
     pack: Arc<pack::Reader>,
     spatial: spatial_index::Reader,
@@ -73,6 +74,9 @@ pub struct TextSearcher {
     /// What orders the hits of a query's pool, when the Pack has been
     /// calibrated; else they are chosen by their [`Evidence`].
     ranker: Option<Ranker>,
+    /// Whether it searches places rather than addresses (see
+    /// [`Self::places`]).
+    places: bool,
     /// How long one query searches before it answers with what it found.
     budget: Duration,
     /// The structured index that answers a house number on a known street without a
@@ -416,10 +420,25 @@ impl TextSearcher {
             columns: Arc::new(columns),
             confidence,
             ranker,
+            places: false,
             budget: SEARCH_BUDGET,
             structured,
             segments: Arc::new(segments),
         })
+    }
+
+    /// A searcher of places (POIs): the same search over places' own text
+    /// fields (see [`Fields::for_places`]). The structured index, the
+    /// confidence model and the ranker know addresses alone, so it has none.
+    pub fn places(&self) -> Self {
+        Self {
+            fields: self.fields.for_places(),
+            confidence: None,
+            ranker: None,
+            structured: None,
+            places: true,
+            ..self.clone()
+        }
     }
 
     /// The same searcher without its structured index: every query runs the text
@@ -510,6 +529,13 @@ impl TextSearcher {
         }
         if let Some(named) = NAMED.with(RefCell::take) {
             named.choose(&mut hits);
+        }
+        // A place is sought by its name: of the places a pass finds, the one
+        // the query's words cover with none left over answers it, whatever a
+        // name that repeats a street's words scores. No ranker knows places
+        // yet to weigh the two.
+        if self.places {
+            hits.sort_by_key(|hit| (hit.features.pass, hit.features.dropped_words));
         }
         self.rate(&mut hits);
         hits.truncate(limit);
@@ -7923,6 +7949,40 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
+/// One list of the address and the place suggestions for `query`, at most
+/// `limit` of them.
+///
+/// The two are ranked by text scores over different fields, which do not
+/// compare, so they are ordered by what the query says: a query that starts
+/// with a house number asks for an address, so addresses come first; else a
+/// place whose name starts as the query does comes first, then the
+/// addresses, then the other places.
+pub fn mix_suggestions(
+    query: &str,
+    addresses: Vec<TextSearchHit>,
+    places: Vec<TextSearchHit>,
+    limit: usize,
+) -> Vec<TextSearchHit> {
+    let limit = effective_autocomplete_limit(limit);
+    let key = search_key(query.trim()).unwrap_or_default();
+    let numbered = autocomplete_number(&autocomplete_query_tokens(&key)).is_some();
+    let mut mixed = Vec::with_capacity(addresses.len() + places.len());
+    if numbered {
+        mixed.extend(addresses);
+        mixed.extend(places);
+    } else {
+        let (named, others): (Vec<_>, Vec<_>) = places.into_iter().partition(|hit| {
+            !key.is_empty()
+                && search_key(&hit.record.name).is_some_and(|name| name.starts_with(&key))
+        });
+        mixed.extend(named);
+        mixed.extend(addresses);
+        mixed.extend(others);
+    }
+    mixed.truncate(limit);
+    mixed
+}
+
 fn effective_autocomplete_limit(limit: usize) -> usize {
     let limit = effective_limit(limit);
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
@@ -9626,7 +9686,7 @@ mod tests {
     }
 
     #[test]
-    fn pois_named_after_a_place_or_street_do_not_outrank_it() {
+    fn pois_named_after_a_place_or_street_are_found_apart_from_it() {
         use crate::{
             context::AdminContextTuple,
             pack::RecordContext,
@@ -9715,17 +9775,21 @@ mod tests {
                 .clone()
         };
 
+        // Address search answers with the place and the street; the POIs
+        // named after them are /places' answers.
         assert_eq!(top("Muskoka Lakes Township"), "osm:relation:1");
         assert_eq!(top("Walmer Road"), "osm:node:3");
-        assert_eq!(top("Walmer Road Parkette"), "osm:node:4");
-        assert_eq!(top("Fire Station, Muskoka Lakes Township"), "osm:node:2");
+        let places = searcher.places();
+        let place = |query: &str| top_ids(&places, query)[0].clone();
+        assert_eq!(place("Walmer Road Parkette"), "osm:node:4");
+        assert_eq!(place("Fire Station, Muskoka Lakes Township"), "osm:node:2");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// A Pack of one street: a POI named after the street, a shop at one of
-    /// its addresses and a park off it.
+    /// its addresses and a bakery off it.
     #[test]
-    fn addresses_rank_above_pois_unless_a_poi_confirms_the_address() {
+    fn address_search_answers_no_poi_and_place_search_finds_them() {
         let temp_dir = temp_pack_path("search-addresses-beat-pois");
         let _ = std::fs::remove_dir_all(&temp_dir);
         let mut writer = Writer::create(&temp_dir).expect("writer");
@@ -9767,7 +9831,8 @@ mod tests {
         }
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let layers = |query: &str| {
+        let places = searcher.places();
+        let layers_of = |searcher: &TextSearcher, query: &str| {
             searcher
                 .search(&TextSearchOptions {
                     query: query.to_string(),
@@ -9782,37 +9847,24 @@ mod tests {
                 .map(|hit| (hit.record.id, hit.record.layer))
                 .collect::<Vec<_>>()
         };
-        let first_poi = |hits: &[(String, String)]| {
-            hits.iter()
-                .position(|(_, layer)| layer == "poi")
-                .unwrap_or(hits.len())
-        };
-        let last_address = |hits: &[(String, String)]| {
-            hits.iter()
-                .rposition(|(_, layer)| layer != "poi")
-                .expect("an address or street")
-        };
+        let no_poi = |hits: &[(String, String)]| hits.iter().all(|(_, layer)| layer != "poi");
 
-        // The query names a street the Pack has: every POI follows it.
-        let street = layers("Walmer Road");
-        assert!(last_address(&street) < first_poi(&street), "{street:?}");
-        // A house number: the shop at number 4 follows the address.
-        let numbered = layers("4 Walmer Road");
+        // Address search never answers with a POI, however its name reads.
+        let street = layers_of(&searcher, "Walmer Road");
+        assert!(no_poi(&street), "{street:?}");
+        let numbered = layers_of(&searcher, "4 Walmer Road");
         assert_eq!(numbered[0].0, "osm:node:4", "{numbered:?}");
-        assert!(
-            last_address(&numbered) < first_poi(&numbered),
-            "{numbered:?}"
+        assert!(no_poi(&numbered), "{numbered:?}");
+        assert!(no_poi(&layers_of(&searcher, "Walmer Road Bakery")));
+        // Place search finds the shop by its name and the address it stands
+        // at, and the others by their names.
+        let confirmed = layers_of(&places, "Corner Store 4 Walmer Road");
+        assert_eq!(confirmed[0].0, "osm:node:11", "{confirmed:?}");
+        assert_eq!(layers_of(&places, "Walmer Road Bakery")[0].0, "osm:node:12");
+        assert_eq!(
+            layers_of(&places, "Walmer Road Variety")[0].0,
+            "osm:node:10"
         );
-        // The shop's own name confirms the address it stands at.
-        let confirmed = layers("Corner Store 4 Walmer Road");
-        assert!(
-            confirmed.iter().take(2).any(|(id, _)| id == "osm:node:11"),
-            "{confirmed:?}"
-        );
-        // A number only a POI states is the POI.
-        assert_eq!(layers("6 Walmer Road")[0].0, "osm:node:10");
-        // Name-only POI queries rank as they did: the street lacks a word.
-        assert_eq!(layers("Walmer Road Bakery")[0].0, "osm:node:12");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -9853,7 +9905,7 @@ mod tests {
             writer.write(&record.into(), None).expect("cafe");
         }
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher").places();
         assert_eq!(
             top_ids(&searcher, "Blue Door"),
             ["osm:node:3", "osm:node:2", "osm:node:1"]
@@ -9886,6 +9938,54 @@ mod tests {
             &Ranking::default(),
         );
         assert!(first < known);
+    }
+
+    #[test]
+    fn suggestions_mix_addresses_and_places_by_what_the_query_says() {
+        let hit = |id: &str, layer: &str, name: &str| TextSearchHit {
+            record_id: 0,
+            score: 1.0,
+            record: Summary {
+                id: id.to_string(),
+                layer: layer.to_string(),
+                name: name.to_string(),
+                label: name.to_string(),
+                ..street_summary()
+            },
+            fallback: false,
+            features: Features::default(),
+            confidence: None,
+            signals: Signals::default(),
+        };
+        let addresses = || {
+            vec![
+                hit("osm:node:1", "address", "10 Queen Street"),
+                hit("osm:way:2", "street", "Queen Street"),
+            ]
+        };
+        let places = || {
+            vec![
+                hit("osm:node:3", "poi", "Corner Store"),
+                hit("osm:node:4", "poi", "Queen Bakery"),
+            ]
+        };
+        let ids = |hits: Vec<TextSearchHit>| {
+            hits.into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(mix_suggestions("queen", addresses(), places(), 0)),
+            ["osm:node:4", "osm:node:1", "osm:way:2", "osm:node:3"],
+            "a place named as typed first, then the addresses"
+        );
+        assert_eq!(
+            ids(mix_suggestions("10 queen", addresses(), places(), 0)),
+            ["osm:node:1", "osm:way:2", "osm:node:3", "osm:node:4"],
+            "a house number asks for an address"
+        );
+        assert_eq!(mix_suggestions("queen", addresses(), places(), 2).len(), 2);
     }
 
     fn street_summary() -> Summary {
@@ -11053,6 +11153,21 @@ mod tests {
             None,
         )
         .address;
+        // The builder writes a POI's address as an address of its own.
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "300",
+                    "St. Clair Avenue West",
+                    Some("Toronto"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("dental address");
         writer
             .write(
                 &PoiRecord {
@@ -11079,11 +11194,14 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(top_ids(&searcher, "300 Spadina Ave"), vec!["osm:node:2"]);
-        assert_eq!(top_ids(&searcher, "Spadina Dental")[0], "osm:node:1");
+        assert_eq!(
+            top_ids(&searcher.places(), "Spadina Dental")[0],
+            "osm:node:1"
+        );
         assert_eq!(
             top_ids(&searcher, "300 St Clair Ave W"),
             vec!["osm:node:1"],
-            "a POI's address is its street's"
+            "the dentist's address is its street's"
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }

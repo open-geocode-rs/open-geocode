@@ -41,7 +41,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 12;
 /// Postcode data within this radius describes where a record is: a record
 /// with no postcode of its own is ranked by the nearest postcode centroid
 /// within it, and the batch check compares the postcode areas within it.
@@ -94,6 +94,11 @@ fn create_dir(path: &Path) -> Result<PathBuf> {
 }
 const LABEL: &str = "pack-text";
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
+const PLACE_NAME_FIELD: &str = "place_name_text";
+const PLACE_CONTENT_FIELD: &str = "place_content_text";
+const PLACE_CONTEXT_FIELD: &str = "place_context_text";
+const PLACE_AUTOCOMPLETE_SUBJECT_FIELD: &str = "place_autocomplete_subject_text";
+const PLACE_ADDRESS_NUMBER_FIELD: &str = "place_address_number";
 pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
 pub(crate) const INTERPOLATION_END_FIELD: &str = "interpolation_end";
 pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
@@ -219,6 +224,15 @@ pub struct Fields {
     pub address_number: Field,
     pub postcode_exact: Field,
     pub autocomplete_subject_text: Field,
+    /// A place's (POI's) own text fields, apart from the address fields
+    /// above: address search lists only those, so a place never matches it,
+    /// and a word common in shop names stays rare among street names.
+    pub place_name_text: Field,
+    pub place_content_text: Field,
+    pub place_context_text: Field,
+    pub place_autocomplete_subject_text: Field,
+    /// The house numbers of a place's address, apart from addresses' own.
+    pub place_address_number: Field,
     /// First and last number of an interpolation range, so a search finds the
     /// ranges that contain a requested house number.
     pub interpolation_start: Field,
@@ -625,6 +639,11 @@ impl Fields {
             address_number: schema.get_field("address_number")?,
             postcode_exact: schema.get_field("postcode_exact")?,
             autocomplete_subject_text: schema.get_field(AUTOCOMPLETE_SUBJECT_FIELD)?,
+            place_name_text: schema.get_field(PLACE_NAME_FIELD)?,
+            place_content_text: schema.get_field(PLACE_CONTENT_FIELD)?,
+            place_context_text: schema.get_field(PLACE_CONTEXT_FIELD)?,
+            place_autocomplete_subject_text: schema.get_field(PLACE_AUTOCOMPLETE_SUBJECT_FIELD)?,
+            place_address_number: schema.get_field(PLACE_ADDRESS_NUMBER_FIELD)?,
             interpolation_start: schema.get_field(INTERPOLATION_START_FIELD)?,
             interpolation_end: schema.get_field(INTERPOLATION_END_FIELD)?,
             street_text: schema.get_field("street_text")?,
@@ -666,9 +685,39 @@ impl Fields {
         }
     }
 
+    /// The same fields with places' text fields in the address fields'
+    /// stead: what a search of places reads. A place states no exact
+    /// postcode, so that field stays and matches no place.
+    pub fn for_places(self) -> Self {
+        Self {
+            name_text: self.place_name_text,
+            content_text: self.place_content_text,
+            context_text: self.place_context_text,
+            // A place's street is a word of what it is, beside its name.
+            street_text: self.place_content_text,
+            autocomplete_subject_text: self.place_autocomplete_subject_text,
+            address_number: self.place_address_number,
+            ..self
+        }
+    }
+
     /// The document of `projected`, whose numbers and units index as
-    /// `numbers`.
+    /// `numbers`. A place's words go to the place fields alone.
     fn to_tantivy_document(self, projected: &Document, numbers: Numbers) -> TantivyDocument {
+        let place = projected
+            .layers
+            .iter()
+            .any(|layer| layer == Layer::Poi.as_str());
+        let fields = if place { self.for_places() } else { self };
+        fields.write_document(projected, numbers, place)
+    }
+
+    fn write_document(
+        self,
+        projected: &Document,
+        numbers: Numbers,
+        place: bool,
+    ) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
         document.add_u64(self.record_count, projected.record_count);
@@ -703,11 +752,13 @@ impl Fields {
         if let Some(base) = numbers.lowest {
             document.add_u64(self.house_number, base.into());
         }
-        add_normalized_text_if_present(
-            &mut document,
-            self.postcode_exact,
-            projected.postcode.as_deref(),
-        );
+        if !place {
+            add_normalized_text_if_present(
+                &mut document,
+                self.postcode_exact,
+                projected.postcode.as_deref(),
+            );
+        }
         if !projected.autocomplete_subject_text.is_empty() {
             document.add_text(
                 self.autocomplete_subject_text,
@@ -1026,6 +1077,15 @@ fn build_schema() -> (Schema, Fields) {
         AUTOCOMPLETE_SUBJECT_FIELD,
         autocomplete_subject_text_options(),
     );
+    let place_name_text = builder.add_text_field(PLACE_NAME_FIELD, searchable_text_options());
+    let place_content_text = builder.add_text_field(PLACE_CONTENT_FIELD, searchable_text_options());
+    let place_context_text = builder.add_text_field(PLACE_CONTEXT_FIELD, searchable_text_options());
+    let place_autocomplete_subject_text = builder.add_text_field(
+        PLACE_AUTOCOMPLETE_SUBJECT_FIELD,
+        autocomplete_subject_text_options(),
+    );
+    let place_address_number =
+        builder.add_text_field(PLACE_ADDRESS_NUMBER_FIELD, exact_string_options());
     let interpolation_start = builder.add_u64_field(INTERPOLATION_START_FIELD, FAST);
     let interpolation_end = builder.add_u64_field(INTERPOLATION_END_FIELD, FAST);
     let street_text = builder.add_text_field("street_text", searchable_text_options());
@@ -1060,6 +1120,11 @@ fn build_schema() -> (Schema, Fields) {
         address_number,
         postcode_exact,
         autocomplete_subject_text,
+        place_name_text,
+        place_content_text,
+        place_context_text,
+        place_autocomplete_subject_text,
+        place_address_number,
         interpolation_start,
         interpolation_end,
         street_text,

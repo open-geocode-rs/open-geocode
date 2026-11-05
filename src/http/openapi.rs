@@ -74,7 +74,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
          description = "Local server on the default address."),
     ),
     paths(
-        crate::runtime::search,
+        crate::runtime::places,
         crate::runtime::autocomplete,
         crate::runtime::geocode,
         crate::runtime::geocode_batch,
@@ -226,6 +226,9 @@ pub(crate) struct GeocodeItem {
     /// Echoed in this item's result, to match it up.
     #[schema(example = "row-1", max_length = 128)]
     pub id: Option<String>,
+    /// The address as free text. Give `q` or `address`, not both.
+    #[schema(example = "10 King Street, Toronto", max_length = 256)]
+    pub q: Option<String>,
     /// The street address on its own: house number and street, without the
     /// town or postcode.
     #[schema(example = "10 King Street", min_length = 1, max_length = 256)]
@@ -642,7 +645,7 @@ mod tests {
         let spec: Value =
             serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
 
-        for path in ["/search", "/autocomplete"] {
+        for path in ["/places", "/autocomplete"] {
             assert_eq!(
                 parameter(&spec, path, "q")["schema"]["maxLength"],
                 Value::from(MAX_QUERY_CHARS),
@@ -650,7 +653,7 @@ mod tests {
             );
         }
         assert_eq!(
-            parameter(&spec, "/search", "limit")["schema"]["maximum"],
+            parameter(&spec, "/places", "limit")["schema"]["maximum"],
             Value::from(MAX_SEARCH_LIMIT),
         );
         assert_eq!(

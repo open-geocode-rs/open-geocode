@@ -17,6 +17,7 @@ use serde::Serialize;
 pub(crate) struct Engine {
     pack: Arc<Reader>,
     searcher: TextSearcher,
+    places: TextSearcher,
     reverse: PackReverseGeocoder,
     tagger: LatticeTagger,
 }
@@ -94,6 +95,7 @@ impl Engine {
         let tagger = LatticeTagger::from_container(pack.container())?;
         Ok(Self {
             pack,
+            places: searcher.places(),
             searcher,
             reverse,
             tagger,
@@ -104,18 +106,22 @@ impl Engine {
         self.pack.manifest().record_count
     }
 
-    /// What `/search?q=` answers.
+    /// What `/geocode?q=` answers, or `/places?q=` when no address matches.
     pub(crate) fn search(&self, query: &str) -> Result<Answer> {
         let started = Instant::now();
         let query = query.trim().to_string();
-        let hits = self.searcher.search(&TextSearchOptions {
+        let options = TextSearchOptions {
             query: query.clone(),
             limit: DEFAULT_SEARCH_LIMIT,
             layer: None,
             countries: Vec::new(),
             focus: None,
             bbox: None,
-        })?;
+        };
+        let mut hits = self.searcher.search(&options)?;
+        if hits.is_empty() {
+            hits = self.places.search(&options)?;
+        }
         let collection = api::forward_collection(&self.pack, query, hits)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
         let hits = collection

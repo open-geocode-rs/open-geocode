@@ -16,7 +16,6 @@
           "street": "King Street"
         },
         "category": "shop:bakery",
-        "confidence": 0.76852477,
         "context": {
           "country": {
             "id": "osm:relation:1",
@@ -35,7 +34,7 @@
         "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
         "layer": "poi",
         "name": "Queen Bakery",
-        "score": 21.96003,
+        "score": 12.631804,
         "source": {
           "dataset": "osm"
         }

@@ -243,8 +243,8 @@ async fn responses_match_the_committed_examples() {
         Some(&pack.join("basemap.pmtiles")),
     );
 
-    let address = get(&router, "/search?q=10%20King%20Street").await;
-    assert_example("search-address", &address);
+    let address = get(&router, "/geocode?q=10%20King%20Street").await;
+    assert_example("geocode-text", &address);
     assert_eq!(address["type"], "FeatureCollection");
     assert_eq!(address["geocoding"]["query"], "10 King Street");
     let top = &address["features"][0];
@@ -270,16 +270,30 @@ async fn responses_match_the_committed_examples() {
     assert!((0.0..=1.0).contains(&confidence), "{confidence}");
     assert!(properties.get("distance_m").is_none());
 
-    let poi = get(&router, "/search?q=Queen%20Bakery").await;
-    assert_example("search-poi", &poi);
+    // A place is /places' answer, never /geocode's.
+    let poi = get(&router, "/places?q=Queen%20Bakery").await;
+    assert_example("places", &poi);
     let properties = &poi["features"][0]["properties"];
     assert_eq!(properties["layer"], "poi");
     assert_eq!(properties["name"], "Queen Bakery");
     assert_eq!(properties["category"], "shop:bakery");
     assert_eq!(properties["accuracy"], "centroid");
+    let bakery = get(&router, "/geocode?q=Queen%20Bakery").await;
+    assert!(
+        bakery["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .all(|feature| feature["properties"]["layer"] != "poi"),
+        "{bakery}"
+    );
+    let (status, both) =
+        get_error(&router, "/geocode?q=10%20King%20Street&address=10%20King").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(both["invalid_params"][0]["name"], "q");
 
-    let estimated = get(&router, "/search?q=50%20Queen%20Street").await;
-    assert_example("search-interpolation", &estimated);
+    let estimated = get(&router, "/geocode?q=50%20Queen%20Street").await;
+    assert_example("geocode-interpolation", &estimated);
     let properties = &estimated["features"][0]["properties"];
     assert_eq!(properties["layer"], "interpolation");
     assert_eq!(properties["accuracy"], "interpolated");
@@ -288,8 +302,8 @@ async fn responses_match_the_committed_examples() {
 
     // An address the Pack lacks, in a town it holds, is answered with the
     // town, and the answer says so; an answer that matches says nothing.
-    let fallback = get(&router, "/search?q=99%20Nowhere%20Lane%2C%20Toronto").await;
-    assert_example("search-fallback", &fallback);
+    let fallback = get(&router, "/geocode?q=99%20Nowhere%20Lane%2C%20Toronto").await;
+    assert_example("geocode-fallback", &fallback);
     let properties = &fallback["features"][0]["properties"];
     assert_eq!(properties["fallback"], true);
     assert_eq!(properties["layer"], "locality");
@@ -301,8 +315,8 @@ async fn responses_match_the_committed_examples() {
     );
 
     for (name, uri) in [
-        ("search-street", "/search?q=King%20Street"),
-        ("search-locality", "/search?q=Toronto"),
+        ("geocode-street", "/geocode?q=King%20Street"),
+        ("geocode-locality", "/geocode?q=Toronto"),
     ] {
         assert_example(name, &get(&router, uri).await);
     }
@@ -310,14 +324,14 @@ async fn responses_match_the_committed_examples() {
     // box holds answers, and one wholly outside it does not.
     let near = get(
         &router,
-        "/search?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
+        "/geocode?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
     )
     .await;
-    assert_example("search-near", &near);
+    assert_example("geocode-near", &near);
     assert!(!near["features"].as_array().expect("features").is_empty());
-    let far = get(&router, "/search?q=King%20Street&bbox=10,10,11,11").await;
+    let far = get(&router, "/geocode?q=King%20Street&bbox=10,10,11,11").await;
     assert_eq!(far["features"], json!([]));
-    let (status, crossed) = get_error(&router, "/search?q=king&bbox=170,-10,-170,10").await;
+    let (status, crossed) = get_error(&router, "/geocode?q=king&bbox=170,-10,-170,10").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(crossed["error_code"], "invalid_coordinate");
     assert_eq!(crossed["invalid_params"][0]["name"], "bbox");
@@ -416,7 +430,7 @@ async fn responses_match_the_committed_examples() {
 
     // Errors are part of the contract too: a client branches on `error_code`
     // and shows `detail`, so both are committed like any answer.
-    let (status, empty_query) = get_error(&router, "/search?q=").await;
+    let (status, empty_query) = get_error(&router, "/geocode?q=").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_example("error-invalid-query", &empty_query);
     assert_eq!(empty_query["error_code"], "invalid_query");
@@ -430,21 +444,21 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(out_of_range["error_code"], "invalid_coordinate");
     assert_eq!(out_of_range["invalid_params"][0]["name"], "lat");
 
-    let (status, unknown_layer) = get_error(&router, "/search?q=king&layer=bogus").await;
+    let (status, unknown_layer) = get_error(&router, "/geocode?q=king&layer=bogus").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_example("error-malformed-parameter", &unknown_layer);
     assert_eq!(unknown_layer["error_code"], "malformed_parameter");
 
     // A country code that is not two letters is a typo, and is rejected like
     // an unknown layer rather than silently matching nothing.
-    let (status, bad_country) = get_error(&router, "/search?q=king&country=Canada").await;
+    let (status, bad_country) = get_error(&router, "/geocode?q=king&country=Canada").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(bad_country["error_code"], "malformed_parameter");
     assert_eq!(bad_country["invalid_params"][0]["name"], "country");
 
     // A well-formed country the Pack does not cover is not an error: it is
     // an empty answer.
-    let elsewhere = get(&router, "/search?q=king&country=FR").await;
+    let elsewhere = get(&router, "/geocode?q=king&country=FR").await;
     assert_eq!(
         elsewhere["features"].as_array().expect("features").len(),
         0,
@@ -453,8 +467,8 @@ async fn responses_match_the_committed_examples() {
 
     // The country the contract Pack is built from finds the same places the
     // unfiltered query does, so the filter narrows without changing ranking.
-    let unfiltered = get(&router, "/search?q=king").await;
-    let filtered = get(&router, "/search?q=king&country=CA").await;
+    let unfiltered = get(&router, "/geocode?q=king").await;
+    let filtered = get(&router, "/geocode?q=king&country=CA").await;
     assert_eq!(unfiltered["features"], filtered["features"]);
 
     let _ = std::fs::remove_dir_all(&pack);
