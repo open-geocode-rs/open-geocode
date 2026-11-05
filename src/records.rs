@@ -1580,6 +1580,28 @@ impl Reader {
         })
     }
 
+    /// The places of block `block` (POIs and areas drawn from OpenStreetMap,
+    /// which the id catalogue holds), each with the OSM object it is.
+    /// Reads plain headers alone: a continued record is an address.
+    pub fn block_places(&self, block: u64) -> Result<Vec<(RecordId, ObjectType, i64)>> {
+        let found = self.block(block)?;
+        let strings = self.segment(found.first);
+        let mut places = Vec::new();
+        for slot in 0..found.count {
+            if found.is_continued(slot) {
+                continue;
+            }
+            let (header, _) = plain_header(found.base, strings, found.plain_body(slot)?)?;
+            let place = header.layer == Layer::Poi || header.layer.place_layer().is_some();
+            if !place || header.dataset.is_some() || header.source_kind == SourceKind::Other {
+                continue;
+            }
+            let (object_type, object_id) = header.object()?;
+            places.push((found.first + slot as u64, object_type, object_id));
+        }
+        Ok(places)
+    }
+
     fn locate(&self, id: RecordId) -> Result<(Block<'_>, usize)> {
         if id >= self.record_count {
             return Err(Error::IdOutOfRange { what: "record", id });

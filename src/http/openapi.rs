@@ -202,6 +202,9 @@ pub(crate) enum ErrorCode {
     /// The lookup ran past the server's lookup timeout and stopped. It takes
     /// as long the next time, so a retry does not help.
     Timeout,
+    /// The Pack was built before it held what the request needs, such as
+    /// the id catalogue `/places?ids=` reads. Rebuild the Pack.
+    PackOutdated,
 }
 
 // Mirrors [`crate::http::problem::InvalidParam`] for the schema.

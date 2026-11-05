@@ -278,6 +278,26 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(properties["name"], "Queen Bakery");
     assert_eq!(properties["category"], "shop:bakery");
     assert_eq!(properties["accuracy"], "centroid");
+    // By its stable id, as a shared link or a saved place asks: in the
+    // order asked, an unknown id left out.
+    let by_id = get(&router, "/places?ids=osm:way:999,osm:way:11,osm:relation:3").await;
+    assert_example("places-ids", &by_id);
+    let found = by_id["features"]
+        .as_array()
+        .expect("features")
+        .iter()
+        .map(|feature| feature["properties"]["id"].as_str().expect("id"))
+        .collect::<Vec<_>>();
+    assert_eq!(found, ["osm:way:11", "osm:relation:3"]);
+    let (status, malformed) = get_error(&router, "/places?ids=11").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(malformed["error_code"], "malformed_parameter");
+    let many = ["osm:node:1"; 51].join(",");
+    let (status, _) = get_error(&router, &format!("/places?ids={many}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get_error(&router, "/places?ids=osm:node:1&q=x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     let bakery = get(&router, "/geocode?q=Queen%20Bakery").await;
     assert!(
         bakery["features"]

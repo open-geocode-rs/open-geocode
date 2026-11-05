@@ -163,6 +163,7 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # Compresses build scratch blocks: 2-5x less spill disk and I/O at zstd-1
 # speeds far above the scratch disk's. Already in the tree through Tantivy.
 zstd = { version = "0.13", default-features = false }
+ph = { version = "=0.11.0", default-features = false, features = ["xxhash-rust"] }
 
 # The resource probe: usable CPUs, memory and disk, and memory-map hints.
 [target.'cfg(unix)'.dependencies]

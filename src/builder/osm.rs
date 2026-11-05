@@ -1924,6 +1924,7 @@ impl<'a> Run<'a> {
         self.progress.start(BuildStage::StructuredIndex, None)?;
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed)?;
+        crate::ids::add_to(&mut sealed)?;
         stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
         let mut report = self.report();

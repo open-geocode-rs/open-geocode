@@ -364,6 +364,21 @@ const NEAR_SETTLEMENTS: usize = 5;
 /// built-up areas reach farther from their centre.
 const NEAR_SETTLEMENT_RADIUS_M: f64 = 15_000.0;
 
+impl TextSearchHit {
+    /// A record asked for by its id rather than found by words: no score.
+    pub fn of_record(record_id: RecordId, record: Summary) -> Self {
+        Self {
+            record_id,
+            score: 0.0,
+            record,
+            features: Features::default(),
+            confidence: None,
+            fallback: false,
+            signals: Signals::default(),
+        }
+    }
+}
+
 impl TextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
         Self::from_pack(Arc::new(pack::Reader::open(pack_path)?))

@@ -25,6 +25,7 @@ use open_geocode::{
     },
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
+    ids::{self, Catalogue},
     limits::Limits,
     openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
@@ -212,7 +213,8 @@ enum PackCommand {
         #[arg(long)]
         row: Option<RecordId>,
 
-        /// Read one Pack record by source id, for example osm:node:123.
+        /// Read the place or area of a stable id, for example osm:node:123,
+        /// through the Pack's id catalogue.
         #[arg(long)]
         id: Option<String>,
 
@@ -948,9 +950,22 @@ fn inspect_record_by_source_id_json(
     source_id: &str,
     include_context: bool,
 ) -> Result<Value> {
-    match reader.find_by_source_id(source_id)? {
-        Some(record_id) => inspect_record_json(reader, record_id, include_context),
-        None => bail!("record not found: {source_id}"),
+    let Some(catalogue) = Catalogue::open(reader.container())? else {
+        bail!("this Pack has no id catalogue: rebuild it, or inspect by --row");
+    };
+    let Some((object_type, object_id)) = ids::parse(source_id)? else {
+        bail!("only places and areas are found by id; {source_id} is neither");
+    };
+    let found = catalogue.find(reader.records(), object_type, object_id)?;
+    match found.as_slice() {
+        [] => bail!("no place or area has id {source_id}"),
+        [record_id] => inspect_record_json(reader, *record_id, include_context),
+        records => Ok(Value::Array(
+            records
+                .iter()
+                .map(|record_id| inspect_record_json(reader, *record_id, include_context))
+                .collect::<Result<_>>()?,
+        )),
     }
 }
 

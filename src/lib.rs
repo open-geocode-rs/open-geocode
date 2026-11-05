@@ -13,6 +13,7 @@ pub mod error;
 pub mod extsort;
 pub mod geocode_bench;
 mod http;
+pub mod ids;
 pub mod labels;
 pub mod licences;
 pub mod limits;

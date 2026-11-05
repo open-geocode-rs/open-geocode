@@ -35,14 +35,16 @@ use crate::{
         shutdown::shutdown_signal,
         version,
     },
+    ids::{self, Catalogue},
+    labels,
     limits::Limits,
     pack::Reader,
-    record::Layer,
+    record::{Layer, ObjectType},
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{
-        AddressGeocodeOptions, TextAutocompleteOptions, TextSearchOptions, TextSearcher,
-        mix_suggestions,
+        AddressGeocodeOptions, TextAutocompleteOptions, TextSearchHit, TextSearchOptions,
+        TextSearcher, mix_suggestions,
     },
     stop::{self, CancelOnDrop, Stop},
     util::hilbert::hilbert_key,
@@ -79,6 +81,8 @@ pub(crate) struct AppState {
     searcher: Arc<TextSearcher>,
     /// The same search over places alone (see [`TextSearcher::places`]).
     places: Arc<TextSearcher>,
+    /// Places by their stable id, `None` for a Pack built before it had one.
+    catalogue: Option<Arc<Catalogue>>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
     /// Cancelled once the server starts to stop.
@@ -106,6 +110,7 @@ impl AppState {
             .advise_random_reads(resources.available_memory_bytes);
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
+        let catalogue = Catalogue::open(pack.container())?;
         // Every CPU, at low priority: batches and jobs take all the CPU
         // single lookups leave idle, and a single lookup never waits for a
         // core.
@@ -118,6 +123,7 @@ impl AppState {
         Ok(Self {
             pack,
             places: Arc::new(searcher.places()),
+            catalogue,
             searcher: Arc::new(searcher),
             reverse_geocoder: Arc::new(reverse_geocoder),
             ready: Arc::new(AtomicBool::new(true)),
@@ -177,6 +183,19 @@ impl AppState {
     pub(crate) fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
+}
+
+/// `/places`: places by name in `q`, or by id in `ids`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlacesParams {
+    q: Option<String>,
+    /// Comma-separated stable ids, such as `osm:node:123`.
+    ids: Option<String>,
+    #[serde(default)]
+    limit: usize,
+    country: Option<String>,
+    focus: Option<String>,
+    bbox: Option<String>,
 }
 
 /// `/places` and `/autocomplete` take the same parameters. They differ only
@@ -542,17 +561,26 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
 /// Search places
 ///
 /// Finds places (POIs) by name, such as a museum, a station or a shop, and
-/// the words of where they are. Results are sorted by `score`, highest first.
-/// Addresses, streets and areas are `/geocode`'s.
+/// the words of where they are, in `q`. Results are sorted by `score`,
+/// highest first. Addresses, streets and areas are `/geocode`'s.
+///
+/// Or finds places and areas by their stable ids in `ids`, such as
+/// `osm:node:1383955044` from a shared link, a saved place or a map tile.
+/// Results come in the order asked; an id no record has is left out.
 #[utoipa::path(
     get,
     path = "/places",
     tag = "Geocoding",
     params(
-        ("q" = String, Query,
-         description = "Name of the place, with where it is when known.",
+        ("q" = Option<String>, Query,
+         description = "Name of the place, with where it is when known. Give `q` \
+                        or `ids`, not both.",
          example = "Rijksmuseum Amsterdam",
-         min_length = 1, max_length = 256),
+         max_length = 256),
+        ("ids" = Option<String>, Query,
+         description = "Comma-separated stable ids of places or areas, at most 50, \
+                        such as `osm:node:1383955044,osm:way:4`.",
+         example = "osm:node:1383955044"),
         ("limit" = Option<usize>, Query,
          description = "Maximum number of results. `0`, the default, lets the \
                         server choose.",
@@ -578,17 +606,53 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
          body = ForwardCollection),
         (status = 400, description = "`q` is empty or too long, `limit` is too \
                                       large, `focus` or `bbox` is out of range, \
-                                      or a parameter is malformed.",
+                                      an id is malformed or there are more than \
+                                      50, or a parameter is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 501, description = "`ids` was given to a Pack built before it had \
+                                      an id catalogue. Rebuild the Pack.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
 pub(crate) async fn places(
     State(state): State<AppState>,
-    params: Result<Query<SearchParams>, QueryRejection>,
+    params: Result<Query<PlacesParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
+    if let Some(ids) = params.ids {
+        if params.q.is_some() {
+            return Err(Problem::malformed_parameter("give q or ids, not both")
+                .with_invalid_params(vec![InvalidParam::new("ids", "given with q")]));
+        }
+        let ids = place_ids(&ids)?;
+        let Some(catalogue) = state.catalogue.clone() else {
+            return Err(Problem::pack_outdated(
+                "this Pack has no id catalogue: rebuild it to look places up by id",
+            ));
+        };
+        let worker = state.clone();
+        let collection = lookup(&state, move || {
+            let records = worker.pack.records();
+            let mut hits = Vec::new();
+            for (object_type, object_id) in ids.iter().flatten() {
+                for record_id in catalogue.find(records, *object_type, *object_id)? {
+                    hits.push(TextSearchHit::of_record(
+                        record_id,
+                        worker.pack.record_summary(record_id)?,
+                    ));
+                }
+            }
+            let asked = ids
+                .iter()
+                .flatten()
+                .map(|(kind, id)| labels::osm_record_id(*kind, *id));
+            api::forward_collection(&worker.pack, asked.collect::<Vec<_>>().join(","), hits)
+        })
+        .await?;
+        return Ok(Json(collection));
+    }
     let options = text_request(TextParams {
         q: params.q,
         limit: params.limit,
@@ -603,6 +667,37 @@ pub(crate) async fn places(
     })
     .await?;
     Ok(Json(collection))
+}
+
+/// `ids`, checked: at most [`ids::MAX_IDS`], each written as a record id.
+/// An id of a record no catalogue holds (an imported row) is `None`, and
+/// finds nothing.
+fn place_ids(ids: &str) -> Result<Vec<Option<(ObjectType, i64)>>, Problem> {
+    let ids = ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(Problem::malformed_parameter("ids names no id")
+            .with_invalid_params(vec![InvalidParam::new("ids", "empty")]));
+    }
+    if ids.len() > ids::MAX_IDS {
+        return Err(Problem::limit_too_large(vec![InvalidParam::new(
+            "ids",
+            format!("at most {} ids", ids::MAX_IDS),
+        )]));
+    }
+    ids.into_iter()
+        .map(|id| {
+            ids::parse(id).map_err(|_| {
+                Problem::malformed_parameter(format!(
+                    "{id:?} is no record id, such as osm:node:123"
+                ))
+                .with_invalid_params(vec![InvalidParam::new("ids", "not a record id")])
+            })
+        })
+        .collect()
 }
 
 /// The parameters of a free-text lookup, `/places`' or `/geocode`'s `q`.
