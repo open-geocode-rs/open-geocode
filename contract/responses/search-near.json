@@ -30,6 +30,7 @@
         "layer": "street",
         "name": "King Street",
         "record_id": 5,
+        "road_class": "residential",
         "score": 14.649926,
         "source": {
           "dataset": "osm",

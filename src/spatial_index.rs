@@ -1354,6 +1354,7 @@ mod tests {
     fn indexes_line_segments_with_fraction() {
         let street = |object_id: i64, lon: f64| {
             Record::Street(StreetRecord {
+                road_class: crate::record::RoadClass::Residential,
                 alt_names: Vec::new(),
                 locality: None,
                 name: "King Street".to_string(),
@@ -1398,6 +1399,7 @@ mod tests {
     fn measures_a_street_of_several_ways_end_to_end() {
         let part = |lon: f64| vec![vec![lon, 43.0].into(), vec![lon, 43.001].into()];
         let street = Record::Street(StreetRecord {
+            road_class: crate::record::RoadClass::Residential,
             alt_names: Vec::new(),
             locality: None,
             name: "King Street".to_string(),

@@ -21,7 +21,9 @@ use utoipa::ToSchema;
 use crate::{
     labels,
     pack::{Reader, RecordId, Source, Summary},
-    record::{AddressComponents, InterpolationAddressComponents, Layer, ObjectType, PlaceLayer},
+    record::{
+        AddressComponents, InterpolationAddressComponents, Layer, ObjectType, PlaceLayer, RoadClass,
+    },
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
     search::TextSearchHit,
@@ -154,6 +156,10 @@ pub struct Common {
     /// POI category, such as `amenity:cafe`. Present only on POIs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// The class of road a street is, the most important of its ways, such
+    /// as `motorway` or `residential`. Present only on streets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub road_class: Option<RoadClass>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -679,6 +685,7 @@ fn common(
         name: summary.name,
         label: summary.label,
         category: summary.category,
+        road_class: summary.road_class,
         address: summary.address,
         context: contexts.of(record_id)?,
         source: summary.source,
@@ -738,6 +745,10 @@ fn flat(
         ("name", field(&|p| Some(p.name.clone()))),
         ("label", field(&|p| Some(p.label.clone()))),
         ("category", field(&|p| p.category.clone())),
+        (
+            "road_class",
+            field(&|p| p.road_class.map(|class| class.as_str().to_string())),
+        ),
         ("lat", coordinate(1)),
         ("lon", coordinate(0)),
         (

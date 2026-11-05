@@ -791,6 +791,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
     writer
         .write(
             &StreetRecord {
+                road_class: crate::record::RoadClass::Residential,
                 alt_names: Vec::new(),
                 locality: None,
                 name: "King Street".to_string(),

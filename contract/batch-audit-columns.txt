@@ -9,6 +9,7 @@ geocode_accuracy
 geocode_name
 geocode_label
 geocode_category
+geocode_road_class
 geocode_lat
 geocode_lon
 geocode_address_housenumber

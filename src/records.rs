@@ -27,7 +27,8 @@
 //!                     dataset's index in `records/datasets`
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
-//!                     (a street's locality after them, behind a presence byte)
+//!                     (a street's locality after them, behind a presence byte,
+//!                     then its road class as one byte)
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
@@ -94,7 +95,7 @@ use crate::{
         AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
         LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord,
-        Prominence, Record, SourceProvenance, StreetRecord, point_geometry,
+        Prominence, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
     },
     util::{
         codec::{
@@ -109,7 +110,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 8;
+pub const RECORDS_VERSION: u32 = 9;
 
 pub const BLOCK_RECORDS: u64 = 64;
 const LABEL: &str = "pack-records";
@@ -166,6 +167,9 @@ pub struct Summary {
     /// A POI's category, for example `amenity:cafe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// A street's road class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub road_class: Option<RoadClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<Point>,
     pub source: Source,
@@ -801,6 +805,7 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 self.put_strings(out, &record.alt_names)?;
                 self.put_optional_strings(out, &[record.locality.as_deref()])?;
+                out.push(record.road_class.to_byte());
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
@@ -1166,6 +1171,7 @@ impl Reader {
                     let [locality] = self.optional_strings(header.strings, &mut fields)?;
                     locality
                 },
+                road_class: road_class_field(&mut fields)?,
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance(&self.datasets)?,
@@ -1199,6 +1205,7 @@ impl Reader {
         let (header, mut fields) = (entry.header, entry.fields);
         let source = header.source(&self.datasets)?;
         let mut category = None;
+        let mut road_class = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
@@ -1240,6 +1247,7 @@ impl Reader {
                 let name = self.string_field(header.strings, &mut fields)?.to_string();
                 self.string_list(header.strings, &mut fields)?;
                 let [locality] = self.optional_strings(header.strings, &mut fields)?;
+                road_class = Some(road_class_field(&mut fields)?);
                 (
                     crate::labels::osm_record_id(object_type, object_id),
                     name.clone(),
@@ -1273,6 +1281,7 @@ impl Reader {
             label,
             address: stated,
             category,
+            road_class,
             point: Some(header.point()),
             source,
         })
@@ -1860,6 +1869,7 @@ impl Reader {
                 get_u32(fields)?;
                 self.string_list(header.strings, fields)?;
                 self.optional_strings::<1>(header.strings, fields)?;
+                road_class_field(fields)?;
             }
             Layer::Postcode => {
                 get_u32(fields)?;
@@ -2088,6 +2098,10 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
 }
 
 /// A postcode record's country, 0 when unknown.
+fn road_class_field(fields: &mut &[u8]) -> Result<RoadClass> {
+    RoadClass::from_byte(get_u8(fields)?).ok_or(Error::Decode("street has an unknown road class"))
+}
+
 fn country_field(fields: &mut &[u8]) -> Result<Option<CountryCode>> {
     match get_u64(fields)? {
         0 => Ok(None),
@@ -2294,6 +2308,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, 1),
             }),
             Record::Street(StreetRecord {
+                road_class: RoadClass::Residential,
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
                 locality: None,
                 name: "King Street".into(),

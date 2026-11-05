@@ -46,6 +46,8 @@ pub struct InterpolationRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreetRecord {
     pub name: String,
+    /// The most important class among its ways.
+    pub road_class: RoadClass,
     /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
     /// The town or city it lies in, which its label names: one name is
@@ -64,6 +66,123 @@ pub struct PostcodeRecord {
     pub country: Option<CountryCode>,
     pub geometry: Geometry,
     pub source: DerivedSourceProvenance,
+}
+
+/// What kind of road a street is, from its OSM `highway` tag, most important
+/// first. A link road (`motorway_link`) is its road's class. The
+/// discriminants are the Pack's encoding: a variant may not be renumbered
+/// without a `RECORDS_VERSION`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum RoadClass {
+    Motorway = 0,
+    Trunk = 1,
+    Primary = 2,
+    Secondary = 3,
+    Tertiary = 4,
+    Unclassified = 5,
+    Residential = 6,
+    LivingStreet = 7,
+    Service = 8,
+    Pedestrian = 9,
+    Track = 10,
+    Busway = 11,
+    Cycleway = 12,
+    Footway = 13,
+    Path = 14,
+    Steps = 15,
+    /// Any other value, such as a road under construction.
+    #[default]
+    Other = 16,
+}
+
+impl RoadClass {
+    const ALL: [RoadClass; 17] = [
+        RoadClass::Motorway,
+        RoadClass::Trunk,
+        RoadClass::Primary,
+        RoadClass::Secondary,
+        RoadClass::Tertiary,
+        RoadClass::Unclassified,
+        RoadClass::Residential,
+        RoadClass::LivingStreet,
+        RoadClass::Service,
+        RoadClass::Pedestrian,
+        RoadClass::Track,
+        RoadClass::Busway,
+        RoadClass::Cycleway,
+        RoadClass::Footway,
+        RoadClass::Path,
+        RoadClass::Steps,
+        RoadClass::Other,
+    ];
+
+    /// The class of an OSM `highway` value.
+    pub fn of_highway(value: &str) -> Self {
+        match value.strip_suffix("_link").unwrap_or(value) {
+            "motorway" => Self::Motorway,
+            "trunk" => Self::Trunk,
+            "primary" => Self::Primary,
+            "secondary" => Self::Secondary,
+            "tertiary" => Self::Tertiary,
+            "unclassified" => Self::Unclassified,
+            "residential" => Self::Residential,
+            "living_street" => Self::LivingStreet,
+            "service" => Self::Service,
+            "pedestrian" => Self::Pedestrian,
+            "track" => Self::Track,
+            "busway" => Self::Busway,
+            "cycleway" => Self::Cycleway,
+            "footway" | "bridleway" => Self::Footway,
+            "path" => Self::Path,
+            "steps" => Self::Steps,
+            _ => Self::Other,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Motorway => "motorway",
+            Self::Trunk => "trunk",
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Tertiary => "tertiary",
+            Self::Unclassified => "unclassified",
+            Self::Residential => "residential",
+            Self::LivingStreet => "living_street",
+            Self::Service => "service",
+            Self::Pedestrian => "pedestrian",
+            Self::Track => "track",
+            Self::Busway => "busway",
+            Self::Cycleway => "cycleway",
+            Self::Footway => "footway",
+            Self::Path => "path",
+            Self::Steps => "steps",
+            Self::Other => "other",
+        }
+    }
+
+    pub const fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(byte)).copied()
+    }
 }
 
 /// A named point of interest. One that also states a valid address carries it,
@@ -692,11 +811,12 @@ impl StreetRecord {
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 8)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
         serialize_alt_names(&mut state, &self.alt_names)?;
+        state.serialize_field("road_class", &self.road_class)?;
         if let Some(locality) = &self.locality {
             state.serialize_field("locality", locality)?;
         }

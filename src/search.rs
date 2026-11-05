@@ -5879,6 +5879,7 @@ impl TextSearcher {
                 label: labels::address_label(&address),
                 address: Address::from(&address),
                 category: None,
+                road_class: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -9895,6 +9896,7 @@ mod tests {
             label: "Blue Door".to_string(),
             address: Address::default(),
             category: None,
+            road_class: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),
@@ -12844,6 +12846,7 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(9);
         StreetRecord {
+            road_class: crate::record::RoadClass::Residential,
             alt_names: Vec::new(),
             locality: None,
             name: label.to_string(),

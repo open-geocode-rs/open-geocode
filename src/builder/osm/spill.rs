@@ -14,7 +14,7 @@ use crate::{
     record::{
         AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceRecord,
-        PoiRecord, PostcodeRecord, Prominence, Record, SourceProvenance, StreetRecord,
+        PoiRecord, PostcodeRecord, Prominence, Record, RoadClass, SourceProvenance, StreetRecord,
         point_geometry,
     },
     util::{
@@ -1125,6 +1125,7 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             put_str(out, &record.name);
             put_strs(out, &record.alt_names);
             put_opt_str(out, record.locality.as_deref());
+            out.push(record.road_class.to_byte());
             encode_point(out, record.representative_point);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
@@ -1198,6 +1199,8 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
             name: get_string(input)?,
             alt_names: get_strings(input)?,
             locality: get_opt_string(input)?,
+            road_class: RoadClass::from_byte(get_u8(input)?)
+                .ok_or(Error::Decode("spilled street has an unknown road class"))?,
             representative_point: decode_point(input)?,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
@@ -1437,6 +1440,7 @@ mod tests {
     #[test]
     fn out_of_range_line_coordinates_are_not_spilled_as_zero() {
         let record = Record::Street(StreetRecord {
+            road_class: RoadClass::Residential,
             alt_names: Vec::new(),
             name: "Edge Road".into(),
             locality: None,
@@ -1462,6 +1466,7 @@ mod tests {
         );
 
         let mut infinite = Record::Street(StreetRecord {
+            road_class: RoadClass::Residential,
             alt_names: Vec::new(),
             name: "Edge Road".into(),
             locality: None,
@@ -1495,6 +1500,7 @@ mod tests {
         });
         let records = [
             Record::Street(StreetRecord {
+                road_class: RoadClass::Residential,
                 alt_names: Vec::new(),
                 name: "King Street".into(),
                 locality: None,
@@ -1504,6 +1510,7 @@ mod tests {
             }),
             // The ways of one street, merged.
             Record::Street(StreetRecord {
+                road_class: RoadClass::Residential,
                 alt_names: vec!["Te Huarahi o King".into()],
                 name: "King Street".into(),
                 locality: Some("Toronto".into()),

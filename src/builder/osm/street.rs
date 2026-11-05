@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     builder::report::CandidateIssue,
-    record::{ObjectType, Record, SourceProvenance, StreetRecord},
+    record::{ObjectType, Record, RoadClass, SourceProvenance, StreetRecord},
     spatial_index::haversine_m,
     util::geo::{line_geometry, line_parts},
 };
@@ -74,6 +74,9 @@ pub(crate) fn emit_street(
         Some(StreetRecord {
             alt_names: alternate_names(tags, &name),
             locality: None,
+            road_class: tags
+                .get("highway")
+                .map_or(RoadClass::Other, |value| RoadClass::of_highway(value)),
             name,
             geometry: built.geometry,
             representative_point: built.representative_point,
@@ -108,7 +111,8 @@ const METRES_PER_DEGREE: f64 = 111_320.0;
 /// The ways of one street name in one area, as streets: a way whose end
 /// lies within [`JOIN_GAP_M`] of another's line joins it, and a street is
 /// every way so joined. It keeps the name, source and id of its lowest way,
-/// every other name its ways have, a line part per way, and the vertex
+/// every other name its ways have, the most important class of its ways, a
+/// line part per way, and the vertex
 /// nearest the middle of its ways as its point.
 pub(crate) fn join_ways(mut ways: Vec<StreetRecord>) -> Vec<StreetRecord> {
     if ways.len() < 2 {
@@ -239,6 +243,7 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
         .map(<[_]>::to_vec)
         .collect::<Vec<_>>();
     for way in members {
+        street.road_class = street.road_class.min(way.road_class);
         parts.extend(
             line_parts(&way.geometry)
                 .into_iter()
@@ -323,6 +328,17 @@ mod tests {
     }
 
     #[test]
+    fn a_link_road_is_its_road_and_an_unknown_value_is_other() {
+        assert_eq!(RoadClass::of_highway("motorway_link"), RoadClass::Motorway);
+        assert_eq!(RoadClass::of_highway("residential"), RoadClass::Residential);
+        assert_eq!(RoadClass::of_highway("construction"), RoadClass::Other);
+        for class in [RoadClass::Motorway, RoadClass::Steps, RoadClass::Other] {
+            assert_eq!(RoadClass::from_byte(class.to_byte()), Some(class));
+        }
+        assert_eq!(RoadClass::from_byte(17), None);
+    }
+
+    #[test]
     fn a_platform_or_a_proposed_way_is_no_street_but_a_footway_is() {
         let highway = |value: &str| BTreeMap::from([("highway".to_string(), value.to_string())]);
         for value in ["platform", "proposed", "bus_stop", "services"] {
@@ -357,6 +373,7 @@ mod tests {
         let way = |id: i64, points: &[[f64; 2]], alt_names: &[&str]| {
             let coordinates = points.iter().map(|point| point.to_vec().into()).collect();
             StreetRecord {
+                road_class: RoadClass::Residential,
                 alt_names: alt_names.iter().map(|name| name.to_string()).collect(),
                 name: "King Street".to_string(),
                 locality: None,
@@ -369,12 +386,20 @@ mod tests {
         let streets = join_ways(vec![
             way(3, &[[-79.002, 43.0], [-79.003, 43.0]], &["Rue King"]),
             way(1, &[[-79.0, 43.0], [-79.001, 43.0]], &[]),
-            way(2, &[[-79.0013, 43.0], [-79.002, 43.0]], &["King St"]),
+            StreetRecord {
+                road_class: RoadClass::Primary,
+                ..way(2, &[[-79.0013, 43.0], [-79.002, 43.0]], &["King St"])
+            },
             way(4, &[[-79.1, 43.0], [-79.101, 43.0]], &[]),
         ]);
         assert_eq!(streets.len(), 2);
         let joined = &streets[0];
         assert_eq!(joined.id(), "osm:way:1", "named by its lowest way");
+        assert_eq!(
+            joined.road_class,
+            RoadClass::Primary,
+            "its most important way's class"
+        );
         assert_eq!(joined.alt_names, ["King St", "Rue King"]);
         let parts = line_parts(&joined.geometry).expect("a line");
         assert_eq!(parts.len(), 3);

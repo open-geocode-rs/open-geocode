@@ -30,6 +30,7 @@
         "layer": "street",
         "name": "King Street",
         "record_id": 5,
+        "road_class": "residential",
         "source": {
           "dataset": "osm",
           "object_id": 12,

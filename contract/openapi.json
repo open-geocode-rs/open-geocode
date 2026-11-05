@@ -119,6 +119,10 @@
             "$ref": "#/components/schemas/u64",
             "description": "Row of the record in this Pack. Changes between Pack builds."
           },
+          "road_class": {
+            "$ref": "#/components/schemas/RoadClass",
+            "description": "The class of road a street is, the most important of its ways, such\nas `motorway` or `residential`. Present only on streets."
+          },
           "source": {
             "$ref": "#/components/schemas/Source"
           }
@@ -853,6 +857,29 @@
           "status"
         ],
         "type": "object"
+      },
+      "RoadClass": {
+        "description": "What kind of road a street is, from its OSM `highway` tag, most important\nfirst. A link road (`motorway_link`) is its road's class. The\ndiscriminants are the Pack's encoding: a variant may not be renumbered\nwithout a `RECORDS_VERSION`.",
+        "enum": [
+          "motorway",
+          "trunk",
+          "primary",
+          "secondary",
+          "tertiary",
+          "unclassified",
+          "residential",
+          "living_street",
+          "service",
+          "pedestrian",
+          "track",
+          "busway",
+          "cycleway",
+          "footway",
+          "path",
+          "steps",
+          "other"
+        ],
+        "type": "string"
       },
       "Source": {
         "description": "Source data the result comes from.",
