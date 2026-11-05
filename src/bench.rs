@@ -410,10 +410,7 @@ fn benchmark_reverse_cases(
     for case in cases {
         let mut result_present = false;
         let durations = measure_iterations(iterations, warmup, || {
-            let response = geocoder.reverse(GeocodeOptions {
-                lon: case.lon,
-                lat: case.lat,
-            })?;
+            let response = geocoder.reverse(GeocodeOptions::at(case.lon, case.lat))?;
             result_present = response.result.is_some();
             Ok(())
         })?;

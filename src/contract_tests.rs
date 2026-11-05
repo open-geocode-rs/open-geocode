@@ -365,6 +365,13 @@ async fn responses_match_the_committed_examples() {
             .expect("number")
     );
 
+    // One layer: its nearest record, and no other area.
+    let street_only = get(&router, "/reverse?lon=-79.0&lat=43.0&layer=street").await;
+    assert_example("reverse-layer", &street_only);
+    let features = street_only["features"].as_array().expect("features");
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0]["properties"]["layer"], "street");
+
     // Far from everything but the areas.
     let context_only = get(&router, "/reverse?lon=-79.2&lat=43.2").await;
     assert_example("reverse-areas", &context_only);

@@ -268,10 +268,12 @@ pub(crate) struct GeocodeParams {
     country: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct ReverseParams {
     lon: f64,
     lat: f64,
+    /// See [`parse_layer`].
+    layer: Option<String>,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -891,7 +893,7 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
 ///
 /// Returns the nearest address or street to a point, followed by the areas
 /// that contain the point, most precise first. Only the first result carries
-/// `distance_m`.
+/// `distance_m`. With `layer`, returns only the nearest result of that layer.
 #[utoipa::path(
     get,
     path = "/reverse",
@@ -901,12 +903,17 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
          example = -79.3832, minimum = -180.0, maximum = 180.0),
         ("lat" = f64, Query, description = "Latitude in degrees.",
          example = 43.6532, minimum = -90.0, maximum = 90.0),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only the nearest result of this layer, or for an area \
+                        layer the area of that layer the point lies in, and no other \
+                        area. An unknown layer returns `400`."),
     ),
     responses(
         (status = 200, description = "Results at the point, most precise first. \
                                       `features` is empty when nothing is near.",
          body = ReverseCollection),
-        (status = 400, description = "`lon` or `lat` is missing or out of range.",
+        (status = 400, description = "`lon` or `lat` is missing or out of range, or \
+                                      `layer` is unknown.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -947,6 +954,9 @@ pub(crate) async fn reverse(
          description = "Latitude in degrees. Applies to every item; an item's own \
                         field overrides it.",
          minimum = -90.0, maximum = 90.0),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only results of this layer. Applies to every item; an \
+                        item's own field overrides it."),
     ),
     request_body(content = Vec<openapi::ReverseItem>, content_type = "application/json"),
     responses(
@@ -980,10 +990,12 @@ pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollectio
 
 /// `/reverse`'s parameters, checked.
 fn reverse_request(params: ReverseParams) -> Result<GeocodeOptions, Problem> {
-    bounds::validate_coords(params.lon, params.lat)?;
+    let ReverseParams { lon, lat, layer } = params;
+    bounds::validate_coords(lon, lat)?;
     Ok(GeocodeOptions {
-        lon: params.lon,
-        lat: params.lat,
+        lon,
+        lat,
+        layer: parse_layer(layer.as_deref())?,
     })
 }
 

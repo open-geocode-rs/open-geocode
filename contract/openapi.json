@@ -795,6 +795,9 @@
             "minimum": -90,
             "type": "number"
           },
+          "layer": {
+            "$ref": "#/components/schemas/Layer"
+          },
           "lon": {
             "example": -79.3832,
             "format": "double",
@@ -2476,7 +2479,7 @@
     },
     "/reverse": {
       "get": {
-        "description": "Returns the nearest address or street to a point, followed by the areas\nthat contain the point, most precise first. Only the first result carries\n`distance_m`.",
+        "description": "Returns the nearest address or street to a point, followed by the areas\nthat contain the point, most precise first. Only the first result carries\n`distance_m`. With `layer`, returns only the nearest result of that layer.",
         "operationId": "reverse",
         "parameters": [
           {
@@ -2503,6 +2506,15 @@
               "maximum": 90,
               "minimum": -90,
               "type": "number"
+            }
+          },
+          {
+            "description": "Return only the nearest result of this layer, or for an area layer the area of that layer the point lies in, and no other area. An unknown layer returns `400`.",
+            "in": "query",
+            "name": "layer",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Layer"
             }
           }
         ],
@@ -2548,7 +2560,7 @@
                 }
               }
             },
-            "description": "`lon` or `lat` is missing or out of range.",
+            "description": "`lon` or `lat` is missing or out of range, or `layer` is unknown.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -2704,6 +2716,15 @@
               "maximum": 90,
               "minimum": -90,
               "type": "number"
+            }
+          },
+          {
+            "description": "Return only results of this layer. Applies to every item; an item's own field overrides it.",
+            "in": "query",
+            "name": "layer",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Layer"
             }
           }
         ],

@@ -177,7 +177,7 @@ impl Engine {
     /// What `/reverse?lat=&lon=` answers.
     pub(crate) fn reverse(&self, lat: f64, lon: f64) -> Result<Answer> {
         let started = Instant::now();
-        let response = self.reverse.reverse(GeocodeOptions { lon, lat })?;
+        let response = self.reverse.reverse(GeocodeOptions::at(lon, lat))?;
         let collection = api::reverse_collection(&self.pack, &response)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
         let hits = collection

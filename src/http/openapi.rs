@@ -262,6 +262,7 @@ pub(crate) struct ReverseItem {
     pub lon: Option<f64>,
     #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
     pub lat: Option<f64>,
+    pub layer: Option<Layer>,
 }
 
 /// A forward batch's answer: one result per item, in input order.

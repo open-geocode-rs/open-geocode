@@ -742,6 +742,24 @@ impl Reader {
         Ok(closest_candidates(candidates, limit))
     }
 
+    pub fn poi_candidates(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates =
+            self.block_points(
+                lon,
+                lat,
+                radius_m,
+                limit,
+                |_, layer| Ok(layer == Layer::Poi),
+            )?;
+        Ok(closest_candidates(candidates, limit))
+    }
+
     pub fn context_candidates(
         &self,
         lon: f64,

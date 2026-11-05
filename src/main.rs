@@ -1092,7 +1092,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
-    let response = geocoder.reverse(reverse::GeocodeOptions { lon, lat })?;
+    let response = geocoder.reverse(reverse::GeocodeOptions::at(lon, lat))?;
     write_json(&serde_json::to_value(api::reverse_collection(
         &pack, &response,
     )?)?)

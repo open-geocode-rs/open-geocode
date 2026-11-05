@@ -3641,7 +3641,7 @@ mod tests {
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = |lon, lat| {
             reverse
-                .reverse(GeocodeOptions { lon, lat })
+                .reverse(GeocodeOptions::at(lon, lat))
                 .expect("reverse")
                 .result
                 .expect("result")
@@ -4096,10 +4096,7 @@ mod tests {
         // an address record.
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = reverse
-            .reverse(GeocodeOptions {
-                lon: -79.38,
-                lat: 43.65,
-            })
+            .reverse(GeocodeOptions::at(-79.38, 43.65))
             .expect("reverse")
             .result
             .expect("result");

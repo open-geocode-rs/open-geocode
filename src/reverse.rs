@@ -26,6 +26,19 @@ pub struct PackReverseGeocoder {
 pub struct GeocodeOptions {
     pub lon: f64,
     pub lat: f64,
+    /// Answer only with a record of this layer, and list no other area.
+    pub layer: Option<Layer>,
+}
+
+impl GeocodeOptions {
+    /// The nearest answer of any layer at a point.
+    pub const fn at(lon: f64, lat: f64) -> Self {
+        Self {
+            lon,
+            lat,
+            layer: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -60,6 +73,8 @@ pub enum MatchKind {
     ExplicitAddress,
     EstimatedAddress,
     NearestStreet,
+    /// The nearest POI, answered only to `layer=poi`.
+    Poi,
     ContextOnly,
 }
 
@@ -126,6 +141,21 @@ impl PackReverseGeocoder {
         let mut context = Context::default();
         let mut context_record_ids = Vec::new();
 
+        if let Some(layer) = options.layer {
+            let mut result =
+                self.of_layer(layer, options, &mut context, &mut context_record_ids)?;
+            // The answer is the one layer asked for: the areas it resolved
+            // still label it, but are not answers of their own.
+            if let Some(result) = &mut result {
+                result.evidence.context_record_ids.clear();
+            }
+            return Ok(GeocodeResponse {
+                lon: options.lon,
+                lat: options.lat,
+                result,
+            });
+        }
+
         let mut result = self.explicit_address(options, &mut context, &mut context_record_ids)?;
         if result.is_none() {
             crate::stop::check()?;
@@ -147,17 +177,45 @@ impl PackReverseGeocoder {
         })
     }
 
+    /// The nearest record of `layer`: the stage of the fallback chain that
+    /// answers with it, or for an area the area of that layer the point lies
+    /// in.
+    fn of_layer(
+        &self,
+        layer: Layer,
+        options: GeocodeOptions,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
+        match layer {
+            Layer::Address => self.explicit_address(options, context, context_record_ids),
+            Layer::Interpolation => self.estimated_address(options, context, context_record_ids),
+            Layer::Street => self.nearest_street(options, context, context_record_ids),
+            Layer::Poi => self.nearest_poi(options, context, context_record_ids),
+            Layer::Country
+            | Layer::District
+            | Layer::Locality
+            | Layer::Neighbourhood
+            | Layer::Place
+            | Layer::Postcode
+            | Layer::Region => self.area(layer, options, context, context_record_ids),
+        }
+    }
+
     fn explicit_address(
         &self,
         options: GeocodeOptions,
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
+        // With `layer=address`, a POI that carries an address is passed over
+        // for the address behind it.
+        let only_addresses = options.layer == Some(Layer::Address);
         let Some(candidate) = self
             .spatial
-            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
+            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, CANDIDATE_LIMIT)?
             .into_iter()
-            .next()
+            .find(|candidate| !only_addresses || candidate.layer == Layer::Address)
         else {
             return Ok(None);
         };
@@ -286,6 +344,85 @@ impl PackReverseGeocoder {
                 ..Evidence::default()
             },
         }))
+    }
+
+    fn nearest_poi(
+        &self,
+        options: GeocodeOptions,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
+        let Some(candidate) = self
+            .spatial
+            .poi_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let record = self.pack.records().record(candidate.record_id)?;
+        let Record::Poi(poi) = &record else {
+            return Ok(None);
+        };
+
+        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+        if let Some(address) = &poi.address {
+            apply_address_context(context, address);
+        }
+        self.enrich_context(options, context, context_record_ids)?;
+
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::Poi,
+            label: compose_label(&poi.name, context),
+            primary_record_id: Some(candidate.record_id),
+            id: Some(record.id()),
+            layer: Some(Layer::Poi.as_str().to_string()),
+            distance_m: Some(candidate.distance_m),
+            point: Some(Point {
+                lon: candidate.lon,
+                lat: candidate.lat,
+                precision: PointPrecision::Point,
+            }),
+            context: context.clone(),
+            evidence: Evidence {
+                context_record_ids: context_record_ids.clone(),
+                ..Evidence::default()
+            },
+        }))
+    }
+
+    /// The area of `layer` the point lies in.
+    fn area(
+        &self,
+        layer: Layer,
+        options: GeocodeOptions,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
+        self.enrich_context(options, context, context_record_ids)?;
+        for &record_id in context_record_ids.iter() {
+            let Some(record) = self.pack.context_record(record_id)? else {
+                continue;
+            };
+            if record.layer != layer.as_str() {
+                continue;
+            }
+            return Ok(Some(GeocodeResult {
+                match_kind: MatchKind::ContextOnly,
+                label: compose_label(&record.name, context),
+                primary_record_id: Some(record_id),
+                id: Some(record.id),
+                layer: Some(record.layer),
+                distance_m: None,
+                point: record.point.map(context_point),
+                context: context.clone(),
+                evidence: Evidence {
+                    context_record_ids: context_record_ids.clone(),
+                    ..Evidence::default()
+                },
+            }));
+        }
+        Ok(None)
     }
 
     fn context_only(
@@ -500,10 +637,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(GeocodeOptions {
-                lon: -79.0,
-                lat: 43.0,
-            })
+            .reverse(GeocodeOptions::at(-79.0, 43.0))
             .expect("reverse");
         let result = response.result.expect("result");
 
@@ -525,10 +659,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(GeocodeOptions {
-                lon: -79.00001,
-                lat: 43.0005,
-            })
+            .reverse(GeocodeOptions::at(-79.00001, 43.0005))
             .expect("reverse");
         let result = response.result.expect("result");
 
@@ -548,10 +679,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(GeocodeOptions {
-                lon: -79.00001,
-                lat: 43.0005,
-            })
+            .reverse(GeocodeOptions::at(-79.00001, 43.0005))
             .expect("reverse");
         let result = response.result.expect("result");
 
@@ -587,10 +715,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let response = geocoder
-            .reverse(GeocodeOptions {
-                lon: -79.0,
-                lat: 43.0,
-            })
+            .reverse(GeocodeOptions::at(-79.0, 43.0))
             .expect("reverse");
         let result = response.result.expect("result");
 
@@ -653,10 +778,7 @@ mod tests {
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
         let result = geocoder
-            .reverse(GeocodeOptions {
-                lon: -79.0,
-                lat: 43.0,
-            })
+            .reverse(GeocodeOptions::at(-79.0, 43.0))
             .expect("reverse")
             .result
             .expect("result");
@@ -666,6 +788,71 @@ mod tests {
         assert_eq!(result.layer.as_deref(), Some("poi"));
         assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
         assert_eq!(result.evidence.explicit_address_record_id, Some(2));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_layer_answers_with_its_nearest_record_and_lists_no_other_area() {
+        let temp_dir = temp_pack_dir("layer");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let locality_id = writer
+            .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
+            .expect("place");
+        writer.write(&street_record().into(), None).expect("street");
+        writer
+            .write(
+                &PoiRecord {
+                    alt_names: Vec::new(),
+                    name: "Queen Bakery".to_string(),
+                    category: "shop:bakery".to_string(),
+                    address: Some(address_record().address),
+                    geometry: point_geometry(-79.0, 43.0),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::osm(ObjectType::Node, 41),
+                    prominence: Default::default(),
+                }
+                .into(),
+                None,
+            )
+            .expect("bakery");
+        let mut address = address_record();
+        address.geometry = point_geometry(-79.0, 43.00005);
+        writer.write(&address.into(), None).expect("address");
+        writer.finish().expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let at = |layer| {
+            geocoder
+                .reverse(GeocodeOptions {
+                    layer: Some(layer),
+                    ..GeocodeOptions::at(-79.0, 43.0)
+                })
+                .expect("reverse")
+                .result
+        };
+
+        let street = at(Layer::Street).expect("street");
+        assert_eq!(street.match_kind, MatchKind::NearestStreet);
+        assert_eq!(street.id.as_deref(), Some("osm:way:30"));
+        assert!(street.evidence.context_record_ids.is_empty());
+
+        // The bakery on the point carries an address, but is no address.
+        let address = at(Layer::Address).expect("address");
+        assert_eq!(address.id.as_deref(), Some("osm:node:10"));
+        assert_eq!(address.layer.as_deref(), Some("address"));
+
+        let poi = at(Layer::Poi).expect("poi");
+        assert_eq!(poi.match_kind, MatchKind::Poi);
+        assert_eq!(poi.id.as_deref(), Some("osm:node:41"));
+        assert!(poi.label.starts_with("Queen Bakery, "), "{}", poi.label);
+
+        let locality = at(Layer::Locality).expect("locality");
+        assert_eq!(locality.primary_record_id, Some(locality_id));
+        assert_eq!(locality.layer.as_deref(), Some("locality"));
+
+        assert!(at(Layer::Interpolation).is_none());
+        assert!(at(Layer::Country).is_none());
 
         let _ = fs::remove_dir_all(temp_dir);
     }
