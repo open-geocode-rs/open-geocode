@@ -21,7 +21,10 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::Deserialize;
 use tokio::{net::TcpListener, sync::Semaphore, task};
 use tokio_util::sync::CancellationToken;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    compression::CompressionLayer,
+    services::{ServeDir, ServeFile},
+};
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
@@ -462,6 +465,9 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         error_log,
         request_id::propagate,
     ))
+    // gzip or zstd by Accept-Encoding. The default predicate leaves bodies
+    // under 32 bytes, ranges and already-encoded bodies alone.
+    .layer(CompressionLayer::new())
     .with_state(state)
 }
 
@@ -3527,6 +3533,142 @@ mod router_tests {
         let refused = place_ids(&huge, 7).unwrap_err();
         assert_eq!(refused.error_code().as_str(), "limit_too_large");
         assert_eq!(refused.invalid_params()[0].reason, "at most 7 ids");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn with_headers(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = request(method, uri);
+        for (name, value) in headers {
+            request.headers_mut().append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn responses_are_compressed_as_the_client_accepts() {
+        use std::io::Read;
+
+        let pack = temp_path("compress");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let uri = "/geocode?q=10%20King%20Street";
+
+        let plain = send(router.clone(), request("GET", uri)).await;
+        assert!(plain.headers.get(header::CONTENT_ENCODING).is_none());
+
+        let gzip = send(
+            router.clone(),
+            with_headers("GET", uri, &[("accept-encoding", "gzip")]),
+        )
+        .await;
+        assert_eq!(header_value(&gzip, "content-encoding"), Some("gzip"));
+        assert!(
+            header_value(&gzip, "vary")
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("accept-encoding")
+        );
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&gzip.body[..])
+            .read_to_end(&mut decoded)
+            .expect("gunzip");
+        assert_eq!(decoded, plain.body);
+
+        let zstd = send(
+            router.clone(),
+            with_headers("GET", uri, &[("accept-encoding", "zstd")]),
+        )
+        .await;
+        assert_eq!(header_value(&zstd, "content-encoding"), Some("zstd"));
+        assert_eq!(
+            zstd::stream::decode_all(&zstd.body[..]).expect("unzstd"),
+            plain.body
+        );
+
+        // Too small to be worth the frame.
+        let tiny = send(
+            router,
+            with_headers("GET", "/healthz", &[("accept-encoding", "gzip")]),
+        )
+        .await;
+        assert!(tiny.headers.get(header::CONTENT_ENCODING).is_none());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Compression must not hold a job's rows back until the upload ends, nor
+    /// panic on the end of the results stream.
+    #[tokio::test]
+    async fn compressed_jobs_still_stream_while_uploading() {
+        use futures_util::{StreamExt, stream};
+        use std::convert::Infallible;
+        use std::io::Read;
+
+        let pack = temp_path("compress-stream");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        for encoding in ["gzip", "zstd"] {
+            let (upload, rows) = tokio::sync::mpsc::channel::<String>(4);
+            let body = Body::from_stream(stream::unfold(rows, |mut rows| async {
+                rows.recv()
+                    .await
+                    .map(|chunk| (Ok::<_, Infallible>(chunk), rows))
+            }));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/jobs?endpoint=reverse")
+                .header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::ACCEPT_ENCODING, encoding)
+                .body(body)
+                .unwrap();
+            // Two windows of rows, so the first is answered while the upload
+            // is still open.
+            let rows = 2 * 256;
+            upload
+                .send("{\"lon\": -79.0, \"lat\": 43.0}\n".repeat(rows))
+                .await
+                .unwrap();
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                Some(encoding)
+            );
+
+            let mut chunks = response.into_body().into_data_stream();
+            let mut compressed = Vec::new();
+            let first = tokio::time::timeout(Duration::from_secs(5), chunks.next()).await;
+            let Ok(Some(Ok(first))) = first else {
+                panic!("{encoding}: no bytes arrived before the upload ended");
+            };
+            compressed.extend_from_slice(&first);
+
+            drop(upload);
+            while let Some(chunk) = chunks.next().await {
+                compressed.extend_from_slice(&chunk.expect("chunk"));
+            }
+            let mut decoded = Vec::new();
+            match encoding {
+                "gzip" => flate2::read::MultiGzDecoder::new(&compressed[..])
+                    .read_to_end(&mut decoded)
+                    .map(drop),
+                _ => zstd::stream::copy_decode(&compressed[..], &mut decoded),
+            }
+            .expect("decode");
+            assert_eq!(decoded.split(|byte| *byte == b'\n').count() - 1, rows);
+        }
+
         let _ = std::fs::remove_dir_all(&pack);
     }
 }

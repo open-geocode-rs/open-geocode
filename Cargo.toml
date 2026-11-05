@@ -148,7 +148,7 @@ tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread", "sig
 # Stop token shared by the server and its jobs. Already in the tree through
 # tower-http.
 tokio-util = { version = "0.7", default-features = false }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd", "fs"] }
 # The Unicode Script property: which characters the parser reads as a
 # script written without spaces.
 unicode-script = "0.5.7"
