@@ -785,6 +785,7 @@ impl TextSearcher {
         for word in &plan.optional {
             clauses.push((Occur::Should, self.word_query(word, &plan.spellings)));
         }
+        clauses.push(self.product_clause());
         if let Some(layer) = filters
             .layer
             .map(str::trim)
@@ -1721,6 +1722,19 @@ impl TextSearcher {
             ));
         }
         Ok(Box::new(BooleanQuery::new(alternatives)))
+    }
+
+    /// What keeps a search to its product: a place search reads POIs alone,
+    /// an address search no POI. The two share where records are
+    /// (`context_text`), so a query that matched on it alone could reach the
+    /// other's records.
+    fn product_clause(&self) -> (Occur, Box<dyn Query>) {
+        let occur = if self.places {
+            Occur::Must
+        } else {
+            Occur::MustNot
+        };
+        (occur, self.layer_query(Layer::Poi.as_str()))
     }
 
     fn layer_query(&self, layer: &str) -> Box<dyn Query> {
@@ -5163,6 +5177,7 @@ impl TextSearcher {
         if let Some(bbox) = filters.bbox {
             subqueries.push((Occur::Must, self.bbox_query(bbox)));
         }
+        subqueries.push(self.product_clause());
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
@@ -5202,6 +5217,7 @@ impl TextSearcher {
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
+        clauses.push(self.product_clause());
         let ranking = Ranking {
             query_words: QueryWords::new(query_text),
             focus,

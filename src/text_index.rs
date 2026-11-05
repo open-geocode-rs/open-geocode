@@ -41,7 +41,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 12;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 13;
 /// Postcode data within this radius describes where a record is: a record
 /// with no postcode of its own is ranked by the nearest postcode centroid
 /// within it, and the batch check compares the postcode areas within it.
@@ -96,7 +96,6 @@ const LABEL: &str = "pack-text";
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
 const PLACE_NAME_FIELD: &str = "place_name_text";
 const PLACE_CONTENT_FIELD: &str = "place_content_text";
-const PLACE_CONTEXT_FIELD: &str = "place_context_text";
 const PLACE_AUTOCOMPLETE_SUBJECT_FIELD: &str = "place_autocomplete_subject_text";
 const PLACE_ADDRESS_NUMBER_FIELD: &str = "place_address_number";
 pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
@@ -225,11 +224,14 @@ pub struct Fields {
     pub postcode_exact: Field,
     pub autocomplete_subject_text: Field,
     /// A place's (POI's) own text fields, apart from the address fields
-    /// above: address search lists only those, so a place never matches it,
-    /// and a word common in shop names stays rare among street names.
+    /// above, so a word common in shop names stays rare among street names.
+    /// Where a place is stays in `context_text` with the addresses': the
+    /// documents run in map order, so the neighbours that share a town's
+    /// name are runs of one list, which cost a fraction of the two lists
+    /// apart. Search keeps the products apart by layer (see
+    /// `TextSearcher::product_clause`).
     pub place_name_text: Field,
     pub place_content_text: Field,
-    pub place_context_text: Field,
     pub place_autocomplete_subject_text: Field,
     /// The house numbers of a place's address, apart from addresses' own.
     pub place_address_number: Field,
@@ -641,7 +643,6 @@ impl Fields {
             autocomplete_subject_text: schema.get_field(AUTOCOMPLETE_SUBJECT_FIELD)?,
             place_name_text: schema.get_field(PLACE_NAME_FIELD)?,
             place_content_text: schema.get_field(PLACE_CONTENT_FIELD)?,
-            place_context_text: schema.get_field(PLACE_CONTEXT_FIELD)?,
             place_autocomplete_subject_text: schema.get_field(PLACE_AUTOCOMPLETE_SUBJECT_FIELD)?,
             place_address_number: schema.get_field(PLACE_ADDRESS_NUMBER_FIELD)?,
             interpolation_start: schema.get_field(INTERPOLATION_START_FIELD)?,
@@ -686,13 +687,12 @@ impl Fields {
     }
 
     /// The same fields with places' text fields in the address fields'
-    /// stead: what a search of places reads. A place states no exact
-    /// postcode, so that field stays and matches no place.
+    /// stead: what a search of places reads. Context is one field for both,
+    /// and a place states no exact postcode, so those fields stay.
     pub fn for_places(self) -> Self {
         Self {
             name_text: self.place_name_text,
             content_text: self.place_content_text,
-            context_text: self.place_context_text,
             // A place's street is a word of what it is, beside its name.
             street_text: self.place_content_text,
             autocomplete_subject_text: self.place_autocomplete_subject_text,
@@ -1084,7 +1084,6 @@ fn build_schema() -> (Schema, Fields) {
     );
     let place_name_text = builder.add_text_field(PLACE_NAME_FIELD, searchable_text_options());
     let place_content_text = builder.add_text_field(PLACE_CONTENT_FIELD, searchable_text_options());
-    let place_context_text = builder.add_text_field(PLACE_CONTEXT_FIELD, searchable_text_options());
     let place_autocomplete_subject_text = builder.add_text_field(
         PLACE_AUTOCOMPLETE_SUBJECT_FIELD,
         autocomplete_subject_text_options(),
@@ -1127,7 +1126,6 @@ fn build_schema() -> (Schema, Fields) {
         autocomplete_subject_text,
         place_name_text,
         place_content_text,
-        place_context_text,
         place_autocomplete_subject_text,
         place_address_number,
         interpolation_start,
