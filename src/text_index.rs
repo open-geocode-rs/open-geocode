@@ -846,8 +846,9 @@ impl Document {
             builder.name(name);
         }
         builder.add_content_text(&poi.category);
+        // Its address words find it ("Albert Heijn Damrak"); its address is
+        // answered by the address record the builder writes beside it.
         if let Some(address) = &poi.address {
-            builder.also_layer(Layer::Address.as_str());
             builder.address(address);
         }
         builder
@@ -1142,10 +1143,6 @@ impl ProjectionBuilder {
             context_parts: Vec::new(),
             autocomplete_subject_parts: Vec::new(),
         }
-    }
-
-    fn also_layer(&mut self, layer: &str) {
-        self.projected.layers.push(layer.to_string());
     }
 
     fn name(&mut self, value: &str) {
@@ -1864,7 +1861,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(projected.layers, vec!["poi", "address"]);
+        assert_eq!(projected.layers, vec!["poi"]);
         assert_eq!(
             projected.name.as_deref(),
             Some("tim hortons"),

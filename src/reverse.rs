@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::{
     labels,
     pack::{self, ContextRecord, RecordId},
-    record::{AddressComponents, InterpolationAddressComponents, Layer, PoiRecord, Record},
+    record::{AddressComponents, AddressRecord, InterpolationAddressComponents, Layer, Record},
     spatial_index,
 };
 
@@ -208,26 +208,17 @@ impl PackReverseGeocoder {
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
-        // With `layer=address`, a POI that carries an address is passed over
-        // for the address behind it.
-        let only_addresses = options.layer == Some(Layer::Address);
         let Some(candidate) = self
             .spatial
-            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, CANDIDATE_LIMIT)?
+            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
             .into_iter()
-            .find(|candidate| !only_addresses || candidate.layer == Layer::Address)
+            .next()
         else {
             return Ok(None);
         };
-        // A POI that carries an address answers as that address.
         let record = self.pack.records().record(candidate.record_id)?;
-        let address = match &record {
-            Record::Address(record) => &record.address,
-            Record::Poi(PoiRecord {
-                address: Some(address),
-                ..
-            }) => address,
-            _ => return Ok(None),
+        let Record::Address(AddressRecord { address, .. }) = &record else {
+            return Ok(None);
         };
 
         self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
@@ -618,8 +609,8 @@ mod tests {
         context::AdminContextTuple,
         pack::{RecordContext, Writer},
         record::{
-            AddressRecord, InterpolationRange, LocationPrecision, ObjectType, PlaceLayer,
-            PlaceRecord, Record, SourceProvenance, StreetRecord, point_geometry,
+            InterpolationRange, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
+            SourceProvenance, StreetRecord, point_geometry,
         },
     };
 
@@ -737,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_answers_with_the_address_of_a_poi_but_not_its_name() {
+    fn reverse_answers_with_the_address_beside_a_poi_not_the_poi() {
         let temp_dir = temp_pack_dir("poi");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
@@ -774,6 +765,12 @@ mod tests {
                 None,
             )
             .expect("bakery");
+        // The builder writes the bakery's address as an address of its own.
+        let mut address = address_record();
+        address.geometry = point_geometry(-79.0, 43.00005);
+        address.location_precision = LocationPrecision::Centroid;
+        address.source = SourceProvenance::osm(ObjectType::Way, 41);
+        writer.write(&address.into(), None).expect("address");
         writer.finish().expect("finish");
 
         let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
@@ -785,9 +782,9 @@ mod tests {
 
         assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(result.id.as_deref(), Some("osm:way:41"));
-        assert_eq!(result.layer.as_deref(), Some("poi"));
+        assert_eq!(result.layer.as_deref(), Some("address"));
         assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
-        assert_eq!(result.evidence.explicit_address_record_id, Some(2));
+        assert_eq!(result.evidence.explicit_address_record_id, Some(3));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -837,7 +834,6 @@ mod tests {
         assert_eq!(street.id.as_deref(), Some("osm:way:30"));
         assert!(street.evidence.context_record_ids.is_empty());
 
-        // The bakery on the point carries an address, but is no address.
         let address = at(Layer::Address).expect("address");
         assert_eq!(address.id.as_deref(), Some("osm:node:10"));
         assert_eq!(address.layer.as_deref(), Some("address"));

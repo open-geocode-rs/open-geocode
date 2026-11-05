@@ -4001,8 +4001,8 @@ mod tests {
         assert_eq!(counts.get("poi"), Some(&4), "{counts:?}");
         assert_eq!(
             counts.get("address"),
-            Some(&6),
-            "the unnamed cafe stays an address; the named one does not"
+            Some(&7),
+            "the unnamed cafe stays an address; the named one's address is one too"
         );
         assert_eq!(report.accepted.pois_with_address, 1);
         assert_eq!(report.accepted.poi_nodes, 3);
@@ -4010,17 +4010,28 @@ mod tests {
         assert_eq!(report.accepted.poi_categories.get("amenity"), Some(&2));
         assert_eq!(report.geometry_resolution.poi_way_stubs, 1);
 
-        // One record for the cafe, carrying its address.
-        let ids = (0..reader.manifest().record_count)
-            .map(|id| reader.record_summary(id).expect("summary").id)
+        // The cafe is a POI carrying its address, and the address an
+        // address of its own.
+        let summaries = (0..reader.manifest().record_count)
+            .map(|id| (id, reader.record_summary(id).expect("summary")))
             .collect::<Vec<_>>();
-        assert_eq!(ids.iter().filter(|id| *id == "osm:node:2001").count(), 1);
-        assert!(!ids.iter().any(|id| id == "osm:node:2003"), "bench");
-        let cafe = reader
-            .find_by_source_id("osm:node:2001")
-            .expect("lookup")
-            .expect("cafe");
-        let Record::Poi(poi) = reader.records().record(cafe).expect("record") else {
+        let mut cafe = summaries
+            .iter()
+            .filter(|(_, summary)| summary.id == "osm:node:2001")
+            .map(|(id, summary)| (summary.layer.as_str(), *id))
+            .collect::<Vec<_>>();
+        cafe.sort_unstable();
+        assert_eq!(
+            cafe.iter().map(|(layer, _)| *layer).collect::<Vec<_>>(),
+            ["address", "poi"]
+        );
+        assert!(
+            !summaries
+                .iter()
+                .any(|(_, summary)| summary.id == "osm:node:2003"),
+            "bench"
+        );
+        let Record::Poi(poi) = reader.records().record(cafe[1].1).expect("record") else {
             panic!("the cafe is a POI");
         };
         assert_eq!(poi.category, "amenity:cafe");
@@ -4066,11 +4077,10 @@ mod tests {
                 .label,
             "Riverdale Farm, Toronto"
         );
-        // By its address, also under the address layer filter.
-        assert_eq!(
-            ids(&search("123 King Street West", Some("address"))),
-            vec!["osm:node:2001"]
-        );
+        // By its address, under the address layer filter as its address.
+        let address = search("123 King Street West", Some("address"));
+        assert_eq!(ids(&address), vec!["osm:node:2001"]);
+        assert_eq!(address[0].record.layer, "address");
         assert!(search("Riverdale Farm", Some("address")).is_empty());
         let station = search("Union Station Toronto", Some("poi"));
         assert_eq!(ids(&station), vec!["osm:way:700"]);
@@ -4092,8 +4102,7 @@ mod tests {
             .expect("autocomplete");
         assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);
 
-        // Reverse answers with the cafe's address, as it did when the cafe was
-        // an address record.
+        // Reverse answers with the cafe's address.
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = reverse
             .reverse(GeocodeOptions::at(-79.38, 43.65))

@@ -733,12 +733,9 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
-        let candidates =
-            self.block_points(lon, lat, radius_m, limit, |record_id, layer| match layer {
-                Layer::Address => Ok(true),
-                Layer::Poi => self.records.is_explicit_address(record_id),
-                _ => Ok(false),
-            })?;
+        let candidates = self.block_points(lon, lat, radius_m, limit, |_, layer| {
+            Ok(layer == Layer::Address)
+        })?;
         Ok(closest_candidates(candidates, limit))
     }
 

@@ -1389,26 +1389,6 @@ impl Reader {
         }
     }
 
-    /// Whether a record is an explicit address: an address record or a POI
-    /// that carries one. Reads no strings.
-    pub fn is_explicit_address(&self, id: RecordId) -> Result<bool> {
-        let entry = self.body(id)?;
-        let (header, mut fields) = (entry.header, entry.fields);
-        Ok(match header.layer {
-            Layer::Address => true,
-            Layer::Poi => {
-                get_u32(&mut fields)?;
-                get_u32(&mut fields)?;
-                for _ in 0..get_u64(&mut fields)? {
-                    get_u32(&mut fields)?;
-                }
-                get_u8(&mut fields)?;
-                get_u8(&mut fields)? != 0
-            }
-            _ => false,
-        })
-    }
-
     /// Every name of a street, place or POI, its `name` first; empty for the
     /// other layers. Reads no geometry.
     pub fn names(&self, id: RecordId) -> Result<Vec<String>> {
@@ -2509,10 +2489,6 @@ mod tests {
             Some("M5V 1A1")
         );
         assert_eq!(reader.postcode(5).expect("postcode"), None);
-        let explicit = (0..records.len() as u64)
-            .map(|id| reader.is_explicit_address(id).expect("explicit"))
-            .collect::<Vec<_>>();
-        assert_eq!(&explicit[..6], &[true, false, false, false, true, false]);
         assert_eq!(
             reader.names(0).expect("address names"),
             Vec::<String>::new()

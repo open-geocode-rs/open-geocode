@@ -2,12 +2,14 @@
 //!
 //! A node or way is a POI when it has a name and one of the tags below with a
 //! value that is not street furniture. A POI that also states a valid address
-//! becomes one record carrying that address, not a POI plus an address record.
+//! carries it, and the address is emitted as an address record of its own:
+//! address search reads addresses alone.
 
 use std::collections::BTreeMap;
 
 use crate::record::{
-    LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance, point_geometry,
+    AddressRecord, LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance,
+    point_geometry,
 };
 
 use super::{
@@ -104,14 +106,32 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let (Some(name), Some(category)) = (poi_name(tags), poi_category(tags)) else {
         return;
     };
+    let address = address_components(tags).ok();
+    let source = SourceProvenance::osm(candidate.object_type, candidate.object_id);
+    let geometry = point_geometry(candidate.lon, candidate.lat);
+    // The address the place stands at is an address of its own: address
+    // search reads addresses alone, and would otherwise miss every house
+    // that only a POI states.
+    if let Some(address) = &address {
+        let record = AddressRecord {
+            disputed: false,
+            street_postcodes: Vec::new(),
+            address: address.clone(),
+            geometry: geometry.clone(),
+            location_precision: candidate.location_precision,
+            source: source.clone(),
+        };
+        out.report.accept_address_with_tags(&record, Some(tags));
+        out.records.push(Record::Address(record));
+    }
     let record = PoiRecord {
         alt_names: alternate_names(tags, &name),
         name,
         category,
-        address: address_components(tags).ok(),
-        geometry: point_geometry(candidate.lon, candidate.lat),
+        address,
+        geometry,
         location_precision: candidate.location_precision,
-        source: SourceProvenance::osm(candidate.object_type, candidate.object_id),
+        source,
         prominence: prominence(tags),
     };
     out.report.accept_poi(&record);
@@ -249,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_one_record_carrying_its_address() {
+    fn emits_its_address_as_an_address_and_itself_as_a_poi() {
         let mut out = Emitted::default();
         let source = tags(&[("name", " Tim  Hortons "), ("amenity", "cafe")]);
         let address = tags(&[
@@ -268,15 +288,18 @@ mod tests {
             },
             &mut out,
         );
-        let [Record::Poi(record)] = out.records.as_slice() else {
-            panic!("one POI record, got {:?}", out.records);
+        let [Record::Address(address), Record::Poi(record)] = out.records.as_slice() else {
+            panic!("an address and a POI, got {:?}", out.records);
         };
+        assert_eq!(address.id(), "osm:way:9");
+        assert_eq!(address.address.number, "123");
+        assert_eq!(address.location_precision, LocationPrecision::Centroid);
         assert_eq!(record.id(), "osm:way:9");
         assert_eq!(record.name, "Tim Hortons");
         assert_eq!(record.category, "amenity:cafe");
         assert_eq!(record.label(), "Tim Hortons, 123 King Street West, M5V 1A1");
         assert_eq!(out.report.accepted.by_layer.get("poi"), Some(&1));
-        assert_eq!(out.report.accepted.by_layer.get("address"), None);
+        assert_eq!(out.report.accepted.by_layer.get("address"), Some(&1));
         assert_eq!(out.report.accepted.pois_with_address, 1);
 
         let plain = emit(&[("name", "Riverdale Farm"), ("tourism", "attraction")]);
