@@ -1,5 +1,5 @@
 //! The response contract checked against what the code produces (ADR 0022):
-//! real `/search`, `/autocomplete`, `/geocode` and `/reverse` answers, and a
+//! real `/geocode`, `/places`, `/autocomplete` and `/reverse` answers, and a
 //! batch, from the router on a small Pack are the committed examples in
 //! `contract/responses/`, and the
 //! geocode batch audit columns are the committed
@@ -419,8 +419,9 @@ async fn responses_match_the_committed_examples() {
     assert_example("reverse-nothing", &nothing);
     assert_eq!(nothing["features"], json!([]));
 
-    // `/geocode` answers with the same collection as `/search`, holding the
-    // one address that fits, so a client parses one shape for both.
+    // A structured `/geocode` answers with the same collection as `q=`,
+    // holding the one address that fits, so a client parses one shape for
+    // both.
     let structured = get(
         &router,
         "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
@@ -829,6 +830,7 @@ fn write_pack(dir: &PathBuf) {
     writer
         .write(
             &StreetRecord {
+                other_ways: Vec::new(),
                 road_class: crate::record::RoadClass::Residential,
                 alt_names: Vec::new(),
                 locality: None,

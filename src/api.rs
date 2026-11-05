@@ -1,4 +1,4 @@
-//! The response contract of `/search`, `/autocomplete` and `/reverse`
+//! The response contract of `/geocode`, `/places`, `/autocomplete` and `/reverse`
 //! (ADR 0022).
 //!
 //! Every response is one GeoJSON FeatureCollection: a `geocoding` block that
@@ -35,8 +35,8 @@ use crate::{
 // generator, which then emitted one `FeatureCollection` for both and
 // described each endpoint with the other's fields. Construction is still
 // shared, by [`common`] and the builders below.
-/// A GeoJSON FeatureCollection answering `/search`, `/autocomplete` or
-/// `/geocode`.
+/// A GeoJSON FeatureCollection answering `/geocode`, `/places` or
+/// `/autocomplete`.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardCollection {
     #[serde(rename = "type")]
@@ -533,7 +533,7 @@ impl<'a> Contexts<'a> {
     }
 }
 
-/// The answer to `/search` or `/autocomplete`: one feature per hit, in the
+/// The answer to `/geocode`, `/places` or `/autocomplete`: one feature per hit, in the
 /// order search ranked them.
 pub fn forward_collection(
     pack: &Reader,

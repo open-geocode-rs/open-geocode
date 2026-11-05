@@ -1371,7 +1371,7 @@ fn done(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         step("Serve the API", format!("og serve {}", app.region.slug())),
         more(
-            format!("then GET http://{}/search?q=…", app::SERVE_ADDRESS),
+            format!("then GET http://{}/geocode?q=…", app::SERVE_ADDRESS),
             DIM,
         ),
         step("Build it again", app.command()),

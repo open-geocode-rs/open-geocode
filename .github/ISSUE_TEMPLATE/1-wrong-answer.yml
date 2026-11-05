@@ -7,7 +7,7 @@ body:
     attributes:
       label: Query
       description: Exactly as sent, with the endpoint.
-      placeholder: "/search?q=12 Rue de la Paix 75002 Paris"
+      placeholder: "/geocode?q=12 Rue de la Paix 75002 Paris"
     validations:
       required: true
   - type: textarea

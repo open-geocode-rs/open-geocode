@@ -272,7 +272,7 @@
         "type": "object"
       },
       "ForwardCollection": {
-        "description": "A GeoJSON FeatureCollection answering `/search`, `/autocomplete` or\n`/geocode`.",
+        "description": "A GeoJSON FeatureCollection answering `/geocode`, `/places` or\n`/autocomplete`.",
         "properties": {
           "features": {
             "items": {
