@@ -550,12 +550,15 @@ impl Writer {
             if name.ends_with(".lock") {
                 continue;
             }
+            let section = format!("{TEXT_SECTION_PREFIX}{name}");
+            if name.ends_with(STORE_EXTENSION) {
+                let store = empty_store()?;
+                bytes += store.len() as u64;
+                pack.add(&section, TEXT_INDEX_SCHEMA_VERSION, &store)?;
+                continue;
+            }
             bytes += fs::metadata(&file)?.len();
-            pack.add_file(
-                &format!("{TEXT_SECTION_PREFIX}{name}"),
-                TEXT_INDEX_SCHEMA_VERSION,
-                &file,
-            )?;
+            pack.add_file(&section, TEXT_INDEX_SCHEMA_VERSION, &file)?;
         }
         // The segments are in the Pack now; their scratch goes before the
         // parser trains, not after.
@@ -975,6 +978,36 @@ impl Directory for PackDirectory {
     fn watch(&self, _watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
         Ok(WatchHandle::empty())
     }
+}
+
+/// The extension of a segment's document store.
+const STORE_EXTENSION: &str = ".store";
+
+/// A valid document store holding one empty document, in place of the
+/// segment's own.
+///
+/// No field is stored and nothing reads a stored document: records come from
+/// the record store. Tantivy still writes a 4-byte offset a document into the
+/// store, 471 MB on planet, and opens every segment's store when a searcher
+/// is created, so the file must stay a store tantivy can open. Any store
+/// opens: its document count is never checked against the segment's.
+fn empty_store() -> Result<Vec<u8>> {
+    let (schema, _) = build_schema();
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, MIN_INDEX_MEMORY_BYTES)?;
+    writer.add_document(TantivyDocument::default())?;
+    writer.commit()?;
+    drop(writer);
+    let segment = index
+        .searchable_segments()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Inconsistent("an empty store's index has no segment".into()))?;
+    let path = segment.relative_path(tantivy::index::SegmentComponent::Store);
+    index
+        .directory()
+        .atomic_read(&path)
+        .map_err(|error| Error::Inconsistent(format!("empty document store: {error}")))
 }
 
 fn build_schema() -> (Schema, Fields) {
@@ -1640,13 +1673,24 @@ mod tests {
         }
         writer.finish().expect("finish");
         let pack = crate::pack::Reader::open(&dir).expect("pack");
+        // The searcher opens every segment's store: the empty one opens too.
         let searcher = open_text_index(pack.container())
             .expect("text index")
             .reader()
             .expect("reader")
             .searcher();
+        let store_bytes = pack
+            .section_sizes()
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(STORE_EXTENSION))
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>();
         let segments = searcher.segment_readers();
         let _ = fs::remove_dir_all(&dir);
+        assert!(
+            store_bytes < 1_024,
+            "{count} documents keep no store of their own: {store_bytes} bytes"
+        );
         assert_eq!(segments.len(), 1, "the parts are joined into one segment");
         let ids = segments[0]
             .fast_fields()
