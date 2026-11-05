@@ -1,0 +1,161 @@
+# Changelog
+
+## [1.0.0](https://github.com/open-geocode-rs/open-geocode/compare/open-geocode-v0.1.0...open-geocode-v1.0.0) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **search:** rate each answer with a calibrated confidence
+* **build:** keep one record of a house two sources place apart
+* **search:** weigh a postcode by how few addresses it covers in its country
+* **search:** fold Latin letters to ASCII in search keys
+* **postcode:** key postcodes by country and lend a street's postcodes
+* **address:** read slash house numbers from their street
+* **search:** index one text document per street group
+* **spatial:** index record blocks and lines in packed Hilbert R-trees
+* **records:** store each street's addresses as one run
+* **context:** let one area be several tiers at once
+* **context:** rank admin areas into a chain, not six slots
+* **search:** TextSearchOptions, TextAutocompleteOptions and AddressGeocodeOptions take a `countries` field.
+* **build:** BuildOsmOptions takes `inputs` and `input_sources` rather than `input` and `input_source`. The build report replaces `input`, `input_source` and `input_replication_timestamp` with an `inputs` array, schema version 19. `og build` and `pack build` take `--region` and `--input` more than once.
+* **error:** public functions return open_geocode::Error rather than anyhow::Error.
+
+### Features
+
+* add named POI layer ([b075d04](https://github.com/open-geocode-rs/open-geocode/commit/b075d04d65f67bb4d74bb5e487c0daf8e37b81ca))
+* **api:** answer search and reverse with one GeoJSON contract ([407d884](https://github.com/open-geocode-rs/open-geocode/commit/407d884f0116e37e82cb1a0a842b0adb78860c35))
+* **api:** batch lookups with QUERY and POST on /geocode and /reverse ([#41](https://github.com/open-geocode-rs/open-geocode/issues/41)) ([d3cb12e](https://github.com/open-geocode-rs/open-geocode/commit/d3cb12eef642dd8e5e6a24498f90bd82170c8db4))
+* **api:** publish the API contract as OpenAPI ([#21](https://github.com/open-geocode-rs/open-geocode/issues/21)) ([d9aa819](https://github.com/open-geocode-rs/open-geocode/commit/d9aa819a6acf680d9e0acf9eb9b4410c5f1899d2))
+* **bench:** score forward geocoding against G-NAF coordinates ([6881aff](https://github.com/open-geocode-rs/open-geocode/commit/6881affda6dfefc3ba32546080d0e2671a42b83e))
+* **build:** assign admin layers from libpostal's admin level table ([9c6788c](https://github.com/open-geocode-rs/open-geocode/commit/9c6788c9d73b593f3ae4d3cdf743e62b48a1c3a4))
+* **build:** build one Pack from several extracts ([0dc5f38](https://github.com/open-geocode-rs/open-geocode/commit/0dc5f3859af46afe708d70b82924cc9253035449))
+* **build:** compress and leash scratch, merge runs in one pass, and report what each stage cost ([225a0c2](https://github.com/open-geocode-rs/open-geocode/commit/225a0c20366034d55c8f4a5694127884da4816dd))
+* **builder:** add OpenAddresses as optional address enrichment ([c2c89e3](https://github.com/open-geocode-rs/open-geocode/commit/c2c89e356d97c12fa77681118387dcbe419b26b8))
+* **builder:** index every name and accept Japanese block addresses ([2c7565d](https://github.com/open-geocode-rs/open-geocode/commit/2c7565ddafec66bbeef803dae899fbdc34a880f3))
+* **builder:** name features by the Latin form of kana, Cyrillic and Greek names ([dac47de](https://github.com/open-geocode-rs/open-geocode/commit/dac47de29463f4c83ba18f5242e2d1a6e5a1cb75))
+* **builder:** read places drawn as areas ([5f3720e](https://github.com/open-geocode-rs/open-geocode/commit/5f3720ea3bef3e8a6856166d5b99d22162efaa2d))
+* **build:** go on with a stopped Pack build from its last checkpoint ([d59f8c6](https://github.com/open-geocode-rs/open-geocode/commit/d59f8c6b016ee2a20a06d678792b8b3a00d8d4f9))
+* **build:** join the ways of a street into one record named by its town ([5ae2899](https://github.com/open-geocode-rs/open-geocode/commit/5ae28992c8870c2a841f9bf69f3ee9f744c24001))
+* **build:** keep one record of a house two sources place apart ([7475006](https://github.com/open-geocode-rs/open-geocode/commit/747500674b8d34f5d59057f496874390fdef6b94))
+* **build:** read OpenAddresses from a collection archive with --openaddresses-zip ([294fb64](https://github.com/open-geocode-rs/open-geocode/commit/294fb64dede3a5d4f43e5ce0a110f2481573abd4))
+* **build:** train the address parser inside build ([0a0a665](https://github.com/open-geocode-rs/open-geocode/commit/0a0a66558a8969611ec64e5778b2960b6876879f))
+* **context:** let one area be several tiers at once ([9eada71](https://github.com/open-geocode-rs/open-geocode/commit/9eada719103ed45d37d7bf7100fad388b1d6ce63))
+* **context:** rank admin areas into a chain, not six slots ([830cefb](https://github.com/open-geocode-rs/open-geocode/commit/830cefb33b9648304addd091e421afb52996d45f))
+* **docker:** publish a multi-platform server image ([#85](https://github.com/open-geocode-rs/open-geocode/issues/85)) ([0881346](https://github.com/open-geocode-rs/open-geocode/commit/08813468f8fbe491e6533e9c5101e56da5e9b29e))
+* **error:** return a typed Error from the geocoding API ([#23](https://github.com/open-geocode-rs/open-geocode/issues/23)) ([23a51af](https://github.com/open-geocode-rs/open-geocode/commit/23a51af2780f906383fcadd5f1be7b5d7a374de0))
+* **extsort:** add SortStats::merge ([423e0fd](https://github.com/open-geocode-rs/open-geocode/commit/423e0fd25135834c3721978f2cbfab9b39573a10))
+* **fixtures:** answer keys from national address registers and engine suites ([7a6b977](https://github.com/open-geocode-rs/open-geocode/commit/7a6b9779d357cdd739616dd4ed1a7be6be2509af))
+* **fixtures:** answer keys from national address registers and engine suites ([9e9b045](https://github.com/open-geocode-rs/open-geocode/commit/9e9b045725891612201ac34ce695941dc4698982))
+* **index:** index the country each record lies in ([bc50a7d](https://github.com/open-geocode-rs/open-geocode/commit/bc50a7d45d42a7325f1c33ee4506441d90e00fca))
+* og, an interactive terminal for Packs, builds, downloads and batch geocoding ([#20](https://github.com/open-geocode-rs/open-geocode/issues/20)) ([927247d](https://github.com/open-geocode-rs/open-geocode/commit/927247d30c7e165efbbe927f22f13cfb5cef3e28))
+* **og:** offer OpenAddresses on the confirm screen ([cc47a63](https://github.com/open-geocode-rs/open-geocode/commit/cc47a635d5c555a0d6ac3cb6b531acd29d66fb71))
+* **parse-bench:** split scores by dictionary coverage ([d521d48](https://github.com/open-geocode-rs/open-geocode/commit/d521d48e6dd262408e43d8fdd9c837fdfdcda094))
+* **parse-train:** give block scheme addresses a share of their own ([bf3ad92](https://github.com/open-geocode-rs/open-geocode/commit/bf3ad92b37571bf365ea211e970e2e9c30729131))
+* **parse-train:** write region and country records as rows of their own ([e2a18d9](https://github.com/open-geocode-rs/open-geocode/commit/e2a18d93333356ddd0bf21b382e21fc9c95fecf0))
+* **parse-train:** write the areas an address states as one locality ([ad333a4](https://github.com/open-geocode-rs/open-geocode/commit/ad333a40755f5aff36c049e7aaa509286b3c9e7b))
+* **parse:** drop labellings whose places cannot be one address ([fe1a848](https://github.com/open-geocode-rs/open-geocode/commit/fe1a848336ce1ee7bc7b69ae89c21e0711af60b0))
+* **parse:** drop the district label, as libpostal's data does ([14df63b](https://github.com/open-geocode-rs/open-geocode/commit/14df63bea5aa996fb33b8c356c871fbe225a5b11))
+* **parse:** ground places and postcodes in what the Pack explains ([dbff372](https://github.com/open-geocode-rs/open-geocode/commit/dbff372ec7fc38796af2925e84688b29aede723d))
+* **parse:** hash the affixes of a span's word into features ([0a66f0f](https://github.com/open-geocode-rs/open-geocode/commit/0a66f0f4fa1c8039405302ecc3395dd77c781ec7))
+* **parse:** keep the name a misspelt span was read as ([2df11f4](https://github.com/open-geocode-rs/open-geocode/commit/2df11f4e07f08fc35c79ad60fc71edf40464391d))
+* **parse:** label address tokens with a lattice parser ([51ed329](https://github.com/open-geocode-rs/open-geocode/commit/51ed3296d8120e9b6e29d8968c9c502dd394c816))
+* **parse:** learn POI names as a dictionary field of their own ([7c4f82a](https://github.com/open-geocode-rs/open-geocode/commit/7c4f82a19d38d9775f484674b239363ffd3920b3))
+* **parse:** learn unit words from the Pack's addr:unit values ([e139a48](https://github.com/open-geocode-rs/open-geocode/commit/e139a4851e3b232d84b145d4005ac3dcd68b0900))
+* **parse:** learn units, street spellings and category queries ([7be3a63](https://github.com/open-geocode-rs/open-geocode/commit/7be3a636722c1d5663844425289d609470b57040))
+* **parse:** name admin areas without their type word ([3cc689e](https://github.com/open-geocode-rs/open-geocode/commit/3cc689e9823f73ba18df24abc74d0947ebef66f5))
+* **parse:** name the groups of regions a region lies in ([035562b](https://github.com/open-geocode-rs/open-geocode/commit/035562b9b67a7fabd57885be1f162fe5521ca8a9))
+* **parse:** read admin type words on the side they are written ([587ae17](https://github.com/open-geocode-rs/open-geocode/commit/587ae177605b4cc3d5545d9f77aa23014e5934c4))
+* **parse:** read districts, glued units, abbreviations and near phrases ([90011cd](https://github.com/open-geocode-rs/open-geocode/commit/90011cd5e1e27ceb0bf1bbcf93eddd4fd09740bd))
+* **parse:** read glued area names as one chain ([fa27ba4](https://github.com/open-geocode-rs/open-geocode/commit/fa27ba491c12b45077836bd104da7679adc7dd67))
+* **parse:** read numbered areas and check places where the Pack is complete ([2f5a0ba](https://github.com/open-geocode-rs/open-geocode/commit/2f5a0ba6cb7eab747f2ff076de6b8e0e12c4b0ac))
+* **parse:** read numerals of any script as digits ([7a1442e](https://github.com/open-geocode-rs/open-geocode/commit/7a1442e840ecd5ee88ee267b7281a949c8423adc))
+* **parse:** read postcodes after country letters and the dominant field ([2b902de](https://github.com/open-geocode-rs/open-geocode/commit/2b902de88ea8c007efaeb9c6b21b4d2d7d8ad09a))
+* **parse:** read scripts without spaces by the Unicode Script property ([8089a7d](https://github.com/open-geocode-rs/open-geocode/commit/8089a7d7109f863d4c780ffd373beef69d489c78))
+* **parse:** score address parsing against libpostal gold rows ([fdb7060](https://github.com/open-geocode-rs/open-geocode/commit/fdb706016b2f5419f0b0534c2081dd008f44c925))
+* **parse:** train a semi-Markov CRF with hashed word features ([1c175b4](https://github.com/open-geocode-rs/open-geocode/commit/1c175b45e06e3bff1e9aeb6f4dc8e752621cbee9))
+* **parse:** vendor libpostal's word lists as phrase dictionaries ([09f0402](https://github.com/open-geocode-rs/open-geocode/commit/09f04024e3bfe794ebecabbab4bad10b87a935f6))
+* **postcode:** key postcodes by country and lend a street's postcodes ([3ae5bfb](https://github.com/open-geocode-rs/open-geocode/commit/3ae5bfb71727de7eef3a904717ad6b49855dfd99))
+* **records:** store each street's addresses as one run ([e82106f](https://github.com/open-geocode-rs/open-geocode/commit/e82106f3f08dd59f4b2fbb891a9242712ff93d43))
+* **runtime:** serve structured address geocoding at /geocode ([#7](https://github.com/open-geocode-rs/open-geocode/issues/7)) ([5694b79](https://github.com/open-geocode-rs/open-geocode/commit/5694b79871e365c376e5f107b7345042e9a39960))
+* score bench fixtures against expected POIs ([1c5a595](https://github.com/open-geocode-rs/open-geocode/commit/1c5a595ac7086855cd12cf7e2349a69bc610f8e5))
+* **search:** answer messy web addresses: countries, regions, postal towns, noise and fallbacks ([7927f30](https://github.com/open-geocode-rs/open-geocode/commit/7927f30e2d7318c60b38db25dcfd98cae081c5d0))
+* **search:** break equal-name ties toward the larger place ([a1b0935](https://github.com/open-geocode-rs/open-geocode/commit/a1b0935f99c71096e890654cd356260e4b6c8d69))
+* **search:** break ties between POIs by how widely OSM knows them ([558bdeb](https://github.com/open-geocode-rs/open-geocode/commit/558bdeb250bb951bf4c6a7155ef3b7073f17dfd2))
+* **search:** drop query words by label, not by count ([d6f41be](https://github.com/open-geocode-rs/open-geocode/commit/d6f41be97bf8e3d5ba759ba1365df5046479cce0))
+* **search:** filter search by country ([2f11e3f](https://github.com/open-geocode-rs/open-geocode/commit/2f11e3f4d160d594d1dece7c308317ff6a15d90f))
+* **search:** fold Latin letters to ASCII in search keys ([7aa45b4](https://github.com/open-geocode-rs/open-geocode/commit/7aa45b495bc9f2a66a2443b6167a43ef11773b30))
+* **search:** index one text document per street group ([5194e08](https://github.com/open-geocode-rs/open-geocode/commit/5194e083716c9662239531d1953c08173fbc5140))
+* **search:** let a stricter later reading outweigh a lenient first one ([6fa0b0c](https://github.com/open-geocode-rs/open-geocode/commit/6fa0b0cc556020968e3f086cb0421b632a70a423))
+* **search:** plan queries from the address parser ([5e26af9](https://github.com/open-geocode-rs/open-geocode/commit/5e26af9cfb1a520f650bd513057093ae857f3b71))
+* **search:** rank addresses above POIs when the query is an address ([eaba524](https://github.com/open-geocode-rs/open-geocode/commit/eaba524f1464330c4bc1d4443281d5488a89abae))
+* **search:** rank ties by the caller's focus and filter by a box ([9a8fe43](https://github.com/open-geocode-rs/open-geocode/commit/9a8fe43b970d6e353a13ac70b420895aa9b57feb))
+* **search:** rate each answer with a calibrated confidence ([26b20bc](https://github.com/open-geocode-rs/open-geocode/commit/26b20bc380e48e9d1496307ab258afc94397f5a4))
+* **search:** search typos in tiers, exact first ([3fc5469](https://github.com/open-geocode-rs/open-geocode/commit/3fc5469da450b07f4afbca275b8bc63b1d203308))
+* **search:** weigh a postcode by how few addresses it covers in its country ([f7b88d0](https://github.com/open-geocode-rs/open-geocode/commit/f7b88d0b658139d5f4b6809d389d4e56bfa74e33))
+* **serve:** drain in-flight requests on SIGTERM ([#66](https://github.com/open-geocode-rs/open-geocode/issues/66)) ([cad9f81](https://github.com/open-geocode-rs/open-geocode/commit/cad9f81fbb63497d7d5afff0e6eed23cac047e5c))
+* **serve:** GET /version names the build and the Pack ([#64](https://github.com/open-geocode-rs/open-geocode/issues/64)) ([b06310a](https://github.com/open-geocode-rs/open-geocode/commit/b06310a32259c436f53dcd78e0f20605880370ef))
+* **spatial:** index record blocks and lines in packed Hilbert R-trees ([0a42f5d](https://github.com/open-geocode-rs/open-geocode/commit/0a42f5dc7f889a923ef79c3db29a8f42a9b334d5))
+* stream builds to planet scale with a single-file Pack ([7d69c12](https://github.com/open-geocode-rs/open-geocode/commit/7d69c1210741fc89271acf85f3dd31129bf0e812))
+
+
+### Bug Fixes
+
+* address review findings on the planet-scale build ([fd4a912](https://github.com/open-geocode-rs/open-geocode/commit/fd4a91271a49b03417192fb9c5cf09a253b111e9))
+* **address:** read slash house numbers from their street ([460c5ef](https://github.com/open-geocode-rs/open-geocode/commit/460c5efb4e83cac697820716cd77acfa76033496))
+* **batch:** pass the country filter to the searcher ([7c21495](https://github.com/open-geocode-rs/open-geocode/commit/7c21495be28ffb36905420c2b59be349fc1832ba))
+* **builder:** check the refined plan against the memory the machine has now ([ba08749](https://github.com/open-geocode-rs/open-geocode/commit/ba087494aa0577cfeccaba2d51252c05e1d5056c))
+* **builder:** cut pasted tags from values, rank no union of countries, drop a build's generation last ([f86f557](https://github.com/open-geocode-rs/open-geocode/commit/f86f557af783d217b0e27be55f424df04051cef2))
+* **builder:** keep boundary geometry inside the memory budget ([cd294d7](https://github.com/open-geocode-rs/open-geocode/commit/cd294d78fccc4bd65028cfca2e7b02daed7b60c3))
+* **builder:** keep boundary shapes on disk so a planet build stays in its budget ([e03624e](https://github.com/open-geocode-rs/open-geocode/commit/e03624e4bcefb6b10986afce92fb2804e879c353))
+* **build:** join the ways of a street within the area its label names ([d085e0f](https://github.com/open-geocode-rs/open-geocode/commit/d085e0f518e0b2ca56aee72200d7d8ef459d9a89))
+* **context:** rank a country with more admin levels than tiers ([e2e4194](https://github.com/open-geocode-rs/open-geocode/commit/e2e4194ae838d79b5a2f8284c5a5dee5f3218f12))
+* **fixtures:** drop estimated, unit and unplaced rows; clean place names ([37983f7](https://github.com/open-geocode-rs/open-geocode/commit/37983f71078dd071d2a6954d96a2d9db8ed2fe0f))
+* **fixtures:** keep territory and country out of overseas messy queries ([430b672](https://github.com/open-geocode-rs/open-geocode/commit/430b6723391e6bca4ae84d2a4872d14125bd1c41))
+* **geocode:** accept a locality the record lies in at any tier or states ([8a1a927](https://github.com/open-geocode-rs/open-geocode/commit/8a1a92721aa0a81c8ffa9f85f4ec63a769fe9228))
+* keep every build buffer within the memory budget ([9e41cc5](https://github.com/open-geocode-rs/open-geocode/commit/9e41cc51a26cc05f255ea3b9d87f91d1bc0c5b68))
+* **labels:** show a bare unit as a unit, not a place ([1261854](https://github.com/open-geocode-rs/open-geocode/commit/1261854aefe4e3b09212d2662d5d9857b33784ca))
+* **lint:** satisfy clippy 1.99 ([8dc9089](https://github.com/open-geocode-rs/open-geocode/commit/8dc9089d25d739250f628aea344ddf30bfb5a332))
+* **lint:** satisfy clippy 1.99 (as_chunks, needless borrow) ([6ec0633](https://github.com/open-geocode-rs/open-geocode/commit/6ec063360109fff8523868a968453e42d5ed8979))
+* **lint:** satisfy clippy 1.99 (as_chunks, needless borrow) ([0dcbb2f](https://github.com/open-geocode-rs/open-geocode/commit/0dcbb2fa70c35902ad8a414522081976a6f01a8b))
+* **pack:** publish validated generations without replacing live data ([70e8671](https://github.com/open-geocode-rs/open-geocode/commit/70e8671ca57698a5ea2299525ff6b0dad9fe5120))
+* **pack:** read postcode address counts with as_chunks ([a8b64fc](https://github.com/open-geocode-rs/open-geocode/commit/a8b64fc2e4ea70b4990f4f66049233633ec43b40))
+* **parse:** check admin aliases against the names of areas only ([cf9a6be](https://github.com/open-geocode-rs/open-geocode/commit/cf9a6be65436d247f15992ff7c2f6e46fb7a03de))
+* **parse:** ground each closed-class label in a name of its own field ([c72e090](https://github.com/open-geocode-rs/open-geocode/commit/c72e09056766f794154636c516b53e9ebc9b34aa))
+* **parse:** read a query as the countries its evidence points to ([d140236](https://github.com/open-geocode-rs/open-geocode/commit/d1402363c5773d4d2beb2830a8a899995a76f26d))
+* **postcode:** place a postcode at the medoid of a bounded member sample, not the mean ([2b83d07](https://github.com/open-geocode-rs/open-geocode/commit/2b83d07973e9035b77a3e5be52ab2fcb1121a023))
+* **postcode:** place a postcode at the medoid of a bounded member sample, not the mean ([8329eca](https://github.com/open-geocode-rs/open-geocode/commit/8329ecadc83ce20a407b688fa0c5ab18889d3f91)), closes [#3](https://github.com/open-geocode-rs/open-geocode/issues/3)
+* **resources:** build on Windows under the denied lints ([6c9e059](https://github.com/open-geocode-rs/open-geocode/commit/6c9e0592cfc081a23d0a6df6f170b6613805964b))
+* **resources:** keep the rlimit cast for 32-bit targets ([331b1da](https://github.com/open-geocode-rs/open-geocode/commit/331b1da05ebd20c7528b781b9d9e208440473674))
+* **runtime:** log the cause of every internal error under its request id ([7d8781a](https://github.com/open-geocode-rs/open-geocode/commit/7d8781a1e522d7a6bf81a4ce19a989e99192a776))
+* **runtime:** log the cause of every internal error under its request id ([3343c83](https://github.com/open-geocode-rs/open-geocode/commit/3343c837cb776c7de600ac45dd4abe3bdb34b400)), closes [#2](https://github.com/open-geocode-rs/open-geocode/issues/2)
+* **search:** accept hits before the cut to the requested limit ([00441b8](https://github.com/open-geocode-rs/open-geocode/commit/00441b84df7d20be9063ae245d10d11c3ff100b5))
+* **search:** count an address's number among the words of its name ([6e0e726](https://github.com/open-geocode-rs/open-geocode/commit/6e0e7261d9d7b14ae2a00dc794428bb8775cc41d))
+* **search:** drop hits that contradict a stated postcode ([269baeb](https://github.com/open-geocode-rs/open-geocode/commit/269baeb30824f458238e7714323fdee556047524))
+* **search:** hold a known country's word to the country, and a town's node to its boundary ([d45b0ce](https://github.com/open-geocode-rs/open-geocode/commit/d45b0cedca71e25bae0130bb65139159dc6745f4))
+* **search:** hold where the query says a record is in every reading ([66a2985](https://github.com/open-geocode-rs/open-geocode/commit/66a29854142a80b95e00962b77a8beef18918036))
+* **search:** judge a postcode by where its area lies, not by exact membership ([70b56a8](https://github.com/open-geocode-rs/open-geocode/commit/70b56a8d6795771e50216ed44459910b11bc3996))
+* **search:** keep an area from answering for every required street word ([40646ab](https://github.com/open-geocode-rs/open-geocode/commit/40646ab6ac95fb36cfbcb1ede1630351d088e912))
+* **search:** keep the closest name and the larger place among equal scores ([2671502](https://github.com/open-geocode-rs/open-geocode/commit/267150235b65bd31d728b8bd002c6c0bb9ff5124))
+* **search:** let a given postcode win over one parsed from the address ([9221847](https://github.com/open-geocode-rs/open-geocode/commit/92218475dc9461d97510a58207e82e72fe06a606))
+* **search:** let a named flat choose among one street's addresses, not outscore the street ([4bc3bb5](https://github.com/open-geocode-rs/open-geocode/commit/4bc3bb57bd0d76402c4cb4398e5bf59ee46ff2c5))
+* **search:** let a number read as an unconfirmed postcode be the house ([0a44133](https://github.com/open-geocode-rs/open-geocode/commit/0a4413355cb488cb2a617acf68df0606aa35a64e))
+* **search:** let a query of unplaced words drop one, and not for a street type ([1cf5615](https://github.com/open-geocode-rs/open-geocode/commit/1cf56155de4e385ccdd0ab7b48069dbbe8cab23e))
+* **search:** let a typo change a long word's second letter ([6f4dc43](https://github.com/open-geocode-rs/open-geocode/commit/6f4dc436dd883a7491d2c125454ce3aeb4475a05))
+* **search:** put a stand-in street on its own centre line ([4a18d43](https://github.com/open-geocode-rs/open-geocode/commit/4a18d43136104daa6bd253a85c5fb19e89063e10))
+* **search:** rank hits by distance from a named postcode before the cut ([ebaf22f](https://github.com/open-geocode-rs/open-geocode/commit/ebaf22ff39636e1702d9b79e6174958d8109a03c))
+* **search:** rank the street a query names above one with more words ([ca9fd92](https://github.com/open-geocode-rs/open-geocode/commit/ca9fd9269a2d71a2cc31d2de93cc545d01014c98))
+* **search:** read a flat named by a letter or written onto its number ([7a47ba9](https://github.com/open-geocode-rs/open-geocode/commit/7a47ba95701c024b63b6cd4360406fa52df421b5))
+* **search:** read a street-type abbreviation as every word it stands for ([c002250](https://github.com/open-geocode-rs/open-geocode/commit/c002250896827476d4d622780daec85c848984d8))
+
+
+### Performance Improvements
+
+* bound the string table by budget and parallelize anchor tags ([5c31033](https://github.com/open-geocode-rs/open-geocode/commit/5c31033288e0a6ff9a68b2e481da6689976d110b))
+* **builder:** give ways their nodes from a node store, and plan from counted items ([5c9115f](https://github.com/open-geocode-rs/open-geocode/commit/5c9115f7da0bb3027c4be2347560e0324871a28d))
+* **builder:** keep the read buffer across seeks to nearby blobs ([24fba04](https://github.com/open-geocode-rs/open-geocode/commit/24fba041b23aec52beb80f66d97508c18151a40e))
+* **builder:** rank each point in one pass, intern the country codes ([6bdb0f3](https://github.com/open-geocode-rs/open-geocode/commit/6bdb0f361f9571cf75614ebbe59ad60ffdf7c64a))
+* **builder:** sort addresses by key and place, not by copies of the record ([b89b2b2](https://github.com/open-geocode-rs/open-geocode/commit/b89b2b23b7432fced556a7264ac1d017a3c89375))
+* **build:** size the build to the host and train in seconds ([147d844](https://github.com/open-geocode-rs/open-geocode/commit/147d844f0a7e0ace266055399a0cc77436231430))
+* **parse:** decode more labellings only when the best are no address ([b5515bc](https://github.com/open-geocode-rs/open-geocode/commit/b5515bc96a8939464443409a6e80b753b4284f29))
+* **records:** build summaries without decoding geometry ([798f476](https://github.com/open-geocode-rs/open-geocode/commit/798f476c8d01904f52f55e655ee9f2117e7d45ac))
+* **spatial:** select nearest candidates before sorting ([09b806d](https://github.com/open-geocode-rs/open-geocode/commit/09b806df1db854fd2a690da72989c23816604b87))
