@@ -12,10 +12,10 @@ use crate::{
     extsort::Spill,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
-        InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceRecord,
-        PoiRecord, PostcodeRecord, Prominence, Record, RoadClass, SourceProvenance, StreetRecord,
-        point_geometry,
+        AddressComponents, AddressRecord, Brand, DerivedSourceProvenance,
+        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
+        LocationPrecision, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Prominence, Record,
+        RoadClass, SourceProvenance, StreetRecord, point_geometry,
     },
     util::{
         codec::{
@@ -1098,6 +1098,15 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             out.push(record.prominence.to_byte());
             out.push(record.prominence.importance);
             put_u64(out, record.wikidata.map_or(0, u64::from));
+            put_opt_str(out, record.brand.as_ref().map(|brand| brand.name.as_str()));
+            put_u64(
+                out,
+                record
+                    .brand
+                    .as_ref()
+                    .and_then(|brand| brand.wikidata)
+                    .map_or(0, u64::from),
+            );
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1151,6 +1160,16 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
     }
 }
 
+/// A Wikidata item number spilled as a varint, 0 for none.
+fn spilled_item(input: &mut &[u8]) -> Result<Option<u32>> {
+    match get_u64(input)? {
+        0 => Ok(None),
+        item => u32::try_from(item)
+            .map(Some)
+            .map_err(|_| Error::Decode("spilled Wikidata item is out of range")),
+    }
+}
+
 pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
     let layer = *Layer::ALL
         .get(usize::from(get_u8(input)?))
@@ -1167,12 +1186,11 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
             },
             location_precision: decode_precision(input)?,
             prominence: Prominence::from_byte(get_u8(input)?, get_u8(input)?),
-            wikidata: match get_u64(input)? {
-                0 => None,
-                item => Some(
-                    u32::try_from(item)
-                        .map_err(|_| Error::Decode("spilled Wikidata item is out of range"))?,
-                ),
+            wikidata: spilled_item(input)?,
+            brand: {
+                let name = get_opt_string(input)?;
+                let wikidata = spilled_item(input)?;
+                name.map(|name| Brand { name, wikidata })
             },
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
@@ -1588,6 +1606,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Way, 16),
                 prominence: Default::default(),
                 wikidata: None,
+                brand: None,
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -1599,6 +1618,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, 17),
                 prominence: Default::default(),
                 wikidata: None,
+                brand: None,
             }),
         ];
         for (seq, record) in records.into_iter().enumerate() {

@@ -16,7 +16,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::record::{
-    AddressRecord, LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance,
+    AddressRecord, Brand, LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance,
     point_geometry,
 };
 
@@ -44,6 +44,8 @@ impl Drawn {
 
 #[derive(Debug, Deserialize)]
 struct Catalog {
+    /// The keys whose values say what kind of place an object is.
+    keys: Vec<String>,
     presets: BTreeMap<String, CatalogPreset>,
 }
 
@@ -88,6 +90,8 @@ struct Presets {
     by_tag: HashMap<(String, String), Vec<usize>>,
     /// Every key a preset tests: what the scan keeps of a POI's tags.
     keys: HashSet<String>,
+    /// The keys whose values say what kind of place an object is.
+    kinds: HashSet<String>,
 }
 
 fn presets() -> &'static Presets {
@@ -99,6 +103,7 @@ fn presets() -> &'static Presets {
             all: Vec::new(),
             by_tag: HashMap::new(),
             keys: HashSet::new(),
+            kinds: catalog.keys.iter().cloned().collect(),
         };
         for (id, preset) in catalog.presets {
             let index = presets.all.len();
@@ -199,6 +204,27 @@ pub(crate) fn is_poi(tags: &BTreeMap<String, String>, drawn: Drawn) -> bool {
     poi_name(tags).is_some() && poi_category(tags, drawn).is_some()
 }
 
+/// Count `tags`, a named object drawn as `drawn`, in the report as left out
+/// when one of its keys is a key places are tagged by and no counted preset
+/// matches it: by its first such tag.
+pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out: &mut Emitted) {
+    if poi_name(tags).is_none() || poi_category(tags, drawn).is_some() {
+        return;
+    }
+    let kinds = &presets().kinds;
+    if let Some((key, value)) = tags.iter().find(|(key, _)| kinds.contains(key.as_str())) {
+        out.report.leave_out_place(key, value);
+    }
+}
+
+/// The chain `brand=` and `brand:wikidata=` name.
+fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
+    Some(Brand {
+        name: tags.cleaned("brand")?,
+        wikidata: item(tags, "brand:wikidata"),
+    })
+}
+
 /// The tags a POI keeps: its names, its category tags, its Wikidata and
 /// Wikipedia links and, when they state a valid address, its `addr:*` tags.
 pub(crate) fn poi_tags(
@@ -207,7 +233,12 @@ pub(crate) fn poi_tags(
 ) -> BTreeMap<String, String> {
     // The links are kept for the POI's prominence and importance.
     tags.iter()
-        .filter(|(key, _)| matches!(key.as_str(), "wikidata" | "wikipedia") || is_place_key(key))
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "wikidata" | "wikipedia" | "brand" | "brand:wikidata"
+            ) || is_place_key(key)
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .chain(name_tags(tags))
         .chain(
@@ -253,16 +284,17 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         location_precision: candidate.location_precision,
         source,
         prominence: prominence(tags),
-        wikidata: wikidata_item(tags),
+        wikidata: item(tags, "wikidata"),
+        brand: brand(tags),
     };
     out.report.accept_poi(&record);
     out.records.push(Record::Poi(record));
 }
 
-/// The number of the Wikidata item `wikidata=` names: 1 for `Q1`. A value of
+/// The number of the Wikidata item tag `key` names: 1 for `Q1`. A value of
 /// several items, or none, names none.
-fn wikidata_item(tags: &BTreeMap<String, String>) -> Option<u32> {
-    tags.cleaned("wikidata")?
+fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
+    tags.cleaned(key)?
         .strip_prefix('Q')?
         .parse()
         .ok()
@@ -270,10 +302,13 @@ fn wikidata_item(tags: &BTreeMap<String, String>) -> Option<u32> {
 }
 
 /// A name with at least one letter: house numbers and ref codes in `name` are
-/// not names.
+/// not names. A place with none is named by its brand, which is what its
+/// sign says.
 fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {
-    tags.cleaned("name")
-        .filter(|name| name.chars().any(char::is_alphabetic))
+    ["name", "brand"].into_iter().find_map(|key| {
+        tags.cleaned(key)
+            .filter(|name| name.chars().any(char::is_alphabetic))
+    })
 }
 
 #[cfg(test)]

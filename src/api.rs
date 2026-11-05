@@ -22,7 +22,7 @@ use crate::{
     labels,
     pack::{Reader, RecordId, Summary},
     record::{
-        AddressComponents, InterpolationAddressComponents, Layer, OSM_DATASET, ObjectType,
+        AddressComponents, Brand, InterpolationAddressComponents, Layer, OSM_DATASET, ObjectType,
         PlaceLayer, RoadClass,
     },
     records, reverse,
@@ -207,6 +207,10 @@ pub struct Common {
     /// as `motorway` or `residential`. Present only on streets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub road_class: Option<RoadClass>,
+    /// The chain a place belongs to, when its name may not say: "Tankstation
+    /// Zanoli" is an Esso. Present only on places.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -744,6 +748,7 @@ fn common(
         label: summary.label,
         category: summary.category,
         road_class: summary.road_class,
+        brand: summary.brand,
         address: summary.address,
         context: contexts.of(record_id)?,
         source: Source {
@@ -804,6 +809,10 @@ fn flat(
         ("name", field(&|p| Some(p.name.clone()))),
         ("label", field(&|p| Some(p.label.clone()))),
         ("category", field(&|p| p.category.clone())),
+        (
+            "brand",
+            field(&|p| p.brand.as_ref().map(|brand| brand.name.clone())),
+        ),
         (
             "road_class",
             field(&|p| p.road_class.map(|class| class.as_str().to_string())),

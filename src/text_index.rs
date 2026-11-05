@@ -897,6 +897,11 @@ impl Document {
             builder.name(name);
         }
         builder.add_content_text(&poi.category);
+        // Its brand finds it as its name does: "Esso" is "Tankstation Zanoli".
+        if let Some(brand) = &poi.brand {
+            builder.add_content_text(&brand.name);
+            builder.add_optional_autocomplete_text(Some(&brand.name));
+        }
         // Its address words find it ("Albert Heijn Damrak"); its address is
         // answered by the address record the builder writes beside it.
         if let Some(address) = &poi.address {
@@ -1917,6 +1922,7 @@ mod tests {
             source: SourceProvenance::osm(ObjectType::Node, 5),
             prominence: Default::default(),
             wikidata: None,
+            brand: None,
         };
 
         let projected = Document::from_record(

@@ -35,8 +35,9 @@
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
 //!                     its names as one byte, its importance as one byte
-//!                     and its Wikidata item as a varint (0 = none), then its
-//!                     address after a presence byte; a postcode's country follows its code as
+//!                     and its Wikidata item as a varint (0 = none), its
+//!                     brand's string id + 1 (0 = none) and the brand's
+//!                     Wikidata item, then its address after a presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      lines only: varint part count, then per part a varint
 //!                     point count and zigzag deltas, chained across parts
@@ -96,10 +97,11 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
-        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord,
-        Prominence, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, Brand, DERIVED_FROM_ADDRESS_RECORDS,
+        DerivedSourceProvenance, InterpolationAddressComponents, InterpolationRange,
+        InterpolationRecord, Layer, LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord,
+        PoiRecord, PostcodeRecord, Prominence, Record, RoadClass, SourceProvenance, StreetRecord,
+        point_geometry,
     },
     util::{
         codec::{
@@ -174,6 +176,9 @@ pub struct Summary {
     /// A street's road class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub road_class: Option<RoadClass>,
+    /// A POI's brand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<Point>,
     pub source: Source,
@@ -778,6 +783,13 @@ impl Writer {
                 out.push(record.prominence.to_byte());
                 out.push(record.prominence.importance);
                 put_u64(out, record.wikidata.map_or(0, u64::from));
+                match &record.brand {
+                    Some(brand) => {
+                        put_u64(out, u64::from(self.strings.id(&brand.name)?) + 1);
+                        put_u64(out, brand.wikidata.map_or(0, u64::from));
+                    }
+                    None => put_u64(out, 0),
+                }
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -1181,6 +1193,7 @@ impl Reader {
                     source: header.provenance(&self.datasets)?,
                     prominence: poi.prominence,
                     wikidata: poi.wikidata,
+                    brand: poi.brand,
                 })
             }
             Layer::Interpolation => {
@@ -1247,6 +1260,7 @@ impl Reader {
         let source = header.source(&self.datasets)?;
         let mut category = None;
         let mut road_class = None;
+        let mut brand = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
@@ -1261,6 +1275,7 @@ impl Reader {
             Layer::Poi => {
                 let poi = self.poi_fields(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.object()?;
+                brand.clone_from(&poi.brand);
                 category = Some(poi.category.to_string());
                 if let Some(address) = &poi.address {
                     stated = Address::from(address);
@@ -1323,6 +1338,7 @@ impl Reader {
             address: stated,
             category,
             road_class,
+            brand,
             point: Some(header.point()),
             source,
         })
@@ -1830,11 +1846,19 @@ impl Reader {
         let category = self.string_field(strings, fields)?;
         let alt_names = self.string_list(strings, fields)?;
         let prominence = Prominence::from_byte(get_u8(fields)?, get_u8(fields)?);
-        let wikidata = match get_u64(fields)? {
+        let wikidata = item_field(fields)?;
+        let brand = match get_u64(fields)? {
             0 => None,
-            item => Some(
-                u32::try_from(item).map_err(|_| Error::Decode("Wikidata item is out of range"))?,
-            ),
+            id => Some(Brand {
+                name: self
+                    .string(
+                        strings,
+                        u32::try_from(id - 1)
+                            .map_err(|_| Error::Decode("brand string id is out of range"))?,
+                    )?
+                    .to_string(),
+                wikidata: item_field(fields)?,
+            }),
         };
         let address = match get_u8(fields)? {
             0 => None,
@@ -1846,6 +1870,7 @@ impl Reader {
             alt_names,
             prominence,
             wikidata,
+            brand,
             address,
         })
     }
@@ -1964,6 +1989,7 @@ struct PoiFields<'a> {
     alt_names: Vec<String>,
     prominence: Prominence,
     wikidata: Option<u32>,
+    brand: Option<Brand>,
     address: Option<AddressComponents>,
 }
 
@@ -2127,6 +2153,16 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
 }
 
 /// A postcode record's country, 0 when unknown.
+/// A Wikidata item number written as a varint, 0 for none.
+fn item_field(fields: &mut &[u8]) -> Result<Option<u32>> {
+    match get_u64(fields)? {
+        0 => Ok(None),
+        item => u32::try_from(item)
+            .map(Some)
+            .map_err(|_| Error::Decode("Wikidata item is out of range")),
+    }
+}
+
 fn road_class_field(fields: &mut &[u8]) -> Result<RoadClass> {
     RoadClass::from_byte(get_u8(fields)?).ok_or(Error::Decode("street has an unknown road class"))
 }
@@ -2395,6 +2431,7 @@ mod tests {
                     importance: 0,
                 },
                 wikidata: None,
+                brand: None,
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -2406,6 +2443,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, 7),
                 prominence: Default::default(),
                 wikidata: None,
+                brand: None,
             }),
         ];
         for layer in [

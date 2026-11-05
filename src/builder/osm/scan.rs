@@ -29,7 +29,7 @@ use super::{
     emitted::Emitted,
     interpolation::has_interpolation_tag,
     place::{emit_place_node, has_place_tag},
-    poi::{Drawn, PoiCandidate, emit_poi, is_place_key, is_poi, poi_tags},
+    poi::{Drawn, PoiCandidate, count_left_out, emit_poi, is_place_key, is_poi, poi_tags},
     spill::{WayFeature, WayKind},
     street::{has_highway_tag, is_street, missing_street_name_issue, street_name, street_tags},
 };
@@ -45,7 +45,8 @@ pub(crate) fn may_matter<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
     for key in keys {
         match key {
             "place" | "highway" | "boundary" => return true,
-            "name" => named = true,
+            // A branded place unnamed is named by its brand.
+            "name" | "brand" => named = true,
             key if key.starts_with("addr:") => return true,
             key if is_place_key(key) => category = true,
             _ => {}
@@ -162,7 +163,11 @@ fn scan_node(
     }
 
     let address = node_address_tags(object_id, all_tags, out);
-    if is_poi(all_tags, Drawn::Point) {
+    let poi = is_poi(all_tags, Drawn::Point);
+    if !poi {
+        count_left_out(all_tags, Drawn::Point, out);
+    }
+    if poi {
         emit_poi(
             &PoiCandidate {
                 object_type: ObjectType::Node,
@@ -339,7 +344,11 @@ fn scan_way<'a>(
         Some(tags)
     };
 
-    let (kind, tags, layer_hint) = if is_poi(all_tags, Drawn::Area) {
+    let poi = is_poi(all_tags, Drawn::Area);
+    if !poi && let Some(out) = out.as_deref_mut() {
+        count_left_out(all_tags, Drawn::Area, out);
+    }
+    let (kind, tags, layer_hint) = if poi {
         (WayKind::Poi, poi_tags(all_tags, address.as_ref()), "poi")
     } else if let Some(tags) = address {
         (WayKind::Address, tags, "address")

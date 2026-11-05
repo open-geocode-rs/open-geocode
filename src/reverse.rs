@@ -745,6 +745,7 @@ mod tests {
                     source: SourceProvenance::osm(ObjectType::Node, 40),
                     prominence: Default::default(),
                     wikidata: None,
+                    brand: None,
                 }
                 .into(),
                 None,
@@ -762,6 +763,7 @@ mod tests {
                     source: SourceProvenance::osm(ObjectType::Way, 41),
                     prominence: Default::default(),
                     wikidata: None,
+                    brand: None,
                 }
                 .into(),
                 None,
@@ -811,6 +813,7 @@ mod tests {
                     source: SourceProvenance::osm(ObjectType::Node, 41),
                     prominence: Default::default(),
                     wikidata: None,
+                    brand: None,
                 }
                 .into(),
                 None,

@@ -5906,6 +5906,7 @@ impl TextSearcher {
                 address: Address::from(&address),
                 category: None,
                 road_class: None,
+                brand: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -9730,6 +9731,7 @@ mod tests {
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence: Default::default(),
             wikidata: None,
+            brand: None,
         };
         writer
             .write(
@@ -9823,6 +9825,7 @@ mod tests {
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence: Default::default(),
             wikidata: None,
+            brand: None,
         };
         for record in [
             poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
@@ -9887,6 +9890,7 @@ mod tests {
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence,
             wikidata: None,
+            brand: None,
         };
         for record in [
             cafe(1, Prominence::default()),
@@ -10003,6 +10007,7 @@ mod tests {
             address: Address::default(),
             category: None,
             road_class: None,
+            brand: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),
@@ -11186,6 +11191,7 @@ mod tests {
                     source: SourceProvenance::osm(ObjectType::Node, 1),
                     prominence: Default::default(),
                     wikidata: None,
+                    brand: None,
                 }
                 .into(),
                 None,

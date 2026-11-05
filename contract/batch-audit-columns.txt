@@ -8,6 +8,7 @@ geocode_accuracy
 geocode_name
 geocode_label
 geocode_category
+geocode_brand
 geocode_road_class
 geocode_lat
 geocode_lon

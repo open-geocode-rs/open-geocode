@@ -179,6 +179,7 @@ impl BuilderReport {
         self.accepted.poi_way_centroids += accepted.poi_way_centroids;
         self.accepted.pois_with_address += accepted.pois_with_address;
         merge_counts(&mut self.accepted.poi_categories, accepted.poi_categories);
+        merge_counts(&mut self.accepted.places_left_out, accepted.places_left_out);
 
         self.rejected.total += rejected.total;
         merge_counts(&mut self.rejected.by_reason, rejected.by_reason);
@@ -547,10 +548,14 @@ pub struct AcceptedCounts {
     pub place_areas: u64,
     pub poi_nodes: u64,
     pub poi_way_centroids: u64,
-    /// POIs that carry an address instead of being an address record.
+    /// POIs that state an address, which is also an address record.
     pub pois_with_address: u64,
     /// POIs by the key of their category, for example `amenity`.
     pub poi_categories: BTreeMap<String, u64>,
+    /// Named objects with a key places are tagged by that are no place,
+    /// by that tag (`amenity=bench`): what the counted presets leave out.
+    #[serde(default)]
+    pub places_left_out: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -945,6 +950,15 @@ impl BuilderReport {
     pub(crate) fn accept_place_area(&mut self, layer: PlaceLayer) {
         self.accept_place(layer);
         self.accepted.place_areas += 1;
+    }
+
+    /// Count a named object tagged `key=value` that is no place.
+    pub(crate) fn leave_out_place(&mut self, key: &str, value: &str) {
+        *self
+            .accepted
+            .places_left_out
+            .entry(format!("{key}={value}"))
+            .or_default() += 1;
     }
 
     pub(crate) fn accept_poi(&mut self, poi: &PoiRecord) {

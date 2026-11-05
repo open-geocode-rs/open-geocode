@@ -799,6 +799,7 @@ fn write_pack(dir: &PathBuf) {
                 source: SourceProvenance::osm(ObjectType::Way, 11),
                 prominence: Default::default(),
                 wikidata: None,
+                brand: None,
             }
             .into(),
             context.clone(),

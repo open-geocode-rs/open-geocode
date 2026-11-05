@@ -201,6 +201,42 @@ pub struct PoiRecord {
     pub prominence: Prominence,
     /// The number of its `wikidata` item, `Q1` being 1.
     pub wikidata: Option<u32>,
+    /// The chain it belongs to, apart from its name: "Tankstation Zanoli"
+    /// is an Esso.
+    pub brand: Option<Brand>,
+}
+
+/// A chain: its name and the number of its `brand:wikidata` item. The item
+/// is the chain's, never the place's, so it gives the place no importance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Brand {
+    #[schema(example = "Esso")]
+    pub name: String,
+    /// Its Wikidata item, such as `Q867662`, a stable id of the chain.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_item",
+        deserialize_with = "deserialize_item",
+        default
+    )]
+    #[schema(value_type = Option<String>, example = "Q867662")]
+    pub wikidata: Option<u32>,
+}
+
+// serde's `serialize_with` hands the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_item<S: Serializer>(item: &Option<u32>, serializer: S) -> Result<S::Ok, S::Error> {
+    match item {
+        Some(item) => serializer.serialize_str(&format!("Q{item}")),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_item<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let text = Option::<String>::deserialize(deserializer)?;
+    Ok(text.and_then(|text| text.strip_prefix('Q').and_then(|item| item.parse().ok())))
 }
 
 /// How widely a POI is known: how much its Wikidata item is read, when the
@@ -941,7 +977,7 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 11)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 12)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -963,6 +999,10 @@ impl Serialize for PoiRecord {
         match self.wikidata {
             Some(item) => state.serialize_field("wikidata", &format!("Q{item}"))?,
             None => state.skip_field("wikidata")?,
+        }
+        match &self.brand {
+            Some(brand) => state.serialize_field("brand", brand)?,
+            None => state.skip_field("brand")?,
         }
         state.end()
     }

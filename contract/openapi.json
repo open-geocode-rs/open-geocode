@@ -97,6 +97,24 @@
         ],
         "type": "object"
       },
+      "Brand": {
+        "description": "A chain: its name and the number of its `brand:wikidata` item. The item\nis the chain's, never the place's, so it gives the place no importance.",
+        "properties": {
+          "name": {
+            "example": "Esso",
+            "type": "string"
+          },
+          "wikidata": {
+            "description": "Its Wikidata item, such as `Q867662`, a stable id of the chain.",
+            "example": "Q867662",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "Common": {
         "description": "Properties shared by forward and reverse results.",
         "properties": {
@@ -106,6 +124,10 @@
           "address": {
             "$ref": "#/components/schemas/Address",
             "description": "Address parts stated by the source record."
+          },
+          "brand": {
+            "$ref": "#/components/schemas/Brand",
+            "description": "The chain a place belongs to, when its name may not say: \"Tankstation\nZanoli\" is an Esso. Present only on places."
           },
           "category": {
             "description": "POI category, such as `amenity:cafe`. Present only on POIs.",

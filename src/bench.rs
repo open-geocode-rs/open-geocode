@@ -715,6 +715,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, object_id),
                 prominence: Default::default(),
                 wikidata: None,
+                brand: None,
             };
             writer.write(&poi.into(), context).expect("POI");
         }

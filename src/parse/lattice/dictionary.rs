@@ -1834,6 +1834,7 @@ mod tests {
             source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
             prominence: Default::default(),
             wikidata: None,
+            brand: None,
         });
         assert_eq!(
             named(&RecordNames::of(&poi)),

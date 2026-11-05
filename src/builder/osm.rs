@@ -4165,6 +4165,84 @@ mod tests {
     }
 
     #[test]
+    fn a_place_is_found_by_its_brand_and_codes_and_drops_are_counted() {
+        let dir = temp_dir("brands");
+        let input = dir.join("brands.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        1,
+                        52.37,
+                        4.89,
+                        &[
+                            ("name", "Tankstation Zanoli"),
+                            ("amenity", "fuel"),
+                            ("brand", "Esso"),
+                            ("brand:wikidata", "Q867662"),
+                        ],
+                    ),
+                    // No name: its brand names it.
+                    node(
+                        2,
+                        52.38,
+                        4.90,
+                        &[("amenity", "cafe"), ("brand", "Starbucks")],
+                    ),
+                    node(
+                        3,
+                        52.31,
+                        4.76,
+                        &[
+                            ("name", "Amsterdam Airport Schiphol"),
+                            ("aeroway", "aerodrome"),
+                            ("iata", "AMS"),
+                        ],
+                    ),
+                    node(4, 52.36, 4.88, &[("name", "Bench"), ("amenity", "bench")]),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(
+            report.accepted.places_left_out.get("amenity=bench"),
+            Some(&1)
+        );
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let top = |query: &str| {
+            places
+                .search(&TextSearchOptions {
+                    query: query.into(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .next()
+                .expect("a place")
+                .record
+        };
+        let esso = top("Esso");
+        assert_eq!(esso.name, "Tankstation Zanoli");
+        let brand = esso.brand.expect("a brand");
+        assert_eq!(
+            (brand.name.as_str(), brand.wikidata),
+            ("Esso", Some(867_662))
+        );
+        assert_eq!(top("Starbucks").id, "osm:node:2");
+        assert_eq!(top("AMS").id, "osm:node:3");
+    }
+
+    #[test]
     fn a_place_whose_wikidata_item_is_read_more_ranks_first() {
         let dir = temp_dir("qrank");
         let input = dir.join("cafes.osm.pbf");
