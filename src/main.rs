@@ -1214,27 +1214,61 @@ mod tests {
         assert_eq!(build_budget(None).expect("derived"), None);
     }
 
-    /// Answers one request with `status`, as the server's /readyz would.
-    fn readyz_stub(status: &'static str) -> SocketAddr {
-        use std::io::{Read, Write};
+    /// Answers one request with `status`, as the server's /readyz would, and
+    /// returns the request line it got.
+    fn readyz_stub(status: &'static str) -> (SocketAddr, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request);
-            let _ = write!(stream, "HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+        let stub = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).expect("request line");
+            let mut header = String::new();
+            while reader.read_line(&mut header).expect("header") > 2 {
+                header.clear();
+            }
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n"
+            )
+            .expect("respond");
+            request_line
         });
-        addr
+        (addr, stub)
     }
 
     #[test]
-    fn health_follows_readyz() {
-        assert!(health(readyz_stub("200 OK")).is_ok());
-        assert!(health(readyz_stub("503 Service Unavailable")).is_err());
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+    fn health_passes_when_readyz_answers_200() {
+        let (addr, stub) = readyz_stub("200 OK");
+        let checked = health(addr);
+        assert_eq!(stub.join().expect("stub"), "GET /readyz HTTP/1.1\r\n");
+        checked.expect("ready");
+    }
+
+    #[test]
+    fn health_fails_when_readyz_answers_503() {
+        let (addr, stub) = readyz_stub("503 Service Unavailable");
+        let error = health(addr).expect_err("not ready");
+        stub.join().expect("stub");
+        assert_eq!(error.to_string(), format!("server at {addr} is not ready"));
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::StatusCode(503))
+        ));
+    }
+
+    #[test]
+    fn health_fails_when_nothing_listens() {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
             .expect("free port");
-        assert!(health(closed).is_err());
+        let error = health(addr).expect_err("nothing listens");
+        assert_eq!(error.to_string(), format!("server at {addr} is not ready"));
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Io(io)) if io.kind() == std::io::ErrorKind::ConnectionRefused
+        ));
     }
 }

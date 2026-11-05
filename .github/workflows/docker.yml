@@ -1,8 +1,9 @@
 name: Docker
 
 # Publishes ghcr.io/<owner>/open-geocode for linux/amd64 and linux/arm64 once CI passes on a push to
-# main, so no tag points at a commit that failed CI. A pull request that touches the image builds it
-# for both platforms without pushing.
+# main, so no tag points at a commit that failed CI. No manual trigger: it would skip that gate; re-run
+# a failed publish from its workflow_run instead. A pull request that touches the image builds it for
+# both platforms without pushing.
 on:
   workflow_run:
     workflows: [CI]
@@ -14,7 +15,6 @@ on:
       - .dockerignore
       - .github/workflows/docker.yml
       - Cargo.lock
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,7 +31,7 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.platform }})
-    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    if: github.event_name == 'pull_request' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     strategy:
       matrix:
         include:
@@ -59,8 +59,8 @@ jobs:
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          context: git
           images: ${{ env.IMAGE }}
+          labels: org.opencontainers.image.revision=${{ env.HEAD_SHA }}
 
       - name: Build
         if: github.event_name == 'pull_request'
@@ -121,7 +121,7 @@ jobs:
   publish:
     name: Publish
     needs: build
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_run'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
