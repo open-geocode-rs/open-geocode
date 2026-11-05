@@ -193,6 +193,13 @@ enum PackCommand {
         /// several.
         #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
         address_files: Vec<String>,
+
+        /// Rank places by how much their Wikidata items are read, from a
+        /// QRank file (`qrank.csv.gz` from https://qrank.toolforge.org),
+        /// gzipped or not. Without one, places of one name are told apart
+        /// by their tags alone.
+        #[arg(long, value_name = "PATH")]
+        qrank: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -594,6 +601,7 @@ async fn main() -> Result<()> {
             openaddresses,
             openaddresses_zip,
             address_files,
+            qrank,
         }) => {
             resources::opt_out_of_power_throttling();
             resources::yield_to_interactive_programs();
@@ -607,6 +615,7 @@ async fn main() -> Result<()> {
                 inputs,
                 pack,
                 addresses,
+                qrank,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()

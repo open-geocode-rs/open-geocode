@@ -34,8 +34,9 @@
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
-//!                     its names as one byte, then its address after a
-//!                     presence byte; a postcode's country follows its code as
+//!                     its names as one byte, its importance as one byte
+//!                     and its Wikidata item as a varint (0 = none), then its
+//!                     address after a presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      lines only: varint part count, then per part a varint
 //!                     point count and zigzag deltas, chained across parts
@@ -775,6 +776,8 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.category)?));
                 self.put_strings(out, &record.alt_names)?;
                 out.push(record.prominence.to_byte());
+                out.push(record.prominence.importance);
+                put_u64(out, record.wikidata.map_or(0, u64::from));
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -1177,6 +1180,7 @@ impl Reader {
                     location_precision,
                     source: header.provenance(&self.datasets)?,
                     prominence: poi.prominence,
+                    wikidata: poi.wikidata,
                 })
             }
             Layer::Interpolation => {
@@ -1825,7 +1829,13 @@ impl Reader {
         let name = self.string_field(strings, fields)?;
         let category = self.string_field(strings, fields)?;
         let alt_names = self.string_list(strings, fields)?;
-        let prominence = Prominence::from_byte(get_u8(fields)?);
+        let prominence = Prominence::from_byte(get_u8(fields)?, get_u8(fields)?);
+        let wikidata = match get_u64(fields)? {
+            0 => None,
+            item => Some(
+                u32::try_from(item).map_err(|_| Error::Decode("Wikidata item is out of range"))?,
+            ),
+        };
         let address = match get_u8(fields)? {
             0 => None,
             _ => Some(self.address_components(strings, fields)?),
@@ -1835,6 +1845,7 @@ impl Reader {
             category,
             alt_names,
             prominence,
+            wikidata,
             address,
         })
     }
@@ -1952,6 +1963,7 @@ struct PoiFields<'a> {
     category: &'a str,
     alt_names: Vec<String>,
     prominence: Prominence,
+    wikidata: Option<u32>,
     address: Option<AddressComponents>,
 }
 
@@ -2380,7 +2392,9 @@ mod tests {
                 prominence: Prominence {
                     linked: true,
                     languages: 12,
+                    importance: 0,
                 },
+                wikidata: None,
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -2391,6 +2405,7 @@ mod tests {
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 7),
                 prominence: Default::default(),
+                wikidata: None,
             }),
         ];
         for layer in [

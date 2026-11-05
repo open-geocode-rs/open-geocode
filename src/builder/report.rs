@@ -11,7 +11,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 22;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 23;
 
 /// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -71,6 +71,22 @@ pub struct BuilderReport {
     /// Each time the build went on from a checkpoint a run before left.
     #[serde(default)]
     pub resumes: Vec<ResumeReport>,
+    /// The QRank file places' importance came from, when the build had one.
+    #[serde(default)]
+    pub qrank: Option<QRankReport>,
+}
+
+/// The QRank file a build read, so a Pack's importances can be traced to it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct QRankReport {
+    pub path: String,
+    pub bytes: u64,
+    /// When the file was last changed, in seconds since the Unix epoch.
+    pub modified_unix: u64,
+    /// The items it ranks.
+    pub items: u64,
+    /// The places linked to an item it ranks.
+    pub ranked_places: u64,
 }
 
 /// What checkpointing cost.

@@ -714,6 +714,7 @@ mod tests {
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, object_id),
                 prominence: Default::default(),
+                wikidata: None,
             };
             writer.write(&poi.into(), context).expect("POI");
         }

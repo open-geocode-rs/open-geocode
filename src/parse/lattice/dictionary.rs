@@ -1833,6 +1833,7 @@ mod tests {
             location_precision: crate::record::LocationPrecision::Point,
             source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
             prominence: Default::default(),
+            wikidata: None,
         });
         assert_eq!(
             named(&RecordNames::of(&poi)),

@@ -253,9 +253,20 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         location_precision: candidate.location_precision,
         source,
         prominence: prominence(tags),
+        wikidata: wikidata_item(tags),
     };
     out.report.accept_poi(&record);
     out.records.push(Record::Poi(record));
+}
+
+/// The number of the Wikidata item `wikidata=` names: 1 for `Q1`. A value of
+/// several items, or none, names none.
+fn wikidata_item(tags: &BTreeMap<String, String>) -> Option<u32> {
+    tags.cleaned("wikidata")?
+        .strip_prefix('Q')?
+        .parse()
+        .ok()
+        .filter(|item| *item > 0)
 }
 
 /// A name with at least one letter: house numbers and ref codes in `name` are
@@ -454,6 +465,7 @@ mod tests {
             crate::record::Prominence {
                 linked: true,
                 languages: 2,
+                importance: 0,
             }
         );
     }

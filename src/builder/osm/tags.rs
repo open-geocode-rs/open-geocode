@@ -112,6 +112,7 @@ pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
     Prominence {
         linked: tags.has("wikidata") || tags.has("wikipedia"),
         languages: languages.len().min(usize::from(Prominence::MAX_LANGUAGES)) as u8,
+        importance: 0,
     }
 }
 
@@ -225,6 +226,7 @@ mod tests {
             Prominence {
                 linked: true,
                 languages: 2,
+                importance: 0,
             },
             "ja and its scripts are one language; an etymology, a blank and an alt name none"
         );
@@ -232,13 +234,15 @@ mod tests {
         let byte = Prominence {
             linked: true,
             languages: 5,
+            importance: 0,
         }
         .to_byte();
         assert_eq!(
-            Prominence::from_byte(byte),
+            Prominence::from_byte(byte, 9),
             Prominence {
                 linked: true,
-                languages: 5
+                languages: 5,
+                importance: 9,
             }
         );
     }

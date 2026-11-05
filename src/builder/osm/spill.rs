@@ -1096,6 +1096,8 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             }
             encode_precision(out, record.location_precision);
             out.push(record.prominence.to_byte());
+            out.push(record.prominence.importance);
+            put_u64(out, record.wikidata.map_or(0, u64::from));
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1164,7 +1166,14 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 _ => Some(decode_address(input)?),
             },
             location_precision: decode_precision(input)?,
-            prominence: Prominence::from_byte(get_u8(input)?),
+            prominence: Prominence::from_byte(get_u8(input)?, get_u8(input)?),
+            wikidata: match get_u64(input)? {
+                0 => None,
+                item => Some(
+                    u32::try_from(item)
+                        .map_err(|_| Error::Decode("spilled Wikidata item is out of range"))?,
+                ),
+            },
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -1578,6 +1587,7 @@ mod tests {
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 16),
                 prominence: Default::default(),
+                wikidata: None,
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -1588,6 +1598,7 @@ mod tests {
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 17),
                 prominence: Default::default(),
+                wikidata: None,
             }),
         ];
         for (seq, record) in records.into_iter().enumerate() {

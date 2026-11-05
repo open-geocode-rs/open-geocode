@@ -199,18 +199,24 @@ pub struct PoiRecord {
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
     pub prominence: Prominence,
+    /// The number of its `wikidata` item, `Q1` being 1.
+    pub wikidata: Option<u32>,
 }
 
-/// How widely a POI is known, read from its own OSM tags alone: whether
-/// mappers linked it to Wikidata or Wikipedia, and in how many languages
-/// they named it. A museum of a city is linked and named in a dozen
-/// languages; a corner shop of the same name in neither. It breaks ties
-/// between POIs only (see the search's tie-break), never against another
-/// layer, and needs no data beyond the extract.
+/// How widely a POI is known: how much its Wikidata item is read, when the
+/// build had QRank, then from its own OSM tags whether mappers linked it to
+/// Wikidata or Wikipedia, and in how many languages they named it. A museum
+/// of a city is read, linked and named in a dozen languages; a corner shop
+/// of the same name in none. It breaks ties between POIs only (see the
+/// search's tie-break), never against another layer.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub struct Prominence {
+    /// How much its Wikidata item is read, from QRank: Wikimedia page views
+    /// on a log scale, 1 to 255; 0 when it has none or the build had no
+    /// QRank. First, so it orders before what the tags alone say.
+    pub importance: u8,
     /// It carries `wikidata=` or `wikipedia=`.
     pub linked: bool,
     /// The languages of its `name:<lang>` tags, `ja`, `ja-Hira` and `ja_rm`
@@ -223,13 +229,17 @@ impl Prominence {
     /// and past a few dozen a name is everywhere already.
     pub const MAX_LANGUAGES: u8 = 127;
 
-    /// One byte: the languages, then whether it is linked.
+    /// One byte: the languages, then whether it is linked. The importance is
+    /// not in it.
     pub fn to_byte(self) -> u8 {
         self.languages.min(Self::MAX_LANGUAGES) << 1 | u8::from(self.linked)
     }
 
-    pub const fn from_byte(byte: u8) -> Self {
+    /// The tags' part of the byte [`Self::to_byte`] writes; the importance
+    /// is stored apart.
+    pub const fn from_byte(byte: u8, importance: u8) -> Self {
         Self {
+            importance,
             linked: byte & 1 != 0,
             languages: byte >> 1,
         }
@@ -931,7 +941,7 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 10)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 11)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -949,6 +959,10 @@ impl Serialize for PoiRecord {
             state.skip_field("prominence")?;
         } else {
             state.serialize_field("prominence", &self.prominence)?;
+        }
+        match self.wikidata {
+            Some(item) => state.serialize_field("wikidata", &format!("Q{item}"))?,
+            None => state.skip_field("wikidata")?,
         }
         state.end()
     }

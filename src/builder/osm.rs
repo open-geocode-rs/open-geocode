@@ -76,7 +76,10 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -89,8 +92,9 @@ use crate::{
         addresses::{self, AddressFile, AddressSource},
         plan::{BuildPlan, ItemCounts, Scanned, plan_build_holding},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
+        qrank::QRank,
         report::{
-            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, ReportInput,
+            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, QRankReport, ReportInput,
             ResumeReport, SlashNumberCounts, SorterReport, StageReport,
         },
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
@@ -191,6 +195,10 @@ pub struct BuildOsmOptions {
     /// How many addresses `addresses` is expected to add, for the plan to
     /// size disk by; 0 when not known before they are fetched.
     pub imported_rows: u64,
+    /// A QRank file (see [`crate::builder::qrank`]): a place linked to a
+    /// Wikidata item it ranks gets that item's importance. Without one,
+    /// places tell their importance apart by their tags alone.
+    pub qrank: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -208,6 +216,7 @@ impl Default for BuildOsmOptions {
             cancel: Arc::new(AtomicBool::new(false)),
             addresses: None,
             imported_rows: 0,
+            qrank: None,
         }
     }
 }
@@ -226,6 +235,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("input_sources", &self.input_sources)
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
+            .field("qrank", &self.qrank)
             .finish_non_exhaustive()
     }
 }
@@ -1611,6 +1621,7 @@ impl<'a> Run<'a> {
             context_count,
             &index,
             None,
+            None,
             &self.progress,
             BuildStage::ContextRecords,
         )?;
@@ -1635,16 +1646,35 @@ impl<'a> Run<'a> {
             .books
             .take()
             .ok_or_else(|| missing("the address book"))?;
-        write_ordered(
+        let qrank = match &self.options.qrank {
+            Some(path) => Some(QRank::load(path, &self.memory)?),
+            None => None,
+        };
+        let ranked = write_ordered(
             &mut writer,
             &mut sample,
             records.finish()?,
             record_stats.items,
             &index,
             Some(&books),
+            qrank.as_ref(),
             &self.progress,
             BuildStage::Records,
         )?;
+        if let (Some(path), Some(qrank)) = (&self.options.qrank, &qrank) {
+            let metadata = fs::metadata(path)?;
+            self.build.report.qrank = Some(QRankReport {
+                path: path.display().to_string(),
+                bytes: metadata.len(),
+                modified_unix: metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+                items: qrank.len() as u64,
+                ranked_places: ranked,
+            });
+        }
+        drop(qrank);
         drop((index, books));
         self.boundaries_saved = None;
         self.boundary_shapes = None;
@@ -2788,7 +2818,9 @@ fn overlapped<T: Send>(
 /// Write sorted records in batches, computing admin context in parallel, and
 /// offer each record to the parser's training sample under the country it
 /// lies in. Boundary and derived-country records describe context and get
-/// none, but are offered under the country their point lies in.
+/// none, but are offered under the country their point lies in. Each POI
+/// gets the importance `qrank` gives its Wikidata item; returns how many it
+/// ranked.
 #[allow(clippy::too_many_arguments)]
 fn write_ordered(
     writer: &mut Writer,
@@ -2797,9 +2829,12 @@ fn write_ordered(
     total: u64,
     index: &BoundaryIndex,
     book: Option<&AddressBook>,
+    qrank: Option<&QRank>,
     progress: &Progress,
     stage: BuildStage,
-) -> Result<()> {
+) -> Result<u64> {
+    let ranked = AtomicU64::new(0);
+    let ranked_ref = &ranked;
     progress.start(stage, Some(total))?;
     let mut preparer = writer.preparer();
     // One thread reads and prepares the next batch while this one appends the
@@ -2829,7 +2864,15 @@ fn write_ordered(
                     .and_then(|batch| {
                         let (batch, countries): (Vec<_>, Vec<_>) = batch
                             .into_par_iter()
-                            .map(|(record, origin)| {
+                            .map(|(mut record, origin)| {
+                                if let (Some(qrank), Record::Poi(poi)) = (qrank, &mut record)
+                                    && let Some(item) = poi.wikidata
+                                {
+                                    poi.prominence.importance = qrank.importance(item);
+                                    if poi.prominence.importance > 0 {
+                                        ranked_ref.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                                 let located = record_context(index, &record);
                                 let country = located
                                     .as_ref()
@@ -2864,7 +2907,7 @@ fn write_ordered(
         Ok(())
     })?;
     progress.finish(stage);
-    Ok(())
+    Ok(ranked.into_inner())
 }
 
 /// Build audit outputs written next to the Pack file, outside it.
@@ -4119,6 +4162,58 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn a_place_whose_wikidata_item_is_read_more_ranks_first() {
+        let dir = temp_dir("qrank");
+        let input = dir.join("cafes.osm.pbf");
+        let cafe = |id: i64, item: &'static str| {
+            node(
+                id,
+                43.65,
+                -79.38,
+                &[
+                    ("name", "Blue Door"),
+                    ("amenity", "cafe"),
+                    ("wikidata", item),
+                ],
+            )
+        };
+        write_pbf(
+            &input,
+            &[vec![cafe(1, "Q11"), cafe(2, "Q22")], vec![], vec![]],
+        );
+        let qrank = dir.join("qrank.csv");
+        fs::write(&qrank, "Entity,QRank\nQ11,40\nQ22,90000\n").expect("qrank");
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            qrank: Some(qrank),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let ranked = report.qrank.expect("the QRank file read");
+        assert_eq!((ranked.items, ranked.ranked_places), (2, 2));
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let hits = places
+            .search(&TextSearchOptions {
+                query: "Blue Door".into(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search");
+        let ids = hits
+            .iter()
+            .map(|hit| hit.record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["osm:node:2", "osm:node:1"]);
     }
 
     #[test]

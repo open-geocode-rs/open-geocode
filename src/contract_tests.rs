@@ -798,6 +798,7 @@ fn write_pack(dir: &PathBuf) {
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 11),
                 prominence: Default::default(),
+                wikidata: None,
             }
             .into(),
             context.clone(),

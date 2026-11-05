@@ -9729,6 +9729,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence: Default::default(),
+            wikidata: None,
         };
         writer
             .write(
@@ -9821,6 +9822,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence: Default::default(),
+            wikidata: None,
         };
         for record in [
             poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
@@ -9884,6 +9886,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence,
+            wikidata: None,
         };
         for record in [
             cafe(1, Prominence::default()),
@@ -9892,6 +9895,7 @@ mod tests {
                 Prominence {
                     linked: false,
                     languages: 3,
+                    importance: 0,
                 },
             ),
             cafe(
@@ -9899,6 +9903,7 @@ mod tests {
                 Prominence {
                     linked: true,
                     languages: 1,
+                    importance: 0,
                 },
             ),
         ] {
@@ -9931,6 +9936,7 @@ mod tests {
                 prominence: Some(Prominence {
                     linked: true,
                     languages: 40,
+                    importance: 0,
                 }),
                 disputed: false,
             },
@@ -11179,6 +11185,7 @@ mod tests {
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 1),
                     prominence: Default::default(),
+                    wikidata: None,
                 }
                 .into(),
                 None,

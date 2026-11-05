@@ -744,6 +744,7 @@ mod tests {
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 40),
                     prominence: Default::default(),
+                    wikidata: None,
                 }
                 .into(),
                 None,
@@ -760,6 +761,7 @@ mod tests {
                     location_precision: LocationPrecision::Centroid,
                     source: SourceProvenance::osm(ObjectType::Way, 41),
                     prominence: Default::default(),
+                    wikidata: None,
                 }
                 .into(),
                 None,
@@ -808,6 +810,7 @@ mod tests {
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 41),
                     prominence: Default::default(),
+                    wikidata: None,
                 }
                 .into(),
                 None,

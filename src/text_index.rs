@@ -1916,6 +1916,7 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, 5),
             prominence: Default::default(),
+            wikidata: None,
         };
 
         let projected = Document::from_record(
