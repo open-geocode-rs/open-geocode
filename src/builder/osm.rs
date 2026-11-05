@@ -1252,6 +1252,11 @@ impl<'a> Run<'a> {
             }
         }
         self.progress.check()?;
+        let mut places = Emitted::default();
+        for candidate in boundary::place_relations(&relations, member_line)? {
+            poi::emit_poi(&candidate, &mut places);
+        }
+        self.build.absorb(places)?;
         drop((line_memory, line_at, lines, relations, batch_memory));
         let passes = &mut self.build.report.geometry_passes;
         passes.boundary_shape_vertices = builder.vertices();
@@ -4162,6 +4167,65 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn a_place_drawn_as_a_multipolygon_is_a_place_inside_its_outline() {
+        let dir = temp_dir("place-relations");
+        let input = dir.join("stadium.osm.pbf");
+        // A ring around a hole: the plain centre lies in the hole.
+        let nodes = vec![
+            node(1, 52.300, 4.930, &[]),
+            node(2, 52.300, 4.950, &[]),
+            node(3, 52.320, 4.950, &[]),
+            node(4, 52.320, 4.930, &[]),
+            node(5, 52.305, 4.935, &[]),
+            node(6, 52.305, 4.945, &[]),
+            node(7, 52.315, 4.945, &[]),
+            node(8, 52.315, 4.935, &[]),
+        ];
+        let ways = vec![
+            way(10, &[1, 2, 3], &[]),
+            way(11, &[3, 4, 1], &[]),
+            way(12, &[5, 6, 7, 8, 5], &[]),
+        ];
+        let relations = vec![relation(
+            100,
+            &[(10, "outer"), (11, "outer"), (12, "inner")],
+            &[
+                ("type", "multipolygon"),
+                ("leisure", "stadium"),
+                ("name", "Johan Cruijff ArenA"),
+            ],
+        )];
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let hit = places
+            .search(&TextSearchOptions {
+                query: "Johan Cruijff ArenA".into(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .next()
+            .expect("the stadium");
+        assert_eq!(hit.record.id, "osm:relation:100");
+        assert_eq!(hit.record.category.as_deref(), Some("leisure:stadium"));
+        let point = hit.record.point.expect("point");
+        let inside = |(low, high): (f64, f64), value: f64| low < value && value < high;
+        assert!(inside((4.930, 4.950), point.lon) && inside((52.300, 52.320), point.lat));
+        assert!(
+            !(inside((4.935, 4.945), point.lon) && inside((52.305, 52.315), point.lat)),
+            "its point is not in the hole: {point:?}"
+        );
     }
 
     #[test]

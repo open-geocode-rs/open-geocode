@@ -398,6 +398,22 @@ fn scan_relation(
         }
         return;
     }
+    // A place drawn as several outlines: a stadium, a campus, a castle and
+    // its moat. Its rings are assembled with the boundaries', and it becomes
+    // a place at a point inside them (see `boundary::place_relations`).
+    if is_area_relation(all_tags) && is_poi(all_tags, Drawn::Area) {
+        if !members.is_empty() {
+            let address = collect_addr_tags_from_map(all_tags);
+            let address =
+                (!address.is_empty() && validate_address_tags(&address).is_ok()).then_some(address);
+            output.relations.push(BoundaryRelationStub {
+                object_id,
+                members,
+                tags: poi_tags(all_tags, address.as_ref()),
+            });
+        }
+        return;
+    }
 
     let tags = collect_addr_tags_from_map(all_tags);
     if tags.is_empty() {
