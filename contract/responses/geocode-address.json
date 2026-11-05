@@ -34,19 +34,22 @@
         "label": "10 King Street, M5V 1A1",
         "layer": "address",
         "name": "10 King Street",
-        "record_id": 3,
         "score": 5.459071,
         "source": {
-          "dataset": "osm",
-          "object_id": 10,
-          "object_type": "node"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
     }
   ],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
     "query": "10 king street, m5v 1a1",
     "version": "1"
   },

@@ -41,12 +41,11 @@ use crate::{
         Accuracy, Address, Attribution, Common, Context, ContextArea, FeatureCollectionType,
         FeatureType, ForwardCollection, ForwardFeature, ForwardGeocoding, ForwardProperties,
         LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
-        ReverseProperties, Version,
+        ReverseProperties, Source, Version,
     },
     http::batch,
     limits::Limits,
-    record::{Layer, ObjectType},
-    records::Source,
+    record::{Layer, RoadClass},
     runtime::AppState,
 };
 
@@ -113,7 +112,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Context,
         ContextArea,
         Source,
-        ObjectType,
+        RoadClass,
         // Only ever reached through a parameter, so it needs naming here or
         // it is left out of the components and the `$ref` dangles.
         Layer,

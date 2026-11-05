@@ -22,7 +22,7 @@ use crate::{
     batch,
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
-    pack::{RecordId, Writer},
+    pack::Writer,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
         InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
@@ -231,7 +231,7 @@ async fn responses_match_the_committed_examples() {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let ids = write_pack(&pack);
+    write_pack(&pack);
     let router = build_router(
         AppState::open(
             &pack,
@@ -345,7 +345,12 @@ async fn responses_match_the_committed_examples() {
         .map(|feature| feature["properties"]["layer"].as_str().expect("layer"))
         .collect::<Vec<_>>();
     assert_eq!(layers, ["address", "locality", "region", "country"]);
-    assert_eq!(features[0]["properties"]["record_id"], ids.address);
+    assert_eq!(features[0]["properties"]["id"], "osm:node:10");
+    assert!(features[0]["properties"].get("record_id").is_none());
+    assert_eq!(
+        on_address["geocoding"]["attribution"][0]["licence"],
+        "ODbL 1.0"
+    );
     assert_eq!(features[0]["properties"]["distance_m"], 0.0);
     assert!(features[1]["properties"].get("distance_m").is_none());
     assert!(features[0]["properties"].get("score").is_none());
@@ -696,13 +701,9 @@ async fn get(router: &Router, uri: &str) -> Value {
     serde_json::from_slice(&body).expect("response body is JSON")
 }
 
-struct Ids {
-    address: RecordId,
-}
-
 /// Canada > Ontario > Toronto, an address, a POI with an address, a street
 /// and an interpolation range in Toronto.
-fn write_pack(dir: &PathBuf) -> Ids {
+fn write_pack(dir: &PathBuf) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let place = |writer: &mut Writer, layer, name: &str, id| {
@@ -755,7 +756,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
         postcode: Some("M5V 1A1".to_string()),
         country: None,
     };
-    let address = writer
+    writer
         .write(
             &AddressRecord {
                 disputed: false,
@@ -836,7 +837,6 @@ fn write_pack(dir: &PathBuf) -> Ids {
     Model::new(CONTRACT_WEIGHTS, Default::default())
         .save(&pack)
         .expect("confidence model");
-    Ids { address }
 }
 
 /// A plausible model: an answer is likelier right on a strict pass, with

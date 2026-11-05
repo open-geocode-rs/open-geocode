@@ -29,13 +29,10 @@
         "label": "King Street",
         "layer": "street",
         "name": "King Street",
-        "record_id": 5,
         "road_class": "residential",
         "score": 14.649926,
         "source": {
-          "dataset": "osm",
-          "object_id": 12,
-          "object_type": "way"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
@@ -74,12 +71,9 @@
         "label": "10 King Street, M5V 1A1",
         "layer": "address",
         "name": "10 King Street",
-        "record_id": 3,
         "score": 14.649926,
         "source": {
-          "dataset": "osm",
-          "object_id": 10,
-          "object_type": "node"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
@@ -119,19 +113,22 @@
         "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
         "layer": "poi",
         "name": "Queen Bakery",
-        "record_id": 4,
         "score": 1.7933104,
         "source": {
-          "dataset": "osm",
-          "object_id": 11,
-          "object_type": "way"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
     }
   ],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
     "query": "King Street",
     "version": "1"
   },

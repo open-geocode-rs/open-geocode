@@ -24,6 +24,7 @@ UPSTREAM = os.path.join(CATALOG, "upstream")
 LOCK = os.path.join(CATALOG, "sources.lock.json")
 CURATION = os.path.join(CATALOG, "curation.toml")
 REGIONS = os.path.join(CATALOG, "regions.json")
+LICENCES = os.path.join(CATALOG, "licences.json")
 
 GEOFABRIK_INDEX = "https://download.geofabrik.de/index-v1-nogeom.json"
 GEOFABRIK_SHAPES = "https://download.geofabrik.de/index-v1.json"
@@ -184,7 +185,8 @@ def trim_license(lic):
     if isinstance(lic, str):
         return dict(name=lic)
     out = {}
-    for src, dst in (("text", "name"), ("url", "url"), ("attribution", "attribution"), ("share-alike", "share_alike")):
+    for src, dst in (("text", "name"), ("url", "url"), ("attribution", "attribution"),
+                     ("attribution name", "attribution_name"), ("share-alike", "share_alike")):
         if lic.get(src) not in (None, ""):
             out[dst] = lic[src]
     return out or None
@@ -654,6 +656,21 @@ def print_unresolved(unresolved):
             log(f"  {item}")
 
 
+def licences_text():
+    """The license of each OpenAddresses data set that states one, by source and
+    name, for the Pack to credit the data sets an answer comes from."""
+    rows = []
+    for d in load_snapshot("openaddresses")["datasets"]:
+        lic = d.get("license")
+        if not lic:
+            continue
+        row = dict(source=d["source"], name=d["name"], licence=lic.get("name"), url=lic.get("url"),
+                   attribution=lic.get("attribution"), attribution_name=lic.get("attribution_name"))
+        rows.append({k: v for k, v in row.items() if v not in (None, "")})
+    rows.sort(key=lambda r: (r["source"], r["name"]))
+    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"]), "datasets", rows)
+
+
 def cmd_generate(_):
     text, unresolved = generate_text()
     if unresolved:
@@ -661,6 +678,9 @@ def cmd_generate(_):
         return 1
     write(REGIONS, text)
     log(f"wrote {os.path.relpath(REGIONS, ROOT)}: {len(text.encode('utf-8'))} bytes")
+    licences = licences_text()
+    write(LICENCES, licences)
+    log(f"wrote {os.path.relpath(LICENCES, ROOT)}: {len(licences.encode('utf-8'))} bytes")
     return 0
 
 
@@ -681,6 +701,10 @@ def cmd_check(_):
     current = read_bytes(REGIONS).decode("utf-8") if os.path.exists(REGIONS) else None
     if current != text:
         log("catalog/regions.json is not what `generate` produces; run it and commit the result")
+        failed = True
+    current = read_bytes(LICENCES).decode("utf-8") if os.path.exists(LICENCES) else None
+    if current != licences_text():
+        log("catalog/licences.json is not what `generate` produces; run it and commit the result")
         failed = True
     if not failed:
         log("catalog is up to date")
@@ -725,6 +749,7 @@ def cmd_update(args):
         log("catalog/regions.json left as it was")
         return 1
     write(REGIONS, text)
+    write(LICENCES, licences_text())
     log(f"wrote catalog/regions.json: {len(text.encode('utf-8'))} bytes in {time.time() - started:.0f}s")
     return 0
 
@@ -735,8 +760,8 @@ def main():
     up = sub.add_parser("update", help="fetch an upstream, pin it and regenerate")
     up.add_argument("source", choices=["geofabrik", "openaddresses", "overture", "all"])
     up.set_defaults(run=cmd_update)
-    sub.add_parser("generate", help="build regions.json from the pinned snapshots").set_defaults(run=cmd_generate)
-    sub.add_parser("check", help="fail if regions.json or a snapshot drifted").set_defaults(run=cmd_check)
+    sub.add_parser("generate", help="build regions.json and licences.json from the pinned snapshots").set_defaults(run=cmd_generate)
+    sub.add_parser("check", help="fail if regions.json, licences.json or a snapshot drifted").set_defaults(run=cmd_check)
     a = p.parse_args()
     sys.exit(a.run(a))
 

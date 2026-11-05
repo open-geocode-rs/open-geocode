@@ -29,19 +29,22 @@
         "label": "King Street, Toronto, Ontario, Canada",
         "layer": "street",
         "name": "King Street",
-        "record_id": 5,
         "road_class": "residential",
         "source": {
-          "dataset": "osm",
-          "object_id": 12,
-          "object_type": "way"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
     }
   ],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
     "point": {
       "lat": 43.0,
       "lon": -79.0

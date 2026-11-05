@@ -15,7 +15,9 @@
 //!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
 //!                  u64, disputed u64, each when its flag is set | the start (u16
 //!                  or u32) of each body that is not continued | bodies
-//! records/datasets count varint, then each imported dataset's name
+//! records/datasets count varint, then each imported dataset's name and a
+//!                  presence byte, then its licence: name, URL and whom it
+//!                  credits, the last two each behind a presence byte
 //! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
 //!
@@ -88,6 +90,7 @@ use crate::{
     api::Address,
     container::{self, Bytes, Container},
     extsort::{Scratch, ScratchFile},
+    licences::Licence,
     memory::{Budget, Reservation},
     pack::RecordId,
     parse::lattice::CountryCode,
@@ -99,8 +102,8 @@ use crate::{
     },
     util::{
         codec::{
-            get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
-            unzigzag, zigzag,
+            get_i64, get_opt_string, get_str, get_u8, get_u32, get_u64, put_i64, put_opt_str,
+            put_str, put_u64, read_u64_le, unzigzag, zigzag,
         },
         geo::{line_geometry, line_parts},
     },
@@ -998,6 +1001,15 @@ impl Writer {
         put_u64(&mut datasets, self.datasets.len() as u64);
         for dataset in &self.datasets {
             put_str(&mut datasets, dataset);
+            match crate::licences::of(dataset) {
+                Some(licence) => {
+                    datasets.push(1);
+                    put_str(&mut datasets, &licence.name);
+                    put_opt_str(&mut datasets, licence.url.as_deref());
+                    put_opt_str(&mut datasets, licence.attribution.as_deref());
+                }
+                None => datasets.push(0),
+            }
         }
         pack.add(SECTION_DATASETS, RECORDS_VERSION, &datasets)?;
 
@@ -1028,6 +1040,8 @@ pub struct Reader {
     text_start: usize,
     /// Names of the imported datasets, by the index records store.
     datasets: Arc<Vec<String>>,
+    /// Each imported dataset's licence, when its source states one.
+    licences: Arc<Vec<Option<Licence>>>,
 }
 
 impl Reader {
@@ -1042,10 +1056,22 @@ impl Reader {
             if count > input.len() as u64 {
                 return Err(Error::Decode("dataset table is truncated"));
             }
-            (0..count)
-                .map(|_| get_str(&mut input).map(str::to_string))
-                .collect::<Result<Vec<_>>>()?
+            let mut datasets = Vec::new();
+            for _ in 0..count {
+                let name = get_str(&mut input)?.to_string();
+                let licence = match get_u8(&mut input)? {
+                    0 => None,
+                    _ => Some(Licence {
+                        name: get_str(&mut input)?.to_string(),
+                        url: get_opt_string(&mut input)?,
+                        attribution: get_opt_string(&mut input)?,
+                    }),
+                };
+                datasets.push((name, licence));
+            }
+            datasets
         };
+        let (datasets, licences): (Vec<_>, Vec<_>) = datasets.into_iter().unzip();
 
         let record_count =
             read_u64_le(&index, 0).ok_or(Error::Decode("records index is truncated"))?;
@@ -1107,6 +1133,7 @@ impl Reader {
             ends_start,
             text_start,
             datasets: Arc::new(datasets),
+            licences: Arc::new(licences),
         })
     }
 
@@ -1200,6 +1227,16 @@ impl Reader {
 
     /// Id, name, label, address, layer, point and source without decoding
     /// geometry.
+    /// The licence of the dataset records name `dataset`: OpenStreetMap's, or
+    /// an imported dataset's when its source states one.
+    pub fn licence(&self, dataset: &str) -> Option<Licence> {
+        if dataset == OSM_DATASET {
+            return Some(crate::licences::osm());
+        }
+        let index = self.datasets.iter().position(|known| known == dataset)?;
+        self.licences.get(index).cloned().flatten()
+    }
+
     pub fn summary(&self, id: RecordId) -> Result<Summary> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);

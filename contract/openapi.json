@@ -51,11 +51,26 @@
         "type": "object"
       },
       "Attribution": {
-        "description": "Attribution required by the data licence.",
-        "enum": [
-          "© OpenStreetMap contributors, ODbL"
+        "description": "A data set an answer comes from and how its licence asks it to be\ncredited. OpenStreetMap is always first: every answer's areas and labels\ncome from it.",
+        "properties": {
+          "licence": {
+            "description": "The licence's name, such as `ODbL 1.0` or `CC BY 4.0`. Absent when\nthe data set's source states none.",
+            "type": "string"
+          },
+          "text": {
+            "description": "Whom to credit, such as `© OpenStreetMap contributors`, or the data\nset's name when its licence asks for no credit or is not known.",
+            "example": "© OpenStreetMap contributors",
+            "type": "string"
+          },
+          "url": {
+            "description": "The licence's terms.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
         ],
-        "type": "string"
+        "type": "object"
       },
       "BatchSummary": {
         "description": "How a batch went.",
@@ -101,7 +116,7 @@
             "description": "Administrative areas containing the result."
           },
           "id": {
-            "description": "Stable ID from the source data, such as `osm:node:123`.",
+            "description": "Stable ID from the source data, such as `osm:node:123`. Store it to\nfind the record again: it outlives a Pack rebuild.",
             "type": "string"
           },
           "label": {
@@ -115,10 +130,6 @@
             "description": "House number and street for an address (`12 King Street West`), or\nthe name of a street, area or POI.",
             "type": "string"
           },
-          "record_id": {
-            "$ref": "#/components/schemas/u64",
-            "description": "Row of the record in this Pack. Changes between Pack builds."
-          },
           "road_class": {
             "$ref": "#/components/schemas/RoadClass",
             "description": "The class of road a street is, the most important of its ways, such\nas `motorway` or `residential`. Present only on streets."
@@ -129,7 +140,6 @@
         },
         "required": [
           "id",
-          "record_id",
           "layer",
           "accuracy",
           "name",
@@ -249,7 +259,7 @@
           },
           "geocoding": {
             "$ref": "#/components/schemas/ForwardGeocoding",
-            "description": "The query, API version and data attribution."
+            "description": "The query, API version and the credits of the data sets the answer\ncomes from."
           },
           "type": {
             "$ref": "#/components/schemas/FeatureCollectionType"
@@ -285,7 +295,10 @@
       "ForwardGeocoding": {
         "properties": {
           "attribution": {
-            "$ref": "#/components/schemas/Attribution"
+            "items": {
+              "$ref": "#/components/schemas/Attribution"
+            },
+            "type": "array"
           },
           "query": {
             "description": "Query as received, trimmed, with each run of whitespace collapsed to\none space.",
@@ -577,16 +590,6 @@
         ],
         "type": "object"
       },
-      "ObjectType": {
-        "description": "Source object type: an OSM `node`, `way` or `relation`, or a `row` of an\naddress dataset such as OpenAddresses.",
-        "enum": [
-          "node",
-          "way",
-          "relation",
-          "row"
-        ],
-        "type": "string"
-      },
       "PackInfo": {
         "description": "Which Pack is served, and how it was built.",
         "properties": {
@@ -730,7 +733,7 @@
           },
           "geocoding": {
             "$ref": "#/components/schemas/ReverseGeocoding",
-            "description": "The queried point, API version and data attribution."
+            "description": "The queried point, API version and the credits of the data sets the\nanswer comes from."
           },
           "type": {
             "$ref": "#/components/schemas/FeatureCollectionType"
@@ -766,7 +769,10 @@
       "ReverseGeocoding": {
         "properties": {
           "attribution": {
-            "$ref": "#/components/schemas/Attribution"
+            "items": {
+              "$ref": "#/components/schemas/Attribution"
+            },
+            "type": "array"
           },
           "point": {
             "$ref": "#/components/schemas/LonLat",
@@ -882,25 +888,12 @@
         "type": "string"
       },
       "Source": {
-        "description": "Source data the result comes from.",
+        "description": "The data set a result comes from.",
         "properties": {
           "dataset": {
+            "description": "`osm`, or an imported data set such as `openaddresses:nz/countrywide`.",
+            "example": "osm",
             "type": "string"
-          },
-          "derived_from": {
-            "type": "string"
-          },
-          "object_id": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "object_type": {
-            "$ref": "#/components/schemas/ObjectType"
-          },
-          "record_count": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
           }
         },
         "required": [
@@ -932,11 +925,6 @@
           "pack"
         ],
         "type": "object"
-      },
-      "u64": {
-        "format": "int64",
-        "minimum": 0,
-        "type": "integer"
       }
     }
   },

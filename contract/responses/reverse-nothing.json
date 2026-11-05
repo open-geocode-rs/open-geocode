@@ -1,7 +1,13 @@
 {
   "features": [],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
     "point": {
       "lat": 10.0,
       "lon": 10.0

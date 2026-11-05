@@ -35,19 +35,22 @@
         "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
         "layer": "poi",
         "name": "Queen Bakery",
-        "record_id": 4,
         "score": 21.96003,
         "source": {
-          "dataset": "osm",
-          "object_id": 11,
-          "object_type": "way"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
     }
   ],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
     "query": "Queen Bakery",
     "version": "1"
   },
