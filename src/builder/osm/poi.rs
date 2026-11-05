@@ -217,6 +217,135 @@ pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out:
     }
 }
 
+/// How near a POI must lie to the leader of a place of its name and kind to
+/// be that place: a cafe mapped as two points, or as a point and its
+/// building, lies within a building of itself.
+const SAME_PLACE_M: f64 = 50.0;
+/// How far apart objects linked to one Wikidata item may lie and still be
+/// one place: the parts of a campus or a park, not two branches of a chain,
+/// which link the chain's item as `brand:wikidata`, not `wikidata`.
+const SAME_ITEM_M: f64 = 2_000.0;
+/// Degrees of latitude a cell of the leaders' grid spans: [`SAME_PLACE_M`],
+/// so a leader within it of a point lies in its cell or one beside.
+const CELL_DEGREES: f64 = SAME_PLACE_M / 111_320.0;
+
+/// The POIs of one name that are one place, merged: the standard steps of
+/// entity resolution, with the name as the block. Two of them are one place
+/// when they link the same Wikidata item, or when they are of the same kind
+/// and lie within [`SAME_PLACE_M`]; a hotel and its restaurant, of two
+/// kinds, stay two. Each joins the leader of its place, the most important
+/// member, never another member, so a run of near ones cannot chain one
+/// place out along a street (center clustering). The leader takes what it
+/// lacks from the others (an address, a Wikidata item, a brand, other
+/// names) and their ids as aliases.
+pub(crate) fn resolve(mut places: Vec<PoiRecord>) -> Vec<PoiRecord> {
+    if places.len() < 2 {
+        return places;
+    }
+    let drawn = |place: &PoiRecord| match place.source.object_type {
+        ObjectType::Relation => 2,
+        ObjectType::Way => 1,
+        ObjectType::Node | ObjectType::Row => 0,
+    };
+    places.sort_by(|left, right| {
+        right
+            .prominence
+            .cmp(&left.prominence)
+            .then(drawn(right).cmp(&drawn(left)))
+            .then(left.source.object_type.cmp(&right.source.object_type))
+            .then(left.source.object_id.cmp(&right.source.object_id))
+    });
+    let mut leaders: Vec<PoiRecord> = Vec::new();
+    let mut cells = HashMap::<(i64, i64), Vec<usize>>::new();
+    let mut items = HashMap::<u32, usize>::new();
+    for place in places {
+        let Some(point) = point_of(&place) else {
+            leaders.push(place);
+            continue;
+        };
+        let near = |leader: &PoiRecord, within: f64| {
+            point_of(leader).is_some_and(|at| {
+                crate::spatial_index::haversine_m(point[0], point[1], at[0], at[1]) <= within
+            })
+        };
+        let by_item = place
+            .wikidata
+            .and_then(|item| items.get(&item).copied())
+            .filter(|&leader| near(&leaders[leader], SAME_ITEM_M));
+        let by_kind = || {
+            let (row, column) = cell(point);
+            (row - 1..=row + 1)
+                .flat_map(|row| (column - 1..=column + 1).map(move |column| (row, column)))
+                .filter_map(|at| cells.get(&at))
+                .flatten()
+                .copied()
+                .filter(|&leader| {
+                    let leader = &leaders[leader];
+                    leader.category == place.category
+                        && !(leader.wikidata.is_some()
+                            && place.wikidata.is_some()
+                            && leader.wikidata != place.wikidata)
+                        && near(leader, SAME_PLACE_M)
+                })
+                .min()
+        };
+        match by_item.or_else(by_kind) {
+            Some(leader) => merge(&mut leaders[leader], place),
+            None => {
+                let index = leaders.len();
+                cells.entry(cell(point)).or_default().push(index);
+                if let Some(item) = place.wikidata {
+                    items.entry(item).or_insert(index);
+                }
+                leaders.push(place);
+            }
+        }
+    }
+    leaders
+}
+
+fn point_of(place: &PoiRecord) -> Option<[f64; 2]> {
+    crate::util::geo::point_lon_lat(&place.geometry)
+}
+
+/// The cell of the leaders' grid `point` lies in: a row of latitude, and a
+/// column of longitude as wide on the ground at that latitude.
+fn cell([lon, lat]: [f64; 2]) -> (i64, i64) {
+    let width = CELL_DEGREES / lat.to_radians().cos().max(0.01);
+    (
+        (lat / CELL_DEGREES).floor() as i64,
+        (lon / width).floor() as i64,
+    )
+}
+
+/// `member`, the same place as `leader`, merged into it.
+fn merge(leader: &mut PoiRecord, member: PoiRecord) {
+    if member.source.object_type != ObjectType::Row {
+        leader
+            .aliases
+            .push((member.source.object_type, member.source.object_id));
+    }
+    leader.aliases.extend(member.aliases);
+    if leader.address.is_none() {
+        leader.address = member.address;
+    }
+    if leader.wikidata.is_none() {
+        leader.wikidata = member.wikidata;
+    }
+    if leader.brand.is_none() {
+        leader.brand = member.brand;
+    }
+    leader.prominence = leader.prominence.max(member.prominence);
+    for name in std::iter::once(member.name).chain(member.alt_names) {
+        let known = std::iter::once(&leader.name)
+            .chain(&leader.alt_names)
+            .any(|known| known.to_lowercase() == name.to_lowercase());
+        if !known {
+            leader.alt_names.push(name);
+        }
+    }
+}
+
 /// The chain `brand=` and `brand:wikidata=` name.
 fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
     Some(Brand {
@@ -286,6 +415,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         prominence: prominence(tags),
         wikidata: item(tags, "wikidata"),
         brand: brand(tags),
+        aliases: Vec::new(),
     };
     out.report.accept_poi(&record);
     out.records.push(Record::Poi(record));
@@ -336,6 +466,70 @@ mod tests {
             &mut out,
         );
         out
+    }
+
+    #[test]
+    fn places_of_one_name_merge_when_they_are_one_place_and_never_chain() {
+        let place = |id: i64, category: &str, lon: f64, wikidata: Option<u32>| PoiRecord {
+            alt_names: Vec::new(),
+            name: "De Pindol".to_string(),
+            category: category.to_string(),
+            address: None,
+            geometry: point_geometry(lon, 51.4),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, id),
+            prominence: Default::default(),
+            wikidata,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        // 0.0001 degrees of longitude is some 7 m here.
+        let metres = |m: f64| 5.0 + m / 70_000.0;
+        let ids = |resolved: Vec<PoiRecord>| {
+            let mut ids = resolved
+                .into_iter()
+                .map(|place| (place.source.object_id, place.aliases))
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+
+        // Two points of one cafe 3 m apart are one place.
+        assert_eq!(
+            ids(resolve(vec![
+                place(1, "amenity:cafe", metres(0.0), None),
+                place(2, "amenity:cafe", metres(3.0), None),
+            ])),
+            [(1, vec![(ObjectType::Node, 2)])]
+        );
+        // A hotel and its restaurant, of two kinds, stay two.
+        assert_eq!(
+            resolve(vec![
+                place(1, "tourism:hotel", metres(0.0), None),
+                place(2, "amenity:restaurant", metres(4.0), None),
+            ])
+            .len(),
+            2
+        );
+        // One Wikidata item is one place, of any kind, a campus apart.
+        assert_eq!(
+            resolve(vec![
+                place(1, "amenity:university", metres(0.0), Some(7)),
+                place(2, "building:university", metres(900.0), Some(7)),
+            ])
+            .len(),
+            1
+        );
+        // Three in a row 40 m apart: the third is 80 m from the leader the
+        // second joined, and stays a place of its own.
+        assert_eq!(
+            ids(resolve(vec![
+                place(1, "amenity:cafe", metres(0.0), None),
+                place(2, "amenity:cafe", metres(40.0), None),
+                place(3, "amenity:cafe", metres(80.0), None),
+            ])),
+            [(1, vec![(ObjectType::Node, 2)]), (3, Vec::new())]
+        );
     }
 
     #[test]

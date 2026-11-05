@@ -1835,6 +1835,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            aliases: Vec::new(),
         });
         assert_eq!(
             named(&RecordNames::of(&poi)),

@@ -268,6 +268,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    aliases: Vec::new(),
                 }
                 .into(),
                 1 => Record::Place(

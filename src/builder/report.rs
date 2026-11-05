@@ -552,6 +552,10 @@ pub struct AcceptedCounts {
     pub pois_with_address: u64,
     /// POIs by the key of their category, for example `amenity`.
     pub poi_categories: BTreeMap<String, u64>,
+    /// POIs merged into another that is the same place (see
+    /// `poi::resolve`).
+    #[serde(default)]
+    pub places_merged: u64,
     /// Named objects with a key places are tagged by that are no place,
     /// by that tag (`amenity=bench`): what the counted presets leave out.
     #[serde(default)]

@@ -36,7 +36,8 @@
 //!                     then its street's postcodes; a POI's prominence follows
 //!                     its names as one byte, its importance as one byte
 //!                     and its Wikidata item as a varint (0 = none), its
-//!                     brand's string id + 1 (0 = none) and the brand's
+//!                     aliases (a varint count, then each OSM object's
+//!                     number << 2 | kind), its brand's string id + 1 (0 = none) and the brand's
 //!                     Wikidata item, then its address after a presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      lines only: varint part count, then per part a varint
@@ -783,6 +784,7 @@ impl Writer {
                 out.push(record.prominence.to_byte());
                 out.push(record.prominence.importance);
                 put_u64(out, record.wikidata.map_or(0, u64::from));
+                put_aliases(out, &record.aliases)?;
                 match &record.brand {
                     Some(brand) => {
                         put_u64(out, u64::from(self.strings.id(&brand.name)?) + 1);
@@ -1194,6 +1196,7 @@ impl Reader {
                     prominence: poi.prominence,
                     wikidata: poi.wikidata,
                     brand: poi.brand,
+                    aliases: poi.aliases,
                 })
             }
             Layer::Interpolation => {
@@ -1581,8 +1584,10 @@ impl Reader {
     }
 
     /// The places of block `block` (POIs and areas drawn from OpenStreetMap,
-    /// which the id catalogue holds), each with the OSM object it is.
-    /// Reads plain headers alone: a continued record is an address.
+    /// which the id catalogue holds), each with the OSM object it is, and a
+    /// POI once more for each object merged into it (see
+    /// [`PoiRecord::aliases`]). Reads plain headers, and a POI's fields up to
+    /// its aliases: a continued record is an address.
     pub fn block_places(&self, block: u64) -> Result<Vec<(RecordId, ObjectType, i64)>> {
         let found = self.block(block)?;
         let strings = self.segment(found.first);
@@ -1591,13 +1596,31 @@ impl Reader {
             if found.is_continued(slot) {
                 continue;
             }
-            let (header, _) = plain_header(found.base, strings, found.plain_body(slot)?)?;
+            let (header, mut fields) = plain_header(found.base, strings, found.plain_body(slot)?)?;
             let place = header.layer == Layer::Poi || header.layer.place_layer().is_some();
             if !place || header.dataset.is_some() || header.source_kind == SourceKind::Other {
                 continue;
             }
+            let record_id = found.first + slot as u64;
             let (object_type, object_id) = header.object()?;
-            places.push((found.first + slot as u64, object_type, object_id));
+            places.push((record_id, object_type, object_id));
+            if header.layer == Layer::Poi {
+                // Name and category ids, alternate names, prominence and
+                // importance, Wikidata item: then the aliases.
+                get_u32(&mut fields)?;
+                get_u32(&mut fields)?;
+                for _ in 0..get_u64(&mut fields)? {
+                    get_u32(&mut fields)?;
+                }
+                get_u8(&mut fields)?;
+                get_u8(&mut fields)?;
+                item_field(&mut fields)?;
+                places.extend(
+                    aliases_field(&mut fields)?
+                        .into_iter()
+                        .map(|(kind, id)| (record_id, kind, id)),
+                );
+            }
         }
         Ok(places)
     }
@@ -1869,6 +1892,7 @@ impl Reader {
         let alt_names = self.string_list(strings, fields)?;
         let prominence = Prominence::from_byte(get_u8(fields)?, get_u8(fields)?);
         let wikidata = item_field(fields)?;
+        let aliases = aliases_field(fields)?;
         let brand = match get_u64(fields)? {
             0 => None,
             id => Some(Brand {
@@ -1892,6 +1916,7 @@ impl Reader {
             alt_names,
             prominence,
             wikidata,
+            aliases,
             brand,
             address,
         })
@@ -2011,6 +2036,7 @@ struct PoiFields<'a> {
     alt_names: Vec<String>,
     prominence: Prominence,
     wikidata: Option<u32>,
+    aliases: Vec<(ObjectType, i64)>,
     brand: Option<Brand>,
     address: Option<AddressComponents>,
 }
@@ -2175,6 +2201,52 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
 }
 
 /// A postcode record's country, 0 when unknown.
+/// Bits of an alias that name its kind of OSM object.
+const ALIAS_KIND_BITS: u32 = 2;
+
+/// A POI's aliases: a varint count, then each OSM object as a varint of
+/// its number shifted past [`ALIAS_KIND_BITS`] bits of its kind.
+pub(crate) fn put_aliases(out: &mut Vec<u8>, aliases: &[(ObjectType, i64)]) -> Result<()> {
+    put_u64(out, aliases.len() as u64);
+    for (object_type, object_id) in aliases {
+        let kind = match object_type {
+            ObjectType::Node => 0,
+            ObjectType::Way => 1,
+            ObjectType::Relation => 2,
+            ObjectType::Row => {
+                return Err(Error::Inconsistent("an imported row is no alias".into()));
+            }
+        };
+        let number = u64::try_from(*object_id)
+            .ok()
+            .filter(|number| number >> (u64::BITS - ALIAS_KIND_BITS) == 0)
+            .ok_or_else(|| Error::Inconsistent(format!("alias {object_id} is out of range")))?;
+        put_u64(out, number << ALIAS_KIND_BITS | kind);
+    }
+    Ok(())
+}
+
+pub(crate) fn aliases_field(fields: &mut &[u8]) -> Result<Vec<(ObjectType, i64)>> {
+    let count = get_u64(fields)?;
+    if count > fields.len() as u64 {
+        return Err(Error::Decode("alias list is truncated"));
+    }
+    (0..count)
+        .map(|_| {
+            let value = get_u64(fields)?;
+            let object_type = match value & ((1 << ALIAS_KIND_BITS) - 1) {
+                0 => ObjectType::Node,
+                1 => ObjectType::Way,
+                2 => ObjectType::Relation,
+                _ => return Err(Error::Decode("an alias names no kind of object")),
+            };
+            let number = i64::try_from(value >> ALIAS_KIND_BITS)
+                .map_err(|_| Error::Decode("alias is out of range"))?;
+            Ok((object_type, number))
+        })
+        .collect()
+}
+
 /// A Wikidata item number written as a varint, 0 for none.
 fn item_field(fields: &mut &[u8]) -> Result<Option<u32>> {
     match get_u64(fields)? {
@@ -2454,6 +2526,7 @@ mod tests {
                 },
                 wikidata: None,
                 brand: None,
+                aliases: Vec::new(),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -2466,6 +2539,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                aliases: Vec::new(),
             }),
         ];
         for layer in [

@@ -204,6 +204,9 @@ pub struct PoiRecord {
     /// The chain it belongs to, apart from its name: "Tankstation Zanoli"
     /// is an Esso.
     pub brand: Option<Brand>,
+    /// The other OSM objects that are this same place, merged into it (a
+    /// cafe mapped as two points): their ids still find it.
+    pub aliases: Vec<(ObjectType, i64)>,
 }
 
 /// A chain: its name and the number of its `brand:wikidata` item. The item
@@ -977,7 +980,7 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 12)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 13)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -1003,6 +1006,16 @@ impl Serialize for PoiRecord {
         match &self.brand {
             Some(brand) => state.serialize_field("brand", brand)?,
             None => state.skip_field("brand")?,
+        }
+        if self.aliases.is_empty() {
+            state.skip_field("aliases")?;
+        } else {
+            let aliases = self
+                .aliases
+                .iter()
+                .map(|(object_type, object_id)| labels::osm_record_id(*object_type, *object_id))
+                .collect::<Vec<_>>();
+            state.serialize_field("aliases", &aliases)?;
         }
         state.end()
     }

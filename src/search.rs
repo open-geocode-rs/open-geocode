@@ -9747,6 +9747,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            aliases: Vec::new(),
         };
         writer
             .write(
@@ -9841,6 +9842,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            aliases: Vec::new(),
         };
         for record in [
             poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
@@ -9906,6 +9908,7 @@ mod tests {
             prominence,
             wikidata: None,
             brand: None,
+            aliases: Vec::new(),
         };
         for record in [
             cafe(1, Prominence::default()),
@@ -11207,6 +11210,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    aliases: Vec::new(),
                 }
                 .into(),
                 None,

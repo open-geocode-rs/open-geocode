@@ -139,7 +139,7 @@ use pbf::for_each_block;
 pub use pbf::replication_timestamp;
 use scan::scan_block;
 use spill::{
-    Body, Datasets, House, PendingAddress, PendingRecord, PendingStreet, PlacedAddress, Postcodes,
+    Body, Datasets, House, PendingAddress, PendingNamed, PendingRecord, PlacedAddress, Postcodes,
     WayKind,
 };
 
@@ -626,6 +626,7 @@ impl<'a> Run<'a> {
             records: Some(ExternalSorter::new(&scratch, "records", &memory, budget)),
             addresses: Some(ExternalSorter::new(&scratch, "addresses", &memory, budget)),
             streets: Some(ExternalSorter::new(&scratch, "streets", &memory, budget)),
+            places: Some(ExternalSorter::new(&scratch, "places", &memory, budget)),
             context_records: Some(ExternalSorter::new(
                 &scratch,
                 "context-records",
@@ -730,6 +731,7 @@ impl<'a> Run<'a> {
             records: sorter_of(sorters, "records", &scratch, &memory, budget)?,
             addresses: sorter_of(sorters, "addresses", &scratch, &memory, budget)?,
             streets: sorter_of(sorters, "streets", &scratch, &memory, budget)?,
+            places: sorter_of(sorters, "places", &scratch, &memory, budget)?,
             context_records: sorter_of(
                 sorters,
                 "context-records",
@@ -860,7 +862,10 @@ impl<'a> Run<'a> {
             Step::Boundaries => self.boundaries(),
             Step::ImportAddresses => self.import_addresses(),
             Step::Contexts => self.order_contexts(),
-            Step::Streets => self.join_streets(),
+            Step::Streets => {
+                self.join_streets()?;
+                self.resolve_places()
+            }
             Step::AddressBook => self.write_address_book(),
             Step::Houses => self.find_repeated_houses(),
             Step::Addresses => self.place_addresses(),
@@ -1457,6 +1462,23 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
+    /// The POIs that are one place merged, into the records.
+    fn resolve_places(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let places = self
+            .build
+            .places
+            .take()
+            .ok_or_else(|| missing("the places"))?;
+        self.sorted
+            .insert("places".to_string(), sorter_report(&places));
+        let records = open(&mut self.build.records, "records")?;
+        let merged = resolve_places(places, records, &mut self.build.seq)?;
+        self.build.report.accepted.places_merged = merged;
+        self.build.report.phases.street_join_ms += phase.elapsed().as_millis();
+        Ok(())
+    }
+
     /// Whether imported rows are matched against the addresses the Pack
     /// already has before they are placed.
     fn imported(&self) -> bool {
@@ -1730,6 +1752,7 @@ impl<'a> Run<'a> {
         save_sorter(&mut self.build.records, &mut sorters)?;
         save_sorter(&mut self.build.addresses, &mut sorters)?;
         save_sorter(&mut self.build.streets, &mut sorters)?;
+        save_sorter(&mut self.build.places, &mut sorters)?;
         save_sorter(&mut self.build.context_records, &mut sorters)?;
         save_sorter(&mut self.verdicts, &mut sorters)?;
         for sorter in &sorters {
@@ -2030,7 +2053,10 @@ struct Build {
     addresses: Option<ExternalSorter<PendingAddress>>,
     /// The ways of streets, until every one is known and the ways of one
     /// street can join (see [`join_streets`]).
-    streets: Option<ExternalSorter<PendingStreet>>,
+    streets: Option<ExternalSorter<PendingNamed>>,
+    /// The POIs, until every one is known and those that are one place can
+    /// be merged (see [`resolve_places`]).
+    places: Option<ExternalSorter<PendingNamed>>,
     /// Places: everything a context tuple can point at.
     context_records: Option<ExternalSorter<PendingRecord>>,
     /// The datasets of the imported addresses.
@@ -2088,7 +2114,11 @@ impl Build {
         if let Record::Street(street) = record {
             self.seq += 1;
             return open(&mut self.streets, "streets")?
-                .push(PendingStreet::new(street, self.seq - 1)?);
+                .push(PendingNamed::new(street, self.seq - 1)?);
+        }
+        if let Record::Poi(poi) = record {
+            self.seq += 1;
+            return open(&mut self.places, "places")?.push(PendingNamed::place(poi, self.seq - 1)?);
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
@@ -2345,8 +2375,49 @@ fn read_chunks<T: book::Entry + Send + Sync>(
 /// city and joins across the wards; else the locality. One name is many
 /// streets across a country, and a road crossing a town line is a street in
 /// each town. `area_names` are the names of each area, its own first.
+/// The POIs of `places`, one name at a time, the ones that are one place
+/// merged (see [`poi::resolve`]), pushed to `records`. Returns how many were
+/// merged into another.
+fn resolve_places(
+    places: ExternalSorter<PendingNamed>,
+    records: &mut ExternalSorter<PendingRecord>,
+    seq: &mut u64,
+) -> Result<u64> {
+    let mut merged = 0;
+    let mut flush = |group: &mut Vec<crate::record::PoiRecord>| -> Result<()> {
+        let count = group.len();
+        let resolved = poi::resolve(std::mem::take(group));
+        merged += (count - resolved.len()) as u64;
+        for place in resolved {
+            let [lon, lat] = Record::Poi(place.clone())
+                .display_point()
+                .ok_or_else(|| Error::BadGeometry(format!("place {} has no point", place.id())))?;
+            records.push(PendingRecord {
+                key: hilbert_key(quantize(lon)?, quantize(lat)?),
+                seq: *seq,
+                origin: None,
+                body: Record::Poi(place).into(),
+            })?;
+            *seq += 1;
+        }
+        Ok(())
+    };
+    let mut group = Vec::new();
+    let mut name = None::<Vec<u8>>;
+    for pending in places.finish()? {
+        let pending = pending?;
+        if name.as_deref() != Some(pending.name_key()) {
+            flush(&mut group)?;
+            name = Some(pending.name_key().to_vec());
+        }
+        group.push(pending.into_place());
+    }
+    flush(&mut group)?;
+    Ok(merged)
+}
+
 fn join_streets(
-    streets: ExternalSorter<PendingStreet>,
+    streets: ExternalSorter<PendingNamed>,
     index: &BoundaryIndex,
     settled: &HashSet<RecordId>,
     area_names: &HashMap<RecordId, Vec<String>>,
@@ -2406,7 +2477,7 @@ fn join_streets(
     let mut name = None::<Vec<u8>>;
     overlapped(
         |emit| streets.finish()?.try_for_each(|pending| emit(pending?)),
-        |pending: PendingStreet| {
+        |pending: PendingNamed| {
             if name.as_deref() != Some(pending.name_key()) {
                 if ways >= WRITE_BATCH_RECORDS {
                     flush(&mut runs)?;
@@ -4168,6 +4239,55 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn one_cafe_mapped_twice_is_one_place_found_by_either_id() {
+        let dir = temp_dir("one-place");
+        let input = dir.join("cafes.osm.pbf");
+        let cafe = |id: i64, lon: f64, tags: &[(&'static str, &'static str)]| {
+            let mut all = vec![("name", "Cafetaria De Pindol"), ("amenity", "cafe")];
+            all.extend_from_slice(tags);
+            node(id, 51.41, lon, &all)
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    cafe(1, 5.40000, &[]),
+                    cafe(
+                        2,
+                        5.40004,
+                        &[("addr:housenumber", "82"), ("addr:street", "Dorpstraat")],
+                    ),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.places_merged, 1);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts.get("poi"), Some(&1));
+        let catalogue = crate::ids::Catalogue::open(reader.container())
+            .expect("open")
+            .expect("a catalogue");
+        let first = catalogue
+            .find(reader.records(), ObjectType::Node, 1)
+            .expect("find");
+        let second = catalogue
+            .find(reader.records(), ObjectType::Node, 2)
+            .expect("find");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first, second, "the merged-away id finds the place");
+        let Record::Poi(cafe) = reader.records().record(first[0]).expect("record") else {
+            panic!("a place");
+        };
+        assert_eq!(
+            cafe.address.expect("the address one copy stated").number,
+            "82"
+        );
     }
 
     #[test]

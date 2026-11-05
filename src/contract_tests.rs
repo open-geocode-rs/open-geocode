@@ -820,6 +820,7 @@ fn write_pack(dir: &PathBuf) {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                aliases: Vec::new(),
             }
             .into(),
             context.clone(),

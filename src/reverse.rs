@@ -746,6 +746,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    aliases: Vec::new(),
                 }
                 .into(),
                 None,
@@ -764,6 +765,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    aliases: Vec::new(),
                 }
                 .into(),
                 None,
@@ -814,6 +816,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    aliases: Vec::new(),
                 }
                 .into(),
                 None,

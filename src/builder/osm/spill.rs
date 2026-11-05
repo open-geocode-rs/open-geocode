@@ -710,11 +710,11 @@ fn decode_compact_point(input: &mut &[u8]) -> Result<[f64; 2]> {
     Ok(point)
 }
 
-/// A way of a street waiting for the other ways of its name: sorted by the
-/// name as search spells it, then along the Hilbert curve, so every way of
-/// one name comes out together, the near ones close.
+/// A way of a street, or a POI, waiting for the others of its name: sorted
+/// by the name as search spells it, then along the Hilbert curve, so every
+/// one of a name comes out together, the near ones close.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingStreet {
+pub(crate) struct PendingNamed {
     /// The name key, then the Hilbert key of its representative point.
     pub order: Vec<u8>,
     /// Length of the start of `order` its name takes.
@@ -723,7 +723,7 @@ pub(crate) struct PendingStreet {
     pub record: Record,
 }
 
-impl PendingStreet {
+impl PendingNamed {
     pub(super) fn new(mut record: StreetRecord, seq: u64) -> Result<Self> {
         as_spilled(&mut record.geometry);
         let mut order = Vec::new();
@@ -746,6 +746,38 @@ impl PendingStreet {
         })
     }
 
+    /// A POI waiting for the others of its name.
+    pub(super) fn place(mut record: PoiRecord, seq: u64) -> Result<Self> {
+        as_spilled(&mut record.geometry);
+        let mut order = Vec::new();
+        put_order_text(
+            &mut order,
+            crate::util::fold::search_key(&record.name).as_deref(),
+        );
+        let name_len = order.len();
+        let [lon, lat] = Record::Poi(record.clone())
+            .display_point()
+            .ok_or_else(|| Error::BadGeometry(format!("place {} has no point", record.id())))?;
+        let key = crate::util::hilbert::hilbert_key(
+            crate::records::quantize(lon)?,
+            crate::records::quantize(lat)?,
+        );
+        order.extend_from_slice(&key.to_be_bytes());
+        Ok(Self {
+            order,
+            name_len,
+            seq,
+            record: Record::Poi(record),
+        })
+    }
+
+    pub(super) fn into_place(self) -> PoiRecord {
+        match self.record {
+            Record::Poi(record) => record,
+            _ => unreachable!("a pending place holds a POI"),
+        }
+    }
+
     /// Its name as search spells it, as the sort key holds it.
     pub(super) fn name_key(&self) -> &[u8] {
         &self.order[..self.name_len]
@@ -759,21 +791,21 @@ impl PendingStreet {
     }
 }
 
-impl Eq for PendingStreet {}
+impl Eq for PendingNamed {}
 
-impl PartialOrd for PendingStreet {
+impl PartialOrd for PendingNamed {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PendingStreet {
+impl Ord for PendingNamed {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (&self.order, self.seq).cmp(&(&other.order, other.seq))
     }
 }
 
-impl PendingStreet {
+impl PendingNamed {
     fn encode_rest(&self, out: &mut Vec<u8>) {
         put_u64(out, self.name_len as u64);
         put_u64(out, self.seq);
@@ -794,7 +826,7 @@ impl PendingStreet {
     }
 }
 
-impl Spill for PendingStreet {
+impl Spill for PendingNamed {
     fn encode(&self, out: &mut Vec<u8>) {
         put_bytes(out, &self.order);
         self.encode_rest(out);
@@ -1098,6 +1130,8 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             out.push(record.prominence.to_byte());
             out.push(record.prominence.importance);
             put_u64(out, record.wikidata.map_or(0, u64::from));
+            crate::records::put_aliases(out, &record.aliases)
+                .expect("an alias is an OSM object the builder merged");
             put_opt_str(out, record.brand.as_ref().map(|brand| brand.name.as_str()));
             put_u64(
                 out,
@@ -1187,6 +1221,7 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
             location_precision: decode_precision(input)?,
             prominence: Prominence::from_byte(get_u8(input)?, get_u8(input)?),
             wikidata: spilled_item(input)?,
+            aliases: crate::records::aliases_field(input)?,
             brand: {
                 let name = get_opt_string(input)?;
                 let wikidata = spilled_item(input)?;
@@ -1607,6 +1642,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                aliases: Vec::new(),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -1619,6 +1655,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                aliases: Vec::new(),
             }),
         ];
         for (seq, record) in records.into_iter().enumerate() {
