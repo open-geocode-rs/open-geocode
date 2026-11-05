@@ -1,9 +1,6 @@
-# Build context excludes for the benchmark-arena Docker image.
-# Keep the context small: ship only Cargo manifests, src, and demo.
-/target
-/data
-/reports
-.git
-.github
-*.log
-**/*.md
+# Allow-list: the server build reads only the manifests and src.
+# rust-toolchain.toml stays out so the builder image's pinned toolchain is used, not a fresh stable.
+*
+!Cargo.toml
+!Cargo.lock
+!src

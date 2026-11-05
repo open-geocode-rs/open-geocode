@@ -126,6 +126,19 @@ Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an A
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 
+### Docker
+
+The image serves a Pack; it does not build one.
+Mount a Pack directory or `.ogp` file read-only at `/packs/pack`:
+
+```
+docker run -p 8080:8080 -v ~/.local/share/open-geocode/packs/canada-ontario:/packs/pack:ro ghcr.io/open-geocode-rs/open-geocode
+```
+
+Images are published for `linux/amd64` and `linux/arm64`, tagged `latest` and `sha-<commit>`, after CI passes on `main`.
+The container health check runs `open-geocode health`, which asks `/readyz`; Kubernetes can probe `/readyz` directly.
+`/jobs` results go under `/tmp`: mount a volume there to keep them across restarts, or a tmpfs with `--read-only`.
+
 ## Use Cases
 
 | Capability | Example use case |
