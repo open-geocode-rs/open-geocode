@@ -332,6 +332,9 @@ const TYPO_PREFIX_CHARS: usize = 1;
 /// The terms near one word kept per field, fewest edits then most documents
 /// first: a common short word has dozens of neighbours on a planet.
 const MAX_TYPO_TERMS: usize = 32;
+/// Places a place search reads whose names hold every word of the query,
+/// before it orders them by how exactly they are named and how well known.
+const NAMED_PLACES_WINDOW: usize = 200;
 /// Stated house numbers read on each side of one that no record states: a
 /// few, so the nearest of the same parity can be found and the numbers of a
 /// same-named street elsewhere passed over.
@@ -551,6 +554,15 @@ impl TextSearcher {
         // yet to weigh the two.
         if self.places {
             hits.sort_by_key(|hit| (hit.features.pass, hit.features.dropped_words));
+            let named = self.places_by_name(query_text, &filters, options.focus, limit)?;
+            if !named.is_empty() {
+                let mut seen = named
+                    .iter()
+                    .map(|hit| hit.record_id)
+                    .collect::<HashSet<_>>();
+                hits.retain(|hit| seen.insert(hit.record_id));
+                hits.splice(0..0, named);
+            }
         }
         self.rate(&mut hits);
         hits.truncate(limit);
@@ -4444,7 +4456,11 @@ impl TextSearcher {
     }
 
     /// The words of `words`, a query's street, that say its type or which
-    /// way it runs, each in all its forms ("n" is "north").
+    /// way it runs, each in all its forms ("n" is "north"). A type glued
+    /// onto a name is a type too ("plein" of "wilderinksplein"), as the
+    /// street keys read it: "Wilderinksplein" and "Wilderinksstraat" key
+    /// alike, and are two streets. A name of fewer than three letters is
+    /// no name a type is glued onto: "16th" is an ordinal.
     fn descriptors<'w>(&self, words: impl Iterator<Item = &'w str>) -> Descriptors {
         let dictionaries = self.tagger.dictionaries();
         let mut descriptors = Descriptors::default();
@@ -4453,6 +4469,13 @@ impl TextSearcher {
                 &mut descriptors.directions
             } else if dictionaries.is_street_type(word) {
                 &mut descriptors.types
+            } else if let Some((stem, glued)) = lattice::glued_parts(word)
+                .filter(|(stem, _)| stem.chars().filter(|c| c.is_alphabetic()).count() >= 3)
+            {
+                descriptors.names.push(stem.to_string());
+                descriptors.types.insert(glued.to_string());
+                descriptors.types.extend(lattice::other_forms(glued));
+                continue;
             } else {
                 descriptors.names.push(word.to_string());
                 continue;
@@ -5142,6 +5165,74 @@ impl TextSearcher {
         }
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
+    }
+
+    /// The places whose names hold every word of `query_text`, the most
+    /// important first: what a place search answers before it reads the
+    /// query as an address would be read. A place's name often holds a
+    /// town's or a street's words ("Rijksmuseum Twenthe", "Van Gogh
+    /// Museum"), which the address reading takes for where it is, or for a
+    /// street, and so passes it over.
+    fn places_by_name(
+        &self,
+        query_text: &str,
+        filters: &Filters<'_>,
+        focus: Option<[f64; 2]>,
+        limit: usize,
+    ) -> Result<Vec<TextSearchHit>> {
+        let Some(key) = search_key(query_text) else {
+            return Ok(Vec::new());
+        };
+        let words = key.split_whitespace().collect::<Vec<_>>();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut clauses = words
+            .iter()
+            .map(|word| {
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.name_text, word),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(bbox) = filters.bbox {
+            clauses.push((Occur::Must, self.bbox_query(bbox)));
+        }
+        let ranking = Ranking {
+            query_words: QueryWords::new(query_text),
+            focus,
+            ..Ranking::default()
+        };
+        // Many places can hold the words ("Schiphol" names the airport and a
+        // dozen hotels), so a window wide enough to hold the one most known.
+        let window = limit.max(NAMED_PLACES_WINDOW);
+        let mut hits =
+            self.ranked_hits(&BooleanQuery::new(clauses), &ranking, window, &mut |hit| {
+                Ok(filters.admit(hit))
+            })?;
+        let records = self.pack.records();
+        let mut order = HashMap::new();
+        for hit in &hits {
+            // A name that is the query, its own or another ("AMS" of the
+            // airport), before one that only holds its words; then the more
+            // known.
+            let exact = records
+                .names(hit.record_id)?
+                .iter()
+                .any(|name| search_key(name).as_deref() == Some(key.as_str()));
+            let known = records.prominence(hit.record_id)?.unwrap_or_default();
+            order.insert(
+                hit.record_id,
+                (std::cmp::Reverse(exact), std::cmp::Reverse(known)),
+            );
+        }
+        hits.sort_by_key(|hit| order[&hit.record_id]);
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// The best `limit` hits that `accept` keeps, ranked by [`RankKey`] over
@@ -12478,6 +12569,104 @@ mod tests {
             )[0],
             "osm:way:22"
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A place search answers first with the places whose names hold every
+    /// word, the one named exactly so first, then the better known, however
+    /// the address reading of the query takes the words.
+    #[test]
+    fn a_place_search_answers_with_the_places_so_named_the_best_known_first() {
+        let temp_dir = temp_pack_path("search-places-by-name");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let place = |id: i64, name: &str, importance: u8, lon: f64| PoiRecord {
+            alt_names: if name == "Luchthaven Schiphol" {
+                vec!["AMS".to_string()]
+            } else {
+                Vec::new()
+            },
+            name: name.to_string(),
+            category: "tourism:museum".to_string(),
+            address: None,
+            geometry: point_geometry(lon, 52.36),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, id),
+            prominence: Prominence {
+                importance,
+                ..Prominence::default()
+            },
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        for record in [
+            place(1, "Stedelijk Museum Breda", 0, 4.78),
+            place(2, "Stedelijk Museum Amsterdam", 120, 4.88),
+            place(3, "Van Gogh Museum", 140, 4.881),
+            place(4, "AMS", 0, 4.882),
+            place(5, "Luchthaven Schiphol", 160, 4.76),
+        ] {
+            writer.write(&record.into(), None).expect("place");
+        }
+        writer
+            .write(
+                &address_record(
+                    "osm:node:9",
+                    "",
+                    "1",
+                    "Van Goghstraat",
+                    Some("Amsterdam"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let places = TextSearcher::open(&temp_dir).expect("searcher").places();
+        assert_eq!(top_ids(&places, "Stedelijk Museum")[0], "osm:node:2");
+        assert_eq!(top_ids(&places, "Van Gogh Museum")[0], "osm:node:3");
+        assert_eq!(
+            top_ids(&places, "AMS")[0],
+            "osm:node:5",
+            "an exact other name of the better known"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Two streets whose names differ only by the type glued onto them key
+    /// alike, and are two streets: the one of the type written answers.
+    #[test]
+    fn a_street_whose_glued_type_contradicts_the_query_ranks_after() {
+        let temp_dir = temp_pack_path("search-glued-types");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, street, lon) in [
+            ("osm:node:1", "Wilderinksstraat", 6.7930),
+            ("osm:node:2", "Wilderinksplein", 6.7935),
+        ] {
+            let mut record = address_record(id, "", "2", street, Some("Hengelo"), None);
+            record.geometry = point_geometry(lon, 52.265);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        for (street, id) in [
+            ("Wilderinksplein", "osm:node:2"),
+            ("Wilderinksstraat", "osm:node:1"),
+        ] {
+            let found = top_ids_limited(&searcher, &format!("{street} 2, Hengelo"), 1);
+            assert_eq!(found, [id], "{street}");
+            let tagged = answer(
+                &searcher,
+                &format!(
+                    "2/house_number {}/street hengelo/locality",
+                    street.to_lowercase()
+                ),
+            );
+            assert_eq!(tagged[0], id, "{street}: {tagged:?}");
+        }
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

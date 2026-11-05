@@ -705,9 +705,13 @@ pub(crate) fn full_form(word: &str) -> Option<&'static str> {
 /// "hauptstr" and of "hauptstrasse"), as a type written apart is left out of
 /// a street's key; `None` when no type is glued onto it.
 pub(crate) fn glued_stem(word: &str) -> Option<&str> {
-    abbreviations::abbreviations()
-        .split_glued(word)
-        .map(|(stem, _)| stem)
+    glued_parts(word).map(|(stem, _)| stem)
+}
+
+/// The name and the street type glued onto it in `word` ("wilderinks" and
+/// "plein" of "wilderinksplein"); `None` when no type is glued onto it.
+pub(crate) fn glued_parts(word: &str) -> Option<(&str, &str)> {
+    abbreviations::abbreviations().split_glued(word)
 }
 
 impl fmt::Debug for LatticeTagger {
