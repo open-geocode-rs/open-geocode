@@ -802,6 +802,7 @@ pub(crate) enum CandidateIssue {
     StreetMissingName,
     StreetRefOnlyName,
     StreetUnresolvedGeometry,
+    HighwayNotAStreet,
     PlaceMissingName,
     PlaceUnsupportedValue,
 }
@@ -829,6 +830,7 @@ impl CandidateIssue {
             Self::StreetMissingName => "street_missing_name",
             Self::StreetRefOnlyName => "street_ref_only_name",
             Self::StreetUnresolvedGeometry => "street_unresolved_geometry",
+            Self::HighwayNotAStreet => "highway_not_a_street",
             Self::PlaceMissingName => "place_missing_name",
             Self::PlaceUnsupportedValue => "place_unsupported_value",
         }
@@ -853,6 +855,7 @@ impl CandidateIssue {
             | Self::InterpolationNonNumericAnchor => CandidateDisposition::Invalid,
             Self::StreetMissingName
             | Self::StreetRefOnlyName
+            | Self::HighwayNotAStreet
             | Self::PlaceMissingName
             | Self::PlaceUnsupportedValue => CandidateDisposition::OutOfScope,
         }
@@ -1155,9 +1158,9 @@ impl BuilderReport {
             | CandidateIssue::InterpolationInvalidNumberRange
             | CandidateIssue::InterpolationInvalidParity
             | CandidateIssue::InterpolationNonNumericAnchor => &mut self.validation.interpolation,
-            CandidateIssue::StreetMissingName | CandidateIssue::StreetRefOnlyName => {
-                &mut self.validation.unresolved_geometry
-            }
+            CandidateIssue::StreetMissingName
+            | CandidateIssue::StreetRefOnlyName
+            | CandidateIssue::HighwayNotAStreet => &mut self.validation.unresolved_geometry,
             CandidateIssue::PlaceMissingName | CandidateIssue::PlaceUnsupportedValue => {
                 &mut self.validation.unsupported_relation
             }
@@ -1308,6 +1311,10 @@ fn location_precision_name(precision: LocationPrecision) -> &'static str {
 fn rejection_triage(issue: CandidateIssue, tags: &BTreeMap<String, String>) -> RejectionTriage {
     match issue {
         CandidateIssue::StreetMissingName => unnamed_highway_triage(tags),
+        CandidateIssue::HighwayNotAStreet => RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "highway=* value names no street (a platform, a bus stop, a proposed way, a service area); its name is not an address street",
+        },
         CandidateIssue::StreetRefOnlyName => RejectionTriage {
             bucket: "needs_model_decision",
             note: "highway has ref=* but no name=*; it may be useful for route-number search, but is not a reliable address street name",
@@ -1495,6 +1502,7 @@ fn address_shape(issue: CandidateIssue, addr_tags: &BTreeMap<String, String>) ->
         CandidateIssue::StreetUnresolvedGeometry => "street_unresolved_geometry",
         CandidateIssue::StreetMissingName => "street_missing_name",
         CandidateIssue::StreetRefOnlyName => "street_ref_only_name",
+        CandidateIssue::HighwayNotAStreet => "highway_not_a_street",
         CandidateIssue::PlaceMissingName => "place_missing_name",
         CandidateIssue::PlaceUnsupportedValue => "place_unsupported_value",
         CandidateIssue::InterpolationUnsupportedValue

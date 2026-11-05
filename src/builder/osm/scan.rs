@@ -31,7 +31,7 @@ use super::{
     place::{emit_place_node, has_place_tag},
     poi::{POI_KEYS, PoiCandidate, emit_poi, is_poi, poi_tags},
     spill::{WayFeature, WayKind},
-    street::{has_highway_tag, missing_street_name_issue, street_name, street_tags},
+    street::{has_highway_tag, is_street, missing_street_name_issue, street_name, street_tags},
 };
 
 /// Whether an element tagged with `keys` may be anything the scan keeps or
@@ -263,7 +263,18 @@ fn scan_way<'a>(
         ways.push(feature(WayKind::Boundary, boundary_tags(all_tags)));
     }
 
-    if has_highway_tag(all_tags) {
+    if has_highway_tag(all_tags) && !is_street(all_tags) {
+        if let Some(out) = out.as_deref_mut() {
+            out.reject_in_report(
+                CandidateIssue::HighwayNotAStreet,
+                ObjectType::Way,
+                object_id,
+                all_tags,
+                None,
+                None,
+            );
+        }
+    } else if has_highway_tag(all_tags) {
         if street_name(all_tags).is_some() {
             if refs().is_empty() {
                 if let Some(out) = out.as_deref_mut() {

@@ -17,8 +17,29 @@ use super::{
 /// audit needs to explain a rejection.
 const STREET_TAG_KEYS: [&str; 2] = ["highway", "ref"];
 
+/// `highway` values that name no street: a platform or a bus stop is named
+/// after its station, a proposed or abandoned way has no addresses, and a
+/// service area or a rest area is a place. A footway, a path or steps stay
+/// streets, as houses stand on them; so does a road under construction, whose
+/// addresses often exist before it opens.
+const NOT_STREETS: [&str; 7] = [
+    "abandoned",
+    "bus_stop",
+    "corridor",
+    "platform",
+    "proposed",
+    "rest_area",
+    "services",
+];
+
 pub(crate) fn has_highway_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("highway")
+}
+
+/// Whether a way's `highway` tag makes it a street.
+pub(crate) fn is_street(tags: &BTreeMap<String, String>) -> bool {
+    tags.get("highway")
+        .is_some_and(|value| !NOT_STREETS.contains(&value.as_str()))
 }
 
 pub(crate) fn street_name(tags: &BTreeMap<String, String>) -> Option<String> {
@@ -299,6 +320,18 @@ mod tests {
         assert_eq!(out.rejections[0].reason, "street_unresolved_geometry");
         assert_eq!(out.rejections[0].layer_hint.as_deref(), Some("street"));
         assert_eq!(out.report.disposition.unresolved_geometry, 1);
+    }
+
+    #[test]
+    fn a_platform_or_a_proposed_way_is_no_street_but_a_footway_is() {
+        let highway = |value: &str| BTreeMap::from([("highway".to_string(), value.to_string())]);
+        for value in ["platform", "proposed", "bus_stop", "services"] {
+            assert!(!is_street(&highway(value)), "{value}");
+        }
+        for value in ["residential", "footway", "pedestrian", "construction"] {
+            assert!(is_street(&highway(value)), "{value}");
+        }
+        assert!(!is_street(&BTreeMap::new()));
     }
 
     #[test]

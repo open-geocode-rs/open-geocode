@@ -4173,11 +4173,21 @@ mod tests {
             way(703, &[205, 206], &road("Ponsonby Road")),
             way(710, &[211, 212], &road("Main Street")),
             way(711, &[212, 213], &road("Main Street")),
+            // Named after its station, not a street.
+            way(
+                720,
+                &[205, 206],
+                &[("highway", "platform"), ("name", "Kingston Station")],
+            ),
         ]);
         write_pbf(&input, &[nodes, ways, vec![district, board, town]]);
         let report = build(&dir.join("pack"), &input, None);
         assert_eq!(report.accepted.street_segments, 6);
         assert_eq!(report.accepted.streets, 3);
+        assert_eq!(
+            report.triage.by_reason_and_bucket["highway_not_a_street"]["likely_not_useful_for_geocoding"],
+            1
+        );
 
         let reader = Reader::open(dir.join("pack")).expect("reader");
         let mut streets = reader
