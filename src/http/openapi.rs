@@ -127,9 +127,9 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         BatchSummary,
     )),
     tags(
-        (name = "geocoding", description = "Geocode addresses and points."),
-        (name = "jobs", description = "Geocode a whole file, streamed back as it uploads."),
-        (name = "operations", description = "Health checks, the server and Pack versions, and the OpenAPI document."),
+        (name = "Geocoding", description = "Geocode addresses and points."),
+        (name = "Jobs", description = "Geocode a whole file, streamed back as it uploads."),
+        (name = "Operations", description = "Health checks, the server and Pack versions, and the OpenAPI document."),
     ),
 )]
 pub(crate) struct ApiDoc;
@@ -332,7 +332,7 @@ pub(crate) struct BatchSummary {
 #[utoipa::path(
     get,
     path = "/openapi.json",
-    tag = "operations",
+    tag = "Operations",
     responses(
         (status = 200, description = "The OpenAPI document.",
          content_type = "application/json"),
@@ -397,7 +397,7 @@ fn add_lookup_refusals(value: &mut Value) {
         };
         if !get["tags"]
             .as_array()
-            .is_some_and(|tags| tags.iter().any(|tag| tag == "geocoding"))
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "Geocoding"))
         {
             continue;
         }

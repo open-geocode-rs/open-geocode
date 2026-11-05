@@ -42,3 +42,25 @@ Not:
 
 `SAFETY:` comments are mandatory on every `unsafe` block and state the invariant
 that makes it sound.
+
+## API summaries
+
+First line of a handler's `///` doc comment becomes its OpenAPI `summary`: the
+page title, sidebar label and overview row on the docs site. Write a label, not a
+sentence. Verb and object, sentence case, at most 6 words, no trailing period.
+Detail goes in the paragraphs below it.
+
+Tag names are the sidebar's group labels: sentence case, `Geocoding`, not
+`geocoding`.
+
+```rust
+/// Search addresses
+/// Reverse geocode a point
+/// Get a job
+```
+
+Not:
+
+```rust
+/// Geocode many addresses whose parts are already apart in one request.
+```

@@ -749,7 +749,7 @@ pub(crate) struct JobQuery {
 #[utoipa::path(
     post,
     path = "/jobs",
-    tag = "jobs",
+    tag = "Jobs",
     params(
         JobQuery,
         ("Prefer" = Option<String>, Header,
@@ -1586,7 +1586,7 @@ fn no_such_job() -> Problem {
 #[utoipa::path(
     get,
     path = "/jobs/{id}",
-    tag = "jobs",
+    tag = "Jobs",
     params(("id" = String, Path, description = "The job's id.")),
     responses(
         (status = 200, description = "The job.", body = JobStatus),
@@ -1609,7 +1609,7 @@ pub(crate) async fn status(
 #[utoipa::path(
     get,
     path = "/jobs/{id}/results",
-    tag = "jobs",
+    tag = "Jobs",
     params(("id" = String, Path, description = "The job's id.")),
     responses(
         (status = 200, description = "The results, in the job's output format.",
@@ -1643,7 +1643,7 @@ pub(crate) async fn results(
 #[utoipa::path(
     post,
     path = "/jobs/{id}/cancel",
-    tag = "jobs",
+    tag = "Jobs",
     params(("id" = String, Path, description = "The job's id.")),
     responses(
         (status = 200, description = "The job, stopping.", body = JobStatus),
@@ -1666,7 +1666,7 @@ pub(crate) async fn cancel(
 #[utoipa::path(
     delete,
     path = "/jobs/{id}",
-    tag = "jobs",
+    tag = "Jobs",
     params(("id" = String, Path, description = "The job's id.")),
     responses(
         (status = 204, description = "Deleted."),

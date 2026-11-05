@@ -531,7 +531,7 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
 #[utoipa::path(
     get,
     path = "/search",
-    tag = "geocoding",
+    tag = "Geocoding",
     params(
         ("q" = String, Query,
          description = "Text to geocode, such as a full address.",
@@ -617,7 +617,7 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
 #[utoipa::path(
     get,
     path = "/autocomplete",
-    tag = "geocoding",
+    tag = "Geocoding",
     params(
         ("q" = Option<String>, Query,
          description = "Text typed so far.",
@@ -711,7 +711,7 @@ pub(crate) async fn autocomplete(
 #[utoipa::path(
     get,
     path = "/geocode",
-    tag = "geocoding",
+    tag = "Geocoding",
     params(
         ("address" = String, Query,
          description = "House number and street, without town or postcode.",
@@ -761,7 +761,7 @@ pub(crate) async fn geocode(
     Ok(Json(collection))
 }
 
-/// Geocode many addresses whose parts are already apart in one request.
+/// Geocode a batch of addresses
 ///
 /// The body is a JSON array of items, at most the server's item limit (1000
 /// by default). Each takes the parameters `GET /geocode` takes, plus an
@@ -777,7 +777,7 @@ pub(crate) async fn geocode(
 #[utoipa::path(
     post,
     path = "/geocode",
-    tag = "geocoding",
+    tag = "Geocoding",
     params(
         ("address" = Option<String>, Query,
          description = "House number and street, without town or postcode. Applies \
@@ -895,7 +895,7 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
 #[utoipa::path(
     get,
     path = "/reverse",
-    tag = "geocoding",
+    tag = "Geocoding",
     params(
         ("lon" = f64, Query, description = "Longitude in degrees.",
          example = -79.3832, minimum = -180.0, maximum = 180.0),
@@ -923,7 +923,7 @@ pub(crate) async fn reverse(
     Ok(Json(collection))
 }
 
-/// Find the places at many points in one request.
+/// Reverse geocode a batch of points
 ///
 /// The body is a JSON array of items, at most the server's item limit (1000
 /// by default). Each takes the parameters `GET /reverse` takes, plus an
@@ -937,7 +937,7 @@ pub(crate) async fn reverse(
 #[utoipa::path(
     post,
     path = "/reverse",
-    tag = "geocoding",
+    tag = "Geocoding",
     params(
         ("lon" = Option<f64>, Query,
          description = "Longitude in degrees. Applies to every item; an item's own \
