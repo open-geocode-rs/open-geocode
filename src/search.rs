@@ -7521,10 +7521,10 @@ fn typo_distance(word: &str, other: &str) -> Option<u8> {
     // each thread keeps the automata of the words it saw last, and how many
     // states they hold between them.
     thread_local! {
-        static AUTOMATA: RefCell<(HashMap<String, Option<Rc<DFA>>>, usize)> = RefCell::default();
+        static AUTOMATA: RefCell<TypoAutomata> = RefCell::default();
     }
-    let dfa = AUTOMATA.with(|automata| {
-        let (automata, states) = &mut *automata.borrow_mut();
+    let dfa = AUTOMATA.with(|cache| {
+        let TypoAutomata { automata, states } = &mut *cache.borrow_mut();
         if let Some(dfa) = automata.get(word) {
             return dfa.clone();
         }
@@ -7542,6 +7542,14 @@ fn typo_distance(word: &str, other: &str) -> Option<u8> {
         Distance::Exact(distance) => Some(distance),
         Distance::AtLeast(_) => None,
     }
+}
+
+/// Automata of query words each thread keeps for [`typo_distance`], `None`
+/// for a word that allows no typo, and how many states they hold between them.
+#[derive(Default)]
+struct TypoAutomata {
+    automata: HashMap<String, Option<Rc<DFA>>>,
+    states: usize,
 }
 
 /// Automata of query words each thread keeps for [`typo_distance`].
