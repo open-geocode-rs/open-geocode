@@ -1,11 +1,19 @@
 //! Named points of interest.
 //!
-//! A node or way is a POI when it has a name and one of the tags below with a
-//! value that is not street furniture. A POI that also states a valid address
-//! carries it, and the address is emitted as an address record of its own:
-//! address search reads addresses alone.
+//! A node or way is a POI when it has a name and its tags match a preset of
+//! the iD tagging schema that `catalog/places.json` counts as a place (see
+//! `catalog/curation.toml`): the schema OSM's editor offers mappers, so a
+//! new kind of place counts once mappers have a preset for it, with no list
+//! of keys here. A POI that also states a valid address carries it, and the
+//! address is emitted as an address record of its own: address search reads
+//! addresses alone.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::OnceLock,
+};
+
+use serde::Deserialize;
 
 use crate::record::{
     AddressRecord, LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance,
@@ -18,51 +26,163 @@ use super::{
     tags::{OsmTags, alternate_names, name_tags, prominence},
 };
 
-/// Keys that make a named object a POI, in category order: an object tagged
-/// `amenity=school` and `building=school` is an `amenity:school`.
-pub(crate) const POI_KEYS: [&str; 12] = [
-    "amenity",
-    "shop",
-    "tourism",
-    "leisure",
-    "office",
-    "craft",
-    "healthcare",
-    "historic",
-    "aeroway",
-    "railway",
-    "public_transport",
-    "building",
-];
+/// How an object is drawn, as a preset names the drawings it applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Drawn {
+    Point,
+    Area,
+}
 
-/// Street furniture and fixtures that carry names but are not places anyone
-/// looks up by name.
-const NOISE_AMENITIES: [&str; 22] = [
-    "atm",
-    "bbq",
-    "bench",
-    "bicycle_parking",
-    "clock",
-    "drinking_water",
-    "give_box",
-    "grit_bin",
-    "hunting_stand",
-    "letter_box",
-    "motorcycle_parking",
-    "parking_entrance",
-    "parking_space",
-    "post_box",
-    "shelter",
-    "telephone",
-    "toilets",
-    "vending_machine",
-    "waste_basket",
-    "waste_disposal",
-    "water_point",
-    "watering_place",
-];
-const NOISE_LEISURE: [&str; 4] = ["bleachers", "firepit", "outdoor_seating", "picnic_table"];
-const AEROWAYS: [&str; 5] = ["aerodrome", "airstrip", "helipad", "heliport", "terminal"];
+impl Drawn {
+    pub(crate) const fn of(object_type: ObjectType) -> Self {
+        match object_type {
+            ObjectType::Node => Self::Point,
+            _ => Self::Area,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Catalog {
+    presets: BTreeMap<String, CatalogPreset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogPreset {
+    tags: BTreeMap<String, String>,
+    geometry: Vec<String>,
+    #[serde(default = "default_match_score")]
+    match_score: f64,
+    #[serde(default)]
+    needs_wikidata: bool,
+    /// Never a place: an object it matches best is none.
+    #[serde(default)]
+    never: bool,
+}
+
+const fn default_match_score() -> f64 {
+    1.0
+}
+
+/// A counted preset, as matching reads it.
+#[derive(Debug)]
+struct Preset {
+    /// The key its id starts with, whose value names its category.
+    key: String,
+    tags: Vec<(String, String)>,
+    point: bool,
+    area: bool,
+    match_score: f64,
+    needs_wikidata: bool,
+    never: bool,
+}
+
+/// The value a preset tag of any value matches: any but `no`.
+const ANY: &str = "*";
+
+#[derive(Debug)]
+struct Presets {
+    all: Vec<Preset>,
+    /// Each preset by every `(key, value)` it tests, `value` being [`ANY`]
+    /// for a tag of any value.
+    by_tag: HashMap<(String, String), Vec<usize>>,
+    /// Every key a preset tests: what the scan keeps of a POI's tags.
+    keys: HashSet<String>,
+}
+
+fn presets() -> &'static Presets {
+    static PRESETS: OnceLock<Presets> = OnceLock::new();
+    PRESETS.get_or_init(|| {
+        let catalog: Catalog = serde_json::from_str(include_str!("../../../catalog/places.json"))
+            .expect("catalog/places.json is a place catalog");
+        let mut presets = Presets {
+            all: Vec::new(),
+            by_tag: HashMap::new(),
+            keys: HashSet::new(),
+        };
+        for (id, preset) in catalog.presets {
+            let index = presets.all.len();
+            for (key, value) in &preset.tags {
+                presets.keys.insert(key.clone());
+                presets
+                    .by_tag
+                    .entry((key.clone(), value.clone()))
+                    .or_default()
+                    .push(index);
+            }
+            let has = |drawing: &str| preset.geometry.iter().any(|kind| kind == drawing);
+            presets.all.push(Preset {
+                key: id.split('/').next().unwrap_or_default().to_string(),
+                tags: preset.tags.into_iter().collect(),
+                point: has("point") || has("vertex"),
+                area: has("area") || has("line"),
+                match_score: preset.match_score,
+                needs_wikidata: preset.needs_wikidata,
+                never: preset.never,
+            });
+        }
+        presets
+    })
+}
+
+/// Whether `key` is one a place preset tests.
+pub(crate) fn is_place_key(key: &str) -> bool {
+    presets().keys.contains(key)
+}
+
+/// The preset `tags`, drawn as `drawn`, match best, when it is counted as a
+/// place: of the presets whose every tag the object has, the one testing
+/// the most tags of a stated value, then the most tags, then of the highest
+/// match score; a counted preset wins a tie with one never counted (a bench
+/// beside a bakery is the bakery). `None` when no preset matches or the
+/// best is never counted (`shop=vacant` is no `shop=*`).
+fn place_preset(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<&'static Preset> {
+    let presets = presets();
+    let linked = tags.contains_key("wikidata");
+    let mut best: Option<((usize, usize, f64, bool), usize)> = None;
+    for (key, value) in tags {
+        let candidates = [
+            presets.by_tag.get(&(key.clone(), value.clone())),
+            presets.by_tag.get(&(key.clone(), ANY.to_string())),
+        ];
+        for &index in candidates.into_iter().flatten().flatten() {
+            let preset = &presets.all[index];
+            let drawn_so = match drawn {
+                Drawn::Point => preset.point,
+                Drawn::Area => preset.area,
+            };
+            let tagged = preset.tags.iter().all(|(key, wanted)| {
+                tags.get(key).is_some_and(|value| match wanted.as_str() {
+                    ANY => value != "no",
+                    wanted => value == wanted,
+                })
+            });
+            if !drawn_so || !tagged || (preset.needs_wikidata && !linked) {
+                continue;
+            }
+            let stated = preset.tags.iter().filter(|(_, value)| value != ANY).count();
+            let rank = (stated, preset.tags.len(), preset.match_score, !preset.never);
+            let better = best.is_none_or(|(best_rank, best_index)| {
+                rank.partial_cmp(&best_rank) == Some(std::cmp::Ordering::Greater)
+                    || (rank == best_rank && index < best_index)
+            });
+            if better {
+                best = Some((rank, index));
+            }
+        }
+    }
+    let (_, index) = best?;
+    let preset = &presets.all[index];
+    (!preset.never).then_some(preset)
+}
+
+/// `key:value` of the tag of the preset `tags` match that names its kind,
+/// such as `amenity:cafe`.
+fn poi_category(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<String> {
+    let preset = place_preset(tags, drawn)?;
+    let value = tags.get(&preset.key)?;
+    Some(format!("{}:{value}", preset.key))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PoiCandidate {
@@ -75,8 +195,8 @@ pub(crate) struct PoiCandidate {
     pub tags: BTreeMap<String, String>,
 }
 
-pub(crate) fn is_poi(tags: &BTreeMap<String, String>) -> bool {
-    poi_name(tags).is_some() && poi_category(tags).is_some()
+pub(crate) fn is_poi(tags: &BTreeMap<String, String>, drawn: Drawn) -> bool {
+    poi_name(tags).is_some() && poi_category(tags, drawn).is_some()
 }
 
 /// The tags a POI keeps: its names, its category tags, its Wikidata and
@@ -85,11 +205,10 @@ pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
-    // The links are kept for the POI's prominence.
-    ["information", "wikidata", "wikipedia"]
-        .into_iter()
-        .chain(POI_KEYS)
-        .filter_map(|key| Some((key.to_string(), tags.get(key)?.clone())))
+    // The links are kept for the POI's prominence and importance.
+    tags.iter()
+        .filter(|(key, _)| matches!(key.as_str(), "wikidata" | "wikipedia") || is_place_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
         .chain(name_tags(tags))
         .chain(
             address_tags
@@ -103,7 +222,8 @@ pub(crate) fn poi_tags(
 /// Emit a POI from its kept tags; their `addr:*` tags are already validated.
 pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let tags = &candidate.tags;
-    let (Some(name), Some(category)) = (poi_name(tags), poi_category(tags)) else {
+    let drawn = Drawn::of(candidate.object_type);
+    let (Some(name), Some(category)) = (poi_name(tags), poi_category(tags, drawn)) else {
         return;
     };
     let address = address_components(tags).ok();
@@ -145,31 +265,6 @@ fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {
         .filter(|name| name.chars().any(char::is_alphabetic))
 }
 
-/// `key:value` of the first POI tag that is not noise.
-fn poi_category(tags: &BTreeMap<String, String>) -> Option<String> {
-    POI_KEYS.into_iter().find_map(|key| {
-        let value = tags.cleaned(key)?;
-        is_poi_value(key, &value, tags).then(|| format!("{key}:{value}"))
-    })
-}
-
-fn is_poi_value(key: &str, value: &str, tags: &BTreeMap<String, String>) -> bool {
-    if matches!(value, "no" | "vacant") {
-        return false;
-    }
-    match key {
-        "amenity" => !NOISE_AMENITIES.contains(&value),
-        "leisure" => !NOISE_LEISURE.contains(&value),
-        // Trail maps and guideposts; a staffed information office is a place.
-        "tourism" => {
-            value != "information" || tags.cleaned("information").as_deref() == Some("office")
-        }
-        "aeroway" => AEROWAYS.contains(&value),
-        "railway" | "public_transport" => value == "station",
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,32 +293,42 @@ mod tests {
     }
 
     #[test]
-    fn categorizes_by_the_first_poi_key() {
+    fn categorizes_by_the_preset_its_tags_match_best() {
+        let point = |pairs: &[(&str, &str)]| poi_category(&tags(pairs), Drawn::Point);
+        let area = |pairs: &[(&str, &str)]| poi_category(&tags(pairs), Drawn::Area);
+        // A school's building preset scores below the school's.
         assert_eq!(
-            poi_category(&tags(&[("building", "school"), ("amenity", "school")])).as_deref(),
+            area(&[("building", "school"), ("amenity", "school")]).as_deref(),
             Some("amenity:school")
         );
         assert_eq!(
-            poi_category(&tags(&[
-                ("railway", "station"),
-                ("public_transport", "station")
-            ]))
-            .as_deref(),
-            Some("railway:station")
+            point(&[("man_made", "lighthouse")]).as_deref(),
+            Some("man_made:lighthouse")
         );
         assert_eq!(
-            poi_category(&tags(&[("building", "yes")])).as_deref(),
-            Some("building:yes")
+            point(&[("highway", "bus_stop")]).as_deref(),
+            Some("highway:bus_stop")
+        );
+        assert_eq!(
+            point(&[("natural", "peak")]).as_deref(),
+            Some("natural:peak")
+        );
+        // A preset for areas only matches no point.
+        assert_eq!(point(&[("natural", "water"), ("water", "lake")]), None);
+        assert_eq!(
+            area(&[("natural", "water"), ("water", "lake")]).as_deref(),
+            Some("natural:water")
         );
     }
 
     #[test]
     fn excludes_noise_unnamed_and_unlisted_objects() {
-        let named = |pairs: &[(&str, &str)]| {
+        let drawn_named = |pairs: &[(&str, &str)], drawn| {
             let mut tags = tags(pairs);
             tags.insert("name".to_string(), "Example".to_string());
-            is_poi(&tags)
+            is_poi(&tags, drawn)
         };
+        let named = |pairs: &[(&str, &str)]| drawn_named(pairs, Drawn::Point);
         assert!(named(&[("amenity", "cafe")]));
         assert!(!named(&[("amenity", "bench")]));
         assert!(!named(&[("amenity", "waste_basket")]));
@@ -232,6 +337,7 @@ mod tests {
         assert!(!named(&[("aeroway", "runway")]));
         assert!(!named(&[("railway", "level_crossing")]));
         assert!(named(&[("railway", "station")]));
+        assert!(named(&[("railway", "halt")]));
         assert!(!named(&[
             ("tourism", "information"),
             ("information", "board")
@@ -240,13 +346,29 @@ mod tests {
             ("tourism", "information"),
             ("information", "office")
         ]));
-        assert!(!named(&[("highway", "bus_stop")]));
+        assert!(!named(&[("highway", "residential")]));
+        assert!(!named(&[("landuse", "residential")]));
         // A bench next to a shop is still the shop.
         assert!(named(&[("amenity", "bench"), ("shop", "bakery")]));
+        // A named house is a place only when Wikidata knows it.
+        assert!(!drawn_named(&[("building", "yes")], Drawn::Area));
+        assert!(drawn_named(
+            &[("building", "yes"), ("wikidata", "Q1")],
+            Drawn::Area
+        ));
 
-        assert!(!is_poi(&tags(&[("amenity", "cafe")])), "unnamed");
-        assert!(!is_poi(&tags(&[("amenity", "cafe"), ("name", "  ")])));
-        assert!(!is_poi(&tags(&[("building", "yes"), ("name", "12")])));
+        assert!(
+            !is_poi(&tags(&[("amenity", "cafe")]), Drawn::Point),
+            "unnamed"
+        );
+        assert!(!is_poi(
+            &tags(&[("amenity", "cafe"), ("name", "  ")]),
+            Drawn::Point
+        ));
+        assert!(!is_poi(
+            &tags(&[("amenity", "cafe"), ("name", "12")]),
+            Drawn::Point
+        ));
     }
 
     #[test]
@@ -261,11 +383,16 @@ mod tests {
             ("addr:housenumber", "123"),
             ("addr:street", "King Street West"),
         ]);
+        // `cuisine` is kept: presets tell kinds of restaurant apart by it.
         assert_eq!(
             poi_tags(&source, None),
-            tags(&[("name", "Tim Hortons"), ("amenity", "cafe")])
+            tags(&[
+                ("name", "Tim Hortons"),
+                ("amenity", "cafe"),
+                ("cuisine", "coffee_shop")
+            ])
         );
-        assert_eq!(poi_tags(&source, Some(&address)).len(), 4);
+        assert_eq!(poi_tags(&source, Some(&address)).len(), 5);
     }
 
     #[test]

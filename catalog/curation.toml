@@ -17,6 +17,8 @@
 #                  Used to match OpenAddresses; no single code is shown.
 #   names          English display name first, then aliases for search.
 #   accept_names   Upstream names flagged by the generator that are fine as they are.
+#   places         Which iD tagging schema presets make a named object a place:
+#                  catalog/places.json is generated from them.
 
 [continents]
 why = "Geofabrik's top-level extracts with no parent. Russia is also top level upstream but is a country, see parent.transcontinental."
@@ -470,3 +472,78 @@ malaysia-singapore-brunei = ["Malaysia, Singapore, and Brunei", "Malaysia", "Sin
 senegal-and-gambia = ["Senegal and Gambia", "Senegal", "Gambia"]
 american-oceania = ["American Oceania", "American Samoa", "Guam", "Northern Mariana Islands"]
 ireland-and-northern-ireland = ["Ireland and Northern Ireland", "Ireland", "Northern Ireland"]
+
+# --- Places ------------------------------------------------------------
+
+[places.keys]
+why = "A named object is a place when it matches a searchable iD preset of one of these keys. A key set to \"*\" counts every preset of it; a list counts only those values. natural, landuse, boundary and highway also tag land cover, zoning and roads, which no one looks up as a place by name."
+
+[places.keys.set]
+aeroway = ["aerodrome", "airstrip", "helipad", "heliport", "terminal"]
+amenity = "*"
+boundary = ["national_park", "protected_area"]
+building = "*"
+club = "*"
+craft = "*"
+emergency = ["ambulance_station", "lifeguard", "mountain_rescue"]
+healthcare = "*"
+highway = ["bus_stop", "rest_area", "services"]
+historic = "*"
+landuse = ["cemetery", "recreation_ground", "religious", "winter_sports"]
+leisure = "*"
+man_made = "*"
+natural = ["bay", "beach", "cape", "cave_entrance", "glacier", "heath", "peak", "ridge", "saddle", "spring", "valley", "volcano", "water", "wetland", "wood"]
+office = "*"
+public_transport = ["station", "station_aerialway", "station_bus", "station_ferry", "station_light_rail", "station_monorail", "station_subway", "station_train", "station_train_halt", "station_tram"]
+railway = ["halt", "station", "tram_stop"]
+shop = "*"
+tourism = "*"
+
+[places.never]
+why = "Street furniture and fittings: a name on one says what it is (\"Bench\", \"Bin 4\"), not a place to find. Kept out as the hand-written lists did before the presets."
+ids = [
+  "amenity/atm",
+  "amenity/bbq",
+  "amenity/bench",
+  "amenity/bicycle_parking",
+  "amenity/clock",
+  "amenity/drinking_water",
+  "amenity/fountain",
+  "amenity/grit_bin",
+  "amenity/hunting_stand",
+  "amenity/letter_box",
+  "amenity/lounger",
+  "amenity/motorcycle_parking",
+  "amenity/parking_entrance",
+  "amenity/parking_space",
+  "amenity/post_box",
+  "amenity/recycling",
+  "amenity/shelter",
+  "amenity/telephone",
+  "amenity/toilets",
+  "amenity/vending_machine",
+  "amenity/waste_basket",
+  "amenity/waste_disposal",
+  "amenity/water_point",
+  "amenity/watering_place",
+  "leisure/bleachers",
+  "leisure/firepit",
+  "leisure/outdoor_seating",
+  "leisure/picnic_table",
+  "man_made/manhole",
+  "man_made/pipeline",
+  "man_made/street_cabinet",
+  "man_made/surveillance",
+  "man_made/utility_pole",
+  "shop/vacant",
+  "tourism/information/board",
+  "tourism/information/guidepost",
+  "tourism/information/map",
+  "tourism/information/route_marker",
+  "tourism/information/terminal",
+]
+
+[places.needs_wikidata]
+why = "A named house or block of flats is no place people look up: the Netherlands holds about 19,500 named buildings of the generic presets. One linked to Wikidata is known beyond its street."
+ids = ["building"]
+
