@@ -13,6 +13,7 @@
 
 pub(crate) mod batch;
 pub(crate) mod bounds;
+pub(crate) mod cache;
 pub(crate) mod health;
 pub(crate) mod jobs;
 pub(crate) mod method;
