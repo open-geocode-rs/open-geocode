@@ -105,6 +105,12 @@ enum Commands {
         /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
         shutdown_timeout: u64,
+
+        /// Seconds a client may reuse a lookup answer (`Cache-Control:
+        /// max-age`). 0, the default, sends `no-cache`: clients revalidate
+        /// each time with the ETag and get a 304.
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        cache_max_age: u32,
     },
 
     /// Check that a running server is ready: exit 0 if its /readyz answers
@@ -777,6 +783,7 @@ async fn main() -> Result<()> {
             job_dir,
             limits,
             shutdown_timeout,
+            cache_max_age,
         } => {
             serve(ServeOptions {
                 pack,
@@ -786,6 +793,7 @@ async fn main() -> Result<()> {
                 job_dir,
                 limits,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
+                cache_max_age,
             })
             .await?;
             Ok(())
