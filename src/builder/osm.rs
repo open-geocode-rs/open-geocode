@@ -4212,6 +4212,21 @@ mod tests {
             ],
             "a street in a local board is named by its district, one in a town by the town"
         );
+        // Every way of a joined street finds the street, not only its lowest.
+        let found = |id: &str| {
+            reader
+                .records_by_source_id(&crate::pack::SourceId::parse(id).expect("a source id"))
+                .expect("lookup")
+                .into_iter()
+                .map(|record| reader.record_summary(record).expect("summary").id)
+                .collect::<Vec<_>>()
+        };
+        for way in ["osm:way:700", "osm:way:701", "osm:way:702"] {
+            assert_eq!(found(way), ["osm:way:700"], "{way}");
+        }
+        assert_eq!(found("osm:way:703"), ["osm:way:703"]);
+        assert_eq!(found("osm:way:711"), ["osm:way:710"]);
+        assert_eq!(found("osm:way:712"), Vec::<String>::new());
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -1023,6 +1023,7 @@ fn record_heap_bytes(record: &Record) -> usize {
             record.name.len()
                 + strings_heap_bytes(&record.alt_names)
                 + record.locality.as_ref().map_or(0, String::len)
+                + record.member_ways.len() * 8
         }
         Record::Postcode(record) => record.postcode.len(),
         Record::Place(_, record) => {
@@ -1125,6 +1126,10 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             put_str(out, &record.name);
             put_strs(out, &record.alt_names);
             put_opt_str(out, record.locality.as_deref());
+            put_u64(out, record.member_ways.len() as u64);
+            for way in &record.member_ways {
+                put_i64(out, *way);
+            }
             encode_point(out, record.representative_point);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
@@ -1198,6 +1203,16 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
             name: get_string(input)?,
             alt_names: get_strings(input)?,
             locality: get_opt_string(input)?,
+            member_ways: {
+                let count = get_u64(input)?;
+                // Every id takes at least a byte, so a corrupt count allocates nothing.
+                if count > input.len() as u64 {
+                    return Err(Error::Decode("street ways are truncated"));
+                }
+                (0..count)
+                    .map(|_| get_i64(input))
+                    .collect::<Result<Vec<_>>>()?
+            },
             representative_point: decode_point(input)?,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
@@ -1437,6 +1452,7 @@ mod tests {
     #[test]
     fn out_of_range_line_coordinates_are_not_spilled_as_zero() {
         let record = Record::Street(StreetRecord {
+            member_ways: Vec::new(),
             alt_names: Vec::new(),
             name: "Edge Road".into(),
             locality: None,
@@ -1462,6 +1478,7 @@ mod tests {
         );
 
         let mut infinite = Record::Street(StreetRecord {
+            member_ways: Vec::new(),
             alt_names: Vec::new(),
             name: "Edge Road".into(),
             locality: None,
@@ -1495,6 +1512,7 @@ mod tests {
         });
         let records = [
             Record::Street(StreetRecord {
+                member_ways: Vec::new(),
                 alt_names: Vec::new(),
                 name: "King Street".into(),
                 locality: None,
@@ -1504,6 +1522,7 @@ mod tests {
             }),
             // The ways of one street, merged.
             Record::Street(StreetRecord {
+                member_ways: vec![17, 90, 5_000_000_000],
                 alt_names: vec!["Te Huarahi o King".into()],
                 name: "King Street".into(),
                 locality: Some("Toronto".into()),

@@ -27,7 +27,9 @@
 //!                     dataset's index in `records/datasets`
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
-//!                     (a street's locality after them, behind a presence byte)
+//!                     (a street's locality after them, behind a presence byte, then
+//!                     the ids of its other ways: a count, and each id as its
+//!                     zigzag distance from the one before, the first from its own)
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
@@ -109,7 +111,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 8;
+pub const RECORDS_VERSION: u32 = 9;
 
 pub const BLOCK_RECORDS: u64 = 64;
 const LABEL: &str = "pack-records";
@@ -806,6 +808,7 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 self.put_strings(out, &record.alt_names)?;
                 self.put_optional_strings(out, &[record.locality.as_deref()])?;
+                put_member_ways(out, record.source.object_id, &record.member_ways);
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
@@ -1122,23 +1125,40 @@ impl Reader {
     /// `None` when that id is not its source object's: an interpolation
     /// range, a postcode, a country derived from its areas.
     pub fn source_key(&self, id: RecordId) -> Result<Option<SourceKey>> {
-        let header = self.header(id)?;
+        Ok(self.source_keys(id)?.0)
+    }
+
+    /// [`Self::source_key`], and the ids of the other OSM ways of a street
+    /// joined from several: each finds the street, which no key of its own
+    /// says.
+    pub fn source_keys(&self, id: RecordId) -> Result<(Option<SourceKey>, Vec<i64>)> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        let member_ways = if header.layer == Layer::Street {
+            self.string_field(header.strings, &mut fields)?;
+            self.string_list(header.strings, &mut fields)?;
+            self.optional_strings::<1>(header.strings, &mut fields)?;
+            get_member_ways(&mut fields, unzigzag(header.source_value))?
+        } else {
+            Vec::new()
+        };
         if header.layer == Layer::Interpolation
             || (header.source_kind == SourceKind::Other && header.dataset.is_none())
         {
-            return Ok(None);
+            return Ok((None, member_ways));
         }
         let derived_country = header.layer.place_layer().is_some()
             && self
                 .place_type(id)?
                 .is_some_and(|place_type| place_type.starts_with("derived_country:"));
-        Ok((!derived_country).then(|| {
+        let key = (!derived_country).then(|| {
             let dataset = header.dataset.map_or(0, |index| u64::from(index) + 1);
             (
                 dataset << 2 | header.source_kind as u64,
                 header.source_value,
             )
-        }))
+        });
+        Ok((key, member_ways))
     }
 
     /// The key a source object's records are under, `None` when no record
@@ -1216,6 +1236,7 @@ impl Reader {
                     let [locality] = self.optional_strings(header.strings, &mut fields)?;
                     locality
                 },
+                member_ways: get_member_ways(&mut fields, unzigzag(header.source_value))?,
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance(&self.datasets)?,
@@ -1910,6 +1931,7 @@ impl Reader {
                 get_u32(fields)?;
                 self.string_list(header.strings, fields)?;
                 self.optional_strings::<1>(header.strings, fields)?;
+                get_member_ways(fields, 0)?;
             }
             Layer::Postcode => {
                 get_u32(fields)?;
@@ -2137,6 +2159,33 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     Ok(body)
 }
 
+/// A street's other ways: a count, then each id as its distance from the
+/// one before, the first from the street's own way. Ascending ids make
+/// the distances small.
+fn put_member_ways(out: &mut Vec<u8>, source: i64, ways: &[i64]) {
+    put_u64(out, ways.len() as u64);
+    let mut before = source;
+    for way in ways {
+        put_i64(out, way.wrapping_sub(before));
+        before = *way;
+    }
+}
+
+fn get_member_ways(fields: &mut &[u8], source: i64) -> Result<Vec<i64>> {
+    let count = get_u64(fields)?;
+    // Every id takes at least a byte, so a corrupt count allocates nothing.
+    if count > fields.len() as u64 {
+        return Err(Error::Decode("street ways are truncated"));
+    }
+    let mut way = source;
+    (0..count)
+        .map(|_| {
+            way = way.wrapping_add(get_i64(fields)?);
+            Ok(way)
+        })
+        .collect()
+}
+
 /// A postcode record's country, 0 when unknown.
 fn country_field(fields: &mut &[u8]) -> Result<Option<CountryCode>> {
     match get_u64(fields)? {
@@ -2344,6 +2393,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, 1),
             }),
             Record::Street(StreetRecord {
+                member_ways: vec![3, 700, 5_000_000_000],
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
                 locality: None,
                 name: "King Street".into(),

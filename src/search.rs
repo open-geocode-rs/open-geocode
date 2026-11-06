@@ -12844,6 +12844,7 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(9);
         StreetRecord {
+            member_ways: Vec::new(),
             alt_names: Vec::new(),
             locality: None,
             name: label.to_string(),

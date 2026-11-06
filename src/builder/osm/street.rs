@@ -56,6 +56,7 @@ pub(crate) fn emit_street(
             name,
             geometry: built.geometry,
             representative_point: built.representative_point,
+            member_ways: Vec::new(),
             source: SourceProvenance::osm(ObjectType::Way, way_id),
         })
     });
@@ -87,8 +88,8 @@ const METRES_PER_DEGREE: f64 = 111_320.0;
 /// The ways of one street name in one area, as streets: a way whose end
 /// lies within [`JOIN_GAP_M`] of another's line joins it, and a street is
 /// every way so joined. It keeps the name, source and id of its lowest way,
-/// every other name its ways have, a line part per way, and the vertex
-/// nearest the middle of its ways as its point.
+/// every other name its ways have, a line part per way, the ids of its other
+/// ways, and the vertex nearest the middle of its ways as its point.
 pub(crate) fn join_ways(mut ways: Vec<StreetRecord>) -> Vec<StreetRecord> {
     if ways.len() < 2 {
         return ways;
@@ -218,6 +219,7 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
         .map(<[_]>::to_vec)
         .collect::<Vec<_>>();
     for way in members {
+        street.member_ways.push(way.source.object_id);
         parts.extend(
             line_parts(&way.geometry)
                 .into_iter()
@@ -329,6 +331,7 @@ mod tests {
                 locality: None,
                 geometry: line_geometry(vec![coordinates]),
                 representative_point: points[0],
+                member_ways: Vec::new(),
                 source: SourceProvenance::osm(ObjectType::Way, id),
             }
         };
@@ -343,6 +346,8 @@ mod tests {
         let joined = &streets[0];
         assert_eq!(joined.id(), "osm:way:1", "named by its lowest way");
         assert_eq!(joined.alt_names, ["King St", "Rue King"]);
+        assert_eq!(joined.member_ways, [2, 3], "its other ways, ascending");
+        assert!(streets[1].member_ways.is_empty());
         let parts = line_parts(&joined.geometry).expect("a line");
         assert_eq!(parts.len(), 3);
         assert!(

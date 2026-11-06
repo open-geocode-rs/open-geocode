@@ -726,6 +726,7 @@ mod tests {
 
     fn street_record() -> StreetRecord {
         StreetRecord {
+            member_ways: Vec::new(),
             alt_names: Vec::new(),
             locality: None,
             name: "Queen Street".to_string(),

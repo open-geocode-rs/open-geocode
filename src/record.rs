@@ -53,6 +53,10 @@ pub struct StreetRecord {
     pub locality: Option<String>,
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
+    /// The street's lowest OSM way is its `source`. A street joined from
+    /// several ways lists the others here, ascending, so each way's id
+    /// finds the street.
+    pub member_ways: Vec<i64>,
     pub source: SourceProvenance,
 }
 
@@ -692,7 +696,7 @@ impl StreetRecord {
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 8)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -702,6 +706,9 @@ impl Serialize for StreetRecord {
         }
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
+        if !self.member_ways.is_empty() {
+            state.serialize_field("member_ways", &self.member_ways)?;
+        }
         state.serialize_field("source", &self.source)?;
         state.end()
     }

@@ -1281,6 +1281,7 @@ mod tests {
                 prominence: Default::default(),
             }),
             Record::Street(StreetRecord {
+                member_ways: vec![5001, 7_000_000_000],
                 alt_names: Vec::new(),
                 locality: None,
                 name: "King Street".into(),
@@ -1333,13 +1334,21 @@ mod tests {
             let expected = if n == 5 { vec![5, 300] } else { vec![n as u64] };
             assert_eq!(find(&format!("osm:node:{}", object(n))), expected, "{n}");
         }
-        assert_eq!(find("osm:way:5000"), [301]);
+        for way in ["osm:way:5000", "osm:way:5001", "osm:way:7000000000"] {
+            assert_eq!(
+                find(way),
+                [301],
+                "{way}: a street is found by each of its ways"
+            );
+        }
         assert_eq!(find("openaddresses:nz/countrywide:row:7"), [302]);
         for absent in [
             "osm:node:9",
             "osm:node:1019",
             &format!("osm:way:{}", object(5)),
             "osm:way:6000",
+            "osm:node:5001",
+            "osm:relation:7000000000",
             "osm:relation:9",
             "openaddresses:nz/countrywide:row:8",
             "openaddresses:other:row:7",
@@ -1351,6 +1360,11 @@ mod tests {
             1 + 2 * (manifest.record_count - 2),
             "a width byte, then two bytes for every record but the interpolation and the derived \
              country"
+        );
+        assert_eq!(
+            reader.section_sizes()["source_ids/ways"],
+            1 + 2 * (8 + 2),
+            "a width byte, then a way id and a two-byte record id for each of the street's ways"
         );
     }
 

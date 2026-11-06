@@ -798,6 +798,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
     writer
         .write(
             &StreetRecord {
+                member_ways: Vec::new(),
                 alt_names: Vec::new(),
                 locality: None,
                 name: "King Street".to_string(),
