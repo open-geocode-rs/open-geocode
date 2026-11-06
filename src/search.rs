@@ -531,6 +531,18 @@ impl TextSearcher {
         // One hit past the limit, so the last one asked for has a margin;
         // [`CHOOSER_HITS`] at least, so the answer is chosen among them.
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
+        // Name pass first: address reading scans planet-wide context postings
+        // and adds nothing once names fill the limit.
+        let mut named = if self.places {
+            self.places_by_name(query_text, &filters, options.focus, limit)?
+        } else {
+            Vec::new()
+        };
+        if named.len() >= limit {
+            self.rate(&mut named);
+            named.truncate(limit);
+            return Ok(named);
+        }
         let (_, mut hits) = self.search_variants(
             query_text,
             &[],
@@ -554,7 +566,6 @@ impl TextSearcher {
         // yet to weigh the two.
         if self.places {
             hits.sort_by_key(|hit| (hit.features.pass, hit.features.dropped_words));
-            let named = self.places_by_name(query_text, &filters, options.focus, limit)?;
             if !named.is_empty() {
                 let mut seen = named
                     .iter()
