@@ -2781,10 +2781,18 @@ mod router_tests {
             StatusCode::METHOD_NOT_ALLOWED
         );
         let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 
     fn metrics_text(reply: &Reply) -> String {
         String::from_utf8(reply.body.clone()).expect("metrics are text")
+    }
+
+    /// Whole lines, so a count of 20 does not pass for 2.
+    fn assert_samples(text: &str, samples: &[&str]) {
+        for sample in samples {
+            assert!(text.lines().any(|line| line == *sample), "{sample}\n{text}");
+        }
     }
 
     #[tokio::test]
@@ -2806,39 +2814,21 @@ mod router_tests {
 
         let reply = send(router, request("GET", "/metrics")).await;
         let text = metrics_text(&reply);
-        assert!(
-            text.contains(
-                r#"open_geocode_http_requests_total{route="/geocode",method="GET",status="200"} 2"#
-            ),
-            "{text}"
+        let build_info = format!(
+            r#"open_geocode_build_info{{version="{}"}} 1"#,
+            env!("CARGO_PKG_VERSION")
         );
-        assert!(
-            text.contains(
-                r#"open_geocode_http_requests_total{route="unmatched",method="GET",status="404"} 1"#
-            ),
-            "{text}"
-        );
-        assert!(text.contains(r#"method="other",status="405""#), "{text}");
-        assert!(
-            text.contains(
-                r#"open_geocode_http_request_duration_seconds_count{route="/geocode"} 3"#
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("open_geocode_http_requests_in_flight 1\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                r#"open_geocode_build_info{{version="{}"}} 1"#,
-                env!("CARGO_PKG_VERSION")
-            )),
-            "{text}"
-        );
-        assert!(
-            text.contains("open_geocode_batch_slots_in_use 0\n"),
-            "{text}"
+        assert_samples(
+            &text,
+            &[
+                r#"open_geocode_http_requests_total{route="/geocode",method="GET",status="200"} 2"#,
+                r#"open_geocode_http_requests_total{route="unmatched",method="GET",status="404"} 1"#,
+                r#"open_geocode_http_requests_total{route="/geocode",method="other",status="405"} 1"#,
+                r#"open_geocode_http_request_duration_seconds_count{route="/geocode"} 3"#,
+                "open_geocode_http_requests_in_flight 1",
+                &build_info,
+                "open_geocode_batch_slots_in_use 0",
+            ],
         );
         for private in [
             "King", "king", "M5V", "secret", "lane", "48151623", "such", "address=", "?",
@@ -2846,6 +2836,7 @@ mod router_tests {
             assert!(!text.contains(private), "{private} leaked:\n{text}");
         }
         let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 
     #[tokio::test]
@@ -2866,18 +2857,41 @@ mod router_tests {
         assert_eq!(reply.status, StatusCode::OK);
 
         let text = metrics_text(&send(router, request("GET", "/metrics")).await);
-        assert!(
-            text.contains(r#"open_geocode_batch_items_total{outcome="succeeded"} 2"#),
-            "{text}"
-        );
-        assert!(
-            text.contains(r#"open_geocode_batch_items_total{outcome="failed"} 1"#),
-            "{text}"
-        );
-        assert!(
-            text.contains(r#"route="/geocode",method="POST",status="200""#),
-            "{text}"
+        assert_samples(
+            &text,
+            &[
+                r#"open_geocode_batch_items_total{outcome="succeeded"} 2"#,
+                r#"open_geocode_batch_items_total{outcome="failed"} 1"#,
+                r#"open_geocode_http_requests_total{route="/geocode",method="POST",status="200"} 1"#,
+            ],
         );
         let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    #[tokio::test]
+    async fn metrics_count_job_rows_by_outcome() {
+        let pack = temp_path("metrics-jobs");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true).with_metrics(), None, None);
+
+        let body = "{\"lon\": -79.0, \"lat\": 43.0}\n{\"lon\": 999, \"lat\": 0}\nnot json\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", body),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+
+        let text = metrics_text(&send(router, request("GET", "/metrics")).await);
+        assert_samples(
+            &text,
+            &[
+                r#"open_geocode_batch_items_total{outcome="succeeded"} 1"#,
+                r#"open_geocode_batch_items_total{outcome="failed"} 2"#,
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 }
