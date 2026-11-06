@@ -578,8 +578,10 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
          example = "Rijksmuseum Amsterdam",
          max_length = 256),
         ("ids" = Option<String>, Query,
-         description = "Comma-separated stable ids of places or areas, at most 50, \
-                        such as `osm:node:1383955044,osm:way:4`.",
+         description = "Comma-separated stable ids of places, areas or streets, at \
+                        most 50, such as `osm:node:1383955044,osm:way:4`. A \
+                        street answers to the id of any of its ways; when a \
+                        place and a street share an id, the place answers.",
          example = "osm:node:1383955044"),
         ("limit" = Option<usize>, Query,
          description = "Maximum number of results. `0`, the default, lets the \

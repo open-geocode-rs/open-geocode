@@ -1055,6 +1055,7 @@ fn record_heap_bytes(record: &Record) -> usize {
             record.name.len()
                 + strings_heap_bytes(&record.alt_names)
                 + record.locality.as_ref().map_or(0, String::len)
+                + record.other_ways.len() * 8
         }
         Record::Postcode(record) => record.postcode.len(),
         Record::Place(_, record) => {
@@ -1174,6 +1175,10 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             encode_point(out, record.representative_point);
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
+            put_u64(out, record.other_ways.len() as u64);
+            for way in &record.other_ways {
+                put_i64(out, *way);
+            }
         }
         Record::Postcode(record) => {
             put_str(out, &record.postcode);
@@ -1266,6 +1271,13 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
             representative_point: decode_point(input)?,
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
+            other_ways: {
+                let count = get_u64(input)?;
+                if count > input.len() as u64 {
+                    return Err(Error::Decode("spilled street's ways are truncated"));
+                }
+                (0..count).map(|_| get_i64(input)).collect::<Result<_>>()?
+            },
         }),
         Layer::Postcode => Record::Postcode(PostcodeRecord {
             postcode: get_string(input)?,
@@ -1502,6 +1514,7 @@ mod tests {
     #[test]
     fn out_of_range_line_coordinates_are_not_spilled_as_zero() {
         let record = Record::Street(StreetRecord {
+            other_ways: Vec::new(),
             road_class: RoadClass::Residential,
             alt_names: Vec::new(),
             name: "Edge Road".into(),
@@ -1528,6 +1541,7 @@ mod tests {
         );
 
         let mut infinite = Record::Street(StreetRecord {
+            other_ways: Vec::new(),
             road_class: RoadClass::Residential,
             alt_names: Vec::new(),
             name: "Edge Road".into(),
@@ -1562,6 +1576,7 @@ mod tests {
         });
         let records = [
             Record::Street(StreetRecord {
+                other_ways: Vec::new(),
                 road_class: RoadClass::Residential,
                 alt_names: Vec::new(),
                 name: "King Street".into(),
@@ -1572,6 +1587,7 @@ mod tests {
             }),
             // The ways of one street, merged.
             Record::Street(StreetRecord {
+                other_ways: vec![14, 2_000_000_000],
                 road_class: RoadClass::Residential,
                 alt_names: vec!["Te Huarahi o King".into()],
                 name: "King Street".into(),

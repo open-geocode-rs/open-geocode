@@ -30,7 +30,9 @@
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
 //!                     (a street's locality after them, behind a presence byte,
-//!                     then its road class as one byte)
+//!                     then its road class as one byte, then its other ways
+//!                     as a varint count and varint deltas, each from the way
+//!                     before it, the street's own way first)
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
@@ -117,7 +119,18 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 9;
+pub const RECORDS_VERSION: u32 = 10;
+
+/// One id the id catalogue holds, and the record it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogueId {
+    pub record_id: RecordId,
+    pub object_type: ObjectType,
+    pub object_id: i64,
+    /// Whether the record is a street: when a place and a street share an
+    /// id (a way that is a market and a piece of a road), the place answers.
+    pub street: bool,
+}
 
 pub const BLOCK_RECORDS: u64 = 64;
 const LABEL: &str = "pack-records";
@@ -826,6 +839,7 @@ impl Writer {
                 self.put_strings(out, &record.alt_names)?;
                 self.put_optional_strings(out, &[record.locality.as_deref()])?;
                 out.push(record.road_class.to_byte());
+                put_other_ways(out, record.source.object_id, &record.other_ways)?;
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
@@ -1219,6 +1233,7 @@ impl Reader {
                     locality
                 },
                 road_class: road_class_field(&mut fields)?,
+                other_ways: other_ways_field(&mut fields, header.object()?.1)?,
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance(&self.datasets)?,
@@ -1583,27 +1598,39 @@ impl Reader {
         })
     }
 
-    /// The places of block `block` (POIs and areas drawn from OpenStreetMap,
-    /// which the id catalogue holds), each with the OSM object it is, and a
-    /// POI once more for each object merged into it (see
-    /// [`PoiRecord::aliases`]). Reads plain headers, and a POI's fields up to
-    /// its aliases: a continued record is an address.
-    pub fn block_places(&self, block: u64) -> Result<Vec<(RecordId, ObjectType, i64)>> {
+    /// The ids the id catalogue holds in block `block`: each place (a POI or
+    /// an area drawn from OpenStreetMap) and street with the OSM object it
+    /// is, a POI once more for each object merged into it (see
+    /// [`PoiRecord::aliases`]), and a street once more for each of its other
+    /// ways (see [`StreetRecord::other_ways`]). Reads plain headers, and a
+    /// POI's or street's fields up to its aliases or ways: a continued
+    /// record is an address.
+    pub fn block_ids(&self, block: u64) -> Result<Vec<CatalogueId>> {
         let found = self.block(block)?;
         let strings = self.segment(found.first);
-        let mut places = Vec::new();
+        let mut ids = Vec::new();
         for slot in 0..found.count {
             if found.is_continued(slot) {
                 continue;
             }
             let (header, mut fields) = plain_header(found.base, strings, found.plain_body(slot)?)?;
+            let street = header.layer == Layer::Street;
             let place = header.layer == Layer::Poi || header.layer.place_layer().is_some();
-            if !place || header.dataset.is_some() || header.source_kind == SourceKind::Other {
+            if !(place || street)
+                || header.dataset.is_some()
+                || header.source_kind == SourceKind::Other
+            {
                 continue;
             }
             let record_id = found.first + slot as u64;
             let (object_type, object_id) = header.object()?;
-            places.push((record_id, object_type, object_id));
+            let id = |object_type, object_id| CatalogueId {
+                record_id,
+                object_type,
+                object_id,
+                street,
+            };
+            ids.push(id(object_type, object_id));
             if header.layer == Layer::Poi {
                 // Name and category ids, alternate names, prominence and
                 // importance, Wikidata item: then the aliases.
@@ -1615,14 +1642,27 @@ impl Reader {
                 get_u8(&mut fields)?;
                 get_u8(&mut fields)?;
                 item_field(&mut fields)?;
-                places.extend(
+                ids.extend(
                     aliases_field(&mut fields)?
                         .into_iter()
-                        .map(|(kind, id)| (record_id, kind, id)),
+                        .map(|(kind, alias)| id(kind, alias)),
+                );
+            } else if street {
+                // Name, alternate names, locality, road class: then the ways.
+                get_u32(&mut fields)?;
+                for _ in 0..get_u64(&mut fields)? {
+                    get_u32(&mut fields)?;
+                }
+                self.optional_strings::<1>(header.strings, &mut fields)?;
+                road_class_field(&mut fields)?;
+                ids.extend(
+                    other_ways_field(&mut fields, object_id)?
+                        .into_iter()
+                        .map(|way| id(ObjectType::Way, way)),
                 );
             }
         }
-        Ok(places)
+        Ok(ids)
     }
 
     fn locate(&self, id: RecordId) -> Result<(Block<'_>, usize)> {
@@ -1970,6 +2010,7 @@ impl Reader {
                 self.string_list(header.strings, fields)?;
                 self.optional_strings::<1>(header.strings, fields)?;
                 road_class_field(fields)?;
+                other_ways_field(fields, header.object()?.1)?;
             }
             Layer::Postcode => {
                 get_u32(fields)?;
@@ -2247,6 +2288,46 @@ pub(crate) fn aliases_field(fields: &mut &[u8]) -> Result<Vec<(ObjectType, i64)>
         .collect()
 }
 
+/// A street's other ways (see [`StreetRecord::other_ways`]): a varint count,
+/// then each way's number as a varint delta from the way before it, the
+/// street's own way first. A road's ways are mapped together, so their
+/// numbers lie close and a delta takes a byte or two.
+pub(crate) fn put_other_ways(out: &mut Vec<u8>, own: i64, ways: &[i64]) -> Result<()> {
+    put_u64(out, ways.len() as u64);
+    let mut before = own;
+    for way in ways {
+        let delta = way
+            .checked_sub(before)
+            .and_then(|delta| u64::try_from(delta).ok())
+            .filter(|delta| *delta > 0)
+            .ok_or_else(|| {
+                Error::Inconsistent(format!(
+                    "a street's way {way} is not above the way before it, {before}"
+                ))
+            })?;
+        put_u64(out, delta);
+        before = *way;
+    }
+    Ok(())
+}
+
+pub(crate) fn other_ways_field(fields: &mut &[u8], own: i64) -> Result<Vec<i64>> {
+    let count = get_u64(fields)?;
+    if count > fields.len() as u64 {
+        return Err(Error::Decode("a street's way list is truncated"));
+    }
+    let mut before = own;
+    (0..count)
+        .map(|_| {
+            before = i64::try_from(get_u64(fields)?)
+                .ok()
+                .and_then(|delta| before.checked_add(delta))
+                .ok_or(Error::Decode("a street's way is out of range"))?;
+            Ok(before)
+        })
+        .collect()
+}
+
 /// A Wikidata item number written as a varint, 0 for none.
 fn item_field(fields: &mut &[u8]) -> Result<Option<u32>> {
     match get_u64(fields)? {
@@ -2467,6 +2548,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, 1),
             }),
             Record::Street(StreetRecord {
+                other_ways: vec![5, 1_400_000_000],
                 road_class: RoadClass::Residential,
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
                 locality: None,

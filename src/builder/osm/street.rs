@@ -72,6 +72,7 @@ pub(crate) fn emit_street(
     let record = street_name(tags).zip(points).and_then(|(name, points)| {
         let built = line_string_geometry(points)?;
         Some(StreetRecord {
+            other_ways: Vec::new(),
             alt_names: alternate_names(tags, &name),
             locality: None,
             road_class: tags
@@ -111,9 +112,9 @@ const METRES_PER_DEGREE: f64 = 111_320.0;
 /// The ways of one street name in one area, as streets: a way whose end
 /// lies within [`JOIN_GAP_M`] of another's line joins it, and a street is
 /// every way so joined. It keeps the name, source and id of its lowest way,
-/// every other name its ways have, the most important class of its ways, a
-/// line part per way, and the vertex
-/// nearest the middle of its ways as its point.
+/// the ids of its other ways, every other name its ways have, the most
+/// important class of its ways, a line part per way, and the vertex nearest
+/// the middle of its ways as its point.
 pub(crate) fn join_ways(mut ways: Vec<StreetRecord>) -> Vec<StreetRecord> {
     if ways.len() < 2 {
         return ways;
@@ -243,6 +244,8 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
         .map(<[_]>::to_vec)
         .collect::<Vec<_>>();
     for way in members {
+        street.other_ways.push(way.source.object_id);
+        street.other_ways.extend(way.other_ways);
         street.road_class = street.road_class.min(way.road_class);
         parts.extend(
             line_parts(&way.geometry)
@@ -259,6 +262,12 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
             }
         }
     }
+    // Two inputs can hold one way twice: each id once, the street's own
+    // left out.
+    let own = street.source.object_id;
+    street.other_ways.sort_unstable();
+    street.other_ways.dedup();
+    street.other_ways.retain(|way| *way != own);
     street.geometry = line_geometry(parts);
     street.representative_point = point;
     street
@@ -373,6 +382,7 @@ mod tests {
         let way = |id: i64, points: &[[f64; 2]], alt_names: &[&str]| {
             let coordinates = points.iter().map(|point| point.to_vec().into()).collect();
             StreetRecord {
+                other_ways: Vec::new(),
                 road_class: RoadClass::Residential,
                 alt_names: alt_names.iter().map(|name| name.to_string()).collect(),
                 name: "King Street".to_string(),
@@ -395,6 +405,17 @@ mod tests {
         assert_eq!(streets.len(), 2);
         let joined = &streets[0];
         assert_eq!(joined.id(), "osm:way:1", "named by its lowest way");
+        assert_eq!(joined.other_ways, [2, 3], "its other ways find it");
+        assert!(streets[1].other_ways.is_empty(), "a lone way has none");
+        // Two inputs that hold the same ways: each id once, its own left out.
+        let twice = join_ways(vec![
+            way(1, &[[-79.0, 43.0], [-79.001, 43.0]], &[]),
+            way(1, &[[-79.0, 43.0], [-79.001, 43.0]], &[]),
+            way(2, &[[-79.0013, 43.0], [-79.002, 43.0]], &[]),
+            way(2, &[[-79.0013, 43.0], [-79.002, 43.0]], &[]),
+        ]);
+        assert_eq!(twice.len(), 1);
+        assert_eq!(twice[0].other_ways, [2]);
         assert_eq!(
             joined.road_class,
             RoadClass::Primary,

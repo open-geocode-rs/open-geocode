@@ -3,9 +3,11 @@
 //!
 //! Map clients keep a place's id, from a shared link, a saved place or a tap
 //! on a map tile, and ask for that place again after any rebuild. The
-//! catalogue holds the places alone, POIs and areas drawn from OpenStreetMap,
-//! whose ids are stable; an address or an imported row is found by its words
-//! or its point.
+//! catalogue holds the places, POIs and areas drawn from OpenStreetMap, and
+//! the streets, whose ids are stable; an address or an imported row is found
+//! by its words or its point. A street is found by the id of any of its ways,
+//! since a tile names the way a tap lands on, and when a place and a street
+//! share an id, the place answers.
 //!
 //! It stores no id. A minimal perfect hash (FMPHGO, from the `ph` crate,
 //! about 2 to 3 bits an id) gives each catalogued id a slot of its own, and
@@ -34,7 +36,7 @@ use crate::{
 };
 
 pub const SECTION: &str = "places/ids";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// The most ids one lookup takes.
 pub const MAX_IDS: usize = 50;
 
@@ -90,17 +92,16 @@ pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
     sealed.add_section(SECTION, VERSION, &bytes)
 }
 
-/// The places of every block, in parallel.
-fn places(records: &records::Reader) -> Result<Vec<([u8; 8], u64)>> {
+/// The catalogued ids of every block, in parallel, each with whether its
+/// record is a street.
+fn entries(records: &records::Reader) -> Result<Vec<([u8; 8], bool, u64)>> {
     let per_block = (0..records.block_count())
         .into_par_iter()
         .map(|block| {
             Ok(records
-                .block_places(block)?
+                .block_ids(block)?
                 .into_iter()
-                .filter_map(|(_, object_type, object_id)| {
-                    Some((key(object_type, object_id)?, block))
-                })
+                .filter_map(|id| Some((key(id.object_type, id.object_id)?, id.street, block)))
                 .collect::<Vec<_>>())
         })
         .collect::<Result<Vec<_>>>()?;
@@ -108,19 +109,20 @@ fn places(records: &records::Reader) -> Result<Vec<([u8; 8], u64)>> {
 }
 
 fn build(records: &records::Reader) -> Result<Vec<u8>> {
-    let mut places = places(records)?;
-    // One object can be two places (a node that is a town and a POI); the
-    // block of the first keeps it.
-    places.sort_unstable_by_key(|(key, block)| (*key, *block));
-    places.dedup_by_key(|(key, _)| *key);
-    let keys = places.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let mut places = entries(records)?;
+    // One object can be two records (a node that is a town and a POI, a way
+    // that is a market and a piece of a road): a place's block keeps it over
+    // a street's, and the first block over a later one.
+    places.sort_unstable_by_key(|(key, street, block)| (*key, *street, *block));
+    places.dedup_by_key(|(key, ..)| *key);
+    let keys = places.iter().map(|(key, ..)| *key).collect::<Vec<_>>();
     let function = GOFunction::from_slice(&keys);
     drop(keys);
     let width = (u64::BITS - records.block_count().leading_zeros())
         .div_ceil(8)
         .max(1) as usize;
     let mut values = vec![0u8; places.len() * width];
-    for (key, block) in &places {
+    for (key, _, block) in &places {
         let slot = function
             .get(key)
             .ok_or_else(|| Error::Inconsistent("a catalogued id has no slot".into()))?
@@ -178,7 +180,8 @@ impl Catalogue {
         })))
     }
 
-    /// The records whose own id is `object_type`/`object_id`, by id order.
+    /// The records whose id is `object_type`/`object_id`, by id order: its
+    /// places, or its street when no place has it.
     pub fn find(
         &self,
         records: &records::Reader,
@@ -201,11 +204,16 @@ impl Catalogue {
         if block >= records.block_count() {
             return Ok(Vec::new());
         }
-        Ok(records
-            .block_places(block)?
+        let found = records
+            .block_ids(block)?
             .into_iter()
-            .filter(|(_, kind, id)| *kind == object_type && *id == object_id)
-            .map(|(record_id, _, _)| record_id)
+            .filter(|id| id.object_type == object_type && id.object_id == object_id)
+            .collect::<Vec<_>>();
+        let place = found.iter().any(|id| !id.street);
+        Ok(found
+            .into_iter()
+            .filter(|id| !(place && id.street))
+            .map(|id| id.record_id)
             .collect())
     }
 
@@ -224,8 +232,9 @@ mod tests {
         pack::{Reader, Writer},
         record::{
             AddressComponents, AddressRecord, LocationPrecision, PlaceLayer, PlaceRecord,
-            PoiRecord, Record, SourceProvenance, point_geometry,
+            PoiRecord, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
         },
+        util::geo::line_geometry,
     };
 
     use super::*;
@@ -338,6 +347,79 @@ mod tests {
                 .is_empty(),
             "an id no record has"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn a_street_answers_to_each_of_its_ways_and_a_place_comes_first() {
+        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
+        let mut writer = Writer::create(&dir).expect("writer");
+        let street = |own: i64, other_ways: Vec<i64>, lon: f64| -> Record {
+            Record::Street(StreetRecord {
+                name: "Ponsonby Road".to_string(),
+                road_class: RoadClass::Secondary,
+                alt_names: Vec::new(),
+                locality: None,
+                geometry: line_geometry(vec![vec![
+                    vec![lon, -36.85].into(),
+                    vec![lon + 0.001, -36.85].into(),
+                ]]),
+                representative_point: [lon, -36.85],
+                source: SourceProvenance::osm(ObjectType::Way, own),
+                other_ways,
+            })
+        };
+        writer
+            .write(&street(700, vec![701, 702], 174.74), None)
+            .expect("write");
+        // Way 701 is also a market: the place answers to it.
+        let market: Record = PoiRecord {
+            alt_names: Vec::new(),
+            name: "Ponsonby Market".to_string(),
+            category: "amenity:marketplace".to_string(),
+            address: None,
+            geometry: point_geometry(174.7405, -36.85),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Way, 701),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        }
+        .into();
+        writer.write(&market, None).expect("write");
+        // A street far beyond the first block, whose ways jump far apart.
+        for index in 0..100 {
+            writer
+                .write(&street(10_000 + index, Vec::new(), 175.0), None)
+                .expect("write");
+        }
+        writer
+            .write(&street(20_000, vec![1_400_000_000], 175.1), None)
+            .expect("write");
+        writer.finish().expect("finish");
+        let pack = Reader::open(&dir).expect("pack");
+        let catalogue = Catalogue::open(pack.container())
+            .expect("open")
+            .expect("a catalogue");
+        let find = |object_id| {
+            catalogue
+                .find(pack.records(), ObjectType::Way, object_id)
+                .expect("find")
+                .into_iter()
+                .map(|id| pack.record_summary(id).expect("summary"))
+                .map(|summary| (summary.layer, summary.name))
+                .collect::<Vec<_>>()
+        };
+        let road = vec![("street".to_string(), "Ponsonby Road".to_string())];
+        assert_eq!(find(700), road, "its own way");
+        assert_eq!(find(702), road, "another of its ways");
+        assert_eq!(
+            find(701),
+            [("poi".to_string(), "Ponsonby Market".to_string())],
+            "a place before the street that shares its id"
+        );
+        assert_eq!(find(1_400_000_000)[0].1, "Ponsonby Road");
+        assert!(find(703).is_empty(), "a way of no street");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

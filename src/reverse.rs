@@ -918,6 +918,7 @@ mod tests {
 
     fn street_record() -> StreetRecord {
         StreetRecord {
+            other_ways: Vec::new(),
             road_class: crate::record::RoadClass::Residential,
             alt_names: Vec::new(),
             locality: None,

@@ -56,6 +56,9 @@ pub struct StreetRecord {
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
+    /// The ids of the other OSM ways joined into it, ascending: a map tile
+    /// names the way a tap lands on, and any of them finds the street.
+    pub other_ways: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -860,7 +863,7 @@ impl StreetRecord {
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 9)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 10)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -872,6 +875,16 @@ impl Serialize for StreetRecord {
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
         state.serialize_field("source", &self.source)?;
+        if self.other_ways.is_empty() {
+            state.skip_field("aliases")?;
+        } else {
+            let aliases = self
+                .other_ways
+                .iter()
+                .map(|way| labels::osm_record_id(ObjectType::Way, *way))
+                .collect::<Vec<_>>();
+            state.serialize_field("aliases", &aliases)?;
+        }
         state.end()
     }
 }

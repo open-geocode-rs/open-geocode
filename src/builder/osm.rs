@@ -4588,6 +4588,24 @@ mod tests {
             ],
             "a street in a local board is named by its district, one in a town by the town"
         );
+        // A tap on any way of the joined road finds the road.
+        let catalogue = crate::ids::Catalogue::open(reader.container())
+            .expect("open")
+            .expect("a catalogue");
+        let found = |way: i64| {
+            catalogue
+                .find(reader.records(), ObjectType::Way, way)
+                .expect("find")
+                .into_iter()
+                .map(|id| reader.record_summary(id).expect("summary").id)
+                .collect::<Vec<_>>()
+        };
+        for way in [700, 701, 702] {
+            assert_eq!(found(way), ["osm:way:700"], "way {way}");
+        }
+        assert_eq!(found(703), ["osm:way:703"], "the far road stays its own");
+        assert_eq!(found(711), ["osm:way:710"]);
+        assert!(found(720).is_empty(), "a platform is no street");
         let _ = fs::remove_dir_all(dir);
     }
 

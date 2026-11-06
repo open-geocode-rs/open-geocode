@@ -213,8 +213,8 @@ enum PackCommand {
         #[arg(long)]
         row: Option<RecordId>,
 
-        /// Read the place or area of a stable id, for example osm:node:123,
-        /// through the Pack's id catalogue.
+        /// Read the place, area or street of a stable id, for example
+        /// osm:node:123, through the Pack's id catalogue.
         #[arg(long)]
         id: Option<String>,
 
@@ -958,7 +958,7 @@ fn inspect_record_by_source_id_json(
     };
     let found = catalogue.find(reader.records(), object_type, object_id)?;
     match found.as_slice() {
-        [] => bail!("no place or area has id {source_id}"),
+        [] => bail!("no place, area or street has id {source_id}"),
         [record_id] => inspect_record_json(reader, *record_id, include_context),
         records => Ok(Value::Array(
             records
