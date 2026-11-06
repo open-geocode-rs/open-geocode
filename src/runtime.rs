@@ -27,7 +27,7 @@ use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
         batch::{self, Lookup},
-        bounds, health,
+        bounds, cache, health,
         jobs::{self, JobStore},
         method, openapi,
         param::Param,
@@ -74,6 +74,9 @@ pub struct ServeOptions {
     /// Longest the server takes to stop once Ctrl-C or SIGTERM arrives;
     /// what is still open then is dropped. Zero drops it at once.
     pub shutdown_timeout: Duration,
+    /// Seconds a client may reuse a lookup answer without asking again; 0
+    /// sends `no-cache`, so it revalidates with the ETag each time.
+    pub cache_max_age: u32,
 }
 
 #[derive(Clone)]
@@ -316,11 +319,13 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
     let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
     tokio::spawn(jobs::sweep_forever(state.clone()));
+    let cache = cache::Cache::new(state.pack.container().fingerprint(), options.cache_max_age);
     let app = build_router(
         state.clone(),
         options.demo.as_deref(),
         options.basemap.as_deref(),
-    );
+    )
+    .layer(middleware::from_fn_with_state(cache, cache::layer));
 
     let listener = TcpListener::bind(options.bind)
         .await
@@ -3527,6 +3532,116 @@ mod router_tests {
         let refused = place_ids(&huge, 7).unwrap_err();
         assert_eq!(refused.error_code().as_str(), "limit_too_large");
         assert_eq!(refused.invalid_params()[0].reason, "at most 7 ids");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn with_headers(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = request(method, uri);
+        for (name, value) in headers {
+            request.headers_mut().append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        request
+    }
+
+    fn cached_router(pack: &Path, max_age: u32) -> Router {
+        let state = state_for(pack, true);
+        let cache = cache::Cache::new(state.pack.container().fingerprint(), max_age);
+        build_router(state, None, None).layer(middleware::from_fn_with_state(cache, cache::layer))
+    }
+
+    #[tokio::test]
+    async fn lookups_carry_an_etag_and_answer_a_match_with_304() {
+        let pack = temp_path("etag");
+        write_pack(&pack);
+        let router = cached_router(&pack, 0);
+        let uri = "/geocode?address=10%20King%20Street";
+
+        let first = send(router.clone(), request("GET", uri)).await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(header_value(&first, "cache-control"), Some("no-cache"));
+        let etag = header_value(&first, "etag").expect("etag").to_string();
+
+        let again = send(router.clone(), request("GET", uri)).await;
+        assert_eq!(header_value(&again, "etag"), Some(etag.as_str()));
+
+        let other = send(router.clone(), request("GET", "/geocode?address=x")).await;
+        assert_ne!(header_value(&other, "etag"), Some(etag.as_str()));
+
+        for presented in [etag.clone(), format!("\"nope\", {etag}"), "*".to_string()] {
+            let reply = send(
+                router.clone(),
+                with_headers("GET", uri, &[("if-none-match", &presented)]),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::NOT_MODIFIED, "{presented}");
+            assert!(reply.body.is_empty());
+            assert_eq!(header_value(&reply, "etag"), Some(etag.as_str()));
+            assert_eq!(header_value(&reply, "cache-control"), Some("no-cache"));
+            assert_eq!(header_value(&reply, "vary"), Some("accept-encoding"));
+        }
+
+        let stale = send(
+            router,
+            with_headers("GET", uri, &[("if-none-match", "W/\"0000000000000000\"")]),
+        )
+        .await;
+        assert_eq!(stale.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn only_successful_lookups_are_cacheable() {
+        let pack = temp_path("etag-errors");
+        write_pack(&pack);
+        let router = cached_router(&pack, 0);
+
+        for (method, uri, status) in [
+            ("GET", "/places?q=", StatusCode::BAD_REQUEST),
+            ("GET", "/reverse?lon=999&lat=0", StatusCode::BAD_REQUEST),
+            ("GET", "/does-not-exist", StatusCode::NOT_FOUND),
+            ("POST", "/places", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert_eq!(reply.status, status, "{method} {uri}");
+            assert!(reply.headers.get(header::CACHE_CONTROL).is_none(), "{uri}");
+            assert!(reply.headers.get(header::ETAG).is_none(), "{uri}");
+        }
+
+        for (method, uri) in [
+            ("GET", "/healthz"),
+            ("GET", "/readyz"),
+            ("GET", "/openapi.json"),
+            ("GET", "/jobs/abc"),
+            ("QUERY", "/geocode"),
+        ] {
+            let reply = send(router.clone(), request(method, uri)).await;
+            assert!(reply.headers.get(header::CACHE_CONTROL).is_none(), "{uri}");
+            assert!(reply.headers.get(header::ETAG).is_none(), "{uri}");
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn a_max_age_lets_clients_reuse_an_answer() {
+        let pack = temp_path("etag-max-age");
+        write_pack(&pack);
+        let reply = send(
+            cached_router(&pack, 600),
+            request("GET", "/places?q=King%20Street"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            header_value(&reply, "cache-control"),
+            Some("public, max-age=600")
+        );
+        assert!(reply.headers.get(header::ETAG).is_some());
+
         let _ = std::fs::remove_dir_all(&pack);
     }
 }
