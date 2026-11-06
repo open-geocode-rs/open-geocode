@@ -1,5 +1,5 @@
 //! `GET /metrics`, behind `serve --metrics`: Prometheus counters of the
-//! server, one registry per [`AppState`](crate::runtime::AppState).
+//! server, one set per [`AppState`](crate::runtime::AppState).
 //!
 //! Labels are bounded by construction. A route is the template the router
 //! matched, never the URI: the path and query hold the addresses people
@@ -7,7 +7,15 @@
 //! series. Methods outside the standard set share one label for the same
 //! reason.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fmt::Write,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use axum::{
     extract::{MatchedPath, Request, State},
@@ -15,53 +23,45 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use prometheus_client::{
-    encoding::{EncodeLabelSet, text::encode},
-    metrics::{
-        counter::Counter,
-        family::Family,
-        gauge::Gauge,
-        histogram::{Histogram, exponential_buckets},
-        info::Info,
-    },
-    registry::{Registry, Unit},
-};
 
 use crate::runtime::AppState;
 
-/// OpenMetrics, which is what `prometheus-client` writes; Prometheus reads
-/// it when the content type says so.
+/// Prometheus reads OpenMetrics when the content type says so.
 const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 /// The route of a request no route matched: the 404 fallbacks.
 const UNMATCHED: &str = "unmatched";
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct RequestLabels {
-    route: String,
-    method: &'static str,
-    status: u16,
-}
+/// Upper bounds of the latency buckets, in seconds: 1 ms times powers of 4.
+const BUCKETS: [&str; 10] = [
+    "0.001", "0.004", "0.016", "0.064", "0.256", "1.024", "4.096", "16.384", "65.536", "262.144",
+];
+const BOUNDS: [f64; 10] = [
+    0.001, 0.004, 0.016, 0.064, 0.256, 1.024, 4.096, 16.384, 65.536, 262.144,
+];
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct RouteLabels {
-    route: String,
-}
+// Written by hand, not with prometheus-client: that crate grew the shipped
+// binary past CI's size limit for five metrics.
+#[derive(Clone, Default)]
+pub(crate) struct Metrics(Arc<Inner>);
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct OutcomeLabels {
-    outcome: &'static str,
-}
-
-#[derive(Clone)]
-pub(crate) struct Metrics {
-    registry: Arc<Registry>,
-    requests: Family<RequestLabels, Counter>,
-    duration: Family<RouteLabels, Histogram>,
-    in_flight: Gauge,
-    batch_items: Family<OutcomeLabels, Counter>,
-    slots_in_use: Gauge,
+#[derive(Default)]
+struct Inner {
+    /// By route, method and status.
+    requests: Mutex<BTreeMap<(String, &'static str, u16), u64>>,
+    durations: Mutex<BTreeMap<String, Histogram>>,
+    in_flight: AtomicI64,
+    succeeded: AtomicU64,
+    failed: AtomicU64,
     slots: usize,
+}
+
+#[derive(Default)]
+struct Histogram {
+    /// Not cumulative: each observation counts in its own bucket only.
+    buckets: [u64; BUCKETS.len()],
+    count: u64,
+    sum: f64,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -73,86 +73,136 @@ impl std::fmt::Debug for Metrics {
 impl Metrics {
     /// `slots` is how many batches and jobs may run at once.
     pub(crate) fn new(slots: usize) -> Self {
-        let mut registry = Registry::with_prefix("open_geocode");
-        let requests = Family::<RequestLabels, Counter>::default();
-        let duration = Family::<RouteLabels, Histogram>::new_with_constructor(|| {
-            Histogram::new(exponential_buckets(0.001, 4.0, 10))
-        });
-        let in_flight = Gauge::default();
-        let batch_items = Family::<OutcomeLabels, Counter>::default();
-        let slots_in_use = Gauge::default();
-        let slots_total = Gauge::<i64>::default();
-        slots_total.set(slots as i64);
-
-        registry.register(
-            "build",
-            "The server build",
-            Info::new(vec![("version", env!("CARGO_PKG_VERSION"))]),
-        );
-        registry.register(
-            "http_requests",
-            "Requests answered, by matched route, method and status",
-            requests.clone(),
-        );
-        registry.register_with_unit(
-            "http_request_duration",
-            "Time to the response headers, by matched route",
-            Unit::Seconds,
-            duration.clone(),
-        );
-        registry.register(
-            "http_requests_in_flight",
-            "Requests being answered now",
-            in_flight.clone(),
-        );
-        registry.register(
-            "batch_items",
-            "Batch items and job rows answered, by outcome",
-            batch_items.clone(),
-        );
-        registry.register(
-            "batch_slots_in_use",
-            "Batches and jobs running now",
-            slots_in_use.clone(),
-        );
-        registry.register(
-            "batch_slots",
-            "Batches and jobs that may run at once",
-            slots_total,
-        );
-        // Both outcomes from the start, so a rate over no items reads 0
-        // rather than no data.
-        for outcome in ["succeeded", "failed"] {
-            let _ = batch_items.get_or_create(&OutcomeLabels { outcome });
-        }
-        Self {
-            registry: Arc::new(registry),
-            requests,
-            duration,
-            in_flight,
-            batch_items,
-            slots_in_use,
+        Self(Arc::new(Inner {
             slots,
-        }
+            ..Inner::default()
+        }))
     }
 
     pub(crate) fn batch_items(&self, succeeded: usize, failed: usize) {
-        for (outcome, count) in [("succeeded", succeeded), ("failed", failed)] {
-            if count > 0 {
-                self.batch_items
-                    .get_or_create(&OutcomeLabels { outcome })
-                    .inc_by(count as u64);
-            }
-        }
+        self.0
+            .succeeded
+            .fetch_add(succeeded as u64, Ordering::Relaxed);
+        self.0.failed.fetch_add(failed as u64, Ordering::Relaxed);
     }
 
+    fn observe(&self, route: String, method: &'static str, status: u16, seconds: f64) {
+        let mut durations = self.0.durations.lock().expect("metrics lock");
+        let histogram = durations.entry(route.clone()).or_default();
+        let bucket = BOUNDS.partition_point(|bound| *bound < seconds);
+        if let Some(count) = histogram.buckets.get_mut(bucket) {
+            *count += 1;
+        }
+        histogram.count += 1;
+        histogram.sum += seconds;
+        drop(durations);
+        *self
+            .0
+            .requests
+            .lock()
+            .expect("metrics lock")
+            .entry((route, method, status))
+            .or_default() += 1;
+    }
+
+    /// Route templates are ours and hold no `"` or `\`, so label values
+    /// need no escaping.
     fn render(&self, slots_free: usize) -> String {
-        self.slots_in_use
-            .set(self.slots.saturating_sub(slots_free) as i64);
+        let inner = &self.0;
         let mut text = String::new();
-        encode(&mut text, &self.registry).expect("encoding into a String cannot fail");
+        render_family(&mut text, "build", "info", "The server build");
+        let _ = writeln!(
+            text,
+            "open_geocode_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        render_family(
+            &mut text,
+            "http_requests",
+            "counter",
+            "Requests answered, by matched route, method and status",
+        );
+        for ((route, method, status), count) in inner.requests.lock().expect("metrics lock").iter()
+        {
+            let _ = writeln!(
+                text,
+                "open_geocode_http_requests_total{{route=\"{route}\",method=\"{method}\",status=\"{status}\"}} {count}"
+            );
+        }
+
+        let name = "open_geocode_http_request_duration_seconds";
+        render_family(
+            &mut text,
+            "http_request_duration_seconds",
+            "histogram",
+            "Time to the response headers, by matched route",
+        );
+        let _ = writeln!(text, "# UNIT {name} seconds");
+        for (route, histogram) in inner.durations.lock().expect("metrics lock").iter() {
+            let _ = writeln!(text, "{name}_sum{{route=\"{route}\"}} {}", histogram.sum);
+            let _ = writeln!(
+                text,
+                "{name}_count{{route=\"{route}\"}} {}",
+                histogram.count
+            );
+            let mut below = 0;
+            for (bound, count) in BUCKETS.iter().zip(histogram.buckets) {
+                below += count;
+                let _ = writeln!(
+                    text,
+                    "{name}_bucket{{le=\"{bound}\",route=\"{route}\"}} {below}"
+                );
+            }
+            let _ = writeln!(
+                text,
+                "{name}_bucket{{le=\"+Inf\",route=\"{route}\"}} {}",
+                histogram.count
+            );
+        }
+
+        let gauges = [
+            (
+                "http_requests_in_flight",
+                "Requests being answered now",
+                inner.in_flight.load(Ordering::Relaxed),
+            ),
+            (
+                "batch_slots_in_use",
+                "Batches and jobs running now",
+                inner.slots.saturating_sub(slots_free) as i64,
+            ),
+            (
+                "batch_slots",
+                "Batches and jobs that may run at once",
+                inner.slots as i64,
+            ),
+        ];
+        render_family(
+            &mut text,
+            "batch_items",
+            "counter",
+            "Batch items and job rows answered, by outcome",
+        );
+        for (outcome, count) in [("succeeded", &inner.succeeded), ("failed", &inner.failed)] {
+            let _ = writeln!(
+                text,
+                "open_geocode_batch_items_total{{outcome=\"{outcome}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
+        for (name, help, value) in gauges {
+            render_family(&mut text, name, "gauge", help);
+            let _ = writeln!(text, "open_geocode_{name} {value}");
+        }
+        text.push_str("# EOF\n");
         text
     }
+}
+
+fn render_family(text: &mut String, name: &str, kind: &str, help: &str) {
+    let _ = writeln!(text, "# HELP open_geocode_{name} {help}.");
+    let _ = writeln!(text, "# TYPE open_geocode_{name} {kind}");
 }
 
 /// Counts a request, its latency and the requests in flight. Latency ends
@@ -170,24 +220,16 @@ pub(crate) async fn track(
         .to_owned();
     let method = method_label(request.method());
     let started = Instant::now();
-    let _in_flight = InFlight::enter(&metrics.in_flight);
+    let _in_flight = InFlight::enter(&metrics.0.in_flight);
 
     let response = next.run(request).await;
 
-    metrics
-        .duration
-        .get_or_create(&RouteLabels {
-            route: route.clone(),
-        })
-        .observe(started.elapsed().as_secs_f64());
-    metrics
-        .requests
-        .get_or_create(&RequestLabels {
-            route,
-            method,
-            status: response.status().as_u16(),
-        })
-        .inc();
+    metrics.observe(
+        route,
+        method,
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
     response
 }
 
@@ -208,18 +250,18 @@ fn method_label(method: &Method) -> &'static str {
 
 /// Decrements on drop: a client that hangs up mid-request drops the
 /// handler's future, and the gauge must still come back down.
-struct InFlight<'a>(&'a Gauge);
+struct InFlight<'a>(&'a AtomicI64);
 
 impl<'a> InFlight<'a> {
-    fn enter(gauge: &'a Gauge) -> Self {
-        gauge.inc();
+    fn enter(gauge: &'a AtomicI64) -> Self {
+        gauge.fetch_add(1, Ordering::Relaxed);
         Self(gauge)
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0.dec();
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -230,4 +272,32 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buckets_are_cumulative_and_the_text_ends_with_eof() {
+        let metrics = Metrics::new(4);
+        metrics.observe("/search".into(), "GET", 200, 0.005);
+        metrics.observe("/search".into(), "GET", 200, 0.001);
+        metrics.observe("/search".into(), "GET", 200, 999.0);
+        let text = metrics.render(3);
+        let name = "open_geocode_http_request_duration_seconds";
+        for sample in [
+            format!(r#"{name}_bucket{{le="0.001",route="/search"}} 1"#),
+            format!(r#"{name}_bucket{{le="0.004",route="/search"}} 1"#),
+            format!(r#"{name}_bucket{{le="0.016",route="/search"}} 2"#),
+            format!(r#"{name}_bucket{{le="262.144",route="/search"}} 2"#),
+            format!(r#"{name}_bucket{{le="+Inf",route="/search"}} 3"#),
+            format!(r#"{name}_count{{route="/search"}} 3"#),
+            "open_geocode_batch_slots_in_use 1".to_string(),
+            "open_geocode_batch_slots 4".to_string(),
+        ] {
+            assert!(text.lines().any(|line| line == sample), "{sample}\n{text}");
+        }
+        assert!(text.ends_with("\n# EOF\n"), "{text}");
+    }
 }
