@@ -120,6 +120,9 @@ memmap2 = "0.9"
 # with a null read in its arena bitmap (`mi_bitmap_try_find_and_claim`).
 mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 osmpbf = "0.3"
+# `/metrics` of `serve`. One registry per server rather than a process-wide
+# recorder, so servers in one process (the tests) keep their own counts.
+prometheus-client = "0.25"
 # The interactive `og` interface, drawn inline below the prompt.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 rayon = "1.12"
