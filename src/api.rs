@@ -12,7 +12,7 @@
 //! ([`flat_columns`]), so a CSV row and a JSON answer never drift apart
 //! either.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -163,6 +163,11 @@ pub struct Common {
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     pub source: Source,
+    /// The server operator's own key-value pairs for this `id`, the ones
+    /// the `tags` parameter asks for. Absent when `tags` is not given or the
+    /// operator has none for the `id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 /// Properties of a forward geocoding result.
@@ -709,6 +714,7 @@ fn common(
         address: summary.address,
         context: contexts.of(record_id)?,
         source: summary.source,
+        tags: None,
     })
 }
 

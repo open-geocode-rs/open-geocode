@@ -11,7 +11,9 @@ use std::{
 use crate::error::{Error, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, Request, State, rejection::QueryRejection},
+    extract::{
+        DefaultBodyLimit, FromRequestParts, Query, Request, State, rejection::QueryRejection,
+    },
     handler::{Handler, HandlerWithoutStateExt},
     middleware,
     response::{IntoResponse, Response},
@@ -25,6 +27,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
+    attributes::{Attributes, TagKeys},
     http::{
         batch::{self, Lookup},
         bounds, health,
@@ -65,6 +68,9 @@ pub struct ServeOptions {
     /// system's temporary directory when not given.
     pub job_dir: Option<PathBuf>,
     pub limits: Limits,
+    /// A CSV of `id,key,value` rows: the operator's own data for og ids, read
+    /// once at startup and added to the features a request's `tags` asks for.
+    pub attributes: Option<PathBuf>,
     /// Longest the server takes to stop once Ctrl-C or SIGTERM arrives;
     /// what is still open then is dropped. Zero drops it at once.
     pub shutdown_timeout: Duration,
@@ -87,6 +93,7 @@ pub(crate) struct AppState {
     lookup_slots: Arc<Semaphore>,
     /// `/openapi.json` for this server's limits, built once.
     spec: Arc<str>,
+    attributes: Arc<Attributes>,
 }
 
 impl AppState {
@@ -129,7 +136,14 @@ impl AppState {
             )),
             spec: openapi::document(&limits)?.into(),
             limits,
+            attributes: Arc::default(),
         })
+    }
+
+    /// This state with the operator's `attributes` for `tags` to ask for.
+    pub(crate) fn with_attributes(mut self, attributes: Attributes) -> Self {
+        self.attributes = Arc::new(attributes);
+        self
     }
 
     pub(crate) fn stopping(&self) -> &CancellationToken {
@@ -279,7 +293,15 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .job_dir
         .clone()
         .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
-    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
+    // Before the Pack opens: a bad file should not wait on it.
+    let attributes = options
+        .attributes
+        .as_deref()
+        .map(Attributes::load)
+        .transpose()?
+        .unwrap_or_default();
+    let state =
+        AppState::open(&options.pack, &jobs_dir, options.limits)?.with_attributes(attributes);
     tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(
         state.clone(),
@@ -525,6 +547,53 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
     Problem::unparsable_parameters()
 }
 
+#[derive(Debug, Deserialize)]
+struct TagsParam {
+    tags: Option<String>,
+}
+
+/// The `tags` parameter of a single `GET`, checked: which of the operator's
+/// attributes to add to the features. It is its own extractor, not a field of
+/// each route's parameters, because a batch item reads those too, and a batch
+/// does not take `tags`.
+#[derive(Debug)]
+pub(crate) struct Tags(Option<TagKeys>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Tags {
+    type Rejection = Problem;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _: &S,
+    ) -> Result<Self, Problem> {
+        let Query(param) =
+            Query::<TagsParam>::try_from_uri(&parts.uri).map_err(malformed_parameters)?;
+        bounds::parse_tags(param.tags.as_deref()).map(Self)
+    }
+}
+
+impl Tags {
+    fn add_to_forward(&self, state: &AppState, collection: &mut ForwardCollection) {
+        if let Some(keys) = &self.0 {
+            for feature in &mut collection.features {
+                state
+                    .attributes
+                    .attach(&mut feature.properties.common, keys);
+            }
+        }
+    }
+
+    fn add_to_reverse(&self, state: &AppState, collection: &mut ReverseCollection) {
+        if let Some(keys) = &self.0 {
+            for feature in &mut collection.features {
+                state
+                    .attributes
+                    .attach(&mut feature.properties.common, keys);
+            }
+        }
+    }
+}
+
 /// Search addresses
 ///
 /// Geocodes free-form text, such as a full address, to coordinates. Results
@@ -560,6 +629,14 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
+        ("tags" = Option<String>, Query,
+         description = "Add the server operator's own key-value pairs to each \
+                        feature that has some, as `properties.tags`: `*` for \
+                        all, or comma-separated keys for those. At most 32 keys \
+                        of at most 64 characters; an empty value returns \
+                        `400`. Single `GET` requests only: a batch item does \
+                        not take it.",
+         example = "maxspeed,ref"),
     ),
     responses(
         (status = 200, description = "Matching results, highest `score` first.",
@@ -574,12 +651,14 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
 )]
 pub(crate) async fn search(
     State(state): State<AppState>,
+    tags: Tags,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = search_request(params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || search_answer(&worker, options)).await?;
+    let mut collection = lookup(&state, move || search_answer(&worker, options)).await?;
+    tags.add_to_forward(&state, &mut collection);
     Ok(Json(collection))
 }
 
@@ -646,6 +725,14 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
+        ("tags" = Option<String>, Query,
+         description = "Add the server operator's own key-value pairs to each \
+                        feature that has some, as `properties.tags`: `*` for \
+                        all, or comma-separated keys for those. At most 32 keys \
+                        of at most 64 characters; an empty value returns \
+                        `400`. Single `GET` requests only: a batch item does \
+                        not take it.",
+         example = "maxspeed,ref"),
     ),
     responses(
         (status = 200, description = "Suggested results, highest `score` first.",
@@ -660,6 +747,7 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
 )]
 pub(crate) async fn autocomplete(
     State(state): State<AppState>,
+    tags: Tags,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
@@ -682,11 +770,12 @@ pub(crate) async fn autocomplete(
         bbox,
     };
     let worker = state.clone();
-    let collection = lookup(&state, move || {
+    let mut collection = lookup(&state, move || {
         let hits = worker.searcher.autocomplete(&options)?;
         api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
+    tags.add_to_forward(&state, &mut collection);
 
     Ok(Json(collection))
 }
@@ -716,6 +805,14 @@ pub(crate) struct PlaceParams {
         ("id" = String, Query,
          description = "Id of the source object, as `dataset:type:number`.",
          example = "osm:node:1383955044"),
+        ("tags" = Option<String>, Query,
+         description = "Add the server operator's own key-value pairs to each \
+                        feature that has some, as `properties.tags`: `*` for \
+                        all, or comma-separated keys for those. At most 32 keys \
+                        of at most 64 characters; an empty value returns \
+                        `400`. Single `GET` requests only: a batch item does \
+                        not take it.",
+         example = "maxspeed,ref"),
     ),
     responses(
         (status = 200, description = "The records of the object. `features` is empty \
@@ -730,6 +827,7 @@ pub(crate) struct PlaceParams {
 )]
 pub(crate) async fn place(
     State(state): State<AppState>,
+    tags: Tags,
     params: Result<Query<PlaceParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
@@ -741,11 +839,12 @@ pub(crate) async fn place(
         .with_invalid_params(vec![InvalidParam::new("id", "not a source object id")])
     })?;
     let worker = state.clone();
-    let collection = lookup(&state, move || {
+    let mut collection = lookup(&state, move || {
         let records = worker.pack.records_by_source_id(&source_id)?;
         api::lookup_collection(&worker.pack, id, records)
     })
     .await?;
+    tags.add_to_forward(&state, &mut collection);
     Ok(Json(collection))
 }
 
@@ -796,6 +895,14 @@ pub(crate) async fn place(
                         returns `400`. A code the Pack does not cover returns no \
                         results.",
          example = "NZ,AU"),
+        ("tags" = Option<String>, Query,
+         description = "Add the server operator's own key-value pairs to each \
+                        feature that has some, as `properties.tags`: `*` for \
+                        all, or comma-separated keys for those. At most 32 keys \
+                        of at most 64 characters; an empty value returns \
+                        `400`. Single `GET` requests only: a batch item does \
+                        not take it.",
+         example = "maxspeed,ref"),
     ),
     responses(
         (status = 200,
@@ -811,12 +918,14 @@ pub(crate) async fn place(
 )]
 pub(crate) async fn geocode(
     State(state): State<AppState>,
+    tags: Tags,
     params: Result<Query<GeocodeParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = geocode_request(params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
+    let mut collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
+    tags.add_to_forward(&state, &mut collection);
     Ok(Json(collection))
 }
 
@@ -960,6 +1069,14 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
          example = -79.3832, minimum = -180.0, maximum = 180.0),
         ("lat" = f64, Query, description = "Latitude in degrees.",
          example = 43.6532, minimum = -90.0, maximum = 90.0),
+        ("tags" = Option<String>, Query,
+         description = "Add the server operator's own key-value pairs to each \
+                        feature that has some, as `properties.tags`: `*` for \
+                        all, or comma-separated keys for those. At most 32 keys \
+                        of at most 64 characters; an empty value returns \
+                        `400`. Single `GET` requests only: a batch item does \
+                        not take it.",
+         example = "maxspeed,ref"),
     ),
     responses(
         (status = 200, description = "Results at the point, most precise first. \
@@ -973,12 +1090,14 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
 )]
 pub(crate) async fn reverse(
     State(state): State<AppState>,
+    tags: Tags,
     params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let options = reverse_request(params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
+    let mut collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
+    tags.add_to_reverse(&state, &mut collection);
     Ok(Json(collection))
 }
 
@@ -1418,6 +1537,180 @@ mod router_tests {
                 serde_json::json!([{"name": "id", "reason": "not a source object id"}]),
                 "{uri}"
             );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn attributes(rows: &str) -> Attributes {
+        Attributes::read(format!("id,key,value\n{rows}").as_bytes(), "tags.csv")
+            .expect("good attributes")
+    }
+
+    fn with_attributes(pack: &Path, rows: &str) -> Router {
+        build_router(
+            state_for(pack, true).with_attributes(attributes(rows)),
+            None,
+            None,
+        )
+    }
+
+    const ROUTES: [&str; 4] = [
+        "/place?id=osm:node:1",
+        "/search?q=10%20King%20Street",
+        "/autocomplete?q=10%20King",
+        "/reverse?lon=-79.0&lat=43.0",
+    ];
+
+    #[tokio::test]
+    async fn tags_add_the_operators_attributes_to_the_features_that_have_them() {
+        let pack = temp_path("tags");
+        write_pack(&pack);
+        let plain = build_router(state_for(&pack, true), None, None);
+        let router = with_attributes(
+            &pack,
+            "osm:node:1,maxspeed,30\nosm:node:1,ref,A1\nosm:node:1,name,Home\nosm:node:2,ref,B2\n",
+        );
+        // An operator with attributes and a request without `tags` answer as a
+        // server with none does.
+        for route in ROUTES {
+            let before = send(plain.clone(), request("GET", route)).await;
+            let after = send(router.clone(), request("GET", route)).await;
+            assert_eq!(before.status, StatusCode::OK, "{route}");
+            assert_eq!(after.body, before.body, "{route}");
+            assert!(
+                before.json()["features"][0]["properties"]
+                    .get("tags")
+                    .is_none()
+            );
+        }
+
+        let tags = |reply: Reply| {
+            let features = reply.json()["features"].clone();
+            assert_eq!(features.as_array().expect("features").len(), 1);
+            features[0]["properties"].get("tags").cloned()
+        };
+        for route in ROUTES {
+            let uri = |tags: &str| {
+                let join = if route.contains('?') { '&' } else { '?' };
+                format!("{route}{join}tags={tags}")
+            };
+            let all = send(router.clone(), request("GET", &uri("*"))).await;
+            assert_eq!(all.status, StatusCode::OK, "{route}");
+            assert_eq!(
+                tags(all),
+                Some(serde_json::json!({"maxspeed": "30", "name": "Home", "ref": "A1"})),
+                "{route}"
+            );
+            let some = send(router.clone(), request("GET", &uri("ref,maxspeed,nope"))).await;
+            assert_eq!(
+                tags(some),
+                Some(serde_json::json!({"maxspeed": "30", "ref": "A1"})),
+                "{route}"
+            );
+            let none = send(router.clone(), request("GET", &uri("surface"))).await;
+            assert_eq!(tags(none), None, "{route}: no asked key, no tags");
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn a_feature_without_attributes_gets_no_tags() {
+        let pack = temp_path("tags-none");
+        write_pack(&pack);
+        let router = with_attributes(&pack, "osm:node:2,ref,B2\nosm:way:1,ref,C3\n");
+        for route in ROUTES {
+            let join = if route.contains('?') { '&' } else { '?' };
+            let plain = send(router.clone(), request("GET", route)).await;
+            let asked = send(
+                router.clone(),
+                request("GET", &format!("{route}{join}tags=*")),
+            )
+            .await;
+            assert_eq!(asked.body, plain.body, "{route}");
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn a_joined_street_has_the_attributes_of_its_own_id_not_its_ways() {
+        let pack = temp_path("tags-street");
+        let _ = std::fs::remove_dir_all(&pack);
+        let mut writer = Writer::create(&pack).expect("writer");
+        writer
+            .write(
+                &crate::record::StreetRecord {
+                    alt_names: Vec::new(),
+                    locality: None,
+                    name: "King Street".into(),
+                    geometry: geojson::Geometry::new(geojson::GeometryValue::LineString {
+                        coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
+                    }),
+                    representative_point: [-79.0, 43.0005],
+                    member_ways: vec![2],
+                    source: SourceProvenance::osm(ObjectType::Way, 1),
+                }
+                .into(),
+                None,
+            )
+            .expect("street");
+        writer.finish().expect("finish");
+        let router = with_attributes(&pack, "osm:way:1,ref,A1\nosm:way:2,ref,B2\n");
+
+        for way in [1, 2] {
+            let reply = send(
+                router.clone(),
+                request("GET", &format!("/place?id=osm:way:{way}&tags=*")),
+            )
+            .await;
+            let body = reply.json();
+            let properties = &body["features"][0]["properties"];
+            assert_eq!(properties["id"], "osm:way:1", "way {way}");
+            assert_eq!(
+                properties["tags"],
+                serde_json::json!({"ref": "A1"}),
+                "way {way}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn a_bad_tags_parameter_is_a_malformed_parameter() {
+        let pack = temp_path("tags-bad");
+        write_pack(&pack);
+        let router = with_attributes(&pack, "osm:node:1,ref,A1\n");
+        let many = (0..33)
+            .map(|n| format!("k{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let long = "k".repeat(65);
+        for (tags, reason) in [
+            ("", "empty key"),
+            ("a,,b", "empty key"),
+            ("*,ref", "* beside keys"),
+            (many.as_str(), "too many keys"),
+            (long.as_str(), "key too long"),
+        ] {
+            for route in ROUTES {
+                let join = if route.contains('?') { '&' } else { '?' };
+                let reply = send(
+                    router.clone(),
+                    request("GET", &format!("{route}{join}tags={tags}")),
+                )
+                .await;
+                assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{route} {tags:?}");
+                let body = reply.json();
+                assert_eq!(body["error_code"], "malformed_parameter");
+                assert_eq!(
+                    body["invalid_params"],
+                    serde_json::json!([{"name": "tags", "reason": reason}]),
+                    "{route} {tags:?}"
+                );
+            }
         }
 
         let _ = std::fs::remove_dir_all(&pack);

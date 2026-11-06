@@ -93,6 +93,17 @@ impl SourceId {
     }
 }
 
+/// The id as results write it.
+impl std::fmt::Display for SourceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&crate::labels::record_id(
+            &self.dataset,
+            self.object_type,
+            self.object_id,
+        ))
+    }
+}
+
 /// Bytes an entry needs for any record id below `record_count`.
 fn entry_width(record_count: u64) -> usize {
     let bits = u64::BITS - record_count.saturating_sub(1).leading_zeros();

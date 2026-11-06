@@ -1,0 +1,14 @@
+{
+  "detail": "tags must be * or comma-separated keys, with none empty",
+  "error_code": "malformed_parameter",
+  "invalid_params": [
+    {
+      "name": "tags",
+      "reason": "empty key"
+    }
+  ],
+  "request_id": "contract-example",
+  "status": 400,
+  "title": "Bad Request",
+  "type": "about:blank"
+}

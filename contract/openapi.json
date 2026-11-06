@@ -121,6 +121,16 @@
           },
           "source": {
             "$ref": "#/components/schemas/Source"
+          },
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The server operator's own key-value pairs for this `id`, the ones\nthe `tags` parameter asks for. Absent when `tags` is not given or the\noperator has none for the `id`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           }
         },
         "required": [
@@ -986,6 +996,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Add the server operator's own key-value pairs to each feature that has some, as `properties.tags`: `*` for all, or comma-separated keys for those. At most 32 keys of at most 64 characters; an empty value returns `400`. Single `GET` requests only: a batch item does not take it.",
+            "example": "maxspeed,ref",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1173,6 +1193,16 @@
             "example": "NZ,AU",
             "in": "query",
             "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Add the server operator's own key-value pairs to each feature that has some, as `properties.tags`: `*` for all, or comma-separated keys for those. At most 32 keys of at most 64 characters; an empty value returns `400`. Single `GET` requests only: a batch item does not take it.",
+            "example": "maxspeed,ref",
+            "in": "query",
+            "name": "tags",
             "required": false,
             "schema": {
               "type": "string"
@@ -2426,6 +2456,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Add the server operator's own key-value pairs to each feature that has some, as `properties.tags`: `*` for all, or comma-separated keys for those. At most 32 keys of at most 64 characters; an empty value returns `400`. Single `GET` requests only: a batch item does not take it.",
+            "example": "maxspeed,ref",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2629,6 +2669,16 @@
               "maximum": 90,
               "minimum": -90,
               "type": "number"
+            }
+          },
+          {
+            "description": "Add the server operator's own key-value pairs to each feature that has some, as `properties.tags`: `*` for all, or comma-separated keys for those. At most 32 keys of at most 64 characters; an empty value returns `400`. Single `GET` requests only: a batch item does not take it.",
+            "example": "maxspeed,ref",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -3148,6 +3198,16 @@
             "example": "-79.64,43.58,-79.12,43.86",
             "in": "query",
             "name": "bbox",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Add the server operator's own key-value pairs to each feature that has some, as `properties.tags`: `*` for all, or comma-separated keys for those. At most 32 keys of at most 64 characters; an empty value returns `400`. Single `GET` requests only: a batch item does not take it.",
+            "example": "maxspeed,ref",
+            "in": "query",
+            "name": "tags",
             "required": false,
             "schema": {
               "type": "string"

@@ -1,5 +1,6 @@
 pub mod alloc;
 pub mod api;
+pub mod attributes;
 pub mod batch;
 pub mod bench;
 pub mod builder;

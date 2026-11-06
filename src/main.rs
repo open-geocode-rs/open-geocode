@@ -101,6 +101,13 @@ enum Commands {
         #[command(flatten)]
         limits: Limits,
 
+        /// CSV of your own data for og ids, with the header `id,key,value`:
+        /// `osm:way:5,maxspeed,50`. Read into memory at startup. A request
+        /// with `tags=*` or `tags=maxspeed,ref` gets them as `properties.tags`
+        /// on the features that have some.
+        #[arg(long, value_name = "FILE")]
+        attributes: Option<PathBuf>,
+
         /// Longest, in seconds, the server takes to stop after Ctrl-C or
         /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
@@ -776,6 +783,7 @@ async fn main() -> Result<()> {
             basemap,
             job_dir,
             limits,
+            attributes,
             shutdown_timeout,
         } => {
             serve(ServeOptions {
@@ -785,6 +793,7 @@ async fn main() -> Result<()> {
                 basemap: Some(basemap),
                 job_dir,
                 limits,
+                attributes,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;

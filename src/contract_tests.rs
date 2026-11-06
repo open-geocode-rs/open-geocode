@@ -238,7 +238,15 @@ async fn responses_match_the_committed_examples() {
             &pack.with_extension("jobs"),
             crate::limits::Limits::DEFAULT,
         )
-        .expect("open pack"),
+        .expect("open pack")
+        .with_attributes(
+            crate::attributes::Attributes::read(
+                "id,key,value\nosm:way:11,opening_hours,Mo-Fr 07:00-18:00\nosm:way:11,wheelchair,yes\n"
+                    .as_bytes(),
+                "contract",
+            )
+            .expect("attributes"),
+        ),
         Some(&pack.join("demo")),
         Some(&pack.join("basemap.pmtiles")),
     );
@@ -429,6 +437,20 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(place["geocoding"]["query"], "osm:way:11");
     assert_eq!(place["features"][0]["properties"]["name"], "Queen Bakery");
     assert_eq!(place["features"][0]["properties"]["score"], 0.0);
+    // The operator's own attributes, when asked for.
+    let tagged = get(&router, "/place?id=osm:way:11&tags=*").await;
+    assert_example("place-poi-tags", &tagged);
+    assert_eq!(
+        tagged["features"][0]["properties"]["tags"],
+        json!({"opening_hours": "Mo-Fr 07:00-18:00", "wheelchair": "yes"})
+    );
+    assert_eq!(
+        get(&router, "/place?id=osm:way:11&tags=wheelchair").await["features"][0]["properties"]["tags"],
+        json!({"wheelchair": "yes"})
+    );
+    let (status, empty) = get_error(&router, "/place?id=osm:way:11&tags=").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_example("error-empty-tags", &empty);
     assert_eq!(
         get(&router, "/place?id=osm:way:999").await["features"],
         json!([])

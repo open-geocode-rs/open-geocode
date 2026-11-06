@@ -8,6 +8,7 @@
 //! parsing and response size. The capacity limits an operator sets are in
 //! [`crate::limits`].
 
+use crate::attributes::TagKeys;
 use crate::http::problem::{InvalidParam, Problem};
 use crate::search::{BoundingBox, MAX_AUTOCOMPLETE_LIMIT};
 
@@ -26,6 +27,12 @@ pub(crate) const BATCH_ITEM_BYTES: usize = 4096;
 
 /// Longest `id` a batch item may carry, in Unicode scalar values.
 pub(crate) const MAX_BATCH_ID_CHARS: usize = 128;
+
+/// Most keys one `tags` parameter may name.
+pub(crate) const MAX_TAG_KEYS: usize = 32;
+
+/// Longest key a `tags` parameter may name, in Unicode scalar values.
+pub(crate) const MAX_TAG_KEY_CHARS: usize = 64;
 
 /// Seconds an upload may send nothing before it is cut off, so a client
 /// that stalls does not hold a job slot.
@@ -177,9 +184,98 @@ pub(crate) fn parse_bbox(value: Option<&str>) -> Result<Option<BoundingBox>, Pro
     }
 }
 
+/// Validate `tags`: `*`, or comma-separated keys, at most [`MAX_TAG_KEYS`]
+/// of at most [`MAX_TAG_KEY_CHARS`] characters each. Absent means none is
+/// asked for, but an empty value is a mistake, not that: a form that always
+/// sends the key would otherwise look like a request for no tags.
+pub(crate) fn parse_tags(value: Option<&str>) -> Result<Option<TagKeys>, Problem> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let reject = |detail: String, reason: &str| {
+        Problem::malformed_parameter(detail)
+            .with_invalid_params(vec![InvalidParam::new("tags", reason)])
+    };
+    let value = value.trim();
+    if value == "*" {
+        return Ok(Some(TagKeys::All));
+    }
+    let keys = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if keys.iter().any(|key| key.is_empty()) {
+        return Err(reject(
+            "tags must be * or comma-separated keys, with none empty".into(),
+            "empty key",
+        ));
+    }
+    if keys.contains(&"*") {
+        return Err(reject(
+            "tags takes * alone, not beside other keys".into(),
+            "* beside keys",
+        ));
+    }
+    if keys.len() > MAX_TAG_KEYS {
+        return Err(reject(
+            format!(
+                "tags names {} keys, at most {MAX_TAG_KEYS} are allowed",
+                keys.len()
+            ),
+            "too many keys",
+        ));
+    }
+    if let Some(key) = keys
+        .iter()
+        .find(|key| key.chars().count() > MAX_TAG_KEY_CHARS)
+    {
+        return Err(reject(
+            format!("tags key {key:?} is over {MAX_TAG_KEY_CHARS} characters"),
+            "key too long",
+        ));
+    }
+    let mut keys = keys.into_iter().map(str::to_string).collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    Ok(Some(TagKeys::Some(keys)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_are_star_or_a_bounded_list_of_keys() {
+        assert_eq!(parse_tags(None).unwrap(), None);
+        assert_eq!(parse_tags(Some("*")).unwrap(), Some(TagKeys::All));
+        assert_eq!(parse_tags(Some(" * ")).unwrap(), Some(TagKeys::All));
+        assert_eq!(
+            parse_tags(Some("ref, maxspeed,ref")).unwrap(),
+            Some(TagKeys::Some(vec!["maxspeed".into(), "ref".into()]))
+        );
+        let at_limit = (0..MAX_TAG_KEYS)
+            .map(|index| format!("k{index}"))
+            .collect::<Vec<_>>();
+        assert!(parse_tags(Some(&at_limit.join(","))).is_ok());
+        let over = format!("{},extra", at_limit.join(","));
+        let long = "k".repeat(MAX_TAG_KEY_CHARS + 1);
+        assert!(parse_tags(Some(&"k".repeat(MAX_TAG_KEY_CHARS))).is_ok());
+        for (value, reason) in [
+            ("", "empty key"),
+            ("  ", "empty key"),
+            ("a,,b", "empty key"),
+            ("a,", "empty key"),
+            (over.as_str(), "too many keys"),
+            (long.as_str(), "key too long"),
+            ("*,a", "* beside keys"),
+        ] {
+            let problem = parse_tags(Some(value)).unwrap_err();
+            assert_eq!(
+                problem.error_code().as_str(),
+                "malformed_parameter",
+                "{value:?}"
+            );
+            assert_eq!(problem.invalid_params()[0].name, "tags", "{value:?}");
+            assert_eq!(problem.invalid_params()[0].reason, reason, "{value:?}");
+        }
+    }
 
     #[test]
     fn focus_and_bbox_are_points_in_range() {

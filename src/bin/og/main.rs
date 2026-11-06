@@ -194,6 +194,7 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             basemap: None,
             job_dir: None,
             limits: Limits::DEFAULT,
+            attributes: None,
             shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
         }))
         .map_err(Into::into)
