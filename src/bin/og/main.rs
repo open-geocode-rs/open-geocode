@@ -195,6 +195,7 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
             job_dir: None,
             limits: Limits::DEFAULT,
             shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+            cors_origins: Vec::new(),
         }))
         .map_err(Into::into)
 }
