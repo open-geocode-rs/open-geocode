@@ -1678,7 +1678,11 @@ impl<'a> Run<'a> {
     fn seal(&mut self) -> Result<()> {
         self.indexing()?;
         let sealing = self.sealing.take().ok_or_else(|| missing("the sealing"))?;
-        self.sealed = Some(sealing.finish()?);
+        let (mut sealed, stats) = sealing.finish()?;
+        // Before the checkpoint, and before the parser trains: reading the
+        // Pack needs the index.
+        crate::source_ids::add_to(&mut sealed, &self.scratch, &self.memory)?;
+        self.sealed = Some((sealed, stats));
         self.progress.finish(BuildStage::Indexes);
         let started = self.indexing.take().expect("indexing started");
         self.build.report.phases.pack_seal_ms += started.elapsed().as_millis();

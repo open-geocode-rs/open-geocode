@@ -1,0 +1,14 @@
+{
+  "detail": "id \"osm:way:eleven\" is not a source object id such as osm:node:1383955044",
+  "error_code": "malformed_parameter",
+  "invalid_params": [
+    {
+      "name": "id",
+      "reason": "not a source object id"
+    }
+  ],
+  "request_id": "contract-example",
+  "status": 400,
+  "title": "Bad Request",
+  "type": "about:blank"
+}

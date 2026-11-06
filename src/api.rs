@@ -19,8 +19,10 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::{
+    confidence::Features,
     labels,
     pack::{Reader, RecordId, Source, Summary},
+    rank::Signals,
     record::{AddressComponents, InterpolationAddressComponents, Layer, ObjectType, PlaceLayer},
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
@@ -497,6 +499,31 @@ pub fn forward_collection(
         },
         features,
     })
+}
+
+/// The answer to `/place`: one feature per record of the source object `id`,
+/// by record id. Nothing was ranked, so each feature has `score` 0, as a
+/// fallback area has.
+pub fn lookup_collection(
+    pack: &Reader,
+    id: String,
+    record_ids: Vec<RecordId>,
+) -> Result<ForwardCollection> {
+    let hits = record_ids
+        .into_iter()
+        .map(|record_id| {
+            Ok(TextSearchHit {
+                record_id,
+                score: 0.0,
+                record: pack.record_summary(record_id)?,
+                features: Features::default(),
+                confidence: None,
+                fallback: false,
+                signals: Signals::default(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    forward_collection(pack, id, hits)
 }
 
 /// One search hit as a feature. The hit's summary already holds what search

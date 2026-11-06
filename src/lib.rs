@@ -27,6 +27,7 @@ pub mod reverse;
 mod road;
 pub mod runtime;
 pub mod search;
+mod source_ids;
 pub mod spatial_index;
 mod stop;
 pub mod structured;

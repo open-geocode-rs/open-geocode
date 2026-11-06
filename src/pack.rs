@@ -43,13 +43,14 @@ use crate::{
         dictionary::{Builder, RecordNames},
     },
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
-    records, spatial_index,
+    records, source_ids, spatial_index,
     text_index::{self, PostcodeAreas},
 };
 
 pub use crate::{
     context::{AdminContextTuple, RecordContext},
     records::{ContextRecord, Point, PointPrecision, Source, Summary},
+    source_ids::SourceId,
 };
 
 pub type RecordId = u64;
@@ -61,7 +62,7 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 10;
+pub const PACK_SCHEMA_VERSION: u32 = 11;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -194,6 +195,7 @@ fn indexed_area_names<'a>(
 #[derive(Debug)]
 pub struct Writer {
     scratch: Arc<Scratch>,
+    memory: Arc<Budget>,
     records: records::Writer,
     contexts: TupleWriter,
     text: text_index::Writer,
@@ -342,6 +344,7 @@ impl Writer {
             )?,
             spatial: spatial_index::Writer::new(&scratch)?,
             scratch,
+            memory: Arc::clone(&options.memory),
             generation,
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
@@ -466,11 +469,15 @@ impl Writer {
         Ok(())
     }
 
-    /// Write the Pack file without publishing it.
+    /// Write the Pack file without publishing it, source id index included.
     pub fn seal(self) -> Result<(SealedPack, BuildStats)> {
+        let (scratch, memory) = (Arc::clone(&self.scratch), Arc::clone(&self.memory));
         let mut sealing = self.into_sealing()?;
         while sealing.seal_part()?.is_some() {}
-        sealing.finish()
+        let (mut sealed, mut stats) = sealing.finish()?;
+        crate::source_ids::add_to(&mut sealed, &scratch, &memory)?;
+        stats.bytes = sealed.bytes();
+        Ok((sealed, stats))
     }
 
     /// Start the Pack file with the parts held in memory, the context
@@ -793,10 +800,12 @@ impl SealedPack {
     }
 
     /// Add a section made from the sealed Pack itself, such as the parser
-    /// weights trained on its records. Nothing reads the Pack file yet.
+    /// weights trained on its records. Nothing reads the Pack file yet. A
+    /// checkpoint of the sealed Pack taken after this keeps the section.
     pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
         let mut pack = container::Writer::append(self.path())?;
         pack.add(name, version, bytes)?;
+        self.sections = pack.state()?;
         self.bytes = pack.finish()?;
         Ok(())
     }
@@ -808,6 +817,7 @@ impl SealedPack {
         for (name, version, path) in sections {
             pack.add_file(name, *version, path)?;
         }
+        self.sections = pack.state()?;
         self.bytes = pack.finish()?;
         Ok(())
     }
@@ -831,6 +841,7 @@ pub struct Reader {
     records: records::Reader,
     context: context::Reader,
     postcode_addresses: PostcodeAddresses,
+    source_ids: source_ids::Index,
 }
 
 impl std::fmt::Debug for Reader {
@@ -863,6 +874,7 @@ impl Reader {
         let postcode_addresses = PostcodeAddresses::from_bytes(
             &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
         )?;
+        let source_ids = source_ids::Index::open(&container, manifest.record_count)?;
         Ok(Self {
             path,
             container,
@@ -870,6 +882,7 @@ impl Reader {
             records,
             context,
             postcode_addresses,
+            source_ids,
         })
     }
 
@@ -958,6 +971,15 @@ impl Reader {
             }
         }
         Ok(records)
+    }
+
+    /// Every record of a source object, lowest record id first, found by
+    /// binary search of the source id index. An OSM node can be both a POI
+    /// and an address, so one id can name several records. Interpolation
+    /// ranges and derived records have no source object: only
+    /// [`Self::find_by_source_id`] finds those, by scanning.
+    pub fn records_by_source_id(&self, id: &SourceId) -> Result<Vec<RecordId>> {
+        self.source_ids.find(&self.records, id)
     }
 
     pub fn find_by_source_id(&self, source_id: &str) -> Result<Option<RecordId>> {
@@ -1224,6 +1246,134 @@ mod tests {
         fs::copy(reader.path(), &copy).expect("copy");
         assert_eq!(first_hit(&copy, "king").as_deref(), Some("osm:node:1"));
         assert!(!reader.path().parent().unwrap().join(SCRATCH_DIR).exists());
+    }
+
+    /// Object ids in scrambled order across several blocks of one run of
+    /// continued addresses, one node that is an address and a POI, and the
+    /// records whose result id is no source object's.
+    #[test]
+    fn finds_the_records_of_a_source_object_whatever_their_order() {
+        use crate::record::{
+            InterpolationAddressComponents, InterpolationRange, InterpolationRecord, PlaceLayer,
+            PlaceRecord, PoiRecord, StreetRecord,
+        };
+
+        let object = |n: i64| n * 7919 % 1009 + 10;
+        let mut records = (0..300)
+            .map(|n| address_record(object(n), &n.to_string(), "King Street"))
+            .collect::<Vec<_>>();
+        let Record::Address(mut row) = address_record(0, "7", "Row Street") else {
+            unreachable!("an address");
+        };
+        row.source = SourceProvenance::imported("openaddresses:nz/countrywide", 7);
+        let line = geojson::Geometry::new(geojson::GeometryValue::LineString {
+            coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
+        });
+        records.extend([
+            Record::Poi(PoiRecord {
+                name: "Bakery".into(),
+                alt_names: Vec::new(),
+                category: "shop:bakery".into(),
+                address: None,
+                geometry: point_geometry(-79.0, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, object(5)),
+                prominence: Default::default(),
+            }),
+            Record::Street(StreetRecord {
+                alt_names: Vec::new(),
+                locality: None,
+                name: "King Street".into(),
+                geometry: line.clone(),
+                representative_point: [-79.0, 43.0005],
+                source: SourceProvenance::osm(ObjectType::Way, 5000),
+            }),
+            Record::Address(row),
+            Record::Interpolation(InterpolationRecord {
+                address: InterpolationAddressComponents {
+                    street: Some("Queen Street".into()),
+                    place: None,
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                interpolation: InterpolationRange {
+                    kind: "even".into(),
+                    start: 2,
+                    end: 98,
+                    step: 2,
+                },
+                anchor_node_ids: [2, 98],
+                geometry: line,
+                representative_point: [-79.0, 43.0005],
+                source: SourceProvenance::osm(ObjectType::Way, 6000),
+            }),
+            Record::Place(
+                PlaceLayer::Country,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Canada".into(),
+                    place_type: "derived_country:CA".into(),
+                    geometry: point_geometry(-79.0, 43.0),
+                    source: SourceProvenance::osm(ObjectType::Relation, 9),
+                },
+            ),
+        ]);
+        let root = temp_root("source-ids");
+        let manifest = write_pack(&root, &records);
+        let reader = Reader::open(&root).expect("reader");
+        let find = |id: &str| {
+            reader
+                .records_by_source_id(&SourceId::parse(id).expect("a source id"))
+                .expect("lookup")
+        };
+
+        for n in 0..300 {
+            let expected = if n == 5 { vec![5, 300] } else { vec![n as u64] };
+            assert_eq!(find(&format!("osm:node:{}", object(n))), expected, "{n}");
+        }
+        assert_eq!(find("osm:way:5000"), [301]);
+        assert_eq!(find("openaddresses:nz/countrywide:row:7"), [302]);
+        for absent in [
+            "osm:node:9",
+            "osm:node:1019",
+            &format!("osm:way:{}", object(5)),
+            "osm:way:6000",
+            "osm:relation:9",
+            "openaddresses:nz/countrywide:row:8",
+            "openaddresses:other:row:7",
+        ] {
+            assert_eq!(find(absent), Vec::<RecordId>::new(), "{absent}");
+        }
+        assert_eq!(
+            reader.section_sizes()["source_ids"],
+            1 + 2 * (manifest.record_count - 2),
+            "a width byte, then two bytes for every record but the interpolation and the derived \
+             country"
+        );
+    }
+
+    #[test]
+    fn a_source_id_is_dataset_type_and_number() {
+        let id = |text: &str| SourceId::parse(text);
+        assert!(id("osm:node:1383955044").is_some());
+        assert!(id("osm:relation:-5").is_some());
+        assert!(id("openaddresses:nz/countrywide:row:7").is_some());
+        for text in [
+            "",
+            "osm",
+            "osm:node",
+            "osm:node:",
+            "osm:node:one",
+            ":node:1",
+            "osm:tree:1",
+            "osm:node:1,osm:node:2",
+            "osm:way:1:interp:2-3",
+            "derived:osm:postcode:nz:2110",
+        ] {
+            assert_eq!(id(text), None, "{text:?}");
+        }
     }
 
     #[test]

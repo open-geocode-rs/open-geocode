@@ -36,7 +36,7 @@ use crate::{
         version,
     },
     limits::Limits,
-    pack::Reader,
+    pack::{Reader, SourceId},
     record::Layer,
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
@@ -364,6 +364,7 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", batchable(geocode, geocode_batch, max_body))
         .route("/reverse", batchable(reverse, reverse_batch, max_body))
+        .route("/place", get_only(place))
         .route("/jobs", only(MethodFilter::POST, "POST", jobs::create))
         .route(
             "/jobs/{id}",
@@ -687,6 +688,64 @@ pub(crate) async fn autocomplete(
     })
     .await?;
 
+    Ok(Json(collection))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlaceParams {
+    id: Option<String>,
+}
+
+/// Look up a place by id
+///
+/// Returns the records of one source object, by the stable `id` a result
+/// carries, such as `osm:node:1383955044`. Unlike `record_id`, `id` survives a
+/// Pack rebuild. `features` is empty when the Pack has no such object. An
+/// OSM node can be both a POI and an address, so one id can return several
+/// features, lowest `record_id` first. Each has `score` `0`: nothing was
+/// ranked.
+///
+/// Takes the ids of OSM nodes, ways and relations and of imported address
+/// rows. An interpolated address or a derived area, such as a postcode, has
+/// no source object, and its id returns `400`.
+#[utoipa::path(
+    get,
+    path = "/place",
+    tag = "Geocoding",
+    params(
+        ("id" = String, Query,
+         description = "Id of the source object, as `dataset:type:number`.",
+         example = "osm:node:1383955044"),
+    ),
+    responses(
+        (status = 200, description = "The records of the object. `features` is empty \
+                                      when the Pack has none.",
+         body = ForwardCollection),
+        (status = 400, description = "`id` is missing or is not the id of a source \
+                                      object.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "Internal server error.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn place(
+    State(state): State<AppState>,
+    params: Result<Query<PlaceParams>, QueryRejection>,
+) -> Result<Json<ForwardCollection>, Problem> {
+    let Query(params) = params.map_err(malformed_parameters)?;
+    let id = params.id.unwrap_or_default();
+    let source_id = SourceId::parse(&id).ok_or_else(|| {
+        Problem::malformed_parameter(format!(
+            "id {id:?} is not a source object id such as osm:node:1383955044"
+        ))
+        .with_invalid_params(vec![InvalidParam::new("id", "not a source object id")])
+    })?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || {
+        let records = worker.pack.records_by_source_id(&source_id)?;
+        api::lookup_collection(&worker.pack, id, records)
+    })
+    .await?;
     Ok(Json(collection))
 }
 
@@ -1279,6 +1338,87 @@ mod router_tests {
 
         let reply = send(router, request("GET", "/reverse?lon=-79.0&lat=43.0")).await;
         assert_eq!(reply.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn place_finds_a_record_by_its_source_id() {
+        let pack = temp_path("place");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let reply = send(router.clone(), request("GET", "/place?id=osm:node:1")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        assert_eq!(body["type"], "FeatureCollection");
+        assert_eq!(body["geocoding"]["query"], "osm:node:1");
+        let features = body["features"].as_array().expect("features");
+        assert_eq!(features.len(), 1);
+        let properties = &features[0]["properties"];
+        assert_eq!(properties["id"], "osm:node:1");
+        assert_eq!(properties["record_id"], 0);
+        assert_eq!(properties["layer"], "address");
+        assert_eq!(properties["name"], "10 King Street");
+        assert_eq!(properties["score"], 0.0);
+        assert_eq!(features[0]["geometry"]["coordinates"][0], -79.0);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn place_answers_an_unknown_id_with_no_features() {
+        let pack = temp_path("place-unknown");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        // Another object, another type of the same number, and a dataset the
+        // Pack did not import.
+        for id in [
+            "osm:node:2",
+            "osm:way:1",
+            "osm:node:-1",
+            "openaddresses:nz/countrywide:row:1",
+        ] {
+            let reply = send(router.clone(), request("GET", &format!("/place?id={id}"))).await;
+            assert_eq!(reply.status, StatusCode::OK, "{id}");
+            let body = reply.json();
+            assert_eq!(body["features"], serde_json::json!([]), "{id}");
+            assert_eq!(body["geocoding"]["query"], id);
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn place_rejects_an_id_that_is_not_a_source_id() {
+        let pack = temp_path("place-malformed");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        for uri in [
+            "/place",
+            "/place?id=",
+            "/place?id=1",
+            "/place?id=osm:node",
+            "/place?id=osm:node:abc",
+            "/place?id=osm:node:1.5",
+            "/place?id=:node:1",
+            "/place?id=osm:tree:1",
+            "/place?id=osm:node:1,osm:node:2",
+            "/place?id=osm:way:1:interp:2-3",
+            "/place?id=derived:osm:postcode:nz:2110",
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+            let body = reply.json();
+            assert_eq!(body["error_code"], "malformed_parameter", "{uri}");
+            assert_eq!(
+                body["invalid_params"],
+                serde_json::json!([{"name": "id", "reason": "not a source object id"}]),
+                "{uri}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&pack);
     }

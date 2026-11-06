@@ -145,6 +145,11 @@ enum SourceKind {
     Other = 3,
 }
 
+/// Where a record's id sorts in the source id index: its dataset and source
+/// kind, then its zigzag object id. Only the order matters, and only that
+/// both sides of the index agree on it.
+pub type SourceKey = (u64, u64);
+
 /// Admin context reference stored in a record body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextRef {
@@ -1111,6 +1116,51 @@ impl Reader {
 
     pub fn header(&self, id: RecordId) -> Result<Header> {
         Ok(self.body(id)?.header)
+    }
+
+    /// The key of the id the record shows in a result (`osm:node:1`), or
+    /// `None` when that id is not its source object's: an interpolation
+    /// range, a postcode, a country derived from its areas.
+    pub fn source_key(&self, id: RecordId) -> Result<Option<SourceKey>> {
+        let header = self.header(id)?;
+        if header.layer == Layer::Interpolation
+            || (header.source_kind == SourceKind::Other && header.dataset.is_none())
+        {
+            return Ok(None);
+        }
+        let derived_country = header.layer.place_layer().is_some()
+            && self
+                .place_type(id)?
+                .is_some_and(|place_type| place_type.starts_with("derived_country:"));
+        Ok((!derived_country).then(|| {
+            let dataset = header.dataset.map_or(0, |index| u64::from(index) + 1);
+            (
+                dataset << 2 | header.source_kind as u64,
+                header.source_value,
+            )
+        }))
+    }
+
+    /// The key a source object's records are under, `None` when no record
+    /// can be: the dataset is not one this Pack imported.
+    pub fn source_key_of(
+        &self,
+        dataset: &str,
+        object_type: ObjectType,
+        object_id: i64,
+    ) -> Option<SourceKey> {
+        let dataset = if dataset == OSM_DATASET {
+            0
+        } else {
+            self.datasets.iter().position(|name| name == dataset)? as u64 + 1
+        };
+        let kind = match object_type {
+            ObjectType::Node => SourceKind::Node,
+            ObjectType::Way => SourceKind::Way,
+            ObjectType::Relation => SourceKind::Relation,
+            ObjectType::Row => SourceKind::Other,
+        };
+        Some((dataset << 2 | kind as u64, zigzag(object_id)))
     }
 
     pub fn record(&self, id: RecordId) -> Result<Record> {

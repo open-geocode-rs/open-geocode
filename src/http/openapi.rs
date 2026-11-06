@@ -81,6 +81,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         crate::runtime::geocode_batch,
         crate::runtime::reverse,
         crate::runtime::reverse_batch,
+        crate::runtime::place,
         crate::http::jobs::create,
         crate::http::jobs::status,
         crate::http::jobs::results,

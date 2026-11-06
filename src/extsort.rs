@@ -898,6 +898,7 @@ macro_rules! spill_tuple_of_unsigned {
 }
 
 spill_tuple_of_unsigned!(a: u64, b: u64);
+spill_tuple_of_unsigned!(a: u64, b: u64, c: u64);
 spill_tuple_of_unsigned!(a: u64, b: u8, c: u64);
 
 #[cfg(test)]

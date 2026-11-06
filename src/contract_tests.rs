@@ -423,6 +423,20 @@ async fn responses_match_the_committed_examples() {
     assert_example("error-malformed-parameter", &unknown_layer);
     assert_eq!(unknown_layer["error_code"], "malformed_parameter");
 
+    // A POI by its source id: the shape of /search, one feature, score 0.
+    let place = get(&router, "/place?id=osm:way:11").await;
+    assert_example("place-poi", &place);
+    assert_eq!(place["geocoding"]["query"], "osm:way:11");
+    assert_eq!(place["features"][0]["properties"]["name"], "Queen Bakery");
+    assert_eq!(place["features"][0]["properties"]["score"], 0.0);
+    assert_eq!(
+        get(&router, "/place?id=osm:way:999").await["features"],
+        json!([])
+    );
+    let (status, malformed) = get_error(&router, "/place?id=osm:way:eleven").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_example("error-malformed-place-id", &malformed);
+
     // A country code that is not two letters is a typo, and is rejected like
     // an unknown layer rather than silently matching nothing.
     let (status, bad_country) = get_error(&router, "/search?q=king&country=Canada").await;

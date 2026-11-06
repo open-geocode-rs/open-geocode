@@ -2412,6 +2412,132 @@
         ]
       }
     },
+    "/place": {
+      "get": {
+        "description": "Returns the records of one source object, by the stable `id` a result\ncarries, such as `osm:node:1383955044`. Unlike `record_id`, `id` survives a\nPack rebuild. `features` is empty when the Pack has no such object. An\nOSM node can be both a POI and an address, so one id can return several\nfeatures, lowest `record_id` first. Each has `score` `0`: nothing was\nranked.\n\nTakes the ids of OSM nodes, ways and relations and of imported address\nrows. An interpolated address or a derived area, such as a postcode, has\nno source object, and its id returns `400`.",
+        "operationId": "place",
+        "parameters": [
+          {
+            "description": "Id of the source object, as `dataset:type:number`.",
+            "example": "osm:node:1383955044",
+            "in": "query",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardCollection"
+                }
+              }
+            },
+            "description": "The records of the object. `features` is empty when the Pack has none.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "`id` is missing or is not the id of a source object.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Method not allowed. The route accepts `GET` only.",
+            "headers": {
+              "Allow": {
+                "description": "The methods this route accepts.",
+                "schema": {
+                  "example": "GET",
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal server error.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The server runs as many lookups as it allows (`busy`; retry after the `Retry-After` header's seconds), or the lookup ran past the server's lookup timeout (`timeout`).",
+            "headers": {
+              "X-Request-Id": {
+                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
+                "schema": {
+                  "maxLength": 128,
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Look up a place by id",
+        "tags": [
+          "Geocoding"
+        ]
+      }
+    },
     "/readyz": {
       "get": {
         "description": "Returns `200` once the Pack is loaded, and `503` before that. The body is\nempty.",
