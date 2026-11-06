@@ -79,9 +79,8 @@ pub struct ServeOptions {
 pub(crate) struct AppState {
     pack: Arc<Reader>,
     searcher: Arc<TextSearcher>,
-    /// The same search over places alone (see [`TextSearcher::places`]).
     places: Arc<TextSearcher>,
-    /// Places by their stable id, `None` for a Pack built before it had one.
+    /// `None` for a Pack built before the catalogue.
     catalogue: Option<Arc<Catalogue>>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
@@ -671,9 +670,6 @@ pub(crate) async fn places(
     Ok(Json(collection))
 }
 
-/// `ids`, checked: at most [`ids::MAX_IDS`], each written as a record id.
-/// An id of a record no catalogue holds (an imported row) is `None`, and
-/// finds nothing.
 fn place_ids(ids: &str) -> Result<Vec<Option<(ObjectType, i64)>>, Problem> {
     let ids = ids
         .split(',')
@@ -702,7 +698,6 @@ fn place_ids(ids: &str) -> Result<Vec<Option<(ObjectType, i64)>>, Problem> {
         .collect()
 }
 
-/// The parameters of a free-text lookup, `/places`' or `/geocode`'s `q`.
 struct TextParams {
     q: Option<String>,
     limit: usize,
@@ -711,7 +706,6 @@ struct TextParams {
     bbox: Option<String>,
 }
 
-/// A free-text lookup's parameters, checked.
 fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
     let TextParams {
         q,
@@ -807,7 +801,6 @@ pub(crate) async fn autocomplete(
     };
     let worker = state.clone();
     let collection = lookup(&state, move || {
-        // A layer names one product; no layer suggests from both, one list.
         let hits = match layer {
             Some(Layer::Poi) => worker.places.autocomplete(&TextAutocompleteOptions {
                 layer: None,
@@ -1001,7 +994,6 @@ pub(crate) const GEOCODE: Lookup<GeocodeParams, GeocodeRequest, ForwardCollectio
         answer: geocode_answer,
     };
 
-/// A `/geocode` lookup: free text, or an address in fields.
 #[derive(Debug, Clone)]
 pub(crate) enum GeocodeRequest {
     Text(TextSearchOptions),
@@ -1036,7 +1028,6 @@ fn geocode_request(params: GeocodeParams) -> Result<GeocodeRequest, Problem> {
     geocode_fields(params).map(GeocodeRequest::Fields)
 }
 
-/// `/geocode`'s address fields, checked.
 fn geocode_fields(params: GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
     let address = bounds::validate_query(params.address.as_deref().unwrap_or_default())
         .map_err(|_| Problem::invalid_query("give q, or address with its other fields"))?;

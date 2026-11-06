@@ -509,8 +509,6 @@ mod tests {
             "x",
         ] {
             let shell = engine.search(query).unwrap();
-            // The shell answers as /geocode does, then as /places when no
-            // address matches.
             let q = query.replace(' ', "%20");
             let mut api = get(&format!("/geocode?q={q}"));
             if api["features"].as_array().unwrap().is_empty() {

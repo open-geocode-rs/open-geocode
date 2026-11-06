@@ -1,12 +1,8 @@
 //! Named points of interest.
 //!
-//! A node or way is a POI when it has a name and its tags match a preset of
-//! the iD tagging schema that `catalog/places.json` counts as a place (see
-//! `catalog/curation.toml`): the schema OSM's editor offers mappers, so a
-//! new kind of place counts once mappers have a preset for it, with no list
-//! of keys here. A POI that also states a valid address carries it, and the
-//! address is emitted as an address record of its own: address search reads
-//! addresses alone.
+//! What counts as a place comes from iD tagging schema presets
+//! (`catalog/places.json`, filtered by `catalog/curation.toml`), not a key
+//! list here: a new kind of place counts once mappers get a preset for it.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -26,7 +22,6 @@ use super::{
     tags::{OsmTags, alternate_names, name_tags, prominence},
 };
 
-/// How an object is drawn, as a preset names the drawings it applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Drawn {
     Point,
@@ -44,7 +39,6 @@ impl Drawn {
 
 #[derive(Debug, Deserialize)]
 struct Catalog {
-    /// The keys whose values say what kind of place an object is.
     keys: Vec<String>,
     presets: BTreeMap<String, CatalogPreset>,
 }
@@ -66,10 +60,8 @@ const fn default_match_score() -> f64 {
     1.0
 }
 
-/// A counted preset, as matching reads it.
 #[derive(Debug)]
 struct Preset {
-    /// The key its id starts with, whose value names its category.
     key: String,
     tags: Vec<(String, String)>,
     point: bool,
@@ -79,18 +71,14 @@ struct Preset {
     never: bool,
 }
 
-/// The value a preset tag of any value matches: any but `no`.
+// iD's `key=*` matches any value but `no`.
 const ANY: &str = "*";
 
 #[derive(Debug)]
 struct Presets {
     all: Vec<Preset>,
-    /// Each preset by every `(key, value)` it tests, `value` being [`ANY`]
-    /// for a tag of any value.
     by_tag: HashMap<(String, String), Vec<usize>>,
-    /// Every key a preset tests: what the scan keeps of a POI's tags.
     keys: HashSet<String>,
-    /// The keys whose values say what kind of place an object is.
     kinds: HashSet<String>,
 }
 
@@ -130,17 +118,13 @@ fn presets() -> &'static Presets {
     })
 }
 
-/// Whether `key` is one a place preset tests.
 pub(crate) fn is_place_key(key: &str) -> bool {
     presets().keys.contains(key)
 }
 
-/// The preset `tags`, drawn as `drawn`, match best, when it is counted as a
-/// place: of the presets whose every tag the object has, the one testing
-/// the most tags of a stated value, then the most tags, then of the highest
-/// match score; a counted preset wins a tie with one never counted (a bench
-/// beside a bakery is the bakery). `None` when no preset matches or the
-/// best is never counted (`shop=vacant` is no `shop=*`).
+/// iD's order: most tags of a stated value, then most tags, then match
+/// score. Counted wins a tie with never counted (bench beside a bakery is the
+/// bakery). Best never counted means no place (`shop=vacant` is no `shop=*`).
 fn place_preset(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<&'static Preset> {
     let presets = presets();
     let linked = tags.contains_key("wikidata");
@@ -181,8 +165,6 @@ fn place_preset(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<&'stati
     (!preset.never).then_some(preset)
 }
 
-/// `key:value` of the tag of the preset `tags` match that names its kind,
-/// such as `amenity:cafe`.
 fn poi_category(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<String> {
     let preset = place_preset(tags, drawn)?;
     let value = tags.get(&preset.key)?;
@@ -204,9 +186,6 @@ pub(crate) fn is_poi(tags: &BTreeMap<String, String>, drawn: Drawn) -> bool {
     poi_name(tags).is_some() && poi_category(tags, drawn).is_some()
 }
 
-/// Count `tags`, a named object drawn as `drawn`, in the report as left out
-/// when one of its keys is a key places are tagged by and no counted preset
-/// matches it: by its first such tag.
 pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out: &mut Emitted) {
     if poi_name(tags).is_none() || poi_category(tags, drawn).is_some() {
         return;
@@ -217,27 +196,18 @@ pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out:
     }
 }
 
-/// How near a POI must lie to the leader of a place of its name and kind to
-/// be that place: a cafe mapped as two points, or as a point and its
-/// building, lies within a building of itself.
+// A cafe mapped as a point and its building lies within a building of itself.
 const SAME_PLACE_M: f64 = 50.0;
-/// How far apart objects linked to one Wikidata item may lie and still be
-/// one place: the parts of a campus or a park, not two branches of a chain,
-/// which link the chain's item as `brand:wikidata`, not `wikidata`.
+// Parts of a campus or park. Chain branches never meet here: they link the
+// chain as `brand:wikidata`, not `wikidata`.
 const SAME_ITEM_M: f64 = 2_000.0;
-/// Degrees of latitude a cell of the leaders' grid spans: [`SAME_PLACE_M`],
-/// so a leader within it of a point lies in its cell or one beside.
+// One cell spans [`SAME_PLACE_M`]: a near leader is in this cell or a neighbour.
 const CELL_DEGREES: f64 = SAME_PLACE_M / 111_320.0;
 
-/// The POIs of one name that are one place, merged: the standard steps of
-/// entity resolution, with the name as the block. Two of them are one place
-/// when they link the same Wikidata item, or when they are of the same kind
-/// and lie within [`SAME_PLACE_M`]; a hotel and its restaurant, of two
-/// kinds, stay two. Each joins the leader of its place, the most important
-/// member, never another member, so a run of near ones cannot chain one
-/// place out along a street (center clustering). The leader takes what it
-/// lacks from the others (an address, a Wikidata item, a brand, other
-/// names) and their ids as aliases.
+/// Entity resolution blocked by name. Same Wikidata item, or same kind
+/// within [`SAME_PLACE_M`]: a hotel and its restaurant stay two. Each joins
+/// the leader, never another member (center clustering), so a run of near
+/// ones cannot chain a place along a street. Merged ids stay as aliases.
 pub(crate) fn resolve(mut places: Vec<PoiRecord>) -> Vec<PoiRecord> {
     if places.len() < 2 {
         return places;
@@ -308,8 +278,6 @@ fn point_of(place: &PoiRecord) -> Option<[f64; 2]> {
     crate::util::geo::point_lon_lat(&place.geometry)
 }
 
-/// The cell of the leaders' grid `point` lies in: a row of latitude, and a
-/// column of longitude as wide on the ground at that latitude.
 fn cell([lon, lat]: [f64; 2]) -> (i64, i64) {
     let width = CELL_DEGREES / lat.to_radians().cos().max(0.01);
     (
@@ -318,7 +286,6 @@ fn cell([lon, lat]: [f64; 2]) -> (i64, i64) {
     )
 }
 
-/// `member`, the same place as `leader`, merged into it.
 fn merge(leader: &mut PoiRecord, member: PoiRecord) {
     if member.source.object_type != ObjectType::Row {
         leader
@@ -346,7 +313,6 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
     }
 }
 
-/// The chain `brand=` and `brand:wikidata=` name.
 fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
     Some(Brand {
         name: tags.cleaned("brand")?,
@@ -360,7 +326,6 @@ pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
-    // The links are kept for the POI's prominence and importance.
     tags.iter()
         .filter(|(key, _)| {
             matches!(
@@ -389,9 +354,8 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let address = address_components(tags).ok();
     let source = SourceProvenance::osm(candidate.object_type, candidate.object_id);
     let geometry = point_geometry(candidate.lon, candidate.lat);
-    // The address the place stands at is an address of its own: address
-    // search reads addresses alone, and would otherwise miss every house
-    // that only a POI states.
+    // Address search reads addresses alone: without this it misses every
+    // house only a POI states.
     if let Some(address) = &address {
         let record = AddressRecord {
             disputed: false,
@@ -421,8 +385,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     out.records.push(Record::Poi(record));
 }
 
-/// The number of the Wikidata item tag `key` names: 1 for `Q1`. A value of
-/// several items, or none, names none.
+/// Several items in one value name none.
 fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
     tags.cleaned(key)?
         .strip_prefix('Q')?
@@ -431,9 +394,7 @@ fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
         .filter(|item| *item > 0)
 }
 
-/// A name with at least one letter: house numbers and ref codes in `name` are
-/// not names. A place with none is named by its brand, which is what its
-/// sign says.
+/// House numbers and ref codes in `name` are no names.
 fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {
     ["name", "brand"].into_iter().find_map(|key| {
         tags.cleaned(key)
@@ -483,7 +444,6 @@ mod tests {
             brand: None,
             aliases: Vec::new(),
         };
-        // 0.0001 degrees of longitude is some 7 m here.
         let metres = |m: f64| 5.0 + m / 70_000.0;
         let ids = |resolved: Vec<PoiRecord>| {
             let mut ids = resolved
@@ -494,7 +454,6 @@ mod tests {
             ids
         };
 
-        // Two points of one cafe 3 m apart are one place.
         assert_eq!(
             ids(resolve(vec![
                 place(1, "amenity:cafe", metres(0.0), None),
@@ -502,7 +461,6 @@ mod tests {
             ])),
             [(1, vec![(ObjectType::Node, 2)])]
         );
-        // A hotel and its restaurant, of two kinds, stay two.
         assert_eq!(
             resolve(vec![
                 place(1, "tourism:hotel", metres(0.0), None),
@@ -511,7 +469,6 @@ mod tests {
             .len(),
             2
         );
-        // One Wikidata item is one place, of any kind, a campus apart.
         assert_eq!(
             resolve(vec![
                 place(1, "amenity:university", metres(0.0), Some(7)),
@@ -520,8 +477,7 @@ mod tests {
             .len(),
             1
         );
-        // Three in a row 40 m apart: the third is 80 m from the leader the
-        // second joined, and stays a place of its own.
+        // No chaining: third is 80 m from the leader.
         assert_eq!(
             ids(resolve(vec![
                 place(1, "amenity:cafe", metres(0.0), None),
@@ -553,7 +509,6 @@ mod tests {
             point(&[("natural", "peak")]).as_deref(),
             Some("natural:peak")
         );
-        // A preset for areas only matches no point.
         assert_eq!(point(&[("natural", "water"), ("water", "lake")]), None);
         assert_eq!(
             area(&[("natural", "water"), ("water", "lake")]).as_deref(),
@@ -590,7 +545,6 @@ mod tests {
         assert!(!named(&[("landuse", "residential")]));
         // A bench next to a shop is still the shop.
         assert!(named(&[("amenity", "bench"), ("shop", "bakery")]));
-        // A named house is a place only when Wikidata knows it.
         assert!(!drawn_named(&[("building", "yes")], Drawn::Area));
         assert!(drawn_named(
             &[("building", "yes"), ("wikidata", "Q1")],

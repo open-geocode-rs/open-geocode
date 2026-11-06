@@ -80,10 +80,7 @@ const PASTED_KEY_NAMESPACES: [&str; 8] = [
 
 /// Keys whose values are other names of the feature, with or without a
 /// `:<lang>` suffix.
-/// The other names a feature is known by. `loc_name` is what locals call it,
-/// `int_name` and `reg_name` its international and regional names, and an
-/// airport's `iata`, `icao` and `faa` codes are what travellers type
-/// ("AMS").
+/// Airport codes count: travellers type "AMS".
 const ALT_NAME_KEYS: [&str; 10] = [
     "alt_name",
     "official_name",

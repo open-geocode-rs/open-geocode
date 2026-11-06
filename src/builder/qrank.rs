@@ -1,10 +1,5 @@
-//! How much each Wikidata item is read, from QRank.
-//!
-//! QRank (<https://qrank.toolforge.org>, CC0) ranks every Wikidata item by
-//! its Wikimedia page views, weekly, as a CSV of `Entity,QRank` rows such as
-//! `Q5296,4958942240`. A place's importance is its item's rank on a log
-//! scale, one byte: a museum read the world over is far above a chapel
-//! read by its village, and both above a place no article describes.
+//! QRank (<https://qrank.toolforge.org>, CC0): Wikimedia page views per
+//! Wikidata item, `Entity,QRank` rows such as `Q5296,4958942240`.
 
 use std::{
     fs::File,
@@ -18,21 +13,16 @@ use crate::{
     memory::{Budget, Reservation},
 };
 
-/// Bytes an item takes in memory: its number and its importance.
 const ITEM_BYTES: usize = std::mem::size_of::<u32>() + std::mem::size_of::<u8>();
 
-/// Each ranked item's importance, by item number.
 #[derive(Debug)]
 pub struct QRank {
-    /// Item numbers, ascending.
     items: Vec<u32>,
     importance: Vec<u8>,
     _memory: Reservation,
 }
 
 impl QRank {
-    /// Read the QRank file at `path`, gzipped or not, holding its memory
-    /// against `budget`.
     pub fn load(path: &Path, budget: &Arc<Budget>) -> Result<Self> {
         let file = File::open(path).map_err(|source| Error::IoPath {
             action: "failed to open",
@@ -83,7 +73,6 @@ impl QRank {
         })
     }
 
-    /// The importance of item `item`, 0 when QRank does not rank it.
     pub fn importance(&self, item: u32) -> u8 {
         self.items
             .binary_search(&item)
@@ -99,8 +88,7 @@ impl QRank {
     }
 }
 
-/// A rank as one byte, 1 to 255: 7.5 steps a doubling, so the most read
-/// item of all, some 5 billion views, still fits.
+// 7.5 steps a doubling: the most read item, ~5 billion views, still fits a byte.
 fn importance(rank: u64) -> u8 {
     let doublings = (rank as f64 + 1.0).log2();
     (1.0 + doublings * 7.5).clamp(1.0, 255.0) as u8

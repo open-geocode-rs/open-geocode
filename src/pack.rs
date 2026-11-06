@@ -961,9 +961,7 @@ impl Reader {
         Ok(records)
     }
 
-    /// The first record whose id is `source_id`, by reading every record:
-    /// the oracle tests check the id catalogue and the builder's records
-    /// against, too slow to serve.
+    /// Full scan: a test oracle for the id catalogue, too slow to serve.
     #[cfg(test)]
     pub(crate) fn find_by_source_id(&self, source_id: &str) -> Result<Option<RecordId>> {
         for record_id in 0..self.records.record_count() {

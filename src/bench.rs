@@ -337,8 +337,6 @@ fn benchmark_search_cases(
     })
 }
 
-/// The searcher a case's layer names, `/places`' for `poi`, and the layer
-/// filter left for it.
 fn product<'a>(
     addresses: &'a TextSearcher,
     places: &'a TextSearcher,
@@ -550,7 +548,6 @@ pub fn sample_poi_fixture(options: &PoiFixtureOptions) -> Result<BenchmarkFixtur
             name: Some(poi.category.clone()),
             query: format!("{}, {locality}", poi.name),
             limit: Some(POI_CASE_LIMIT),
-            // A place is /places' to find.
             layer: Some(Layer::Poi.as_str().to_string()),
             expect: Some(ExpectedObject {
                 osm_type: poi.source.object_type,

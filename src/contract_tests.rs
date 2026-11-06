@@ -270,7 +270,6 @@ async fn responses_match_the_committed_examples() {
     assert!((0.0..=1.0).contains(&confidence), "{confidence}");
     assert!(properties.get("distance_m").is_none());
 
-    // A place is /places' answer, never /geocode's.
     let poi = get(&router, "/places?q=Queen%20Bakery").await;
     assert_example("places", &poi);
     let properties = &poi["features"][0]["properties"];
@@ -278,8 +277,6 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(properties["name"], "Queen Bakery");
     assert_eq!(properties["category"], "shop:bakery");
     assert_eq!(properties["accuracy"], "centroid");
-    // By its stable id, as a shared link or a saved place asks: in the
-    // order asked, an unknown id left out.
     let by_id = get(&router, "/places?ids=osm:way:999,osm:way:11,osm:relation:3").await;
     assert_example("places-ids", &by_id);
     let found = by_id["features"]
@@ -404,7 +401,6 @@ async fn responses_match_the_committed_examples() {
             .expect("number")
     );
 
-    // One layer: its nearest record, and no other area.
     let street_only = get(&router, "/reverse?lon=-79.0&lat=43.0&layer=street").await;
     assert_example("reverse-layer", &street_only);
     let features = street_only["features"].as_array().expect("features");
@@ -419,9 +415,6 @@ async fn responses_match_the_committed_examples() {
     assert_example("reverse-nothing", &nothing);
     assert_eq!(nothing["features"], json!([]));
 
-    // A structured `/geocode` answers with the same collection as `q=`,
-    // holding the one address that fits, so a client parses one shape for
-    // both.
     let structured = get(
         &router,
         "/geocode?address=10%20King%20Street&postcode=M5V%201A1",

@@ -46,7 +46,6 @@ pub struct InterpolationRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreetRecord {
     pub name: String,
-    /// The most important class among its ways.
     pub road_class: RoadClass,
     /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
@@ -56,8 +55,7 @@ pub struct StreetRecord {
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
-    /// The ids of the other OSM ways joined into it, ascending: a map tile
-    /// names the way a tap lands on, and any of them finds the street.
+    /// Ascending. A tile names the way a tap lands on.
     pub other_ways: Vec<i64>,
 }
 
@@ -71,10 +69,9 @@ pub struct PostcodeRecord {
     pub source: DerivedSourceProvenance,
 }
 
+// Discriminants are the Pack encoding: renumbering needs a `RECORDS_VERSION`.
 /// What kind of road a street is, from its OSM `highway` tag, most important
-/// first. A link road (`motorway_link`) is its road's class. The
-/// discriminants are the Pack's encoding: a variant may not be renumbered
-/// without a `RECORDS_VERSION`.
+/// first. A link road (`motorway_link`) is its road's class.
 #[derive(
     Debug,
     Clone,
@@ -108,7 +105,6 @@ pub enum RoadClass {
     Footway = 13,
     Path = 14,
     Steps = 15,
-    /// Any other value, such as a road under construction.
     #[default]
     Other = 16,
 }
@@ -134,7 +130,6 @@ impl RoadClass {
         RoadClass::Other,
     ];
 
-    /// The class of an OSM `highway` value.
     pub fn of_highway(value: &str) -> Self {
         match value.strip_suffix("_link").unwrap_or(value) {
             "motorway" => Self::Motorway,
@@ -202,13 +197,9 @@ pub struct PoiRecord {
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
     pub prominence: Prominence,
-    /// The number of its `wikidata` item, `Q1` being 1.
     pub wikidata: Option<u32>,
-    /// The chain it belongs to, apart from its name: "Tankstation Zanoli"
-    /// is an Esso.
     pub brand: Option<Brand>,
-    /// The other OSM objects that are this same place, merged into it (a
-    /// cafe mapped as two points): their ids still find it.
+    /// Ids of objects merged into it: they still find it.
     pub aliases: Vec<(ObjectType, i64)>,
 }
 
@@ -245,19 +236,12 @@ fn deserialize_item<'de, D: serde::Deserializer<'de>>(
     Ok(text.and_then(|text| text.strip_prefix('Q').and_then(|item| item.parse().ok())))
 }
 
-/// How widely a POI is known: how much its Wikidata item is read, when the
-/// build had QRank, then from its own OSM tags whether mappers linked it to
-/// Wikidata or Wikipedia, and in how many languages they named it. A museum
-/// of a city is read, linked and named in a dozen languages; a corner shop
-/// of the same name in none. It breaks ties between POIs only (see the
-/// search's tie-break), never against another layer.
+/// Breaks ties between POIs only, never against another layer.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub struct Prominence {
-    /// How much its Wikidata item is read, from QRank: Wikimedia page views
-    /// on a log scale, 1 to 255; 0 when it has none or the build had no
-    /// QRank. First, so it orders before what the tags alone say.
+    /// QRank, 0 when none. First field: it orders before the tags.
     pub importance: u8,
     /// It carries `wikidata=` or `wikipedia=`.
     pub linked: bool,
@@ -271,14 +255,11 @@ impl Prominence {
     /// and past a few dozen a name is everywhere already.
     pub const MAX_LANGUAGES: u8 = 127;
 
-    /// One byte: the languages, then whether it is linked. The importance is
-    /// not in it.
+    /// Importance stored apart.
     pub fn to_byte(self) -> u8 {
         self.languages.min(Self::MAX_LANGUAGES) << 1 | u8::from(self.linked)
     }
 
-    /// The tags' part of the byte [`Self::to_byte`] writes; the importance
-    /// is stored apart.
     pub const fn from_byte(byte: u8, importance: u8) -> Self {
         Self {
             importance,

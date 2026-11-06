@@ -1,9 +1,6 @@
-//! What each data set an answer comes from asks to be credited with.
-//!
-//! OpenStreetMap's licence is fixed. An OpenAddresses data set's comes from
-//! `catalog/licences.json`, generated from the pinned OpenAddresses snapshot;
-//! a data set it does not list, or a file a build was handed by path, has no
-//! known licence and is credited by its name alone.
+//! OpenAddresses licences come from `catalog/licences.json`, generated from
+//! the pinned snapshot. A data set it does not list, or a file handed by
+//! path, is credited by name alone.
 
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -11,18 +8,15 @@ use serde::Deserialize;
 
 use crate::{openaddresses::DATASET_PREFIX, record::OSM_DATASET};
 
-/// A data set's licence, as an answer credits it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Licence {
-    /// The licence's name, such as `CC BY 4.0`, or the URL of its terms when
-    /// the source states no name.
+    /// The URL of its terms when the source states no name.
     pub name: String,
     pub url: Option<String>,
-    /// Whom the licence asks to be credited, when it asks.
     pub attribution: Option<String>,
 }
 
-/// OpenStreetMap's licence: every answer's areas and labels come from it.
+// Every answer's areas and labels come from OSM, so it is always credited.
 pub fn osm() -> Licence {
     Licence {
         name: "ODbL 1.0".to_string(),
@@ -47,7 +41,6 @@ struct Row {
     attribution_name: Option<String>,
 }
 
-/// The licence of the data set records name `dataset`, when it is known.
 pub fn of(dataset: &str) -> Option<Licence> {
     if dataset == OSM_DATASET {
         return Some(osm());
@@ -56,9 +49,6 @@ pub fn of(dataset: &str) -> Option<Licence> {
     openaddresses().get(path).cloned()
 }
 
-/// OpenAddresses licences by data set path: `nz/countrywide`, and
-/// `us/ca/sf/city` for a source with several data sets, as
-/// [`crate::openaddresses`] names them.
 fn openaddresses() -> &'static HashMap<String, Licence> {
     static TABLE: OnceLock<HashMap<String, Licence>> = OnceLock::new();
     TABLE.get_or_init(|| {

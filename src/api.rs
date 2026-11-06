@@ -98,8 +98,6 @@ pub struct Source {
     pub dataset: String,
 }
 
-/// The credits of the data sets `datasets` names, OpenStreetMap first, each
-/// once, in the order first named.
 fn attribution<'a>(pack: &Reader, datasets: impl Iterator<Item = &'a str>) -> Vec<Attribution> {
     let mut named = vec![OSM_DATASET];
     for dataset in datasets {

@@ -17,11 +17,8 @@ use super::{
 /// audit needs to explain a rejection.
 const STREET_TAG_KEYS: [&str; 2] = ["highway", "ref"];
 
-/// `highway` values that name no street: a platform or a bus stop is named
-/// after its station, a proposed or abandoned way has no addresses, and a
-/// service area or a rest area is a place. A footway, a path or steps stay
-/// streets, as houses stand on them; so does a road under construction, whose
-/// addresses often exist before it opens.
+// Footways, paths and steps stay streets: houses stand on them. So does a
+// road under construction: its addresses often exist before it opens.
 const NOT_STREETS: [&str; 7] = [
     "abandoned",
     "bus_stop",
@@ -36,7 +33,6 @@ pub(crate) fn has_highway_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("highway")
 }
 
-/// Whether a way's `highway` tag makes it a street.
 pub(crate) fn is_street(tags: &BTreeMap<String, String>) -> bool {
     tags.get("highway")
         .is_some_and(|value| !NOT_STREETS.contains(&value.as_str()))
@@ -262,8 +258,7 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
             }
         }
     }
-    // Two inputs can hold one way twice: each id once, the street's own
-    // left out.
+    // Two inputs can hold one way twice.
     let own = street.source.object_id;
     street.other_ways.sort_unstable();
     street.other_ways.dedup();
@@ -407,7 +402,6 @@ mod tests {
         assert_eq!(joined.id(), "osm:way:1", "named by its lowest way");
         assert_eq!(joined.other_ways, [2, 3], "its other ways find it");
         assert!(streets[1].other_ways.is_empty(), "a lone way has none");
-        // Two inputs that hold the same ways: each id once, its own left out.
         let twice = join_ways(vec![
             way(1, &[[-79.0, 43.0], [-79.001, 43.0]], &[]),
             way(1, &[[-79.0, 43.0], [-79.001, 43.0]], &[]),

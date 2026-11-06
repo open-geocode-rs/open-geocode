@@ -74,8 +74,6 @@ pub struct TextSearcher {
     /// What orders the hits of a query's pool, when the Pack has been
     /// calibrated; else they are chosen by their [`Evidence`].
     ranker: Option<Ranker>,
-    /// Whether it searches places rather than addresses (see
-    /// [`Self::places`]).
     places: bool,
     /// How long one query searches before it answers with what it found.
     budget: Duration,
@@ -332,8 +330,7 @@ const TYPO_PREFIX_CHARS: usize = 1;
 /// The terms near one word kept per field, fewest edits then most documents
 /// first: a common short word has dozens of neighbours on a planet.
 const MAX_TYPO_TERMS: usize = 32;
-/// Places a place search reads whose names hold every word of the query,
-/// before it orders them by how exactly they are named and how well known.
+// Wide enough that the best-known of many same-named places makes it.
 const NAMED_PLACES_WINDOW: usize = 200;
 /// Stated house numbers read on each side of one that no record states: a
 /// few, so the nearest of the same parity can be found and the numbers of a
@@ -445,9 +442,8 @@ impl TextSearcher {
         })
     }
 
-    /// A searcher of places (POIs): the same search over places' own text
-    /// fields (see [`Fields::for_places`]). The structured index, the
-    /// confidence model and the ranker know addresses alone, so it has none.
+    /// No structured index, confidence model or ranker: those know
+    /// addresses alone.
     pub fn places(&self) -> Self {
         Self {
             fields: self.fields.for_places(),
@@ -560,10 +556,8 @@ impl TextSearcher {
         if let Some(named) = NAMED.with(RefCell::take) {
             named.choose(&mut hits);
         }
-        // A place is sought by its name: of the places a pass finds, the one
-        // the query's words cover with none left over answers it, whatever a
-        // name that repeats a street's words scores. No ranker knows places
-        // yet to weigh the two.
+        // No ranker knows places yet: a place whose name the query covers
+        // fully beats one that only repeats a street's words.
         if self.places {
             hits.sort_by_key(|hit| (hit.features.pass, hit.features.dropped_words));
             if !named.is_empty() {
@@ -1735,10 +1729,8 @@ impl TextSearcher {
         Ok(Box::new(BooleanQuery::new(alternatives)))
     }
 
-    /// What keeps a search to its product: a place search reads POIs alone,
-    /// an address search no POI. The two share where records are
-    /// (`context_text`), so a query that matched on it alone could reach the
-    /// other's records.
+    /// Both products share `context_text`: a query matching on it alone
+    /// would reach the other product's records.
     fn product_clause(&self) -> (Occur, Box<dyn Query>) {
         let occur = if self.places {
             Occur::Must
@@ -5193,12 +5185,8 @@ impl TextSearcher {
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
 
-    /// The places whose names hold every word of `query_text`, the most
-    /// important first: what a place search answers before it reads the
-    /// query as an address would be read. A place's name often holds a
-    /// town's or a street's words ("Rijksmuseum Twenthe", "Van Gogh
-    /// Museum"), which the address reading takes for where it is, or for a
-    /// street, and so passes it over.
+    /// The address reading takes a town's or street's words in a name
+    /// ("Rijksmuseum Twenthe") for where it is, and passes the place over.
     fn places_by_name(
         &self,
         query_text: &str,
@@ -5234,8 +5222,6 @@ impl TextSearcher {
             focus,
             ..Ranking::default()
         };
-        // Many places can hold the words ("Schiphol" names the airport and a
-        // dozen hotels), so a window wide enough to hold the one most known.
         let window = limit.max(NAMED_PLACES_WINDOW);
         let mut hits =
             self.ranked_hits(&BooleanQuery::new(clauses), &ranking, window, &mut |hit| {
@@ -5244,9 +5230,7 @@ impl TextSearcher {
         let records = self.pack.records();
         let mut order = HashMap::new();
         for hit in &hits {
-            // A name that is the query, its own or another ("AMS" of the
-            // airport), before one that only holds its words; then the more
-            // known.
+            // Exact name, own or alternate ("AMS"), before a name holding the words.
             let exact = records
                 .names(hit.record_id)?
                 .iter()
@@ -8083,14 +8067,9 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
-/// One list of the address and the place suggestions for `query`, at most
-/// `limit` of them.
-///
-/// The two are ranked by text scores over different fields, which do not
-/// compare, so they are ordered by what the query says: a query that starts
-/// with a house number asks for an address, so addresses come first; else a
-/// place whose name starts as the query does comes first, then the
-/// addresses, then the other places.
+/// Scores over different fields do not compare, so the query decides the
+/// order: a leading house number puts addresses first; else a place whose
+/// name starts as the query, then addresses, then other places.
 pub fn mix_suggestions(
     query: &str,
     addresses: Vec<TextSearchHit>,
@@ -9912,8 +9891,6 @@ mod tests {
                 .clone()
         };
 
-        // Address search answers with the place and the street; the POIs
-        // named after them are /places' answers.
         assert_eq!(top("Muskoka Lakes Township"), "osm:relation:1");
         assert_eq!(top("Walmer Road"), "osm:node:3");
         let places = searcher.places();
@@ -9989,15 +9966,12 @@ mod tests {
         };
         let no_poi = |hits: &[(String, String)]| hits.iter().all(|(_, layer)| layer != "poi");
 
-        // Address search never answers with a POI, however its name reads.
         let street = layers_of(&searcher, "Walmer Road");
         assert!(no_poi(&street), "{street:?}");
         let numbered = layers_of(&searcher, "4 Walmer Road");
         assert_eq!(numbered[0].0, "osm:node:4", "{numbered:?}");
         assert!(no_poi(&numbered), "{numbered:?}");
         assert!(no_poi(&layers_of(&searcher, "Walmer Road Bakery")));
-        // Place search finds the shop by its name and the address it stands
-        // at, and the others by their names.
         let confirmed = layers_of(&places, "Corner Store 4 Walmer Road");
         assert_eq!(confirmed[0].0, "osm:node:11", "{confirmed:?}");
         assert_eq!(layers_of(&places, "Walmer Road Bakery")[0].0, "osm:node:12");
@@ -11300,7 +11274,6 @@ mod tests {
             None,
         )
         .address;
-        // The builder writes a POI's address as an address of its own.
         writer
             .write(
                 &address_record(

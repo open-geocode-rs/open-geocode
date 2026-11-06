@@ -195,9 +195,7 @@ pub struct BuildOsmOptions {
     /// How many addresses `addresses` is expected to add, for the plan to
     /// size disk by; 0 when not known before they are fetched.
     pub imported_rows: u64,
-    /// A QRank file (see [`crate::builder::qrank`]): a place linked to a
-    /// Wikidata item it ranks gets that item's importance. Without one,
-    /// places tell their importance apart by their tags alone.
+    /// QRank file (see [`crate::builder::qrank`]).
     pub qrank: Option<PathBuf>,
 }
 
@@ -1462,7 +1460,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// The POIs that are one place merged, into the records.
     fn resolve_places(&mut self) -> Result<()> {
         let phase = Instant::now();
         let places = self
@@ -2054,8 +2051,7 @@ struct Build {
     /// The ways of streets, until every one is known and the ways of one
     /// street can join (see [`join_streets`]).
     streets: Option<ExternalSorter<PendingNamed>>,
-    /// The POIs, until every one is known and those that are one place can
-    /// be merged (see [`resolve_places`]).
+    // Held until all are known: merging needs every POI of a name.
     places: Option<ExternalSorter<PendingNamed>>,
     /// Places: everything a context tuple can point at.
     context_records: Option<ExternalSorter<PendingRecord>>,
@@ -2375,9 +2371,6 @@ fn read_chunks<T: book::Entry + Send + Sync>(
 /// city and joins across the wards; else the locality. One name is many
 /// streets across a country, and a road crossing a town line is a street in
 /// each town. `area_names` are the names of each area, its own first.
-/// The POIs of `places`, one name at a time, the ones that are one place
-/// merged (see [`poi::resolve`]), pushed to `records`. Returns how many were
-/// merged into another.
 fn resolve_places(
     places: ExternalSorter<PendingNamed>,
     records: &mut ExternalSorter<PendingRecord>,
@@ -2895,9 +2888,7 @@ fn overlapped<T: Send>(
 /// Write sorted records in batches, computing admin context in parallel, and
 /// offer each record to the parser's training sample under the country it
 /// lies in. Boundary and derived-country records describe context and get
-/// none, but are offered under the country their point lies in. Each POI
-/// gets the importance `qrank` gives its Wikidata item; returns how many it
-/// ranked.
+/// none, but are offered under the country their point lies in.
 #[allow(clippy::too_many_arguments)]
 fn write_ordered(
     writer: &mut Writer,
@@ -4130,8 +4121,6 @@ mod tests {
         assert_eq!(report.accepted.poi_categories.get("amenity"), Some(&2));
         assert_eq!(report.geometry_resolution.poi_way_stubs, 1);
 
-        // The cafe is a POI carrying its address, and the address an
-        // address of its own.
         let summaries = (0..reader.manifest().record_count)
             .map(|id| (id, reader.record_summary(id).expect("summary")))
             .collect::<Vec<_>>();
@@ -4162,7 +4151,6 @@ mod tests {
 
         let addresses = TextSearcher::open(dir.join("pack")).expect("searcher");
         let places = addresses.places();
-        // `poi` asks /places, any other layer /geocode, as the API does.
         let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
             let searcher = match layer {
                 Some("poi") | None => &places,
@@ -4203,7 +4191,6 @@ mod tests {
                 .label,
             "Riverdale Farm, Toronto"
         );
-        // By its address, under the address layer filter as its address.
         let address = search("123 King Street West", Some("address"));
         assert_eq!(ids(&address), vec!["osm:node:2001"]);
         assert_eq!(address[0].record.layer, "address");
@@ -4228,7 +4215,6 @@ mod tests {
             .expect("autocomplete");
         assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);
 
-        // Reverse answers with the cafe's address.
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = reverse
             .reverse(GeocodeOptions::at(-79.38, 43.65))
@@ -4294,7 +4280,7 @@ mod tests {
     fn a_place_drawn_as_a_multipolygon_is_a_place_inside_its_outline() {
         let dir = temp_dir("place-relations");
         let input = dir.join("stadium.osm.pbf");
-        // A ring around a hole: the plain centre lies in the hole.
+        // Plain centre lies in the hole.
         let nodes = vec![
             node(1, 52.300, 4.930, &[]),
             node(2, 52.300, 4.950, &[]),
@@ -4368,7 +4354,6 @@ mod tests {
                             ("brand:wikidata", "Q867662"),
                         ],
                     ),
-                    // No name: its brand names it.
                     node(
                         2,
                         52.38,
@@ -4543,7 +4528,6 @@ mod tests {
             way(703, &[205, 206], &road("Ponsonby Road")),
             way(710, &[211, 212], &road("Main Street")),
             way(711, &[212, 213], &road("Main Street")),
-            // Named after its station, not a street.
             way(
                 720,
                 &[205, 206],
@@ -4588,7 +4572,6 @@ mod tests {
             ],
             "a street in a local board is named by its district, one in a town by the town"
         );
-        // A tap on any way of the joined road finds the road.
         let catalogue = crate::ids::Catalogue::open(reader.container())
             .expect("open")
             .expect("a catalogue");

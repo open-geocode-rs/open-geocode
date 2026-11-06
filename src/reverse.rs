@@ -31,7 +31,6 @@ pub struct GeocodeOptions {
 }
 
 impl GeocodeOptions {
-    /// The nearest answer of any layer at a point.
     pub const fn at(lon: f64, lat: f64) -> Self {
         Self {
             lon,
@@ -73,7 +72,6 @@ pub enum MatchKind {
     ExplicitAddress,
     EstimatedAddress,
     NearestStreet,
-    /// The nearest POI, answered only to `layer=poi`.
     Poi,
     ContextOnly,
 }
@@ -144,8 +142,7 @@ impl PackReverseGeocoder {
         if let Some(layer) = options.layer {
             let mut result =
                 self.of_layer(layer, options, &mut context, &mut context_record_ids)?;
-            // The answer is the one layer asked for: the areas it resolved
-            // still label it, but are not answers of their own.
+            // Resolved areas still label it, but are no answers of their own.
             if let Some(result) = &mut result {
                 result.evidence.context_record_ids.clear();
             }
@@ -177,9 +174,6 @@ impl PackReverseGeocoder {
         })
     }
 
-    /// The nearest record of `layer`: the stage of the fallback chain that
-    /// answers with it, or for an area the area of that layer the point lies
-    /// in.
     fn of_layer(
         &self,
         layer: Layer,
@@ -382,7 +376,6 @@ impl PackReverseGeocoder {
         }))
     }
 
-    /// The area of `layer` the point lies in.
     fn area(
         &self,
         layer: Layer,
@@ -771,7 +764,6 @@ mod tests {
                 None,
             )
             .expect("bakery");
-        // The builder writes the bakery's address as an address of its own.
         let mut address = address_record();
         address.geometry = point_geometry(-79.0, 43.00005);
         address.location_precision = LocationPrecision::Centroid;

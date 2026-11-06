@@ -708,8 +708,7 @@ pub(crate) fn glued_stem(word: &str) -> Option<&str> {
     glued_parts(word).map(|(stem, _)| stem)
 }
 
-/// The name and the street type glued onto it in `word` ("wilderinks" and
-/// "plein" of "wilderinksplein"); `None` when no type is glued onto it.
+/// "wilderinksplein" is "wilderinks" + "plein".
 pub(crate) fn glued_parts(word: &str) -> Option<(&str, &str)> {
     abbreviations::abbreviations().split_glued(word)
 }

@@ -45,7 +45,6 @@ pub(crate) fn may_matter<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
     for key in keys {
         match key {
             "place" | "highway" | "boundary" => return true,
-            // A branded place unnamed is named by its brand.
             "name" | "brand" => named = true,
             key if key.starts_with("addr:") => return true,
             key if is_place_key(key) => category = true,
@@ -398,9 +397,7 @@ fn scan_relation(
         }
         return;
     }
-    // A place drawn as several outlines: a stadium, a campus, a castle and
-    // its moat. Its rings are assembled with the boundaries', and it becomes
-    // a place at a point inside them (see `boundary::place_relations`).
+    // Rings assembled with the boundaries' (see `boundary::place_relations`).
     if is_area_relation(all_tags) && is_poi(all_tags, Drawn::Area) {
         if !members.is_empty() {
             let address = collect_addr_tags_from_map(all_tags);

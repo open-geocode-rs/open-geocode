@@ -71,21 +71,17 @@ pub struct BuilderReport {
     /// Each time the build went on from a checkpoint a run before left.
     #[serde(default)]
     pub resumes: Vec<ResumeReport>,
-    /// The QRank file places' importance came from, when the build had one.
     #[serde(default)]
     pub qrank: Option<QRankReport>,
 }
 
-/// The QRank file a build read, so a Pack's importances can be traced to it.
+// Traces a Pack's importances to the file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct QRankReport {
     pub path: String,
     pub bytes: u64,
-    /// When the file was last changed, in seconds since the Unix epoch.
     pub modified_unix: u64,
-    /// The items it ranks.
     pub items: u64,
-    /// The places linked to an item it ranks.
     pub ranked_places: u64,
 }
 
@@ -548,16 +544,12 @@ pub struct AcceptedCounts {
     pub place_areas: u64,
     pub poi_nodes: u64,
     pub poi_way_centroids: u64,
-    /// POIs that state an address, which is also an address record.
     pub pois_with_address: u64,
     /// POIs by the key of their category, for example `amenity`.
     pub poi_categories: BTreeMap<String, u64>,
-    /// POIs merged into another that is the same place (see
-    /// `poi::resolve`).
     #[serde(default)]
     pub places_merged: u64,
-    /// Named objects with a key places are tagged by that are no place,
-    /// by that tag (`amenity=bench`): what the counted presets leave out.
+    /// What the counted presets leave out, to audit curation.
     #[serde(default)]
     pub places_left_out: BTreeMap<String, u64>,
 }
@@ -956,7 +948,6 @@ impl BuilderReport {
         self.accepted.place_areas += 1;
     }
 
-    /// Count a named object tagged `key=value` that is no place.
     pub(crate) fn leave_out_place(&mut self, key: &str, value: &str) {
         *self
             .accepted

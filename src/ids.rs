@@ -1,20 +1,12 @@
-//! The id catalogue: from a place's stable id to the block of the record
-//! store that holds it.
+//! Stable id to record block.
 //!
-//! Map clients keep a place's id, from a shared link, a saved place or a tap
-//! on a map tile, and ask for that place again after any rebuild. The
-//! catalogue holds the places, POIs and areas drawn from OpenStreetMap, and
-//! the streets, whose ids are stable; an address or an imported row is found
-//! by its words or its point. A street is found by the id of any of its ways,
-//! since a tile names the way a tap lands on, and when a place and a street
-//! share an id, the place answers.
+//! Only OSM places, areas and streets: OpenAddresses row ids renumber every
+//! release, so a saved one would open another house. A street answers to any
+//! of its ways' ids: a tile names the way a tap lands on.
 //!
-//! It stores no id. A minimal perfect hash (FMPHGO, from the `ph` crate,
-//! about 2 to 3 bits an id) gives each catalogued id a slot of its own, and
-//! the slot holds the number of the block of 64 records the place is in. A
-//! lookup decodes that block and keeps the record whose own id is the one
-//! asked for, so an id never catalogued, which the hash sends to some slot
-//! anyway, finds nothing.
+//! Stores no id. A minimal perfect hash (FMPHGO, `ph` crate, ~2-3 bits an id)
+//! maps each id to a slot holding its block number. The hash sends unknown
+//! ids to some slot too, so a lookup checks the record's own id.
 //!
 //! ```text
 //! places/ids   width u8 (bytes of a block number) | count u64 | count block
@@ -37,11 +29,9 @@ use crate::{
 
 pub const SECTION: &str = "places/ids";
 const VERSION: u32 = 2;
-/// The most ids one lookup takes.
 pub const MAX_IDS: usize = 50;
 
-/// An OSM object as the hash takes it: its kind in the top two bits, its
-/// number below, little-endian so a Pack reads alike on every machine.
+// Little-endian: a Pack hashes alike on every machine.
 fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {
     let kind: u64 = match object_type {
         ObjectType::Node => 0,
@@ -55,9 +45,8 @@ fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {
     Some((kind << 62 | number).to_le_bytes())
 }
 
-/// The OSM object `id` names: `osm:node:123`. `Err` for text no id is
-/// written as; `Ok(None)` for the id of a record the catalogue does not hold
-/// (an imported row, a derived postcode).
+/// `Ok(None)`: a well-formed id the catalogue never holds (imported row,
+/// derived postcode).
 pub fn parse(id: &str) -> Result<Option<(ObjectType, i64)>> {
     let malformed =
         || Error::BadOptions(format!("{id:?} is no record id, such as osm:node:123").into());
@@ -83,7 +72,6 @@ pub fn parse(id: &str) -> Result<Option<(ObjectType, i64)>> {
     Ok(Some((object_type, number)))
 }
 
-/// Build the catalogue of the sealed Pack and add it.
 pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
     let bytes = {
         let pack = pack::Reader::open(sealed.path())?;
@@ -92,8 +80,6 @@ pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
     sealed.add_section(SECTION, VERSION, &bytes)
 }
 
-/// The catalogued ids of every block, in parallel, each with whether its
-/// record is a street.
 fn entries(records: &records::Reader) -> Result<Vec<([u8; 8], bool, u64)>> {
     let per_block = (0..records.block_count())
         .into_par_iter()
@@ -111,8 +97,7 @@ fn entries(records: &records::Reader) -> Result<Vec<([u8; 8], bool, u64)>> {
 fn build(records: &records::Reader) -> Result<Vec<u8>> {
     let mut places = entries(records)?;
     // One object can be two records (a node that is a town and a POI, a way
-    // that is a market and a piece of a road): a place's block keeps it over
-    // a street's, and the first block over a later one.
+    // that is a market and a road): the place wins over the street.
     places.sort_unstable_by_key(|(key, street, block)| (*key, *street, *block));
     places.dedup_by_key(|(key, ..)| *key);
     let keys = places.iter().map(|(key, ..)| *key).collect::<Vec<_>>();
@@ -137,7 +122,6 @@ fn build(records: &records::Reader) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The catalogue of a Pack.
 pub struct Catalogue {
     function: GOFunction,
     width: usize,
@@ -155,7 +139,6 @@ impl std::fmt::Debug for Catalogue {
 }
 
 impl Catalogue {
-    /// The Pack's catalogue, `None` for a Pack built before it had one.
     pub fn open(container: &Container) -> Result<Option<Arc<Self>>> {
         if !container.sections().contains_key(SECTION) {
             return Ok(None);
@@ -180,8 +163,6 @@ impl Catalogue {
         })))
     }
 
-    /// The records whose id is `object_type`/`object_id`, by id order: its
-    /// places, or its street when no place has it.
     pub fn find(
         &self,
         records: &records::Reader,
@@ -262,7 +243,6 @@ mod tests {
     fn finds_every_place_by_its_id_and_nothing_else() {
         let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
         let mut writer = Writer::create(&dir).expect("writer");
-        // Enough records for several blocks.
         for index in 0..300 {
             let lon = -79.0 + f64::from(index) * 1e-4;
             let record: Record = match index % 3 {
@@ -371,7 +351,6 @@ mod tests {
         writer
             .write(&street(700, vec![701, 702], 174.74), None)
             .expect("write");
-        // Way 701 is also a market: the place answers to it.
         let market: Record = PoiRecord {
             alt_names: Vec::new(),
             name: "Ponsonby Market".to_string(),
@@ -387,7 +366,6 @@ mod tests {
         }
         .into();
         writer.write(&market, None).expect("write");
-        // A street far beyond the first block, whose ways jump far apart.
         for index in 0..100 {
             writer
                 .write(&street(10_000 + index, Vec::new(), 175.0), None)

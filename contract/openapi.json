@@ -894,7 +894,7 @@
         "type": "object"
       },
       "RoadClass": {
-        "description": "What kind of road a street is, from its OSM `highway` tag, most important\nfirst. A link road (`motorway_link`) is its road's class. The\ndiscriminants are the Pack's encoding: a variant may not be renumbered\nwithout a `RECORDS_VERSION`.",
+        "description": "What kind of road a street is, from its OSM `highway` tag, most important\nfirst. A link road (`motorway_link`) is its road's class.",
         "enum": [
           "motorway",
           "trunk",

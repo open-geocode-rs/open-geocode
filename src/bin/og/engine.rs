@@ -106,7 +106,6 @@ impl Engine {
         self.pack.manifest().record_count
     }
 
-    /// What `/geocode?q=` answers, or `/places?q=` when no address matches.
     pub(crate) fn search(&self, query: &str) -> Result<Answer> {
         let started = Instant::now();
         let query = query.trim().to_string();

@@ -223,17 +223,13 @@ pub struct Fields {
     pub address_number: Field,
     pub postcode_exact: Field,
     pub autocomplete_subject_text: Field,
-    /// A place's (POI's) own text fields, apart from the address fields
-    /// above, so a word common in shop names stays rare among street names.
-    /// Where a place is stays in `context_text` with the addresses': the
-    /// documents run in map order, so the neighbours that share a town's
-    /// name are runs of one list, which cost a fraction of the two lists
-    /// apart. Search keeps the products apart by layer (see
-    /// `TextSearcher::product_clause`).
+    /// Apart from the address fields, so a word common in shop names stays
+    /// rare among street names. Context stays shared: documents run in map
+    /// order, so one list of a town's neighbours compresses far better than
+    /// two. Search splits the products by layer (`product_clause`).
     pub place_name_text: Field,
     pub place_content_text: Field,
     pub place_autocomplete_subject_text: Field,
-    /// The house numbers of a place's address, apart from addresses' own.
     pub place_address_number: Field,
     /// First and last number of an interpolation range, so a search finds the
     /// ranges that contain a requested house number.
@@ -686,14 +682,10 @@ impl Fields {
         }
     }
 
-    /// The same fields with places' text fields in the address fields'
-    /// stead: what a search of places reads. Context is one field for both,
-    /// and a place states no exact postcode, so those fields stay.
     pub fn for_places(self) -> Self {
         Self {
             name_text: self.place_name_text,
             content_text: self.place_content_text,
-            // A place's street is a word of what it is, beside its name.
             street_text: self.place_content_text,
             autocomplete_subject_text: self.place_autocomplete_subject_text,
             address_number: self.place_address_number,
@@ -897,13 +889,12 @@ impl Document {
             builder.name(name);
         }
         builder.add_content_text(&poi.category);
-        // Its brand finds it as its name does: "Esso" is "Tankstation Zanoli".
+        // "Esso" finds "Tankstation Zanoli".
         if let Some(brand) = &poi.brand {
             builder.add_content_text(&brand.name);
             builder.add_optional_autocomplete_text(Some(&brand.name));
         }
-        // Its address words find it ("Albert Heijn Damrak"); its address is
-        // answered by the address record the builder writes beside it.
+        // "Albert Heijn Damrak": address words find the place too.
         if let Some(address) = &poi.address {
             builder.address(address);
         }
@@ -1037,17 +1028,11 @@ impl Directory for PackDirectory {
     }
 }
 
-/// The extension of a segment's document store.
 const STORE_EXTENSION: &str = ".store";
 
-/// A valid document store holding one empty document, in place of the
-/// segment's own.
-///
-/// No field is stored and nothing reads a stored document: records come from
-/// the record store. Tantivy still writes a 4-byte offset a document into the
-/// store, 471 MB on planet, and opens every segment's store when a searcher
-/// is created, so the file must stay a store tantivy can open. Any store
-/// opens: its document count is never checked against the segment's.
+/// Nothing reads stored documents, but tantivy writes a 4-byte offset per
+/// document anyway (471 MB on planet) and opens every segment's store, so
+/// the file must stay a valid store. Tantivy never checks its doc count.
 fn empty_store() -> Result<Vec<u8>> {
     let (schema, _) = build_schema();
     let index = Index::create_in_ram(schema);
@@ -1738,7 +1723,6 @@ mod tests {
         }
         writer.finish().expect("finish");
         let pack = crate::pack::Reader::open(&dir).expect("pack");
-        // The searcher opens every segment's store: the empty one opens too.
         let searcher = open_text_index(pack.container())
             .expect("text index")
             .reader()

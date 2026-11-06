@@ -121,14 +121,12 @@ pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
 pub const RECORDS_VERSION: u32 = 10;
 
-/// One id the id catalogue holds, and the record it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
     pub record_id: RecordId,
     pub object_type: ObjectType,
     pub object_id: i64,
-    /// Whether the record is a street: when a place and a street share an
-    /// id (a way that is a market and a piece of a road), the place answers.
+    /// A place sharing the id with a street wins.
     pub street: bool,
 }
 
@@ -187,10 +185,8 @@ pub struct Summary {
     /// A POI's category, for example `amenity:cafe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    /// A street's road class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub road_class: Option<RoadClass>,
-    /// A POI's brand.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brand: Option<Brand>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1071,7 +1067,6 @@ pub struct Reader {
     text_start: usize,
     /// Names of the imported datasets, by the index records store.
     datasets: Arc<Vec<String>>,
-    /// Each imported dataset's licence, when its source states one.
     licences: Arc<Vec<Option<Licence>>>,
 }
 
@@ -1262,8 +1257,6 @@ impl Reader {
 
     /// Id, name, label, address, layer, point and source without decoding
     /// geometry.
-    /// The licence of the dataset records name `dataset`: OpenStreetMap's, or
-    /// an imported dataset's when its source states one.
     pub fn licence(&self, dataset: &str) -> Option<Licence> {
         if dataset == OSM_DATASET {
             return Some(crate::licences::osm());
@@ -1598,13 +1591,8 @@ impl Reader {
         })
     }
 
-    /// The ids the id catalogue holds in block `block`: each place (a POI or
-    /// an area drawn from OpenStreetMap) and street with the OSM object it
-    /// is, a POI once more for each object merged into it (see
-    /// [`PoiRecord::aliases`]), and a street once more for each of its other
-    /// ways (see [`StreetRecord::other_ways`]). Reads plain headers, and a
-    /// POI's or street's fields up to its aliases or ways: a continued
-    /// record is an address.
+    /// Decodes POIs and streets only up to their aliases or ways: building
+    /// the catalogue reads every block.
     pub fn block_ids(&self, block: u64) -> Result<Vec<CatalogueId>> {
         let found = self.block(block)?;
         let strings = self.segment(found.first);
@@ -1632,8 +1620,6 @@ impl Reader {
             };
             ids.push(id(object_type, object_id));
             if header.layer == Layer::Poi {
-                // Name and category ids, alternate names, prominence and
-                // importance, Wikidata item: then the aliases.
                 get_u32(&mut fields)?;
                 get_u32(&mut fields)?;
                 for _ in 0..get_u64(&mut fields)? {
@@ -1648,7 +1634,6 @@ impl Reader {
                         .map(|(kind, alias)| id(kind, alias)),
                 );
             } else if street {
-                // Name, alternate names, locality, road class: then the ways.
                 get_u32(&mut fields)?;
                 for _ in 0..get_u64(&mut fields)? {
                     get_u32(&mut fields)?;
@@ -2242,11 +2227,8 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
 }
 
 /// A postcode record's country, 0 when unknown.
-/// Bits of an alias that name its kind of OSM object.
 const ALIAS_KIND_BITS: u32 = 2;
 
-/// A POI's aliases: a varint count, then each OSM object as a varint of
-/// its number shifted past [`ALIAS_KIND_BITS`] bits of its kind.
 pub(crate) fn put_aliases(out: &mut Vec<u8>, aliases: &[(ObjectType, i64)]) -> Result<()> {
     put_u64(out, aliases.len() as u64);
     for (object_type, object_id) in aliases {
@@ -2288,10 +2270,8 @@ pub(crate) fn aliases_field(fields: &mut &[u8]) -> Result<Vec<(ObjectType, i64)>
         .collect()
 }
 
-/// A street's other ways (see [`StreetRecord::other_ways`]): a varint count,
-/// then each way's number as a varint delta from the way before it, the
-/// street's own way first. A road's ways are mapped together, so their
-/// numbers lie close and a delta takes a byte or two.
+// Deltas: a road's ways are mapped together, so their ids lie close and a
+// delta takes a byte or two.
 pub(crate) fn put_other_ways(out: &mut Vec<u8>, own: i64, ways: &[i64]) -> Result<()> {
     put_u64(out, ways.len() as u64);
     let mut before = own;
@@ -2328,7 +2308,6 @@ pub(crate) fn other_ways_field(fields: &mut &[u8], own: i64) -> Result<Vec<i64>>
         .collect()
 }
 
-/// A Wikidata item number written as a varint, 0 for none.
 fn item_field(fields: &mut &[u8]) -> Result<Option<u32>> {
     match get_u64(fields)? {
         0 => Ok(None),

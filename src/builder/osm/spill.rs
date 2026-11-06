@@ -710,9 +710,8 @@ fn decode_compact_point(input: &mut &[u8]) -> Result<[f64; 2]> {
     Ok(point)
 }
 
-/// A way of a street, or a POI, waiting for the others of its name: sorted
-/// by the name as search spells it, then along the Hilbert curve, so every
-/// one of a name comes out together, the near ones close.
+/// Sorted by search key then Hilbert, so a name's records come out together,
+/// near ones close.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingNamed {
     /// The name key, then the Hilbert key of its representative point.
@@ -746,7 +745,6 @@ impl PendingNamed {
         })
     }
 
-    /// A POI waiting for the others of its name.
     pub(super) fn place(mut record: PoiRecord, seq: u64) -> Result<Self> {
         as_spilled(&mut record.geometry);
         let mut order = Vec::new();
@@ -1199,7 +1197,6 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
     }
 }
 
-/// A Wikidata item number spilled as a varint, 0 for none.
 fn spilled_item(input: &mut &[u8]) -> Result<Option<u32>> {
     match get_u64(input)? {
         0 => Ok(None),

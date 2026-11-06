@@ -1096,8 +1096,6 @@ fn parse_query(pack: &Path, query: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `/geocode?q=` answer for `query`, as the Runtime gives it, or the
-/// `/places?q=` answer with `--layer poi`.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
     let mut searcher = TextSearcher::from_pack(Arc::clone(&pack))?;

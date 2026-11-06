@@ -777,9 +777,8 @@ fn boundary_from_relation(
     Ok(built(parts, &stub.tags, &geometry))
 }
 
-/// The places among `relations` (the ones no boundary is), each at a point
-/// inside its outline, ready to be emitted: [`super::poi::emit_poi`] decides,
-/// from their kept tags, what they are.
+/// Point inside the outline, not the centre: a ring's centre can lie in its
+/// hole. [`super::poi::emit_poi`] decides from the tags whether it is a place.
 pub(crate) fn place_relations(
     relations: &[BoundaryRelationStub],
     member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
@@ -807,8 +806,6 @@ pub(crate) fn place_relations(
         .collect()
 }
 
-/// The multipolygon a relation's member ways draw, `None` when a member has
-/// no line or the outer ones close no ring.
 fn relation_geometry(
     stub: &BoundaryRelationStub,
     member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,

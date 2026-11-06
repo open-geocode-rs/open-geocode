@@ -289,7 +289,6 @@ impl Problem {
 
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
-    /// The Pack was built before what the request needs was in a Pack.
     pub(crate) fn pack_outdated(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::PackOutdated).with_detail(detail)
     }
