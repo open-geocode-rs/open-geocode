@@ -434,7 +434,7 @@ mod tests {
         let toml = r#"
             name = "og"
             port = 7100
-            forward = "/search?q={q}&limit=1"
+            forward = "/geocode?q={q}&limit=1"
             reverse = "/reverse?lat={lat}&lon={lon}"
             coords = "/features/0/geometry/coordinates"
             data = ["/srv/og"]
@@ -453,7 +453,7 @@ mod tests {
         let e = og();
         assert_eq!(
             e.forward_url("Damrak 1, Amsterdam"),
-            "http://127.0.0.1:7100/search?q=Damrak%201%2C%20Amsterdam&limit=1"
+            "http://127.0.0.1:7100/geocode?q=Damrak%201%2C%20Amsterdam&limit=1"
         );
         assert_eq!(
             e.reverse_url(52.3731, 4.8926),

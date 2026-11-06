@@ -15,7 +15,9 @@
 //!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
 //!                  u64, disputed u64, each when its flag is set | the start (u16
 //!                  or u32) of each body that is not continued | bodies
-//! records/datasets count varint, then each imported dataset's name
+//! records/datasets count varint, then each imported dataset's name and a
+//!                  presence byte, then its licence: name, URL and whom it
+//!                  credits, the last two each behind a presence byte
 //! records/strings  segment_count u64 | per segment: first record u64, first string u64
 //!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
 //!
@@ -27,12 +29,18 @@
 //!                     dataset's index in `records/datasets`
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
-//!                     (a street's locality after them, behind a presence byte)
+//!                     (a street's locality after them, behind a presence byte,
+//!                     then its road class as one byte, then its other ways
+//!                     as a varint count and varint deltas, each from the way
+//!                     before it, the street's own way first)
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
 //!                     then its street's postcodes; a POI's prominence follows
-//!                     its names as one byte, then its address after a
-//!                     presence byte; a postcode's country follows its code as
+//!                     its names as one byte, its importance as one byte
+//!                     and its Wikidata item as a varint (0 = none), its
+//!                     aliases (a varint count, then each OSM object's
+//!                     number << 2 | kind), its brand's string id + 1 (0 = none) and the brand's
+//!                     Wikidata item, then its address after a presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      lines only: varint part count, then per part a varint
 //!                     point count and zigzag deltas, chained across parts
@@ -87,19 +95,21 @@ use crate::{
     api::Address,
     container::{self, Bytes, Container},
     extsort::{Scratch, ScratchFile},
+    licences::Licence,
     memory::{Budget, Reservation},
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, DerivedSourceProvenance,
-        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord,
-        Prominence, Record, SourceProvenance, StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, Brand, DERIVED_FROM_ADDRESS_RECORDS,
+        DerivedSourceProvenance, InterpolationAddressComponents, InterpolationRange,
+        InterpolationRecord, Layer, LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord,
+        PoiRecord, PostcodeRecord, Prominence, Record, RoadClass, SourceProvenance, StreetRecord,
+        point_geometry,
     },
     util::{
         codec::{
-            get_i64, get_str, get_u8, get_u32, get_u64, put_i64, put_str, put_u64, read_u64_le,
-            unzigzag, zigzag,
+            get_i64, get_opt_string, get_str, get_u8, get_u32, get_u64, put_i64, put_opt_str,
+            put_str, put_u64, read_u64_le, unzigzag, zigzag,
         },
         geo::{line_geometry, line_parts},
     },
@@ -109,7 +119,16 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 8;
+pub const RECORDS_VERSION: u32 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogueId {
+    pub record_id: RecordId,
+    pub object_type: ObjectType,
+    pub object_id: i64,
+    /// A place sharing the id with a street wins.
+    pub street: bool,
+}
 
 pub const BLOCK_RECORDS: u64 = 64;
 const LABEL: &str = "pack-records";
@@ -166,6 +185,10 @@ pub struct Summary {
     /// A POI's category, for example `amenity:cafe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub road_class: Option<RoadClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<Point>,
     pub source: Source,
@@ -768,6 +791,16 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.category)?));
                 self.put_strings(out, &record.alt_names)?;
                 out.push(record.prominence.to_byte());
+                out.push(record.prominence.importance);
+                put_u64(out, record.wikidata.map_or(0, u64::from));
+                put_aliases(out, &record.aliases)?;
+                match &record.brand {
+                    Some(brand) => {
+                        put_u64(out, u64::from(self.strings.id(&brand.name)?) + 1);
+                        put_u64(out, brand.wikidata.map_or(0, u64::from));
+                    }
+                    None => put_u64(out, 0),
+                }
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -801,6 +834,8 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 self.put_strings(out, &record.alt_names)?;
                 self.put_optional_strings(out, &[record.locality.as_deref()])?;
+                out.push(record.road_class.to_byte());
+                put_other_ways(out, record.source.object_id, &record.other_ways)?;
             }
             Record::Postcode(record) => {
                 if record.source.derived_from != DERIVED_FROM_ADDRESS_RECORDS {
@@ -993,6 +1028,15 @@ impl Writer {
         put_u64(&mut datasets, self.datasets.len() as u64);
         for dataset in &self.datasets {
             put_str(&mut datasets, dataset);
+            match crate::licences::of(dataset) {
+                Some(licence) => {
+                    datasets.push(1);
+                    put_str(&mut datasets, &licence.name);
+                    put_opt_str(&mut datasets, licence.url.as_deref());
+                    put_opt_str(&mut datasets, licence.attribution.as_deref());
+                }
+                None => datasets.push(0),
+            }
         }
         pack.add(SECTION_DATASETS, RECORDS_VERSION, &datasets)?;
 
@@ -1023,6 +1067,7 @@ pub struct Reader {
     text_start: usize,
     /// Names of the imported datasets, by the index records store.
     datasets: Arc<Vec<String>>,
+    licences: Arc<Vec<Option<Licence>>>,
 }
 
 impl Reader {
@@ -1037,10 +1082,22 @@ impl Reader {
             if count > input.len() as u64 {
                 return Err(Error::Decode("dataset table is truncated"));
             }
-            (0..count)
-                .map(|_| get_str(&mut input).map(str::to_string))
-                .collect::<Result<Vec<_>>>()?
+            let mut datasets = Vec::new();
+            for _ in 0..count {
+                let name = get_str(&mut input)?.to_string();
+                let licence = match get_u8(&mut input)? {
+                    0 => None,
+                    _ => Some(Licence {
+                        name: get_str(&mut input)?.to_string(),
+                        url: get_opt_string(&mut input)?,
+                        attribution: get_opt_string(&mut input)?,
+                    }),
+                };
+                datasets.push((name, licence));
+            }
+            datasets
         };
+        let (datasets, licences): (Vec<_>, Vec<_>) = datasets.into_iter().unzip();
 
         let record_count =
             read_u64_le(&index, 0).ok_or(Error::Decode("records index is truncated"))?;
@@ -1102,6 +1159,7 @@ impl Reader {
             ends_start,
             text_start,
             datasets: Arc::new(datasets),
+            licences: Arc::new(licences),
         })
     }
 
@@ -1145,6 +1203,9 @@ impl Reader {
                     location_precision,
                     source: header.provenance(&self.datasets)?,
                     prominence: poi.prominence,
+                    wikidata: poi.wikidata,
+                    brand: poi.brand,
+                    aliases: poi.aliases,
                 })
             }
             Layer::Interpolation => {
@@ -1166,6 +1227,8 @@ impl Reader {
                     let [locality] = self.optional_strings(header.strings, &mut fields)?;
                     locality
                 },
+                road_class: road_class_field(&mut fields)?,
+                other_ways: other_ways_field(&mut fields, header.object()?.1)?,
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
                 source: header.provenance(&self.datasets)?,
@@ -1194,11 +1257,21 @@ impl Reader {
 
     /// Id, name, label, address, layer, point and source without decoding
     /// geometry.
+    pub fn licence(&self, dataset: &str) -> Option<Licence> {
+        if dataset == OSM_DATASET {
+            return Some(crate::licences::osm());
+        }
+        let index = self.datasets.iter().position(|known| known == dataset)?;
+        self.licences.get(index).cloned().flatten()
+    }
+
     pub fn summary(&self, id: RecordId) -> Result<Summary> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
         let source = header.source(&self.datasets)?;
         let mut category = None;
+        let mut road_class = None;
+        let mut brand = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
@@ -1213,6 +1286,7 @@ impl Reader {
             Layer::Poi => {
                 let poi = self.poi_fields(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.object()?;
+                brand.clone_from(&poi.brand);
                 category = Some(poi.category.to_string());
                 if let Some(address) = &poi.address {
                     stated = Address::from(address);
@@ -1240,6 +1314,7 @@ impl Reader {
                 let name = self.string_field(header.strings, &mut fields)?.to_string();
                 self.string_list(header.strings, &mut fields)?;
                 let [locality] = self.optional_strings(header.strings, &mut fields)?;
+                road_class = Some(road_class_field(&mut fields)?);
                 (
                     crate::labels::osm_record_id(object_type, object_id),
                     name.clone(),
@@ -1273,6 +1348,8 @@ impl Reader {
             label,
             address: stated,
             category,
+            road_class,
+            brand,
             point: Some(header.point()),
             source,
         })
@@ -1341,26 +1418,6 @@ impl Reader {
             Some(postcode) => Ok(vec![postcode]),
             None => self.string_list(entry.header.strings, &mut fields),
         }
-    }
-
-    /// Whether a record is an explicit address: an address record or a POI
-    /// that carries one. Reads no strings.
-    pub fn is_explicit_address(&self, id: RecordId) -> Result<bool> {
-        let entry = self.body(id)?;
-        let (header, mut fields) = (entry.header, entry.fields);
-        Ok(match header.layer {
-            Layer::Address => true,
-            Layer::Poi => {
-                get_u32(&mut fields)?;
-                get_u32(&mut fields)?;
-                for _ in 0..get_u64(&mut fields)? {
-                    get_u32(&mut fields)?;
-                }
-                get_u8(&mut fields)?;
-                get_u8(&mut fields)? != 0
-            }
-            _ => false,
-        })
     }
 
     /// Every name of a street, place or POI, its `name` first; empty for the
@@ -1532,6 +1589,65 @@ impl Reader {
             starts: &bytes[at..bodies_start],
             bodies: &bytes[bodies_start..],
         })
+    }
+
+    /// Decodes POIs and streets only up to their aliases or ways: building
+    /// the catalogue reads every block.
+    pub fn block_ids(&self, block: u64) -> Result<Vec<CatalogueId>> {
+        let found = self.block(block)?;
+        let strings = self.segment(found.first);
+        let mut ids = Vec::new();
+        for slot in 0..found.count {
+            if found.is_continued(slot) {
+                continue;
+            }
+            let (header, mut fields) = plain_header(found.base, strings, found.plain_body(slot)?)?;
+            let street = header.layer == Layer::Street;
+            let place = header.layer == Layer::Poi || header.layer.place_layer().is_some();
+            if !(place || street)
+                || header.dataset.is_some()
+                || header.source_kind == SourceKind::Other
+            {
+                continue;
+            }
+            let record_id = found.first + slot as u64;
+            let (object_type, object_id) = header.object()?;
+            let id = |object_type, object_id| CatalogueId {
+                record_id,
+                object_type,
+                object_id,
+                street,
+            };
+            ids.push(id(object_type, object_id));
+            if header.layer == Layer::Poi {
+                get_u32(&mut fields)?;
+                get_u32(&mut fields)?;
+                for _ in 0..get_u64(&mut fields)? {
+                    get_u32(&mut fields)?;
+                }
+                get_u8(&mut fields)?;
+                get_u8(&mut fields)?;
+                item_field(&mut fields)?;
+                ids.extend(
+                    aliases_field(&mut fields)?
+                        .into_iter()
+                        .map(|(kind, alias)| id(kind, alias)),
+                );
+            } else if street {
+                get_u32(&mut fields)?;
+                for _ in 0..get_u64(&mut fields)? {
+                    get_u32(&mut fields)?;
+                }
+                self.optional_strings::<1>(header.strings, &mut fields)?;
+                road_class_field(&mut fields)?;
+                ids.extend(
+                    other_ways_field(&mut fields, object_id)?
+                        .into_iter()
+                        .map(|way| id(ObjectType::Way, way)),
+                );
+            }
+        }
+        Ok(ids)
     }
 
     fn locate(&self, id: RecordId) -> Result<(Block<'_>, usize)> {
@@ -1799,7 +1915,22 @@ impl Reader {
         let name = self.string_field(strings, fields)?;
         let category = self.string_field(strings, fields)?;
         let alt_names = self.string_list(strings, fields)?;
-        let prominence = Prominence::from_byte(get_u8(fields)?);
+        let prominence = Prominence::from_byte(get_u8(fields)?, get_u8(fields)?);
+        let wikidata = item_field(fields)?;
+        let aliases = aliases_field(fields)?;
+        let brand = match get_u64(fields)? {
+            0 => None,
+            id => Some(Brand {
+                name: self
+                    .string(
+                        strings,
+                        u32::try_from(id - 1)
+                            .map_err(|_| Error::Decode("brand string id is out of range"))?,
+                    )?
+                    .to_string(),
+                wikidata: item_field(fields)?,
+            }),
+        };
         let address = match get_u8(fields)? {
             0 => None,
             _ => Some(self.address_components(strings, fields)?),
@@ -1809,6 +1940,9 @@ impl Reader {
             category,
             alt_names,
             prominence,
+            wikidata,
+            aliases,
+            brand,
             address,
         })
     }
@@ -1860,6 +1994,8 @@ impl Reader {
                 get_u32(fields)?;
                 self.string_list(header.strings, fields)?;
                 self.optional_strings::<1>(header.strings, fields)?;
+                road_class_field(fields)?;
+                other_ways_field(fields, header.object()?.1)?;
             }
             Layer::Postcode => {
                 get_u32(fields)?;
@@ -1925,6 +2061,9 @@ struct PoiFields<'a> {
     category: &'a str,
     alt_names: Vec<String>,
     prominence: Prominence,
+    wikidata: Option<u32>,
+    aliases: Vec<(ObjectType, i64)>,
+    brand: Option<Brand>,
     address: Option<AddressComponents>,
 }
 
@@ -2088,6 +2227,100 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
 }
 
 /// A postcode record's country, 0 when unknown.
+const ALIAS_KIND_BITS: u32 = 2;
+
+pub(crate) fn put_aliases(out: &mut Vec<u8>, aliases: &[(ObjectType, i64)]) -> Result<()> {
+    put_u64(out, aliases.len() as u64);
+    for (object_type, object_id) in aliases {
+        let kind = match object_type {
+            ObjectType::Node => 0,
+            ObjectType::Way => 1,
+            ObjectType::Relation => 2,
+            ObjectType::Row => {
+                return Err(Error::Inconsistent("an imported row is no alias".into()));
+            }
+        };
+        let number = u64::try_from(*object_id)
+            .ok()
+            .filter(|number| number >> (u64::BITS - ALIAS_KIND_BITS) == 0)
+            .ok_or_else(|| Error::Inconsistent(format!("alias {object_id} is out of range")))?;
+        put_u64(out, number << ALIAS_KIND_BITS | kind);
+    }
+    Ok(())
+}
+
+pub(crate) fn aliases_field(fields: &mut &[u8]) -> Result<Vec<(ObjectType, i64)>> {
+    let count = get_u64(fields)?;
+    if count > fields.len() as u64 {
+        return Err(Error::Decode("alias list is truncated"));
+    }
+    (0..count)
+        .map(|_| {
+            let value = get_u64(fields)?;
+            let object_type = match value & ((1 << ALIAS_KIND_BITS) - 1) {
+                0 => ObjectType::Node,
+                1 => ObjectType::Way,
+                2 => ObjectType::Relation,
+                _ => return Err(Error::Decode("an alias names no kind of object")),
+            };
+            let number = i64::try_from(value >> ALIAS_KIND_BITS)
+                .map_err(|_| Error::Decode("alias is out of range"))?;
+            Ok((object_type, number))
+        })
+        .collect()
+}
+
+// Deltas: a road's ways are mapped together, so their ids lie close and a
+// delta takes a byte or two.
+pub(crate) fn put_other_ways(out: &mut Vec<u8>, own: i64, ways: &[i64]) -> Result<()> {
+    put_u64(out, ways.len() as u64);
+    let mut before = own;
+    for way in ways {
+        let delta = way
+            .checked_sub(before)
+            .and_then(|delta| u64::try_from(delta).ok())
+            .filter(|delta| *delta > 0)
+            .ok_or_else(|| {
+                Error::Inconsistent(format!(
+                    "a street's way {way} is not above the way before it, {before}"
+                ))
+            })?;
+        put_u64(out, delta);
+        before = *way;
+    }
+    Ok(())
+}
+
+pub(crate) fn other_ways_field(fields: &mut &[u8], own: i64) -> Result<Vec<i64>> {
+    let count = get_u64(fields)?;
+    if count > fields.len() as u64 {
+        return Err(Error::Decode("a street's way list is truncated"));
+    }
+    let mut before = own;
+    (0..count)
+        .map(|_| {
+            before = i64::try_from(get_u64(fields)?)
+                .ok()
+                .and_then(|delta| before.checked_add(delta))
+                .ok_or(Error::Decode("a street's way is out of range"))?;
+            Ok(before)
+        })
+        .collect()
+}
+
+fn item_field(fields: &mut &[u8]) -> Result<Option<u32>> {
+    match get_u64(fields)? {
+        0 => Ok(None),
+        item => u32::try_from(item)
+            .map(Some)
+            .map_err(|_| Error::Decode("Wikidata item is out of range")),
+    }
+}
+
+fn road_class_field(fields: &mut &[u8]) -> Result<RoadClass> {
+    RoadClass::from_byte(get_u8(fields)?).ok_or(Error::Decode("street has an unknown road class"))
+}
+
 fn country_field(fields: &mut &[u8]) -> Result<Option<CountryCode>> {
     match get_u64(fields)? {
         0 => Ok(None),
@@ -2294,6 +2527,8 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Node, 1),
             }),
             Record::Street(StreetRecord {
+                other_ways: vec![5, 1_400_000_000],
+                road_class: RoadClass::Residential,
                 alt_names: vec!["Rue King".into(), "キングストリート".into()],
                 locality: None,
                 name: "King Street".into(),
@@ -2348,7 +2583,11 @@ mod tests {
                 prominence: Prominence {
                     linked: true,
                     languages: 12,
+                    importance: 0,
                 },
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
             }),
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -2359,6 +2598,9 @@ mod tests {
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, 7),
                 prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
             }),
         ];
         for layer in [
@@ -2457,10 +2699,6 @@ mod tests {
             Some("M5V 1A1")
         );
         assert_eq!(reader.postcode(5).expect("postcode"), None);
-        let explicit = (0..records.len() as u64)
-            .map(|id| reader.is_explicit_address(id).expect("explicit"))
-            .collect::<Vec<_>>();
-        assert_eq!(&explicit[..6], &[true, false, false, false, true, false]);
         assert_eq!(
             reader.names(0).expect("address names"),
             Vec::<String>::new()

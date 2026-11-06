@@ -24,6 +24,8 @@ UPSTREAM = os.path.join(CATALOG, "upstream")
 LOCK = os.path.join(CATALOG, "sources.lock.json")
 CURATION = os.path.join(CATALOG, "curation.toml")
 REGIONS = os.path.join(CATALOG, "regions.json")
+LICENCES = os.path.join(CATALOG, "licences.json")
+PLACES = os.path.join(CATALOG, "places.json")
 
 GEOFABRIK_INDEX = "https://download.geofabrik.de/index-v1-nogeom.json"
 GEOFABRIK_SHAPES = "https://download.geofabrik.de/index-v1.json"
@@ -32,11 +34,13 @@ PBF_SUFFIX = "-latest.osm.pbf"
 PLANET = "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
 OA_DATA = "https://batch.openaddresses.io/api/data"
 OA_JOB = "https://batch.openaddresses.io/api/job/{}"
+ID_SCHEMA_PACKAGE = "https://registry.npmjs.org/@openstreetmap/id-tagging-schema/latest"
+ID_SCHEMA_PRESETS = "https://cdn.jsdelivr.net/npm/@openstreetmap/id-tagging-schema@{}/dist/presets.min.json"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
 OVERTURE_LIST = "https://overturemaps-us-west-2.s3.amazonaws.com/?list-type=2&prefix={}&delimiter=/"
 OVERTURE_THEMES = (("places", "places", "place"), ("addresses", "addresses", "address"))
 
-SNAPSHOTS = {name: f"upstream/{name}.json" for name in ("geofabrik", "openaddresses", "overture")}
+SNAPSHOTS = {name: f"upstream/{name}.json" for name in ("geofabrik", "openaddresses", "overture", "id-tagging-schema")}
 KINDS = ("world", "continent", "country", "subregion", "group")
 USER_AGENT = "og-catalog (https://github.com/nexa-ca/open-geocode)"
 SIZE_CHANGE = 0.20
@@ -184,7 +188,8 @@ def trim_license(lic):
     if isinstance(lic, str):
         return dict(name=lic)
     out = {}
-    for src, dst in (("text", "name"), ("url", "url"), ("attribution", "attribution"), ("share-alike", "share_alike")):
+    for src, dst in (("text", "name"), ("url", "url"), ("attribution", "attribution"),
+                     ("attribution name", "attribution_name"), ("share-alike", "share_alike")):
         if lic.get(src) not in (None, ""):
             out[dst] = lic[src]
     return out or None
@@ -243,6 +248,27 @@ def update_openaddresses(lock):
     log(f"  kept {len(rows)}, skipped {skipped} without a successful job, {unlicensed} with no license found")
     text = snapshot_text(dict(source=OA_DATA), "datasets", rows)
     pin(lock, "openaddresses", text, api=OA_DATA, fetched=now())
+
+
+# --- Update: iD tagging schema ------------------------------------------
+
+def update_id_tagging_schema(lock):
+    version = get_json(ID_SCHEMA_PACKAGE)["version"]
+    url = ID_SCHEMA_PRESETS.format(version)
+    presets = get_json(url)
+    log(f"id-tagging-schema {version}: {len(presets)} presets")
+    rows = {}
+    for pid, preset in sorted(presets.items()):
+        if pid.startswith("@") or not preset.get("tags"):
+            continue
+        row = dict(tags=preset["tags"], geometry=preset.get("geometry", []))
+        if "matchScore" in preset:
+            row["match_score"] = preset["matchScore"]
+        if preset.get("searchable") is False:
+            row["searchable"] = False
+        rows[pid] = row
+    text = snapshot_text(dict(source=url, version=version), "presets", rows)
+    pin(lock, "id-tagging-schema", text, package=ID_SCHEMA_PACKAGE, version=version, fetched=now())
 
 
 # --- Update: Overture ---------------------------------------------------
@@ -654,6 +680,69 @@ def print_unresolved(unresolved):
             log(f"  {item}")
 
 
+def licences_text():
+    """The license of each OpenAddresses data set that states one, by source and
+    name, for the Pack to credit the data sets an answer comes from."""
+    rows = []
+    for d in load_snapshot("openaddresses")["datasets"]:
+        lic = d.get("license")
+        if not lic:
+            continue
+        row = dict(source=d["source"], name=d["name"], licence=lic.get("name"), url=lic.get("url"),
+                   attribution=lic.get("attribution"), attribution_name=lic.get("attribution_name"))
+        rows.append({k: v for k, v in row.items() if v not in (None, "")})
+    rows.sort(key=lambda r: (r["source"], r["name"]))
+    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"]), "datasets", rows)
+
+
+def places_text():
+    """The presets whose named objects are places, as the builder matches them:
+    the searchable presets of the keys `[places]` in curation.toml counts, less
+    those it never counts; and the ones that count only with a `wikidata` tag.
+    An unsearchable preset of any value (`amenity=*`) is a fallback the editor
+    offers for a value it has no preset of, so a bench would match it; one of
+    a value (`amenity=school`) is only hidden from the editor's search, and
+    its objects are places. A preset never counted is kept, marked: an object
+    it matches more closely than any counted preset (`shop=vacant` against
+    `shop=*`) is no place."""
+    with open(CURATION, "rb") as f:
+        curation = tomllib.load(f).get("places", {})
+    for name in ("keys", "never", "needs_wikidata"):
+        table = curation.get(name, {})
+        if not str(table.get("why", "")).strip():
+            raise SystemExit(f"curation: [places.{name}] has no why")
+    keys = curation["keys"]["set"]
+    never = curation["never"]["ids"]
+    needs_wikidata = curation["needs_wikidata"]["ids"]
+
+    def under(pid, prefixes):
+        return any(pid == p or pid.startswith(p + "/") for p in prefixes)
+
+    snapshot = load_snapshot("id-tagging-schema")
+    rows = {}
+    for pid, preset in snapshot["presets"].items():
+        key = pid.split("/")[0]
+        fallback = preset.get("searchable") is False and all(v == "*" for v in preset["tags"].values())
+        if key not in keys or fallback:
+            continue
+        if under(pid, never):
+            rows[pid] = dict(tags=preset["tags"], geometry=preset["geometry"], never=True)
+            continue
+        allowed = keys[key]
+        if allowed != "*" and not under(pid, [f"{key}/{value}" for value in allowed]):
+            continue
+        if not set(preset["geometry"]) & {"point", "vertex", "area"}:
+            continue
+        row = dict(tags=preset["tags"], geometry=preset["geometry"])
+        if "match_score" in preset:
+            row["match_score"] = preset["match_score"]
+        if under(pid, needs_wikidata):
+            row["needs_wikidata"] = True
+        rows[pid] = row
+    meta = dict(source=SNAPSHOTS["id-tagging-schema"], version=snapshot["version"], keys=sorted(keys))
+    return snapshot_text(meta, "presets", dict(sorted(rows.items())))
+
+
 def cmd_generate(_):
     text, unresolved = generate_text()
     if unresolved:
@@ -661,6 +750,12 @@ def cmd_generate(_):
         return 1
     write(REGIONS, text)
     log(f"wrote {os.path.relpath(REGIONS, ROOT)}: {len(text.encode('utf-8'))} bytes")
+    licences = licences_text()
+    write(LICENCES, licences)
+    log(f"wrote {os.path.relpath(LICENCES, ROOT)}: {len(licences.encode('utf-8'))} bytes")
+    places = places_text()
+    write(PLACES, places)
+    log(f"wrote {os.path.relpath(PLACES, ROOT)}: {len(places.encode('utf-8'))} bytes")
     return 0
 
 
@@ -682,6 +777,11 @@ def cmd_check(_):
     if current != text:
         log("catalog/regions.json is not what `generate` produces; run it and commit the result")
         failed = True
+    for path, text in ((LICENCES, licences_text()), (PLACES, places_text())):
+        current = read_bytes(path).decode("utf-8") if os.path.exists(path) else None
+        if current != text:
+            log(f"{os.path.relpath(path, ROOT)} is not what `generate` produces; run it and commit the result")
+            failed = True
     if not failed:
         log("catalog is up to date")
     return 1 if failed else 0
@@ -711,7 +811,8 @@ def review(before, after):
 def cmd_update(args):
     lock = load_lock()
     started = time.time()
-    steps = dict(geofabrik=update_geofabrik, openaddresses=update_openaddresses, overture=update_overture)
+    steps = {"geofabrik": update_geofabrik, "openaddresses": update_openaddresses,
+             "overture": update_overture, "id-tagging-schema": update_id_tagging_schema}
     for name in (steps if args.source == "all" else [args.source]):
         step = time.time()
         steps[name](lock)
@@ -725,6 +826,8 @@ def cmd_update(args):
         log("catalog/regions.json left as it was")
         return 1
     write(REGIONS, text)
+    write(LICENCES, licences_text())
+    write(PLACES, places_text())
     log(f"wrote catalog/regions.json: {len(text.encode('utf-8'))} bytes in {time.time() - started:.0f}s")
     return 0
 
@@ -733,10 +836,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     up = sub.add_parser("update", help="fetch an upstream, pin it and regenerate")
-    up.add_argument("source", choices=["geofabrik", "openaddresses", "overture", "all"])
+    up.add_argument("source", choices=["geofabrik", "openaddresses", "overture", "id-tagging-schema", "all"])
     up.set_defaults(run=cmd_update)
-    sub.add_parser("generate", help="build regions.json from the pinned snapshots").set_defaults(run=cmd_generate)
-    sub.add_parser("check", help="fail if regions.json or a snapshot drifted").set_defaults(run=cmd_check)
+    sub.add_parser("generate", help="build regions.json, licences.json and places.json from the pinned snapshots").set_defaults(run=cmd_generate)
+    sub.add_parser("check", help="fail if regions.json, licences.json, places.json or a snapshot drifted").set_defaults(run=cmd_check)
     a = p.parse_args()
     sys.exit(a.run(a))
 

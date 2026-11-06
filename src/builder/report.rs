@@ -11,7 +11,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 22;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 23;
 
 /// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -71,6 +71,18 @@ pub struct BuilderReport {
     /// Each time the build went on from a checkpoint a run before left.
     #[serde(default)]
     pub resumes: Vec<ResumeReport>,
+    #[serde(default)]
+    pub qrank: Option<QRankReport>,
+}
+
+// Traces a Pack's importances to the file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct QRankReport {
+    pub path: String,
+    pub bytes: u64,
+    pub modified_unix: u64,
+    pub items: u64,
+    pub ranked_places: u64,
 }
 
 /// What checkpointing cost.
@@ -163,6 +175,7 @@ impl BuilderReport {
         self.accepted.poi_way_centroids += accepted.poi_way_centroids;
         self.accepted.pois_with_address += accepted.pois_with_address;
         merge_counts(&mut self.accepted.poi_categories, accepted.poi_categories);
+        merge_counts(&mut self.accepted.places_left_out, accepted.places_left_out);
 
         self.rejected.total += rejected.total;
         merge_counts(&mut self.rejected.by_reason, rejected.by_reason);
@@ -531,10 +544,14 @@ pub struct AcceptedCounts {
     pub place_areas: u64,
     pub poi_nodes: u64,
     pub poi_way_centroids: u64,
-    /// POIs that carry an address instead of being an address record.
     pub pois_with_address: u64,
     /// POIs by the key of their category, for example `amenity`.
     pub poi_categories: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub places_merged: u64,
+    /// What the counted presets leave out, to audit curation.
+    #[serde(default)]
+    pub places_left_out: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -802,6 +819,7 @@ pub(crate) enum CandidateIssue {
     StreetMissingName,
     StreetRefOnlyName,
     StreetUnresolvedGeometry,
+    HighwayNotAStreet,
     PlaceMissingName,
     PlaceUnsupportedValue,
 }
@@ -829,6 +847,7 @@ impl CandidateIssue {
             Self::StreetMissingName => "street_missing_name",
             Self::StreetRefOnlyName => "street_ref_only_name",
             Self::StreetUnresolvedGeometry => "street_unresolved_geometry",
+            Self::HighwayNotAStreet => "highway_not_a_street",
             Self::PlaceMissingName => "place_missing_name",
             Self::PlaceUnsupportedValue => "place_unsupported_value",
         }
@@ -853,6 +872,7 @@ impl CandidateIssue {
             | Self::InterpolationNonNumericAnchor => CandidateDisposition::Invalid,
             Self::StreetMissingName
             | Self::StreetRefOnlyName
+            | Self::HighwayNotAStreet
             | Self::PlaceMissingName
             | Self::PlaceUnsupportedValue => CandidateDisposition::OutOfScope,
         }
@@ -926,6 +946,14 @@ impl BuilderReport {
     pub(crate) fn accept_place_area(&mut self, layer: PlaceLayer) {
         self.accept_place(layer);
         self.accepted.place_areas += 1;
+    }
+
+    pub(crate) fn leave_out_place(&mut self, key: &str, value: &str) {
+        *self
+            .accepted
+            .places_left_out
+            .entry(format!("{key}={value}"))
+            .or_default() += 1;
     }
 
     pub(crate) fn accept_poi(&mut self, poi: &PoiRecord) {
@@ -1155,9 +1183,9 @@ impl BuilderReport {
             | CandidateIssue::InterpolationInvalidNumberRange
             | CandidateIssue::InterpolationInvalidParity
             | CandidateIssue::InterpolationNonNumericAnchor => &mut self.validation.interpolation,
-            CandidateIssue::StreetMissingName | CandidateIssue::StreetRefOnlyName => {
-                &mut self.validation.unresolved_geometry
-            }
+            CandidateIssue::StreetMissingName
+            | CandidateIssue::StreetRefOnlyName
+            | CandidateIssue::HighwayNotAStreet => &mut self.validation.unresolved_geometry,
             CandidateIssue::PlaceMissingName | CandidateIssue::PlaceUnsupportedValue => {
                 &mut self.validation.unsupported_relation
             }
@@ -1308,6 +1336,10 @@ fn location_precision_name(precision: LocationPrecision) -> &'static str {
 fn rejection_triage(issue: CandidateIssue, tags: &BTreeMap<String, String>) -> RejectionTriage {
     match issue {
         CandidateIssue::StreetMissingName => unnamed_highway_triage(tags),
+        CandidateIssue::HighwayNotAStreet => RejectionTriage {
+            bucket: "likely_not_useful_for_geocoding",
+            note: "highway=* value names no street (a platform, a bus stop, a proposed way, a service area); its name is not an address street",
+        },
         CandidateIssue::StreetRefOnlyName => RejectionTriage {
             bucket: "needs_model_decision",
             note: "highway has ref=* but no name=*; it may be useful for route-number search, but is not a reliable address street name",
@@ -1495,6 +1527,7 @@ fn address_shape(issue: CandidateIssue, addr_tags: &BTreeMap<String, String>) ->
         CandidateIssue::StreetUnresolvedGeometry => "street_unresolved_geometry",
         CandidateIssue::StreetMissingName => "street_missing_name",
         CandidateIssue::StreetRefOnlyName => "street_ref_only_name",
+        CandidateIssue::HighwayNotAStreet => "highway_not_a_street",
         CandidateIssue::PlaceMissingName => "place_missing_name",
         CandidateIssue::PlaceUnsupportedValue => "place_unsupported_value",
         CandidateIssue::InterpolationUnsupportedValue

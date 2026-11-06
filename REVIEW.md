@@ -6,7 +6,7 @@
   Deleting any load-bearing line of the fix breaks at least one test.
 - Every assertion can fail.
   Assert exact values: the exact record, error variant and message, not "is_ok" or "contains".
-- Cover the variant matrix: every entry point the fix touches (`/search`, `/geocode`, `/reverse`, `/autocomplete`, batch, CLI), empty and zero and missing input, limit boundaries (at the limit passes, one past fails).
+- Cover the variant matrix: every entry point the fix touches (`/geocode`, `/places`, `/reverse`, `/autocomplete`, batch, CLI), empty and zero and missing input, limit boundaries (at the limit passes, one past fails).
 - Add new cases beside existing tests; never change an existing test's input to the new case.
 - Tests are hermetic: no network, temp files cleaned up even when an assertion fails.
 - Never delete, skip or loosen a test without a stated reason.

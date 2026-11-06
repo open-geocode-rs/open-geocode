@@ -57,6 +57,7 @@ use crate::{
     util::fold::{exact_key, replaced_characters, search_key},
 };
 
+#[derive(Clone)]
 pub struct TextSearcher {
     pack: Arc<pack::Reader>,
     spatial: spatial_index::Reader,
@@ -73,6 +74,7 @@ pub struct TextSearcher {
     /// What orders the hits of a query's pool, when the Pack has been
     /// calibrated; else they are chosen by their [`Evidence`].
     ranker: Option<Ranker>,
+    places: bool,
     /// How long one query searches before it answers with what it found.
     budget: Duration,
     /// The structured index that answers a house number on a known street without a
@@ -328,6 +330,8 @@ const TYPO_PREFIX_CHARS: usize = 1;
 /// The terms near one word kept per field, fewest edits then most documents
 /// first: a common short word has dozens of neighbours on a planet.
 const MAX_TYPO_TERMS: usize = 32;
+// Wide enough that the best-known of many same-named places makes it.
+const NAMED_PLACES_WINDOW: usize = 200;
 /// Stated house numbers read on each side of one that no record states: a
 /// few, so the nearest of the same parity can be found and the numbers of a
 /// same-named street elsewhere passed over.
@@ -359,6 +363,21 @@ const NEAR_SETTLEMENTS: usize = 5;
 /// The farthest a settlement point names the land around it: few towns'
 /// built-up areas reach farther from their centre.
 const NEAR_SETTLEMENT_RADIUS_M: f64 = 15_000.0;
+
+impl TextSearchHit {
+    /// A record asked for by its id rather than found by words: no score.
+    pub fn of_record(record_id: RecordId, record: Summary) -> Self {
+        Self {
+            record_id,
+            score: 0.0,
+            record,
+            features: Features::default(),
+            confidence: None,
+            fallback: false,
+            signals: Signals::default(),
+        }
+    }
+}
 
 impl TextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
@@ -416,10 +435,24 @@ impl TextSearcher {
             columns: Arc::new(columns),
             confidence,
             ranker,
+            places: false,
             budget: SEARCH_BUDGET,
             structured,
             segments: Arc::new(segments),
         })
+    }
+
+    /// No structured index, confidence model or ranker: those know
+    /// addresses alone.
+    pub fn places(&self) -> Self {
+        Self {
+            fields: self.fields.for_places(),
+            confidence: None,
+            ranker: None,
+            structured: None,
+            places: true,
+            ..self.clone()
+        }
     }
 
     /// The same searcher without its structured index: every query runs the text
@@ -494,6 +527,18 @@ impl TextSearcher {
         // One hit past the limit, so the last one asked for has a margin;
         // [`CHOOSER_HITS`] at least, so the answer is chosen among them.
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
+        // Name pass first: address reading scans planet-wide context postings
+        // and adds nothing once names fill the limit.
+        let mut named = if self.places {
+            self.places_by_name(query_text, &filters, options.focus, limit)?
+        } else {
+            Vec::new()
+        };
+        if named.len() >= limit {
+            self.rate(&mut named);
+            named.truncate(limit);
+            return Ok(named);
+        }
         let (_, mut hits) = self.search_variants(
             query_text,
             &[],
@@ -510,6 +555,19 @@ impl TextSearcher {
         }
         if let Some(named) = NAMED.with(RefCell::take) {
             named.choose(&mut hits);
+        }
+        // No ranker knows places yet: a place whose name the query covers
+        // fully beats one that only repeats a street's words.
+        if self.places {
+            hits.sort_by_key(|hit| (hit.features.pass, hit.features.dropped_words));
+            if !named.is_empty() {
+                let mut seen = named
+                    .iter()
+                    .map(|hit| hit.record_id)
+                    .collect::<HashSet<_>>();
+                hits.retain(|hit| seen.insert(hit.record_id));
+                hits.splice(0..0, named);
+            }
         }
         self.rate(&mut hits);
         hits.truncate(limit);
@@ -732,6 +790,7 @@ impl TextSearcher {
         for word in &plan.optional {
             clauses.push((Occur::Should, self.word_query(word, &plan.spellings)));
         }
+        clauses.push(self.product_clause());
         if let Some(layer) = filters
             .layer
             .map(str::trim)
@@ -1668,6 +1727,17 @@ impl TextSearcher {
             ));
         }
         Ok(Box::new(BooleanQuery::new(alternatives)))
+    }
+
+    /// Both products share `context_text`: a query matching on it alone
+    /// would reach the other product's records.
+    fn product_clause(&self) -> (Occur, Box<dyn Query>) {
+        let occur = if self.places {
+            Occur::Must
+        } else {
+            Occur::MustNot
+        };
+        (occur, self.layer_query(Layer::Poi.as_str()))
     }
 
     fn layer_query(&self, layer: &str) -> Box<dyn Query> {
@@ -4403,7 +4473,11 @@ impl TextSearcher {
     }
 
     /// The words of `words`, a query's street, that say its type or which
-    /// way it runs, each in all its forms ("n" is "north").
+    /// way it runs, each in all its forms ("n" is "north"). A type glued
+    /// onto a name is a type too ("plein" of "wilderinksplein"), as the
+    /// street keys read it: "Wilderinksplein" and "Wilderinksstraat" key
+    /// alike, and are two streets. A name of fewer than three letters is
+    /// no name a type is glued onto: "16th" is an ordinal.
     fn descriptors<'w>(&self, words: impl Iterator<Item = &'w str>) -> Descriptors {
         let dictionaries = self.tagger.dictionaries();
         let mut descriptors = Descriptors::default();
@@ -4412,6 +4486,13 @@ impl TextSearcher {
                 &mut descriptors.directions
             } else if dictionaries.is_street_type(word) {
                 &mut descriptors.types
+            } else if let Some((stem, glued)) = lattice::glued_parts(word)
+                .filter(|(stem, _)| stem.chars().filter(|c| c.is_alphabetic()).count() >= 3)
+            {
+                descriptors.names.push(stem.to_string());
+                descriptors.types.insert(glued.to_string());
+                descriptors.types.extend(lattice::other_forms(glued));
+                continue;
             } else {
                 descriptors.names.push(word.to_string());
                 continue;
@@ -5099,8 +5180,70 @@ impl TextSearcher {
         if let Some(bbox) = filters.bbox {
             subqueries.push((Occur::Must, self.bbox_query(bbox)));
         }
+        subqueries.push(self.product_clause());
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
+    }
+
+    /// The address reading takes a town's or street's words in a name
+    /// ("Rijksmuseum Twenthe") for where it is, and passes the place over.
+    fn places_by_name(
+        &self,
+        query_text: &str,
+        filters: &Filters<'_>,
+        focus: Option<[f64; 2]>,
+        limit: usize,
+    ) -> Result<Vec<TextSearchHit>> {
+        let Some(key) = search_key(query_text) else {
+            return Ok(Vec::new());
+        };
+        let words = key.split_whitespace().collect::<Vec<_>>();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut clauses = words
+            .iter()
+            .map(|word| {
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.name_text, word),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(bbox) = filters.bbox {
+            clauses.push((Occur::Must, self.bbox_query(bbox)));
+        }
+        clauses.push(self.product_clause());
+        let ranking = Ranking {
+            query_words: QueryWords::new(query_text),
+            focus,
+            ..Ranking::default()
+        };
+        let window = limit.max(NAMED_PLACES_WINDOW);
+        let mut hits =
+            self.ranked_hits(&BooleanQuery::new(clauses), &ranking, window, &mut |hit| {
+                Ok(filters.admit(hit))
+            })?;
+        let records = self.pack.records();
+        let mut order = HashMap::new();
+        for hit in &hits {
+            // Exact name, own or alternate ("AMS"), before a name holding the words.
+            let exact = records
+                .names(hit.record_id)?
+                .iter()
+                .any(|name| search_key(name).as_deref() == Some(key.as_str()));
+            let known = records.prominence(hit.record_id)?.unwrap_or_default();
+            order.insert(
+                hit.record_id,
+                (std::cmp::Reverse(exact), std::cmp::Reverse(known)),
+            );
+        }
+        hits.sort_by_key(|hit| order[&hit.record_id]);
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// The best `limit` hits that `accept` keeps, ranked by [`RankKey`] over
@@ -5879,6 +6022,8 @@ impl TextSearcher {
                 label: labels::address_label(&address),
                 address: Address::from(&address),
                 category: None,
+                road_class: None,
+                brand: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -7922,6 +8067,35 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
+/// Scores over different fields do not compare, so the query decides the
+/// order: a leading house number puts addresses first; else a place whose
+/// name starts as the query, then addresses, then other places.
+pub fn mix_suggestions(
+    query: &str,
+    addresses: Vec<TextSearchHit>,
+    places: Vec<TextSearchHit>,
+    limit: usize,
+) -> Vec<TextSearchHit> {
+    let limit = effective_autocomplete_limit(limit);
+    let key = search_key(query.trim()).unwrap_or_default();
+    let numbered = autocomplete_number(&autocomplete_query_tokens(&key)).is_some();
+    let mut mixed = Vec::with_capacity(addresses.len() + places.len());
+    if numbered {
+        mixed.extend(addresses);
+        mixed.extend(places);
+    } else {
+        let (named, others): (Vec<_>, Vec<_>) = places.into_iter().partition(|hit| {
+            !key.is_empty()
+                && search_key(&hit.record.name).is_some_and(|name| name.starts_with(&key))
+        });
+        mixed.extend(named);
+        mixed.extend(addresses);
+        mixed.extend(others);
+    }
+    mixed.truncate(limit);
+    mixed
+}
+
 fn effective_autocomplete_limit(limit: usize) -> usize {
     let limit = effective_limit(limit);
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
@@ -9625,7 +9799,7 @@ mod tests {
     }
 
     #[test]
-    fn pois_named_after_a_place_or_street_do_not_outrank_it() {
+    fn pois_named_after_a_place_or_street_are_found_apart_from_it() {
         use crate::{
             context::AdminContextTuple,
             pack::RecordContext,
@@ -9668,6 +9842,9 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
         };
         writer
             .write(
@@ -9716,15 +9893,17 @@ mod tests {
 
         assert_eq!(top("Muskoka Lakes Township"), "osm:relation:1");
         assert_eq!(top("Walmer Road"), "osm:node:3");
-        assert_eq!(top("Walmer Road Parkette"), "osm:node:4");
-        assert_eq!(top("Fire Station, Muskoka Lakes Township"), "osm:node:2");
+        let places = searcher.places();
+        let place = |query: &str| top_ids(&places, query)[0].clone();
+        assert_eq!(place("Walmer Road Parkette"), "osm:node:4");
+        assert_eq!(place("Fire Station, Muskoka Lakes Township"), "osm:node:2");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// A Pack of one street: a POI named after the street, a shop at one of
-    /// its addresses and a park off it.
+    /// its addresses and a bakery off it.
     #[test]
-    fn addresses_rank_above_pois_unless_a_poi_confirms_the_address() {
+    fn address_search_answers_no_poi_and_place_search_finds_them() {
         let temp_dir = temp_pack_path("search-addresses-beat-pois");
         let _ = std::fs::remove_dir_all(&temp_dir);
         let mut writer = Writer::create(&temp_dir).expect("writer");
@@ -9756,6 +9935,9 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
         };
         for record in [
             poi(10, "Walmer Road Walmer Road Variety", Some("6"), -79.0),
@@ -9766,7 +9948,8 @@ mod tests {
         }
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let layers = |query: &str| {
+        let places = searcher.places();
+        let layers_of = |searcher: &TextSearcher, query: &str| {
             searcher
                 .search(&TextSearchOptions {
                     query: query.to_string(),
@@ -9781,37 +9964,21 @@ mod tests {
                 .map(|hit| (hit.record.id, hit.record.layer))
                 .collect::<Vec<_>>()
         };
-        let first_poi = |hits: &[(String, String)]| {
-            hits.iter()
-                .position(|(_, layer)| layer == "poi")
-                .unwrap_or(hits.len())
-        };
-        let last_address = |hits: &[(String, String)]| {
-            hits.iter()
-                .rposition(|(_, layer)| layer != "poi")
-                .expect("an address or street")
-        };
+        let no_poi = |hits: &[(String, String)]| hits.iter().all(|(_, layer)| layer != "poi");
 
-        // The query names a street the Pack has: every POI follows it.
-        let street = layers("Walmer Road");
-        assert!(last_address(&street) < first_poi(&street), "{street:?}");
-        // A house number: the shop at number 4 follows the address.
-        let numbered = layers("4 Walmer Road");
+        let street = layers_of(&searcher, "Walmer Road");
+        assert!(no_poi(&street), "{street:?}");
+        let numbered = layers_of(&searcher, "4 Walmer Road");
         assert_eq!(numbered[0].0, "osm:node:4", "{numbered:?}");
-        assert!(
-            last_address(&numbered) < first_poi(&numbered),
-            "{numbered:?}"
+        assert!(no_poi(&numbered), "{numbered:?}");
+        assert!(no_poi(&layers_of(&searcher, "Walmer Road Bakery")));
+        let confirmed = layers_of(&places, "Corner Store 4 Walmer Road");
+        assert_eq!(confirmed[0].0, "osm:node:11", "{confirmed:?}");
+        assert_eq!(layers_of(&places, "Walmer Road Bakery")[0].0, "osm:node:12");
+        assert_eq!(
+            layers_of(&places, "Walmer Road Variety")[0].0,
+            "osm:node:10"
         );
-        // The shop's own name confirms the address it stands at.
-        let confirmed = layers("Corner Store 4 Walmer Road");
-        assert!(
-            confirmed.iter().take(2).any(|(id, _)| id == "osm:node:11"),
-            "{confirmed:?}"
-        );
-        // A number only a POI states is the POI.
-        assert_eq!(layers("6 Walmer Road")[0].0, "osm:node:10");
-        // Name-only POI queries rank as they did: the street lacks a word.
-        assert_eq!(layers("Walmer Road Bakery")[0].0, "osm:node:12");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -9831,6 +9998,9 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
             prominence,
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
         };
         for record in [
             cafe(1, Prominence::default()),
@@ -9839,6 +10009,7 @@ mod tests {
                 Prominence {
                     linked: false,
                     languages: 3,
+                    importance: 0,
                 },
             ),
             cafe(
@@ -9846,13 +10017,14 @@ mod tests {
                 Prominence {
                     linked: true,
                     languages: 1,
+                    importance: 0,
                 },
             ),
         ] {
             writer.write(&record.into(), None).expect("cafe");
         }
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher").places();
         assert_eq!(
             top_ids(&searcher, "Blue Door"),
             ["osm:node:3", "osm:node:2", "osm:node:1"]
@@ -9878,6 +10050,7 @@ mod tests {
                 prominence: Some(Prominence {
                     linked: true,
                     languages: 40,
+                    importance: 0,
                 }),
                 disputed: false,
             },
@@ -9885,6 +10058,54 @@ mod tests {
             &Ranking::default(),
         );
         assert!(first < known);
+    }
+
+    #[test]
+    fn suggestions_mix_addresses_and_places_by_what_the_query_says() {
+        let hit = |id: &str, layer: &str, name: &str| TextSearchHit {
+            record_id: 0,
+            score: 1.0,
+            record: Summary {
+                id: id.to_string(),
+                layer: layer.to_string(),
+                name: name.to_string(),
+                label: name.to_string(),
+                ..street_summary()
+            },
+            fallback: false,
+            features: Features::default(),
+            confidence: None,
+            signals: Signals::default(),
+        };
+        let addresses = || {
+            vec![
+                hit("osm:node:1", "address", "10 Queen Street"),
+                hit("osm:way:2", "street", "Queen Street"),
+            ]
+        };
+        let places = || {
+            vec![
+                hit("osm:node:3", "poi", "Corner Store"),
+                hit("osm:node:4", "poi", "Queen Bakery"),
+            ]
+        };
+        let ids = |hits: Vec<TextSearchHit>| {
+            hits.into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(mix_suggestions("queen", addresses(), places(), 0)),
+            ["osm:node:4", "osm:node:1", "osm:way:2", "osm:node:3"],
+            "a place named as typed first, then the addresses"
+        );
+        assert_eq!(
+            ids(mix_suggestions("10 queen", addresses(), places(), 0)),
+            ["osm:node:1", "osm:way:2", "osm:node:3", "osm:node:4"],
+            "a house number asks for an address"
+        );
+        assert_eq!(mix_suggestions("queen", addresses(), places(), 2).len(), 2);
     }
 
     fn street_summary() -> Summary {
@@ -9895,6 +10116,8 @@ mod tests {
             label: "Blue Door".to_string(),
             address: Address::default(),
             category: None,
+            road_class: None,
+            brand: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),
@@ -11053,6 +11276,20 @@ mod tests {
         .address;
         writer
             .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "300",
+                    "St. Clair Avenue West",
+                    Some("Toronto"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("dental address");
+        writer
+            .write(
                 &PoiRecord {
                     alt_names: Vec::new(),
                     name: "St. Clair Spadina Dental".to_string(),
@@ -11062,6 +11299,9 @@ mod tests {
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 1),
                     prominence: Default::default(),
+                    wikidata: None,
+                    brand: None,
+                    aliases: Vec::new(),
                 }
                 .into(),
                 None,
@@ -11077,11 +11317,14 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(top_ids(&searcher, "300 Spadina Ave"), vec!["osm:node:2"]);
-        assert_eq!(top_ids(&searcher, "Spadina Dental")[0], "osm:node:1");
+        assert_eq!(
+            top_ids(&searcher.places(), "Spadina Dental")[0],
+            "osm:node:1"
+        );
         assert_eq!(
             top_ids(&searcher, "300 St Clair Ave W"),
             vec!["osm:node:1"],
-            "a POI's address is its street's"
+            "the dentist's address is its street's"
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -12329,6 +12572,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// A place search answers first with the places whose names hold every
+    /// word, the one named exactly so first, then the better known, however
+    /// the address reading of the query takes the words.
+    #[test]
+    fn a_place_search_answers_with_the_places_so_named_the_best_known_first() {
+        let temp_dir = temp_pack_path("search-places-by-name");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let place = |id: i64, name: &str, importance: u8, lon: f64| PoiRecord {
+            alt_names: if name == "Luchthaven Schiphol" {
+                vec!["AMS".to_string()]
+            } else {
+                Vec::new()
+            },
+            name: name.to_string(),
+            category: "tourism:museum".to_string(),
+            address: None,
+            geometry: point_geometry(lon, 52.36),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, id),
+            prominence: Prominence {
+                importance,
+                ..Prominence::default()
+            },
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        for record in [
+            place(1, "Stedelijk Museum Breda", 0, 4.78),
+            place(2, "Stedelijk Museum Amsterdam", 120, 4.88),
+            place(3, "Van Gogh Museum", 140, 4.881),
+            place(4, "AMS", 0, 4.882),
+            place(5, "Luchthaven Schiphol", 160, 4.76),
+        ] {
+            writer.write(&record.into(), None).expect("place");
+        }
+        writer
+            .write(
+                &address_record(
+                    "osm:node:9",
+                    "",
+                    "1",
+                    "Van Goghstraat",
+                    Some("Amsterdam"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let places = TextSearcher::open(&temp_dir).expect("searcher").places();
+        assert_eq!(top_ids(&places, "Stedelijk Museum")[0], "osm:node:2");
+        assert_eq!(top_ids(&places, "Van Gogh Museum")[0], "osm:node:3");
+        assert_eq!(
+            top_ids(&places, "AMS")[0],
+            "osm:node:5",
+            "an exact other name of the better known"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Two streets whose names differ only by the type glued onto them key
+    /// alike, and are two streets: the one of the type written answers.
+    #[test]
+    fn a_street_whose_glued_type_contradicts_the_query_ranks_after() {
+        let temp_dir = temp_pack_path("search-glued-types");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, street, lon) in [
+            ("osm:node:1", "Wilderinksstraat", 6.7930),
+            ("osm:node:2", "Wilderinksplein", 6.7935),
+        ] {
+            let mut record = address_record(id, "", "2", street, Some("Hengelo"), None);
+            record.geometry = point_geometry(lon, 52.265);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        for (street, id) in [
+            ("Wilderinksplein", "osm:node:2"),
+            ("Wilderinksstraat", "osm:node:1"),
+        ] {
+            let found = top_ids_limited(&searcher, &format!("{street} 2, Hengelo"), 1);
+            assert_eq!(found, [id], "{street}");
+            let tagged = answer(
+                &searcher,
+                &format!(
+                    "2/house_number {}/street hengelo/locality",
+                    street.to_lowercase()
+                ),
+            );
+            assert_eq!(tagged[0], id, "{street}: {tagged:?}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
     #[test]
     fn noise_around_an_address_leaves_the_address() {
         let temp_dir = temp_pack_path("search-noise");
@@ -12844,6 +13185,8 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(9);
         StreetRecord {
+            other_ways: Vec::new(),
+            road_class: crate::record::RoadClass::Residential,
             alt_names: Vec::new(),
             locality: None,
             name: label.to_string(),

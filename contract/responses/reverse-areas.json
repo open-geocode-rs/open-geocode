@@ -14,11 +14,8 @@
         "label": "Toronto, Ontario, Canada",
         "layer": "country",
         "name": "Canada",
-        "record_id": 0,
         "source": {
-          "dataset": "osm",
-          "object_id": 1,
-          "object_type": "relation"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
@@ -37,11 +34,8 @@
         "label": "Toronto",
         "layer": "locality",
         "name": "Toronto",
-        "record_id": 2,
         "source": {
-          "dataset": "osm",
-          "object_id": 3,
-          "object_type": "relation"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
@@ -60,18 +54,21 @@
         "label": "Ontario",
         "layer": "region",
         "name": "Ontario",
-        "record_id": 1,
         "source": {
-          "dataset": "osm",
-          "object_id": 2,
-          "object_type": "relation"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
     }
   ],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
     "point": {
       "lat": 43.2,
       "lon": -79.2

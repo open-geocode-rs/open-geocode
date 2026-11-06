@@ -1,7 +1,7 @@
 ## Problem
 
 <!-- What is slow or large, measured, naming the Pack, the query set and the machine.
-"On the planet Pack, p99 of /search over the Photon suite is 2.3 s." -->
+"On the planet Pack, p99 of /geocode?q= over the Photon suite is 2.3 s." -->
 
 <!-- Where the time or memory goes.
 "Queries with no stated area try every typo tier on every reading, and each tier rescans the subject's postings." -->
@@ -30,7 +30,7 @@ API contract changed: <!-- no / yes: which field, parameter or error -->
 | | main | this PR |
 |---|---|---|
 | Accuracy | <!-- per fixture register: right answers out of 2,000; answers changed --> | |
-| Time | <!-- /search p50 and p99; candidates scored per query; build time if rebuilt --> | |
+| Time | <!-- /geocode?q= p50 and p99; candidates scored per query; build time if rebuilt --> | |
 | Space | <!-- Pack size; peak query memory; binary size; build peak RAM and scratch if rebuilt --> | |
 
 ## Downsides

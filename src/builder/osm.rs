@@ -76,7 +76,10 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -89,8 +92,9 @@ use crate::{
         addresses::{self, AddressFile, AddressSource},
         plan::{BuildPlan, ItemCounts, Scanned, plan_build_holding},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
+        qrank::QRank,
         report::{
-            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, ReportInput,
+            BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, QRankReport, ReportInput,
             ResumeReport, SlashNumberCounts, SorterReport, StageReport,
         },
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
@@ -135,7 +139,7 @@ use pbf::for_each_block;
 pub use pbf::replication_timestamp;
 use scan::scan_block;
 use spill::{
-    Body, Datasets, House, PendingAddress, PendingRecord, PendingStreet, PlacedAddress, Postcodes,
+    Body, Datasets, House, PendingAddress, PendingNamed, PendingRecord, PlacedAddress, Postcodes,
     WayKind,
 };
 
@@ -191,6 +195,8 @@ pub struct BuildOsmOptions {
     /// How many addresses `addresses` is expected to add, for the plan to
     /// size disk by; 0 when not known before they are fetched.
     pub imported_rows: u64,
+    /// QRank file (see [`crate::builder::qrank`]).
+    pub qrank: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -208,6 +214,7 @@ impl Default for BuildOsmOptions {
             cancel: Arc::new(AtomicBool::new(false)),
             addresses: None,
             imported_rows: 0,
+            qrank: None,
         }
     }
 }
@@ -226,6 +233,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("input_sources", &self.input_sources)
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
+            .field("qrank", &self.qrank)
             .finish_non_exhaustive()
     }
 }
@@ -616,6 +624,7 @@ impl<'a> Run<'a> {
             records: Some(ExternalSorter::new(&scratch, "records", &memory, budget)),
             addresses: Some(ExternalSorter::new(&scratch, "addresses", &memory, budget)),
             streets: Some(ExternalSorter::new(&scratch, "streets", &memory, budget)),
+            places: Some(ExternalSorter::new(&scratch, "places", &memory, budget)),
             context_records: Some(ExternalSorter::new(
                 &scratch,
                 "context-records",
@@ -720,6 +729,7 @@ impl<'a> Run<'a> {
             records: sorter_of(sorters, "records", &scratch, &memory, budget)?,
             addresses: sorter_of(sorters, "addresses", &scratch, &memory, budget)?,
             streets: sorter_of(sorters, "streets", &scratch, &memory, budget)?,
+            places: sorter_of(sorters, "places", &scratch, &memory, budget)?,
             context_records: sorter_of(
                 sorters,
                 "context-records",
@@ -850,7 +860,10 @@ impl<'a> Run<'a> {
             Step::Boundaries => self.boundaries(),
             Step::ImportAddresses => self.import_addresses(),
             Step::Contexts => self.order_contexts(),
-            Step::Streets => self.join_streets(),
+            Step::Streets => {
+                self.join_streets()?;
+                self.resolve_places()
+            }
             Step::AddressBook => self.write_address_book(),
             Step::Houses => self.find_repeated_houses(),
             Step::Addresses => self.place_addresses(),
@@ -1242,6 +1255,11 @@ impl<'a> Run<'a> {
             }
         }
         self.progress.check()?;
+        let mut places = Emitted::default();
+        for candidate in boundary::place_relations(&relations, member_line)? {
+            poi::emit_poi(&candidate, &mut places);
+        }
+        self.build.absorb(places)?;
         drop((line_memory, line_at, lines, relations, batch_memory));
         let passes = &mut self.build.report.geometry_passes;
         passes.boundary_shape_vertices = builder.vertices();
@@ -1442,6 +1460,22 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
+    fn resolve_places(&mut self) -> Result<()> {
+        let phase = Instant::now();
+        let places = self
+            .build
+            .places
+            .take()
+            .ok_or_else(|| missing("the places"))?;
+        self.sorted
+            .insert("places".to_string(), sorter_report(&places));
+        let records = open(&mut self.build.records, "records")?;
+        let merged = resolve_places(places, records, &mut self.build.seq)?;
+        self.build.report.accepted.places_merged = merged;
+        self.build.report.phases.street_join_ms += phase.elapsed().as_millis();
+        Ok(())
+    }
+
     /// Whether imported rows are matched against the addresses the Pack
     /// already has before they are placed.
     fn imported(&self) -> bool {
@@ -1611,6 +1645,7 @@ impl<'a> Run<'a> {
             context_count,
             &index,
             None,
+            None,
             &self.progress,
             BuildStage::ContextRecords,
         )?;
@@ -1635,16 +1670,35 @@ impl<'a> Run<'a> {
             .books
             .take()
             .ok_or_else(|| missing("the address book"))?;
-        write_ordered(
+        let qrank = match &self.options.qrank {
+            Some(path) => Some(QRank::load(path, &self.memory)?),
+            None => None,
+        };
+        let ranked = write_ordered(
             &mut writer,
             &mut sample,
             records.finish()?,
             record_stats.items,
             &index,
             Some(&books),
+            qrank.as_ref(),
             &self.progress,
             BuildStage::Records,
         )?;
+        if let (Some(path), Some(qrank)) = (&self.options.qrank, &qrank) {
+            let metadata = fs::metadata(path)?;
+            self.build.report.qrank = Some(QRankReport {
+                path: path.display().to_string(),
+                bytes: metadata.len(),
+                modified_unix: metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+                items: qrank.len() as u64,
+                ranked_places: ranked,
+            });
+        }
+        drop(qrank);
         drop((index, books));
         self.boundaries_saved = None;
         self.boundary_shapes = None;
@@ -1695,6 +1749,7 @@ impl<'a> Run<'a> {
         save_sorter(&mut self.build.records, &mut sorters)?;
         save_sorter(&mut self.build.addresses, &mut sorters)?;
         save_sorter(&mut self.build.streets, &mut sorters)?;
+        save_sorter(&mut self.build.places, &mut sorters)?;
         save_sorter(&mut self.build.context_records, &mut sorters)?;
         save_sorter(&mut self.verdicts, &mut sorters)?;
         for sorter in &sorters {
@@ -1889,6 +1944,7 @@ impl<'a> Run<'a> {
         self.progress.start(BuildStage::StructuredIndex, None)?;
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed)?;
+        crate::ids::add_to(&mut sealed)?;
         stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
         let mut report = self.report();
@@ -1994,7 +2050,9 @@ struct Build {
     addresses: Option<ExternalSorter<PendingAddress>>,
     /// The ways of streets, until every one is known and the ways of one
     /// street can join (see [`join_streets`]).
-    streets: Option<ExternalSorter<PendingStreet>>,
+    streets: Option<ExternalSorter<PendingNamed>>,
+    // Held until all are known: merging needs every POI of a name.
+    places: Option<ExternalSorter<PendingNamed>>,
     /// Places: everything a context tuple can point at.
     context_records: Option<ExternalSorter<PendingRecord>>,
     /// The datasets of the imported addresses.
@@ -2052,7 +2110,11 @@ impl Build {
         if let Record::Street(street) = record {
             self.seq += 1;
             return open(&mut self.streets, "streets")?
-                .push(PendingStreet::new(street, self.seq - 1)?);
+                .push(PendingNamed::new(street, self.seq - 1)?);
+        }
+        if let Record::Poi(poi) = record {
+            self.seq += 1;
+            return open(&mut self.places, "places")?.push(PendingNamed::place(poi, self.seq - 1)?);
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
@@ -2309,8 +2371,46 @@ fn read_chunks<T: book::Entry + Send + Sync>(
 /// city and joins across the wards; else the locality. One name is many
 /// streets across a country, and a road crossing a town line is a street in
 /// each town. `area_names` are the names of each area, its own first.
+fn resolve_places(
+    places: ExternalSorter<PendingNamed>,
+    records: &mut ExternalSorter<PendingRecord>,
+    seq: &mut u64,
+) -> Result<u64> {
+    let mut merged = 0;
+    let mut flush = |group: &mut Vec<crate::record::PoiRecord>| -> Result<()> {
+        let count = group.len();
+        let resolved = poi::resolve(std::mem::take(group));
+        merged += (count - resolved.len()) as u64;
+        for place in resolved {
+            let [lon, lat] = Record::Poi(place.clone())
+                .display_point()
+                .ok_or_else(|| Error::BadGeometry(format!("place {} has no point", place.id())))?;
+            records.push(PendingRecord {
+                key: hilbert_key(quantize(lon)?, quantize(lat)?),
+                seq: *seq,
+                origin: None,
+                body: Record::Poi(place).into(),
+            })?;
+            *seq += 1;
+        }
+        Ok(())
+    };
+    let mut group = Vec::new();
+    let mut name = None::<Vec<u8>>;
+    for pending in places.finish()? {
+        let pending = pending?;
+        if name.as_deref() != Some(pending.name_key()) {
+            flush(&mut group)?;
+            name = Some(pending.name_key().to_vec());
+        }
+        group.push(pending.into_place());
+    }
+    flush(&mut group)?;
+    Ok(merged)
+}
+
 fn join_streets(
-    streets: ExternalSorter<PendingStreet>,
+    streets: ExternalSorter<PendingNamed>,
     index: &BoundaryIndex,
     settled: &HashSet<RecordId>,
     area_names: &HashMap<RecordId, Vec<String>>,
@@ -2370,7 +2470,7 @@ fn join_streets(
     let mut name = None::<Vec<u8>>;
     overlapped(
         |emit| streets.finish()?.try_for_each(|pending| emit(pending?)),
-        |pending: PendingStreet| {
+        |pending: PendingNamed| {
             if name.as_deref() != Some(pending.name_key()) {
                 if ways >= WRITE_BATCH_RECORDS {
                     flush(&mut runs)?;
@@ -2797,9 +2897,12 @@ fn write_ordered(
     total: u64,
     index: &BoundaryIndex,
     book: Option<&AddressBook>,
+    qrank: Option<&QRank>,
     progress: &Progress,
     stage: BuildStage,
-) -> Result<()> {
+) -> Result<u64> {
+    let ranked = AtomicU64::new(0);
+    let ranked_ref = &ranked;
     progress.start(stage, Some(total))?;
     let mut preparer = writer.preparer();
     // One thread reads and prepares the next batch while this one appends the
@@ -2829,7 +2932,15 @@ fn write_ordered(
                     .and_then(|batch| {
                         let (batch, countries): (Vec<_>, Vec<_>) = batch
                             .into_par_iter()
-                            .map(|(record, origin)| {
+                            .map(|(mut record, origin)| {
+                                if let (Some(qrank), Record::Poi(poi)) = (qrank, &mut record)
+                                    && let Some(item) = poi.wikidata
+                                {
+                                    poi.prominence.importance = qrank.importance(item);
+                                    if poi.prominence.importance > 0 {
+                                        ranked_ref.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                                 let located = record_context(index, &record);
                                 let country = located
                                     .as_ref()
@@ -2864,7 +2975,7 @@ fn write_ordered(
         Ok(())
     })?;
     progress.finish(stage);
-    Ok(())
+    Ok(ranked.into_inner())
 }
 
 /// Build audit outputs written next to the Pack file, outside it.
@@ -3641,7 +3752,7 @@ mod tests {
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = |lon, lat| {
             reverse
-                .reverse(GeocodeOptions { lon, lat })
+                .reverse(GeocodeOptions::at(lon, lat))
                 .expect("reverse")
                 .result
                 .expect("result")
@@ -4001,8 +4112,8 @@ mod tests {
         assert_eq!(counts.get("poi"), Some(&4), "{counts:?}");
         assert_eq!(
             counts.get("address"),
-            Some(&6),
-            "the unnamed cafe stays an address; the named one does not"
+            Some(&7),
+            "the unnamed cafe stays an address; the named one's address is one too"
         );
         assert_eq!(report.accepted.pois_with_address, 1);
         assert_eq!(report.accepted.poi_nodes, 3);
@@ -4010,17 +4121,26 @@ mod tests {
         assert_eq!(report.accepted.poi_categories.get("amenity"), Some(&2));
         assert_eq!(report.geometry_resolution.poi_way_stubs, 1);
 
-        // One record for the cafe, carrying its address.
-        let ids = (0..reader.manifest().record_count)
-            .map(|id| reader.record_summary(id).expect("summary").id)
+        let summaries = (0..reader.manifest().record_count)
+            .map(|id| (id, reader.record_summary(id).expect("summary")))
             .collect::<Vec<_>>();
-        assert_eq!(ids.iter().filter(|id| *id == "osm:node:2001").count(), 1);
-        assert!(!ids.iter().any(|id| id == "osm:node:2003"), "bench");
-        let cafe = reader
-            .find_by_source_id("osm:node:2001")
-            .expect("lookup")
-            .expect("cafe");
-        let Record::Poi(poi) = reader.records().record(cafe).expect("record") else {
+        let mut cafe = summaries
+            .iter()
+            .filter(|(_, summary)| summary.id == "osm:node:2001")
+            .map(|(id, summary)| (summary.layer.as_str(), *id))
+            .collect::<Vec<_>>();
+        cafe.sort_unstable();
+        assert_eq!(
+            cafe.iter().map(|(layer, _)| *layer).collect::<Vec<_>>(),
+            ["address", "poi"]
+        );
+        assert!(
+            !summaries
+                .iter()
+                .any(|(_, summary)| summary.id == "osm:node:2003"),
+            "bench"
+        );
+        let Record::Poi(poi) = reader.records().record(cafe[1].1).expect("record") else {
             panic!("the cafe is a POI");
         };
         assert_eq!(poi.category, "amenity:cafe");
@@ -4029,13 +4149,18 @@ mod tests {
             Some("King Street West")
         );
 
-        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let addresses = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let places = addresses.places();
         let search = |query: &str, layer: Option<&str>| -> Vec<TextSearchHit> {
+            let searcher = match layer {
+                Some("poi") | None => &places,
+                Some(_) => &addresses,
+            };
             searcher
                 .search(&TextSearchOptions {
                     query: query.into(),
                     limit: 5,
-                    layer: layer.map(str::to_string),
+                    layer: layer.filter(|layer| *layer != "poi").map(str::to_string),
                     countries: Vec::new(),
                     focus: None,
                     bbox: None,
@@ -4066,11 +4191,9 @@ mod tests {
                 .label,
             "Riverdale Farm, Toronto"
         );
-        // By its address, also under the address layer filter.
-        assert_eq!(
-            ids(&search("123 King Street West", Some("address"))),
-            vec!["osm:node:2001"]
-        );
+        let address = search("123 King Street West", Some("address"));
+        assert_eq!(ids(&address), vec!["osm:node:2001"]);
+        assert_eq!(address[0].record.layer, "address");
         assert!(search("Riverdale Farm", Some("address")).is_empty());
         let station = search("Union Station Toronto", Some("poi"));
         assert_eq!(ids(&station), vec!["osm:way:700"]);
@@ -4080,7 +4203,7 @@ mod tests {
         );
         assert!(search("Memorial Bench", None).is_empty());
 
-        let suggestions = searcher
+        let suggestions = places
             .autocomplete(&TextAutocompleteOptions {
                 query: "riverdale fa".into(),
                 limit: 5,
@@ -4092,14 +4215,9 @@ mod tests {
             .expect("autocomplete");
         assert_eq!(ids(&suggestions), vec!["osm:node:2002"]);
 
-        // Reverse answers with the cafe's address, as it did when the cafe was
-        // an address record.
         let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
         let result = reverse
-            .reverse(GeocodeOptions {
-                lon: -79.38,
-                lat: 43.65,
-            })
+            .reverse(GeocodeOptions::at(-79.38, 43.65))
             .expect("reverse")
             .result
             .expect("result");
@@ -4107,6 +4225,243 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn one_cafe_mapped_twice_is_one_place_found_by_either_id() {
+        let dir = temp_dir("one-place");
+        let input = dir.join("cafes.osm.pbf");
+        let cafe = |id: i64, lon: f64, tags: &[(&'static str, &'static str)]| {
+            let mut all = vec![("name", "Cafetaria De Pindol"), ("amenity", "cafe")];
+            all.extend_from_slice(tags);
+            node(id, 51.41, lon, &all)
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    cafe(1, 5.40000, &[]),
+                    cafe(
+                        2,
+                        5.40004,
+                        &[("addr:housenumber", "82"), ("addr:street", "Dorpstraat")],
+                    ),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.places_merged, 1);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts.get("poi"), Some(&1));
+        let catalogue = crate::ids::Catalogue::open(reader.container())
+            .expect("open")
+            .expect("a catalogue");
+        let first = catalogue
+            .find(reader.records(), ObjectType::Node, 1)
+            .expect("find");
+        let second = catalogue
+            .find(reader.records(), ObjectType::Node, 2)
+            .expect("find");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first, second, "the merged-away id finds the place");
+        let Record::Poi(cafe) = reader.records().record(first[0]).expect("record") else {
+            panic!("a place");
+        };
+        assert_eq!(
+            cafe.address.expect("the address one copy stated").number,
+            "82"
+        );
+    }
+
+    #[test]
+    fn a_place_drawn_as_a_multipolygon_is_a_place_inside_its_outline() {
+        let dir = temp_dir("place-relations");
+        let input = dir.join("stadium.osm.pbf");
+        // Plain centre lies in the hole.
+        let nodes = vec![
+            node(1, 52.300, 4.930, &[]),
+            node(2, 52.300, 4.950, &[]),
+            node(3, 52.320, 4.950, &[]),
+            node(4, 52.320, 4.930, &[]),
+            node(5, 52.305, 4.935, &[]),
+            node(6, 52.305, 4.945, &[]),
+            node(7, 52.315, 4.945, &[]),
+            node(8, 52.315, 4.935, &[]),
+        ];
+        let ways = vec![
+            way(10, &[1, 2, 3], &[]),
+            way(11, &[3, 4, 1], &[]),
+            way(12, &[5, 6, 7, 8, 5], &[]),
+        ];
+        let relations = vec![relation(
+            100,
+            &[(10, "outer"), (11, "outer"), (12, "inner")],
+            &[
+                ("type", "multipolygon"),
+                ("leisure", "stadium"),
+                ("name", "Johan Cruijff ArenA"),
+            ],
+        )];
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let hit = places
+            .search(&TextSearchOptions {
+                query: "Johan Cruijff ArenA".into(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .next()
+            .expect("the stadium");
+        assert_eq!(hit.record.id, "osm:relation:100");
+        assert_eq!(hit.record.category.as_deref(), Some("leisure:stadium"));
+        let point = hit.record.point.expect("point");
+        let inside = |(low, high): (f64, f64), value: f64| low < value && value < high;
+        assert!(inside((4.930, 4.950), point.lon) && inside((52.300, 52.320), point.lat));
+        assert!(
+            !(inside((4.935, 4.945), point.lon) && inside((52.305, 52.315), point.lat)),
+            "its point is not in the hole: {point:?}"
+        );
+    }
+
+    #[test]
+    fn a_place_is_found_by_its_brand_and_codes_and_drops_are_counted() {
+        let dir = temp_dir("brands");
+        let input = dir.join("brands.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        1,
+                        52.37,
+                        4.89,
+                        &[
+                            ("name", "Tankstation Zanoli"),
+                            ("amenity", "fuel"),
+                            ("brand", "Esso"),
+                            ("brand:wikidata", "Q867662"),
+                        ],
+                    ),
+                    node(
+                        2,
+                        52.38,
+                        4.90,
+                        &[("amenity", "cafe"), ("brand", "Starbucks")],
+                    ),
+                    node(
+                        3,
+                        52.31,
+                        4.76,
+                        &[
+                            ("name", "Amsterdam Airport Schiphol"),
+                            ("aeroway", "aerodrome"),
+                            ("iata", "AMS"),
+                        ],
+                    ),
+                    node(4, 52.36, 4.88, &[("name", "Bench"), ("amenity", "bench")]),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(
+            report.accepted.places_left_out.get("amenity=bench"),
+            Some(&1)
+        );
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let top = |query: &str| {
+            places
+                .search(&TextSearchOptions {
+                    query: query.into(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .next()
+                .expect("a place")
+                .record
+        };
+        let esso = top("Esso");
+        assert_eq!(esso.name, "Tankstation Zanoli");
+        let brand = esso.brand.expect("a brand");
+        assert_eq!(
+            (brand.name.as_str(), brand.wikidata),
+            ("Esso", Some(867_662))
+        );
+        assert_eq!(top("Starbucks").id, "osm:node:2");
+        assert_eq!(top("AMS").id, "osm:node:3");
+    }
+
+    #[test]
+    fn a_place_whose_wikidata_item_is_read_more_ranks_first() {
+        let dir = temp_dir("qrank");
+        let input = dir.join("cafes.osm.pbf");
+        let cafe = |id: i64, item: &'static str| {
+            node(
+                id,
+                43.65,
+                -79.38,
+                &[
+                    ("name", "Blue Door"),
+                    ("amenity", "cafe"),
+                    ("wikidata", item),
+                ],
+            )
+        };
+        write_pbf(
+            &input,
+            &[vec![cafe(1, "Q11"), cafe(2, "Q22")], vec![], vec![]],
+        );
+        let qrank = dir.join("qrank.csv");
+        fs::write(&qrank, "Entity,QRank\nQ11,40\nQ22,90000\n").expect("qrank");
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            qrank: Some(qrank),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let ranked = report.qrank.expect("the QRank file read");
+        assert_eq!((ranked.items, ranked.ranked_places), (2, 2));
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let hits = places
+            .search(&TextSearchOptions {
+                query: "Blue Door".into(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search");
+        let ids = hits
+            .iter()
+            .map(|hit| hit.record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["osm:node:2", "osm:node:1"]);
     }
 
     #[test]
@@ -4173,11 +4528,20 @@ mod tests {
             way(703, &[205, 206], &road("Ponsonby Road")),
             way(710, &[211, 212], &road("Main Street")),
             way(711, &[212, 213], &road("Main Street")),
+            way(
+                720,
+                &[205, 206],
+                &[("highway", "platform"), ("name", "Kingston Station")],
+            ),
         ]);
         write_pbf(&input, &[nodes, ways, vec![district, board, town]]);
         let report = build(&dir.join("pack"), &input, None);
         assert_eq!(report.accepted.street_segments, 6);
         assert_eq!(report.accepted.streets, 3);
+        assert_eq!(
+            report.triage.by_reason_and_bucket["highway_not_a_street"]["likely_not_useful_for_geocoding"],
+            1
+        );
 
         let reader = Reader::open(dir.join("pack")).expect("reader");
         let mut streets = reader
@@ -4208,6 +4572,23 @@ mod tests {
             ],
             "a street in a local board is named by its district, one in a town by the town"
         );
+        let catalogue = crate::ids::Catalogue::open(reader.container())
+            .expect("open")
+            .expect("a catalogue");
+        let found = |way: i64| {
+            catalogue
+                .find(reader.records(), ObjectType::Way, way)
+                .expect("find")
+                .into_iter()
+                .map(|id| reader.record_summary(id).expect("summary").id)
+                .collect::<Vec<_>>()
+        };
+        for way in [700, 701, 702] {
+            assert_eq!(found(way), ["osm:way:700"], "way {way}");
+        }
+        assert_eq!(found(703), ["osm:way:703"], "the far road stays its own");
+        assert_eq!(found(711), ["osm:way:710"]);
+        assert!(found(720).is_empty(), "a platform is no street");
         let _ = fs::remove_dir_all(dir);
     }
 

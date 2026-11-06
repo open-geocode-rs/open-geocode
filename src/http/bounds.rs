@@ -14,7 +14,7 @@ use crate::search::{BoundingBox, MAX_AUTOCOMPLETE_LIMIT};
 /// Maximum length (in Unicode scalar values) of a `q` query string.
 pub(crate) const MAX_QUERY_CHARS: usize = 256;
 
-/// Maximum `limit` a `/search` request may ask for. `search.rs` has no internal
+/// Maximum `limit` a `/geocode` or `/places` request may ask for. `search.rs` has no internal
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
 
@@ -51,7 +51,7 @@ pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
 }
 
 /// Like [`validate_query_length`] but additionally rejects an empty query, for
-/// `/search` where an empty `q` is a client error.
+/// `/geocode` and `/places`, where an empty `q` is a client error.
 pub(crate) fn validate_query(raw: &str) -> Result<String, Problem> {
     let query = validate_query_length(raw)?;
     if query.is_empty() {
@@ -60,7 +60,7 @@ pub(crate) fn validate_query(raw: &str) -> Result<String, Problem> {
     Ok(query)
 }
 
-/// Reject a `/search` `limit` above [`MAX_SEARCH_LIMIT`].
+/// Reject a `/geocode` or `/places` `limit` above [`MAX_SEARCH_LIMIT`].
 pub(crate) fn validate_search_limit(limit: usize) -> Result<(), Problem> {
     if limit > MAX_SEARCH_LIMIT {
         return Err(Problem::limit_too_large(vec![InvalidParam::new(

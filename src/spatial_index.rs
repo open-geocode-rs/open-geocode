@@ -733,12 +733,27 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.block_points(lon, lat, radius_m, limit, |_, layer| {
+            Ok(layer == Layer::Address)
+        })?;
+        Ok(closest_candidates(candidates, limit))
+    }
+
+    pub fn poi_candidates(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+    ) -> Result<Vec<PointCandidate>> {
         let candidates =
-            self.block_points(lon, lat, radius_m, limit, |record_id, layer| match layer {
-                Layer::Address => Ok(true),
-                Layer::Poi => self.records.is_explicit_address(record_id),
-                _ => Ok(false),
-            })?;
+            self.block_points(
+                lon,
+                lat,
+                radius_m,
+                limit,
+                |_, layer| Ok(layer == Layer::Poi),
+            )?;
         Ok(closest_candidates(candidates, limit))
     }
 
@@ -1336,6 +1351,8 @@ mod tests {
     fn indexes_line_segments_with_fraction() {
         let street = |object_id: i64, lon: f64| {
             Record::Street(StreetRecord {
+                other_ways: Vec::new(),
+                road_class: crate::record::RoadClass::Residential,
                 alt_names: Vec::new(),
                 locality: None,
                 name: "King Street".to_string(),
@@ -1380,6 +1397,8 @@ mod tests {
     fn measures_a_street_of_several_ways_end_to_end() {
         let part = |lon: f64| vec![vec![lon, 43.0].into(), vec![lon, 43.001].into()];
         let street = Record::Street(StreetRecord {
+            other_ways: Vec::new(),
+            road_class: crate::record::RoadClass::Residential,
             alt_names: Vec::new(),
             locality: None,
             name: "King Street".to_string(),

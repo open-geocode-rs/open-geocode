@@ -7,6 +7,13 @@
     "snapshot": "upstream/geofabrik.json",
     "sha256": "bb321b75f774f17128e3e45c5f06397e3dfc90c5cd3df145b89f44c43e8595ca"
   },
+  "id-tagging-schema": {
+    "package": "https://registry.npmjs.org/@openstreetmap/id-tagging-schema/latest",
+    "version": "7.3.0",
+    "fetched": "2026-11-05T22:24:49Z",
+    "snapshot": "upstream/id-tagging-schema.json",
+    "sha256": "7751b614bc717108e28ca61abf7336d61617eb041ed72921994021576e426bd6"
+  },
   "openaddresses": {
     "api": "https://batch.openaddresses.io/api/data",
     "fetched": "2026-10-16T20:55:21Z",

@@ -2,6 +2,7 @@ pub mod addresses;
 pub mod osm;
 pub mod plan;
 pub mod progress;
+pub mod qrank;
 pub mod report;
 pub mod resume;
 
@@ -15,6 +16,6 @@ pub use progress::{
 pub use report::{
     AcceptedCounts, BuilderReport, CandidateDispositionCounts, CheckpointReport,
     CompletenessCounts, GeometryResolutionCounts, IssueAuditCounts, PackOutputReport, PhaseTimings,
-    RejectedCounts, ResumeReport, ScannedCounts, ScratchReport, ValidationAuditCounts,
+    QRankReport, RejectedCounts, ResumeReport, ScannedCounts, ScratchReport, ValidationAuditCounts,
 };
 pub use resume::Leftover;

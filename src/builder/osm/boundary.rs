@@ -4,7 +4,9 @@ use std::{
     sync::Arc,
 };
 
-use geo::{Area, BoundingRect, Centroid, Contains, LineString, MultiPolygon, Polygon, Rect};
+use geo::{
+    Area, BoundingRect, Centroid, Contains, InteriorPoint, LineString, MultiPolygon, Polygon, Rect,
+};
 use rayon::prelude::*;
 use rstar::{AABB, RTree, RTreeObject};
 
@@ -14,7 +16,8 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Layer, ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
+        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance,
+        point_geometry,
     },
     util::text::normalize_for_compare,
 };
@@ -23,6 +26,7 @@ use super::{
     admin_levels::{self, admin_levels},
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
+    poi::PoiCandidate,
     tags::{OsmTags, alternate_names, name_tags},
 };
 
@@ -767,6 +771,45 @@ fn boundary_from_relation(
     let Some(parts) = area_parts(&stub.tags) else {
         return Ok(None);
     };
+    let Some(geometry) = relation_geometry(stub, member_line)? else {
+        return Ok(None);
+    };
+    Ok(built(parts, &stub.tags, &geometry))
+}
+
+/// Point inside the outline, not the centre: a ring's centre can lie in its
+/// hole. [`super::poi::emit_poi`] decides from the tags whether it is a place.
+pub(crate) fn place_relations(
+    relations: &[BoundaryRelationStub],
+    member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
+) -> crate::error::Result<Vec<PoiCandidate>> {
+    relations
+        .par_iter()
+        .filter(|stub| area_parts(&stub.tags).is_none())
+        .map(|stub| {
+            let Some(geometry) = relation_geometry(stub, &member_line)? else {
+                return Ok(None);
+            };
+            let Some(point) = geometry.interior_point() else {
+                return Ok(None);
+            };
+            Ok(Some(PoiCandidate {
+                object_type: ObjectType::Relation,
+                object_id: stub.object_id,
+                lat: point.y(),
+                lon: point.x(),
+                location_precision: LocationPrecision::Centroid,
+                tags: stub.tags.clone(),
+            }))
+        })
+        .filter_map(crate::error::Result::transpose)
+        .collect()
+}
+
+fn relation_geometry(
+    stub: &BoundaryRelationStub,
+    member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
+) -> crate::error::Result<Option<MultiPolygon<f64>>> {
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
@@ -784,10 +827,7 @@ fn boundary_from_relation(
         return Ok(None);
     }
     let inner_rings = stitch_rings(inner_segments);
-    let Some(geometry) = multipolygon_from_rings(outer_rings, inner_rings) else {
-        return Ok(None);
-    };
-    Ok(built(parts, &stub.tags, &geometry))
+    Ok(multipolygon_from_rings(outer_rings, inner_rings))
 }
 
 /// The boundary an area's tags and geometry make, and the block of its

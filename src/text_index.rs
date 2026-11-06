@@ -41,7 +41,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 13;
 /// Postcode data within this radius describes where a record is: a record
 /// with no postcode of its own is ranked by the nearest postcode centroid
 /// within it, and the batch check compares the postcode areas within it.
@@ -94,6 +94,10 @@ fn create_dir(path: &Path) -> Result<PathBuf> {
 }
 const LABEL: &str = "pack-text";
 const AUTOCOMPLETE_SUBJECT_FIELD: &str = "autocomplete_subject_text";
+const PLACE_NAME_FIELD: &str = "place_name_text";
+const PLACE_CONTENT_FIELD: &str = "place_content_text";
+const PLACE_AUTOCOMPLETE_SUBJECT_FIELD: &str = "place_autocomplete_subject_text";
+const PLACE_ADDRESS_NUMBER_FIELD: &str = "place_address_number";
 pub(crate) const INTERPOLATION_START_FIELD: &str = "interpolation_start";
 pub(crate) const INTERPOLATION_END_FIELD: &str = "interpolation_end";
 pub(crate) const HOUSE_NUMBER_FIELD: &str = "house_number";
@@ -219,6 +223,14 @@ pub struct Fields {
     pub address_number: Field,
     pub postcode_exact: Field,
     pub autocomplete_subject_text: Field,
+    /// Apart from the address fields, so a word common in shop names stays
+    /// rare among street names. Context stays shared: documents run in map
+    /// order, so one list of a town's neighbours compresses far better than
+    /// two. Search splits the products by layer (`product_clause`).
+    pub place_name_text: Field,
+    pub place_content_text: Field,
+    pub place_autocomplete_subject_text: Field,
+    pub place_address_number: Field,
     /// First and last number of an interpolation range, so a search finds the
     /// ranges that contain a requested house number.
     pub interpolation_start: Field,
@@ -550,12 +562,15 @@ impl Writer {
             if name.ends_with(".lock") {
                 continue;
             }
+            let section = format!("{TEXT_SECTION_PREFIX}{name}");
+            if name.ends_with(STORE_EXTENSION) {
+                let store = empty_store()?;
+                bytes += store.len() as u64;
+                pack.add(&section, TEXT_INDEX_SCHEMA_VERSION, &store)?;
+                continue;
+            }
             bytes += fs::metadata(&file)?.len();
-            pack.add_file(
-                &format!("{TEXT_SECTION_PREFIX}{name}"),
-                TEXT_INDEX_SCHEMA_VERSION,
-                &file,
-            )?;
+            pack.add_file(&section, TEXT_INDEX_SCHEMA_VERSION, &file)?;
         }
         // The segments are in the Pack now; their scratch goes before the
         // parser trains, not after.
@@ -622,6 +637,10 @@ impl Fields {
             address_number: schema.get_field("address_number")?,
             postcode_exact: schema.get_field("postcode_exact")?,
             autocomplete_subject_text: schema.get_field(AUTOCOMPLETE_SUBJECT_FIELD)?,
+            place_name_text: schema.get_field(PLACE_NAME_FIELD)?,
+            place_content_text: schema.get_field(PLACE_CONTENT_FIELD)?,
+            place_autocomplete_subject_text: schema.get_field(PLACE_AUTOCOMPLETE_SUBJECT_FIELD)?,
+            place_address_number: schema.get_field(PLACE_ADDRESS_NUMBER_FIELD)?,
             interpolation_start: schema.get_field(INTERPOLATION_START_FIELD)?,
             interpolation_end: schema.get_field(INTERPOLATION_END_FIELD)?,
             street_text: schema.get_field("street_text")?,
@@ -663,9 +682,34 @@ impl Fields {
         }
     }
 
+    pub fn for_places(self) -> Self {
+        Self {
+            name_text: self.place_name_text,
+            content_text: self.place_content_text,
+            street_text: self.place_content_text,
+            autocomplete_subject_text: self.place_autocomplete_subject_text,
+            address_number: self.place_address_number,
+            ..self
+        }
+    }
+
     /// The document of `projected`, whose numbers and units index as
-    /// `numbers`.
+    /// `numbers`. A place's words go to the place fields alone.
     fn to_tantivy_document(self, projected: &Document, numbers: Numbers) -> TantivyDocument {
+        let place = projected
+            .layers
+            .iter()
+            .any(|layer| layer == Layer::Poi.as_str());
+        let fields = if place { self.for_places() } else { self };
+        fields.write_document(projected, numbers, place)
+    }
+
+    fn write_document(
+        self,
+        projected: &Document,
+        numbers: Numbers,
+        place: bool,
+    ) -> TantivyDocument {
         let mut document = TantivyDocument::default();
         document.add_u64(self.record_id, projected.record_id);
         document.add_u64(self.record_count, projected.record_count);
@@ -700,11 +744,13 @@ impl Fields {
         if let Some(base) = numbers.lowest {
             document.add_u64(self.house_number, base.into());
         }
-        add_normalized_text_if_present(
-            &mut document,
-            self.postcode_exact,
-            projected.postcode.as_deref(),
-        );
+        if !place {
+            add_normalized_text_if_present(
+                &mut document,
+                self.postcode_exact,
+                projected.postcode.as_deref(),
+            );
+        }
         if !projected.autocomplete_subject_text.is_empty() {
             document.add_text(
                 self.autocomplete_subject_text,
@@ -843,8 +889,13 @@ impl Document {
             builder.name(name);
         }
         builder.add_content_text(&poi.category);
+        // "Esso" finds "Tankstation Zanoli".
+        if let Some(brand) = &poi.brand {
+            builder.add_content_text(&brand.name);
+            builder.add_optional_autocomplete_text(Some(&brand.name));
+        }
+        // "Albert Heijn Damrak": address words find the place too.
         if let Some(address) = &poi.address {
-            builder.also_layer(Layer::Address.as_str());
             builder.address(address);
         }
         builder
@@ -977,6 +1028,30 @@ impl Directory for PackDirectory {
     }
 }
 
+const STORE_EXTENSION: &str = ".store";
+
+/// Nothing reads stored documents, but tantivy writes a 4-byte offset per
+/// document anyway (471 MB on planet) and opens every segment's store, so
+/// the file must stay a valid store. Tantivy never checks its doc count.
+fn empty_store() -> Result<Vec<u8>> {
+    let (schema, _) = build_schema();
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, MIN_INDEX_MEMORY_BYTES)?;
+    writer.add_document(TantivyDocument::default())?;
+    writer.commit()?;
+    drop(writer);
+    let segment = index
+        .searchable_segments()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Inconsistent("an empty store's index has no segment".into()))?;
+    let path = segment.relative_path(tantivy::index::SegmentComponent::Store);
+    index
+        .directory()
+        .atomic_read(&path)
+        .map_err(|error| Error::Inconsistent(format!("empty document store: {error}")))
+}
+
 fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let record_id = builder.add_u64_field("record_id", FAST);
@@ -992,6 +1067,14 @@ fn build_schema() -> (Schema, Fields) {
         AUTOCOMPLETE_SUBJECT_FIELD,
         autocomplete_subject_text_options(),
     );
+    let place_name_text = builder.add_text_field(PLACE_NAME_FIELD, searchable_text_options());
+    let place_content_text = builder.add_text_field(PLACE_CONTENT_FIELD, searchable_text_options());
+    let place_autocomplete_subject_text = builder.add_text_field(
+        PLACE_AUTOCOMPLETE_SUBJECT_FIELD,
+        autocomplete_subject_text_options(),
+    );
+    let place_address_number =
+        builder.add_text_field(PLACE_ADDRESS_NUMBER_FIELD, exact_string_options());
     let interpolation_start = builder.add_u64_field(INTERPOLATION_START_FIELD, FAST);
     let interpolation_end = builder.add_u64_field(INTERPOLATION_END_FIELD, FAST);
     let street_text = builder.add_text_field("street_text", searchable_text_options());
@@ -1026,6 +1109,10 @@ fn build_schema() -> (Schema, Fields) {
         address_number,
         postcode_exact,
         autocomplete_subject_text,
+        place_name_text,
+        place_content_text,
+        place_autocomplete_subject_text,
+        place_address_number,
         interpolation_start,
         interpolation_end,
         street_text,
@@ -1109,10 +1196,6 @@ impl ProjectionBuilder {
             context_parts: Vec::new(),
             autocomplete_subject_parts: Vec::new(),
         }
-    }
-
-    fn also_layer(&mut self, layer: &str) {
-        self.projected.layers.push(layer.to_string());
     }
 
     fn name(&mut self, value: &str) {
@@ -1645,8 +1728,18 @@ mod tests {
             .reader()
             .expect("reader")
             .searcher();
+        let store_bytes = pack
+            .section_sizes()
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(STORE_EXTENSION))
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>();
         let segments = searcher.segment_readers();
         let _ = fs::remove_dir_all(&dir);
+        assert!(
+            store_bytes < 1_024,
+            "{count} documents keep no store of their own: {store_bytes} bytes"
+        );
         assert_eq!(segments.len(), 1, "the parts are joined into one segment");
         let ids = segments[0]
             .fast_fields()
@@ -1810,6 +1903,9 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, 5),
             prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
         };
 
         let projected = Document::from_record(
@@ -1820,7 +1916,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(projected.layers, vec!["poi", "address"]);
+        assert_eq!(projected.layers, vec!["poi"]);
         assert_eq!(
             projected.name.as_deref(),
             Some("tim hortons"),

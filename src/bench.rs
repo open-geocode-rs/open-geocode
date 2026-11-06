@@ -323,16 +323,29 @@ fn benchmark_search_cases(
     iterations: usize,
     warmup: usize,
 ) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
+    let places = searcher.places();
     benchmark_text_cases(cases, iterations, warmup, |case, limit| {
+        let (searcher, layer) = product(searcher, &places, case.layer.as_deref());
         searcher.search(&TextSearchOptions {
             query: case.query.clone(),
             limit,
-            layer: case.layer.clone(),
+            layer,
             countries: Vec::new(),
             focus: None,
             bbox: None,
         })
     })
+}
+
+fn product<'a>(
+    addresses: &'a TextSearcher,
+    places: &'a TextSearcher,
+    layer: Option<&str>,
+) -> (&'a TextSearcher, Option<String>) {
+    match layer {
+        Some(layer) if layer == Layer::Poi.as_str() => (places, None),
+        layer => (addresses, layer.map(str::to_string)),
+    }
 }
 
 fn benchmark_autocomplete_cases(
@@ -341,11 +354,13 @@ fn benchmark_autocomplete_cases(
     iterations: usize,
     warmup: usize,
 ) -> Result<OperationBenchmarkReport<TextQueryCaseReport>> {
+    let places = searcher.places();
     benchmark_text_cases(cases, iterations, warmup, |case, limit| {
+        let (searcher, layer) = product(searcher, &places, case.layer.as_deref());
         searcher.autocomplete(&TextAutocompleteOptions {
             query: case.query.clone(),
             limit,
-            layer: case.layer.clone(),
+            layer,
             countries: Vec::new(),
             focus: None,
             bbox: None,
@@ -410,10 +425,7 @@ fn benchmark_reverse_cases(
     for case in cases {
         let mut result_present = false;
         let durations = measure_iterations(iterations, warmup, || {
-            let response = geocoder.reverse(GeocodeOptions {
-                lon: case.lon,
-                lat: case.lat,
-            })?;
+            let response = geocoder.reverse(GeocodeOptions::at(case.lon, case.lat))?;
             result_present = response.result.is_some();
             Ok(())
         })?;
@@ -536,7 +548,7 @@ pub fn sample_poi_fixture(options: &PoiFixtureOptions) -> Result<BenchmarkFixtur
             name: Some(poi.category.clone()),
             query: format!("{}, {locality}", poi.name),
             limit: Some(POI_CASE_LIMIT),
-            layer: None,
+            layer: Some(Layer::Poi.as_str().to_string()),
             expect: Some(ExpectedObject {
                 osm_type: poi.source.object_type,
                 osm_id: poi.source.object_id,
@@ -699,6 +711,9 @@ mod tests {
                 location_precision: LocationPrecision::Point,
                 source: SourceProvenance::osm(ObjectType::Node, object_id),
                 prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
             };
             writer.write(&poi.into(), context).expect("POI");
         }
@@ -749,7 +764,7 @@ mod tests {
             name: None,
             query: "Riverdale Farm, Toronto".to_string(),
             limit: Some(5),
-            layer: None,
+            layer: Some(Layer::Poi.as_str().to_string()),
             expect: Some(ExpectedObject {
                 osm_type: ObjectType::Way,
                 osm_id: 13,

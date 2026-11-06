@@ -41,12 +41,11 @@ use crate::{
         Accuracy, Address, Attribution, Common, Context, ContextArea, FeatureCollectionType,
         FeatureType, ForwardCollection, ForwardFeature, ForwardGeocoding, ForwardProperties,
         LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
-        ReverseProperties, Version,
+        ReverseProperties, Source, Version,
     },
     http::batch,
     limits::Limits,
-    record::{Layer, ObjectType},
-    records::Source,
+    record::{Brand, Layer, RoadClass},
     runtime::AppState,
 };
 
@@ -75,7 +74,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
          description = "Local server on the default address."),
     ),
     paths(
-        crate::runtime::search,
+        crate::runtime::places,
         crate::runtime::autocomplete,
         crate::runtime::geocode,
         crate::runtime::geocode_batch,
@@ -113,7 +112,8 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Context,
         ContextArea,
         Source,
-        ObjectType,
+        RoadClass,
+        Brand,
         // Only ever reached through a parameter, so it needs naming here or
         // it is left out of the components and the `$ref` dangles.
         Layer,
@@ -202,6 +202,9 @@ pub(crate) enum ErrorCode {
     /// The lookup ran past the server's lookup timeout and stopped. It takes
     /// as long the next time, so a retry does not help.
     Timeout,
+    /// The Pack was built before it held what the request needs, such as
+    /// the id catalogue `/places?ids=` reads. Rebuild the Pack.
+    PackOutdated,
 }
 
 // Mirrors [`crate::http::problem::InvalidParam`] for the schema.
@@ -227,6 +230,9 @@ pub(crate) struct GeocodeItem {
     /// Echoed in this item's result, to match it up.
     #[schema(example = "row-1", max_length = 128)]
     pub id: Option<String>,
+    /// The address as free text. Give `q` or `address`, not both.
+    #[schema(example = "10 King Street, Toronto", max_length = 256)]
+    pub q: Option<String>,
     /// The street address on its own: house number and street, without the
     /// town or postcode.
     #[schema(example = "10 King Street", min_length = 1, max_length = 256)]
@@ -262,6 +268,7 @@ pub(crate) struct ReverseItem {
     pub lon: Option<f64>,
     #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
     pub lat: Option<f64>,
+    pub layer: Option<Layer>,
 }
 
 /// A forward batch's answer: one result per item, in input order.
@@ -642,7 +649,7 @@ mod tests {
         let spec: Value =
             serde_json::from_str(&document(&Limits::DEFAULT).expect("spec")).expect("JSON");
 
-        for path in ["/search", "/autocomplete"] {
+        for path in ["/places", "/autocomplete"] {
             assert_eq!(
                 parameter(&spec, path, "q")["schema"]["maxLength"],
                 Value::from(MAX_QUERY_CHARS),
@@ -650,7 +657,7 @@ mod tests {
             );
         }
         assert_eq!(
-            parameter(&spec, "/search", "limit")["schema"]["maximum"],
+            parameter(&spec, "/places", "limit")["schema"]["maximum"],
             Value::from(MAX_SEARCH_LIMIT),
         );
         assert_eq!(
