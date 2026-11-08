@@ -107,6 +107,11 @@ enum Commands {
         /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
         shutdown_timeout: u64,
+
+        /// Serve Prometheus metrics at /metrics. Off by default: they show
+        /// the server's traffic to anyone who can reach the port.
+        #[arg(long)]
+        metrics: bool,
     },
 
     /// Check that a running server is ready: exit 0 if its /readyz answers
@@ -789,6 +794,7 @@ async fn main() -> Result<()> {
             job_dir,
             limits,
             shutdown_timeout,
+            metrics,
         } => {
             serve(ServeOptions {
                 pack,
@@ -798,6 +804,7 @@ async fn main() -> Result<()> {
                 job_dir,
                 limits,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
+                metrics,
             })
             .await?;
             Ok(())
