@@ -879,6 +879,8 @@ fn write_pack(dir: &PathBuf) {
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-79.0, 43.0),
                         source: SourceProvenance::osm(ObjectType::Relation, id),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 None,

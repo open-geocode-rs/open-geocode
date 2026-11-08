@@ -267,6 +267,8 @@ mod tests {
                         place_type: "town".to_string(),
                         geometry: point_geometry(lon, 43.0),
                         source: SourceProvenance::osm(ObjectType::Relation, i64::from(index) + 1),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 _ => AddressRecord {

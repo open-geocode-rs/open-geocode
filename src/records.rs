@@ -35,9 +35,9 @@
 //!                     before it, the street's own way first)
 //!                     (and category or place type) as a varint count and ids, and
 //!                     an address's areas follow its other fields the same way,
-//!                     then its street's postcodes; a POI's prominence follows
-//!                     its names as one byte, its importance as one byte
-//!                     and its Wikidata item as a varint (0 = none), its
+//!                     then its street's postcodes; a POI's or a place's
+//!                     prominence follows its names as one byte, its importance
+//!                     as one byte and its Wikidata item as a varint (0 = none), a POI's
 //!                     aliases (a varint count, then each OSM object's
 //!                     number << 2 | kind), its brand's string id + 1 (0 = none) and the brand's
 //!                     Wikidata item, then its address after a presence byte; a postcode's country follows its code as
@@ -119,7 +119,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 10;
+pub const RECORDS_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
@@ -854,6 +854,9 @@ impl Writer {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 put_u64(out, u64::from(self.strings.id(&record.place_type)?));
                 self.put_strings(out, &record.alt_names)?;
+                out.push(record.prominence.to_byte());
+                out.push(record.prominence.importance);
+                put_u64(out, record.wikidata.map_or(0, u64::from));
             }
         }
 
@@ -1247,6 +1250,11 @@ impl Reader {
                         name: self.string_field(header.strings, &mut fields)?.to_string(),
                         place_type: self.string_field(header.strings, &mut fields)?.to_string(),
                         alt_names: self.string_list(header.strings, &mut fields)?,
+                        prominence: Prominence::from_byte(
+                            get_u8(&mut fields)?,
+                            get_u8(&mut fields)?,
+                        ),
+                        wikidata: item_field(&mut fields)?,
                         geometry: geometry(&mut fields)?,
                         source: header.provenance(&self.datasets)?,
                     },
@@ -1379,16 +1387,43 @@ impl Reader {
         })
     }
 
-    /// A POI's prominence; none for the other layers. Reads no geometry.
+    /// A POI's or a place's prominence; none for the other layers. Reads no
+    /// geometry.
     pub fn prominence(&self, id: RecordId) -> Result<Option<Prominence>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
-        if header.layer != Layer::Poi {
-            return Ok(None);
+        match header.layer {
+            Layer::Poi => Ok(Some(
+                self.poi_fields(header.strings, &mut fields)?.prominence,
+            )),
+            layer if layer.place_layer().is_some() => {
+                Ok(Some(self.place_prominence(header.strings, &mut fields)?))
+            }
+            _ => Ok(None),
         }
-        Ok(Some(
-            self.poi_fields(header.strings, &mut fields)?.prominence,
-        ))
+    }
+
+    /// A POI's or a place's Wikidata item; none for the other layers or
+    /// when it has none. Reads no geometry.
+    pub fn wikidata(&self, id: RecordId) -> Result<Option<u32>> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        match header.layer {
+            Layer::Poi => Ok(self.poi_fields(header.strings, &mut fields)?.wikidata),
+            layer if layer.place_layer().is_some() => {
+                self.place_prominence(header.strings, &mut fields)?;
+                item_field(&mut fields)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A place's prominence, reading its fields up to it.
+    fn place_prominence(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<Prominence> {
+        get_u32(fields)?;
+        get_u32(fields)?;
+        self.string_list(strings, fields)?;
+        Ok(Prominence::from_byte(get_u8(fields)?, get_u8(fields)?))
     }
 
     /// A place's `place_type`; none for the other layers. Reads no geometry.
@@ -2002,9 +2037,8 @@ impl Reader {
                 country_field(fields)?;
             }
             _ => {
-                get_u32(fields)?;
-                get_u32(fields)?;
-                self.string_list(header.strings, fields)?;
+                self.place_prominence(header.strings, fields)?;
+                item_field(fields)?;
             }
         }
         Ok(())
@@ -2619,6 +2653,8 @@ mod tests {
                     place_type: "city".into(),
                     geometry: point_geometry(-79.0, 43.0),
                     source: SourceProvenance::osm(ObjectType::Relation, 3),
+                    prominence: Default::default(),
+                    wikidata: None,
                 },
             ));
         }
@@ -2630,6 +2666,12 @@ mod tests {
                 place_type: "derived_country:CA".into(),
                 geometry: point_geometry(-79.0, 43.0),
                 source: SourceProvenance::osm(ObjectType::Relation, 4),
+                prominence: Prominence {
+                    importance: 180,
+                    linked: true,
+                    languages: 120,
+                },
+                wikidata: Some(16),
             },
         ));
         records
@@ -2673,6 +2715,16 @@ mod tests {
             let point = summary.point.expect("point");
             assert_eq!((point.lon, point.lat), (-79.0, 43.0));
         }
+        let canada = records.len() as u64 - 1;
+        assert_eq!(
+            reader.prominence(canada).expect("prominence"),
+            Some(Prominence {
+                importance: 180,
+                linked: true,
+                languages: 120,
+            })
+        );
+        assert_eq!(reader.record_json(canada).expect("json")["wikidata"], "Q16");
         assert_eq!(
             reader.record_json(3).expect("interpolation")["anchor_ids"],
             json!(["osm:node:10", "osm:node:20"])

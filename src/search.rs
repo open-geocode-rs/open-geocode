@@ -50,9 +50,10 @@ use crate::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
         INTERPOLATION_END_FIELD, INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD,
         MIN_LAT_FIELD, MIN_LON_FIELD, NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M,
-        RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS, address_number_terms,
-        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
-        flat_number_term, is_numeric_token, open_text_index, street_search_text,
+        PROMINENCE_FIELD, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS,
+        address_number_terms, base_house_number, compact_postcode, expand_address_abbreviations,
+        expand_final_direction, flat_number_term, is_numeric_token, open_text_index,
+        street_search_text,
     },
     util::fold::{exact_key, replaced_characters, search_key},
 };
@@ -109,6 +110,7 @@ struct SegmentColumns {
     max_lat: Column<i64>,
     name_words: Column<u64>,
     place_rank: Column<u64>,
+    prominence: Column<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,6 +334,11 @@ const TYPO_PREFIX_CHARS: usize = 1;
 const MAX_TYPO_TERMS: usize = 32;
 // Wide enough that the best-known of many same-named places makes it.
 const NAMED_PLACES_WINDOW: usize = 200;
+/// Steps of [`Prominence::importance`] read as one level of fame: 15 is two
+/// doublings of page views. Places closer than that are about as well read,
+/// and what the query names them by decides (see
+/// [`TextSearcher::places_by_name`]).
+const FAME_TIER: u8 = 15;
 /// Stated house numbers read on each side of one that no record states: a
 /// few, so the nearest of the same parity can be found and the numbers of a
 /// same-named street elsewhere passed over.
@@ -420,6 +427,7 @@ impl TextSearcher {
                     max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
                     name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
                     place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
+                    prominence: fast_fields.u64(PROMINENCE_FIELD)?,
                 },
             );
         }
@@ -529,14 +537,9 @@ impl TextSearcher {
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
         // Name pass first: address reading scans planet-wide context postings
         // and adds nothing once names fill the limit.
-        let mut named = if self.places {
-            self.places_by_name(query_text, &filters, options.focus, limit)?
-        } else {
-            Vec::new()
-        };
+        let mut named = self.places_by_name(query_text, &filters, options.focus, limit)?;
         if named.len() >= limit {
             self.rate(&mut named);
-            named.truncate(limit);
             return Ok(named);
         }
         let (_, mut hits) = self.search_variants(
@@ -560,18 +563,40 @@ impl TextSearcher {
         // fully beats one that only repeats a street's words.
         if self.places {
             hits.sort_by_key(|hit| (hit.features.pass, hit.features.dropped_words));
-            if !named.is_empty() {
-                let mut seen = named
-                    .iter()
-                    .map(|hit| hit.record_id)
-                    .collect::<HashSet<_>>();
-                hits.retain(|hit| seen.insert(hit.record_id));
-                hits.splice(0..0, named);
-            }
         }
+        if !named.is_empty() {
+            let mut seen = named
+                .iter()
+                .map(|hit| hit.record_id)
+                .collect::<HashSet<_>>();
+            hits.retain(|hit| seen.insert(hit.record_id));
+            hits.splice(0..0, named);
+        }
+        self.one_per_item(&mut hits, limit)?;
         self.rate(&mut hits);
-        hits.truncate(limit);
         Ok(hits)
+    }
+
+    /// `hits` with each Wikidata item once, at its best place, cut to
+    /// `limit`: one place mapped twice, as a node and a boundary, is one
+    /// answer.
+    fn one_per_item(&self, hits: &mut Vec<TextSearchHit>, limit: usize) -> Result<()> {
+        let records = self.pack.records();
+        let mut items = HashSet::new();
+        let mut kept = 0;
+        let mut keep = Vec::with_capacity(hits.len());
+        for hit in hits.iter() {
+            let first = kept < limit
+                && match records.wikidata(hit.record_id)? {
+                    Some(item) => items.insert(item),
+                    None => true,
+                };
+            kept += usize::from(first);
+            keep.push(first);
+        }
+        let mut keep = keep.into_iter();
+        hits.retain(|_| keep.next().unwrap_or(false));
+        Ok(())
     }
 
     /// The answers [`Self::search`] gives without a ranker, and every hit
@@ -5222,27 +5247,72 @@ impl TextSearcher {
             focus,
             ..Ranking::default()
         };
+        // Collected by fame, not text score: BM25 scores a name field down
+        // for its length, and the best known places carry the most names
+        // (Roma's own and its "Rome", "Rom", "Rzym" ...), so by text score
+        // every small Rome would fill the window first.
         let window = limit.max(NAMED_PLACES_WINDOW);
-        let mut hits =
-            self.ranked_hits(&BooleanQuery::new(clauses), &ranking, window, &mut |hit| {
-                Ok(filters.admit(hit))
-            })?;
+        let searcher = self.reader.searcher();
+        let docs = searcher.search(
+            &BooleanQuery::new(clauses),
+            &TopDocs::with_limit(window).tweak_score(FameKeys {
+                columns: &self.columns,
+                focus,
+            }),
+        )?;
+        let top_docs = docs
+            .into_iter()
+            .map(|((_, _, text_score), doc)| (RankKey::text(text_score), doc))
+            .collect();
+        let mut hits = self.rank_documents(&searcher, top_docs, &ranking, window, &mut |hit| {
+            Ok(filters.admit(hit))
+        })?;
         let records = self.pack.records();
         let mut order = HashMap::new();
         for hit in &hits {
-            // Exact name, own or alternate ("AMS"), before a name holding the words.
-            let exact = records
-                .names(hit.record_id)?
-                .iter()
-                .any(|name| search_key(name).as_deref() == Some(key.as_str()));
-            let known = records.prominence(hit.record_id)?.unwrap_or_default();
+            // Exact name, own or alternate ("AMS", "Rome" of Roma), before a
+            // name holding the words; then nearer the caller, so fame never
+            // outranks the caller's own surroundings; then better known. Of
+            // places about as well read, the one the query names by its own
+            // name: "Lagos" is the city, not Laos, which one language spells
+            // so and which is read a little more.
+            let names = records.names(hit.record_id)?;
+            let named = |name: &String| search_key(name).as_deref() == Some(key.as_str());
+            let exact = names.iter().any(named);
+            let own = names.first().is_some_and(named);
+            let band = focus
+                .zip(hit.record.point)
+                .map_or(0, |([lon, lat], point)| {
+                    focus_band(haversine_m(lon, lat, point.lon, point.lat))
+                });
+            let known = records.prominence(hit.record_id)?;
+            let fame = known.unwrap_or_default();
             order.insert(
                 hit.record_id,
-                (std::cmp::Reverse(exact), std::cmp::Reverse(known)),
+                (
+                    std::cmp::Reverse(exact),
+                    band,
+                    std::cmp::Reverse(fame.importance / FAME_TIER),
+                    std::cmp::Reverse(own),
+                    std::cmp::Reverse(fame),
+                    known.is_some(),
+                ),
             );
         }
-        hits.sort_by_key(|hit| order[&hit.record_id]);
-        hits.truncate(limit);
+        hits.sort_by_key(|hit| {
+            let (exact, band, tier, own, fame, _) = order[&hit.record_id];
+            (exact, band, tier, own, fame)
+        });
+        // Address product: only a place named the query takes the lead, as
+        // only places carry fame; a street or an address of the name keeps
+        // the place the address reading gives it.
+        if !self.places {
+            hits.retain(|hit| {
+                let (exact, _, _, _, _, known) = order[&hit.record_id];
+                exact.0 && known
+            });
+        }
+        self.one_per_item(&mut hits, limit)?;
         Ok(hits)
     }
 
@@ -5281,8 +5351,20 @@ impl TextSearcher {
         if tie(&scored, window) && window < TIE_WINDOW {
             scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
         }
-        let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
-        top_docs.truncate(window);
+        // A run past the tie window keeps an arbitrary part of it ("Paris"),
+        // so every match is keyed: no skipping, paid by such runs alone.
+        let top_docs = if tie(&scored, TIE_WINDOW) {
+            let keys = RankKeys {
+                ranking,
+                columns: &self.columns,
+                pack: &self.pack,
+            };
+            searcher.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
+        } else {
+            let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
+            top_docs.truncate(window);
+            top_docs
+        };
         self.rank_documents(&searcher, top_docs, ranking, limit, accept)
     }
 
@@ -5436,7 +5518,7 @@ impl TextSearcher {
                     inexact_query_words: small(tie.inexact_query_words),
                     focus_band: tie.focus_band,
                     precision: tie.precision,
-                    poi: tie.poi.is_some(),
+                    poi: hit.record.layer == Layer::Poi.as_str(),
                     demoted,
                     window_rank: rank.min(usize::from(u16::MAX)) as u16,
                     ..Signals::default()
@@ -6155,6 +6237,11 @@ struct RankKey {
     /// Road", "Queen Street" before "Upper Queen Street"). [`TieBreak`]
     /// asks the same of the hits.
     name_words: u8,
+    /// See [`Prominence::rank`], larger better known; 0 for an address or
+    /// a street. Before the size of a place: Salzburg the city is better
+    /// known than the state, Paris in France than Paris in Benin, though
+    /// both are cities.
+    prominence: u64,
     /// See [`place_rank`], smaller larger; [`u8::MAX`] for a record that is
     /// no place.
     place_rank: u8,
@@ -6175,6 +6262,7 @@ impl RankKey {
             stated: true,
             text_score,
             name_words: u8::MAX,
+            prominence: 0,
             place_rank: u8::MAX,
             nearness: 0,
         }
@@ -6202,11 +6290,18 @@ impl RankKey {
 impl PartialOrd for RankKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp_evidence(other).then_with(|| {
-            (other.name_words, other.place_rank, self.nearness).cmp(&(
-                self.name_words,
-                self.place_rank,
-                other.nearness,
-            ))
+            (
+                other.name_words,
+                self.prominence,
+                other.place_rank,
+                self.nearness,
+            )
+                .cmp(&(
+                    self.name_words,
+                    other.prominence,
+                    self.place_rank,
+                    other.nearness,
+                ))
         }))
     }
 }
@@ -6282,6 +6377,7 @@ struct SegmentRankKeys {
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     name_words: Column<u64>,
+    prominence: Column<u64>,
     place_rank: Column<u64>,
     postcode: Option<SegmentPostcodes>,
     focus: Option<SegmentFocus>,
@@ -6388,6 +6484,49 @@ impl PostcodeNearness {
     }
 }
 
+/// Collects the documents a name query matches nearest the caller's focus
+/// first, then best known, whatever their text score (see
+/// [`TextSearcher::places_by_name`]).
+struct FameKeys<'a> {
+    columns: &'a HashMap<SegmentId, SegmentColumns>,
+    focus: Option<[f64; 2]>,
+}
+
+struct SegmentFameKeys {
+    prominence: Column<u64>,
+    focus: Option<SegmentFocus>,
+}
+
+impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
+    type Child = SegmentFameKeys;
+
+    fn segment_tweaker(&self, segment: &SegmentReader) -> tantivy::Result<SegmentFameKeys> {
+        let columns = self.columns.get(&segment.segment_id()).ok_or_else(|| {
+            tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
+        })?;
+        Ok(SegmentFameKeys {
+            prominence: columns.prominence.clone(),
+            focus: self.focus.map(|focus| SegmentFocus {
+                focus,
+                min_lon: columns.min_lon.clone(),
+                min_lat: columns.min_lat.clone(),
+                max_lon: columns.max_lon.clone(),
+                max_lat: columns.max_lat.clone(),
+            }),
+        })
+    }
+}
+
+impl ScoreSegmentTweaker<(u8, u64, Score)> for SegmentFameKeys {
+    fn score(&mut self, doc: DocId, text_score: Score) -> (u8, u64, Score) {
+        (
+            self.focus.as_ref().map_or(0, |focus| focus.nearness(doc)),
+            self.prominence.first(doc).unwrap_or_default(),
+            text_score,
+        )
+    }
+}
+
 impl ScoreTweaker<RankKey> for RankKeys<'_> {
     type Child = SegmentRankKeys;
 
@@ -6419,6 +6558,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
+            prominence: columns.prominence.clone(),
             place_rank: columns.place_rank.clone(),
             postcode,
             focus: self.ranking.focus.map(|focus| SegmentFocus {
@@ -6440,6 +6580,7 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         let small =
             |value: Option<u64>| value.map_or(u8::MAX, |value| value.min(u64::from(u8::MAX)) as u8);
         key.name_words = small(self.name_words.first(doc));
+        key.prominence = self.prominence.first(doc).unwrap_or_default();
         key.place_rank = small(self.place_rank.first(doc));
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
@@ -6485,6 +6626,10 @@ struct TieBreak {
     /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
     /// finds, and one that writes "Taupo" for Taupo first.
     inexact_query_words: usize,
+    /// Better known places first (see [`Prominence`]), before their size:
+    /// "Paris" is the one in France before the one in Benin, both cities.
+    /// Every record but a place ties on it.
+    fame: std::cmp::Reverse<Prominence>,
     /// Larger places first (see [`place_rank`]), then every other record:
     /// "Richmond" is the town before a locality of that name. Only a tie on
     /// the words and the areas a query states reaches it, so a size prior
@@ -6501,10 +6646,10 @@ struct TieBreak {
     /// [`AddressRecord::disputed`]).
     disputed: bool,
     /// Every other record before a POI, then the POI its OSM tags show
-    /// better known first: linked to Wikidata or Wikipedia, then named in
-    /// more languages (see [`Prominence`]). Only POIs that tie on all the
-    /// query states and on the caller's focus reach it. It is no measure of
-    /// an address or a place, so `None` keeps it from ever ordering one
+    /// better known first: read more, linked to Wikidata or Wikipedia, then
+    /// named in more languages (see [`Prominence`]). Only POIs that tie on
+    /// all the query states and on the caller's focus reach it. It is no
+    /// measure of an address, so `None` keeps it from ever ordering one
     /// against a POI by prominence; at so full a tie an address before a
     /// POI is what [`TextSearcher::demoted`] says anyway.
     poi: Option<std::cmp::Reverse<Prominence>>,
@@ -6591,10 +6736,19 @@ impl TieBreak {
             extra_name_words,
             missing_query_words,
             inexact_query_words,
+            fame: std::cmp::Reverse(
+                prior
+                    .prominence
+                    .filter(|_| record.layer != Layer::Poi.as_str())
+                    .unwrap_or_default(),
+            ),
             place_rank: prior.place_rank.unwrap_or(u8::MAX),
             focus_band,
             disputed: prior.disputed,
-            poi: prior.prominence.map(std::cmp::Reverse),
+            poi: prior
+                .prominence
+                .filter(|_| record.layer == Layer::Poi.as_str())
+                .map(std::cmp::Reverse),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
@@ -6607,7 +6761,7 @@ impl TieBreak {
 struct Prior {
     /// See [`place_rank`].
     place_rank: Option<u8>,
-    /// A POI's, `None` for the other layers.
+    /// A POI's or a place's, `None` for the other layers.
     prominence: Option<Prominence>,
     disputed: bool,
 }
@@ -9147,6 +9301,8 @@ mod tests {
                             place_type: place_type.to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Node, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -9195,6 +9351,8 @@ mod tests {
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -9753,6 +9911,8 @@ mod tests {
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Node, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -9819,6 +9979,8 @@ mod tests {
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-79.5, 45.1),
                         source: SourceProvenance::osm(ObjectType::Relation, 1),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 None,
@@ -9982,6 +10144,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// More records of one name than the tie window holds: the best known
+    /// place or POI is collected and ranked first, wherever it lies in the
+    /// index.
+    #[test]
+    fn the_best_known_of_many_same_named_places_wins() {
+        let temp_dir = temp_pack_path("search-place-prominence");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let known = Prominence {
+            importance: 160,
+            linked: true,
+            languages: 100,
+        };
+        let city = |object_id, prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Paris".to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(2.35, 48.86),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence,
+                    wikidata: None,
+                },
+            )
+        };
+        let cafe = |object_id, prominence| {
+            Record::from(PoiRecord {
+                alt_names: Vec::new(),
+                name: "Paris".to_string(),
+                category: "amenity:cafe".to_string(),
+                address: None,
+                geometry: point_geometry(-79.0, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, object_id),
+                prominence,
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
+            })
+        };
+        writer
+            .write(&city(1, Prominence::default()), None)
+            .expect("benin");
+        // More streets and cafes of the name than the tie window holds, all
+        // scoring as the cities and the known cafe do.
+        for id in 2..=(TIE_WINDOW as i64 + 100) {
+            writer
+                .write(
+                    &street_record(&format!("osm:way:{id}"), "Paris").into(),
+                    None,
+                )
+                .expect("street");
+            writer
+                .write(&cafe(id, Prominence::default()), None)
+                .expect("cafe");
+        }
+        writer.write(&city(9_999, known), None).expect("france");
+        writer.write(&cafe(9_998, known), None).expect("known cafe");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            top_ids(&searcher, "Paris")[..2],
+            ["osm:node:9999", "osm:node:1"]
+        );
+        assert_eq!(top_ids(&searcher.places(), "Paris")[0], "osm:node:9998");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A place the query names by any of its names leads, nearest the
+    /// caller first, then best known, then, of places about as well read,
+    /// the one it names by its own name; a place mapped twice answers once,
+    /// and a street of the name never takes the lead for fame it has none of.
+    #[test]
+    fn a_place_named_by_any_of_its_names_leads_by_fame() {
+        let pack = TempPack::new("search-place-any-name");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let fame = |importance| Prominence {
+            importance,
+            linked: true,
+            languages: 10,
+        };
+        let place = |object: (ObjectType, i64),
+                     name: &str,
+                     alt_names: &[&str],
+                     [lon, lat]: [f64; 2],
+                     importance,
+                     wikidata| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: alt_names.iter().map(|name| name.to_string()).collect(),
+                    name: name.to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(object.0, object.1),
+                    prominence: fame(importance),
+                    wikidata,
+                },
+            )
+        };
+        let roma = [12.48, 41.89];
+        let georgia = [-85.16, 34.26];
+        for record in [
+            place(
+                (ObjectType::Node, 1),
+                "Roma",
+                &["Rome", "Rom"],
+                roma,
+                160,
+                Some(220),
+            ),
+            place(
+                (ObjectType::Relation, 2),
+                "Roma",
+                &["Rome"],
+                roma,
+                160,
+                Some(220),
+            ),
+            place((ObjectType::Node, 3), "Rome", &[], georgia, 60, None),
+            place(
+                (ObjectType::Node, 5),
+                "Lagos",
+                &[],
+                [3.39, 6.46],
+                154,
+                Some(8673),
+            ),
+            place(
+                (ObjectType::Node, 6),
+                "Laos",
+                &["Lagos"],
+                [103.4, 20.0],
+                163,
+                Some(819),
+            ),
+            Record::from(street_record("osm:way:4", "Rome")),
+        ] {
+            writer.write(&record, None).expect("record");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        assert_eq!(
+            top_ids(&searcher, "Rome")[..2],
+            ["osm:node:1", "osm:node:3"]
+        );
+        assert_eq!(top_ids_limited(&searcher, "Rome", 1), ["osm:node:1"]);
+        assert_eq!(top_ids(&searcher, "Lagos"), ["osm:node:5", "osm:node:6"]);
+        let near = searcher
+            .search(&TextSearchOptions {
+                query: "Rome".to_string(),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+                focus: Some(georgia),
+                bbox: None,
+            })
+            .expect("search");
+        assert_eq!(
+            near.iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["osm:node:3"]
+        );
+    }
+
+    /// On /places too a POI mapped twice with one Wikidata item, as a node
+    /// and a way, answers once, and an alternate name finds it.
+    #[test]
+    fn a_poi_mapped_twice_answers_once() {
+        let pack = TempPack::new("search-poi-one-item");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let colosseo = |object_type, object_id, wikidata| {
+            Record::from(PoiRecord {
+                alt_names: vec!["Colosseum".to_string()],
+                name: "Colosseo".to_string(),
+                category: "tourism:attraction".to_string(),
+                address: None,
+                geometry: point_geometry(12.49, 41.89),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(object_type, object_id),
+                prominence: Prominence {
+                    importance: 150,
+                    linked: true,
+                    languages: 50,
+                },
+                wikidata,
+                brand: None,
+                aliases: Vec::new(),
+            })
+        };
+        for record in [
+            colosseo(ObjectType::Node, 1, Some(10285)),
+            colosseo(ObjectType::Way, 2, Some(10285)),
+            colosseo(ObjectType::Node, 3, None),
+        ] {
+            writer.write(&record, None).expect("poi");
+        }
+        writer.finish().expect("finish");
+        let places = TextSearcher::open(&pack.0).expect("searcher").places();
+        assert_eq!(top_ids(&places, "Colosseum"), ["osm:node:1", "osm:node:3"]);
+    }
+
     /// Two cafes of one name the query cannot tell apart: the one its tags
     /// show better known first, never ahead of an address it ties with.
     #[test]
@@ -10044,7 +10412,10 @@ mod tests {
             &Ranking::default(),
         );
         let known = TieBreak::new(
-            &street_summary(),
+            &Summary {
+                layer: Layer::Poi.as_str().to_string(),
+                ..street_summary()
+            },
             Prior {
                 place_rank: None,
                 prominence: Some(Prominence {
@@ -10862,6 +11233,8 @@ mod tests {
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -11749,6 +12122,8 @@ mod tests {
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-81.4, 43.5),
                         source: SourceProvenance::osm(ObjectType::Relation, 1),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 None,
@@ -11825,6 +12200,8 @@ mod tests {
                             place_type: "boundary".to_string(),
                             geometry: point_geometry(174.7, -36.8),
                             source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -11986,6 +12363,8 @@ mod tests {
                         place_type: "boundary".to_string(),
                         geometry: point_geometry(lon, lat),
                         source: SourceProvenance::osm(object_type, object_id),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 context,
@@ -13136,6 +13515,24 @@ mod tests {
         assert!(!LAST_STRUCTURED.with(Cell::get).answered);
         assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A temporary Pack directory, removed when it goes out of scope, a
+    /// failed assertion included.
+    struct TempPack(std::path::PathBuf);
+
+    impl TempPack {
+        fn new(name: &str) -> Self {
+            let path = temp_pack_path(name);
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempPack {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn temp_pack_path(name: &str) -> std::path::PathBuf {

@@ -16,8 +16,8 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance,
-        point_geometry,
+        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
+        SourceProvenance, point_geometry,
     },
     util::text::normalize_for_compare,
 };
@@ -27,11 +27,12 @@ use super::{
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
     poi::{PoiCandidate, outline},
-    tags::{OsmTags, alternate_names, name_tags},
+    tags::{OsmTags, alternate_names, item, name_tags, prominence},
 };
 
-/// Tags a boundary keeps after the scan besides its names.
-const BOUNDARY_TAG_KEYS: [&str; 8] = [
+/// Tags a boundary keeps after the scan besides its names. Its Wikidata
+/// and Wikipedia links rank it (see [`prominence`]).
+const BOUNDARY_TAG_KEYS: [&str; 10] = [
     "ISO3166-1:alpha2",
     "ISO3166-1:alpha3",
     "ISO3166-2",
@@ -40,6 +41,8 @@ const BOUNDARY_TAG_KEYS: [&str; 8] = [
     "country_code",
     "designation",
     "place",
+    "wikidata",
+    "wikipedia",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +135,8 @@ struct BuiltBoundary {
     place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
+    prominence: Prominence,
+    wikidata: Option<u32>,
     /// The layer its `place` tag names, if any (`place=city` is a locality).
     place_layer: Option<PlaceLayer>,
     /// Its `designation` tag (`unitary_authority`), which libpostal's table
@@ -384,6 +389,8 @@ impl BoundarySet {
                             candidate.source_object_type,
                             candidate.source_object_id,
                         ),
+                        prominence: boundary.prominence,
+                        wikidata: boundary.wikidata,
                     },
                 ),
             ));
@@ -738,6 +745,8 @@ fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, Pla
                     candidate.source_object_type,
                     candidate.source_object_id,
                 ),
+                prominence: Prominence::default(),
+                wikidata: None,
             },
         );
     }
@@ -884,6 +893,8 @@ fn built(
             place_type,
             name,
             alt_names,
+            prominence: prominence(tags),
+            wikidata: item(tags, "wikidata"),
             place_layer,
             designation,
             inferred_country_code: country_code_from_tags(tags, layer),
@@ -1737,6 +1748,9 @@ impl crate::extsort::Spill for SetItem {
                 for name in &boundary.alt_names {
                     put_str(out, name);
                 }
+                out.push(boundary.prominence.to_byte());
+                out.push(boundary.prominence.importance);
+                put_u64(out, boundary.wikidata.map_or(0, u64::from));
                 out.push(boundary.place_layer.map_or(u8::MAX, |layer| layer as u8));
                 put_opt_str(out, boundary.designation.as_deref());
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
@@ -1788,6 +1802,14 @@ impl crate::extsort::Spill for SetItem {
                 let alt_names = (0..get_u64(input)?)
                     .map(|_| get_string(input))
                     .collect::<crate::error::Result<Vec<_>>>()?;
+                let prominence = Prominence::from_byte(get_u8(input)?, get_u8(input)?);
+                let wikidata = match get_u64(input)? {
+                    0 => None,
+                    item => Some(
+                        u32::try_from(item)
+                            .map_err(|_| Error::Decode("Wikidata item is out of range"))?,
+                    ),
+                };
                 let place_layer = match get_u8(input)? {
                     u8::MAX => None,
                     code => Some(layer(code)?),
@@ -1813,6 +1835,8 @@ impl crate::extsort::Spill for SetItem {
                         place_type,
                         name,
                         alt_names,
+                        prominence,
+                        wikidata,
                         place_layer,
                         designation,
                         inferred_country_code,
@@ -2015,6 +2039,8 @@ mod tests {
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
             area: geometry.unsigned_area(),
+            prominence: Default::default(),
+            wikidata: None,
         }
     }
 
@@ -2378,6 +2404,8 @@ mod tests {
                     shape,
                     bounds,
                     area,
+                    prominence: Default::default(),
+                    wikidata: None,
                 },
             });
         }
@@ -2467,13 +2495,18 @@ mod tests {
             ),
             (3, None),
         ]);
+        // As the scan keeps them, so a tag it drops is missed here too.
         let tags = |name: &str, iso: &str| {
-            BTreeMap::from([
+            boundary_tags(&BTreeMap::from([
                 ("boundary".to_string(), "administrative".to_string()),
                 ("admin_level".to_string(), "4".to_string()),
                 ("name".to_string(), name.to_string()),
+                ("name:fr".to_string(), name.to_string()),
                 ("ISO3166-2".to_string(), iso.to_string()),
-            ])
+                ("wikidata".to_string(), "Q1904".to_string()),
+                ("wikipedia".to_string(), format!("en:{name}")),
+                ("source".to_string(), "survey".to_string()),
+            ]))
         };
         let members = |ids: &[i64]| {
             ids.iter()
@@ -2515,6 +2548,18 @@ mod tests {
         assert_eq!(places[0].1.label(), "Canada");
         assert_eq!(places[1].0, ContextOrigin::Boundary(0));
         assert_eq!(places[1].1.id(), "osm:relation:100");
+        let Record::Place(_, ontario) = &places[1].1 else {
+            panic!("a boundary is a place");
+        };
+        assert_eq!(ontario.wikidata, Some(1904));
+        assert_eq!(
+            ontario.prominence,
+            Prominence {
+                importance: 0,
+                linked: true,
+                languages: 1,
+            }
+        );
         assert_eq!(report.accepted.place_nodes, 2);
 
         let index = set.into_index(&[5], &HashMap::from([("CA".to_string(), 4)]));
