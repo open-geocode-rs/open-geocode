@@ -1155,7 +1155,7 @@ impl Run {
             let mut groups = HashMap::<String, (K, Q, Vec<RowIn>)>::new();
             for (index, cells, item) in window {
                 let prepared = match item {
-                    Ok(item) => batch::prepare(lookup, &self.shared, item),
+                    Ok(item) => batch::prepare(&self.state, lookup, &self.shared, item),
                     Err(problem) => Prepared::Failed { id: None, problem },
                 };
                 match prepared {

@@ -3,19 +3,19 @@
     {
       "geometry": {
         "coordinates": [
-          -79.01,
-          43.0005
+          -79.0,
+          43.0
         ],
         "type": "Point"
       },
       "properties": {
-        "accuracy": "interpolated",
+        "accuracy": "rooftop",
         "address": {
-          "housenumber": "50",
-          "locality": "Toronto",
-          "street": "Queen Street"
+          "housenumber": "10",
+          "postcode": "M5V 1A1",
+          "street": "King Street"
         },
-        "confidence": 0.95257413,
+        "confidence": 0.975873,
         "context": {
           "country": {
             "id": "osm:relation:1",
@@ -30,24 +30,27 @@
             "name": "Ontario"
           }
         },
-        "id": "osm:way:13:interp:2-98",
-        "label": "50 Queen Street, Toronto",
-        "layer": "interpolation",
-        "name": "50 Queen Street",
-        "record_id": 6,
+        "id": "osm:node:10",
+        "label": "10 King Street, M5V 1A1",
+        "layer": "address",
+        "name": "10 King Street",
         "score": 0.0,
         "source": {
-          "dataset": "osm",
-          "object_id": 13,
-          "object_type": "way"
+          "dataset": "osm"
         }
       },
       "type": "Feature"
     }
   ],
   "geocoding": {
-    "attribution": "© OpenStreetMap contributors, ODbL",
-    "query": "50 Queen Street",
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
+    "query": "10 King Street",
     "version": "1"
   },
   "type": "FeatureCollection"

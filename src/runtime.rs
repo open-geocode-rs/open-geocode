@@ -30,17 +30,23 @@ use crate::{
         bounds, health,
         jobs::{self, JobStore},
         method, openapi,
+        param::Param,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
         shutdown::shutdown_signal,
         version,
     },
+    ids::{self, Catalogue},
+    labels,
     limits::Limits,
     pack::Reader,
-    record::Layer,
+    record::{Layer, ObjectType},
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
-    search::{AddressGeocodeOptions, TextAutocompleteOptions, TextSearchOptions, TextSearcher},
+    search::{
+        AddressGeocodeOptions, TextAutocompleteOptions, TextSearchHit, TextSearchOptions,
+        TextSearcher, mix_suggestions,
+    },
     stop::{self, CancelOnDrop, Stop},
     util::hilbert::hilbert_key,
 };
@@ -74,6 +80,9 @@ pub struct ServeOptions {
 pub(crate) struct AppState {
     pack: Arc<Reader>,
     searcher: Arc<TextSearcher>,
+    places: Arc<TextSearcher>,
+    /// `None` for a Pack built before the catalogue.
+    catalogue: Option<Arc<Catalogue>>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
     /// Cancelled once the server starts to stop.
@@ -101,6 +110,7 @@ impl AppState {
             .advise_random_reads(resources.available_memory_bytes);
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
+        let catalogue = Catalogue::open(pack.container())?;
         // Every CPU, at low priority: batches and jobs take all the CPU
         // single lookups leave idle, and a single lookup never waits for a
         // core.
@@ -112,6 +122,8 @@ impl AppState {
             .map_err(std::io::Error::other)?;
         Ok(Self {
             pack,
+            places: Arc::new(searcher.places()),
+            catalogue,
             searcher: Arc::new(searcher),
             reverse_geocoder: Arc::new(reverse_geocoder),
             ready: Arc::new(AtomicBool::new(true)),
@@ -173,24 +185,36 @@ impl AppState {
     }
 }
 
-/// `/search` and `/autocomplete` take the same parameters. They differ only in
-/// how `q` is bounded, which the handlers do: `/search` requires it, and
-/// `/autocomplete` answers an empty query with no suggestions.
+/// `/places`: places by name in `q`, or by id in `ids`.
 #[derive(Debug, Deserialize)]
-pub(crate) struct SearchParams {
-    q: Option<String>,
+pub(crate) struct PlacesParams {
+    q: Param,
+    /// Comma-separated stable ids, such as `osm:node:123`.
+    ids: Param,
+    #[serde(default)]
+    limit: usize,
+    country: Param,
+    focus: Param,
+    bbox: Param,
+}
+
+/// `/autocomplete`: unlike `/places`, an empty `q` answers no suggestions
+/// rather than an error, as a user who cleared the box expects.
+#[derive(Debug, Deserialize)]
+pub(crate) struct AutocompleteParams {
+    q: Param,
     #[serde(default)]
     limit: usize,
     /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
-    country: Option<String>,
+    country: Param,
     /// Left as a string here and parsed by [`parse_layer`], so an unknown
     /// layer is a 400 naming the valid ones rather than a serde rejection
     /// reading `unknown variant`.
-    layer: Option<String>,
+    layer: Param,
     /// `lon,lat`; see [`bounds::parse_focus`].
-    focus: Option<String>,
+    focus: Param,
     /// `min_lon,min_lat,max_lon,max_lat`; see [`bounds::parse_bbox`].
-    bbox: Option<String>,
+    bbox: Param,
 }
 
 /// Resolve the `layer` filter, rejecting a layer that does not exist.
@@ -199,11 +223,12 @@ pub(crate) struct SearchParams {
 /// matches nothing: a typo would look exactly like "no results here", and a
 /// client could not tell the two apart.
 ///
-/// An empty or whitespace-only value means "no filter", which is what a form
-/// that always sends the key produces.
-fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
-    let Some(value) = layer.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
+/// An empty value means "no filter", which is what a form that always sends
+/// the key produces.
+fn parse_layer(layer: &Param) -> Result<Option<Layer>, Problem> {
+    let value = match layer {
+        Param::Missing | Param::Empty => return Ok(None),
+        Param::Value(value) => value.trim(),
     };
     Layer::parse(value).map(Some).ok_or_else(|| {
         let valid = Layer::ALL
@@ -228,11 +253,12 @@ fn parse_layer(layer: Option<&str>) -> Result<Option<Layer>, Problem> {
 /// here". A country the Pack does not cover is *not* rejected, because it is
 /// a legitimate empty answer.
 ///
-/// An empty or whitespace-only value means "no filter", which is what a form
-/// that always sends the key produces.
-fn parse_countries(country: Option<&str>) -> Result<Vec<String>, Problem> {
-    let Some(value) = country.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(Vec::new());
+/// An empty value means "no filter", which is what a form that always sends
+/// the key produces.
+fn parse_countries(country: &Param) -> Result<Vec<String>, Problem> {
+    let value = match country {
+        Param::Missing | Param::Empty => return Ok(Vec::new()),
+        Param::Value(value) => value.trim(),
     };
     let mut codes = Vec::new();
     for part in value
@@ -254,24 +280,33 @@ fn parse_countries(country: Option<&str>) -> Result<Vec<String>, Problem> {
     Ok(codes)
 }
 
-/// `/geocode`: an address whose parts the caller already has apart.
+/// `/geocode`: an address as free text in `q`, or one whose parts the
+/// caller already has apart.
 #[derive(Debug, Deserialize)]
 pub(crate) struct GeocodeParams {
-    address: Option<String>,
-    locality: Option<String>,
-    region: Option<String>,
-    postcode: Option<String>,
+    q: Param,
+    /// `lon,lat`, with `q` only; see [`bounds::parse_focus`].
+    focus: Param,
+    /// `min_lon,min_lat,max_lon,max_lat`, with `q` only; see
+    /// [`bounds::parse_bbox`].
+    bbox: Param,
+    address: Param,
+    locality: Param,
+    region: Param,
+    postcode: Param,
     #[serde(default)]
     limit: usize,
-    layer: Option<String>,
+    layer: Param,
     /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
-    country: Option<String>,
+    country: Param,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct ReverseParams {
     lon: f64,
     lat: f64,
+    /// See [`parse_layer`].
+    layer: Param,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -360,7 +395,7 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
     // returns 405. Other methods fall through to a 405.
     let max_body = state.limits().max_batch_body_bytes();
     let mut app: Router<AppState> = Router::new()
-        .route("/search", get_only(search))
+        .route("/places", batchable(places, places_batch, max_body))
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", batchable(geocode, geocode_batch, max_body))
         .route("/reverse", batchable(reverse, reverse_batch, max_body))
@@ -524,96 +559,308 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
     Problem::unparsable_parameters()
 }
 
-/// Search addresses
+/// Search places
 ///
-/// Geocodes free-form text, such as a full address, to coordinates. Results
-/// are sorted by `score`, highest first.
+/// Finds places (POIs) by name, such as a museum, a station or a shop, and
+/// the words of where they are, in `q`. Results are sorted by `score`,
+/// highest first. Addresses, streets and areas are `/geocode`'s.
+///
+/// Or finds places and areas by their stable ids in `ids`, such as
+/// `osm:node:1383955044` from a shared link, a saved place or a map tile.
+/// Results come in the order asked; an id no record has is left out.
 #[utoipa::path(
     get,
-    path = "/search",
+    path = "/places",
     tag = "Geocoding",
     params(
-        ("q" = String, Query,
-         description = "Text to geocode, such as a full address.",
-         example = "10 King Street, Toronto",
-         min_length = 1, max_length = 256),
+        ("q" = Option<String>, Query,
+         description = "Name of the place, with where it is when known. Give `q` \
+                        or `ids`, not both; one sent empty counts as given.",
+         example = "Rijksmuseum Amsterdam",
+         max_length = 256),
+        ("ids" = Option<String>, Query,
+         description = "Comma-separated stable ids of places, areas or streets, at \
+                        most the server's batch item limit (1000 by default), such \
+                        as `osm:node:1383955044,osm:way:4`. A street answers to \
+                        the id of any of its ways; when a place and a street \
+                        share an id, the place answers.",
+         example = "osm:node:1383955044"),
         ("limit" = Option<usize>, Query,
          description = "Maximum number of results. `0`, the default, lets the \
                         server choose.",
          minimum = 0, maximum = 50),
-        ("layer" = Option<Layer>, Query,
-         description = "Return only results of this layer. An unknown layer \
-                        returns `400`."),
         ("country" = Option<String>, Query,
          description = "Return only results in these countries, as comma-separated \
                         ISO 3166-1 alpha-2 codes. A code that is not two letters \
                         returns `400`. A code the Pack does not cover returns no \
                         results.",
-         example = "NZ,AU"),
+         example = "NL"),
         ("focus" = Option<String>, Query,
          description = "Point to prefer results near, as `lon,lat`. Breaks ties \
                         between equally good matches only.",
-         example = "-79.38,43.65"),
+         example = "4.88,52.36"),
         ("bbox" = Option<String>, Query,
          description = "Return only results inside this box, as \
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
-         example = "-79.64,43.58,-79.12,43.86"),
+         example = "4.73,52.28,5.07,52.43"),
     ),
     responses(
-        (status = 200, description = "Matching results, highest `score` first.",
+        (status = 200, description = "Matching places, highest `score` first.",
          body = ForwardCollection),
-        (status = 400, description = "`q` is empty or too long, `limit` is too \
-                                      large, `focus` or `bbox` is out of range, \
-                                      or a parameter is malformed.",
+        (status = 400, description = "Neither `q` nor `ids` is given, or both \
+                                      are, `q` is empty or too long, `limit` is \
+                                      too large, `focus` or `bbox` is out of \
+                                      range, `ids` names no id, an id is \
+                                      malformed or there are more than the \
+                                      server's batch item limit, or a parameter \
+                                      is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 501, description = "`ids` was given to a Pack built before it had \
+                                      an id catalogue. Rebuild the Pack.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
-pub(crate) async fn search(
+pub(crate) async fn places(
     State(state): State<AppState>,
-    params: Result<Query<SearchParams>, QueryRejection>,
+    params: Result<Query<PlacesParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-    let options = search_request(params)?;
+    let request = places_request(&state, params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || search_answer(&worker, options)).await?;
+    let collection = lookup(&state, move || places_answer(&worker, request)).await?;
     Ok(Json(collection))
 }
 
-/// `/search`'s parameters, checked.
-fn search_request(params: SearchParams) -> Result<TextSearchOptions, Problem> {
-    let SearchParams {
+/// Find a batch of places
+///
+/// The body is a JSON array of items, at most the server's item limit (1000
+/// by default). Each takes the parameters `GET /places` takes, `q` or `ids`,
+/// plus an optional `id` echoed in its result. The request's own
+/// query-string parameters apply to every item, and an item's own fields
+/// override them: `?country=NL` scopes every item to the Netherlands.
+/// `QUERY` takes the same body and answers the same: `POST` is for clients
+/// that cannot send `QUERY`.
+///
+/// Each result's `response` is exactly what `GET` returns for its item, and
+/// its `error` the Problem `GET` would return. Results are in input order,
+/// one per item, and a bad item never fails the batch. An item's `ids` is
+/// held to the same limit as `GET`'s, the server's item limit, on its own.
+#[utoipa::path(
+    post,
+    path = "/places",
+    tag = "Geocoding",
+    params(
+        ("q" = Option<String>, Query,
+         description = "Name of the place. Applies to every item; an item's own \
+                        field overrides it.",
+         max_length = 256),
+        ("ids" = Option<String>, Query,
+         description = "Comma-separated stable ids. Applies to every item; an \
+                        item's own field overrides it."),
+        ("limit" = Option<usize>, Query,
+         description = "Maximum number of results. Applies to every item; an \
+                        item's own field overrides it.",
+         minimum = 0, maximum = 50),
+        ("country" = Option<String>, Query,
+         description = "Comma-separated ISO 3166-1 alpha-2 codes. Applies to every \
+                        item; an item's own field overrides it.",
+         example = "NL"),
+        ("focus" = Option<String>, Query,
+         description = "Point to prefer results near, as `lon,lat`. Applies to \
+                        every item; an item's own field overrides it."),
+        ("bbox" = Option<String>, Query,
+         description = "Return only results inside this box, as \
+                        `min_lon,min_lat,max_lon,max_lat`. Applies to every item; \
+                        an item's own field overrides it."),
+    ),
+    request_body(content = Vec<openapi::PlacesItem>, content_type = "application/json"),
+    responses(
+        (status = 200, description = "One result per item, in input order.",
+         body = openapi::ForwardBatch),
+        (status = 400, description = "The body is not a JSON array of objects, or the \
+                                      query string did not parse.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 413, description = "More items than the server's limit, or a body over its cap.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 415, description = "The body was not sent as `application/json`.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 500, description = "The batch failed inside the server.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 503, description = "Every slot batches and jobs share is taken. Retry after the \
+                                      `Retry-After` header's seconds.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+    ),
+)]
+pub(crate) async fn places_batch(State(state): State<AppState>, request: Request) -> Response {
+    batch::run(state, PLACES, request).await
+}
+
+/// `/places` as a batch item, in `QUERY /places`. Not a `/jobs` endpoint: a
+/// job is a file of addresses or points too long for one request, and one
+/// batch already holds a saved-place list, ids and names alike.
+pub(crate) const PLACES: Lookup<PlacesParams, PlacesRequest, ForwardCollection, String> = Lookup {
+    route: "/places",
+    prepare: places_request,
+    place: places_place,
+    answer: places_answer,
+};
+
+#[derive(Clone)]
+pub(crate) enum PlacesRequest {
+    Text(TextSearchOptions),
+    Ids {
+        catalogue: Arc<Catalogue>,
+        /// In the order asked, without the ids no record can have.
+        ids: Vec<(ObjectType, i64)>,
+    },
+}
+
+/// `/places`' parameters, checked.
+fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesRequest, Problem> {
+    let q = match (params.q, params.ids) {
+        (Param::Missing, Param::Missing) => {
+            return Err(Problem::invalid_query("give q, or ids"));
+        }
+        (Param::Empty, Param::Missing) => return Err(bounds::empty_query()),
+        (Param::Value(q), Param::Missing) => q,
+        (Param::Missing, Param::Empty) => return Err(no_ids()),
+        (Param::Missing, Param::Value(ids)) => {
+            let ids = place_ids(&ids, state.limits.max_batch_items())?;
+            let Some(catalogue) = state.catalogue.clone() else {
+                return Err(Problem::pack_outdated(
+                    "this Pack has no id catalogue: rebuild it to look places up by id",
+                ));
+            };
+            return Ok(PlacesRequest::Ids { catalogue, ids });
+        }
+        (Param::Empty | Param::Value(_), Param::Empty | Param::Value(_)) => {
+            return Err(Problem::malformed_parameter("give q or ids, not both")
+                .with_invalid_params(vec![InvalidParam::new("ids", "given with q")]));
+        }
+    };
+    text_request(TextParams {
+        q,
+        limit: params.limit,
+        country: params.country,
+        focus: params.focus,
+        bbox: params.bbox,
+    })
+    .map(PlacesRequest::Text)
+}
+
+/// Names that read alike sit together, as `/geocode`'s text queries do. An
+/// id's block is known only once the catalogue is read, so id lookups take no
+/// place and run first.
+fn places_place(request: &PlacesRequest) -> String {
+    match request {
+        PlacesRequest::Text(options) => options.query.to_lowercase(),
+        PlacesRequest::Ids { .. } => String::new(),
+    }
+}
+
+fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardCollection> {
+    let (catalogue, ids) = match request {
+        PlacesRequest::Text(options) => {
+            let hits = state.places.search(&options)?;
+            return api::forward_collection(&state.pack, options.query, hits);
+        }
+        PlacesRequest::Ids { catalogue, ids } => (catalogue, ids),
+    };
+    let records = state.pack.records();
+    let mut hits = Vec::new();
+    for (object_type, object_id) in &ids {
+        for record_id in catalogue.find(records, *object_type, *object_id)? {
+            hits.push(TextSearchHit::of_record(
+                record_id,
+                state.pack.record_summary(record_id)?,
+            ));
+        }
+    }
+    let asked = ids
+        .iter()
+        .map(|(kind, id)| labels::osm_record_id(*kind, *id))
+        .collect::<Vec<_>>();
+    api::forward_collection(&state.pack, asked.join(","), hits)
+}
+
+fn no_ids() -> Problem {
+    Problem::malformed_parameter("ids names no id")
+        .with_invalid_params(vec![InvalidParam::new("ids", "empty")])
+}
+
+/// `ids` as the catalogue reads them, at most `max` of them: the server's
+/// batch item limit, so one setting caps the lookups one request makes
+/// whether they come as items or as ids.
+fn place_ids(ids: &str, max: usize) -> Result<Vec<(ObjectType, i64)>, Problem> {
+    let ids = ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        // One past the limit is enough to refuse the list, so a list of a
+        // million ids costs no more than one just over it.
+        .take(max.saturating_add(1))
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(no_ids());
+    }
+    if ids.len() > max {
+        return Err(Problem::limit_too_large(vec![InvalidParam::new(
+            "ids",
+            format!("at most {max} ids"),
+        )]));
+    }
+    let parsed = ids
+        .into_iter()
+        .map(|id| {
+            ids::parse(id).map_err(|_| {
+                Problem::malformed_parameter(format!(
+                    "{id:?} is no record id, such as osm:node:123"
+                ))
+                .with_invalid_params(vec![InvalidParam::new("ids", "not a record id")])
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(parsed.into_iter().flatten().collect())
+}
+
+struct TextParams {
+    /// As sent, holding at least one word.
+    q: String,
+    limit: usize,
+    country: Param,
+    focus: Param,
+    bbox: Param,
+}
+
+fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
+    let TextParams {
         q,
         limit,
         country,
-        layer,
         focus,
         bbox,
     } = params;
-    let query = bounds::validate_query(q.as_deref().unwrap_or_default())?;
+    let query = bounds::validate_query(&q)?;
     bounds::validate_search_limit(limit)?;
-    let layer = parse_layer(layer.as_deref())?;
     Ok(TextSearchOptions {
         query,
         limit,
-        layer: layer.map(|layer| layer.as_str().to_string()),
-        countries: parse_countries(country.as_deref())?,
-        focus: bounds::parse_focus(focus.as_deref())?,
-        bbox: bounds::parse_bbox(bbox.as_deref())?,
+        layer: None,
+        countries: parse_countries(&country)?,
+        focus: bounds::parse_focus(&focus)?,
+        bbox: bounds::parse_bbox(&bbox)?,
     })
 }
 
-fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<ForwardCollection> {
-    let hits = state.searcher.search(&options)?;
-    api::forward_collection(&state.pack, options.query, hits)
-}
-
-/// Autocomplete addresses
+/// Autocomplete addresses and places
 ///
-/// Suggests addresses for partial text, as a user types. An empty or very
-/// short `q` returns no results.
+/// Suggests addresses and places for partial text, as a user types, in one
+/// list. A query that starts with a house number suggests addresses first; a
+/// place whose name starts as the query does comes before the addresses. An
+/// empty or very short `q` returns no results.
 #[utoipa::path(
     get,
     path = "/autocomplete",
@@ -628,7 +875,8 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
                         server choose.",
          minimum = 0, maximum = 20),
         ("layer" = Option<Layer>, Query,
-         description = "Return only results of this layer. An unknown layer \
+         description = "Return only results of this layer: `poi` suggests places \
+                        alone, any other layer addresses alone. An unknown layer \
                         returns `400`."),
         ("country" = Option<String>, Query,
          description = "Return only results in these countries, as comma-separated \
@@ -647,7 +895,7 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
          example = "-79.64,43.58,-79.12,43.86"),
     ),
     responses(
-        (status = 200, description = "Suggested results, highest `score` first.",
+        (status = 200, description = "Suggested results, best first.",
          body = ForwardCollection),
         (status = 400, description = "`q` is too long, `limit` is too large, \
                                       `focus` or `bbox` is out of range, or a \
@@ -659,18 +907,22 @@ fn search_answer(state: &AppState, options: TextSearchOptions) -> Result<Forward
 )]
 pub(crate) async fn autocomplete(
     State(state): State<AppState>,
-    params: Result<Query<SearchParams>, QueryRejection>,
+    params: Result<Query<AutocompleteParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
 
-    // Autocomplete tolerates an empty/short query (it returns no suggestions), so
-    // only bound the length here; the searcher caps the result count internally.
-    let query = bounds::validate_query_length(params.q.as_deref().unwrap_or_default())?;
+    // Nothing typed yet is no suggestions, not an error, so only the length is
+    // bounded here; the searcher answers an empty or very short query with
+    // none, and caps the result count itself.
+    let query = match &params.q {
+        Param::Missing | Param::Empty => String::new(),
+        Param::Value(q) => bounds::validate_query_length(q)?,
+    };
     bounds::validate_autocomplete_limit(params.limit)?;
-    let layer = parse_layer(params.layer.as_deref())?;
-    let countries = parse_countries(params.country.as_deref())?;
-    let focus = bounds::parse_focus(params.focus.as_deref())?;
-    let bbox = bounds::parse_bbox(params.bbox.as_deref())?;
+    let layer = parse_layer(&params.layer)?;
+    let countries = parse_countries(&params.country)?;
+    let focus = bounds::parse_focus(&params.focus)?;
+    let bbox = bounds::parse_bbox(&params.bbox)?;
 
     let options = TextAutocompleteOptions {
         query: query.clone(),
@@ -682,7 +934,19 @@ pub(crate) async fn autocomplete(
     };
     let worker = state.clone();
     let collection = lookup(&state, move || {
-        let hits = worker.searcher.autocomplete(&options)?;
+        let hits = match layer {
+            Some(Layer::Poi) => worker.places.autocomplete(&TextAutocompleteOptions {
+                layer: None,
+                ..options
+            })?,
+            Some(_) => worker.searcher.autocomplete(&options)?,
+            None => mix_suggestions(
+                &options.query,
+                worker.searcher.autocomplete(&options)?,
+                worker.places.autocomplete(&options)?,
+                options.limit,
+            ),
+        };
         api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
@@ -694,11 +958,18 @@ pub(crate) async fn autocomplete(
 // into one string, the parser would have to split them apart again, and a
 // town in the string could outrank the street. `geocode batch` runs this
 // same lookup per row.
-/// Geocode a structured address
+/// Geocode an address
 ///
-/// Geocodes an address given as separate fields, and returns the best match
-/// or no result. `address` is matched on its own, then checked against
-/// `locality`, `region` and `postcode`.
+/// Geocodes an address to coordinates, given as free text in `q` or as
+/// separate fields. Answers are addresses, streets, postcodes and areas,
+/// never places: those are `/places`'.
+///
+/// With `q`, returns the matches best first, highest `score` first, as many
+/// as `limit`.
+///
+/// With the fields, returns the best match or no result. `address` is
+/// matched on its own, then checked against `locality`, `region` and
+/// `postcode`.
 ///
 /// - A house number missing from the data is interpolated between its
 ///   neighbours (`accuracy: interpolated`), or answered with its street
@@ -713,9 +984,23 @@ pub(crate) async fn autocomplete(
     path = "/geocode",
     tag = "Geocoding",
     params(
-        ("address" = String, Query,
+        ("q" = Option<String>, Query,
+         description = "The address as free text, such as a full address. Give \
+                        `q` or the address fields, not both; a field sent empty \
+                        counts as given.",
+         example = "10 King Street, Toronto", max_length = 256),
+        ("focus" = Option<String>, Query,
+         description = "With `q`: point to prefer results near, as `lon,lat`. \
+                        Breaks ties between equally good matches only.",
+         example = "-79.38,43.65"),
+        ("bbox" = Option<String>, Query,
+         description = "With `q`: return only results inside this box, as \
+                        `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
+                        the antimeridian.",
+         example = "-79.64,43.58,-79.12,43.86"),
+        ("address" = Option<String>, Query,
          description = "House number and street, without town or postcode.",
-         example = "10 King Street", min_length = 1, max_length = 256),
+         example = "10 King Street", max_length = 256),
         ("locality" = Option<String>, Query,
          description = "City or town.",
          example = "Toronto", max_length = 256),
@@ -725,8 +1010,9 @@ pub(crate) async fn autocomplete(
         ("postcode" = Option<String>, Query,
          description = "Postal code.", example = "M5V 1A1", max_length = 256),
         ("limit" = Option<usize>, Query,
-         description = "Number of candidates to consider. `0`, the default, lets \
-                        the server choose. At most one result is returned.",
+         description = "With `q`, the most results to return; with the fields, the \
+                        candidates to consider, of which at most one is returned. \
+                        `0`, the default, lets the server choose.",
          minimum = 0, maximum = 50),
         ("layer" = Option<Layer>, Query,
          description = "Consider only candidates of this layer. An unknown layer \
@@ -740,11 +1026,13 @@ pub(crate) async fn autocomplete(
     ),
     responses(
         (status = 200,
-         description = "The best match, or no features when nothing matches.",
+         description = "The matches best first, or no features when nothing matches.",
          body = ForwardCollection),
-        (status = 400, description = "`address` is empty or too long, another \
-                                      field is too long, `limit` is too large, or \
-                                      a parameter is malformed.",
+        (status = 400, description = "Neither `q` nor `address` is given, `q` and \
+                                      an address field are both given, `q` or \
+                                      `address` is empty, a field is too long, \
+                                      `limit` is too large, or a parameter is \
+                                      malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -755,7 +1043,7 @@ pub(crate) async fn geocode(
     params: Result<Query<GeocodeParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-    let options = geocode_request(params)?;
+    let options = geocode_request(&state, params)?;
     let worker = state.clone();
     let collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
     Ok(Json(collection))
@@ -779,6 +1067,10 @@ pub(crate) async fn geocode(
     path = "/geocode",
     tag = "Geocoding",
     params(
+        ("q" = Option<String>, Query,
+         description = "The address as free text. Applies to every item; an item's \
+                        own field overrides it.",
+         max_length = 256),
         ("address" = Option<String>, Query,
          description = "House number and street, without town or postcode. Applies \
                         to every item; an item's own field overrides it.",
@@ -830,33 +1122,67 @@ pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/geocode` as a batch item, in `QUERY /geocode` and in `/jobs`.
-pub(crate) const GEOCODE: Lookup<
-    GeocodeParams,
-    AddressGeocodeOptions,
-    ForwardCollection,
-    [String; 3],
-> = Lookup {
-    route: "/geocode",
-    prepare: geocode_request,
-    place: geocode_place,
-    answer: geocode_answer,
-};
+pub(crate) const GEOCODE: Lookup<GeocodeParams, GeocodeRequest, ForwardCollection, [String; 3]> =
+    Lookup {
+        route: "/geocode",
+        prepare: geocode_request,
+        place: geocode_place,
+        answer: geocode_answer,
+    };
+
+#[derive(Debug, Clone)]
+pub(crate) enum GeocodeRequest {
+    Text(TextSearchOptions),
+    Fields(AddressGeocodeOptions),
+}
 
 /// `/geocode`'s parameters, checked.
-fn geocode_request(params: GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
-    let address = bounds::validate_query(params.address.as_deref().unwrap_or_default())
-        .map_err(|_| Problem::invalid_query("address must not be empty"))?;
-    // The context fields narrow the search rather than drive it, so an empty
-    // one means "not given" instead of being an error the way `address` is.
-    let context = |value: Option<String>| -> Result<Option<String>, Problem> {
-        let value = bounds::validate_query_length(value.as_deref().unwrap_or_default())?;
-        Ok(Some(value).filter(|value| !value.is_empty()))
+fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest, Problem> {
+    // A field sent empty is still sent: `q=&address=10 King Street` names two
+    // ways of giving the address, and which one the caller meant is a guess.
+    let fields = [
+        &params.address,
+        &params.locality,
+        &params.region,
+        &params.postcode,
+    ]
+    .into_iter()
+    .any(Param::is_sent);
+    let q = match (&params.q, fields) {
+        (Param::Empty | Param::Value(_), true) => {
+            return Err(Problem::malformed_parameter(
+                "give the address as q or as address, locality, region and postcode, not both",
+            )
+            .with_invalid_params(vec![InvalidParam::new("q", "given with address fields")]));
+        }
+        (Param::Empty, false) => return Err(bounds::empty_query()),
+        (Param::Value(q), false) => q.clone(),
+        (Param::Missing, _) => {
+            return geocode_fields(&params).map(GeocodeRequest::Fields);
+        }
     };
-    let locality = context(params.locality)?;
-    let region = context(params.region)?;
-    let postcode = context(params.postcode)?;
+    let mut options = text_request(TextParams {
+        q,
+        limit: params.limit,
+        country: params.country,
+        focus: params.focus,
+        bbox: params.bbox,
+    })?;
+    options.layer = parse_layer(&params.layer)?.map(|layer| layer.as_str().to_string());
+    Ok(GeocodeRequest::Text(options))
+}
+
+fn geocode_fields(params: &GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
+    let address = match &params.address {
+        Param::Missing | Param::Empty => None,
+        Param::Value(address) => bounds::validate_query(address).ok(),
+    }
+    .ok_or_else(|| Problem::invalid_query("give q, or address with its other fields"))?;
+    let locality = context_field(&params.locality)?;
+    let region = context_field(&params.region)?;
+    let postcode = context_field(&params.postcode)?;
     bounds::validate_search_limit(params.limit)?;
-    let layer = parse_layer(params.layer.as_deref())?;
+    let layer = parse_layer(&params.layer)?;
     Ok(AddressGeocodeOptions {
         address,
         locality,
@@ -864,25 +1190,48 @@ fn geocode_request(params: GeocodeParams) -> Result<AddressGeocodeOptions, Probl
         postcode,
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
-        countries: parse_countries(params.country.as_deref())?,
+        countries: parse_countries(&params.country)?,
     })
+}
+
+/// `locality`, `region` or `postcode`, which narrow an address search rather
+/// than drive it.
+fn context_field(field: &Param) -> Result<Option<String>, Problem> {
+    match field {
+        Param::Missing => Ok(None),
+        // A form that always sends every field sends the ones left blank
+        // empty; a blank locality narrows nothing, unlike a blank `address`.
+        Param::Empty => Ok(None),
+        Param::Value(value) => bounds::validate_query_length(value).map(Some),
+    }
 }
 
 /// Addresses in one postcode and town read the same part of the Pack, so a
 /// batch looks them up together, as `geocode batch` does its rows.
-fn geocode_place(options: &AddressGeocodeOptions) -> [String; 3] {
+fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
     let field = |value: &Option<String>| value.as_deref().unwrap_or_default().to_lowercase();
-    [
-        field(&options.postcode).replace(' ', ""),
-        field(&options.region),
-        field(&options.locality),
-    ]
+    match request {
+        GeocodeRequest::Fields(options) => [
+            field(&options.postcode).replace(' ', ""),
+            field(&options.region),
+            field(&options.locality),
+        ],
+        GeocodeRequest::Text(options) => {
+            [String::new(), String::new(), options.query.to_lowercase()]
+        }
+    }
 }
 
-fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<ForwardCollection> {
-    let (query, hits) = match state.searcher.geocode_address(&options)? {
-        Some(found) => (found.query, vec![found.hit]),
-        None => (options.address, Vec::new()),
+fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCollection> {
+    let (query, hits) = match request {
+        GeocodeRequest::Text(options) => {
+            let hits = state.searcher.search(&options)?;
+            (options.query, hits)
+        }
+        GeocodeRequest::Fields(options) => match state.searcher.geocode_address(&options)? {
+            Some(found) => (found.query, vec![found.hit]),
+            None => (options.address, Vec::new()),
+        },
     };
     api::forward_collection(&state.pack, query, hits)
 }
@@ -891,7 +1240,7 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
 ///
 /// Returns the nearest address or street to a point, followed by the areas
 /// that contain the point, most precise first. Only the first result carries
-/// `distance_m`.
+/// `distance_m`. With `layer`, returns only the nearest result of that layer.
 #[utoipa::path(
     get,
     path = "/reverse",
@@ -901,12 +1250,17 @@ fn geocode_answer(state: &AppState, options: AddressGeocodeOptions) -> Result<Fo
          example = -79.3832, minimum = -180.0, maximum = 180.0),
         ("lat" = f64, Query, description = "Latitude in degrees.",
          example = 43.6532, minimum = -90.0, maximum = 90.0),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only the nearest result of this layer, or for an area \
+                        layer the area of that layer the point lies in, and no other \
+                        area. An unknown layer returns `400`."),
     ),
     responses(
         (status = 200, description = "Results at the point, most precise first. \
                                       `features` is empty when nothing is near.",
          body = ReverseCollection),
-        (status = 400, description = "`lon` or `lat` is missing or out of range.",
+        (status = 400, description = "`lon` or `lat` is missing or out of range, or \
+                                      `layer` is unknown.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -917,7 +1271,7 @@ pub(crate) async fn reverse(
     params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-    let options = reverse_request(params)?;
+    let options = reverse_request(&state, params)?;
     let worker = state.clone();
     let collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
     Ok(Json(collection))
@@ -947,6 +1301,9 @@ pub(crate) async fn reverse(
          description = "Latitude in degrees. Applies to every item; an item's own \
                         field overrides it.",
          minimum = -90.0, maximum = 90.0),
+        ("layer" = Option<Layer>, Query,
+         description = "Return only results of this layer. Applies to every item; an \
+                        item's own field overrides it."),
     ),
     request_body(content = Vec<openapi::ReverseItem>, content_type = "application/json"),
     responses(
@@ -979,11 +1336,13 @@ pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollectio
 };
 
 /// `/reverse`'s parameters, checked.
-fn reverse_request(params: ReverseParams) -> Result<GeocodeOptions, Problem> {
-    bounds::validate_coords(params.lon, params.lat)?;
+fn reverse_request(_: &AppState, params: ReverseParams) -> Result<GeocodeOptions, Problem> {
+    let ReverseParams { lon, lat, layer } = params;
+    bounds::validate_coords(lon, lat)?;
     Ok(GeocodeOptions {
-        lon: params.lon,
-        lat: params.lat,
+        lon,
+        lat,
+        layer: parse_layer(&layer)?,
     })
 }
 
@@ -1198,33 +1557,41 @@ mod router_tests {
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // Empty query -> 400 invalid_query, Problem Details.
-        let reply = send(router.clone(), request("GET", "/search?q=")).await;
+        let reply = send(router.clone(), request("GET", "/geocode?q=")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.content_type(), "application/problem+json");
         assert_eq!(reply.json()["error_code"], "invalid_query");
 
         // Over-length query -> 400.
         let long = "a".repeat(300);
-        let reply = send(router.clone(), request("GET", &format!("/search?q={long}"))).await;
+        let reply = send(
+            router.clone(),
+            request("GET", &format!("/geocode?q={long}")),
+        )
+        .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 
         // limit above the cap -> 400 with invalid_params naming "limit".
         let reply = send(
             router.clone(),
-            request("GET", "/search?q=king&limit=999999"),
+            request("GET", "/geocode?q=king&limit=999999"),
         )
         .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["invalid_params"][0]["name"], "limit");
 
         // Malformed limit type -> 400 malformed_parameter.
-        let reply = send(router.clone(), request("GET", "/search?q=king&limit=abc")).await;
+        let reply = send(router.clone(), request("GET", "/geocode?q=king&limit=abc")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["error_code"], "malformed_parameter");
 
         // An unknown layer -> 400 naming the layers that would have been
         // accepted, not an empty answer that looks like "nothing here".
-        let reply = send(router.clone(), request("GET", "/search?q=king&layer=bogus")).await;
+        let reply = send(
+            router.clone(),
+            request("GET", "/geocode?q=king&layer=bogus"),
+        )
+        .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         let body = reply.json();
         assert_eq!(body["error_code"], "malformed_parameter");
@@ -1246,15 +1613,15 @@ mod router_tests {
         // produces.
         let reply = send(
             router.clone(),
-            request("GET", "/search?q=King%20Street&layer=address"),
+            request("GET", "/geocode?q=King%20Street&layer=address"),
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK);
-        let reply = send(router.clone(), request("GET", "/search?q=king&layer=")).await;
+        let reply = send(router.clone(), request("GET", "/geocode?q=king&layer=")).await;
         assert_eq!(reply.status, StatusCode::OK);
 
         // A valid query succeeds.
-        let reply = send(router, request("GET", "/search?q=King%20Street&limit=5")).await;
+        let reply = send(router, request("GET", "/geocode?q=King%20Street&limit=5")).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.content_type(), "application/json");
 
@@ -1371,7 +1738,7 @@ mod router_tests {
         );
 
         // HEAD is not part of the API method surface (Decision 27) -> 405.
-        let reply = send(router.clone(), request("HEAD", "/search")).await;
+        let reply = send(router.clone(), request("HEAD", "/places")).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
 
         // Unknown path -> 404 Problem Details, not a static-file response.
@@ -1384,7 +1751,7 @@ mod router_tests {
         let reply = send(router.clone(), request("GET", "/healthz")).await;
         assert!(reply.request_id().is_some());
 
-        let mut tagged = request("GET", "/search?q=");
+        let mut tagged = request("GET", "/geocode?q=");
         tagged
             .headers_mut()
             .insert("cf-ray", header::HeaderValue::from_static("ray-abc-123"));
@@ -1533,13 +1900,14 @@ mod router_tests {
         let router = build_router(state, Some(&demo), Some(&no_basemap));
 
         for (method, uri, status) in [
-            ("GET", "/search?q=", StatusCode::BAD_REQUEST),
+            ("GET", "/geocode?q=", StatusCode::BAD_REQUEST),
             ("GET", "/reverse?lon=999&lat=0", StatusCode::BAD_REQUEST),
             ("GET", "/does-not-exist", StatusCode::NOT_FOUND),
             ("POST", "/autocomplete", StatusCode::METHOD_NOT_ALLOWED),
-            ("POST", "/search", StatusCode::METHOD_NOT_ALLOWED),
+            ("PUT", "/places", StatusCode::METHOD_NOT_ALLOWED),
+            ("POST", "/places", StatusCode::UNSUPPORTED_MEDIA_TYPE),
             ("POST", "/geocode", StatusCode::UNSUPPORTED_MEDIA_TYPE),
-            ("GET", "/search?q=King%20Street", StatusCode::OK),
+            ("GET", "/geocode?q=King%20Street", StatusCode::OK),
         ] {
             let reply = send(router.clone(), request(method, uri)).await;
             assert_eq!(reply.status, status, "{method} {uri}");
@@ -2126,6 +2494,7 @@ mod router_tests {
 
         for route in [
             "/geocode?address=10%20King%20Street",
+            "/places?ids=osm:node:1",
             "/reverse?lon=0&lat=0",
         ] {
             let reply = send(router.clone(), request("GET", route)).await;
@@ -2145,14 +2514,20 @@ mod router_tests {
         );
         assert!(reply.json()["request_id"].is_string());
 
-        for method in ["HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"] {
-            let reply = send(router.clone(), request(method, "/geocode")).await;
-            assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
-            assert_eq!(
-                header_value(&reply, "allow"),
-                Some(batch::METHODS),
-                "{method}"
-            );
+        for route in ["/geocode", "/places", "/reverse"] {
+            for method in ["HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+                let reply = send(router.clone(), request(method, route)).await;
+                assert_eq!(
+                    reply.status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {route}"
+                );
+                assert_eq!(
+                    header_value(&reply, "allow"),
+                    Some(batch::METHODS),
+                    "{method} {route}"
+                );
+            }
         }
         // A route without a batch still takes GET only.
         let reply = send(router.clone(), request("QUERY", "/autocomplete")).await;
@@ -2189,7 +2564,7 @@ mod router_tests {
                     |State(state): State<AppState>, request: Request<Body>| async move {
                         let lookup = Lookup {
                             route: "/boom",
-                            prepare: |params: PanicParams| Ok(params.q),
+                            prepare: |_: &AppState, params: PanicParams| Ok(params.q),
                             place: |_: &String| (),
                             answer: panic_on_boom,
                         };
@@ -2247,7 +2622,10 @@ mod router_tests {
     /// 400 rather than a filter that silently matches nothing.
     #[test]
     fn parses_the_country_filter() {
-        let parse = |value: Option<&str>| parse_countries(value).map_err(|_| ());
+        let parse = |value: Option<&str>| {
+            let param = serde_json::from_value::<Param>(serde_json::json!(value)).expect("param");
+            parse_countries(&param).map_err(|_| ())
+        };
 
         // No filter: absent, empty, or whitespace, as a form that always
         // sends the key produces.
@@ -2321,7 +2699,7 @@ mod router_tests {
         let router = build_router(state, None, None);
 
         for route in [
-            "/search?q=10%20King%20Street",
+            "/geocode?q=10%20King%20Street",
             "/autocomplete?q=10%20King",
             "/geocode?address=10%20King%20Street",
             "/reverse?lon=-79&lat=43",
@@ -2366,7 +2744,7 @@ mod router_tests {
                     |State(state): State<AppState>, request: Request<Body>| async move {
                         let lookup = Lookup {
                             route: "/slow",
-                            prepare: |params: PanicParams| Ok(params.q),
+                            prepare: |_: &AppState, params: PanicParams| Ok(params.q),
                             place: |_: &String| (),
                             answer: slow_when_asked,
                         };
@@ -2723,5 +3101,432 @@ mod router_tests {
         drop(upload);
         let _ = std::fs::remove_dir_all(&pack);
         let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// How a text parameter is sent in one cell of the matrix below.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Sent {
+        Missing,
+        Empty,
+        Filled,
+    }
+
+    type Sents = BTreeMap<&'static str, Sent>;
+
+    /// What one combination of sent parameters must give.
+    #[derive(Debug)]
+    enum Expect {
+        Answer,
+        Problem {
+            error_code: &'static str,
+            detail: &'static str,
+        },
+    }
+
+    const NOT_BOTH_FIELDS: Expect = Expect::Problem {
+        error_code: "malformed_parameter",
+        detail: "give the address as q or as address, locality, region and postcode, not both",
+    };
+    const EMPTY_Q: Expect = Expect::Problem {
+        error_code: "invalid_query",
+        detail: "q must not be empty",
+    };
+
+    /// One endpoint's text parameters and the rules they answer by.
+    struct Rules {
+        route: &'static str,
+        /// Every field of the endpoint's params struct, as serde reads it.
+        fields: &'static [&'static str],
+        /// The parameters that are not text, and the values they keep.
+        fixed: &'static [(&'static str, &'static str)],
+        /// A valid value for every text parameter.
+        filled: &'static [(&'static str, &'static str)],
+        /// The text parameters that choose what the endpoint does, tried in
+        /// every combination. Each other one is tried empty and filled alone
+        /// beside every such combination: it filters, and filters do not
+        /// interact on whether a request is answered.
+        modes: &'static [&'static str],
+        /// Where it answers, these sent empty answer as if not sent.
+        empty_is_missing: &'static [&'static str],
+        /// Takes a `QUERY` batch, whose items each answer as their `GET`.
+        batchable: bool,
+        expect: fn(&Sents) -> Expect,
+    }
+
+    /// The names of a params struct's fields, as serde's derive lists them to
+    /// a deserializer, so a parameter added to the struct joins the matrix
+    /// without being named in it.
+    fn field_names<P: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+        use serde::de::{Error as _, Visitor, value::Error};
+
+        struct Fields<'a>(&'a std::cell::Cell<&'static [&'static str]>);
+
+        impl<'de> serde::Deserializer<'de> for Fields<'_> {
+            type Error = Error;
+
+            fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Error> {
+                Err(Error::custom("params are a struct"))
+            }
+
+            fn deserialize_struct<V: Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Error> {
+                self.0.set(fields);
+                Err(Error::custom("fields read"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+
+        let fields = std::cell::Cell::new(&[][..]);
+        let _ = P::deserialize(Fields(&fields));
+        assert!(!fields.get().is_empty(), "read no fields");
+        fields.get()
+    }
+
+    fn rules() -> [Rules; 4] {
+        [
+            Rules {
+                route: "/geocode",
+                batchable: true,
+                fields: field_names::<GeocodeParams>(),
+                fixed: &[("limit", "0")],
+                filled: &[
+                    ("q", "10 King Street"),
+                    ("focus", "-79,43"),
+                    ("bbox", "-80,42,-78,44"),
+                    ("address", "10 King Street"),
+                    ("locality", "Toronto"),
+                    ("region", "Ontario"),
+                    ("postcode", "M5V 1A1"),
+                    ("layer", "address"),
+                    ("country", "CA"),
+                ],
+                modes: &["q", "address", "locality", "region", "postcode"],
+                empty_is_missing: &[
+                    "focus", "bbox", "locality", "region", "postcode", "layer", "country",
+                ],
+                expect: |sent| {
+                    let fields = ["address", "locality", "region", "postcode"]
+                        .iter()
+                        .any(|field| sent[field] != Sent::Missing);
+                    match (sent["q"], fields) {
+                        (Sent::Empty | Sent::Filled, true) => NOT_BOTH_FIELDS,
+                        (Sent::Empty, false) => EMPTY_Q,
+                        (Sent::Filled, false) => Expect::Answer,
+                        (Sent::Missing, _) if sent["address"] == Sent::Filled => Expect::Answer,
+                        (Sent::Missing, _) => Expect::Problem {
+                            error_code: "invalid_query",
+                            detail: "give q, or address with its other fields",
+                        },
+                    }
+                },
+            },
+            Rules {
+                route: "/places",
+                batchable: true,
+                fields: field_names::<PlacesParams>(),
+                fixed: &[("limit", "0")],
+                filled: &[
+                    ("q", "King Street"),
+                    ("ids", "osm:node:1"),
+                    ("country", "CA"),
+                    ("focus", "-79,43"),
+                    ("bbox", "-80,42,-78,44"),
+                ],
+                modes: &["q", "ids"],
+                empty_is_missing: &["country", "focus", "bbox"],
+                expect: |sent| match (sent["q"], sent["ids"]) {
+                    (Sent::Missing, Sent::Missing) => Expect::Problem {
+                        error_code: "invalid_query",
+                        detail: "give q, or ids",
+                    },
+                    (Sent::Empty, Sent::Missing) => EMPTY_Q,
+                    (Sent::Filled, Sent::Missing) | (Sent::Missing, Sent::Filled) => Expect::Answer,
+                    (Sent::Missing, Sent::Empty) => Expect::Problem {
+                        error_code: "malformed_parameter",
+                        detail: "ids names no id",
+                    },
+                    (Sent::Empty | Sent::Filled, Sent::Empty | Sent::Filled) => Expect::Problem {
+                        error_code: "malformed_parameter",
+                        detail: "give q or ids, not both",
+                    },
+                },
+            },
+            Rules {
+                route: "/autocomplete",
+                batchable: false,
+                fields: field_names::<AutocompleteParams>(),
+                fixed: &[("limit", "0")],
+                filled: &[
+                    ("q", "10 King"),
+                    ("country", "CA"),
+                    ("layer", "address"),
+                    ("focus", "-79,43"),
+                    ("bbox", "-80,42,-78,44"),
+                ],
+                modes: &["q"],
+                empty_is_missing: &["q", "country", "layer", "focus", "bbox"],
+                expect: |_| Expect::Answer,
+            },
+            Rules {
+                route: "/reverse",
+                batchable: true,
+                fields: field_names::<ReverseParams>(),
+                fixed: &[("lon", "-79"), ("lat", "43")],
+                filled: &[("layer", "address")],
+                modes: &["layer"],
+                empty_is_missing: &["layer"],
+                expect: |_| Expect::Answer,
+            },
+        ]
+    }
+
+    /// Every text parameter of every endpoint missing, empty and filled,
+    /// against the rules: empty, missing and a value are three states, and
+    /// each endpoint says what each means.
+    #[tokio::test]
+    async fn every_text_parameter_missing_empty_or_filled_answers_by_the_rules() {
+        let pack = temp_path("param-matrix");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        for rules in rules() {
+            let mut stated = rules
+                .fixed
+                .iter()
+                .chain(rules.filled)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>();
+            stated.sort_unstable();
+            let mut fields = rules.fields.to_vec();
+            fields.sort_unstable();
+            assert_eq!(
+                stated, fields,
+                "{}: every parameter needs a rule and a value",
+                rules.route
+            );
+
+            assert!(
+                rules
+                    .modes
+                    .iter()
+                    .all(|mode| rules.filled.iter().any(|(name, _)| name == mode)),
+                "{}: a mode is a text parameter",
+                rules.route
+            );
+            let filters = rules
+                .filled
+                .iter()
+                .map(|(name, _)| *name)
+                .filter(|name| !rules.modes.contains(name))
+                .collect::<Vec<_>>();
+            let mut cells = Vec::new();
+            for index in 0..3usize.pow(u32::try_from(rules.modes.len()).expect("few")) {
+                let mut digits = index;
+                let modes = rules
+                    .modes
+                    .iter()
+                    .map(|name| {
+                        let state = [Sent::Missing, Sent::Empty, Sent::Filled][digits % 3];
+                        digits /= 3;
+                        (*name, state)
+                    })
+                    .collect::<Sents>();
+                let alone = filters
+                    .iter()
+                    .flat_map(|filter| [(*filter, Sent::Empty), (*filter, Sent::Filled)]);
+                for (filter, state) in std::iter::once(("", Sent::Missing)).chain(alone) {
+                    let mut sent = modes.clone();
+                    for name in &filters {
+                        sent.insert(
+                            name,
+                            if *name == filter {
+                                state
+                            } else {
+                                Sent::Missing
+                            },
+                        );
+                    }
+                    cells.push(sent);
+                }
+            }
+
+            let mut answers = BTreeMap::<Sents, serde_json::Value>::new();
+            for sent in cells {
+                let mut pairs = rules.fixed.to_vec();
+                for (name, value) in rules.filled {
+                    match sent[name] {
+                        Sent::Missing => {}
+                        Sent::Empty => pairs.push((name, "")),
+                        Sent::Filled => pairs.push((name, value)),
+                    }
+                }
+                let uri = format!(
+                    "{}?{}",
+                    rules.route,
+                    serde_urlencoded::to_string(&pairs).expect("query")
+                );
+                let reply = send(router.clone(), request("GET", &uri)).await;
+                let body = reply.json();
+                if rules.batchable {
+                    let item = pairs
+                        .iter()
+                        .map(|(name, value)| ((*name).to_string(), serde_json::json!(value)))
+                        .collect::<serde_json::Map<_, _>>();
+                    let batch = serde_json::json!([item]).to_string();
+                    let batched = send(router.clone(), batch_request("QUERY", rules.route, batch))
+                        .await
+                        .json();
+                    let result = &batched["results"][0];
+                    assert_eq!(result["status"], reply.status.as_u16(), "QUERY {uri}");
+                    let mut answer = if reply.status == StatusCode::OK {
+                        result["response"].clone()
+                    } else {
+                        result["error"].clone()
+                    };
+                    let mut get = body.clone();
+                    // Each request has its own id.
+                    for value in [&mut answer, &mut get] {
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("request_id");
+                        }
+                    }
+                    assert_eq!(answer, get, "QUERY {uri} answers as its GET");
+                }
+                match (rules.expect)(&sent) {
+                    Expect::Answer => {
+                        assert_eq!(reply.status, StatusCode::OK, "{uri}: {body}");
+                        // Cells run with fewer parameters sent first, so this
+                        // one's twin without its empty ones has answered.
+                        let mut without_empty = sent.clone();
+                        for (name, state) in &mut without_empty {
+                            if *state == Sent::Empty && rules.empty_is_missing.contains(name) {
+                                *state = Sent::Missing;
+                            }
+                        }
+                        if without_empty != sent {
+                            assert_eq!(
+                                answers.get(&without_empty),
+                                Some(&body),
+                                "{uri}: an empty parameter that means none answers as if not sent"
+                            );
+                        }
+                        answers.insert(sent, body);
+                    }
+                    Expect::Problem { error_code, detail } => {
+                        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+                        assert_eq!(body["error_code"], error_code, "{uri}: {body}");
+                        assert_eq!(body["detail"], detail, "{uri}: {body}");
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `q` sent empty beside an address field is two ways of giving the
+    /// address, in a batch item as in `GET`.
+    #[tokio::test]
+    async fn an_empty_q_beside_address_fields_is_both() {
+        let pack = temp_path("param-both");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        for uri in [
+            "/geocode?q=&address=10%20King%20Street",
+            "/geocode?q=%20&address=10%20King%20Street",
+            "/geocode?q=cafe&locality=",
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(reply.json()["error_code"], "malformed_parameter", "{uri}");
+            assert_eq!(reply.json()["invalid_params"][0]["name"], "q", "{uri}");
+        }
+        let answered = send(
+            router.clone(),
+            request("GET", "/geocode?address=10%20King%20Street&locality="),
+        )
+        .await;
+        assert_eq!(answered.status, StatusCode::OK);
+        assert_eq!(
+            answered.json()["features"][0]["properties"]["id"],
+            "osm:node:1"
+        );
+
+        let batch = Request::builder()
+            .method("POST")
+            .uri("/geocode")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"[{"q":"","address":"10 King Street"},{"q":null,"address":"10 King Street"}]"#,
+            ))
+            .unwrap();
+        let reply = send(router, batch).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let results = reply.json()["results"].clone();
+        assert_eq!(results[0]["status"], 400);
+        assert_eq!(
+            results[0]["error"]["detail"],
+            "give the address as q or as address, locality, region and postcode, not both"
+        );
+        assert_eq!(results[1]["status"], 200);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `ids` holds at most the server's batch item limit, in `GET` and in
+    /// each batch item alike.
+    #[tokio::test]
+    async fn ids_past_the_limit_are_refused_however_many() {
+        let pack = temp_path("param-ids");
+        write_pack(&pack);
+        let limits =
+            limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(7).expect("7"));
+        let router = build_router(state_with(&pack, true, limits), None, None);
+        let at_limit = ["osm:node:1"; 7].join(",");
+        let reply = send(
+            router.clone(),
+            request("GET", &format!("/places?ids={at_limit}")),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        for count in [8, 5_000] {
+            let many = ["osm:node:1"; 5_000][..count].join(",");
+            let reply = send(
+                router.clone(),
+                request("GET", &format!("/places?ids={many}")),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{count} ids");
+            assert_eq!(reply.json()["error_code"], "limit_too_large", "{count} ids");
+            assert_eq!(
+                reply.json()["invalid_params"][0]["reason"],
+                "at most 7 ids",
+                "{count} ids"
+            );
+        }
+        let one_past = ["osm:node:1"; 8].join(",");
+        let items = serde_json::json!([{"ids": at_limit}, {"ids": one_past}]).to_string();
+        let reply = send(router.clone(), batch_request("QUERY", "/places", items)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let results = reply.json()["results"].clone();
+        assert_eq!(results[0]["status"], 200);
+        assert_eq!(results[1]["status"], 400);
+        assert_eq!(
+            results[1]["error"]["invalid_params"][0]["reason"],
+            "at most 7 ids"
+        );
+        // Past what a URI holds, so through the parser itself: a malformed id
+        // past the limit is never read.
+        let huge = format!("{}not-an-id", "osm:node:1,".repeat(1_000_000));
+        let refused = place_ids(&huge, 7).unwrap_err();
+        assert_eq!(refused.error_code().as_str(), "limit_too_large");
+        assert_eq!(refused.invalid_params()[0].reason, "at most 7 ids");
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

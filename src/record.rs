@@ -46,6 +46,7 @@ pub struct InterpolationRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreetRecord {
     pub name: String,
+    pub road_class: RoadClass,
     /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
     /// The town or city it lies in, which its label names: one name is
@@ -54,6 +55,8 @@ pub struct StreetRecord {
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
     pub source: SourceProvenance,
+    /// Ascending. A tile names the way a tap lands on.
+    pub other_ways: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +67,120 @@ pub struct PostcodeRecord {
     pub country: Option<CountryCode>,
     pub geometry: Geometry,
     pub source: DerivedSourceProvenance,
+}
+
+// Discriminants are the Pack encoding: renumbering needs a `RECORDS_VERSION`.
+/// What kind of road a street is, from its OSM `highway` tag, most important
+/// first. A link road (`motorway_link`) is its road's class.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum RoadClass {
+    Motorway = 0,
+    Trunk = 1,
+    Primary = 2,
+    Secondary = 3,
+    Tertiary = 4,
+    Unclassified = 5,
+    Residential = 6,
+    LivingStreet = 7,
+    Service = 8,
+    Pedestrian = 9,
+    Track = 10,
+    Busway = 11,
+    Cycleway = 12,
+    Footway = 13,
+    Path = 14,
+    Steps = 15,
+    #[default]
+    Other = 16,
+}
+
+impl RoadClass {
+    const ALL: [RoadClass; 17] = [
+        RoadClass::Motorway,
+        RoadClass::Trunk,
+        RoadClass::Primary,
+        RoadClass::Secondary,
+        RoadClass::Tertiary,
+        RoadClass::Unclassified,
+        RoadClass::Residential,
+        RoadClass::LivingStreet,
+        RoadClass::Service,
+        RoadClass::Pedestrian,
+        RoadClass::Track,
+        RoadClass::Busway,
+        RoadClass::Cycleway,
+        RoadClass::Footway,
+        RoadClass::Path,
+        RoadClass::Steps,
+        RoadClass::Other,
+    ];
+
+    pub fn of_highway(value: &str) -> Self {
+        match value.strip_suffix("_link").unwrap_or(value) {
+            "motorway" => Self::Motorway,
+            "trunk" => Self::Trunk,
+            "primary" => Self::Primary,
+            "secondary" => Self::Secondary,
+            "tertiary" => Self::Tertiary,
+            "unclassified" => Self::Unclassified,
+            "residential" => Self::Residential,
+            "living_street" => Self::LivingStreet,
+            "service" => Self::Service,
+            "pedestrian" => Self::Pedestrian,
+            "track" => Self::Track,
+            "busway" => Self::Busway,
+            "cycleway" => Self::Cycleway,
+            "footway" | "bridleway" => Self::Footway,
+            "path" => Self::Path,
+            "steps" => Self::Steps,
+            _ => Self::Other,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Motorway => "motorway",
+            Self::Trunk => "trunk",
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Tertiary => "tertiary",
+            Self::Unclassified => "unclassified",
+            Self::Residential => "residential",
+            Self::LivingStreet => "living_street",
+            Self::Service => "service",
+            Self::Pedestrian => "pedestrian",
+            Self::Track => "track",
+            Self::Busway => "busway",
+            Self::Cycleway => "cycleway",
+            Self::Footway => "footway",
+            Self::Path => "path",
+            Self::Steps => "steps",
+            Self::Other => "other",
+        }
+    }
+
+    pub const fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(byte)).copied()
+    }
 }
 
 /// A named point of interest. One that also states a valid address carries it,
@@ -80,18 +197,52 @@ pub struct PoiRecord {
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
     pub prominence: Prominence,
+    pub wikidata: Option<u32>,
+    pub brand: Option<Brand>,
+    /// Ids of objects merged into it: they still find it.
+    pub aliases: Vec<(ObjectType, i64)>,
 }
 
-/// How widely a POI is known, read from its own OSM tags alone: whether
-/// mappers linked it to Wikidata or Wikipedia, and in how many languages
-/// they named it. A museum of a city is linked and named in a dozen
-/// languages; a corner shop of the same name in neither. It breaks ties
-/// between POIs only (see the search's tie-break), never against another
-/// layer, and needs no data beyond the extract.
+/// A chain: its name and the number of its `brand:wikidata` item. The item
+/// is the chain's, never the place's, so it gives the place no importance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Brand {
+    #[schema(example = "Esso")]
+    pub name: String,
+    /// Its Wikidata item, such as `Q867662`, a stable id of the chain.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_item",
+        deserialize_with = "deserialize_item",
+        default
+    )]
+    #[schema(value_type = Option<String>, example = "Q867662")]
+    pub wikidata: Option<u32>,
+}
+
+// serde's `serialize_with` hands the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_item<S: Serializer>(item: &Option<u32>, serializer: S) -> Result<S::Ok, S::Error> {
+    match item {
+        Some(item) => serializer.serialize_str(&format!("Q{item}")),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_item<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let text = Option::<String>::deserialize(deserializer)?;
+    Ok(text.and_then(|text| text.strip_prefix('Q').and_then(|item| item.parse().ok())))
+}
+
+/// Breaks ties between POIs only, never against another layer.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub struct Prominence {
+    /// QRank, 0 when none. First field: it orders before the tags.
+    pub importance: u8,
     /// It carries `wikidata=` or `wikipedia=`.
     pub linked: bool,
     /// The languages of its `name:<lang>` tags, `ja`, `ja-Hira` and `ja_rm`
@@ -104,13 +255,14 @@ impl Prominence {
     /// and past a few dozen a name is everywhere already.
     pub const MAX_LANGUAGES: u8 = 127;
 
-    /// One byte: the languages, then whether it is linked.
+    /// Importance stored apart.
     pub fn to_byte(self) -> u8 {
         self.languages.min(Self::MAX_LANGUAGES) << 1 | u8::from(self.linked)
     }
 
-    pub const fn from_byte(byte: u8) -> Self {
+    pub const fn from_byte(byte: u8, importance: u8) -> Self {
         Self {
+            importance,
             linked: byte & 1 != 0,
             languages: byte >> 1,
         }
@@ -692,17 +844,28 @@ impl StreetRecord {
 
 impl Serialize for StreetRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreetRecord", 8)?;
+        let mut state = serializer.serialize_struct("StreetRecord", 10)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
         serialize_alt_names(&mut state, &self.alt_names)?;
+        state.serialize_field("road_class", &self.road_class)?;
         if let Some(locality) = &self.locality {
             state.serialize_field("locality", locality)?;
         }
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("representative_point", &self.representative_point)?;
         state.serialize_field("source", &self.source)?;
+        if self.other_ways.is_empty() {
+            state.skip_field("aliases")?;
+        } else {
+            let aliases = self
+                .other_ways
+                .iter()
+                .map(|way| labels::osm_record_id(ObjectType::Way, *way))
+                .collect::<Vec<_>>();
+            state.serialize_field("aliases", &aliases)?;
+        }
         state.end()
     }
 }
@@ -811,7 +974,7 @@ impl PoiRecord {
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 10)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 13)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -829,6 +992,24 @@ impl Serialize for PoiRecord {
             state.skip_field("prominence")?;
         } else {
             state.serialize_field("prominence", &self.prominence)?;
+        }
+        match self.wikidata {
+            Some(item) => state.serialize_field("wikidata", &format!("Q{item}"))?,
+            None => state.skip_field("wikidata")?,
+        }
+        match &self.brand {
+            Some(brand) => state.serialize_field("brand", brand)?,
+            None => state.skip_field("brand")?,
+        }
+        if self.aliases.is_empty() {
+            state.skip_field("aliases")?;
+        } else {
+            let aliases = self
+                .aliases
+                .iter()
+                .map(|(object_type, object_id)| labels::osm_record_id(*object_type, *object_id))
+                .collect::<Vec<_>>();
+            state.serialize_field("aliases", &aliases)?;
         }
         state.end()
     }

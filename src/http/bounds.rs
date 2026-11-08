@@ -8,13 +8,16 @@
 //! parsing and response size. The capacity limits an operator sets are in
 //! [`crate::limits`].
 
-use crate::http::problem::{InvalidParam, Problem};
+use crate::http::{
+    param::Param,
+    problem::{InvalidParam, Problem},
+};
 use crate::search::{BoundingBox, MAX_AUTOCOMPLETE_LIMIT};
 
 /// Maximum length (in Unicode scalar values) of a `q` query string.
 pub(crate) const MAX_QUERY_CHARS: usize = 256;
 
-/// Maximum `limit` a `/search` request may ask for. `search.rs` has no internal
+/// Maximum `limit` a `/geocode` or `/places` request may ask for. `search.rs` has no internal
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
 
@@ -51,16 +54,21 @@ pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
 }
 
 /// Like [`validate_query_length`] but additionally rejects an empty query, for
-/// `/search` where an empty `q` is a client error.
+/// `/geocode` and `/places`, where an empty `q` is a client error.
 pub(crate) fn validate_query(raw: &str) -> Result<String, Problem> {
     let query = validate_query_length(raw)?;
     if query.is_empty() {
-        return Err(Problem::invalid_query("q must not be empty"));
+        return Err(empty_query());
     }
     Ok(query)
 }
 
-/// Reject a `/search` `limit` above [`MAX_SEARCH_LIMIT`].
+/// The error for a `q` that was sent with no words.
+pub(crate) fn empty_query() -> Problem {
+    Problem::invalid_query("q must not be empty")
+}
+
+/// Reject a `/geocode` or `/places` `limit` above [`MAX_SEARCH_LIMIT`].
 pub(crate) fn validate_search_limit(limit: usize) -> Result<(), Problem> {
     if limit > MAX_SEARCH_LIMIT {
         return Err(Problem::limit_too_large(vec![InvalidParam::new(
@@ -100,10 +108,13 @@ pub(crate) fn validate_coords(lon: f64, lat: f64) -> Result<(), Problem> {
 }
 
 /// The degrees of a comma-separated list of `count` numbers, as `focus`
-/// and `bbox` write them. Empty or whitespace means none was given.
-fn degrees(name: &str, value: Option<&str>, count: usize) -> Result<Option<Vec<f64>>, Problem> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
+/// and `bbox` write them.
+fn degrees(name: &str, value: &Param, count: usize) -> Result<Option<Vec<f64>>, Problem> {
+    let value = match value {
+        // A map that always sends the key sends it blank when the caller has
+        // no point or box.
+        Param::Missing | Param::Empty => return Ok(None),
+        Param::Value(value) => value.trim(),
     };
     let numbers = value
         .split(',')
@@ -146,14 +157,14 @@ fn degrees(name: &str, value: Option<&str>, count: usize) -> Result<Option<Vec<f
 }
 
 /// Validate `focus`, the caller's `lon,lat`, like a reverse point.
-pub(crate) fn parse_focus(value: Option<&str>) -> Result<Option<[f64; 2]>, Problem> {
+pub(crate) fn parse_focus(value: &Param) -> Result<Option<[f64; 2]>, Problem> {
     Ok(degrees("focus", value, 2)?.map(|numbers| [numbers[0], numbers[1]]))
 }
 
 /// Validate `bbox`, `min_lon,min_lat,max_lon,max_lat`: each corner a valid
 /// point, west of east and south of north. A box across the antimeridian is
 /// two requests, as its west edge would lie east of its east edge.
-pub(crate) fn parse_bbox(value: Option<&str>) -> Result<Option<BoundingBox>, Problem> {
+pub(crate) fn parse_bbox(value: &Param) -> Result<Option<BoundingBox>, Problem> {
     let Some(numbers) = degrees("bbox", value, 4)? else {
         return Ok(None);
     };
@@ -181,37 +192,41 @@ pub(crate) fn parse_bbox(value: Option<&str>) -> Result<Option<BoundingBox>, Pro
 mod tests {
     use super::*;
 
+    fn value(text: &str) -> Param {
+        Param::Value(text.to_string())
+    }
+
     #[test]
     fn focus_and_bbox_are_points_in_range() {
-        assert_eq!(parse_focus(None).unwrap(), None);
-        assert_eq!(parse_focus(Some("  ")).unwrap(), None);
+        assert_eq!(parse_focus(&Param::Missing).unwrap(), None);
+        assert_eq!(parse_focus(&Param::Empty).unwrap(), None);
         assert_eq!(
-            parse_focus(Some("-79.38, 43.65")).unwrap(),
+            parse_focus(&value("-79.38, 43.65")).unwrap(),
             Some([-79.38, 43.65])
         );
-        let shape = parse_focus(Some("-79.38")).unwrap_err();
+        let shape = parse_focus(&value("-79.38")).unwrap_err();
         assert_eq!(shape.error_code().as_str(), "malformed_parameter");
         assert_eq!(shape.invalid_params()[0].name, "focus");
-        assert!(parse_focus(Some("a,b")).is_err());
-        let range = parse_focus(Some("200,43")).unwrap_err();
+        assert!(parse_focus(&value("a,b")).is_err());
+        let range = parse_focus(&value("200,43")).unwrap_err();
         assert_eq!(range.error_code().as_str(), "invalid_coordinate");
-        assert!(parse_focus(Some("NaN,43")).is_err());
-        assert!(parse_focus(Some("-79,inf")).is_err());
+        assert!(parse_focus(&value("NaN,43")).is_err());
+        assert!(parse_focus(&value("-79,inf")).is_err());
 
-        let bbox = parse_bbox(Some("-79.6,43.5,-79.1,43.9"))
+        let bbox = parse_bbox(&value("-79.6,43.5,-79.1,43.9"))
             .unwrap()
             .expect("bbox");
         assert!(bbox.contains(-79.38, 43.65));
         assert!(!bbox.contains(-80.0, 43.65));
-        assert_eq!(parse_bbox(Some("")).unwrap(), None);
-        assert!(parse_bbox(Some("-79.6,43.5,-79.1")).is_err());
-        let crossed = parse_bbox(Some("170,-10,-170,10")).unwrap_err();
+        assert_eq!(parse_bbox(&Param::Empty).unwrap(), None);
+        assert!(parse_bbox(&value("-79.6,43.5,-79.1")).is_err());
+        let crossed = parse_bbox(&value("170,-10,-170,10")).unwrap_err();
         assert_eq!(crossed.error_code().as_str(), "invalid_coordinate");
         assert_eq!(
             crossed.invalid_params()[0].reason,
             "min_lon must not exceed max_lon"
         );
-        assert!(parse_bbox(Some("-79,95,-78,96")).is_err());
+        assert!(parse_bbox(&value("-79,95,-78,96")).is_err());
     }
 
     #[test]

@@ -31,7 +31,7 @@ API contract changed: <!-- no / yes: which field, parameter or error -->
 | | main | this PR |
 |---|---|---|
 | Accuracy | <!-- per fixture register: right answers out of 2,000; answers changed --> | |
-| Time | <!-- /search p50 and p99; candidates scored per query; build time if rebuilt --> | |
+| Time | <!-- /geocode?q= p50 and p99; candidates scored per query; build time if rebuilt --> | |
 | Space | <!-- Pack size; peak query memory; binary size; build peak RAM and scratch if rebuilt --> | |
 
 ## Downsides

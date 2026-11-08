@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use geo::MultiPolygon;
 use osmpbf::{Element, PrimitiveBlock};
 
 use crate::{
@@ -17,10 +18,10 @@ use super::{
     address::{AddressCandidate, collect_clean_tags, emit_address},
     boundary::{BoundaryWay, Vertex},
     emitted::Emitted,
-    geometry::centroid,
+    geometry::{centroid, closed_way_polygon},
     interpolation::{InterpolationNode, emit_interpolation},
     locations::{Location, Locations},
-    poi::{PoiCandidate, emit_poi},
+    poi::{PoiCandidate, emit_poi, outline},
     scan::{may_matter, way_features},
     spill::{WayFeature, WayKind},
     street::emit_street,
@@ -165,8 +166,8 @@ pub(crate) fn emit_feature(
         }
         WayKind::Poi => {
             let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
-            match center {
-                Some((lat, lon)) => emit_poi(
+            match (center, nodes.as_deref()) {
+                (Some((lat, lon)), Some(nodes)) => emit_poi(
                     &PoiCandidate {
                         object_type: ObjectType::Way,
                         object_id: feature.way_id,
@@ -174,10 +175,13 @@ pub(crate) fn emit_feature(
                         lon,
                         location_precision: LocationPrecision::Centroid,
                         tags: feature.tags,
+                        outline: closed_way_polygon(&points(nodes))
+                            .map(|polygon| outline(&MultiPolygon::new(vec![polygon]))),
+                        nodes: nodes.iter().map(|node| node.id).collect(),
                     },
                     out,
                 ),
-                None => out.reject(
+                _ => out.reject(
                     CandidateIssue::WayWithoutResolvedNodes,
                     ObjectType::Way,
                     feature.way_id,

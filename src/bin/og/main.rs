@@ -509,7 +509,11 @@ mod tests {
             "x",
         ] {
             let shell = engine.search(query).unwrap();
-            let api = get(&format!("/search?q={}", query.replace(' ', "%20")));
+            let q = query.replace(' ', "%20");
+            let mut api = get(&format!("/geocode?q={q}"));
+            if api["features"].as_array().unwrap().is_empty() {
+                api = get(&format!("/places?q={q}"));
+            }
             assert_eq!(json(shell.collection.json(None)), api, "search {query}");
             assert!(!shell.hits.is_empty() || api["features"].as_array().unwrap().is_empty());
             // One feature picked from the list is that feature of the answer.

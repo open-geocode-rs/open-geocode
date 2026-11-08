@@ -527,6 +527,7 @@ impl Writer {
     pub fn finish(self) -> Result<Manifest> {
         let (mut sealed, _) = self.seal()?;
         crate::structured::add_to(&mut sealed)?;
+        crate::ids::add_to(&mut sealed)?;
         sealed.publish()
     }
 }
@@ -960,7 +961,9 @@ impl Reader {
         Ok(records)
     }
 
-    pub fn find_by_source_id(&self, source_id: &str) -> Result<Option<RecordId>> {
+    /// Full scan: a test oracle for the id catalogue, too slow to serve.
+    #[cfg(test)]
+    pub(crate) fn find_by_source_id(&self, source_id: &str) -> Result<Option<RecordId>> {
         for record_id in 0..self.records.record_count() {
             if self.record_summary(record_id)?.id == source_id {
                 return Ok(Some(record_id));

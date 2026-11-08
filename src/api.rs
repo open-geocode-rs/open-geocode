@@ -1,4 +1,4 @@
-//! The response contract of `/search`, `/autocomplete` and `/reverse`
+//! The response contract of `/geocode`, `/places`, `/autocomplete` and `/reverse`
 //! (ADR 0022).
 //!
 //! Every response is one GeoJSON FeatureCollection: a `geocoding` block that
@@ -20,8 +20,11 @@ use utoipa::ToSchema;
 
 use crate::{
     labels,
-    pack::{Reader, RecordId, Source, Summary},
-    record::{AddressComponents, InterpolationAddressComponents, Layer, ObjectType, PlaceLayer},
+    pack::{Reader, RecordId, Summary},
+    record::{
+        AddressComponents, Brand, InterpolationAddressComponents, Layer, OSM_DATASET, ObjectType,
+        PlaceLayer, RoadClass,
+    },
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
     search::TextSearchHit,
@@ -32,13 +35,14 @@ use crate::{
 // generator, which then emitted one `FeatureCollection` for both and
 // described each endpoint with the other's fields. Construction is still
 // shared, by [`common`] and the builders below.
-/// A GeoJSON FeatureCollection answering `/search`, `/autocomplete` or
-/// `/geocode`.
+/// A GeoJSON FeatureCollection answering `/geocode`, `/places` or
+/// `/autocomplete`.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ForwardCollection {
     #[serde(rename = "type")]
     pub kind: FeatureCollectionType,
-    /// The query, API version and data attribution.
+    /// The query, API version and the credits of the data sets the answer
+    /// comes from.
     pub geocoding: ForwardGeocoding,
     pub features: Vec<ForwardFeature>,
 }
@@ -49,7 +53,8 @@ pub struct ForwardCollection {
 pub struct ReverseCollection {
     #[serde(rename = "type")]
     pub kind: FeatureCollectionType,
-    /// The queried point, API version and data attribution.
+    /// The queried point, API version and the credits of the data sets the
+    /// answer comes from.
     pub geocoding: ReverseGeocoding,
     pub features: Vec<ReverseFeature>,
 }
@@ -67,11 +72,54 @@ pub enum Version {
     V1,
 }
 
-/// Attribution required by the data licence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
-pub enum Attribution {
-    #[serde(rename = "© OpenStreetMap contributors, ODbL")]
-    OpenStreetMap,
+/// A data set an answer comes from and how its licence asks it to be
+/// credited. OpenStreetMap is always first: every answer's areas and labels
+/// come from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct Attribution {
+    /// Whom to credit, such as `© OpenStreetMap contributors`, or the data
+    /// set's name when its licence asks for no credit or is not known.
+    #[schema(example = "© OpenStreetMap contributors")]
+    pub text: String,
+    /// The licence's name, such as `ODbL 1.0` or `CC BY 4.0`. Absent when
+    /// the data set's source states none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub licence: Option<String>,
+    /// The licence's terms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// The data set a result comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct Source {
+    /// `osm`, or an imported data set such as `openaddresses:nz/countrywide`.
+    #[schema(example = "osm")]
+    pub dataset: String,
+}
+
+fn attribution<'a>(pack: &Reader, datasets: impl Iterator<Item = &'a str>) -> Vec<Attribution> {
+    let mut named = vec![OSM_DATASET];
+    for dataset in datasets {
+        if !named.contains(&dataset) {
+            named.push(dataset);
+        }
+    }
+    named
+        .into_iter()
+        .map(|dataset| match pack.records().licence(dataset) {
+            Some(licence) => Attribution {
+                text: licence.attribution.unwrap_or_else(|| dataset.to_string()),
+                licence: Some(licence.name),
+                url: licence.url,
+            },
+            None => Attribution {
+                text: dataset.to_string(),
+                licence: None,
+                url: None,
+            },
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -80,7 +128,7 @@ pub struct ForwardGeocoding {
     /// Query as received, trimmed, with each run of whitespace collapsed to
     /// one space.
     pub query: String,
-    pub attribution: Attribution,
+    pub attribution: Vec<Attribution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
@@ -88,7 +136,7 @@ pub struct ReverseGeocoding {
     pub version: Version,
     /// Queried point.
     pub point: LonLat,
-    pub attribution: Attribution,
+    pub attribution: Vec<Attribution>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
@@ -140,10 +188,9 @@ pub enum PointType {
 /// Properties shared by forward and reverse results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct Common {
-    /// Stable ID from the source data, such as `osm:node:123`.
+    /// Stable ID from the source data, such as `osm:node:123`. Store it to
+    /// find the record again: it outlives a Pack rebuild.
     pub id: String,
-    /// Row of the record in this Pack. Changes between Pack builds.
-    pub record_id: RecordId,
     pub layer: Layer,
     pub accuracy: Accuracy,
     /// House number and street for an address (`12 King Street West`), or
@@ -154,6 +201,14 @@ pub struct Common {
     /// POI category, such as `amenity:cafe`. Present only on POIs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// The class of road a street is, the most important of its ways, such
+    /// as `motorway` or `residential`. Present only on streets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub road_class: Option<RoadClass>,
+    /// The chain a place belongs to, when its name may not say: "Tankstation
+    /// Zanoli" is an Esso. Present only on places.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -220,7 +275,7 @@ pub enum Accuracy {
 
 impl Accuracy {
     /// The accuracy of a record's own point.
-    pub fn of(precision: records::PointPrecision, source: &Source) -> Self {
+    pub fn of(precision: records::PointPrecision, source: &records::Source) -> Self {
         match precision {
             records::PointPrecision::Point => Self::Rooftop,
             records::PointPrecision::Estimated => Self::Interpolated,
@@ -476,7 +531,7 @@ impl<'a> Contexts<'a> {
     }
 }
 
-/// The answer to `/search` or `/autocomplete`: one feature per hit, in the
+/// The answer to `/geocode`, `/places` or `/autocomplete`: one feature per hit, in the
 /// order search ranked them.
 pub fn forward_collection(
     pack: &Reader,
@@ -488,12 +543,18 @@ pub fn forward_collection(
         .into_iter()
         .map(|hit| forward_feature(&mut contexts, hit))
         .collect::<Result<Vec<_>>>()?;
+    let attribution = attribution(
+        pack,
+        features
+            .iter()
+            .map(|feature| feature.properties.common.source.dataset.as_str()),
+    );
     Ok(ForwardCollection {
         kind: FeatureCollectionType::FeatureCollection,
         geocoding: ForwardGeocoding {
             version: Version::V1,
             query,
-            attribution: Attribution::OpenStreetMap,
+            attribution,
         },
         features,
     })
@@ -614,6 +675,12 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
         features.push(ReverseFeature::new(point.lon, point.lat, properties));
     }
 
+    let attribution = attribution(
+        pack,
+        features
+            .iter()
+            .map(|feature| feature.properties.common.source.dataset.as_str()),
+    );
     Ok(ReverseCollection {
         kind: FeatureCollectionType::FeatureCollection,
         geocoding: ReverseGeocoding {
@@ -622,7 +689,7 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
                 lon: response.lon,
                 lat: response.lat,
             },
-            attribution: Attribution::OpenStreetMap,
+            attribution,
         },
         features,
     })
@@ -673,15 +740,18 @@ fn common(
     })?;
     Ok(Common {
         id: summary.id,
-        record_id,
         layer,
         accuracy,
         name: summary.name,
         label: summary.label,
         category: summary.category,
+        road_class: summary.road_class,
+        brand: summary.brand,
         address: summary.address,
         context: contexts.of(record_id)?,
-        source: summary.source,
+        source: Source {
+            dataset: summary.source.dataset,
+        },
     })
 }
 
@@ -728,7 +798,6 @@ fn flat(
     vec![
         ("score", score.unwrap_or_default()),
         ("confidence", confidence.unwrap_or_default()),
-        ("record_id", field(&|p| Some(p.record_id.to_string()))),
         ("id", field(&|p| Some(p.id.clone()))),
         ("layer", field(&|p| Some(p.layer.as_str().to_string()))),
         (
@@ -738,6 +807,14 @@ fn flat(
         ("name", field(&|p| Some(p.name.clone()))),
         ("label", field(&|p| Some(p.label.clone()))),
         ("category", field(&|p| p.category.clone())),
+        (
+            "brand",
+            field(&|p| p.brand.as_ref().map(|brand| brand.name.clone())),
+        ),
+        (
+            "road_class",
+            field(&|p| p.road_class.map(|class| class.as_str().to_string())),
+        ),
         ("lat", coordinate(1)),
         ("lon", coordinate(0)),
         (
@@ -765,26 +842,6 @@ fn flat(
         ("context_country", area(|context| &context.country)),
         ("context_place", area(|context| &context.place)),
         ("source_dataset", field(&|p| Some(p.source.dataset.clone()))),
-        (
-            "source_object_type",
-            field(&|p| {
-                p.source
-                    .object_type
-                    .map(|kind| labels::object_type_name(kind).to_string())
-            }),
-        ),
-        (
-            "source_object_id",
-            field(&|p| p.source.object_id.map(|id| id.to_string())),
-        ),
-        (
-            "source_derived_from",
-            field(&|p| p.source.derived_from.clone()),
-        ),
-        (
-            "source_record_count",
-            field(&|p| p.source.record_count.map(|count| count.to_string())),
-        ),
     ]
 }
 
@@ -794,8 +851,70 @@ mod tests {
 
     use super::*;
 
-    fn source(object_type: Option<ObjectType>) -> Source {
-        Source {
+    #[test]
+    fn an_answer_credits_openstreetmap_and_each_imported_data_set_it_holds() {
+        use crate::record::{AddressRecord, LocationPrecision, SourceProvenance, point_geometry};
+        let dir = std::env::temp_dir().join(format!(
+            "open-geocode-api-attribution-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut writer = crate::pack::Writer::create(&dir).expect("writer");
+        writer
+            .write(
+                &AddressRecord {
+                    disputed: false,
+                    street_postcodes: Vec::new(),
+                    address: AddressComponents {
+                        areas: Vec::new(),
+                        number: "1".to_string(),
+                        street: Some("Avenida de Mayo".to_string()),
+                        place: None,
+                        unit: None,
+                        locality: None,
+                        region: None,
+                        postcode: None,
+                        country: None,
+                    },
+                    geometry: point_geometry(-58.38, -34.6),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::imported(
+                        "openaddresses:ar/c/city_of_buenos_aires",
+                        7,
+                    ),
+                }
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let pack = std::sync::Arc::new(Reader::open(&dir).expect("pack"));
+        let geocoder =
+            reverse::PackReverseGeocoder::from_pack(std::sync::Arc::clone(&pack)).expect("reverse");
+        let response = geocoder
+            .reverse(reverse::GeocodeOptions::at(-58.38, -34.6))
+            .expect("answer");
+        let collection = reverse_collection(&pack, &response).expect("collection");
+        let _ = std::fs::remove_dir_all(&dir);
+        let credits = serde_json::to_value(&collection.geocoding.attribution).expect("json");
+        assert_eq!(
+            credits,
+            json!([
+                {
+                    "text": "© OpenStreetMap contributors",
+                    "licence": "ODbL 1.0",
+                    "url": "https://www.openstreetmap.org/copyright"
+                },
+                {
+                    "text": "OpenAddresses ar/c/city_of_buenos_aires",
+                    "licence": "CC BY 2.5 AR",
+                    "url": "https://creativecommons.org/licenses/by/2.5/ar"
+                }
+            ])
+        );
+    }
+
+    fn source(object_type: Option<ObjectType>) -> records::Source {
+        records::Source {
             dataset: "osm".to_string(),
             object_type,
             object_id: object_type.map(|_| 1),

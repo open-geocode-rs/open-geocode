@@ -80,7 +80,19 @@ const PASTED_KEY_NAMESPACES: [&str; 8] = [
 
 /// Keys whose values are other names of the feature, with or without a
 /// `:<lang>` suffix.
-const ALT_NAME_KEYS: [&str; 4] = ["alt_name", "official_name", "short_name", "old_name"];
+/// Airport codes count: travellers type "AMS".
+const ALT_NAME_KEYS: [&str; 10] = [
+    "alt_name",
+    "official_name",
+    "short_name",
+    "old_name",
+    "loc_name",
+    "int_name",
+    "reg_name",
+    "iata",
+    "icao",
+    "faa",
+];
 
 /// Whether `key` holds a name of the feature: `name`, `name:<lang>`, or one
 /// of [`ALT_NAME_KEYS`] with or without `:<lang>`. A language is a BCP 47
@@ -112,6 +124,7 @@ pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
     Prominence {
         linked: tags.has("wikidata") || tags.has("wikipedia"),
         languages: languages.len().min(usize::from(Prominence::MAX_LANGUAGES)) as u8,
+        importance: 0,
     }
 }
 
@@ -225,6 +238,7 @@ mod tests {
             Prominence {
                 linked: true,
                 languages: 2,
+                importance: 0,
             },
             "ja and its scripts are one language; an etymology, a blank and an alt name none"
         );
@@ -232,13 +246,15 @@ mod tests {
         let byte = Prominence {
             linked: true,
             languages: 5,
+            importance: 0,
         }
         .to_byte();
         assert_eq!(
-            Prominence::from_byte(byte),
+            Prominence::from_byte(byte, 9),
             Prominence {
                 linked: true,
-                languages: 5
+                languages: 5,
+                importance: 9,
             }
         );
     }
@@ -270,6 +286,9 @@ mod tests {
             "official_name",
             "short_name:en",
             "old_name",
+            "loc_name",
+            "int_name",
+            "iata",
         ] {
             assert!(is_name_key(key), "{key}");
         }
@@ -279,7 +298,6 @@ mod tests {
             "name:prefix",
             "name:",
             "old_name:1897-2010",
-            "loc_name",
             "sorting_name",
             "nameplate",
             "name:EN",

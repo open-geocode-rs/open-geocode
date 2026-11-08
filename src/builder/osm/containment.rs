@@ -207,6 +207,25 @@ pub(crate) fn covers(block: &[u8], lon: f64, lat: f64) -> bool {
     inside
 }
 
+/// The box around the area of `block`: west, south, east, north.
+pub(crate) fn extent(block: &[u8]) -> [f64; 4] {
+    let u32_at = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"));
+    let f64_at = |at: usize| f64::from_le_bytes(block[at..at + 8].try_into().expect("8 bytes"));
+    let vertices = u32_at(0) as usize;
+    let coords_at = HEADER_BYTES + 4 * u32_at(4) as usize;
+    let (west, east) = (0..vertices)
+        .map(|index| {
+            let at = coords_at + 8 * index;
+            degrees(i32::from_le_bytes(
+                block[at..at + 4].try_into().expect("4 bytes"),
+            ))
+        })
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), lon| {
+            (lo.min(lon), hi.max(lon))
+        });
+    [west, f64_at(16), east, f64_at(24)]
+}
+
 /// The shape file as it is written, one block after another.
 pub(crate) struct ShapeWriter {
     file: BufWriter<ScratchFile>,
@@ -328,7 +347,7 @@ impl Drop for Shapes {
 
 #[cfg(test)]
 mod tests {
-    use geo::{Covers, LineString, Point, Polygon};
+    use geo::{BoundingRect, Covers, LineString, Point, Polygon};
 
     use super::*;
 
@@ -372,6 +391,17 @@ mod tests {
         assert!(covers(&block, 10.0, 0.0), "a vertex is covered");
         assert!(!covers(&block, 2.0, 1.0), "the hole is not");
         assert!(covers(&block, 30.0, 5.0), "the second part is");
+        let [west, south, east, north] = extent(&block);
+        let bounds = geometry.bounding_rect().expect("a box");
+        assert_eq!(
+            [west, south, east, north],
+            [
+                bounds.min().x,
+                bounds.min().y,
+                bounds.max().x,
+                bounds.max().y
+            ]
+        );
     }
 
     #[test]

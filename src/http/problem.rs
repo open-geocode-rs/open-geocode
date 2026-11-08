@@ -54,6 +54,7 @@ pub(crate) enum ErrorCode {
     InternalError,
     Busy,
     Timeout,
+    PackOutdated,
 }
 
 impl ErrorCode {
@@ -72,6 +73,7 @@ impl ErrorCode {
             Self::InternalError => "internal_error",
             Self::Busy => "busy",
             Self::Timeout => "timeout",
+            Self::PackOutdated => "pack_outdated",
         }
     }
 
@@ -287,6 +289,10 @@ impl Problem {
 
     /// A generic 500. The body carries no detail so internal errors never
     /// leak; the cause rides along privately for the log.
+    pub(crate) fn pack_outdated(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::PackOutdated).with_detail(detail)
+    }
+
     pub(crate) fn internal(cause: anyhow::Error) -> Self {
         let mut problem = Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError);
         problem.0.cause = Some(Arc::new(cause));
@@ -412,7 +418,7 @@ mod tests {
         assert!(value.get("instance").is_none());
     }
 
-    const ALL_CODES: [ErrorCode; 13] = [
+    const ALL_CODES: [ErrorCode; 14] = [
         ErrorCode::InvalidQuery,
         ErrorCode::InvalidCoordinate,
         ErrorCode::LimitTooLarge,
@@ -426,6 +432,7 @@ mod tests {
         ErrorCode::InternalError,
         ErrorCode::Busy,
         ErrorCode::Timeout,
+        ErrorCode::PackOutdated,
     ];
 
     /// `type` is either RFC 9457's `about:blank` or a URI that can actually be

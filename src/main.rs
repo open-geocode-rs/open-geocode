@@ -25,6 +25,7 @@ use open_geocode::{
     },
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
+    ids::{self, Catalogue},
     limits::Limits,
     openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
@@ -35,6 +36,7 @@ use open_geocode::{
         },
         lattice::LatticeTagger,
     },
+    record::Layer,
     resources,
     reverse::{self, PackReverseGeocoder},
     runtime::{DEFAULT_SHUTDOWN_TIMEOUT_SECS, ServeOptions, serve},
@@ -192,6 +194,13 @@ enum PackCommand {
         /// several.
         #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
         address_files: Vec<String>,
+
+        /// Rank places by how much their Wikidata items are read, from a
+        /// QRank file (`qrank.csv.gz` from https://qrank.toolforge.org),
+        /// gzipped or not. Without one, places of one name are told apart
+        /// by their tags alone.
+        #[arg(long, value_name = "PATH")]
+        qrank: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -204,7 +213,8 @@ enum PackCommand {
         #[arg(long)]
         row: Option<RecordId>,
 
-        /// Read one Pack record by source id, for example osm:node:123.
+        /// Read the place, area or street of a stable id, for example
+        /// osm:node:123, through the Pack's id catalogue.
         #[arg(long)]
         id: Option<String>,
 
@@ -593,6 +603,7 @@ async fn main() -> Result<()> {
             openaddresses,
             openaddresses_zip,
             address_files,
+            qrank,
         }) => {
             resources::opt_out_of_power_throttling();
             resources::yield_to_interactive_programs();
@@ -606,6 +617,7 @@ async fn main() -> Result<()> {
                 inputs,
                 pack,
                 addresses,
+                qrank,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()
@@ -938,9 +950,22 @@ fn inspect_record_by_source_id_json(
     source_id: &str,
     include_context: bool,
 ) -> Result<Value> {
-    match reader.find_by_source_id(source_id)? {
-        Some(record_id) => inspect_record_json(reader, record_id, include_context),
-        None => bail!("record not found: {source_id}"),
+    let Some(catalogue) = Catalogue::open(reader.container())? else {
+        bail!("this Pack has no id catalogue: rebuild it, or inspect by --row");
+    };
+    let Some((object_type, object_id)) = ids::parse(source_id)? else {
+        bail!("only places and areas are found by id; {source_id} is neither");
+    };
+    let found = catalogue.find(reader.records(), object_type, object_id)?;
+    match found.as_slice() {
+        [] => bail!("no place, area or street has id {source_id}"),
+        [record_id] => inspect_record_json(reader, *record_id, include_context),
+        records => Ok(Value::Array(
+            records
+                .iter()
+                .map(|record_id| inspect_record_json(reader, *record_id, include_context))
+                .collect::<Result<_>>()?,
+        )),
     }
 }
 
@@ -1071,14 +1096,17 @@ fn parse_query(pack: &Path, query: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `/search` answer for `query`, as the Runtime gives it.
 fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
-    let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
+    let mut searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
+    let places = layer.as_deref() == Some(Layer::Poi.as_str());
+    if places {
+        searcher = searcher.places();
+    }
     let hits = searcher.search(&TextSearchOptions {
         query: query.clone(),
         limit,
-        layer,
+        layer: layer.filter(|_| !places),
         countries: Vec::new(),
         focus: None,
         bbox: None,
@@ -1092,7 +1120,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
-    let response = geocoder.reverse(reverse::GeocodeOptions { lon, lat })?;
+    let response = geocoder.reverse(reverse::GeocodeOptions::at(lon, lat))?;
     write_json(&serde_json::to_value(api::reverse_collection(
         &pack, &response,
     )?)?)

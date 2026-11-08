@@ -1,5 +1,5 @@
 //! The response contract checked against what the code produces (ADR 0022):
-//! real `/search`, `/autocomplete`, `/geocode` and `/reverse` answers, and a
+//! real `/geocode`, `/places`, `/autocomplete` and `/reverse` answers, and a
 //! batch, from the router on a small Pack are the committed examples in
 //! `contract/responses/`, and the
 //! geocode batch audit columns are the committed
@@ -22,7 +22,7 @@ use crate::{
     batch,
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
-    pack::{RecordId, Writer},
+    pack::Writer,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
         InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
@@ -231,7 +231,7 @@ async fn responses_match_the_committed_examples() {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let ids = write_pack(&pack);
+    write_pack(&pack);
     let router = build_router(
         AppState::open(
             &pack,
@@ -243,8 +243,8 @@ async fn responses_match_the_committed_examples() {
         Some(&pack.join("basemap.pmtiles")),
     );
 
-    let address = get(&router, "/search?q=10%20King%20Street").await;
-    assert_example("search-address", &address);
+    let address = get(&router, "/geocode?q=10%20King%20Street").await;
+    assert_example("geocode-text", &address);
     assert_eq!(address["type"], "FeatureCollection");
     assert_eq!(address["geocoding"]["query"], "10 King Street");
     let top = &address["features"][0];
@@ -270,16 +270,52 @@ async fn responses_match_the_committed_examples() {
     assert!((0.0..=1.0).contains(&confidence), "{confidence}");
     assert!(properties.get("distance_m").is_none());
 
-    let poi = get(&router, "/search?q=Queen%20Bakery").await;
-    assert_example("search-poi", &poi);
+    let poi = get(&router, "/places?q=Queen%20Bakery").await;
+    assert_example("places", &poi);
     let properties = &poi["features"][0]["properties"];
     assert_eq!(properties["layer"], "poi");
     assert_eq!(properties["name"], "Queen Bakery");
     assert_eq!(properties["category"], "shop:bakery");
     assert_eq!(properties["accuracy"], "centroid");
+    let by_id = get(&router, "/places?ids=osm:way:999,osm:way:11,osm:relation:3").await;
+    assert_example("places-ids", &by_id);
+    let found = by_id["features"]
+        .as_array()
+        .expect("features")
+        .iter()
+        .map(|feature| feature["properties"]["id"].as_str().expect("id"))
+        .collect::<Vec<_>>();
+    assert_eq!(found, ["osm:way:11", "osm:relation:3"]);
+    let (status, malformed) = get_error(&router, "/places?ids=11").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(malformed["error_code"], "malformed_parameter");
+    // The default batch item limit caps `ids` too.
+    let at_limit = ["osm:node:1"; 1000].join(",");
+    get(&router, &format!("/places?ids={at_limit}")).await;
+    let many = ["osm:node:1"; 1001].join(",");
+    let (status, refused) = get_error(&router, &format!("/places?ids={many}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error_code"], "limit_too_large");
+    assert_eq!(refused["invalid_params"][0]["reason"], "at most 1000 ids");
+    let (status, _) = get_error(&router, "/places?ids=osm:node:1&q=x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let estimated = get(&router, "/search?q=50%20Queen%20Street").await;
-    assert_example("search-interpolation", &estimated);
+    let bakery = get(&router, "/geocode?q=Queen%20Bakery").await;
+    assert!(
+        bakery["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .all(|feature| feature["properties"]["layer"] != "poi"),
+        "{bakery}"
+    );
+    let (status, both) =
+        get_error(&router, "/geocode?q=10%20King%20Street&address=10%20King").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(both["invalid_params"][0]["name"], "q");
+
+    let estimated = get(&router, "/geocode?q=50%20Queen%20Street").await;
+    assert_example("geocode-interpolation", &estimated);
     let properties = &estimated["features"][0]["properties"];
     assert_eq!(properties["layer"], "interpolation");
     assert_eq!(properties["accuracy"], "interpolated");
@@ -288,8 +324,8 @@ async fn responses_match_the_committed_examples() {
 
     // An address the Pack lacks, in a town it holds, is answered with the
     // town, and the answer says so; an answer that matches says nothing.
-    let fallback = get(&router, "/search?q=99%20Nowhere%20Lane%2C%20Toronto").await;
-    assert_example("search-fallback", &fallback);
+    let fallback = get(&router, "/geocode?q=99%20Nowhere%20Lane%2C%20Toronto").await;
+    assert_example("geocode-fallback", &fallback);
     let properties = &fallback["features"][0]["properties"];
     assert_eq!(properties["fallback"], true);
     assert_eq!(properties["layer"], "locality");
@@ -301,8 +337,8 @@ async fn responses_match_the_committed_examples() {
     );
 
     for (name, uri) in [
-        ("search-street", "/search?q=King%20Street"),
-        ("search-locality", "/search?q=Toronto"),
+        ("geocode-street", "/geocode?q=King%20Street"),
+        ("geocode-locality", "/geocode?q=Toronto"),
     ] {
         assert_example(name, &get(&router, uri).await);
     }
@@ -310,14 +346,14 @@ async fn responses_match_the_committed_examples() {
     // box holds answers, and one wholly outside it does not.
     let near = get(
         &router,
-        "/search?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
+        "/geocode?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
     )
     .await;
-    assert_example("search-near", &near);
+    assert_example("geocode-near", &near);
     assert!(!near["features"].as_array().expect("features").is_empty());
-    let far = get(&router, "/search?q=King%20Street&bbox=10,10,11,11").await;
+    let far = get(&router, "/geocode?q=King%20Street&bbox=10,10,11,11").await;
     assert_eq!(far["features"], json!([]));
-    let (status, crossed) = get_error(&router, "/search?q=king&bbox=170,-10,-170,10").await;
+    let (status, crossed) = get_error(&router, "/geocode?q=king&bbox=170,-10,-170,10").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(crossed["error_code"], "invalid_coordinate");
     assert_eq!(crossed["invalid_params"][0]["name"], "bbox");
@@ -345,7 +381,12 @@ async fn responses_match_the_committed_examples() {
         .map(|feature| feature["properties"]["layer"].as_str().expect("layer"))
         .collect::<Vec<_>>();
     assert_eq!(layers, ["address", "locality", "region", "country"]);
-    assert_eq!(features[0]["properties"]["record_id"], ids.address);
+    assert_eq!(features[0]["properties"]["id"], "osm:node:10");
+    assert!(features[0]["properties"].get("record_id").is_none());
+    assert_eq!(
+        on_address["geocoding"]["attribution"][0]["licence"],
+        "ODbL 1.0"
+    );
     assert_eq!(features[0]["properties"]["distance_m"], 0.0);
     assert!(features[1]["properties"].get("distance_m").is_none());
     assert!(features[0]["properties"].get("score").is_none());
@@ -365,6 +406,12 @@ async fn responses_match_the_committed_examples() {
             .expect("number")
     );
 
+    let street_only = get(&router, "/reverse?lon=-79.0&lat=43.0&layer=street").await;
+    assert_example("reverse-layer", &street_only);
+    let features = street_only["features"].as_array().expect("features");
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0]["properties"]["layer"], "street");
+
     // Far from everything but the areas.
     let context_only = get(&router, "/reverse?lon=-79.2&lat=43.2").await;
     assert_example("reverse-areas", &context_only);
@@ -373,8 +420,6 @@ async fn responses_match_the_committed_examples() {
     assert_example("reverse-nothing", &nothing);
     assert_eq!(nothing["features"], json!([]));
 
-    // `/geocode` answers with the same collection as `/search`, holding the
-    // one address that fits, so a client parses one shape for both.
     let structured = get(
         &router,
         "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
@@ -404,7 +449,7 @@ async fn responses_match_the_committed_examples() {
 
     // Errors are part of the contract too: a client branches on `error_code`
     // and shows `detail`, so both are committed like any answer.
-    let (status, empty_query) = get_error(&router, "/search?q=").await;
+    let (status, empty_query) = get_error(&router, "/geocode?q=").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_example("error-invalid-query", &empty_query);
     assert_eq!(empty_query["error_code"], "invalid_query");
@@ -418,21 +463,21 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(out_of_range["error_code"], "invalid_coordinate");
     assert_eq!(out_of_range["invalid_params"][0]["name"], "lat");
 
-    let (status, unknown_layer) = get_error(&router, "/search?q=king&layer=bogus").await;
+    let (status, unknown_layer) = get_error(&router, "/geocode?q=king&layer=bogus").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_example("error-malformed-parameter", &unknown_layer);
     assert_eq!(unknown_layer["error_code"], "malformed_parameter");
 
     // A country code that is not two letters is a typo, and is rejected like
     // an unknown layer rather than silently matching nothing.
-    let (status, bad_country) = get_error(&router, "/search?q=king&country=Canada").await;
+    let (status, bad_country) = get_error(&router, "/geocode?q=king&country=Canada").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(bad_country["error_code"], "malformed_parameter");
     assert_eq!(bad_country["invalid_params"][0]["name"], "country");
 
     // A well-formed country the Pack does not cover is not an error: it is
     // an empty answer.
-    let elsewhere = get(&router, "/search?q=king&country=FR").await;
+    let elsewhere = get(&router, "/geocode?q=king&country=FR").await;
     assert_eq!(
         elsewhere["features"].as_array().expect("features").len(),
         0,
@@ -441,8 +486,8 @@ async fn responses_match_the_committed_examples() {
 
     // The country the contract Pack is built from finds the same places the
     // unfiltered query does, so the filter narrows without changing ranking.
-    let unfiltered = get(&router, "/search?q=king").await;
-    let filtered = get(&router, "/search?q=king&country=CA").await;
+    let unfiltered = get(&router, "/geocode?q=king").await;
+    let filtered = get(&router, "/geocode?q=king&country=CA").await;
     assert_eq!(unfiltered["features"], filtered["features"]);
 
     let _ = std::fs::remove_dir_all(&pack);
@@ -490,6 +535,21 @@ async fn batch_results_are_their_get_answers() {
                 {"address": ""},
                 {"address": "10 King Street", "layer": "bogus"},
                 {"address": "10 King Street", "limit": 51},
+            ]),
+        ),
+        (
+            "/places",
+            "country=CA",
+            json!([
+                {"id": "row-1", "ids": "osm:way:999,osm:way:11,osm:relation:3"},
+                {"id": "row-2", "q": "Queen Bakery"},
+                {"ids": "11"},
+                {"ids": "osm:way:11", "q": "Queen Bakery"},
+                {"ids": ""},
+                {"q": ""},
+                {"q": "Queen Bakery", "country": "FR"},
+                {"q": "Queen Bakery", "limit": 51},
+                {},
             ]),
         ),
         (
@@ -555,6 +615,120 @@ async fn batch_results_are_their_get_answers() {
     let example: Value = serde_json::from_slice(&example).expect("batch is JSON");
     assert_example("batch-geocode", &example);
     batch_schemas_match_the_rendered_body(&example);
+
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// A `/places` batch answers ids and names side by side, each item in its
+/// place; an id no record has is left out, and a malformed one fails only
+/// its item. The batch item limit caps the items and, item by item, the ids.
+#[tokio::test]
+async fn places_batch_answers_ids_and_names_in_order() {
+    let pack = contract_pack();
+    let limits = crate::limits::Limits {
+        max_batch_items: std::num::NonZeroUsize::new(3).expect("3"),
+        ..crate::limits::Limits::DEFAULT
+    };
+    let router = build_router(
+        AppState::open(&pack, &pack.with_extension("jobs"), limits).expect("open pack"),
+        None,
+        None,
+    );
+    let found = |answer: &Value| -> Vec<String> {
+        answer["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| {
+                feature["properties"]["id"]
+                    .as_str()
+                    .expect("id")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let body = json!([
+        {"id": "saved", "ids": "osm:relation:3,osm:way:999,osm:way:11"},
+        {"id": "typed", "q": "Queen Bakery"},
+        {"id": "broken", "ids": "osm:way:11,11"},
+    ])
+    .to_string();
+    let (status, query) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, post) = send_raw(&router, "POST", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(query, post, "QUERY and POST answer differently");
+
+    let batch: Value = serde_json::from_slice(&query).expect("batch is JSON");
+    let results = batch["results"].as_array().expect("results");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["id"], "saved");
+    assert_eq!(results[0]["status"], 200);
+    assert_eq!(
+        found(&results[0]["response"]),
+        ["osm:relation:3", "osm:way:11"]
+    );
+    assert_eq!(
+        results[0]["response"]["geocoding"]["query"],
+        "osm:relation:3,osm:way:999,osm:way:11"
+    );
+    assert_eq!(results[1]["id"], "typed");
+    assert_eq!(results[1]["status"], 200);
+    assert_eq!(found(&results[1]["response"])[0], "osm:way:11");
+    assert_eq!(results[2]["id"], "broken");
+    assert_eq!(results[2]["status"], 400);
+    assert_eq!(results[2]["error"]["error_code"], "malformed_parameter");
+    assert_eq!(
+        results[2]["error"]["detail"],
+        "\"11\" is no record id, such as osm:node:123"
+    );
+    assert_eq!(
+        batch["summary"],
+        json!({"total": 3, "succeeded": 2, "failed": 1})
+    );
+
+    // An item holds as many ids as the limit, and one more fails that item
+    // alone.
+    let body = json!([
+        {"ids": "osm:way:11,osm:way:11,osm:way:11"},
+        {"ids": "osm:way:11,osm:way:11,osm:way:11,osm:way:11"},
+    ])
+    .to_string();
+    let (status, answer) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let batch: Value = serde_json::from_slice(&answer).expect("batch is JSON");
+    assert_eq!(batch["results"][0]["status"], 200);
+    assert_eq!(
+        found(&batch["results"][0]["response"]),
+        ["osm:way:11", "osm:way:11", "osm:way:11"]
+    );
+    assert_eq!(batch["results"][1]["status"], 400);
+    assert_eq!(
+        batch["results"][1]["error"]["error_code"],
+        "limit_too_large"
+    );
+    assert_eq!(
+        batch["results"][1]["error"]["invalid_params"][0]["reason"],
+        "at most 3 ids"
+    );
+
+    // A body of one item past the limit is refused whole, by either method.
+    let over = Value::Array(vec![json!({"q": "Queen Bakery"}); 4]).to_string();
+    for method in ["QUERY", "POST"] {
+        let (status, refused) = send_raw(&router, method, "/places", Some(&over)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method}");
+        let refused: Value = serde_json::from_slice(&refused).expect("problem is JSON");
+        assert_eq!(refused["error_code"], "too_many_items", "{method}");
+        assert_eq!(
+            refused["detail"], "a batch holds at most 3 items",
+            "{method}"
+        );
+    }
+    let empty = send_raw(&router, "QUERY", "/places", Some("[]")).await;
+    assert_eq!(empty.0, StatusCode::OK);
+    let empty: Value = serde_json::from_slice(&empty.1).expect("batch is JSON");
+    assert_eq!(empty["results"], json!([]));
 
     let _ = std::fs::remove_dir_all(&pack);
 }
@@ -689,13 +863,9 @@ async fn get(router: &Router, uri: &str) -> Value {
     serde_json::from_slice(&body).expect("response body is JSON")
 }
 
-struct Ids {
-    address: RecordId,
-}
-
 /// Canada > Ontario > Toronto, an address, a POI with an address, a street
 /// and an interpolation range in Toronto.
-fn write_pack(dir: &PathBuf) -> Ids {
+fn write_pack(dir: &PathBuf) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let place = |writer: &mut Writer, layer, name: &str, id| {
@@ -748,7 +918,7 @@ fn write_pack(dir: &PathBuf) -> Ids {
         postcode: Some("M5V 1A1".to_string()),
         country: None,
     };
-    let address = writer
+    writer
         .write(
             &AddressRecord {
                 disputed: false,
@@ -776,6 +946,9 @@ fn write_pack(dir: &PathBuf) -> Ids {
                 location_precision: LocationPrecision::Centroid,
                 source: SourceProvenance::osm(ObjectType::Way, 11),
                 prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
             }
             .into(),
             context.clone(),
@@ -784,6 +957,8 @@ fn write_pack(dir: &PathBuf) -> Ids {
     writer
         .write(
             &StreetRecord {
+                other_ways: Vec::new(),
+                road_class: crate::record::RoadClass::Residential,
                 alt_names: Vec::new(),
                 locality: None,
                 name: "King Street".to_string(),
@@ -828,7 +1003,6 @@ fn write_pack(dir: &PathBuf) -> Ids {
     Model::new(CONTRACT_WEIGHTS, Default::default())
         .save(&pack)
         .expect("confidence model");
-    Ids { address }
 }
 
 /// A plausible model: an answer is likelier right on a strict pass, with
