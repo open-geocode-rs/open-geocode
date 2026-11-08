@@ -29,7 +29,6 @@ use crate::{
 
 pub const SECTION: &str = "places/ids";
 const VERSION: u32 = 2;
-pub const MAX_IDS: usize = 50;
 
 // Little-endian: a Pack hashes alike on every machine.
 fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {

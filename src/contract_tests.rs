@@ -289,9 +289,14 @@ async fn responses_match_the_committed_examples() {
     let (status, malformed) = get_error(&router, "/places?ids=11").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(malformed["error_code"], "malformed_parameter");
-    let many = ["osm:node:1"; 51].join(",");
-    let (status, _) = get_error(&router, &format!("/places?ids={many}")).await;
+    // The default batch item limit caps `ids` too.
+    let at_limit = ["osm:node:1"; 1000].join(",");
+    get(&router, &format!("/places?ids={at_limit}")).await;
+    let many = ["osm:node:1"; 1001].join(",");
+    let (status, refused) = get_error(&router, &format!("/places?ids={many}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error_code"], "limit_too_large");
+    assert_eq!(refused["invalid_params"][0]["reason"], "at most 1000 ids");
     let (status, _) = get_error(&router, "/places?ids=osm:node:1&q=x").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
@@ -533,6 +538,21 @@ async fn batch_results_are_their_get_answers() {
             ]),
         ),
         (
+            "/places",
+            "country=CA",
+            json!([
+                {"id": "row-1", "ids": "osm:way:999,osm:way:11,osm:relation:3"},
+                {"id": "row-2", "q": "Queen Bakery"},
+                {"ids": "11"},
+                {"ids": "osm:way:11", "q": "Queen Bakery"},
+                {"ids": ""},
+                {"q": ""},
+                {"q": "Queen Bakery", "country": "FR"},
+                {"q": "Queen Bakery", "limit": 51},
+                {},
+            ]),
+        ),
+        (
             "/reverse",
             "",
             json!([
@@ -595,6 +615,120 @@ async fn batch_results_are_their_get_answers() {
     let example: Value = serde_json::from_slice(&example).expect("batch is JSON");
     assert_example("batch-geocode", &example);
     batch_schemas_match_the_rendered_body(&example);
+
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// A `/places` batch answers ids and names side by side, each item in its
+/// place; an id no record has is left out, and a malformed one fails only
+/// its item. The batch item limit caps the items and, item by item, the ids.
+#[tokio::test]
+async fn places_batch_answers_ids_and_names_in_order() {
+    let pack = contract_pack();
+    let limits = crate::limits::Limits {
+        max_batch_items: std::num::NonZeroUsize::new(3).expect("3"),
+        ..crate::limits::Limits::DEFAULT
+    };
+    let router = build_router(
+        AppState::open(&pack, &pack.with_extension("jobs"), limits).expect("open pack"),
+        None,
+        None,
+    );
+    let found = |answer: &Value| -> Vec<String> {
+        answer["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| {
+                feature["properties"]["id"]
+                    .as_str()
+                    .expect("id")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let body = json!([
+        {"id": "saved", "ids": "osm:relation:3,osm:way:999,osm:way:11"},
+        {"id": "typed", "q": "Queen Bakery"},
+        {"id": "broken", "ids": "osm:way:11,11"},
+    ])
+    .to_string();
+    let (status, query) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, post) = send_raw(&router, "POST", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(query, post, "QUERY and POST answer differently");
+
+    let batch: Value = serde_json::from_slice(&query).expect("batch is JSON");
+    let results = batch["results"].as_array().expect("results");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["id"], "saved");
+    assert_eq!(results[0]["status"], 200);
+    assert_eq!(
+        found(&results[0]["response"]),
+        ["osm:relation:3", "osm:way:11"]
+    );
+    assert_eq!(
+        results[0]["response"]["geocoding"]["query"],
+        "osm:relation:3,osm:way:999,osm:way:11"
+    );
+    assert_eq!(results[1]["id"], "typed");
+    assert_eq!(results[1]["status"], 200);
+    assert_eq!(found(&results[1]["response"])[0], "osm:way:11");
+    assert_eq!(results[2]["id"], "broken");
+    assert_eq!(results[2]["status"], 400);
+    assert_eq!(results[2]["error"]["error_code"], "malformed_parameter");
+    assert_eq!(
+        results[2]["error"]["detail"],
+        "\"11\" is no record id, such as osm:node:123"
+    );
+    assert_eq!(
+        batch["summary"],
+        json!({"total": 3, "succeeded": 2, "failed": 1})
+    );
+
+    // An item holds as many ids as the limit, and one more fails that item
+    // alone.
+    let body = json!([
+        {"ids": "osm:way:11,osm:way:11,osm:way:11"},
+        {"ids": "osm:way:11,osm:way:11,osm:way:11,osm:way:11"},
+    ])
+    .to_string();
+    let (status, answer) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let batch: Value = serde_json::from_slice(&answer).expect("batch is JSON");
+    assert_eq!(batch["results"][0]["status"], 200);
+    assert_eq!(
+        found(&batch["results"][0]["response"]),
+        ["osm:way:11", "osm:way:11", "osm:way:11"]
+    );
+    assert_eq!(batch["results"][1]["status"], 400);
+    assert_eq!(
+        batch["results"][1]["error"]["error_code"],
+        "limit_too_large"
+    );
+    assert_eq!(
+        batch["results"][1]["error"]["invalid_params"][0]["reason"],
+        "at most 3 ids"
+    );
+
+    // A body of one item past the limit is refused whole, by either method.
+    let over = Value::Array(vec![json!({"q": "Queen Bakery"}); 4]).to_string();
+    for method in ["QUERY", "POST"] {
+        let (status, refused) = send_raw(&router, method, "/places", Some(&over)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method}");
+        let refused: Value = serde_json::from_slice(&refused).expect("problem is JSON");
+        assert_eq!(refused["error_code"], "too_many_items", "{method}");
+        assert_eq!(
+            refused["detail"], "a batch holds at most 3 items",
+            "{method}"
+        );
+    }
+    let empty = send_raw(&router, "QUERY", "/places", Some("[]")).await;
+    assert_eq!(empty.0, StatusCode::OK);
+    let empty: Value = serde_json::from_slice(&empty.1).expect("batch is JSON");
+    assert_eq!(empty["results"], json!([]));
 
     let _ = std::fs::remove_dir_all(&pack);
 }

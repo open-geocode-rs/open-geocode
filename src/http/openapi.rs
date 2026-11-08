@@ -75,6 +75,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
     ),
     paths(
         crate::runtime::places,
+        crate::runtime::places_batch,
         crate::runtime::autocomplete,
         crate::runtime::geocode,
         crate::runtime::geocode_batch,
@@ -119,6 +120,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Layer,
         Problem,
         GeocodeItem,
+        PlacesItem,
         ReverseItem,
         ForwardBatch,
         ForwardResult,
@@ -253,6 +255,38 @@ pub(crate) struct GeocodeItem {
     /// ISO 3166-1 alpha-2 codes, comma-separated.
     #[schema(example = "CA")]
     pub country: Option<String>,
+}
+
+/// One item of a `/places` batch: `GET /places`' parameters and an `id`.
+///
+/// Every field is optional here because the request's query string may give
+/// it for all items. `q` or `ids` must come from one or the other.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct PlacesItem {
+    /// Echoed in this item's result, to match it up.
+    #[schema(example = "row-1", max_length = 128)]
+    pub id: Option<String>,
+    /// Name of the place, with where it is when known. Give `q` or `ids`,
+    /// not both; one sent empty counts as given.
+    #[schema(example = "Rijksmuseum Amsterdam", max_length = 256)]
+    pub q: Option<String>,
+    /// Comma-separated stable ids, at most the server's batch item limit
+    /// (1000 by default), checked for this item alone.
+    #[schema(example = "osm:node:1383955044")]
+    pub ids: Option<String>,
+    /// Maximum number of results. `0`, the default, lets the server choose.
+    #[schema(minimum = 0, maximum = 50)]
+    pub limit: Option<usize>,
+    /// ISO 3166-1 alpha-2 codes, comma-separated.
+    #[schema(example = "NL")]
+    pub country: Option<String>,
+    /// Point to prefer results near, as `lon,lat`.
+    #[schema(example = "4.88,52.36")]
+    pub focus: Option<String>,
+    /// `min_lon,min_lat,max_lon,max_lat`.
+    #[schema(example = "4.73,52.28,5.07,52.43")]
+    pub bbox: Option<String>,
 }
 
 /// One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.

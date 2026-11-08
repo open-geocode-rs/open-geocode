@@ -54,9 +54,13 @@ const RETRY_AFTER_SECONDS: u32 = 1;
 /// parameters by the rules `GET` checks them with, `place` says where the
 /// lookup will read in the Pack, and `answer` looks it up. The `GET` handler
 /// runs `prepare` and `answer` too.
+///
+/// `prepare` sees the server, not only the parameters: a rule can hang on an
+/// operator limit or on what the Pack holds, and an item is refused by it as
+/// its `GET` is.
 pub(crate) struct Lookup<P, Q, A, K> {
     pub(crate) route: &'static str,
-    pub(crate) prepare: fn(P) -> Result<Q, Problem>,
+    pub(crate) prepare: fn(&AppState, P) -> Result<Q, Problem>,
     pub(crate) place: fn(&Q) -> K,
     pub(crate) answer: fn(&AppState, Q) -> crate::Result<A>,
 }
@@ -272,7 +276,7 @@ where
 {
     let prepared = items
         .into_iter()
-        .map(|item| prepare(lookup, shared, item))
+        .map(|item| prepare(state, lookup, shared, item))
         .collect::<Vec<_>>();
     map_in_order(
         &prepared,
@@ -336,6 +340,7 @@ fn finish<A>(
 /// Check one item by the rules its `GET` is checked with. A panic fails the
 /// item, not the batch.
 pub(crate) fn prepare<P, Q, A, K>(
+    state: &AppState,
     lookup: Lookup<P, Q, A, K>,
     shared: &[(String, String)],
     item: RawItem,
@@ -368,7 +373,7 @@ where
         let key = item_query(shared, &fields)?;
         let params =
             serde_urlencoded::from_str::<P>(&key).map_err(|_| Problem::unparsable_parameters())?;
-        Ok((key, (lookup.prepare)(params)?))
+        Ok((key, (lookup.prepare)(state, params)?))
     }))
     .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
     match checked {
