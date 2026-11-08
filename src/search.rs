@@ -5284,10 +5284,8 @@ impl TextSearcher {
         if tie(&scored, window) && window < TIE_WINDOW {
             scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
         }
-        // A run longer than the tie window ("Paris": every place, street
-        // and POI of the name scores alike) would keep an arbitrary part of
-        // it, Paris in France or not. Keying every matching document instead
-        // gives up the skipping, so only such a run pays for it.
+        // A run past the tie window keeps an arbitrary part of it ("Paris"),
+        // so every match is keyed: no skipping, paid by such runs alone.
         let top_docs = if tie(&scored, TIE_WINDOW) {
             let keys = RankKeys {
                 ranking,

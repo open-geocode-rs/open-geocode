@@ -30,8 +30,9 @@ use super::{
     tags::{OsmTags, alternate_names, item, name_tags, prominence},
 };
 
-/// Tags a boundary keeps after the scan besides its names.
-const BOUNDARY_TAG_KEYS: [&str; 8] = [
+/// Tags a boundary keeps after the scan besides its names. Its Wikidata
+/// and Wikipedia links rank it (see [`prominence`]).
+const BOUNDARY_TAG_KEYS: [&str; 10] = [
     "ISO3166-1:alpha2",
     "ISO3166-1:alpha3",
     "ISO3166-2",
@@ -40,6 +41,8 @@ const BOUNDARY_TAG_KEYS: [&str; 8] = [
     "country_code",
     "designation",
     "place",
+    "wikidata",
+    "wikipedia",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2492,13 +2495,18 @@ mod tests {
             ),
             (3, None),
         ]);
+        // As the scan keeps them, so a tag it drops is missed here too.
         let tags = |name: &str, iso: &str| {
-            BTreeMap::from([
+            boundary_tags(&BTreeMap::from([
                 ("boundary".to_string(), "administrative".to_string()),
                 ("admin_level".to_string(), "4".to_string()),
                 ("name".to_string(), name.to_string()),
+                ("name:fr".to_string(), name.to_string()),
                 ("ISO3166-2".to_string(), iso.to_string()),
-            ])
+                ("wikidata".to_string(), "Q1904".to_string()),
+                ("wikipedia".to_string(), format!("en:{name}")),
+                ("source".to_string(), "survey".to_string()),
+            ]))
         };
         let members = |ids: &[i64]| {
             ids.iter()
@@ -2540,6 +2548,18 @@ mod tests {
         assert_eq!(places[0].1.label(), "Canada");
         assert_eq!(places[1].0, ContextOrigin::Boundary(0));
         assert_eq!(places[1].1.id(), "osm:relation:100");
+        let Record::Place(_, ontario) = &places[1].1 else {
+            panic!("a boundary is a place");
+        };
+        assert_eq!(ontario.wikidata, Some(1904));
+        assert_eq!(
+            ontario.prominence,
+            Prominence {
+                importance: 0,
+                linked: true,
+                languages: 1,
+            }
+        );
         assert_eq!(report.accepted.place_nodes, 2);
 
         let index = set.into_index(&[5], &HashMap::from([("CA".to_string(), 4)]));

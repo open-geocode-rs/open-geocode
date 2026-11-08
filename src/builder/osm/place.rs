@@ -82,6 +82,8 @@ pub(crate) fn place_layer(place_type: &str) -> Option<PlaceLayer> {
 mod tests {
     use geojson::GeometryValue;
 
+    use crate::record::Prominence;
+
     use super::*;
 
     #[test]
@@ -89,9 +91,6 @@ mod tests {
         let tags = BTreeMap::from([
             ("place".to_string(), "city".to_string()),
             ("name".to_string(), " Toronto ".to_string()),
-            ("name:fr".to_string(), "Toronto".to_string()),
-            ("name:ja".to_string(), "トロント".to_string()),
-            ("wikidata".to_string(), "Q172".to_string()),
         ]);
 
         let (record, layer) = place_record_from_node(42, 43.6532, -79.3832, &tags).expect("place");
@@ -100,15 +99,37 @@ mod tests {
         assert_eq!(record.id(), "osm:node:42");
         assert_eq!(record.label(), "Toronto");
         assert_eq!(record.place_type, "city");
-        assert_eq!(record.wikidata, Some(172));
-        assert!(record.prominence.linked);
-        assert_eq!(record.prominence.languages, 2);
+        assert_eq!(record.wikidata, None);
+        assert_eq!(record.prominence, Prominence::default());
         match record.geometry.value {
             GeometryValue::Point { coordinates } => {
                 assert_eq!(coordinates.as_slice(), &[-79.3832, 43.6532]);
             }
             other => panic!("expected Point, got {}", other.type_name()),
         }
+    }
+
+    #[test]
+    fn a_linked_place_node_keeps_its_item_and_languages() {
+        let tags = BTreeMap::from([
+            ("place".to_string(), "city".to_string()),
+            ("name".to_string(), "Toronto".to_string()),
+            ("name:fr".to_string(), "Toronto".to_string()),
+            ("name:ja".to_string(), "トロント".to_string()),
+            ("wikidata".to_string(), "Q172".to_string()),
+        ]);
+
+        let (record, _) = place_record_from_node(42, 43.6532, -79.3832, &tags).expect("place");
+
+        assert_eq!(record.wikidata, Some(172));
+        assert_eq!(
+            record.prominence,
+            Prominence {
+                importance: 0,
+                linked: true,
+                languages: 2,
+            }
+        );
     }
 
     #[test]

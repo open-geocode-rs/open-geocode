@@ -119,7 +119,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 10;
+pub const RECORDS_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
