@@ -1403,6 +1403,21 @@ impl Reader {
         }
     }
 
+    /// A POI's or a place's Wikidata item; none for the other layers or
+    /// when it has none. Reads no geometry.
+    pub fn wikidata(&self, id: RecordId) -> Result<Option<u32>> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        match header.layer {
+            Layer::Poi => Ok(self.poi_fields(header.strings, &mut fields)?.wikidata),
+            layer if layer.place_layer().is_some() => {
+                self.place_prominence(header.strings, &mut fields)?;
+                item_field(&mut fields)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// A place's prominence, reading its fields up to it.
     fn place_prominence(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<Prominence> {
         get_u32(fields)?;
