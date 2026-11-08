@@ -57,7 +57,7 @@ fn line_string(points: &[(f64, f64)]) -> Option<LineString<f64>> {
     ))
 }
 
-fn closed_way_polygon(points: &[(f64, f64)]) -> Option<Polygon<f64>> {
+pub(crate) fn closed_way_polygon(points: &[(f64, f64)]) -> Option<Polygon<f64>> {
     if points.len() < 4 || points.first() != points.last() {
         return None;
     }

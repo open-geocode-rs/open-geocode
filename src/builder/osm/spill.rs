@@ -27,7 +27,11 @@ use crate::{
     },
 };
 
-use super::{book::Entry, boundary::ContextOrigin};
+use super::{
+    book::Entry,
+    boundary::ContextOrigin,
+    poi::{Identity, Place},
+};
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 
@@ -720,6 +724,8 @@ pub(crate) struct PendingNamed {
     pub name_len: usize,
     pub seq: u64,
     pub record: Record,
+    /// A place's; a street has none.
+    pub identity: Option<Box<Identity>>,
 }
 
 impl PendingNamed {
@@ -742,10 +748,17 @@ impl PendingNamed {
             name_len,
             seq,
             record: Record::Street(record),
+            identity: None,
         })
     }
 
-    pub(super) fn place(mut record: PoiRecord, seq: u64) -> Result<Self> {
+    pub(super) fn place(
+        Place {
+            mut record,
+            identity,
+        }: Place,
+        seq: u64,
+    ) -> Result<Self> {
         as_spilled(&mut record.geometry);
         let mut order = Vec::new();
         put_order_text(
@@ -766,13 +779,17 @@ impl PendingNamed {
             name_len,
             seq,
             record: Record::Poi(record),
+            identity: Some(Box::new(identity)),
         })
     }
 
-    pub(super) fn into_place(self) -> PoiRecord {
-        match self.record {
-            Record::Poi(record) => record,
-            _ => unreachable!("a pending place holds a POI"),
+    pub(super) fn into_place(self) -> Place {
+        match (self.record, self.identity) {
+            (Record::Poi(record), Some(identity)) => Place {
+                record,
+                identity: *identity,
+            },
+            _ => unreachable!("a pending place holds a POI and its identity"),
         }
     }
 
@@ -808,6 +825,9 @@ impl PendingNamed {
         put_u64(out, self.name_len as u64);
         put_u64(out, self.seq);
         encode_record(out, &self.record);
+        if let Some(identity) = &self.identity {
+            encode_identity(out, identity);
+        }
     }
 
     fn decode_rest(order: Vec<u8>, input: &mut &[u8]) -> Result<Self> {
@@ -815,11 +835,18 @@ impl PendingNamed {
         if name_len > order.len() {
             return Err(Error::Decode("street name key is longer than its sort key"));
         }
+        let seq = get_u64(input)?;
+        let record = decode_record(input)?;
+        let identity = match record {
+            Record::Poi(_) => Some(Box::new(decode_identity(input)?)),
+            _ => None,
+        };
         Ok(Self {
             order,
             name_len,
-            seq: get_u64(input)?,
-            record: decode_record(input)?,
+            seq,
+            record,
+            identity,
         })
     }
 }
@@ -847,7 +874,17 @@ impl Spill for PendingNamed {
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.order.capacity() + record_heap_bytes(&self.record)
+        std::mem::size_of::<Self>()
+            + self.order.capacity()
+            + record_heap_bytes(&self.record)
+            + self.identity.as_deref().map_or(0, |identity| {
+                std::mem::size_of::<Identity>()
+                    + identity.outline.as_ref().map_or(0, Vec::capacity)
+                    + identity.nodes.capacity() * 8
+                    + strings_heap_bytes(&identity.websites)
+                    + strings_heap_bytes(&identity.phones)
+                    + strings_heap_bytes(&identity.refs)
+            })
     }
 }
 
@@ -1086,6 +1123,46 @@ fn address_heap_bytes(address: &AddressComponents) -> usize {
 
 fn strings_heap_bytes(values: &[String]) -> usize {
     values.iter().map(|value| value.len() + 24).sum()
+}
+
+fn encode_identity(out: &mut Vec<u8>, identity: &Identity) {
+    match &identity.outline {
+        Some(block) => {
+            out.push(1);
+            put_bytes(out, block);
+        }
+        None => out.push(0),
+    }
+    put_u64(out, identity.nodes.len() as u64);
+    let mut delta = Delta::default();
+    for &node in &identity.nodes {
+        put_delta(out, &mut delta, node);
+    }
+    put_strs(out, &identity.websites);
+    put_strs(out, &identity.phones);
+    put_strs(out, &identity.refs);
+}
+
+fn decode_identity(input: &mut &[u8]) -> Result<Identity> {
+    let outline = match get_u8(input)? {
+        0 => None,
+        _ => Some(get_bytes(input)?.to_vec()),
+    };
+    let count = get_u64(input)?;
+    if count > input.len() as u64 {
+        return Err(Error::Decode("spilled node list is truncated"));
+    }
+    let mut delta = Delta::default();
+    let nodes = (0..count)
+        .map(|_| get_delta(input, &mut delta))
+        .collect::<Result<_>>()?;
+    Ok(Identity {
+        outline,
+        nodes,
+        websites: get_strings(input)?,
+        phones: get_strings(input)?,
+        refs: get_strings(input)?,
+    })
 }
 
 fn put_strs(out: &mut Vec<u8>, values: &[String]) {
@@ -1991,6 +2068,52 @@ mod tests {
             )
         });
         assert_eq!(compact, wide);
+    }
+
+    #[test]
+    fn a_pending_place_round_trips_with_what_resolves_it() {
+        let record = PoiRecord {
+            alt_names: Vec::new(),
+            name: "Shell".into(),
+            category: "amenity:fuel".into(),
+            address: None,
+            geometry: point_geometry(6.5665, 53.2194),
+            location_precision: LocationPrecision::Centroid,
+            source: SourceProvenance::osm(ObjectType::Way, 16),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        let mut outline = Vec::new();
+        super::super::containment::encode_shape(
+            &geo::MultiPolygon::new(vec![geo::Polygon::new(
+                geo::LineString::from(vec![(6.56, 53.21), (6.57, 53.21), (6.57, 53.22)]),
+                Vec::new(),
+            )]),
+            &mut outline,
+        );
+        for identity in [
+            Identity::default(),
+            Identity {
+                outline: Some(outline),
+                nodes: vec![-3, 7, 1 << 40],
+                websites: vec!["shell.nl".into()],
+                phones: vec!["501234567".into()],
+                refs: vec!["12".into(), "a".into()],
+            },
+        ] {
+            let pending = PendingNamed::place(
+                Place {
+                    record: record.clone(),
+                    identity: identity.clone(),
+                },
+                3,
+            )
+            .expect("a place");
+            round_trip(&pending);
+            assert_eq!(pending.into_place().identity, identity);
+        }
     }
 
     #[test]

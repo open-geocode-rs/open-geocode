@@ -9,15 +9,24 @@ use std::{
     sync::OnceLock,
 };
 
+use geo::MultiPolygon;
+use rstar::{
+    AABB, RTree,
+    primitives::{GeomWithData, Rectangle},
+};
 use serde::Deserialize;
 
-use crate::record::{
-    AddressRecord, Brand, LocationPrecision, ObjectType, PoiRecord, Record, SourceProvenance,
-    point_geometry,
+use crate::{
+    record::{
+        AddressComponents, AddressRecord, Brand, LocationPrecision, ObjectType, PoiRecord, Record,
+        SourceProvenance, point_geometry,
+    },
+    util::fold::search_key,
 };
 
 use super::{
     address::address_components,
+    containment,
     emitted::Emitted,
     tags::{OsmTags, alternate_names, name_tags, prominence},
 };
@@ -180,6 +189,10 @@ pub(crate) struct PoiCandidate {
     pub location_precision: LocationPrecision,
     /// The tags [`poi_tags`] keeps.
     pub tags: BTreeMap<String, String>,
+    /// See [`Identity::outline`].
+    pub outline: Option<Vec<u8>>,
+    /// See [`Identity::nodes`].
+    pub nodes: Vec<i64>,
 }
 
 pub(crate) fn is_poi(tags: &BTreeMap<String, String>, drawn: Drawn) -> bool {
@@ -196,21 +209,46 @@ pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out:
     }
 }
 
-// A cafe mapped as a point and its building lies within a building of itself.
-const SAME_PLACE_M: f64 = 50.0;
-// Parts of a campus or park. Chain branches never meet here: they link the
-// chain as `brand:wikidata`, not `wikidata`.
-const SAME_ITEM_M: f64 = 2_000.0;
-// One cell spans [`SAME_PLACE_M`]: a near leader is in this cell or a neighbour.
-const CELL_DEGREES: f64 = SAME_PLACE_M / 111_320.0;
+/// What tells a place from another of its name, kept until places resolve.
+/// The Pack stores none of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Identity {
+    /// Its outline as a [`containment`] shape block; none for a point or a line.
+    pub outline: Option<Vec<u8>>,
+    /// The nodes it is drawn with, sorted: a node's own id.
+    pub nodes: Vec<i64>,
+    pub websites: Vec<String>,
+    pub phones: Vec<String>,
+    pub refs: Vec<String>,
+}
 
-/// Entity resolution blocked by name. Same Wikidata item, or same kind
-/// within [`SAME_PLACE_M`]: a hotel and its restaurant stay two. Each joins
-/// the leader, never another member (center clustering), so a run of near
-/// ones cannot chain a place along a street. Merged ids stay as aliases.
-pub(crate) fn resolve(mut places: Vec<PoiRecord>) -> Vec<PoiRecord> {
+/// A place as it waits to resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Place {
+    pub record: PoiRecord,
+    pub identity: Identity,
+}
+
+/// The shape block of `geometry`, for [`Identity::outline`].
+pub(crate) fn outline(geometry: &MultiPolygon<f64>) -> Vec<u8> {
+    let mut block = Vec::new();
+    containment::encode_shape(geometry, &mut block);
+    block
+}
+
+/// Entity resolution blocked by name, on exact keys, never distance: same
+/// name and distance mostly join different things (chalets 9B and 9D, two
+/// pubs facing each other, both sides of a bus stop). Two records are one
+/// place when nothing conflicts and one holds: the same Wikidata item or
+/// kind with one's point inside the other's outline; the same kind and
+/// address; the same kind drawn with a shared node, as a canal in pieces.
+/// A shared item alone is not enough: an organisation tags every office
+/// with its own. A wrong merge hides a real place, a missed one only shows
+/// it twice. Each joins the leader, never another member (center
+/// clustering), so a run cannot chain. Merged ids stay as aliases.
+pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
     if places.len() < 2 {
-        return places;
+        return places.into_iter().map(|place| place.record).collect();
     }
     let drawn = |place: &PoiRecord| match place.source.object_type {
         ObjectType::Relation => 2,
@@ -218,6 +256,7 @@ pub(crate) fn resolve(mut places: Vec<PoiRecord>) -> Vec<PoiRecord> {
         ObjectType::Node | ObjectType::Row => 0,
     };
     places.sort_by(|left, right| {
+        let (left, right) = (&left.record, &right.record);
         right
             .prominence
             .cmp(&left.prominence)
@@ -225,65 +264,202 @@ pub(crate) fn resolve(mut places: Vec<PoiRecord>) -> Vec<PoiRecord> {
             .then(left.source.object_type.cmp(&right.source.object_type))
             .then(left.source.object_id.cmp(&right.source.object_id))
     });
-    let mut leaders: Vec<PoiRecord> = Vec::new();
-    let mut cells = HashMap::<(i64, i64), Vec<usize>>::new();
-    let mut items = HashMap::<u32, usize>::new();
+    let mut leaders: Vec<Place> = Vec::new();
+    let mut addresses = HashMap::<(String, AddressKey), Vec<usize>>::new();
+    let mut nodes = HashMap::<i64, Vec<usize>>::new();
+    // A chain's name group holds thousands of copies: the boxes keep each
+    // test to the outlines that could cover it.
+    let mut outlines = RTree::<GeomWithData<Rectangle<[f64; 2]>, usize>>::new();
+    let mut points = RTree::<GeomWithData<[f64; 2], usize>>::new();
     for place in places {
-        let Some(point) = point_of(&place) else {
+        let Some(point) = point_of(&place.record) else {
             leaders.push(place);
             continue;
         };
-        let near = |leader: &PoiRecord, within: f64| {
-            point_of(leader).is_some_and(|at| {
-                crate::spatial_index::haversine_m(point[0], point[1], at[0], at[1]) <= within
-            })
-        };
-        let by_item = place
-            .wikidata
-            .and_then(|item| items.get(&item).copied())
-            .filter(|&leader| near(&leaders[leader], SAME_ITEM_M));
-        let by_kind = || {
-            let (row, column) = cell(point);
-            (row - 1..=row + 1)
-                .flat_map(|row| (column - 1..=column + 1).map(move |column| (row, column)))
-                .filter_map(|at| cells.get(&at))
-                .flatten()
-                .copied()
-                .filter(|&leader| {
-                    let leader = &leaders[leader];
-                    leader.category == place.category
-                        && !(leader.wikidata.is_some()
-                            && place.wikidata.is_some()
-                            && leader.wikidata != place.wikidata)
-                        && near(leader, SAME_PLACE_M)
-                })
-                .min()
-        };
-        match by_item.or_else(by_kind) {
-            Some(leader) => merge(&mut leaders[leader], place),
+        let address = place.record.address.as_ref().and_then(address_key);
+        let extent = place.identity.outline.as_deref().map(containment::extent);
+        let mut near = address
+            .as_ref()
+            .and_then(|key| addresses.get(&(place.record.category.clone(), key.clone())))
+            .into_iter()
+            .flatten()
+            .chain(
+                place
+                    .identity
+                    .nodes
+                    .iter()
+                    .filter_map(|node| nodes.get(node))
+                    .flatten(),
+            )
+            .copied()
+            .chain(
+                outlines
+                    .locate_all_at_point(&point)
+                    .map(|leader| leader.data),
+            )
+            .chain(extent.into_iter().flat_map(|[west, south, east, north]| {
+                points
+                    .locate_in_envelope(&AABB::from_corners([west, south], [east, north]))
+                    .map(|leader| leader.data)
+            }))
+            .collect::<Vec<_>>();
+        near.sort_unstable();
+        near.dedup();
+        match near
+            .into_iter()
+            .find(|&leader| one_place(&leaders[leader], &place, point))
+        {
+            Some(at) => {
+                let leader = &mut leaders[at];
+                let unaddressed = leader.record.address.is_none();
+                for (own, theirs) in [
+                    (&mut leader.identity.websites, place.identity.websites),
+                    (&mut leader.identity.phones, place.identity.phones),
+                    (&mut leader.identity.refs, place.identity.refs),
+                ] {
+                    if own.is_empty() {
+                        *own = theirs;
+                    }
+                }
+                merge(&mut leader.record, place.record);
+                // An address the leader takes from a member is its own now:
+                // a later copy stating it joins.
+                if unaddressed
+                    && let Some(key) = leader.record.address.as_ref().and_then(address_key)
+                {
+                    addresses
+                        .entry((leader.record.category.clone(), key))
+                        .or_default()
+                        .push(at);
+                }
+            }
             None => {
                 let index = leaders.len();
-                cells.entry(cell(point)).or_default().push(index);
-                if let Some(item) = place.wikidata {
-                    items.entry(item).or_insert(index);
+                if let Some(key) = address {
+                    addresses
+                        .entry((place.record.category.clone(), key))
+                        .or_default()
+                        .push(index);
                 }
+                for &node in &place.identity.nodes {
+                    nodes.entry(node).or_default().push(index);
+                }
+                if let Some([west, south, east, north]) = extent {
+                    outlines.insert(GeomWithData::new(
+                        Rectangle::from_corners([west, south], [east, north]),
+                        index,
+                    ));
+                }
+                points.insert(GeomWithData::new(point, index));
                 leaders.push(place);
             }
         }
     }
-    leaders
+    leaders.into_iter().map(|place| place.record).collect()
+}
+
+/// Whether `member`, at `point`, is the place `leader` is.
+fn one_place(leader: &Place, member: &Place, point: [f64; 2]) -> bool {
+    if conflict(leader, member) {
+        return false;
+    }
+    let (own, theirs) = (&leader.record, &member.record);
+    let kind = own.category == theirs.category;
+    let item = own.wikidata.is_some() && own.wikidata == theirs.wikidata;
+    let covers = |outline: &Option<Vec<u8>>, [lon, lat]: [f64; 2]| {
+        outline
+            .as_deref()
+            .is_some_and(|block| containment::covers(block, lon, lat))
+    };
+    let within = || {
+        covers(&leader.identity.outline, point)
+            || point_of(own).is_some_and(|at| covers(&member.identity.outline, at))
+    };
+    let addressed = || {
+        let key = own.address.as_ref().and_then(address_key);
+        key.is_some() && key == theirs.address.as_ref().and_then(address_key)
+    };
+    let touch = || {
+        member
+            .identity
+            .nodes
+            .iter()
+            .any(|node| leader.identity.nodes.binary_search(node).is_ok())
+    };
+    ((kind || item) && within()) || (kind && (addressed() || touch()))
+}
+
+/// Two records that state different addresses, items, websites, phones or
+/// refs are two places, whatever else they share: chains share a name, an
+/// organisation its item.
+fn conflict(leader: &Place, member: &Place) -> bool {
+    let (own, theirs) = (&leader.record, &member.record);
+    let addresses = own.address.as_ref().zip(theirs.address.as_ref());
+    let items = own.wikidata.zip(theirs.wikidata);
+    let disjoint = |own: &[String], theirs: &[String]| {
+        !own.is_empty() && !theirs.is_empty() && !own.iter().any(|value| theirs.contains(value))
+    };
+    addresses.is_some_and(|(own, theirs)| !same_address(own, theirs))
+        || items.is_some_and(|(own, theirs)| own != theirs)
+        || disjoint(&leader.identity.websites, &member.identity.websites)
+        || disjoint(&leader.identity.phones, &member.identity.phones)
+        || disjoint(&leader.identity.refs, &member.identity.refs)
+}
+
+/// What an address puts its house at, as search spells it: house number,
+/// street or place, unit. An address of the block scheme names no street, so
+/// its areas stand in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AddressKey {
+    number: String,
+    street: Option<String>,
+    place: Option<String>,
+    unit: Option<String>,
+    areas: Vec<String>,
+}
+
+fn address_key(address: &AddressComponents) -> Option<AddressKey> {
+    let key = |value: &Option<String>| value.as_deref().and_then(search_key);
+    let (street, place) = (key(&address.street), key(&address.place));
+    let areas = match (&street, &place) {
+        (None, None) => address
+            .areas
+            .iter()
+            .filter_map(|area| search_key(area))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if street.is_none() && place.is_none() && areas.is_empty() {
+        return None;
+    }
+    Some(AddressKey {
+        number: search_key(&address.number)?.replace(' ', ""),
+        street,
+        place,
+        unit: key(&address.unit),
+        areas,
+    })
+}
+
+/// A postcode or town only one of two states says nothing; two that differ
+/// tell the same street and number in two towns apart.
+fn same_address(own: &AddressComponents, theirs: &AddressComponents) -> bool {
+    let agree = |own: &Option<String>, theirs: &Option<String>| {
+        let key = |value: &Option<String>| {
+            value
+                .as_deref()
+                .and_then(search_key)
+                .map(|value| value.replace(' ', ""))
+        };
+        own.is_none() || theirs.is_none() || key(own) == key(theirs)
+    };
+    address_key(own) == address_key(theirs)
+        && agree(&own.postcode, &theirs.postcode)
+        && agree(&own.locality, &theirs.locality)
 }
 
 fn point_of(place: &PoiRecord) -> Option<[f64; 2]> {
     crate::util::geo::point_lon_lat(&place.geometry)
-}
-
-fn cell([lon, lat]: [f64; 2]) -> (i64, i64) {
-    let width = CELL_DEGREES / lat.to_radians().cos().max(0.01);
-    (
-        (lat / CELL_DEGREES).floor() as i64,
-        (lon / width).floor() as i64,
-    )
 }
 
 fn merge(leader: &mut PoiRecord, member: PoiRecord) {
@@ -321,7 +497,8 @@ fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
 }
 
 /// The tags a POI keeps: its names, its category tags, its Wikidata and
-/// Wikipedia links and, when they state a valid address, its `addr:*` tags.
+/// Wikipedia links, what tells it from another of its name, and, when they
+/// state a valid address, its `addr:*` tags.
 pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
@@ -330,7 +507,15 @@ pub(crate) fn poi_tags(
         .filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "wikidata" | "wikipedia" | "brand" | "brand:wikidata"
+                "wikidata"
+                    | "wikipedia"
+                    | "brand"
+                    | "brand:wikidata"
+                    | "website"
+                    | "contact:website"
+                    | "phone"
+                    | "contact:phone"
+                    | "ref"
             ) || is_place_key(key)
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -382,7 +567,57 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         aliases: Vec::new(),
     };
     out.report.accept_poi(&record);
-    out.records.push(Record::Poi(record));
+    out.places.push(Place {
+        record,
+        identity: Identity {
+            outline: candidate.outline.clone(),
+            nodes: {
+                let mut nodes = candidate.nodes.clone();
+                nodes.sort_unstable();
+                nodes.dedup();
+                nodes
+            },
+            websites: values(tags, &["website", "contact:website"], |value| {
+                let value = value.to_lowercase();
+                let value = value
+                    .strip_prefix("https://")
+                    .or_else(|| value.strip_prefix("http://"))
+                    .unwrap_or(&value);
+                let value = value.strip_prefix("www.").unwrap_or(value);
+                Some(value.trim_end_matches('/').to_string())
+            }),
+            // The last nine digits: one number written with its country
+            // code and without.
+            phones: values(tags, &["phone", "contact:phone"], |value| {
+                let digits = value
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<Vec<_>>();
+                let tail = &digits[digits.len().saturating_sub(9)..];
+                Some(tail.iter().collect())
+            }),
+            refs: values(tags, &["ref"], search_key),
+        },
+    });
+}
+
+/// The values of `keys`, each as `spelled` spells it: one tag may hold
+/// several, split by `;`.
+fn values(
+    tags: &BTreeMap<String, String>,
+    keys: &[&str],
+    spelled: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut values = keys
+        .iter()
+        .filter_map(|key| tags.get(*key))
+        .flat_map(|value| value.split(';'))
+        .filter_map(|value| spelled(value.trim()))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 /// Several items in one value name none.
@@ -423,68 +658,316 @@ mod tests {
                 lon: -79.38,
                 location_precision: LocationPrecision::Point,
                 tags: poi_tags(&tags(pairs), None),
+                outline: None,
+                nodes: vec![7],
             },
             &mut out,
         );
         out
     }
 
-    #[test]
-    fn places_of_one_name_merge_when_they_are_one_place_and_never_chain() {
-        let place = |id: i64, category: &str, lon: f64, wikidata: Option<u32>| PoiRecord {
-            alt_names: Vec::new(),
-            name: "De Pindol".to_string(),
-            category: category.to_string(),
-            address: None,
-            geometry: point_geometry(lon, 51.4),
-            location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(ObjectType::Node, id),
-            prominence: Default::default(),
-            wikidata,
-            brand: None,
-            aliases: Vec::new(),
-        };
-        let metres = |m: f64| 5.0 + m / 70_000.0;
-        let ids = |resolved: Vec<PoiRecord>| {
-            let mut ids = resolved
-                .into_iter()
-                .map(|place| (place.source.object_id, place.aliases))
-                .collect::<Vec<_>>();
-            ids.sort();
-            ids
-        };
+    const LAT: f64 = 53.2;
 
+    /// Longitude `m` metres east of 6.56 at [`LAT`].
+    fn east(m: f64) -> f64 {
+        6.56 + m / 66_660.0
+    }
+
+    fn place(id: i64, category: &str, lon: f64) -> Place {
+        Place {
+            record: PoiRecord {
+                alt_names: Vec::new(),
+                name: "De Pindol".to_string(),
+                category: category.to_string(),
+                address: None,
+                geometry: point_geometry(lon, LAT),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, id),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
+            },
+            identity: Identity {
+                nodes: vec![id],
+                ..Identity::default()
+            },
+        }
+    }
+
+    /// `place` drawn as a way: a square `half` metres each side of its point,
+    /// on nodes `id * 10 ..`.
+    fn outlined(mut place: Place, half: f64) -> Place {
+        let [lon, lat] = point_of(&place.record).expect("a point");
+        let (dx, dy) = (half / 66_660.0, half / 111_320.0);
+        let ring = vec![
+            (lon - dx, lat - dy),
+            (lon + dx, lat - dy),
+            (lon + dx, lat + dy),
+            (lon - dx, lat + dy),
+            (lon - dx, lat - dy),
+        ];
+        let id = place.record.source.object_id;
+        place.record.source = SourceProvenance::osm(ObjectType::Way, id);
+        place.record.location_precision = LocationPrecision::Centroid;
+        place.identity.outline = Some(outline(&MultiPolygon::new(vec![geo::Polygon::new(
+            ring.into(),
+            Vec::new(),
+        )])));
+        place.identity.nodes = (0..4).map(|node| id * 10 + node).collect();
+        place
+    }
+
+    fn at(mut place: Place, number: &str, street: &str) -> Place {
+        place.record.address = Some(AddressComponents {
+            number: number.to_string(),
+            street: Some(street.to_string()),
+            place: None,
+            unit: None,
+            locality: None,
+            areas: Vec::new(),
+            region: None,
+            postcode: None,
+            country: None,
+        });
+        place
+    }
+
+    fn postcode(mut place: Place, postcode: &str) -> Place {
+        if let Some(address) = &mut place.record.address {
+            address.postcode = Some(postcode.to_string());
+        }
+        place
+    }
+
+    fn item(mut place: Place, item: u32) -> Place {
+        place.record.wikidata = Some(item);
+        place
+    }
+
+    /// Each resolved place by id, with the ids merged into it.
+    fn ids(resolved: Vec<PoiRecord>) -> Vec<(i64, Vec<(ObjectType, i64)>)> {
+        let mut ids = resolved
+            .into_iter()
+            .map(|place| (place.source.object_id, place.aliases))
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[track_caller]
+    fn assert_apart(places: Vec<Place>) {
+        let mut apart = places
+            .iter()
+            .map(|place| (place.record.source.object_id, Vec::new()))
+            .collect::<Vec<_>>();
+        apart.sort();
+        assert_eq!(ids(resolve(places)), apart);
+    }
+
+    #[test]
+    fn near_copies_of_one_name_with_nothing_shared_stay_apart() {
+        let chalets = vec![
+            at(place(1, "tourism:chalet", east(0.0)), "9B", "Hoofdweg"),
+            at(place(2, "tourism:chalet", east(25.0)), "9D", "Hoofdweg"),
+        ];
+        assert_apart(chalets);
+        let stops = vec![
+            place(1, "highway:bus_stop", east(0.0)),
+            place(2, "highway:bus_stop", east(5.0)),
+        ];
+        assert_apart(stops);
+    }
+
+    #[test]
+    fn one_kind_at_one_address_is_one_place_however_far_apart() {
+        let atm = |id: i64, lon: f64| at(place(id, "amenity:atm", lon), "26", "Vismarkt");
+        assert_eq!(
+            ids(resolve(vec![atm(1, east(0.0)), atm(2, east(1_000.0))])),
+            [(1, vec![(ObjectType::Node, 2)])]
+        );
+        // Spelling as search spells it.
         assert_eq!(
             ids(resolve(vec![
-                place(1, "amenity:cafe", metres(0.0), None),
-                place(2, "amenity:cafe", metres(3.0), None),
+                atm(1, east(0.0)),
+                at(place(2, "amenity:atm", east(3.0)), "26 ", "VISMARKT"),
             ])),
             [(1, vec![(ObjectType::Node, 2)])]
         );
-        assert_eq!(
-            resolve(vec![
-                place(1, "tourism:hotel", metres(0.0), None),
-                place(2, "amenity:restaurant", metres(4.0), None),
-            ])
-            .len(),
-            2
-        );
-        assert_eq!(
-            resolve(vec![
-                place(1, "amenity:university", metres(0.0), Some(7)),
-                place(2, "building:university", metres(900.0), Some(7)),
-            ])
-            .len(),
-            1
-        );
-        // No chaining: third is 80 m from the leader.
+        // A postcode only one states says nothing; two that differ do.
         assert_eq!(
             ids(resolve(vec![
-                place(1, "amenity:cafe", metres(0.0), None),
-                place(2, "amenity:cafe", metres(40.0), None),
-                place(3, "amenity:cafe", metres(80.0), None),
+                postcode(atm(1, east(0.0)), "9711 KT"),
+                atm(2, east(3.0)),
             ])),
-            [(1, vec![(ObjectType::Node, 2)]), (3, Vec::new())]
+            [(1, vec![(ObjectType::Node, 2)])]
+        );
+        let towns = vec![
+            postcode(atm(1, east(0.0)), "9711 KT"),
+            postcode(atm(2, east(3.0)), "9401 AA"),
+        ];
+        assert_apart(towns);
+        let kinds = vec![
+            atm(1, east(0.0)),
+            at(place(2, "amenity:bank", east(3.0)), "26", "Vismarkt"),
+        ];
+        assert_apart(kinds);
+        let numbers = vec![
+            atm(1, east(0.0)),
+            at(place(2, "amenity:atm", east(3.0)), "28", "Vismarkt"),
+        ];
+        assert_apart(numbers);
+    }
+
+    #[test]
+    fn an_organisations_item_on_each_of_its_offices_keeps_them_apart() {
+        let offices = vec![
+            item(
+                at(place(1, "office:government", east(0.0)), "1", "Guyotplein"),
+                7,
+            ),
+            item(
+                at(
+                    place(2, "office:government", east(400.0)),
+                    "4",
+                    "Zuiderpark",
+                ),
+                7,
+            ),
+            item(place(3, "office:government", east(900.0)), 7),
+        ];
+        assert_apart(offices);
+    }
+
+    #[test]
+    fn a_point_inside_an_outline_of_its_name_is_that_place() {
+        let synagogue = |id| place(id, "amenity:place_of_worship", east(0.0));
+        let building = outlined(synagogue(10), 20.0);
+        assert_eq!(
+            ids(resolve(vec![synagogue(1), building.clone()])),
+            [(10, vec![(ObjectType::Node, 1)])]
+        );
+        // The node leads when it is better known; the outline joins it.
+        let mut known = item(synagogue(1), 5);
+        known.record.prominence.linked = true;
+        assert_eq!(
+            ids(resolve(vec![known, building.clone()])),
+            [(1, vec![(ObjectType::Way, 10)])]
+        );
+        assert_apart(vec![
+            place(1, "amenity:place_of_worship", east(25.0)),
+            building,
+        ]);
+        // A hotel and the restaurant inside it are two.
+        let restaurant = vec![
+            place(1, "amenity:restaurant", east(5.0)),
+            outlined(place(10, "tourism:hotel", east(0.0)), 20.0),
+        ];
+        assert_apart(restaurant);
+        // One item is one place whatever kind each copy says it is.
+        assert_eq!(
+            ids(resolve(vec![
+                item(place(1, "amenity:university", east(5.0)), 7),
+                item(
+                    outlined(place(10, "building:university", east(0.0)), 20.0),
+                    7
+                ),
+            ])),
+            [(10, vec![(ObjectType::Node, 1)])]
+        );
+        // So far east a degree is narrow and the cells of a grid were not.
+        let tokyo = |mut place: Place, lon: f64| {
+            place.record.geometry = point_geometry(lon, 35.68);
+            place
+        };
+        assert_eq!(
+            ids(resolve(vec![
+                outlined(tokyo(synagogue(10), 139.7), 20.0),
+                tokyo(synagogue(1), 139.700_2),
+            ])),
+            [(10, vec![(ObjectType::Node, 1)])]
+        );
+    }
+
+    #[test]
+    fn pieces_of_one_line_that_meet_are_one_place() {
+        let piece = |id: i64, lon: f64, nodes: Vec<i64>| {
+            let mut piece = place(id, "waterway:canal", lon);
+            piece.record.source = SourceProvenance::osm(ObjectType::Way, id);
+            piece.identity.nodes = nodes;
+            piece
+        };
+        assert_eq!(
+            ids(resolve(vec![
+                piece(1, east(0.0), vec![100, 101, 102]),
+                piece(2, east(800.0), vec![102, 103]),
+            ])),
+            [(1, vec![(ObjectType::Way, 2)])]
+        );
+        let apart_pieces = vec![
+            piece(1, east(0.0), vec![100, 101]),
+            piece(2, east(800.0), vec![102, 103]),
+        ];
+        assert_apart(apart_pieces);
+    }
+
+    #[test]
+    fn copies_stating_different_websites_or_refs_stay_apart() {
+        let station = |id: i64, website: &str| {
+            let mut station = at(place(id, "amenity:fuel", east(id as f64)), "2", "Peizerweg");
+            station.identity.websites = vec![website.to_string()];
+            station
+        };
+        let stations = vec![station(1, "shell.nl/a"), station(2, "shell.nl/b")];
+        assert_apart(stations);
+        assert_eq!(
+            ids(resolve(vec![
+                station(1, "shell.nl/a"),
+                station(2, "shell.nl/a")
+            ])),
+            [(1, vec![(ObjectType::Node, 2)])]
+        );
+        let reffed = |id: i64, reference: &str| {
+            let mut copy = place(id, "amenity:fuel", east(0.0));
+            copy.identity.refs = vec![reference.to_string()];
+            copy
+        };
+        let building = outlined(reffed(10, "7"), 20.0);
+        let refs = vec![reffed(1, "8"), building];
+        assert_apart(refs);
+        let items = vec![
+            item(place(1, "amenity:fuel", east(0.0)), 1),
+            item(outlined(place(10, "amenity:fuel", east(0.0)), 20.0), 2),
+        ];
+        assert_apart(items);
+    }
+
+    #[test]
+    fn an_address_a_leader_takes_from_a_copy_is_its_own() {
+        let cafe = |id, lon| place(id, "amenity:cafe", lon);
+        assert_eq!(
+            ids(resolve(vec![
+                outlined(cafe(10, east(0.0)), 20.0),
+                at(cafe(1, east(0.0)), "82", "Dorpstraat"),
+                at(cafe(2, east(1_000.0)), "82", "Dorpstraat"),
+            ])),
+            [(10, vec![(ObjectType::Node, 1), (ObjectType::Node, 2)])]
+        );
+    }
+
+    #[test]
+    fn a_place_resolves_alone_and_without_a_point_stays() {
+        assert_eq!(ids(resolve(Vec::new())), []);
+        let mut lost = place(1, "amenity:cafe", east(0.0));
+        lost.record.geometry = geojson::Geometry::new(geojson::GeometryValue::LineString {
+            coordinates: Vec::new(),
+        });
+        assert_eq!(
+            ids(resolve(vec![
+                lost,
+                at(place(2, "amenity:cafe", east(0.0)), "1", "A")
+            ])),
+            [(1, Vec::new()), (2, Vec::new())]
         );
     }
 
@@ -606,11 +1089,18 @@ mod tests {
                 lon: -79.38,
                 location_precision: LocationPrecision::Centroid,
                 tags: poi_tags(&source, Some(&address)),
+                outline: None,
+                nodes: vec![90, 91],
             },
             &mut out,
         );
-        let [Record::Address(address), Record::Poi(record)] = out.records.as_slice() else {
-            panic!("an address and a POI, got {:?}", out.records);
+        let ([Record::Address(address)], [Place { record, identity }]) =
+            (out.records.as_slice(), out.places.as_slice())
+        else {
+            panic!(
+                "an address and a POI, got {:?} {:?}",
+                out.records, out.places
+            );
         };
         assert_eq!(address.id(), "osm:way:9");
         assert_eq!(address.address.number, "123");
@@ -622,13 +1112,51 @@ mod tests {
         assert_eq!(out.report.accepted.by_layer.get("poi"), Some(&1));
         assert_eq!(out.report.accepted.by_layer.get("address"), Some(&1));
         assert_eq!(out.report.accepted.pois_with_address, 1);
+        assert_eq!(
+            identity,
+            &Identity {
+                nodes: vec![90, 91],
+                ..Identity::default()
+            }
+        );
 
         let plain = emit(&[("name", "Riverdale Farm"), ("tourism", "attraction")]);
-        let [Record::Poi(record)] = plain.records.as_slice() else {
+        let [Place { record, .. }] = plain.places.as_slice() else {
             panic!("one POI record");
         };
         assert_eq!(record.address, None);
         assert_eq!(record.prominence, crate::record::Prominence::default());
+    }
+
+    #[test]
+    fn keeps_what_tells_a_place_from_another_of_its_name() {
+        let out = emit(&[
+            ("name", "Shell"),
+            ("amenity", "fuel"),
+            (
+                "website",
+                "https://www.Shell.nl/stations/;http://shell.nl/stations",
+            ),
+            ("contact:website", "shell.nl/peize"),
+            ("phone", "+31 50 123 4567"),
+            ("contact:phone", "050-1234567"),
+            ("ref", " A12 "),
+        ]);
+        let [Place { identity, .. }] = out.places.as_slice() else {
+            panic!("one POI record");
+        };
+        assert_eq!(
+            identity,
+            &Identity {
+                outline: None,
+                nodes: vec![7],
+                websites: vec!["shell.nl/peize".into(), "shell.nl/stations".into()],
+                phones: vec!["501234567".into()],
+                refs: vec!["a12".into()],
+            }
+        );
+        let plain = emit(&[("name", "Shell"), ("amenity", "fuel"), ("phone", "n/a")]);
+        assert_eq!(plain.places[0].identity.phones, Vec::<String>::new());
     }
 
     #[test]
@@ -640,7 +1168,7 @@ mod tests {
             ("tourism", "museum"),
             ("wikidata", "Q1347123"),
         ]);
-        let [Record::Poi(record)] = known.records.as_slice() else {
+        let [Place { record, .. }] = known.places.as_slice() else {
             panic!("one POI record");
         };
         assert_eq!(

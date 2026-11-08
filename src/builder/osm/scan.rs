@@ -175,6 +175,8 @@ fn scan_node(
                 lon,
                 location_precision: LocationPrecision::Point,
                 tags: poi_tags(all_tags, address.as_ref()),
+                outline: None,
+                nodes: vec![object_id],
             },
             out,
         );

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::spill::PendingAddress;
+use super::{poi::Place, spill::PendingAddress};
 use crate::{
     builder::report::{BuilderReport, CandidateIssue},
     error::Result,
@@ -15,6 +15,8 @@ pub(crate) struct Emitted {
     pub records: Vec<Record>,
     /// What [`Emitted::prepare`] made of `records`, which it empties.
     pub ready: Vec<Ready>,
+    /// Kept apart from `records`: a place carries what resolves it.
+    pub places: Vec<Place>,
     pub rejections: Vec<RejectedRecord>,
 }
 

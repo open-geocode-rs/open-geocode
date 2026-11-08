@@ -26,7 +26,7 @@ use super::{
     admin_levels::{self, admin_levels},
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
-    poi::PoiCandidate,
+    poi::{PoiCandidate, outline},
     tags::{OsmTags, alternate_names, name_tags},
 };
 
@@ -771,7 +771,7 @@ fn boundary_from_relation(
     let Some(parts) = area_parts(&stub.tags) else {
         return Ok(None);
     };
-    let Some(geometry) = relation_geometry(stub, member_line)? else {
+    let Some(geometry) = member_lines(stub, member_line)?.and_then(rings_geometry) else {
         return Ok(None);
     };
     Ok(built(parts, &stub.tags, &geometry))
@@ -787,7 +787,17 @@ pub(crate) fn place_relations(
         .par_iter()
         .filter(|stub| area_parts(&stub.tags).is_none())
         .map(|stub| {
-            let Some(geometry) = relation_geometry(stub, &member_line)? else {
+            let Some(lines) = member_lines(stub, &member_line)? else {
+                return Ok(None);
+            };
+            let nodes = lines
+                .outer
+                .iter()
+                .chain(&lines.inner)
+                .flatten()
+                .map(|vertex| vertex.node_id)
+                .collect();
+            let Some(geometry) = rings_geometry(lines) else {
                 return Ok(None);
             };
             let Some(point) = geometry.interior_point() else {
@@ -800,16 +810,25 @@ pub(crate) fn place_relations(
                 lon: point.x(),
                 location_precision: LocationPrecision::Centroid,
                 tags: stub.tags.clone(),
+                outline: Some(outline(&geometry)),
+                nodes,
             }))
         })
         .filter_map(crate::error::Result::transpose)
         .collect()
 }
 
-fn relation_geometry(
+/// The lines of a relation's members by role, before they are stitched.
+struct MemberLines {
+    outer: Vec<Vec<Vertex>>,
+    inner: Vec<Vec<Vertex>>,
+}
+
+/// None when a member's line is missing.
+fn member_lines(
     stub: &BoundaryRelationStub,
     member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
-) -> crate::error::Result<Option<MultiPolygon<f64>>> {
+) -> crate::error::Result<Option<MemberLines>> {
     let mut outer_segments = Vec::new();
     let mut inner_segments = Vec::new();
     for member in &stub.members {
@@ -822,12 +841,19 @@ fn relation_geometry(
         }
     }
 
-    let outer_rings = stitch_rings(outer_segments);
+    Ok(Some(MemberLines {
+        outer: outer_segments,
+        inner: inner_segments,
+    }))
+}
+
+fn rings_geometry(lines: MemberLines) -> Option<MultiPolygon<f64>> {
+    let outer_rings = stitch_rings(lines.outer);
     if outer_rings.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let inner_rings = stitch_rings(inner_segments);
-    Ok(multipolygon_from_rings(outer_rings, inner_rings))
+    let inner_rings = stitch_rings(lines.inner);
+    multipolygon_from_rings(outer_rings, inner_rings)
 }
 
 /// The boundary an area's tags and geometry make, and the block of its

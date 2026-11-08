@@ -2072,6 +2072,7 @@ impl Build {
             report,
             records,
             ready,
+            places,
             rejections,
         } = emitted;
         self.report.merge(report);
@@ -2091,7 +2092,15 @@ impl Build {
         for record in records {
             self.push(record, None)?;
         }
+        for place in places {
+            self.push_place(place)?;
+        }
         Ok(())
+    }
+
+    fn push_place(&mut self, place: poi::Place) -> Result<()> {
+        self.seq += 1;
+        open(&mut self.places, "places")?.push(PendingNamed::place(place, self.seq - 1)?)
     }
 
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
@@ -2112,9 +2121,11 @@ impl Build {
             return open(&mut self.streets, "streets")?
                 .push(PendingNamed::new(street, self.seq - 1)?);
         }
-        if let Record::Poi(poi) = record {
-            self.seq += 1;
-            return open(&mut self.places, "places")?.push(PendingNamed::place(poi, self.seq - 1)?);
+        if let Record::Poi(record) = record {
+            return self.push_place(poi::Place {
+                record,
+                identity: poi::Identity::default(),
+            });
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
             Error::BadGeometry(format!("record {} has no display point", record.id()))
@@ -2377,7 +2388,7 @@ fn resolve_places(
     seq: &mut u64,
 ) -> Result<u64> {
     let mut merged = 0;
-    let mut flush = |group: &mut Vec<crate::record::PoiRecord>| -> Result<()> {
+    let mut flush = |group: &mut Vec<poi::Place>| -> Result<()> {
         let count = group.len();
         let resolved = poi::resolve(std::mem::take(group));
         merged += (count - resolved.len()) as u64;
@@ -4231,23 +4242,35 @@ mod tests {
     fn one_cafe_mapped_twice_is_one_place_found_by_either_id() {
         let dir = temp_dir("one-place");
         let input = dir.join("cafes.osm.pbf");
-        let cafe = |id: i64, lon: f64, tags: &[(&'static str, &'static str)]| {
-            let mut all = vec![("name", "Cafetaria De Pindol"), ("amenity", "cafe")];
-            all.extend_from_slice(tags);
-            node(id, 51.41, lon, &all)
-        };
+        let cafe = [("name", "Cafetaria De Pindol"), ("amenity", "cafe")];
+        // Its building, its point inside it with its address, and a cafe of
+        // that name across the street that shares nothing with them.
         write_pbf(
             &input,
             &[
                 vec![
-                    cafe(1, 5.40000, &[]),
-                    cafe(
-                        2,
-                        5.40004,
-                        &[("addr:housenumber", "82"), ("addr:street", "Dorpstraat")],
+                    node(
+                        1,
+                        51.41,
+                        5.40000,
+                        &[
+                            cafe[0],
+                            cafe[1],
+                            ("addr:housenumber", "82"),
+                            ("addr:street", "Dorpstraat"),
+                        ],
                     ),
+                    node(2, 51.41, 5.40030, &cafe),
+                    node(20, 51.40990, 5.39985, &[]),
+                    node(21, 51.40990, 5.40015, &[]),
+                    node(22, 51.41010, 5.40015, &[]),
+                    node(23, 51.41010, 5.39985, &[]),
                 ],
-                vec![],
+                vec![way(
+                    10,
+                    &[20, 21, 22, 23, 20],
+                    &[cafe[0], cafe[1], ("building", "yes")],
+                )],
                 vec![],
             ],
         );
@@ -4255,18 +4278,23 @@ mod tests {
         assert_eq!(report.accepted.places_merged, 1);
 
         let reader = Reader::open(dir.join("pack")).expect("reader");
-        assert_eq!(reader.manifest().layer_counts.get("poi"), Some(&1));
+        assert_eq!(reader.manifest().layer_counts.get("poi"), Some(&2));
         let catalogue = crate::ids::Catalogue::open(reader.container())
             .expect("open")
             .expect("a catalogue");
-        let first = catalogue
-            .find(reader.records(), ObjectType::Node, 1)
-            .expect("find");
-        let second = catalogue
-            .find(reader.records(), ObjectType::Node, 2)
-            .expect("find");
+        let find = |object_type, id| {
+            catalogue
+                .find(reader.records(), object_type, id)
+                .expect("find")
+        };
+        let first = find(ObjectType::Way, 10);
         assert_eq!(first.len(), 1);
-        assert_eq!(first, second, "the merged-away id finds the place");
+        assert_eq!(
+            first,
+            find(ObjectType::Node, 1),
+            "the merged-away id finds the place"
+        );
+        assert_ne!(find(ObjectType::Node, 2), first);
         let Record::Poi(cafe) = reader.records().record(first[0]).expect("record") else {
             panic!("a place");
         };

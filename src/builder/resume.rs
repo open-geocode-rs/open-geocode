@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// The manifest's own format. A build refuses a manifest of another.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 /// Bytes of an input's start and end the fingerprint hashes: a PBF's header
 /// and its last blocks, enough to tell an extract from a newer one of the
 /// same size and time.
