@@ -29,7 +29,9 @@ use crate::{
         batch::{self, Lookup},
         bounds, health,
         jobs::{self, JobStore},
-        method, openapi,
+        method,
+        metrics::{self, Metrics},
+        openapi,
         param::Param,
         problem::{InvalidParam, Problem},
         request_id::{self, ErrorLog},
@@ -74,6 +76,9 @@ pub struct ServeOptions {
     /// Longest the server takes to stop once Ctrl-C or SIGTERM arrives;
     /// what is still open then is dropped. Zero drops it at once.
     pub shutdown_timeout: Duration,
+    /// Serve `/metrics`. Off unless asked: it shows the server's load and
+    /// traffic to whoever can reach the port.
+    pub metrics: bool,
 }
 
 #[derive(Clone)]
@@ -96,6 +101,8 @@ pub(crate) struct AppState {
     lookup_slots: Arc<Semaphore>,
     /// `/openapi.json` for this server's limits, built once.
     spec: Arc<str>,
+    metrics: Metrics,
+    expose_metrics: bool,
 }
 
 impl AppState {
@@ -141,7 +148,20 @@ impl AppState {
             )),
             spec: openapi::document(&limits)?.into(),
             limits,
+            metrics: Metrics::new(resources.usable_cpus),
+            expose_metrics: false,
         })
+    }
+
+    /// Serve `/metrics` and count requests. The counters exist either way,
+    /// for the batch hooks, which then cost one atomic add.
+    pub(crate) fn with_metrics(mut self) -> Self {
+        self.expose_metrics = true;
+        self
+    }
+
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     pub(crate) fn stopping(&self) -> &CancellationToken {
@@ -314,7 +334,10 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .job_dir
         .clone()
         .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
-    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
+    let mut state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
+    if options.metrics {
+        state = state.with_metrics();
+    }
     tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(
         state.clone(),
@@ -421,6 +444,9 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz))
         .route("/version", get_only(version::version));
+    if state.expose_metrics {
+        app = app.route("/metrics", get_only(metrics::metrics));
+    }
 
     // The basemap PMTiles lives with the other data artifacts (not in the demo
     // dir), so serve it explicitly. ServeFile honors HTTP range requests, which
@@ -451,12 +477,19 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
     // request-id layer is outermost so it also wraps both fallbacks, which puts
     // the id in every Problem and logs every 500 in one place.
     let error_log = state.error_log.clone();
+    let metrics = state.expose_metrics.then(|| state.metrics.clone());
     let app = app.method_not_allowed_fallback(method::method_not_allowed);
     let app = match demo {
         Some(demo) => app.fallback_service(
             ServeDir::new(demo).not_found_service(method::not_found.into_service()),
         ),
         None => app.fallback(method::not_found),
+    };
+    // Layered on the router, not wrapped around it, so the request carries
+    // the route it matched when this runs.
+    let app = match metrics {
+        Some(metrics) => app.layer(middleware::from_fn_with_state(metrics, metrics::track)),
+        None => app,
     };
     app.layer(middleware::from_fn_with_state(
         error_log,
@@ -3528,5 +3561,142 @@ mod router_tests {
         assert_eq!(refused.error_code().as_str(), "limit_too_large");
         assert_eq!(refused.invalid_params()[0].reason, "at most 7 ids");
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_off_unless_asked() {
+        let pack = temp_path("metrics-off");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let reply = send(router.clone(), request("GET", "/metrics")).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        assert_eq!(reply.content_type(), "application/problem+json");
+
+        let on = build_router(state_for(&pack, true).with_metrics(), None, None);
+        let reply = send(on.clone(), request("GET", "/metrics")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            reply
+                .content_type()
+                .starts_with("application/openmetrics-text")
+        );
+        assert_eq!(
+            send(on, request("HEAD", "/metrics")).await.status,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    fn metrics_text(reply: &Reply) -> String {
+        String::from_utf8(reply.body.clone()).expect("metrics are text")
+    }
+
+    /// Whole lines, so a count of 20 does not pass for 2.
+    fn assert_samples(text: &str, samples: &[&str]) {
+        for sample in samples {
+            assert!(text.lines().any(|line| line == *sample), "{sample}\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_count_requests_by_route_and_never_show_what_was_asked() {
+        let pack = temp_path("metrics-count");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true).with_metrics(), None, None);
+
+        let geocode = "/geocode?address=10%20King%20Street&postcode=M5V%201A1";
+        for _ in 0..2 {
+            assert_eq!(
+                send(router.clone(), request("GET", geocode)).await.status,
+                StatusCode::OK
+            );
+        }
+        send(router.clone(), request("GET", "/places?q=secret%20lane")).await;
+        send(router.clone(), request("GET", "/no/such/place/48151623")).await;
+        send(router.clone(), request("FETCH", "/geocode")).await;
+
+        let reply = send(router, request("GET", "/metrics")).await;
+        let text = metrics_text(&reply);
+        let build_info = format!(
+            r#"open_geocode_build_info{{version="{}"}} 1"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_samples(
+            &text,
+            &[
+                r#"open_geocode_http_requests_total{route="/geocode",method="GET",status="200"} 2"#,
+                r#"open_geocode_http_requests_total{route="unmatched",method="GET",status="404"} 1"#,
+                r#"open_geocode_http_requests_total{route="/geocode",method="other",status="405"} 1"#,
+                r#"open_geocode_http_request_duration_seconds_count{route="/geocode"} 3"#,
+                "open_geocode_http_requests_in_flight 1",
+                &build_info,
+                "open_geocode_batch_slots_in_use 0",
+            ],
+        );
+        for private in [
+            "King", "king", "M5V", "secret", "lane", "48151623", "such", "address=", "?",
+        ] {
+            assert!(!text.contains(private), "{private} leaked:\n{text}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    #[tokio::test]
+    async fn metrics_count_batch_items_by_outcome() {
+        let pack = temp_path("metrics-batch");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true).with_metrics(), None, None);
+
+        let reply = send(
+            router.clone(),
+            batch_request(
+                "POST",
+                "/geocode",
+                r#"[{"address": "10 King Street"}, {"address": "10 King Street"}, {"address": ""}]"#,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        let text = metrics_text(&send(router, request("GET", "/metrics")).await);
+        assert_samples(
+            &text,
+            &[
+                r#"open_geocode_batch_items_total{outcome="succeeded"} 2"#,
+                r#"open_geocode_batch_items_total{outcome="failed"} 1"#,
+                r#"open_geocode_http_requests_total{route="/geocode",method="POST",status="200"} 1"#,
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    #[tokio::test]
+    async fn metrics_count_job_rows_by_outcome() {
+        let pack = temp_path("metrics-jobs");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true).with_metrics(), None, None);
+
+        let body = "{\"lon\": -79.0, \"lat\": 43.0}\n{\"lon\": 999, \"lat\": 0}\nnot json\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", body),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+
+        let text = metrics_text(&send(router, request("GET", "/metrics")).await);
+        assert_samples(
+            &text,
+            &[
+                r#"open_geocode_batch_items_total{outcome="succeeded"} 1"#,
+                r#"open_geocode_batch_items_total{outcome="failed"} 2"#,
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 }

@@ -16,6 +16,7 @@ pub(crate) mod bounds;
 pub(crate) mod health;
 pub(crate) mod jobs;
 pub(crate) mod method;
+pub(crate) mod metrics;
 pub(crate) mod openapi;
 pub(crate) mod param;
 pub(crate) mod problem;
