@@ -440,7 +440,7 @@
             "type": "string"
           },
           "q": {
-            "description": "The address as free text. Give `q` or `address`, not both.",
+            "description": "The address as free text. Give `q` or the address fields, not both; a\nfield sent empty counts as given.",
             "example": "10 King Street, Toronto",
             "maxLength": 256,
             "type": "string"
@@ -1151,7 +1151,7 @@
         "operationId": "geocode",
         "parameters": [
           {
-            "description": "The address as free text, such as a full address. Give `q` or `address`, not both.",
+            "description": "The address as free text, such as a full address. Give `q` or the address fields, not both; a field sent empty counts as given.",
             "example": "10 King Street, Toronto",
             "in": "query",
             "name": "q",
@@ -1298,7 +1298,7 @@
                 }
               }
             },
-            "description": "Neither `q` nor `address` is given, or both are, a field is too long, `limit` is too large, or a parameter is malformed.",
+            "description": "Neither `q` nor `address` is given, `q` and an address field are both given, `q` or `address` is empty, a field is too long, `limit` is too large, or a parameter is malformed.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -2505,7 +2505,7 @@
         "operationId": "places",
         "parameters": [
           {
-            "description": "Name of the place, with where it is when known. Give `q` or `ids`, not both.",
+            "description": "Name of the place, with where it is when known. Give `q` or `ids`, not both; one sent empty counts as given.",
             "example": "Rijksmuseum Amsterdam",
             "in": "query",
             "name": "q",
@@ -2595,7 +2595,7 @@
                 }
               }
             },
-            "description": "`q` is empty or too long, `limit` is too large, `focus` or `bbox` is out of range, an id is malformed or there are more than 50, or a parameter is malformed.",
+            "description": "Neither `q` nor `ids` is given, or both are, `q` is empty or too long, `limit` is too large, `focus` or `bbox` is out of range, `ids` names no id, an id is malformed or there are more than 50, or a parameter is malformed.",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",

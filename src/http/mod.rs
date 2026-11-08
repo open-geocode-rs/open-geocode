@@ -17,6 +17,7 @@ pub(crate) mod health;
 pub(crate) mod jobs;
 pub(crate) mod method;
 pub(crate) mod openapi;
+pub(crate) mod param;
 pub(crate) mod problem;
 pub(crate) mod request_id;
 pub(crate) mod shutdown;

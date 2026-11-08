@@ -230,7 +230,8 @@ pub(crate) struct GeocodeItem {
     /// Echoed in this item's result, to match it up.
     #[schema(example = "row-1", max_length = 128)]
     pub id: Option<String>,
-    /// The address as free text. Give `q` or `address`, not both.
+    /// The address as free text. Give `q` or the address fields, not both; a
+    /// field sent empty counts as given.
     #[schema(example = "10 King Street, Toronto", max_length = 256)]
     pub q: Option<String>,
     /// The street address on its own: house number and street, without the
