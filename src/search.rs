@@ -50,9 +50,10 @@ use crate::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
         INTERPOLATION_END_FIELD, INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD,
         MIN_LAT_FIELD, MIN_LON_FIELD, NAME_WORDS_FIELD, PLACE_RANK_FIELD, POSTCODE_AREA_RADIUS_M,
-        RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS, address_number_terms,
-        base_house_number, compact_postcode, expand_address_abbreviations, expand_final_direction,
-        flat_number_term, is_numeric_token, open_text_index, street_search_text,
+        PROMINENCE_FIELD, RANK_POSTCODE_FIELD, RECORD_COUNT_FIELD, STREET_TYPE_ABBREVIATIONS,
+        address_number_terms, base_house_number, compact_postcode, expand_address_abbreviations,
+        expand_final_direction, flat_number_term, is_numeric_token, open_text_index,
+        street_search_text,
     },
     util::fold::{exact_key, replaced_characters, search_key},
 };
@@ -109,6 +110,7 @@ struct SegmentColumns {
     max_lat: Column<i64>,
     name_words: Column<u64>,
     place_rank: Column<u64>,
+    prominence: Column<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -420,6 +422,7 @@ impl TextSearcher {
                     max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
                     name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
                     place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
+                    prominence: fast_fields.u64(PROMINENCE_FIELD)?,
                 },
             );
         }
@@ -5281,8 +5284,22 @@ impl TextSearcher {
         if tie(&scored, window) && window < TIE_WINDOW {
             scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
         }
-        let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
-        top_docs.truncate(window);
+        // A run longer than the tie window ("Paris": every place, street
+        // and POI of the name scores alike) would keep an arbitrary part of
+        // it, Paris in France or not. Keying every matching document instead
+        // gives up the skipping, so only such a run pays for it.
+        let top_docs = if tie(&scored, TIE_WINDOW) {
+            let keys = RankKeys {
+                ranking,
+                columns: &self.columns,
+                pack: &self.pack,
+            };
+            searcher.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
+        } else {
+            let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
+            top_docs.truncate(window);
+            top_docs
+        };
         self.rank_documents(&searcher, top_docs, ranking, limit, accept)
     }
 
@@ -5436,7 +5453,7 @@ impl TextSearcher {
                     inexact_query_words: small(tie.inexact_query_words),
                     focus_band: tie.focus_band,
                     precision: tie.precision,
-                    poi: tie.poi.is_some(),
+                    poi: hit.record.layer == Layer::Poi.as_str(),
                     demoted,
                     window_rank: rank.min(usize::from(u16::MAX)) as u16,
                     ..Signals::default()
@@ -6155,6 +6172,11 @@ struct RankKey {
     /// Road", "Queen Street" before "Upper Queen Street"). [`TieBreak`]
     /// asks the same of the hits.
     name_words: u8,
+    /// See [`Prominence::rank`], larger better known; 0 for an address or
+    /// a street. Before the size of a place: Salzburg the city is better
+    /// known than the state, Paris in France than Paris in Benin, though
+    /// both are cities.
+    prominence: u64,
     /// See [`place_rank`], smaller larger; [`u8::MAX`] for a record that is
     /// no place.
     place_rank: u8,
@@ -6175,6 +6197,7 @@ impl RankKey {
             stated: true,
             text_score,
             name_words: u8::MAX,
+            prominence: 0,
             place_rank: u8::MAX,
             nearness: 0,
         }
@@ -6202,11 +6225,18 @@ impl RankKey {
 impl PartialOrd for RankKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp_evidence(other).then_with(|| {
-            (other.name_words, other.place_rank, self.nearness).cmp(&(
-                self.name_words,
-                self.place_rank,
-                other.nearness,
-            ))
+            (
+                other.name_words,
+                self.prominence,
+                other.place_rank,
+                self.nearness,
+            )
+                .cmp(&(
+                    self.name_words,
+                    other.prominence,
+                    self.place_rank,
+                    other.nearness,
+                ))
         }))
     }
 }
@@ -6282,6 +6312,7 @@ struct SegmentRankKeys {
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     name_words: Column<u64>,
+    prominence: Column<u64>,
     place_rank: Column<u64>,
     postcode: Option<SegmentPostcodes>,
     focus: Option<SegmentFocus>,
@@ -6419,6 +6450,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
+            prominence: columns.prominence.clone(),
             place_rank: columns.place_rank.clone(),
             postcode,
             focus: self.ranking.focus.map(|focus| SegmentFocus {
@@ -6440,6 +6472,7 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         let small =
             |value: Option<u64>| value.map_or(u8::MAX, |value| value.min(u64::from(u8::MAX)) as u8);
         key.name_words = small(self.name_words.first(doc));
+        key.prominence = self.prominence.first(doc).unwrap_or_default();
         key.place_rank = small(self.place_rank.first(doc));
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
@@ -6485,6 +6518,10 @@ struct TieBreak {
     /// writes "Taupō" asks for Taupō before a "Taupo" its search key also
     /// finds, and one that writes "Taupo" for Taupo first.
     inexact_query_words: usize,
+    /// Better known places first (see [`Prominence`]), before their size:
+    /// "Paris" is the one in France before the one in Benin, both cities.
+    /// Every record but a place ties on it.
+    fame: std::cmp::Reverse<Prominence>,
     /// Larger places first (see [`place_rank`]), then every other record:
     /// "Richmond" is the town before a locality of that name. Only a tie on
     /// the words and the areas a query states reaches it, so a size prior
@@ -6501,10 +6538,10 @@ struct TieBreak {
     /// [`AddressRecord::disputed`]).
     disputed: bool,
     /// Every other record before a POI, then the POI its OSM tags show
-    /// better known first: linked to Wikidata or Wikipedia, then named in
-    /// more languages (see [`Prominence`]). Only POIs that tie on all the
-    /// query states and on the caller's focus reach it. It is no measure of
-    /// an address or a place, so `None` keeps it from ever ordering one
+    /// better known first: read more, linked to Wikidata or Wikipedia, then
+    /// named in more languages (see [`Prominence`]). Only POIs that tie on
+    /// all the query states and on the caller's focus reach it. It is no
+    /// measure of an address, so `None` keeps it from ever ordering one
     /// against a POI by prominence; at so full a tie an address before a
     /// POI is what [`TextSearcher::demoted`] says anyway.
     poi: Option<std::cmp::Reverse<Prominence>>,
@@ -6591,10 +6628,19 @@ impl TieBreak {
             extra_name_words,
             missing_query_words,
             inexact_query_words,
+            fame: std::cmp::Reverse(
+                prior
+                    .prominence
+                    .filter(|_| record.layer != Layer::Poi.as_str())
+                    .unwrap_or_default(),
+            ),
             place_rank: prior.place_rank.unwrap_or(u8::MAX),
             focus_band,
             disputed: prior.disputed,
-            poi: prior.prominence.map(std::cmp::Reverse),
+            poi: prior
+                .prominence
+                .filter(|_| record.layer == Layer::Poi.as_str())
+                .map(std::cmp::Reverse),
             precision,
             source: (source, record.source.object_id.unwrap_or_default()),
             id: record.id.clone(),
@@ -6607,7 +6653,7 @@ impl TieBreak {
 struct Prior {
     /// See [`place_rank`].
     place_rank: Option<u8>,
-    /// A POI's, `None` for the other layers.
+    /// A POI's or a place's, `None` for the other layers.
     prominence: Option<Prominence>,
     disputed: bool,
 }
@@ -9147,6 +9193,8 @@ mod tests {
                             place_type: place_type.to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Node, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -9195,6 +9243,8 @@ mod tests {
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -9753,6 +9803,8 @@ mod tests {
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Node, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -9819,6 +9871,8 @@ mod tests {
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-79.5, 45.1),
                         source: SourceProvenance::osm(ObjectType::Relation, 1),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 None,
@@ -9982,6 +10036,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// More records of one name than the tie window holds: the best known
+    /// place or POI is collected and ranked first, wherever it lies in the
+    /// index.
+    #[test]
+    fn the_best_known_of_many_same_named_places_wins() {
+        let temp_dir = temp_pack_path("search-place-prominence");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let known = Prominence {
+            importance: 160,
+            linked: true,
+            languages: 100,
+        };
+        let city = |object_id, prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Paris".to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(2.35, 48.86),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence,
+                    wikidata: None,
+                },
+            )
+        };
+        let cafe = |object_id, prominence| {
+            Record::from(PoiRecord {
+                alt_names: Vec::new(),
+                name: "Paris".to_string(),
+                category: "amenity:cafe".to_string(),
+                address: None,
+                geometry: point_geometry(-79.0, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, object_id),
+                prominence,
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
+            })
+        };
+        writer
+            .write(&city(1, Prominence::default()), None)
+            .expect("benin");
+        // More streets and cafes of the name than the tie window holds, all
+        // scoring as the cities and the known cafe do.
+        for id in 2..=(TIE_WINDOW as i64 + 100) {
+            writer
+                .write(
+                    &street_record(&format!("osm:way:{id}"), "Paris").into(),
+                    None,
+                )
+                .expect("street");
+            writer
+                .write(&cafe(id, Prominence::default()), None)
+                .expect("cafe");
+        }
+        writer.write(&city(9_999, known), None).expect("france");
+        writer.write(&cafe(9_998, known), None).expect("known cafe");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            top_ids(&searcher, "Paris")[..2],
+            ["osm:node:9999", "osm:node:1"]
+        );
+        assert_eq!(top_ids(&searcher.places(), "Paris")[0], "osm:node:9998");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
     /// Two cafes of one name the query cannot tell apart: the one its tags
     /// show better known first, never ahead of an address it ties with.
     #[test]
@@ -10044,7 +10168,10 @@ mod tests {
             &Ranking::default(),
         );
         let known = TieBreak::new(
-            &street_summary(),
+            &Summary {
+                layer: Layer::Poi.as_str().to_string(),
+                ..street_summary()
+            },
             Prior {
                 place_rank: None,
                 prominence: Some(Prominence {
@@ -10862,6 +10989,8 @@ mod tests {
                             place_type: "city".to_string(),
                             geometry: point_geometry(-79.0, 43.0),
                             source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -11749,6 +11878,8 @@ mod tests {
                         place_type: "admin_level:8".to_string(),
                         geometry: point_geometry(-81.4, 43.5),
                         source: SourceProvenance::osm(ObjectType::Relation, 1),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 None,
@@ -11825,6 +11956,8 @@ mod tests {
                             place_type: "boundary".to_string(),
                             geometry: point_geometry(174.7, -36.8),
                             source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
                         },
                     ),
                     None,
@@ -11986,6 +12119,8 @@ mod tests {
                         place_type: "boundary".to_string(),
                         geometry: point_geometry(lon, lat),
                         source: SourceProvenance::osm(object_type, object_id),
+                        prominence: Default::default(),
+                        wikidata: None,
                     },
                 ),
                 context,

@@ -111,6 +111,7 @@ pub(crate) const MAX_LAT_FIELD: &str = "max_lat";
 pub(crate) const RECORD_COUNT_FIELD: &str = "record_count";
 pub(crate) const NAME_WORDS_FIELD: &str = "name_words";
 pub(crate) const PLACE_RANK_FIELD: &str = "place_rank";
+pub(crate) const PROMINENCE_FIELD: &str = "prominence";
 /// Addresses one document holds at most, so finding a number in a group reads
 /// a bounded run of records.
 const MAX_GROUP_RECORDS: u64 = 1_024;
@@ -263,6 +264,10 @@ pub struct Fields {
     /// The [`place_rank`] of a place, so that of places a query scores
     /// alike the text index keeps the larger.
     pub place_rank: Field,
+    /// The [`crate::record::Prominence::rank`] of a POI or a place, so
+    /// that of records a query scores alike the text index keeps the
+    /// better known.
+    pub prominence: Field,
 }
 
 /// The smallest box holding a document's records, in 1e-7 degrees, the
@@ -356,6 +361,8 @@ pub struct Document {
     pub name_words: Option<u64>,
     /// See [`Fields::place_rank`].
     pub place_rank: Option<u8>,
+    /// See [`Fields::prominence`].
+    pub prominence: Option<u64>,
 }
 
 impl fmt::Debug for Writer {
@@ -654,6 +661,7 @@ impl Fields {
             max_lat: schema.get_field(MAX_LAT_FIELD)?,
             name_words: schema.get_field(NAME_WORDS_FIELD)?,
             place_rank: schema.get_field(PLACE_RANK_FIELD)?,
+            prominence: schema.get_field(PROMINENCE_FIELD)?,
         })
     }
 
@@ -782,6 +790,9 @@ impl Fields {
         if let Some(rank) = projected.place_rank {
             document.add_u64(self.place_rank, rank.into());
         }
+        if let Some(rank) = projected.prominence {
+            document.add_u64(self.prominence, rank);
+        }
         document
     }
 }
@@ -848,8 +859,13 @@ impl Document {
                     .map(str::to_string);
             }
         }
-        if let Record::Place(_, place) = record {
-            document.place_rank = place_rank(&place.place_type);
+        match record {
+            Record::Place(_, place) => {
+                document.place_rank = place_rank(&place.place_type);
+                document.prominence = Some(place.prominence.rank());
+            }
+            Record::Poi(poi) => document.prominence = Some(poi.prominence.rank()),
+            _ => {}
         }
         // A record repeats words across its names and address ("Walmer Road
         // Parkette, 227 Walmer Road", "Upper Queen Street" also named
@@ -1098,6 +1114,7 @@ fn build_schema() -> (Schema, Fields) {
     let max_lat = builder.add_i64_field(MAX_LAT_FIELD, FAST);
     let name_words = builder.add_u64_field(NAME_WORDS_FIELD, FAST);
     let place_rank = builder.add_u64_field(PLACE_RANK_FIELD, FAST);
+    let prominence = builder.add_u64_field(PROMINENCE_FIELD, FAST);
     let schema = builder.build();
     let fields = Fields {
         record_id,
@@ -1126,6 +1143,7 @@ fn build_schema() -> (Schema, Fields) {
         max_lat,
         name_words,
         place_rank,
+        prominence,
     };
     (schema, fields)
 }
@@ -1190,6 +1208,7 @@ impl ProjectionBuilder {
                 extent: None,
                 name_words: None,
                 place_rank: None,
+                prominence: None,
             },
             name_parts: Vec::new(),
             content_parts: Vec::new(),
@@ -1863,6 +1882,8 @@ mod tests {
                 object_id: 1,
                 tags: Some(BTreeMap::new()),
             },
+            prominence: Default::default(),
+            wikidata: None,
         };
 
         let postcode =

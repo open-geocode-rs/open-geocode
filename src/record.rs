@@ -236,7 +236,8 @@ fn deserialize_item<'de, D: serde::Deserializer<'de>>(
     Ok(text.and_then(|text| text.strip_prefix('Q').and_then(|item| item.parse().ok())))
 }
 
-/// Breaks ties between POIs only, never against another layer.
+/// How well known a POI or a place is: what breaks ties between records the
+/// query names alike, never against an address or a street.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -267,6 +268,14 @@ impl Prominence {
             languages: byte >> 1,
         }
     }
+
+    /// One number that orders as the struct does, for the text index to
+    /// collect by.
+    pub fn rank(self) -> u64 {
+        u64::from(self.importance) << 8
+            | u64::from(self.linked) << 7
+            | u64::from(self.languages.min(Self::MAX_LANGUAGES))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -283,6 +292,8 @@ pub struct PlaceRecord {
     pub place_type: String,
     pub geometry: Geometry,
     pub source: SourceProvenance,
+    pub prominence: Prominence,
+    pub wikidata: Option<u32>,
 }
 
 /// Kind of result: an address, a street, a POI, or an area such as a
@@ -946,7 +957,7 @@ pub fn place_rank(place_type: &str) -> Option<u8> {
 
 impl Serialize for PlaceRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PlaceRecord", 7)?;
+        let mut state = serializer.serialize_struct("PlaceRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -954,6 +965,15 @@ impl Serialize for PlaceRecord {
         state.serialize_field("place_type", &self.place_type)?;
         state.serialize_field("geometry", &self.geometry)?;
         state.serialize_field("source", &self.source)?;
+        if self.prominence == Prominence::default() {
+            state.skip_field("prominence")?;
+        } else {
+            state.serialize_field("prominence", &self.prominence)?;
+        }
+        match self.wikidata {
+            Some(item) => state.serialize_field("wikidata", &format!("Q{item}"))?,
+            None => state.skip_field("wikidata")?,
+        }
         state.end()
     }
 }

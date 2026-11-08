@@ -1638,14 +1638,20 @@ impl<'a> Run<'a> {
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
         let context_count = ordered.len();
-        write_ordered(
+        // Before the context records: the admin areas among them are places
+        // QRank ranks too.
+        let qrank = match &self.options.qrank {
+            Some(path) => Some(QRank::load(path, &self.memory)?),
+            None => None,
+        };
+        let ranked_contexts = write_ordered(
             &mut writer,
             &mut sample,
             ordered.into_reader(),
             context_count,
             &index,
             None,
-            None,
+            qrank.as_ref(),
             &self.progress,
             BuildStage::ContextRecords,
         )?;
@@ -1670,10 +1676,6 @@ impl<'a> Run<'a> {
             .books
             .take()
             .ok_or_else(|| missing("the address book"))?;
-        let qrank = match &self.options.qrank {
-            Some(path) => Some(QRank::load(path, &self.memory)?),
-            None => None,
-        };
         let ranked = write_ordered(
             &mut writer,
             &mut sample,
@@ -1695,7 +1697,7 @@ impl<'a> Run<'a> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |since| since.as_secs()),
                 items: qrank.len() as u64,
-                ranked_places: ranked,
+                ranked_places: ranked_contexts + ranked,
             });
         }
         drop(qrank);
@@ -2944,11 +2946,18 @@ fn write_ordered(
                         let (batch, countries): (Vec<_>, Vec<_>) = batch
                             .into_par_iter()
                             .map(|(mut record, origin)| {
-                                if let (Some(qrank), Record::Poi(poi)) = (qrank, &mut record)
-                                    && let Some(item) = poi.wikidata
+                                let known = match &mut record {
+                                    Record::Poi(poi) => Some((&mut poi.prominence, poi.wikidata)),
+                                    Record::Place(_, place) => {
+                                        Some((&mut place.prominence, place.wikidata))
+                                    }
+                                    _ => None,
+                                };
+                                if let (Some(qrank), Some((prominence, Some(item)))) =
+                                    (qrank, known)
                                 {
-                                    poi.prominence.importance = qrank.importance(item);
-                                    if poi.prominence.importance > 0 {
+                                    prominence.importance = qrank.importance(item);
+                                    if prominence.importance > 0 {
                                         ranked_ref.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }

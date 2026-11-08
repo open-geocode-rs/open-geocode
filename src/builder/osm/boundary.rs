@@ -16,8 +16,8 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance,
-        point_geometry,
+        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
+        SourceProvenance, point_geometry,
     },
     util::text::normalize_for_compare,
 };
@@ -27,7 +27,7 @@ use super::{
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
     poi::{PoiCandidate, outline},
-    tags::{OsmTags, alternate_names, name_tags},
+    tags::{OsmTags, alternate_names, item, name_tags, prominence},
 };
 
 /// Tags a boundary keeps after the scan besides its names.
@@ -132,6 +132,8 @@ struct BuiltBoundary {
     place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
+    prominence: Prominence,
+    wikidata: Option<u32>,
     /// The layer its `place` tag names, if any (`place=city` is a locality).
     place_layer: Option<PlaceLayer>,
     /// Its `designation` tag (`unitary_authority`), which libpostal's table
@@ -384,6 +386,8 @@ impl BoundarySet {
                             candidate.source_object_type,
                             candidate.source_object_id,
                         ),
+                        prominence: boundary.prominence,
+                        wikidata: boundary.wikidata,
                     },
                 ),
             ));
@@ -738,6 +742,8 @@ fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, Pla
                     candidate.source_object_type,
                     candidate.source_object_id,
                 ),
+                prominence: Prominence::default(),
+                wikidata: None,
             },
         );
     }
@@ -884,6 +890,8 @@ fn built(
             place_type,
             name,
             alt_names,
+            prominence: prominence(tags),
+            wikidata: item(tags, "wikidata"),
             place_layer,
             designation,
             inferred_country_code: country_code_from_tags(tags, layer),
@@ -1737,6 +1745,9 @@ impl crate::extsort::Spill for SetItem {
                 for name in &boundary.alt_names {
                     put_str(out, name);
                 }
+                out.push(boundary.prominence.to_byte());
+                out.push(boundary.prominence.importance);
+                put_u64(out, boundary.wikidata.map_or(0, u64::from));
                 out.push(boundary.place_layer.map_or(u8::MAX, |layer| layer as u8));
                 put_opt_str(out, boundary.designation.as_deref());
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
@@ -1788,6 +1799,14 @@ impl crate::extsort::Spill for SetItem {
                 let alt_names = (0..get_u64(input)?)
                     .map(|_| get_string(input))
                     .collect::<crate::error::Result<Vec<_>>>()?;
+                let prominence = Prominence::from_byte(get_u8(input)?, get_u8(input)?);
+                let wikidata = match get_u64(input)? {
+                    0 => None,
+                    item => Some(
+                        u32::try_from(item)
+                            .map_err(|_| Error::Decode("Wikidata item is out of range"))?,
+                    ),
+                };
                 let place_layer = match get_u8(input)? {
                     u8::MAX => None,
                     code => Some(layer(code)?),
@@ -1813,6 +1832,8 @@ impl crate::extsort::Spill for SetItem {
                         place_type,
                         name,
                         alt_names,
+                        prominence,
+                        wikidata,
                         place_layer,
                         designation,
                         inferred_country_code,
@@ -2015,6 +2036,8 @@ mod tests {
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
             area: geometry.unsigned_area(),
+            prominence: Default::default(),
+            wikidata: None,
         }
     }
 
@@ -2378,6 +2401,8 @@ mod tests {
                     shape,
                     bounds,
                     area,
+                    prominence: Default::default(),
+                    wikidata: None,
                 },
             });
         }

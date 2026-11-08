@@ -882,6 +882,8 @@ mod tests {
             place_type: "admin_level:8".to_string(),
             geometry: point_geometry(-79.0, 43.0),
             source: SourceProvenance::osm(ObjectType::Relation, 99),
+            prominence: Default::default(),
+            wikidata: None,
         }
     }
 

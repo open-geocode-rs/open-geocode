@@ -28,7 +28,7 @@ use super::{
     address::address_components,
     containment,
     emitted::Emitted,
-    tags::{OsmTags, alternate_names, name_tags, prominence},
+    tags::{OsmTags, alternate_names, item, name_tags, prominence},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,15 +618,6 @@ fn values(
     values.sort_unstable();
     values.dedup();
     values
-}
-
-/// Several items in one value name none.
-fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
-    tags.cleaned(key)?
-        .strip_prefix('Q')?
-        .parse()
-        .ok()
-        .filter(|item| *item > 0)
 }
 
 /// House numbers and ref codes in `name` are no names.

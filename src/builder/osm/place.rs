@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     emitted::Emitted,
-    tags::{OsmTags, alternate_names},
+    tags::{OsmTags, alternate_names, item, prominence},
 };
 
 pub(crate) fn has_place_tag(tags: &BTreeMap<String, String>) -> bool {
@@ -59,6 +59,8 @@ fn place_record_from_node(
             place_type,
             geometry: point_geometry(lon, lat),
             source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: prominence(tags),
+            wikidata: item(tags, "wikidata"),
         },
         layer,
     ))
@@ -87,6 +89,9 @@ mod tests {
         let tags = BTreeMap::from([
             ("place".to_string(), "city".to_string()),
             ("name".to_string(), " Toronto ".to_string()),
+            ("name:fr".to_string(), "Toronto".to_string()),
+            ("name:ja".to_string(), "トロント".to_string()),
+            ("wikidata".to_string(), "Q172".to_string()),
         ]);
 
         let (record, layer) = place_record_from_node(42, 43.6532, -79.3832, &tags).expect("place");
@@ -95,6 +100,9 @@ mod tests {
         assert_eq!(record.id(), "osm:node:42");
         assert_eq!(record.label(), "Toronto");
         assert_eq!(record.place_type, "city");
+        assert_eq!(record.wikidata, Some(172));
+        assert!(record.prominence.linked);
+        assert_eq!(record.prominence.languages, 2);
         match record.geometry.value {
             GeometryValue::Point { coordinates } => {
                 assert_eq!(coordinates.as_slice(), &[-79.3832, 43.6532]);

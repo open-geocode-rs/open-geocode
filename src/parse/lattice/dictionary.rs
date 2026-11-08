@@ -1810,6 +1810,8 @@ mod tests {
                     crate::record::ObjectType::Relation,
                     1,
                 ),
+                prominence: Default::default(),
+                wikidata: None,
             },
         );
         assert_eq!(

@@ -110,6 +110,16 @@ pub(crate) fn is_name_key(key: &str) -> bool {
     base_ok && language.is_none_or(is_language_tag)
 }
 
+/// The Wikidata item `key` names, `Q42` as 42. Several items in one value
+/// name none.
+pub(crate) fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
+    tags.cleaned(key)?
+        .strip_prefix('Q')?
+        .parse()
+        .ok()
+        .filter(|item| *item > 0)
+}
+
 /// How widely a feature is known by its tags (see [`Prominence`]).
 pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
     let mut languages = tags

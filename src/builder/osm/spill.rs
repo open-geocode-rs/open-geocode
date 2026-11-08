@@ -1268,6 +1268,9 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             put_str(out, &record.name);
             put_strs(out, &record.alt_names);
             put_str(out, &record.place_type);
+            out.push(record.prominence.to_byte());
+            out.push(record.prominence.importance);
+            put_u64(out, record.wikidata.map_or(0, u64::from));
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1367,6 +1370,8 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 name: get_string(input)?,
                 alt_names: get_strings(input)?,
                 place_type: get_string(input)?,
+                prominence: Prominence::from_byte(get_u8(input)?, get_u8(input)?),
+                wikidata: spilled_item(input)?,
                 source: decode_source(input)?,
                 geometry: decode_geometry(input)?,
             },
@@ -1709,6 +1714,12 @@ mod tests {
                     place_type: "suburb".into(),
                     geometry: point_geometry(-79.4, 43.67),
                     source: SourceProvenance::osm(ObjectType::Node, 15),
+                    prominence: Prominence {
+                        importance: 90,
+                        linked: true,
+                        languages: 3,
+                    },
+                    wikidata: Some(2_662_544),
                 },
             ),
             Record::Poi(PoiRecord {
