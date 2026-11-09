@@ -1567,7 +1567,10 @@ fn tail(job: Arc<Job>) -> Body {
             }
         },
     );
-    Body::from_stream(stream)
+    // Fused: tower-http compression polls a body once more after its end
+    // (tower-rs/tower-http#732), and unfold panics when polled past its end.
+    // The canary test in runtime.rs fails once tower-http stops doing that.
+    Body::from_stream(stream.fuse())
 }
 
 fn unix_now() -> u64 {
