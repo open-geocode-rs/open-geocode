@@ -1,0 +1,12 @@
+# Weekly cargo bumps. A tower-http bump that fixes tower-rs/tower-http#732
+# fails the canary test in src/runtime.rs, the cue to drop the .fuse() in
+# tail() in src/http/jobs.rs.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+      include: scope

@@ -1567,9 +1567,10 @@ fn tail(job: Arc<Job>) -> Body {
             }
         },
     );
-    // Fused: compression polls a body once more after its end, to look for
-    // trailers, and unfold panics when polled past its end.
-    Body::from_stream(futures_util::StreamExt::fuse(stream))
+    // Fused: tower-http compression polls a body once more after its end
+    // (tower-rs/tower-http#732), and unfold panics when polled past its end.
+    // The canary test in runtime.rs fails once tower-http stops doing that.
+    Body::from_stream(stream.fuse())
 }
 
 fn unix_now() -> u64 {

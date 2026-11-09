@@ -3671,4 +3671,31 @@ mod router_tests {
 
         let _ = std::fs::remove_dir_all(&pack);
     }
+
+    /// Canary for tower-rs/tower-http#732. Passes while tower-http compression
+    /// polls a body past its end, which is why `tail()` in `jobs.rs` fuses its
+    /// stream. Fails once a tower-http bump carries the fix: then drop that
+    /// `.fuse()` and this test.
+    #[tokio::test]
+    async fn tower_http_compression_still_polls_bodies_past_their_end() {
+        let router = Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    Body::from_stream(futures_util::stream::unfold(0, |n| async move {
+                        (n < 2).then(|| (Ok::<_, std::io::Error>(vec![b'x'; 100]), n + 1))
+                    }))
+                }),
+            )
+            .layer(CompressionLayer::new());
+        let response = router
+            .oneshot(with_headers("GET", "/", &[("accept-encoding", "gzip")]))
+            .await
+            .expect("router response");
+        let read = tokio::spawn(to_bytes(response.into_body(), usize::MAX)).await;
+        assert!(
+            read.is_err_and(|error| error.is_panic()),
+            "tower-http#732 is fixed: drop .fuse() in tail() in jobs.rs, and this test"
+        );
+    }
 }
