@@ -232,11 +232,13 @@ impl Collection {
         let bad = |detail: String| Error::BadInput(format!("{}: {detail}", self.path.display()));
         let mut archive = zip::ZipArchive::new(io::BufReader::new(file))
             .map_err(|error| bad(format!("not a readable zip archive: {error}")))?;
-        let metas = archive
-            .file_names()
-            .filter(|name| name.ends_with(".geojson.meta"))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let mut metas = Vec::new();
+        for name in archive.file_names() {
+            let name = name.map_err(|error| bad(format!("unreadable entry name: {error}")))?;
+            if name.ends_with(".geojson.meta") {
+                metas.push(name.into_owned());
+            }
+        }
         let mut listed = Vec::new();
         for meta in metas {
             let entry = meta.trim_end_matches(".meta").to_string();
