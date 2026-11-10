@@ -3574,6 +3574,64 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A region one of whose rings is left open, as Russia's mainland in
+    /// the planet, keeps only the rings that closed: a source is not judged
+    /// by them, and its rows on the open part are kept.
+    #[test]
+    fn keeps_a_source_whose_area_left_a_ring_open() {
+        let dir = temp_dir("open-ring-area");
+        let input = dir.join("town.osm.pbf");
+        let mut elements = town();
+        elements[1].extend([
+            node(1021, 45.0, -75.0, &[]),
+            node(1022, 45.0, -74.9, &[]),
+            node(1023, 45.1, -74.9, &[]),
+            node(1024, 45.1, -75.0, &[]),
+        ]);
+        for element in elements.iter_mut().flatten() {
+            match element {
+                // Ontario's mainland ring, its closing node dropped.
+                TestElement::Way { id: 502, refs, .. } => *refs = vec![1011, 1012, 1013, 1014],
+                TestElement::Relation {
+                    id: 901, members, ..
+                } => *members = vec![(502, "outer"), (503, "outer")],
+                _ => {}
+            }
+        }
+        elements[2].push(way(503, &[1021, 1022, 1023, 1024, 1021], &[]));
+        write_pbf(&input, &elements);
+        let path = dir.join("sound.csv");
+        fs::write(
+            &path,
+            "LON,LAT,NUMBER,STREET\n-79.45,43.65,3,Queen Street\n-79.46,43.66,11,Queen Street\n",
+        )
+        .expect("csv");
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                addresses::AddressFile {
+                    dataset: "openaddresses:ca/on/sound".to_string(),
+                    path,
+                    entry: None,
+                    area: Some("CA-ON".to_string()),
+                },
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let import = &report.imports[0];
+        assert_eq!(
+            (import.rows, import.accepted, import.rejected.clone()),
+            (2, 2, BTreeMap::new()),
+            "both rows lie on the mainland, outside the one ring that closed"
+        );
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A row naming a house OSM has, placed a few hundred metres away, is
     /// the same house in the wrong place: one record, OSM's, marked disputed.
     /// Farther, or in another postcode, it is a house of its own.
