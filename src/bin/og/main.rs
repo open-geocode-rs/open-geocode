@@ -315,7 +315,7 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         if let Some(outcome) = job.take() {
             let built = match outcome {
                 Err(error) if job::cancelled(&error) => {
-                    eprintln!("Cancelled; the unfinished Pack was removed.");
+                    eprintln!("{}", job.stopped());
                     std::process::exit(130);
                 }
                 outcome => outcome?,
@@ -370,7 +370,7 @@ fn interactive(home: Home) -> Result<()> {
         println!("  {line}");
     }
     if app.job.is_some() || !app.stopping_builds.is_empty() || !app.stopping_runs.is_empty() {
-        println!("  Stopping, and removing what was not finished…");
+        println!("  Stopping…");
     }
     result.and(left)?;
     if let Some(pack) = app.serve.take() {

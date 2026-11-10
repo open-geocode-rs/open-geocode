@@ -186,9 +186,8 @@ pub struct BuildOsmOptions {
     /// Told about each stage as it starts, advances and finishes, and about
     /// the plan's warnings.
     pub observer: Arc<dyn BuildObserver>,
-    /// Set to stop the build: it then fails with
-    /// [`crate::builder::BuildCancelled`] and publishes nothing, keeping its
-    /// last checkpoint to resume from.
+    /// Set to stop the build: it then fails with [`crate::Error::Cancelled`]
+    /// and publishes nothing, keeping its last checkpoint to resume from.
     pub cancel: Arc<AtomicBool>,
     /// Address points to add to the inputs' own, such as OpenAddresses.
     pub addresses: Option<Arc<dyn AddressSource>>,

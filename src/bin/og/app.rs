@@ -864,10 +864,14 @@ impl App {
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if let Some(job) = &self.job {
-                job.cancel();
-            }
-            self.farewell.push("Cancelled.".to_string());
+            let farewell = match &self.job {
+                Some(job) if !job.is_finished() => {
+                    job.cancel();
+                    job.stopped()
+                }
+                _ => "Cancelled.".to_string(),
+            };
+            self.farewell.push(farewell);
             self.quit = true;
             return;
         }

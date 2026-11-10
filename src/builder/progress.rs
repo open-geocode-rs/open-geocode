@@ -13,7 +13,6 @@
 
 use std::{
     collections::BTreeMap,
-    fmt,
     io::IsTerminal,
     path::Path,
     sync::{
@@ -25,7 +24,7 @@ use std::{
 
 use crate::{
     builder::report::{Bound, BoundShares, InputRead, ResumeReport, StageReport},
-    error::Result,
+    error::{Error, Result},
     extsort::{IoTimes, Scratch, Traffic},
     memory::Budget,
     resources,
@@ -206,18 +205,6 @@ impl LiveStage {
     }
 }
 
-/// The error a build returns when it was asked to stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BuildCancelled;
-
-impl fmt::Display for BuildCancelled {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("build cancelled")
-    }
-}
-
-impl std::error::Error for BuildCancelled {}
-
 /// The observer and the stop flag, as the passes of a build share them,
 /// and the meter that measures each stage.
 #[derive(Clone)]
@@ -298,10 +285,10 @@ impl Progress {
         })
     }
 
-    /// Fails with [`BuildCancelled`] once the build was asked to stop.
+    /// Fails with [`Error::Cancelled`] once the build was asked to stop.
     pub(crate) fn check(&self) -> Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
-            return Err(BuildCancelled.into());
+            return Err(Error::Cancelled);
         }
         Ok(())
     }
