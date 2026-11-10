@@ -46,8 +46,8 @@ pub(crate) struct Osm {
 }
 
 /// The OpenAddresses data within the region, as the catalog snapshot saw it.
-/// Sources overlap (a countrywide one and a city's), so these are what a
-/// build downloads at most.
+/// Sources overlap (a countrywide one and a city's): a build downloads them
+/// all, and the Pack keeps one record of an address several of them state.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub(crate) struct OpenAddresses {
     pub rows: u64,

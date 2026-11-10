@@ -587,6 +587,7 @@ mod tests {
                 dataset: "held-out".into(),
                 path: csv,
                 entry: None,
+                area: None,
             }],
             rows: 15,
             variants: 2,

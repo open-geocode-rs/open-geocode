@@ -71,7 +71,7 @@ mod tags;
 mod test_pbf;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     fs::{self, File},
     io::{BufWriter, Seek, SeekFrom, Write},
@@ -1313,18 +1313,45 @@ impl<'a> Run<'a> {
         let progress = &self.progress;
         progress.start(BuildStage::ImportAddresses, Some(import_bytes))?;
         let build = &mut self.build;
+        let areas = files
+            .iter()
+            .filter_map(|file| file.area.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|code| (code, boundaries.area(code)))
+            .collect::<BTreeMap<_, _>>();
         for file in &files {
+            let area = file
+                .area
+                .as_deref()
+                .and_then(|code| areas.get(code)?.as_ref());
+            let broken = match area {
+                Some(area) => {
+                    let points = addresses::first_points(file, addresses::SAMPLE_ROWS)?;
+                    let outside = points.iter().filter(|point| !area(**point)).count();
+                    outside * 2 > points.len()
+                }
+                None => false,
+            };
             let imported = addresses::read_file(file, |record| {
                 progress.check()?;
-                let inside = point_lon_lat(&record.geometry).is_some_and(|[lon, lat]| {
-                    extracts.as_ref().is_none_or(|boxes| {
-                        boxes
-                            .iter()
-                            .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
-                    })
+                if broken {
+                    return Ok(Some("source_outside_area"));
+                }
+                let Some(point) = point_lon_lat(&record.geometry) else {
+                    return Ok(Some("outside_extract"));
+                };
+                let [lon, lat] = point;
+                let inside = extracts.as_ref().is_none_or(|boxes| {
+                    boxes
+                        .iter()
+                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
                 });
                 if !inside {
                     return Ok(Some("outside_extract"));
+                }
+                if area.is_some_and(|area| !area(point)) {
+                    return Ok(Some("outside_area"));
                 }
                 build.push(Record::Address(record), None)?;
                 Ok(None)
@@ -3427,6 +3454,7 @@ mod tests {
                 dataset: "openaddresses:test".to_string(),
                 path: csv,
                 entry: None,
+                area: None,
             }],
             ..RecordingSource::default()
         });
@@ -3479,6 +3507,65 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A source's rows lie in the area it names. A row outside is left out;
+    /// a source most of whose rows lie outside, as one with longitude and
+    /// latitude swapped, is left out whole.
+    #[test]
+    fn leaves_out_the_rows_of_a_source_outside_its_area() {
+        let dir = temp_dir("outside-area");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let file = |name: &str, rows: &str| {
+            let path = dir.join(format!("{name}.csv"));
+            fs::write(&path, format!("LON,LAT,NUMBER,STREET\n{rows}")).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:ca/on/{name}"),
+                path,
+                entry: None,
+                area: Some("CA-ON".to_string()),
+            }
+        };
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file(
+                    "sound",
+                    "-79.45,43.65,3,Queen Street\n-78.50,43.65,7,Lake Road\n",
+                ),
+                file(
+                    "swapped",
+                    "43.62,-79.41,8,Queen Street\n43.66,-79.46,9,Queen Street\n\
+                     -79.46,43.66,11,Queen Street\n",
+                ),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let rejected = |at: usize| {
+            let import = &report.imports[at];
+            (import.rows, import.accepted, import.rejected.clone())
+        };
+        assert_eq!(
+            rejected(0),
+            (2, 1, BTreeMap::from([("outside_area".to_string(), 1)])),
+            "Lake Road lies east of Ontario"
+        );
+        assert_eq!(
+            rejected(1),
+            (
+                3,
+                0,
+                BTreeMap::from([("source_outside_area".to_string(), 3)])
+            ),
+            "11 Queen Street lies inside, in a source that cannot be trusted"
+        );
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A row naming a house OSM has, placed a few hundred metres away, is
     /// the same house in the wrong place: one record, OSM's, marked disputed.
     /// Farther, or in another postcode, it is a house of its own.
@@ -3505,6 +3592,7 @@ mod tests {
                     dataset: "openaddresses:test".to_string(),
                     path: csv,
                     entry: None,
+                    area: None,
                 },
             ]))),
             ..BuildOsmOptions::default()
@@ -4945,11 +5033,13 @@ mod tests {
                 dataset: "openaddresses:first".to_string(),
                 path: first,
                 entry: None,
+                area: None,
             },
             addresses::AddressFile {
                 dataset: "openaddresses:second".to_string(),
                 path: second,
                 entry: None,
+                area: None,
             },
         ]
     }
@@ -5134,6 +5224,7 @@ mod tests {
                     dataset: "openaddresses:test".to_string(),
                     path: csv,
                     entry: None,
+                    area: None,
                 },
             ]))),
             ..BuildOsmOptions::default()
