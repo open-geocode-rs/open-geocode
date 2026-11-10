@@ -71,7 +71,7 @@ mod tags;
 mod test_pbf;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     fs::{self, File},
     io::{BufWriter, Seek, SeekFrom, Write},
@@ -1313,18 +1313,45 @@ impl<'a> Run<'a> {
         let progress = &self.progress;
         progress.start(BuildStage::ImportAddresses, Some(import_bytes))?;
         let build = &mut self.build;
+        let areas = files
+            .iter()
+            .filter_map(|file| file.area.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|code| (code, boundaries.area(code)))
+            .collect::<BTreeMap<_, _>>();
         for file in &files {
+            let area = file
+                .area
+                .as_deref()
+                .and_then(|code| areas.get(code)?.as_ref());
+            let broken = match area {
+                Some(area) => {
+                    let points = addresses::first_points(file, addresses::SAMPLE_ROWS)?;
+                    let outside = points.iter().filter(|point| !area(**point)).count();
+                    outside * 2 > points.len()
+                }
+                None => false,
+            };
             let imported = addresses::read_file(file, |record| {
                 progress.check()?;
-                let inside = point_lon_lat(&record.geometry).is_some_and(|[lon, lat]| {
-                    extracts.as_ref().is_none_or(|boxes| {
-                        boxes
-                            .iter()
-                            .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
-                    })
+                if broken {
+                    return Ok(Some("source_outside_area"));
+                }
+                let Some(point) = point_lon_lat(&record.geometry) else {
+                    return Ok(Some("outside_extract"));
+                };
+                let [lon, lat] = point;
+                let inside = extracts.as_ref().is_none_or(|boxes| {
+                    boxes
+                        .iter()
+                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
                 });
                 if !inside {
                     return Ok(Some("outside_extract"));
+                }
+                if area.is_some_and(|area| !area(point)) {
+                    return Ok(Some("outside_area"));
                 }
                 build.push(Record::Address(record), None)?;
                 Ok(None)
@@ -2509,8 +2536,8 @@ fn join_streets(
 const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 
 /// An imported address farther than [`REPEATED_HOUSE_RADIUS_M`] from a kept
-/// address of the same house, but within this, still names that house: the
-/// sources disagree on where it is. Below half the 2 km street-group cell, so
+/// address of the same house, but within this, still names that house: two
+/// sources disagree on where it is, or one places it at several points. Below half the 2 km street-group cell, so
 /// it never joins what the cell grid keeps apart as two runs of one street,
 /// and far below the spacing of the places a street name repeats in (two
 /// villages' Hauptstrasse, a rural road crossing a county line where the
@@ -2577,9 +2604,14 @@ fn replay_address_book(
 /// One record answers for one house. A row within
 /// [`REPEATED_HOUSE_RADIUS_M`] of a kept address of its house agrees with it
 /// and is dropped. One beyond that, but within [`DISPUTED_HOUSE_RADIUS_M`] of
-/// a kept address it does not contradict, is dropped too: the kept address
-/// keeps its point, OSM's when OSM has the house, and is marked
-/// [`crate::record::AddressRecord::disputed`]. Only a row farther still, or
+/// a kept address it does not contradict, is dropped too. When the kept
+/// address came from another source, the two sources disagree: the kept
+/// address keeps its point, OSM's when OSM has the house, and is marked
+/// [`crate::record::AddressRecord::disputed`]. When it came from the row's
+/// own source, nothing disagrees: one source places one house at several
+/// points, as Japan's land ministry does a block or lot cut by a road or a
+/// river, flagging one point representative in a column OpenAddresses drops.
+/// The row only repeats the house. Only a row farther still, or
 /// one stating another postcode, locality or area than every kept address
 /// near it, is a house of its own. Two houses of one street name and number
 /// lie apart by the distance between the places that repeat the name, which
@@ -2615,9 +2647,12 @@ fn find_repeated_houses(
             )
         };
         let repeated = house.imported
-            && kept
-                .iter()
-                .any(|kept| distance(kept) <= REPEATED_HOUSE_RADIUS_M);
+            && kept.iter().any(|kept| {
+                distance(kept) <= REPEATED_HOUSE_RADIUS_M
+                    || (kept.same_source(&house)
+                        && distance(kept) <= DISPUTED_HOUSE_RADIUS_M
+                        && !kept.other_house(&house))
+            });
         let disputed = if house.imported && !repeated {
             kept.iter()
                 .filter(|kept| {
@@ -3427,6 +3462,7 @@ mod tests {
                 dataset: "openaddresses:test".to_string(),
                 path: csv,
                 entry: None,
+                area: None,
             }],
             ..RecordingSource::default()
         });
@@ -3479,6 +3515,65 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A source's rows lie in the area it names. A row outside is left out;
+    /// a source most of whose rows lie outside, as one with longitude and
+    /// latitude swapped, is left out whole.
+    #[test]
+    fn leaves_out_the_rows_of_a_source_outside_its_area() {
+        let dir = temp_dir("outside-area");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let file = |name: &str, rows: &str| {
+            let path = dir.join(format!("{name}.csv"));
+            fs::write(&path, format!("LON,LAT,NUMBER,STREET\n{rows}")).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:ca/on/{name}"),
+                path,
+                entry: None,
+                area: Some("CA-ON".to_string()),
+            }
+        };
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file(
+                    "sound",
+                    "-79.45,43.65,3,Queen Street\n-78.50,43.65,7,Lake Road\n",
+                ),
+                file(
+                    "swapped",
+                    "43.62,-79.41,8,Queen Street\n43.66,-79.46,9,Queen Street\n\
+                     -79.46,43.66,11,Queen Street\n",
+                ),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let rejected = |at: usize| {
+            let import = &report.imports[at];
+            (import.rows, import.accepted, import.rejected.clone())
+        };
+        assert_eq!(
+            rejected(0),
+            (2, 1, BTreeMap::from([("outside_area".to_string(), 1)])),
+            "Lake Road lies east of Ontario"
+        );
+        assert_eq!(
+            rejected(1),
+            (
+                3,
+                0,
+                BTreeMap::from([("source_outside_area".to_string(), 3)])
+            ),
+            "11 Queen Street lies inside, in a source that cannot be trusted"
+        );
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A row naming a house OSM has, placed a few hundred metres away, is
     /// the same house in the wrong place: one record, OSM's, marked disputed.
     /// Farther, or in another postcode, it is a house of its own.
@@ -3505,6 +3600,7 @@ mod tests {
                     dataset: "openaddresses:test".to_string(),
                     path: csv,
                     entry: None,
+                    area: None,
                 },
             ]))),
             ..BuildOsmOptions::default()
@@ -3540,6 +3636,152 @@ mod tests {
         assert!(
             !disputed("openaddresses:test:row:3"),
             "another postcode: another house"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// One source placing one house at several points a few hundred metres
+    /// apart, as Japan's land ministry does a lot cut by a road, repeats
+    /// the house: one record, not disputed. Two sources placing it so
+    /// apart still dispute it.
+    #[test]
+    fn a_house_one_source_places_apart_is_repeated_not_disputed() {
+        let dir = temp_dir("one-source-apart");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let file = |name: &str, rows: &str| {
+            let path = dir.join(format!("{name}.csv"));
+            fs::write(&path, format!("LON,LAT,NUMBER,STREET,CITY\n{rows}")).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:{name}"),
+                path,
+                entry: None,
+                area: None,
+            }
+        };
+        // OSM has no 20 or 30 King Street. Rows 445 m apart.
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file(
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n\
+                     -79.40,43.604,20,King Street,Toronto\n\
+                     -79.40,43.600,30,King Street,Toronto\n",
+                ),
+                file("register", "-79.40,43.604,30,King Street,Toronto\n"),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let counts = report
+            .imports
+            .iter()
+            .map(|import| (import.duplicates, import.disputes))
+            .fold((0, 0), |(duplicates, disputes), (more, also)| {
+                (duplicates + more, disputes + also)
+            });
+        assert_eq!(counts, (1, 1), "20 repeats within lots; 30 is disputed");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
+        let kept = |ids: &[&str]| {
+            ids.iter()
+                .filter_map(|id| {
+                    let record_id = reader.find_by_source_id(id).expect("lookup")?;
+                    match reader.records().record(record_id).expect("record") {
+                        Record::Address(address) => Some(address.disputed),
+                        other => panic!("{id} is an address: {other:?}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kept(&["openaddresses:lots:row:1", "openaddresses:lots:row:2"]),
+            [false],
+            "one record of 20, not disputed"
+        );
+        assert_eq!(
+            kept(&["openaddresses:lots:row:3", "openaddresses:register:row:1"]),
+            [true],
+            "one record of 30, disputed"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The first [`addresses::SAMPLE_ROWS`] rows judge a source; rows past
+    /// them are judged one by one, or go with the source. Half outside is
+    /// not most; a sample with no point judges nothing.
+    #[test]
+    fn judges_a_source_by_its_first_rows_alone() {
+        let dir = temp_dir("sample-rows");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let (inside, outside, swapped) = ("-79.45,43.65", "-78.50,43.65", "43.65,-79.45");
+        let file = |name: &str, runs: &[(usize, &str)]| {
+            let path = dir.join(format!("{name}.csv"));
+            let mut text = String::from("LON,LAT,NUMBER,STREET\n");
+            let mut number = 0;
+            for (rows, point) in runs {
+                for _ in 0..*rows {
+                    number += 1;
+                    text.push_str(&format!("{point},{number},{name} Street\n"));
+                }
+            }
+            fs::write(&path, text).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:ca/on/{name}"),
+                path,
+                entry: None,
+                area: Some("CA-ON".to_string()),
+            }
+        };
+        let sample = addresses::SAMPLE_ROWS;
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file("cutoff", &[(sample, inside), (1, outside)]),
+                file("late", &[(sample, swapped), (1, inside)]),
+                file("half", &[(sample / 2, outside), (sample / 2, inside)]),
+                file(
+                    "most",
+                    &[(sample / 2 + 1, outside), (sample / 2 - 1, inside)],
+                ),
+                file("unplaced", &[(sample, "0,0"), (1, inside)]),
+                file("empty", &[]),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let judged = report
+            .imports
+            .iter()
+            .map(|import| {
+                (
+                    import.dataset.trim_start_matches("openaddresses:ca/on/"),
+                    import.rows,
+                    import.accepted,
+                    import
+                        .rejected
+                        .iter()
+                        .map(|(reason, rows)| (reason.as_str(), *rows))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            judged,
+            [
+                ("cutoff", 1001, 1000, vec![("outside_area", 1)]),
+                ("late", 1001, 0, vec![("source_outside_area", 1001)]),
+                ("half", 1000, 500, vec![("outside_area", 500)]),
+                ("most", 1000, 0, vec![("source_outside_area", 1000)]),
+                ("unplaced", 1001, 1, vec![("bad_coordinates", 1000)]),
+                ("empty", 0, 0, vec![]),
+            ]
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -4945,11 +5187,13 @@ mod tests {
                 dataset: "openaddresses:first".to_string(),
                 path: first,
                 entry: None,
+                area: None,
             },
             addresses::AddressFile {
                 dataset: "openaddresses:second".to_string(),
                 path: second,
                 entry: None,
+                area: None,
             },
         ]
     }
@@ -5134,6 +5378,7 @@ mod tests {
                     dataset: "openaddresses:test".to_string(),
                     path: csv,
                     entry: None,
+                    area: None,
                 },
             ]))),
             ..BuildOsmOptions::default()

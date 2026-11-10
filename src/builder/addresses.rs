@@ -59,7 +59,19 @@ pub struct AddressFile {
     /// the archive without unpacking it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// The ISO 3166 code of the country (`JP`) or region (`CA-ON`) the
+    /// file's addresses lie in, when the source says. Its rows are checked
+    /// against that area's boundary: see [`SAMPLE_ROWS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
 }
+
+/// Rows of a file with an [`AddressFile::area`] read before any is taken. A
+/// file most of whose first rows lie outside its area is a broken source,
+/// such as one with longitude and latitude swapped, and none of its rows is
+/// taken: the few its error lands inside the area are as wrong as the rest.
+/// The first rows tell, since a source is broken throughout or not at all.
+pub const SAMPLE_ROWS: usize = 1_000;
 
 impl AddressFile {
     /// Bytes read to import the file: the entry's compressed bytes inside an
@@ -204,6 +216,24 @@ struct Row {
 /// down, under the reason it gives.
 pub fn read_file(
     file: &AddressFile,
+    accept: impl FnMut(AddressRecord) -> Result<Option<&'static str>>,
+) -> Result<ImportReport> {
+    read_rows(file, usize::MAX, accept)
+}
+
+/// The points of the addresses the first `rows` rows of `file` state.
+pub fn first_points(file: &AddressFile, rows: usize) -> Result<Vec<[f64; 2]>> {
+    let mut points = Vec::new();
+    read_rows(file, rows, |record| {
+        points.extend(crate::util::geo::point_lon_lat(&record.geometry));
+        Ok(None)
+    })?;
+    Ok(points)
+}
+
+fn read_rows(
+    file: &AddressFile,
+    limit: usize,
     mut accept: impl FnMut(AddressRecord) -> Result<Option<&'static str>>,
 ) -> Result<ImportReport> {
     let mut report = ImportReport {
@@ -236,7 +266,7 @@ pub fn read_file(
     };
     match layout(named)? {
         Layout::GeoJson => {
-            for line in input.lines() {
+            for line in input.lines().take(limit) {
                 let line = line?;
                 if line.trim().is_empty() {
                     continue;
@@ -277,7 +307,7 @@ pub fn read_file(
             };
             let [unit, city, district, region, postcode] =
                 ["unit", "city", "district", "region", "postcode"].map(column);
-            for record in reader.records() {
+            for record in reader.records().take(limit) {
                 let Ok(record) = record else {
                     take(Err("malformed_row"))?;
                     continue;
@@ -446,6 +476,7 @@ mod tests {
                 dataset: "openaddresses:test".into(),
                 path,
                 entry: None,
+                area: None,
             },
             |record| {
                 records.push(record);
@@ -520,6 +551,7 @@ mod tests {
                     dataset: "x".into(),
                     path: missing,
                     entry: None,
+                    area: None,
                 },
                 |_| Ok(None)
             )

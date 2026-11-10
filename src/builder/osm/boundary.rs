@@ -455,6 +455,37 @@ impl BoundarySet {
         coverage
     }
 
+    /// Whether a point lies in the country (`JP`) or region (`CA-ON`) of
+    /// ISO 3166 code `code`; `None` when the Pack has no boundary of that
+    /// code to tell by.
+    pub(crate) fn area(&self, code: &str) -> Option<impl Fn([f64; 2]) -> bool + '_> {
+        let region = code.contains('-');
+        let boundaries = self
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.boundary)
+            .filter(|boundary| {
+                if region {
+                    boundary
+                        .subdivision_code
+                        .as_deref()
+                        .is_some_and(|held| held.eq_ignore_ascii_case(code))
+                } else {
+                    boundary.layer == PlaceLayer::Country
+                        && boundary
+                            .inferred_country_code
+                            .as_deref()
+                            .is_some_and(|held| held.eq_ignore_ascii_case(code))
+                }
+            })
+            .collect::<Vec<_>>();
+        (!boundaries.is_empty()).then_some(move |point| {
+            boundaries
+                .iter()
+                .any(|boundary| covers_point(&self.shapes, boundary, point))
+        })
+    }
+
     /// The country code of each country record, by record id: the country
     /// boundaries that state one, and the derived countries.
     pub(crate) fn country_codes(
