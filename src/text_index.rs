@@ -606,9 +606,20 @@ impl Writer {
         }
         self.close_group()?;
         let mut writers = std::mem::take(self.writers()?);
-        for writer in &mut writers {
-            writer.commit()?;
-        }
+        // A commit writes out what its part still holds in memory, on one
+        // thread: together, not one part after another.
+        std::thread::scope(|scope| {
+            let commits = writers
+                .iter_mut()
+                .map(|writer| scope.spawn(move || writer.commit()))
+                .collect::<Vec<_>>();
+            commits.into_iter().try_for_each(|commit| {
+                commit
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    .map(|_| ())
+            })
+        })?;
         for writer in writers {
             writer.wait_merging_threads()?;
         }
