@@ -135,15 +135,26 @@ pub(crate) fn discard(partial: &Path) {
     let _ = fs::remove_file(version_path(partial));
 }
 
+/// How far a download is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fetching {
+    /// Bytes on disk before this request: the partial file it continues.
+    pub from: u64,
+    /// Bytes on disk so far, `from` included.
+    pub done: u64,
+    /// The whole size, when the server says it.
+    pub total: Option<u64>,
+}
+
 /// Downloads `url` to the partial file of `path`, continuing an earlier
 /// download that stopped while the server still has the same version of
-/// the file, and starting over when it does not. `progress` is told the
-/// bytes on disk so far and the whole size, when the server says it.
+/// the file, and starting over when it does not. `progress` is told how
+/// far it is.
 pub(crate) fn download(
     url: &str,
     path: &Path,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(u64, Option<u64>),
+    mut progress: impl FnMut(Fetching),
 ) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -182,7 +193,7 @@ fn fetch(
     partial: &Path,
     resume: Option<&(u64, String)>,
     cancel: &AtomicBool,
-    progress: &mut impl FnMut(u64, Option<u64>),
+    progress: &mut impl FnMut(Fetching),
 ) -> Result<Fetched> {
     let mut request = agent()
         .get(url)
@@ -218,7 +229,11 @@ fn fetch(
         (416, Some((have, _))) => {
             return match range {
                 Some((_, Some(total))) if total == *have => {
-                    progress(*have, Some(total));
+                    progress(Fetching {
+                        from: *have,
+                        done: *have,
+                        total: Some(total),
+                    });
                     Ok(Fetched::Done)
                 }
                 _ => Ok(Fetched::Stale),
@@ -245,7 +260,11 @@ fn fetch(
         .open(partial)
         .with_context(|| format!("failed to create {}", partial.display()))?;
     let mut done = start;
-    progress(done, total);
+    progress(Fetching {
+        from: start,
+        done,
+        total,
+    });
     // The body is read on a thread of its own, so a server that stops
     // sending is noticed, and a cancel is seen, while a read waits.
     let (sender, chunks) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
@@ -278,7 +297,11 @@ fn fetch(
                 file.write_all(&chunk)
                     .with_context(|| format!("failed to write {}", partial.display()))?;
                 done += chunk.len() as u64;
-                progress(done, total);
+                progress(Fetching {
+                    from: start,
+                    done,
+                    total,
+                });
                 heard = Instant::now();
             }
             Ok(Err(error)) => {
@@ -345,4 +368,83 @@ pub(crate) fn check_md5(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::BufRead, net::TcpListener};
+
+    use super::*;
+
+    /// Removed when dropped, also when an assertion fails.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_resumed_download_tells_where_this_run_started() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/x.osm.pbf", listener.local_addr().expect("addr"));
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(&stream);
+            let mut range = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request");
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("range")
+                {
+                    range = Some(value.trim().to_string());
+                }
+            }
+            (&stream)
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\n\
+                      Content-Range: bytes 4-9/10\r\nETag: \"v1\"\r\n\
+                      Connection: close\r\n\r\n456789",
+                )
+                .expect("write response");
+            range
+        });
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("og-resume-{}", std::process::id())));
+        fs::create_dir_all(&scratch.0).expect("create scratch");
+        let path = scratch.0.join("x.osm.pbf");
+        let partial = partial_path(&path);
+        fs::write(&partial, "0123").expect("write partial");
+        fs::write(version_path(&partial), "\"v1\"").expect("write version");
+
+        let mut told = Vec::new();
+        let written = download(&url, &path, &AtomicBool::new(false), |fetching| {
+            told.push(fetching);
+        })
+        .expect("download");
+
+        assert_eq!(server.join().expect("server"), Some("bytes=4-".to_string()));
+        assert_eq!(fs::read(&written).expect("read"), b"0123456789");
+        assert_eq!(
+            told.first(),
+            Some(&Fetching {
+                from: 4,
+                done: 4,
+                total: Some(10),
+            })
+        );
+        assert_eq!(
+            told.last(),
+            Some(&Fetching {
+                from: 4,
+                done: 10,
+                total: Some(10),
+            })
+        );
+    }
 }

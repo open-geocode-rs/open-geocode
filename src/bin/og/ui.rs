@@ -1,7 +1,7 @@
 //! Drawing. Each screen is a short stack of lines inside the inline viewport;
 //! finished steps leave the viewport as plain lines in terminal history.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Instant};
 
 use open_geocode::{builder::BuildPlan, record::Layer};
 use ratatui::{
@@ -1174,20 +1174,18 @@ fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static
     match (step.unit, step.total) {
         (unit, Some(total)) if unit != Unit::None && total > 0 => {
             let ratio = (done as f64 / total as f64).min(1.0);
-            let rate = done as f64 / elapsed.max(0.001);
-            let speed = if elapsed < 1.0 || done == 0 {
-                String::new()
-            } else {
-                match unit {
+            let now = Instant::now();
+            let speed = step
+                .rate(done, now)
+                .map(|rate| match unit {
                     Unit::Bytes => format!("{}/s", format::bytes(rate as u64)),
                     _ => format!("{}/s", format::count(rate as u64)),
-                }
-            };
-            let left = if elapsed < 1.0 || done == 0 {
-                String::new()
-            } else {
-                format::duration(total.saturating_sub(done) as f64 / rate)
-            };
+                })
+                .unwrap_or_default();
+            let left = step
+                .left(done, now)
+                .map(format::duration)
+                .unwrap_or_default();
             spans.push(plain(format!("{:>3}% ", (ratio * 100.0).floor())));
             spans.extend(bar_spans(cells, ratio, None));
             spans.push(plain(format!(
@@ -2136,6 +2134,7 @@ fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
         explain: ["", ""],
         unit: Unit::Count("rows"),
         total: session.file.counted().then(|| session.file.rows()),
+        resumed: 0,
         started: Some(run.started),
         secs: None,
     };
