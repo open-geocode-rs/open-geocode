@@ -1,0 +1,24 @@
+[package]
+name = "open-geocode-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+open-geocode = { path = "..", features = ["fuzzing"] }
+
+# Its own workspace, so `cargo build` and `cargo test` at the root never build
+# it: it needs nightly and libFuzzer.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+test = false
+doc = false
+bench = false

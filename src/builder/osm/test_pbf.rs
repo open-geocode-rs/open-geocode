@@ -1,10 +1,12 @@
-//! Minimal OSM PBF writer for builder tests: uncompressed blobs, dense nodes,
-//! ways and relations. Each slice passed to [`write_pbf`] becomes one block, so
-//! tests control how objects are split across blocks.
+//! Minimal OSM PBF writer for builder tests and the fixture Pack of the fuzz
+//! targets in `fuzz/`: uncompressed blobs, dense nodes, ways and relations.
+//! Each slice passed to [`write_pbf`] becomes one block, so tests control how
+//! objects are split across blocks.
 
 use std::{collections::BTreeMap, path::Path};
 
-pub(crate) enum TestElement {
+#[derive(Debug)]
+pub enum TestElement {
     Node {
         id: i64,
         lat: f64,
@@ -23,12 +25,7 @@ pub(crate) enum TestElement {
     },
 }
 
-pub(crate) fn node(
-    id: i64,
-    lat: f64,
-    lon: f64,
-    tags: &[(&'static str, &'static str)],
-) -> TestElement {
+pub fn node(id: i64, lat: f64, lon: f64, tags: &[(&'static str, &'static str)]) -> TestElement {
     TestElement::Node {
         id,
         lat,
@@ -37,7 +34,7 @@ pub(crate) fn node(
     }
 }
 
-pub(crate) fn way(id: i64, refs: &[i64], tags: &[(&'static str, &'static str)]) -> TestElement {
+pub fn way(id: i64, refs: &[i64], tags: &[(&'static str, &'static str)]) -> TestElement {
     TestElement::Way {
         id,
         refs: refs.to_vec(),
@@ -45,7 +42,7 @@ pub(crate) fn way(id: i64, refs: &[i64], tags: &[(&'static str, &'static str)]) 
     }
 }
 
-pub(crate) fn relation(
+pub fn relation(
     id: i64,
     members: &[(i64, &'static str)],
     tags: &[(&'static str, &'static str)],
@@ -57,7 +54,7 @@ pub(crate) fn relation(
     }
 }
 
-pub(crate) fn write_pbf(path: &Path, blocks: &[Vec<TestElement>]) {
+pub fn write_pbf(path: &Path, blocks: &[Vec<TestElement>]) {
     let mut file = Vec::new();
     let mut header = Vec::new();
     for feature in ["OsmSchema-V0.6", "DenseNodes"] {

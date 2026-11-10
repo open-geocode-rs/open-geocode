@@ -67,8 +67,9 @@ mod spill;
 mod street;
 mod tags;
 
-#[cfg(test)]
-mod test_pbf;
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod test_pbf;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

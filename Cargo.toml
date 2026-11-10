@@ -9,7 +9,7 @@ repository = "https://github.com/open-geocode-rs/open-geocode"
 readme = "README.md"
 keywords = ["geocoding", "geocoder", "osm", "gis", "geospatial"]
 categories = ["science::geo", "command-line-utilities"]
-exclude = ["assets/", "data/", "docs/", "fixtures/", "scripts/", "*.pmtiles"]
+exclude = ["assets/", "data/", "docs/", "fixtures/", "fuzz/", "scripts/", "*.pmtiles"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -189,6 +189,9 @@ tui = [
     "dep:ratatui",
     "dep:signal-hook",
 ]
+# Exposes the test PBF writer, so the fuzz targets in fuzz/ can build their
+# fixture Pack. Not for shipped builds.
+fuzzing = []
 
 [[bin]]
 name = "og"
