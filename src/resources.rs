@@ -410,6 +410,8 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
+    #[cfg(target_os = "linux")]
+    use std::path::{Component, PathBuf};
     use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 
     use super::Resources;
@@ -473,23 +475,30 @@ mod platform {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn cgroup_memory() -> Option<(u64, u64)> {
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        cgroup_memory_from(
+            &read(Path::new("/proc/self/cgroup"))?,
+            &read(Path::new("/proc/self/mountinfo")).unwrap_or_default(),
+            &read,
+        )
+    }
+
     /// The tightest cgroup memory limit over this process's cgroup and its
     /// ancestors, and what is left under it: v2 `memory.max` less
     /// `memory.current`, or v1 `memory.limit_in_bytes` less
-    /// `memory.usage_in_bytes`.
+    /// `memory.usage_in_bytes`. `groups` and `mountinfo` are
+    /// `/proc/self/cgroup` and `/proc/self/mountinfo`; `read` reads a file.
     #[cfg(target_os = "linux")]
-    fn cgroup_memory() -> Option<(u64, u64)> {
-        let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-        let read = |path: &Path| -> Option<u64> {
-            std::fs::read_to_string(path).ok()?.trim().parse().ok()
-        };
+    pub(super) fn cgroup_memory_from(
+        groups: &str,
+        mountinfo: &str,
+        read: &dyn Fn(&Path) -> Option<String>,
+    ) -> Option<(u64, u64)> {
+        let number = |path: &Path| -> Option<u64> { read(path)?.trim().parse().ok() };
+        let mounts: Vec<CgroupMount> = mountinfo.lines().filter_map(CgroupMount::parse).collect();
         let mut tightest: Option<(u64, u64)> = None;
-        let mut consider = |limit: u64, used: u64| {
-            let left = limit.saturating_sub(used);
-            if tightest.is_none_or(|(_, best)| left < best) {
-                tightest = Some((limit, left));
-            }
-        };
         for line in groups.lines() {
             let mut parts = line.splitn(3, ':');
             let (Some(_), Some(controllers), Some(path)) =
@@ -497,36 +506,130 @@ mod platform {
             else {
                 continue;
             };
-            let relative = path.trim_start_matches('/');
-            if controllers.is_empty() {
-                let mut directory = Path::new("/sys/fs/cgroup").join(relative);
+            let v2 = controllers.is_empty();
+            if !v2
+                && !controllers
+                    .split(',')
+                    .any(|controller| controller == "memory")
+            {
+                continue;
+            }
+            let (limit_file, usage_file) = if v2 {
+                ("memory.max", "memory.current")
+            } else {
+                ("memory.limit_in_bytes", "memory.usage_in_bytes")
+            };
+            let hierarchy: Vec<&CgroupMount> = mounts
+                .iter()
+                .filter(|mount| mount.v2 == v2 && (v2 || mount.memory))
+                .collect();
+            // A mount shows the cgroup in its root field, not the hierarchy's
+            // root: in a container on v1, or on v2 with the host's cgroup
+            // namespace, it is the container's own cgroup, and the path from
+            // /proc/self/cgroup is below that.
+            let mut walks: Vec<(PathBuf, &Path)> = hierarchy
+                .iter()
+                .filter_map(|mount| {
+                    let relative = Path::new(path).strip_prefix(&mount.root).ok()?;
+                    relative
+                        .components()
+                        .all(|part| matches!(part, Component::Normal(_)))
+                        .then(|| (mount.point.join(relative), mount.point.as_path()))
+                })
+                .collect();
+            // Root outside this process's cgroup namespace, shown as "/..":
+            // the mount's own folder is the nearest cgroup it shows.
+            if walks.is_empty() {
+                walks = hierarchy
+                    .iter()
+                    .map(|mount| (mount.point.clone(), mount.point.as_path()))
+                    .collect();
+            }
+            for (mut directory, top) in walks {
                 loop {
-                    // "max" does not parse, which is no limit.
-                    if let Some(limit) = read(&directory.join("memory.max")) {
-                        consider(limit, read(&directory.join("memory.current")).unwrap_or(0));
+                    // v2 "max" does not parse, which is no limit. Without a
+                    // limit v1 reports a value near the largest page aligned
+                    // i64.
+                    if let Some(limit) =
+                        number(&directory.join(limit_file)).filter(|limit| *limit < 1 << 62)
+                    {
+                        let left =
+                            limit.saturating_sub(number(&directory.join(usage_file)).unwrap_or(0));
+                        if tightest.is_none_or(|(_, best)| left < best) {
+                            tightest = Some((limit, left));
+                        }
                     }
-                    if !directory.pop() || !directory.starts_with("/sys/fs/cgroup") {
+                    if directory == top || !directory.pop() {
                         break;
                     }
-                }
-            } else if controllers
-                .split(',')
-                .any(|controller| controller == "memory")
-            {
-                let directory = Path::new("/sys/fs/cgroup/memory").join(relative);
-                // Without a limit v1 reports a value near the largest page
-                // aligned i64.
-                if let Some(limit) =
-                    read(&directory.join("memory.limit_in_bytes")).filter(|limit| *limit < 1 << 62)
-                {
-                    consider(
-                        limit,
-                        read(&directory.join("memory.usage_in_bytes")).unwrap_or(0),
-                    );
                 }
             }
         }
         tightest
+    }
+
+    /// A cgroup filesystem in `/proc/self/mountinfo`.
+    #[cfg(target_os = "linux")]
+    struct CgroupMount {
+        /// The cgroup the mount shows, as a path in the hierarchy.
+        root: PathBuf,
+        point: PathBuf,
+        v2: bool,
+        memory: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CgroupMount {
+        fn parse(line: &str) -> Option<Self> {
+            // Paths escape spaces, so " - " only ends the optional fields.
+            let (mount, filesystem) = line.split_once(" - ")?;
+            let mut mount = mount.split(' ').skip(3);
+            let (root, point) = (mount.next()?, mount.next()?);
+            let mut filesystem = filesystem.split(' ');
+            let v2 = match filesystem.next()? {
+                "cgroup2" => true,
+                "cgroup" => false,
+                _ => return None,
+            };
+            let options = filesystem.nth(1)?;
+            Some(Self {
+                root: unescape(root),
+                point: unescape(point),
+                v2,
+                memory: options.split(',').any(|option| option == "memory"),
+            })
+        }
+    }
+
+    /// A mountinfo path, whose space, tab, newline and backslash the kernel
+    /// writes as three octal digits after a backslash.
+    #[cfg(target_os = "linux")]
+    fn unescape(field: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = field.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while let Some(&byte) = bytes.get(at) {
+            let code = bytes
+                .get(at + 1..at + 4)
+                .filter(|digits| byte == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d)))
+                .and_then(|digits| {
+                    digits.iter().try_fold(0u8, |code, digit| {
+                        code.checked_mul(8)?.checked_add(digit - b'0')
+                    })
+                });
+            match code {
+                Some(code) => {
+                    out.push(code);
+                    at += 4;
+                }
+                None => {
+                    out.push(byte);
+                    at += 1;
+                }
+            }
+        }
+        PathBuf::from(std::ffi::OsString::from_vec(out))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -684,5 +787,198 @@ mod tests {
         }
         #[cfg(any(windows, target_os = "linux"))]
         assert!(resident_bytes().is_some_and(|bytes| bytes > 0));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cgroup_tests {
+    use std::{collections::HashMap, path::Path};
+
+    use super::platform::cgroup_memory_from;
+
+    const GIB: u64 = 1 << 30;
+
+    fn probe(groups: &str, mountinfo: &str, files: &[(&str, &str)]) -> Option<(u64, u64)> {
+        let files: HashMap<&Path, &str> = files
+            .iter()
+            .map(|(path, text)| (Path::new(*path), *text))
+            .collect();
+        cgroup_memory_from(groups, mountinfo, &|path| {
+            files.get(path).map(|text| (*text).to_string())
+        })
+    }
+
+    #[test]
+    fn v1_in_docker_reads_the_mount_that_is_the_containers_own_cgroup() {
+        let found = probe(
+            "12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n0::/docker/abc\n",
+            "30 25 0:26 /docker/abc /sys/fs/cgroup/cpu,cpuacct ro,nosuid shared:9 - cgroup cgroup rw,cpu,cpuacct\n\
+             31 25 0:27 /docker/abc /sys/fs/cgroup/memory ro,nosuid shared:10 - cgroup cgroup rw,memory\n",
+            &[
+                (
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                    "2147483648\n",
+                ),
+                ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "536870912\n"),
+            ],
+        );
+        assert_eq!(found, Some((2 * GIB, 2 * GIB - GIB / 2)));
+    }
+
+    #[test]
+    fn v2_with_the_host_namespace_strips_the_mount_root() {
+        let found = probe(
+            "0::/system.slice/docker-abc.scope\n",
+            "467 466 0:30 /system.slice /sys/fs/cgroup ro,nosuid - cgroup2 cgroup rw\n",
+            &[
+                ("/sys/fs/cgroup/memory.max", "max\n"),
+                ("/sys/fs/cgroup/docker-abc.scope/memory.max", "2147483648\n"),
+                (
+                    "/sys/fs/cgroup/docker-abc.scope/memory.current",
+                    "1073741824\n",
+                ),
+            ],
+        );
+        assert_eq!(found, Some((2 * GIB, GIB)));
+    }
+
+    #[test]
+    fn v2_with_the_host_namespace_and_the_whole_tree_mounted() {
+        let found = probe(
+            "0::/system.slice/docker-abc.scope\n",
+            "467 466 0:30 / /sys/fs/cgroup ro,nosuid - cgroup2 cgroup rw\n",
+            &[
+                ("/sys/fs/cgroup/system.slice/memory.max", "max\n"),
+                (
+                    "/sys/fs/cgroup/system.slice/docker-abc.scope/memory.max",
+                    "2147483648\n",
+                ),
+                (
+                    "/sys/fs/cgroup/system.slice/docker-abc.scope/memory.current",
+                    "1073741824\n",
+                ),
+            ],
+        );
+        assert_eq!(found, Some((2 * GIB, GIB)));
+    }
+
+    #[test]
+    fn v2_with_a_private_namespace() {
+        let found = probe(
+            "0::/\n",
+            "467 466 0:30 / /sys/fs/cgroup ro,nosuid - cgroup2 cgroup rw\n",
+            &[
+                ("/sys/fs/cgroup/memory.max", "2147483648\n"),
+                ("/sys/fs/cgroup/memory.current", "1073741824\n"),
+            ],
+        );
+        assert_eq!(found, Some((2 * GIB, GIB)));
+    }
+
+    #[test]
+    fn no_limit_is_none() {
+        assert_eq!(
+            probe(
+                "0::/user.slice\n",
+                "35 25 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+                &[
+                    ("/sys/fs/cgroup/user.slice/memory.max", "max\n"),
+                    ("/sys/fs/cgroup/user.slice/memory.current", "1073741824\n"),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            probe(
+                "4:memory:/user.slice\n",
+                "31 25 0:27 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+                &[
+                    (
+                        "/sys/fs/cgroup/memory/user.slice/memory.limit_in_bytes",
+                        "9223372036854771712\n",
+                    ),
+                    (
+                        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                        "9223372036854771712\n",
+                    ),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(probe("0::/\n", "", &[]), None);
+    }
+
+    #[test]
+    fn the_tightest_limit_up_the_tree_wins() {
+        let found = probe(
+            "0::/a/b\n",
+            "35 25 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            &[
+                ("/sys/fs/cgroup/a/memory.max", "4294967296\n"),
+                ("/sys/fs/cgroup/a/memory.current", "3221225472\n"),
+                ("/sys/fs/cgroup/a/b/memory.max", "2147483648\n"),
+                ("/sys/fs/cgroup/a/b/memory.current", "536870912\n"),
+            ],
+        );
+        assert_eq!(found, Some((4 * GIB, GIB)));
+        let found = probe(
+            "4:memory:/a/b\n",
+            "31 25 0:27 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+            &[
+                (
+                    "/sys/fs/cgroup/memory/a/memory.limit_in_bytes",
+                    "1073741824\n",
+                ),
+                (
+                    "/sys/fs/cgroup/memory/a/b/memory.limit_in_bytes",
+                    "9223372036854771712\n",
+                ),
+            ],
+        );
+        assert_eq!(found, Some((GIB, GIB)));
+    }
+
+    #[test]
+    fn a_root_outside_the_namespace_reads_the_mounts_own_folder() {
+        let found = probe(
+            "0::/\n",
+            "467 466 0:30 /.. /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+            &[("/sys/fs/cgroup/memory.max", "2147483648\n")],
+        );
+        assert_eq!(found, Some((2 * GIB, 2 * GIB)));
+        let found = probe(
+            "4:memory:/\n3:cpu:/\n0::/\n",
+            "31 25 0:27 /.. /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n\
+             30 25 0:26 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n\
+             29 25 0:25 / /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n",
+            &[(
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "1073741824\n",
+            )],
+        );
+        assert_eq!(found, Some((GIB, GIB)));
+    }
+
+    #[test]
+    fn a_path_climbing_out_of_the_mount_is_not_followed() {
+        let found = probe(
+            "0::/../other\n",
+            "467 466 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+            &[
+                ("/sys/fs/cgroup/../other/memory.max", "1073741824\n"),
+                ("/sys/fs/cgroup/memory.max", "2147483648\n"),
+            ],
+        );
+        assert_eq!(found, Some((2 * GIB, 2 * GIB)));
+    }
+
+    #[test]
+    fn mountinfo_escapes_are_read() {
+        let found = probe(
+            "0::/\n",
+            "467 466 0:30 / /mnt/my\\040cgroup rw - cgroup2 cgroup rw\n",
+            &[("/mnt/my cgroup/memory.max", "2147483648\n")],
+        );
+        assert_eq!(found, Some((2 * GIB, 2 * GIB)));
     }
 }
