@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -50,9 +50,27 @@ pub(crate) struct Step {
     pub explain: [&'static str; 2],
     pub unit: Unit,
     pub total: Option<u64>,
+    /// Work done before this run, such as the partial file a download
+    /// continues: counted in the bar, not in the rate.
+    pub resumed: u64,
     pub started: Option<Instant>,
     /// Seconds the step took, once finished.
     pub secs: Option<f64>,
+}
+
+impl Step {
+    /// Work per second in this run, once it has run a second and done some.
+    pub(crate) fn rate(&self, done: u64, now: Instant) -> Option<f64> {
+        let elapsed = now.saturating_duration_since(self.started?);
+        let worked = done.saturating_sub(self.resumed);
+        (elapsed >= Duration::from_secs(1) && worked > 0)
+            .then(|| worked as f64 / elapsed.as_secs_f64())
+    }
+
+    /// Seconds until the total is done at this run's rate.
+    pub(crate) fn left(&self, done: u64, now: Instant) -> Option<f64> {
+        Some(self.total?.saturating_sub(done) as f64 / self.rate(done, now)?)
+    }
 }
 
 /// A job's steps and where it is, shared with its thread.
@@ -101,6 +119,16 @@ impl Progress {
         if let Some(total) = step.total {
             self.done.store(total, Ordering::Relaxed);
         }
+    }
+
+    fn downloaded(&self, index: usize, fetching: net::Fetching) {
+        let mut steps = self.steps.lock().expect("steps lock");
+        let step = &mut steps[index];
+        if let Some(total) = fetching.total {
+            step.total = Some(total);
+        }
+        step.resumed = fetching.from;
+        self.done.store(fetching.done, Ordering::Relaxed);
     }
 
     pub(crate) fn current(&self) -> usize {
@@ -182,6 +210,7 @@ impl BuildJob {
                 ],
                 unit: Unit::Bytes,
                 total: Some(input.region.osm.bytes),
+                resumed: 0,
                 started: None,
                 secs: None,
             });
@@ -195,6 +224,7 @@ impl BuildJob {
                 ],
                 unit: Unit::Bytes,
                 total: None,
+                resumed: 0,
                 started: None,
                 secs: None,
             });
@@ -388,6 +418,7 @@ fn build_step(stage: BuildStage) -> Step {
         explain,
         unit,
         total: None,
+        resumed: 0,
         started: None,
         secs: None,
     }
@@ -440,11 +471,8 @@ fn run(
         let (download_step, check_step) = (offset, offset + 1);
         progress.start(download_step, Some(input.region.osm.bytes));
         let expected = net::published_md5(url)?;
-        let partial = net::download(url, &input.extract, cancel, |done, total| {
-            if let Some(total) = total {
-                progress.steps.lock().expect("steps lock")[download_step].total = Some(total);
-            }
-            progress.done.store(done, Ordering::Relaxed);
+        let partial = net::download(url, &input.extract, cancel, |fetching| {
+            progress.downloaded(download_step, fetching);
         })?;
         progress.finish(download_step);
         let bytes = fs::metadata(&partial)?.len();
@@ -556,4 +584,92 @@ fn run(
         build_secs,
         costs: report.stage_table(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn download_step() -> Step {
+        Step {
+            did: "Downloaded",
+            doing: "Downloading",
+            object: "OpenStreetMap".to_string(),
+            explain: ["", ""],
+            unit: Unit::Bytes,
+            total: None,
+            resumed: 0,
+            started: None,
+            secs: None,
+        }
+    }
+
+    /// Rate and seconds left of a 1,000-byte download told each
+    /// `(from, done)` in turn, `after` into its step.
+    fn measured(fetchings: &[(u64, u64)], after: Duration) -> (Option<f64>, Option<f64>) {
+        let progress = Progress::new(vec![download_step()]);
+        progress.start(0, Some(1_000));
+        for &(from, done) in fetchings {
+            progress.downloaded(
+                0,
+                net::Fetching {
+                    from,
+                    done,
+                    total: Some(1_000),
+                },
+            );
+        }
+        let steps = progress.steps.lock().expect("steps lock");
+        let now = steps[0].started.expect("started") + after;
+        (
+            steps[0].rate(progress.done(), now),
+            steps[0].left(progress.done(), now),
+        )
+    }
+
+    #[test]
+    fn a_resumed_download_rates_only_the_bytes_of_this_run() {
+        // 800 bytes on disk before; 100 arrive in 10 s.
+        assert_eq!(
+            measured(&[(800, 800), (800, 900)], Duration::from_secs(10)),
+            (Some(10.0), Some(10.0))
+        );
+    }
+
+    #[test]
+    fn a_fresh_download_rates_every_byte() {
+        assert_eq!(
+            measured(&[(0, 0), (0, 100)], Duration::from_secs(10)),
+            (Some(10.0), Some(90.0))
+        );
+    }
+
+    #[test]
+    fn a_download_that_starts_over_rates_from_zero() {
+        // The partial file was stale: the server sent the file from its start.
+        assert_eq!(
+            measured(&[(800, 800), (0, 0), (0, 100)], Duration::from_secs(10)),
+            (Some(10.0), Some(90.0))
+        );
+    }
+
+    #[test]
+    fn a_resumed_download_has_no_rate_before_bytes_of_this_run() {
+        assert_eq!(
+            measured(&[(800, 800)], Duration::from_secs(10)),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_download_has_no_rate_in_its_first_second() {
+        assert_eq!(
+            measured(&[(0, 0), (0, 100)], Duration::from_millis(999)),
+            (None, None)
+        );
+        assert_eq!(
+            measured(&[(0, 0), (0, 100)], Duration::from_secs(1)),
+            (Some(100.0), Some(9.0))
+        );
+    }
 }
