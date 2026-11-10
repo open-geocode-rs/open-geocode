@@ -15,7 +15,7 @@ use levenshtein_automata::{DFA, Distance, SINK_STATE};
 use serde::Serialize;
 use tantivy::{
     DocAddress, DocId, DocSet, IndexReader, Score, Searcher, SegmentReader, Term,
-    collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
+    collector::{SegmentSortKeyComputer, SortKeyComputer, TopDocs, sort_key::NaturalComparator},
     columnar::{Column, StrColumn},
     index::SegmentId,
     query::{
@@ -1230,7 +1230,10 @@ impl TextSearcher {
                     .map(|word| (Occur::Must, self.area_term_query(word))),
             );
             if !searcher
-                .search(&BooleanQuery::new(clauses), &TopDocs::with_limit(1))?
+                .search(
+                    &BooleanQuery::new(clauses),
+                    &TopDocs::with_limit(1).order_by_score(),
+                )?
                 .is_empty()
             {
                 return Ok(true);
@@ -5149,7 +5152,7 @@ impl TextSearcher {
         ]);
         let searcher = self.reader.searcher();
         searcher
-            .search(&query, &TopDocs::with_limit(limit))?
+            .search(&query, &TopDocs::with_limit(limit).order_by_score())?
             .into_iter()
             .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
             .collect()
@@ -5255,8 +5258,8 @@ impl TextSearcher {
         let searcher = self.reader.searcher();
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
-            &TopDocs::with_limit(window).tweak_score(FameKeys {
-                columns: &self.columns,
+            &TopDocs::with_limit(window).order_by(FameKeys {
+                columns: Arc::clone(&self.columns),
                 focus,
             }),
         )?;
@@ -5344,22 +5347,18 @@ impl TextSearcher {
         // ("Richmond" the town among a hundred Richmond Roads, the one near
         // the caller among many Main Streets): the run is collected whole,
         // up to [`TIE_WINDOW`].
-        let mut scored = searcher.search(query, &TopDocs::with_limit(window))?;
+        let mut scored = searcher.search(query, &TopDocs::with_limit(window).order_by_score())?;
         let tie = |scored: &[(Score, DocAddress)], window: usize| {
             scored.len() == window && window > 1 && scored[window - 1].0 == scored[window - 2].0
         };
         if tie(&scored, window) && window < TIE_WINDOW {
-            scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
+            scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW).order_by_score())?;
         }
         // A run past the tie window keeps an arbitrary part of it ("Paris"),
         // so every match is keyed: no skipping, paid by such runs alone.
         let top_docs = if tie(&scored, TIE_WINDOW) {
-            let keys = RankKeys {
-                ranking,
-                columns: &self.columns,
-                pack: &self.pack,
-            };
-            searcher.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
+            let keys = RankKeys::new(ranking, &self.columns, &self.pack);
+            searcher.search(query, &TopDocs::with_limit(window).order_by(keys))?
         } else {
             let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
             top_docs.truncate(window);
@@ -5375,21 +5374,17 @@ impl TextSearcher {
         scored: Vec<(Score, DocAddress)>,
         ranking: &Ranking,
     ) -> Result<Vec<(RankKey, DocAddress)>> {
-        let keys = RankKeys {
-            ranking,
-            columns: &self.columns,
-            pack: &self.pack,
-        };
+        let keys = RankKeys::new(ranking, &self.columns, &self.pack);
         let mut tweakers = HashMap::<u32, SegmentRankKeys>::new();
         let mut top_docs = Vec::with_capacity(scored.len());
         for (text_score, doc) in scored {
             let tweaker = match tweakers.entry(doc.segment_ord) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    entry.insert(keys.segment_tweaker(searcher.segment_reader(doc.segment_ord))?)
+                    entry.insert(keys.segment(searcher.segment_reader(doc.segment_ord))?)
                 }
             };
-            top_docs.push((tweaker.score(doc.doc_id, text_score), doc));
+            top_docs.push((tweaker.key(doc.doc_id, text_score), doc));
         }
         top_docs.sort_by(|(left, _), (right, _)| {
             right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
@@ -5898,7 +5893,7 @@ impl TextSearcher {
         clauses.push((Occur::Must, self.layer_query(Layer::Address.as_str())));
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
-            &TopDocs::with_limit(NEIGHBOUR_DOCUMENTS),
+            &TopDocs::with_limit(NEIGHBOUR_DOCUMENTS).order_by_score(),
         )?;
         self.neighbours_of(
             &searcher,
@@ -6366,10 +6361,14 @@ impl SegmentFocus {
 /// Computes each matched record's [`RankKey`] as the text index collects
 /// them, so the window holds the best ranked records of all that match, not
 /// the best scoring.
-struct RankKeys<'a> {
-    ranking: &'a Ranking,
-    columns: &'a HashMap<SegmentId, SegmentColumns>,
-    pack: &'a Arc<pack::Reader>,
+///
+/// Owns what it reads: the text index collector outlives any borrow.
+struct RankKeys {
+    numbered: bool,
+    postcode: QueryPostcode,
+    focus: Option<[f64; 2]>,
+    columns: Arc<HashMap<SegmentId, SegmentColumns>>,
+    pack: Arc<pack::Reader>,
 }
 
 struct SegmentRankKeys {
@@ -6487,8 +6486,8 @@ impl PostcodeNearness {
 /// Collects the documents a name query matches nearest the caller's focus
 /// first, then best known, whatever their text score (see
 /// [`TextSearcher::places_by_name`]).
-struct FameKeys<'a> {
-    columns: &'a HashMap<SegmentId, SegmentColumns>,
+struct FameKeys {
+    columns: Arc<HashMap<SegmentId, SegmentColumns>>,
     focus: Option<[f64; 2]>,
 }
 
@@ -6497,10 +6496,20 @@ struct SegmentFameKeys {
     focus: Option<SegmentFocus>,
 }
 
-impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
+impl SortKeyComputer for FameKeys {
+    type SortKey = (u8, u64, Score);
     type Child = SegmentFameKeys;
+    type Comparator = NaturalComparator;
 
-    fn segment_tweaker(&self, segment: &SegmentReader) -> tantivy::Result<SegmentFameKeys> {
+    // Default is false: tantivy then skips BM25 and every text score reads 0.
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn segment_sort_key_computer(
+        &self,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<SegmentFameKeys> {
         let columns = self.columns.get(&segment.segment_id()).ok_or_else(|| {
             tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
         })?;
@@ -6517,24 +6526,44 @@ impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
     }
 }
 
-impl ScoreSegmentTweaker<(u8, u64, Score)> for SegmentFameKeys {
-    fn score(&mut self, doc: DocId, text_score: Score) -> (u8, u64, Score) {
+impl SegmentSortKeyComputer for SegmentFameKeys {
+    type SortKey = (u8, u64, Score);
+    type SegmentSortKey = (u8, u64, Score);
+    type SegmentComparator = NaturalComparator;
+
+    fn segment_sort_key(&mut self, doc: DocId, text_score: Score) -> (u8, u64, Score) {
         (
             self.focus.as_ref().map_or(0, |focus| focus.nearness(doc)),
             self.prominence.first(doc).unwrap_or_default(),
             text_score,
         )
     }
+
+    fn convert_segment_sort_key(&self, key: (u8, u64, Score)) -> (u8, u64, Score) {
+        key
+    }
 }
 
-impl ScoreTweaker<RankKey> for RankKeys<'_> {
-    type Child = SegmentRankKeys;
+impl RankKeys {
+    fn new(
+        ranking: &Ranking,
+        columns: &Arc<HashMap<SegmentId, SegmentColumns>>,
+        pack: &Arc<pack::Reader>,
+    ) -> Self {
+        Self {
+            numbered: ranking.numbered,
+            postcode: ranking.postcode.clone(),
+            focus: ranking.focus,
+            columns: Arc::clone(columns),
+            pack: Arc::clone(pack),
+        }
+    }
 
-    fn segment_tweaker(&self, segment: &SegmentReader) -> tantivy::Result<SegmentRankKeys> {
+    fn segment(&self, segment: &SegmentReader) -> tantivy::Result<SegmentRankKeys> {
         let columns = self.columns.get(&segment.segment_id()).ok_or_else(|| {
             tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
         })?;
-        let named = &self.ranking.postcode;
+        let named = &self.postcode;
         let column = |column: &Option<StrColumn>| {
             column
                 .as_ref()
@@ -6548,20 +6577,20 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
                 area: column(&columns.area_postcode)?,
                 nearness: (!named.areas.is_empty()).then(|| PostcodeNearness {
                     record_id: columns.record_id.clone(),
-                    pack: Arc::clone(self.pack),
+                    pack: Arc::clone(&self.pack),
                     postcode: named.clone(),
                 }),
             }),
         };
         Ok(SegmentRankKeys {
-            numbered: self.ranking.numbered,
+            numbered: self.numbered,
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
             prominence: columns.prominence.clone(),
             place_rank: columns.place_rank.clone(),
             postcode,
-            focus: self.ranking.focus.map(|focus| SegmentFocus {
+            focus: self.focus.map(|focus| SegmentFocus {
                 focus,
                 min_lon: columns.min_lon.clone(),
                 min_lat: columns.min_lat.clone(),
@@ -6572,8 +6601,41 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
     }
 }
 
-impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
-    fn score(&mut self, doc: DocId, text_score: Score) -> RankKey {
+impl SortKeyComputer for RankKeys {
+    type SortKey = RankKey;
+    type Child = SegmentRankKeys;
+    type Comparator = NaturalComparator;
+
+    // Default is false: tantivy then skips BM25, every text score reads 0, and
+    // the number and postcode terms stop lifting the records that hold them.
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn segment_sort_key_computer(
+        &self,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<SegmentRankKeys> {
+        self.segment(segment)
+    }
+}
+
+impl SegmentSortKeyComputer for SegmentRankKeys {
+    type SortKey = RankKey;
+    type SegmentSortKey = RankKey;
+    type SegmentComparator = NaturalComparator;
+
+    fn segment_sort_key(&mut self, doc: DocId, text_score: Score) -> RankKey {
+        self.key(doc, text_score)
+    }
+
+    fn convert_segment_sort_key(&self, key: RankKey) -> RankKey {
+        key
+    }
+}
+
+impl SegmentRankKeys {
+    fn key(&self, doc: DocId, text_score: Score) -> RankKey {
         // A numbered query matches a record by its stated number, by a range
         // that holds the number, or as a street that stands in for it.
         let mut key = RankKey::text(text_score);
@@ -10214,6 +10276,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// Places as near and as well known as each other keep their text score
+    /// through the name pass, and the one the query names exactly leads.
+    #[test]
+    fn places_alike_in_fame_keep_their_text_scores() {
+        let pack = TempPack::new("search-place-fame-text");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let place = |object_id, name: &str| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(-89.65, 39.8),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence: Prominence {
+                        importance: 100,
+                        linked: true,
+                        languages: 10,
+                    },
+                    wikidata: None,
+                },
+            )
+        };
+        writer
+            .write(&place(2, "Springfield Lake Township"), None)
+            .expect("township");
+        writer.write(&place(1, "Springfield"), None).expect("town");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        let hits = top_scores(&searcher, "Springfield");
+        let ids = hits.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, ["osm:node:1", "osm:node:2"]);
+        assert!(
+            hits.iter().all(|(_, score)| *score > 0.0),
+            "scores {hits:?}"
+        );
+    }
+
+    /// More streets of a name than the tie window holds, so every match is
+    /// ranked as it is collected: each keeps its text score.
+    #[test]
+    fn a_tie_run_past_the_window_keeps_its_text_scores() {
+        let pack = TempPack::new("search-tie-run-score");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        for id in 1..=(TIE_WINDOW as i64 + 100) {
+            writer
+                .write(
+                    &street_record(&format!("osm:way:{id}"), "Main Street").into(),
+                    None,
+                )
+                .expect("street");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        let hits = top_scores(&searcher, "Main Street");
+        assert_eq!(hits.len(), 5);
+        assert!(
+            hits.iter().all(|(_, score)| *score > 0.0),
+            "scores {hits:?}"
+        );
+    }
+
     /// A place the query names by any of its names leads, nearest the
     /// caller first, then best known, then, of places about as well read,
     /// the one it names by its own name; a place mapped twice answers once,
@@ -10981,6 +11108,22 @@ mod tests {
             .expect("search")
             .into_iter()
             .map(|hit| hit.record.id)
+            .collect()
+    }
+
+    fn top_scores(searcher: &TextSearcher, query: &str) -> Vec<(String, Score)> {
+        searcher
+            .search(&TextSearchOptions {
+                query: query.to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| (hit.record.id, hit.score))
             .collect()
     }
 

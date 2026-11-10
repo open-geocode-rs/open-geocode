@@ -1095,19 +1095,13 @@ fn build_schema() -> (Schema, Fields) {
     let interpolation_end = builder.add_u64_field(INTERPOLATION_END_FIELD, FAST);
     let street_text = builder.add_text_field("street_text", searchable_text_options());
     let house_number = builder.add_u64_field(HOUSE_NUMBER_FIELD, FAST);
-    let rank_postcode = builder.add_text_field(
-        RANK_POSTCODE_FIELD,
-        TextOptions::default().set_fast(Some("raw")),
-    );
-    let area_postcode = builder.add_text_field(
-        AREA_POSTCODE_FIELD,
-        TextOptions::default().set_fast(Some("raw")),
-    );
+    let rank_postcode =
+        builder.add_text_field(RANK_POSTCODE_FIELD, TextOptions::default().set_fast("raw"));
+    let area_postcode =
+        builder.add_text_field(AREA_POSTCODE_FIELD, TextOptions::default().set_fast("raw"));
     // Fast too: confidence is rated by the country an answer lies in.
-    let country_code = builder.add_text_field(
-        COUNTRY_CODE_FIELD,
-        exact_string_options().set_fast(Some("raw")),
-    );
+    let country_code =
+        builder.add_text_field(COUNTRY_CODE_FIELD, exact_string_options().set_fast("raw"));
     let min_lon = builder.add_i64_field(MIN_LON_FIELD, FAST);
     let min_lat = builder.add_i64_field(MIN_LAT_FIELD, FAST);
     let max_lon = builder.add_i64_field(MAX_LON_FIELD, FAST);
