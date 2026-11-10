@@ -2,6 +2,7 @@
 /target/
 
 # Generated data
+/THIRD-PARTY-LICENSES
 /data/
 /bench-results/
 /out/

@@ -55,6 +55,34 @@ jobs:
       - name: Check dependencies
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check about.toml accepts what deny.toml allows
+        run: |
+          python3 -I - <<'EOF'
+          import sys, tomllib
+          deny = tomllib.load(open("deny.toml", "rb"))["licenses"]["allow"]
+          about = tomllib.load(open("about.toml", "rb"))["accepted"]
+          if sorted(deny) != sorted(about):
+              sys.exit(f"deny.toml allows {sorted(deny)}, about.toml accepts {sorted(about)}")
+          EOF
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.3
+
+      # Fails when a crate's license is not accepted or not found, the same
+      # command the release and the Docker image run.
+      - name: Generate THIRD-PARTY-LICENSES
+        run: cargo about generate --all-features --locked --fail -o THIRD-PARTY-LICENSES about.hbs
+
   test:
     name: Test (${{ matrix.os }})
     strategy:

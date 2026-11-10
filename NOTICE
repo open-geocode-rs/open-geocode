@@ -1,4 +1,6 @@
 open-geocode includes data from the projects below, under their licences.
+The Rust crates open-geocode is built from, and their licenses, are listed in
+THIRD-PARTY-LICENSES, which ships beside this file.
 
 ========================================================================
 libpostal

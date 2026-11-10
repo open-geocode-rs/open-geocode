@@ -1,0 +1,18 @@
+open-geocode is built from the Rust crates below. Each crate is listed under
+the license open-geocode uses it under, with the license text the crate ships.
+A crate that ships no license file is listed with the license's standard text.
+NOTICE covers the data open-geocode vendors.
+
+Crates by license:
+{{#each overview}}  {{{name}}} ({{id}}): {{count}}
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{id}})
+Used by:
+{{#each used_by}}  {{crate.name}} {{crate.version}}{{#if crate.repository}} {{{crate.repository}}}{{/if}}
+{{/each}}================================================================================
+
+{{{text}}}
+{{/each}}
