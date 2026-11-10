@@ -158,12 +158,6 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 
-impl From<crate::builder::progress::BuildCancelled> for Error {
-    fn from(_: crate::builder::progress::BuildCancelled) -> Self {
-        Self::Cancelled
-    }
-}
-
 impl From<crate::batch::Cancelled> for Error {
     fn from(_: crate::batch::Cancelled) -> Self {
         Self::Cancelled

@@ -34,7 +34,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    builder::BuildCancelled,
     error::{Error, Result},
     resources,
 };
@@ -353,7 +352,7 @@ impl Scratch {
         let _ = self.cancel.set(cancel);
     }
 
-    /// Fails with [`BuildCancelled`] once the flag given to
+    /// Fails with [`Error::Cancelled`] once the flag given to
     /// [`Scratch::cancel_on`] is set.
     pub fn check_cancelled(&self) -> Result<()> {
         if self
@@ -361,7 +360,7 @@ impl Scratch {
             .get()
             .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
         {
-            return Err(BuildCancelled.into());
+            return Err(Error::Cancelled);
         }
         Ok(())
     }

@@ -17,7 +17,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
-use open_geocode::builder::BuildCancelled;
 use ureq::{Agent, http::Response};
 
 use crate::format;
@@ -271,7 +270,7 @@ fn fetch(
     loop {
         if cancel.load(Ordering::Relaxed) {
             file.flush()?;
-            return Err(BuildCancelled.into());
+            return Err(open_geocode::Error::Cancelled.into());
         }
         match chunks.recv_timeout(POLL) {
             Ok(Ok(chunk)) => {
@@ -319,7 +318,7 @@ pub(crate) fn check_md5(
     let mut done = 0;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Err(BuildCancelled.into());
+            return Err(open_geocode::Error::Cancelled.into());
         }
         let read = reader
             .read(&mut buffer)
@@ -345,4 +344,61 @@ pub(crate) fn check_md5(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+    use crate::job;
+
+    /// A directory of its own, removed even when an assertion fails.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("og-{name}-{}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_download_stops_as_a_cancel_and_keeps_its_part() {
+        let dir = TempDir::new("cancelled-download");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/andorra.osm.pbf", listener.local_addr().unwrap());
+        // Headers only: the body never comes, so only the cancel ends it.
+        // The stream is held open by the unjoined handle, and a test that
+        // never connects does not wait on the accept.
+        let _server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .unwrap();
+            stream
+        });
+        let extract = dir.0.join("andorra.osm.pbf");
+        let error = download(&url, &extract, &AtomicBool::new(true), |_, _| {}).unwrap_err();
+        assert!(job::cancelled(&error), "{error:#}");
+        assert!(partial_path(&extract).is_file());
+    }
+
+    #[test]
+    fn a_cancelled_checksum_stops_as_a_cancel() {
+        let dir = TempDir::new("cancelled-checksum");
+        let path = dir.0.join("andorra.osm.pbf.part");
+        fs::write(&path, b"pbf").unwrap();
+        let error = check_md5(&path, "", &AtomicBool::new(true), |_| {}).unwrap_err();
+        assert!(job::cancelled(&error), "{error:#}");
+    }
 }

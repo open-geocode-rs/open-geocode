@@ -155,6 +155,8 @@ pub(crate) struct BuildJob {
     /// The Pack it writes, and the extracts it reads or downloads.
     pack: PathBuf,
     extracts: Vec<PathBuf>,
+    /// The partial file of each extract it downloads, in step order.
+    partials: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<Built>>>,
 }
@@ -208,6 +210,12 @@ impl BuildJob {
             .iter()
             .map(|input| input.extract.clone())
             .collect();
+        let partials = request
+            .inputs
+            .iter()
+            .filter(|input| input.download)
+            .map(|input| net::partial_path(&input.extract))
+            .collect();
         let handle = {
             let progress = Arc::clone(&progress);
             let cancel = Arc::clone(&cancel);
@@ -217,6 +225,7 @@ impl BuildJob {
             progress,
             pack,
             extracts,
+            partials,
             cancel,
             handle: Some(handle),
         }
@@ -229,6 +238,31 @@ impl BuildJob {
     /// The flag that stops the job, for a signal handler to set.
     pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancel)
+    }
+
+    /// What a cancel leaves, as the line og stops with: by the running
+    /// step, or by the next one when the cancel lands between two.
+    pub(crate) fn stopped(&self) -> String {
+        let index = {
+            let steps = self.progress.steps.lock().expect("steps lock");
+            let current = self.progress.current();
+            (current..steps.len())
+                .find(|&index| steps[index].secs.is_none())
+                .unwrap_or(current)
+        };
+        // Each download is two steps, the fetch and then its checksum, all
+        // before the build's.
+        match self.partials.get(index / 2) {
+            Some(partial) if index % 2 == 0 => format!(
+                "Cancelled; {} was kept, and the next run continues the download.",
+                partial.display()
+            ),
+            Some(partial) => format!(
+                "Cancelled; {} was kept, and is checked before a build reads it.",
+                partial.display()
+            ),
+            None => "Cancelled; the unfinished Pack was removed.".to_string(),
+        }
     }
 
     /// Whether the job writes this Pack, or reads or downloads this extract.
@@ -556,4 +590,39 @@ fn run(
         build_secs,
         costs: report.stage_table(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancel_says_what_the_step_it_stopped_leaves() {
+        let partial = PathBuf::from("/og/pbf/andorra.osm.pbf.part");
+        let steps = (0..2)
+            .map(|_| build_step(BuildStage::Scan))
+            .chain(BuildStage::ALL.into_iter().map(build_step))
+            .collect();
+        let job = BuildJob {
+            progress: Progress::new(steps),
+            pack: PathBuf::from("/og/packs/andorra"),
+            extracts: vec![PathBuf::from("/og/pbf/andorra.osm.pbf")],
+            partials: vec![partial],
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        let download = "Cancelled; /og/pbf/andorra.osm.pbf.part was kept, and the next run continues the download.";
+        let checksum = "Cancelled; /og/pbf/andorra.osm.pbf.part was kept, and is checked before a build reads it.";
+        let pack = "Cancelled; the unfinished Pack was removed.";
+        job.progress.start(0, None);
+        assert_eq!(job.stopped(), download);
+        job.progress.finish(0);
+        assert_eq!(job.stopped(), checksum);
+        job.progress.start(1, None);
+        assert_eq!(job.stopped(), checksum);
+        job.progress.finish(1);
+        assert_eq!(job.stopped(), pack);
+        job.progress.start(2, None);
+        assert_eq!(job.stopped(), pack);
+    }
 }
