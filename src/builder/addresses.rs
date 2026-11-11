@@ -23,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -221,23 +222,51 @@ pub fn read_file(
     file: &AddressFile,
     accept: impl FnMut(AddressRecord) -> Result<Option<&'static str>>,
 ) -> Result<ImportReport> {
-    read_rows(file, usize::MAX, accept)
+    read_rows(file, usize::MAX, |record| Ok(Ok(record)), accept)
+}
+
+/// Read every row of `file` as [`read_file`] does, with `prepare` run on each
+/// address on every core before `accept` takes the rows in file order. A row
+/// `prepare` turns down is counted under the reason it gives.
+pub fn read_file_prepared<P: Send>(
+    file: &AddressFile,
+    prepare: impl Fn(AddressRecord) -> Result<std::result::Result<P, &'static str>> + Sync,
+    accept: impl FnMut(P) -> Result<Option<&'static str>>,
+) -> Result<ImportReport> {
+    read_rows(file, usize::MAX, prepare, accept)
 }
 
 /// The points of the addresses the first `rows` rows of `file` state.
 pub fn first_points(file: &AddressFile, rows: usize) -> Result<Vec<[f64; 2]>> {
     let mut points = Vec::new();
-    read_rows(file, rows, |record| {
-        points.extend(crate::util::geo::point_lon_lat(&record.geometry));
-        Ok(None)
-    })?;
+    read_rows(
+        file,
+        rows,
+        |record| Ok(Ok(record)),
+        |record| {
+            points.extend(crate::util::geo::point_lon_lat(&record.geometry));
+            Ok(None)
+        },
+    )?;
     Ok(points)
 }
 
-fn read_rows(
+/// Rows read and handed to the pool at once.
+const ROW_BATCH: usize = 1 << 14;
+
+/// A row as the reading thread hands it on. A GeoJSON line is parsed on the
+/// pool, a CSV record by the reader that splits it.
+enum Unparsed {
+    Line(String),
+    /// Boxed, as a split row is several times a line's size.
+    Row(Box<std::result::Result<Row, &'static str>>),
+}
+
+fn read_rows<P: Send>(
     file: &AddressFile,
     limit: usize,
-    mut accept: impl FnMut(AddressRecord) -> Result<Option<&'static str>>,
+    prepare: impl Fn(AddressRecord) -> Result<std::result::Result<P, &'static str>> + Sync,
+    mut accept: impl FnMut(P) -> Result<Option<&'static str>>,
 ) -> Result<ImportReport> {
     let mut report = ImportReport {
         dataset: file.dataset.clone(),
@@ -245,52 +274,16 @@ fn read_rows(
         bytes: file.bytes()?,
         ..ImportReport::default()
     };
-    let mut row_number = 0i64;
-    let mut take = |row: std::result::Result<Row, &'static str>| -> Result<()> {
-        row_number += 1;
-        report.rows += 1;
-        match row.and_then(|row| address(row, &file.dataset, row_number)) {
-            Ok(record) => {
-                match accept(record)? {
-                    None => report.accepted += 1,
-                    Some(reason) => *report.rejected.entry(reason.to_string()).or_default() += 1,
-                }
-                Ok(())
-            }
-            Err(reason) => {
-                *report.rejected.entry(reason.to_string()).or_default() += 1;
-                Ok(())
-            }
-        }
-    };
     let (input, named) = match &file.entry {
         Some(entry) => (open_entry(&file.path, entry)?, Path::new(entry.as_str())),
         None => (open(&file.path)?, file.path.as_path()),
     };
-    match layout(named)? {
-        Layout::GeoJson => {
-            for line in input.lines().take(limit) {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                take(
-                    serde_json::from_str::<Feature>(&line)
-                        .map(|feature| Row {
-                            lon: feature
-                                .geometry
-                                .as_ref()
-                                .and_then(|g| g.coordinates.first().copied()),
-                            lat: feature
-                                .geometry
-                                .as_ref()
-                                .and_then(|g| g.coordinates.get(1).copied()),
-                            properties: feature.properties,
-                        })
-                        .map_err(|_| "malformed_row"),
-                )?;
-            }
-        }
+    let rows: Box<dyn Iterator<Item = Result<Unparsed>> + Send> = match layout(named)? {
+        Layout::GeoJson => Box::new(input.lines().take(limit).filter_map(|line| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            Ok(line) => Some(Ok(Unparsed::Line(line))),
+            Err(error) => Some(Err(error.into())),
+        })),
         Layout::Csv => {
             let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(input);
             let headers = reader
@@ -310,17 +303,16 @@ fn read_rows(
             };
             let [unit, city, district, region, postcode] =
                 ["unit", "city", "district", "region", "postcode"].map(column);
-            for record in reader.records().take(limit) {
+            Box::new(reader.into_records().take(limit).map(move |record| {
                 let Ok(record) = record else {
-                    take(Err("malformed_row"))?;
-                    continue;
+                    return Ok(Unparsed::Row(Box::new(Err("malformed_row"))));
                 };
                 let text = |index: Option<usize>| {
                     index
                         .and_then(|index| record.get(index))
                         .map(str::to_string)
                 };
-                take(Ok(Row {
+                Ok(Unparsed::Row(Box::new(Ok(Row {
                     lon: record.get(lon).and_then(|value| value.trim().parse().ok()),
                     lat: record.get(lat).and_then(|value| value.trim().parse().ok()),
                     properties: Properties {
@@ -332,11 +324,80 @@ fn read_rows(
                         region: text(region),
                         postcode: text(postcode),
                     },
-                }))?;
+                }))))
+            }))
+        }
+    };
+    let dataset = file.dataset.as_str();
+    let prepare = &prepare;
+    // Inflating and splitting a file is one stream, but each row parses and
+    // checks on its own. One thread reads the next batch while the pool
+    // readies this one, and rows are taken in file order.
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = scope.spawn(move || -> Result<()> {
+            let mut rows = rows;
+            loop {
+                let batch = rows.by_ref().take(ROW_BATCH).collect::<Result<Vec<_>>>()?;
+                if batch.is_empty() || sender.send(batch).is_err() {
+                    return Ok(());
+                }
+            }
+        });
+        // Dropping the receiver on an error here stops the reader at its
+        // next batch.
+        let mut row_number = 0i64;
+        for batch in receiver {
+            let first = row_number + 1;
+            row_number += i64::try_from(batch.len())?;
+            let ready = batch
+                .into_par_iter()
+                .enumerate()
+                .map(|(at, unparsed)| {
+                    let number = first + i64::try_from(at)?;
+                    let row = match unparsed {
+                        Unparsed::Line(line) => parse_feature(&line),
+                        Unparsed::Row(row) => *row,
+                    };
+                    match row.and_then(|row| address(row, dataset, number)) {
+                        Ok(record) => prepare(record),
+                        Err(reason) => Ok(Err(reason)),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for row in ready {
+                report.rows += 1;
+                let rejected = match row {
+                    Ok(prepared) => accept(prepared)?,
+                    Err(reason) => Some(reason),
+                };
+                match rejected {
+                    None => report.accepted += 1,
+                    Some(reason) => *report.rejected.entry(reason.to_string()).or_default() += 1,
+                }
             }
         }
-    }
+        reader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })?;
     Ok(report)
+}
+
+fn parse_feature(line: &str) -> std::result::Result<Row, &'static str> {
+    serde_json::from_str::<Feature>(line)
+        .map(|feature| Row {
+            lon: feature
+                .geometry
+                .as_ref()
+                .and_then(|g| g.coordinates.first().copied()),
+            lat: feature
+                .geometry
+                .as_ref()
+                .and_then(|g| g.coordinates.get(1).copied()),
+            properties: feature.properties,
+        })
+        .map_err(|_| "malformed_row")
 }
 
 enum Layout {
@@ -366,7 +427,7 @@ fn layout(path: &Path) -> Result<Layout> {
 /// The text of `entry` in the zip archive at `path`, inflated as it is read.
 /// The entry is read from its own offset in the archive, so a collection of
 /// thousands of files is read one entry at a time and never unpacked.
-fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead>> {
+fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead + Send>> {
     use std::io::{Seek, SeekFrom};
     let ZipEntry {
         data_start,
@@ -392,7 +453,7 @@ fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead>> {
 }
 
 /// The file's text, gunzipped when it starts with the gzip magic.
-fn open(path: &Path) -> Result<Box<dyn BufRead>> {
+fn open(path: &Path) -> Result<Box<dyn BufRead + Send>> {
     let failed = |source| Error::IoPath {
         action: "failed to open",
         path: path.to_path_buf(),
@@ -559,6 +620,59 @@ mod tests {
                 |_| Ok(None)
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn rows_prepared_on_the_pool_are_taken_in_file_order() {
+        // Past two batches, so rows from three batches must line up.
+        let rows = 2 * ROW_BATCH + 3;
+        let mut csv = String::from("lon,lat,number,street\n");
+        for row in 1..=rows {
+            let lat = if row % 7 == 0 { "oops" } else { "43.6" };
+            csv.push_str(&format!("-79.4,{lat},{row},King St\n"));
+        }
+        let path = temp_file("addresses.csv", csv.as_bytes());
+        let mut taken = Vec::new();
+        let report = read_file_prepared(
+            &AddressFile {
+                dataset: "openaddresses:test".into(),
+                path: path.clone(),
+                entry: None,
+                area: None,
+            },
+            |record| {
+                let number = record.address.number.parse::<usize>().expect("number");
+                Ok(if number % 3 == 0 {
+                    Err("third")
+                } else {
+                    Ok((number, record.source))
+                })
+            },
+            |prepared| {
+                taken.push(prepared);
+                Ok(None)
+            },
+        )
+        .expect("read");
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+
+        let expected = (1..=rows)
+            .filter(|row| row % 7 != 0 && row % 3 != 0)
+            .map(|row| {
+                let id = i64::try_from(row).expect("row");
+                (row, SourceProvenance::imported("openaddresses:test", id))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(taken, expected);
+        assert_eq!(report.rows, 32_771);
+        assert_eq!(report.accepted, 18_727);
+        assert_eq!(
+            report.rejected,
+            BTreeMap::from([
+                ("bad_coordinates".to_string(), 4_681),
+                ("third".to_string(), 9_363),
+            ])
         );
     }
 }
