@@ -234,18 +234,7 @@ impl TreeWriter {
         if !self.count.is_multiple_of(NODE_SIZE as u64) {
             self.parents.push(self.open);
         }
-        let mut levels = Vec::new();
-        if !self.parents.is_empty() {
-            levels.push(std::mem::take(&mut self.parents));
-            while levels.last().is_some_and(|level| level.len() > 1) {
-                let below = levels.last().expect("a level");
-                let above = below
-                    .chunks(NODE_SIZE)
-                    .map(|children| children.iter().copied().fold(EMPTY, union))
-                    .collect();
-                levels.push(above);
-            }
-        }
+        let levels = levels_from(std::mem::take(&mut self.parents));
         let id_width = match &self.ids {
             None => 0u8,
             Some(_) if self.widest_id <= u64::from(u32::MAX) => 4,
@@ -275,6 +264,76 @@ impl TreeWriter {
         }
         pack.end()?;
         Ok(self.count)
+    }
+}
+
+/// The levels of a tree from its lowest parents up to its root.
+fn levels_from(parents: Vec<BoundingBox>) -> Vec<Vec<BoundingBox>> {
+    let mut levels = Vec::new();
+    if !parents.is_empty() {
+        levels.push(parents);
+        while levels.last().is_some_and(|level| level.len() > 1) {
+            let below = levels.last().expect("a level");
+            let above = below
+                .chunks(NODE_SIZE)
+                .map(|children| children.iter().copied().fold(EMPTY, union))
+                .collect();
+            levels.push(above);
+        }
+    }
+    levels
+}
+
+/// Write a tree over `boxes`, item `i` being `boxes[i]`, in the format of
+/// the record trees. For a few boxes known whole, such as the areas', which
+/// need neither scratch nor checkpoints; nearby boxes should be neighbours
+/// in `boxes` for the tree to prune well.
+pub(crate) fn write_box_tree(
+    pack: &mut container::Writer,
+    name: &str,
+    version: u32,
+    boxes: &[[i32; 4]],
+) -> Result<()> {
+    let parents = boxes
+        .chunks(NODE_SIZE)
+        .map(|children| children.iter().copied().fold(EMPTY, union))
+        .collect();
+    pack.begin(name, version)?;
+    pack.write_all(&(boxes.len() as u64).to_le_bytes())?;
+    pack.write_all(&[0])?;
+    for bbox in std::iter::once(boxes)
+        .chain(levels_from(parents).iter().map(Vec::as_slice))
+        .flatten()
+    {
+        for value in bbox {
+            pack.write_all(&value.to_le_bytes())?;
+        }
+    }
+    pack.end()
+}
+
+/// A tree [`write_box_tree`] wrote.
+#[derive(Clone)]
+pub(crate) struct BoxTree(Tree);
+
+impl BoxTree {
+    pub(crate) fn open(container: &Container, name: &str, version: u32) -> Result<Self> {
+        let tree = Tree::open(container, name, version)?;
+        if tree.id_width != 0 {
+            return Err(Error::Inconsistent(format!(
+                "box tree {name} stores ids it should not"
+            )));
+        }
+        Ok(Self(tree))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.count
+    }
+
+    /// The items whose boxes hold the point, edges included.
+    pub(crate) fn containing(&self, lon: f64, lat: f64) -> impl Iterator<Item = usize> + '_ {
+        self.0.nearest(lon, lat, 0.0).map(|(item, _)| item)
     }
 }
 
@@ -432,8 +491,8 @@ struct Tree {
 }
 
 impl Tree {
-    fn open(container: &Container, name: &str) -> Result<Self> {
-        let bytes = container.section(name, SPATIAL_VERSION)?;
+    fn open(container: &Container, name: &str, version: u32) -> Result<Self> {
+        let bytes = container.section(name, version)?;
         let inconsistent = || Error::Inconsistent(format!("spatial index {name} is inconsistent"));
         let count = usize::try_from(read_u64_le(&bytes, 0).ok_or_else(inconsistent)?)?;
         let id_width = usize::from(*bytes.get(8).ok_or_else(inconsistent)?);
@@ -696,7 +755,7 @@ impl LineCache {
 
 impl Reader {
     pub fn open(container: &Container, records: records::Reader) -> Result<Self> {
-        let blocks = Tree::open(container, BLOCKS)?;
+        let blocks = Tree::open(container, BLOCKS, SPATIAL_VERSION)?;
         if blocks.count as u64 != records.block_count() {
             return Err(Error::Inconsistent(
                 "spatial index does not match the record blocks".into(),
@@ -704,8 +763,8 @@ impl Reader {
         }
         Ok(Self {
             blocks,
-            lines: Tree::open(container, LINES)?,
-            context: Tree::open(container, CONTEXT)?,
+            lines: Tree::open(container, LINES, SPATIAL_VERSION)?,
+            context: Tree::open(container, CONTEXT, SPATIAL_VERSION)?,
             records,
         })
     }

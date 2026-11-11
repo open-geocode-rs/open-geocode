@@ -1663,6 +1663,7 @@ impl<'a> Run<'a> {
         writer.set_context_names(area_names);
         writer.set_country_codes(country_codes);
         writer.set_region_groups(region_groups);
+        writer.set_areas(index.areas());
         let mut sample = Sampler::default();
         let context_count = ordered.len();
         // Before the context records: the admin areas among them are places
@@ -3119,7 +3120,7 @@ mod tests {
     use crate::{
         builder::progress::StageUnit,
         pack::{PointPrecision, Reader},
-        record::Record,
+        record::{Layer, Record},
         reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
         search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     };
@@ -3933,6 +3934,194 @@ mod tests {
             top("1300 Eruera Street"),
             vec!["derived:estimate:1300:osm:node:11:osm:node:13"]
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Reverse geocoding names the areas holding the point, tested against
+    /// the shapes the build placed its records in: in a field far from any
+    /// record, and beside the point of an area it is not in.
+    #[test]
+    fn reverse_names_the_areas_that_hold_the_point() {
+        let dir = temp_dir("held");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let id = |source: &str| {
+            reader
+                .find_by_source_id(source)
+                .expect("lookup")
+                .expect(source)
+        };
+        let (toronto, ontario) = (id("osm:relation:900"), id("osm:relation:901"));
+        let canada = reader
+            .boundary_context(id("osm:node:1"))
+            .expect("context")
+            .expect("has context")
+            .admin_context
+            .country_record_id()
+            .expect("Canada, from CA-ON");
+        let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
+        let at = |lon, lat, layer| {
+            reverse
+                .reverse(GeocodeOptions {
+                    layer,
+                    ..GeocodeOptions::at(lon, lat)
+                })
+                .expect("reverse")
+                .result
+        };
+        let area = |lon, lat, layer| {
+            at(lon, lat, Some(layer)).map(|result| (result.primary_record_id, result.label))
+        };
+
+        // In Toronto, two kilometres from any record. Annex is drawn only as
+        // a point, and lies in Toronto too.
+        let field = at(-79.32, 43.52, None).expect("an answer");
+        assert_eq!(field.match_kind, MatchKind::ContextOnly);
+        assert_eq!(field.primary_record_id, Some(toronto));
+        assert_eq!(field.label, "Annex, Toronto, Ontario, M5V 1A1, Canada");
+        assert_eq!(
+            field.evidence.context_record_ids[..3],
+            [toronto, ontario, canada]
+        );
+        assert_eq!(field.context.postcode.as_deref(), Some("M5V 1A1"));
+        assert_eq!(
+            area(-79.32, 43.52, Layer::Locality),
+            Some((Some(toronto), "Toronto, Ontario, Canada".to_string()))
+        );
+        assert_eq!(
+            area(-79.32, 43.52, Layer::Region),
+            Some((Some(ontario), "Ontario, Canada".to_string()))
+        );
+        assert_eq!(
+            area(-79.32, 43.52, Layer::Country),
+            Some((Some(canada), "Canada".to_string()))
+        );
+        assert_eq!(
+            area(-79.32, 43.52, Layer::Neighbourhood),
+            Some((
+                Some(id("osm:node:4")),
+                "Annex, Toronto, Ontario, Canada".to_string()
+            ))
+        );
+
+        // In Ontario, nearer Toronto's point than any other locality's, but
+        // outside Toronto.
+        let beside = at(-79.25, 43.6, None).expect("an answer");
+        assert_eq!(beside.primary_record_id, Some(ontario));
+        assert_eq!(beside.context.locality, None);
+        assert_eq!(area(-79.25, 43.6, Layer::Locality), None);
+        assert_eq!(
+            area(-79.25, 43.6, Layer::Region),
+            Some((Some(ontario), "Ontario, Canada".to_string()))
+        );
+
+        // An address names the areas it lies in, not the nearest point of a
+        // neighbourhood whose shape it is outside, Bay Ward's.
+        let king = at(-79.40, 43.60, None).expect("an address");
+        assert_eq!(king.match_kind, MatchKind::ExplicitAddress);
+        assert_eq!(king.context.neighbourhood.as_deref(), Some("Annex"));
+        assert_eq!(
+            king.evidence.context_record_ids[..3],
+            [toronto, ontario, canada]
+        );
+
+        // Outside every area, and over 50 km from any area's point.
+        assert_eq!(at(-81.0, 43.5, None), None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A town drawn as a U has its centre in the notch, outside itself, so
+    /// its record lies in the region alone. A point in the notch is still
+    /// not in the town.
+    #[test]
+    fn reverse_names_no_area_whose_shape_misses_the_point() {
+        let dir = temp_dir("notch");
+        let input = dir.join("notch.osm.pbf");
+        let corners = [
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 3.0),
+            (2.0, 3.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+        ];
+        let mut nodes = corners
+            .iter()
+            .zip(1..)
+            .map(|(&(lon, lat), id)| node(id, lat, lon, &[]))
+            .collect::<Vec<_>>();
+        nodes.extend([
+            node(11, -1.0, -1.0, &[]),
+            node(12, -1.0, 4.0, &[]),
+            node(13, 4.0, 4.0, &[]),
+            node(14, 4.0, -1.0, &[]),
+        ]);
+        write_pbf(
+            &input,
+            &[
+                nodes,
+                vec![
+                    way(500, &[1, 2, 3, 4, 5, 6, 7, 8, 1], &[]),
+                    way(501, &[11, 12, 13, 14, 11], &[]),
+                ],
+                vec![
+                    relation(
+                        900,
+                        &[(500, "outer")],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "8"),
+                            ("name", "Hoefeld"),
+                        ],
+                    ),
+                    relation(
+                        901,
+                        &[(501, "outer")],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "4"),
+                            ("name", "Ontario"),
+                            ("ISO3166-2", "CA-ON"),
+                        ],
+                    ),
+                ],
+            ],
+        );
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let id = |source: &str| {
+            reader
+                .find_by_source_id(source)
+                .expect("lookup")
+                .expect(source)
+        };
+        let (town, ontario) = (id("osm:relation:900"), id("osm:relation:901"));
+        let reverse = PackReverseGeocoder::open(dir.join("pack")).expect("reverse");
+        let at = |lon, lat, layer| {
+            reverse
+                .reverse(GeocodeOptions {
+                    layer,
+                    ..GeocodeOptions::at(lon, lat)
+                })
+                .expect("reverse")
+                .result
+                .map(|result| (result.primary_record_id, result.context.locality))
+        };
+
+        assert_eq!(
+            at(0.5, 2.5, None),
+            Some((Some(town), Some("Hoefeld".to_string())))
+        );
+        assert_eq!(at(1.5, 2.5, None), Some((Some(ontario), None)));
+        assert_eq!(at(1.5, 2.5, Some(Layer::Locality)), None);
+
         let _ = fs::remove_dir_all(dir);
     }
 

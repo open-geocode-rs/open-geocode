@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    areas,
     container::{self, Container},
     context::{self, TupleWriter},
     extsort::Scratch,
@@ -204,6 +205,7 @@ pub struct Writer {
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
+    areas: Option<areas::Writer>,
     /// Last, so it drops after every writer of a file in it (see
     /// [`Generation`]'s drop).
     generation: Generation,
@@ -349,6 +351,7 @@ impl Writer {
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
+            areas: None,
         })
     }
 
@@ -388,6 +391,12 @@ impl Writer {
     /// The groups of regions each region lies in, by the region's id.
     pub fn set_region_groups(&mut self, groups: HashMap<RecordId, Vec<RecordId>>) {
         self.dictionaries.set_region_groups(groups);
+    }
+
+    /// The areas the records were placed in, for reverse geocoding to test
+    /// any point against.
+    pub fn set_areas(&mut self, areas: areas::Writer) {
+        self.areas = Some(areas);
     }
 
     /// Postcode centroids, so the records written after this that have no
@@ -489,6 +498,7 @@ impl Writer {
             context_names,
             postcode_addresses,
             dictionaries,
+            areas,
             ..
         } = self;
         // Merging the text index's segments is most of the sealing, and on
@@ -515,6 +525,9 @@ impl Writer {
             POSTCODE_ADDRESSES_VERSION,
             &postcode_addresses.to_bytes(),
         )?;
+        if let Some(areas) = areas {
+            areas.finish(&mut pack)?;
+        }
         Ok(Sealing {
             generation,
             scratch,

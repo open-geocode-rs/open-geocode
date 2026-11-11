@@ -11,8 +11,9 @@ use rayon::prelude::*;
 use rstar::{AABB, RTree, RTreeObject};
 
 use crate::{
+    areas::{self, AreaKey, ShapeSource},
     builder::report::BuilderReport,
-    context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext, TierSet},
+    context::{RecordContext, TierSet},
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
@@ -83,6 +84,8 @@ pub(crate) struct BoundaryWay {
 #[derive(Debug)]
 pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
+    /// Each boundary's [`AreaKey::rank`], by its place in `boundaries`.
+    ranks: Vec<u32>,
     tree: RTree<BoundaryBox>,
     shapes: Arc<Shapes>,
 }
@@ -657,11 +660,40 @@ impl BoundaryIndex {
                 boundary_id,
             })
             .collect::<Vec<_>>();
+        let mut order = (0..boundaries.len()).collect::<Vec<_>>();
+        order.sort_by(|&left, &right| rank_order(&boundaries[left], &boundaries[right]));
+        let mut ranks = vec![0; boundaries.len()];
+        for (rank, boundary_id) in order.into_iter().enumerate() {
+            // Context chains hold record ids as u32, so no Pack has more
+            // areas than that.
+            ranks[boundary_id] = u32::try_from(rank).expect("fewer areas than u32::MAX");
+        }
         Self {
             boundaries,
+            ranks,
             tree: RTree::bulk_load(boxes),
             shapes,
         }
+    }
+
+    fn key(&self, boundary_id: usize) -> AreaKey {
+        let boundary = &self.boundaries[boundary_id];
+        AreaKey {
+            record_id: boundary.record_id,
+            layer: boundary.layer,
+            tiers: boundary.tiers,
+            rank: self.ranks[boundary_id],
+            country_record_id: boundary.inferred_country_record_id,
+        }
+    }
+
+    /// The areas for the Pack, so reverse geocoding tests a point against
+    /// the shapes the build tested its records against.
+    pub(crate) fn areas(&self) -> areas::Writer {
+        let areas = (0..self.boundaries.len())
+            .map(|boundary_id| (self.key(boundary_id), self.boundaries[boundary_id].shape))
+            .collect();
+        areas::Writer::new(areas, Arc::clone(&self.shapes) as Arc<dyn ShapeSource>)
     }
 
     pub(crate) fn context_for_point(
@@ -675,53 +707,21 @@ impl BoundaryIndex {
         }
 
         let envelope = AABB::from_point([lon, lat]);
-        let mut covered = Vec::new();
-        for boundary_box in self.tree.locate_in_envelope_intersecting(&envelope) {
-            let boundary = &self.boundaries[boundary_box.boundary_id];
-            if self.shapes.covers(boundary.shape, lon, lat) {
-                covered.push(boundary);
-            }
-        }
-
-        // One pass over the covering boundaries, keeping the best of each
-        // tier, rather than one filtering pass per tier: this runs for every
-        // record of the build, and a pass per tier allocated a vector for
-        // each of the ten even though all but two or three are empty.
-        let mut flags = 0;
-        let mut best: [Option<&AcceptedBoundary>; PlaceLayer::ALL.len()] = Default::default();
-        for boundary in &covered {
-            let slot = &mut best[boundary.layer as usize];
-            match slot {
-                Some(held) => {
-                    flags |= CONTEXT_FLAG_AMBIGUOUS_ADMIN;
-                    if compare_boundary(boundary.layer, boundary, held, source_context).is_lt() {
-                        *slot = Some(boundary);
-                    }
-                }
-                None => *slot = Some(boundary),
-            }
-        }
-
-        // Each tier takes the best boundary ranked into it, and a boundary
-        // that is more than one thing is set under each: it stays one entry
-        // of the chain carrying both tiers.
-        let mut tuple =
-            AdminContextTuple::from_tiers(PlaceLayer::ALL.into_iter().flat_map(|tier| {
-                best[tier as usize].into_iter().flat_map(move |boundary| {
-                    boundary.tiers.iter().map(|at| (at, boundary.record_id))
-                })
-            }));
-        if tuple.country_record_id().is_none()
-            && let Some(country) = best[PlaceLayer::Region as usize]
-                .and_then(|region| region.inferred_country_record_id)
-        {
-            tuple.set(PlaceLayer::Country, country);
-        }
-
-        RecordContext {
-            admin_context: tuple,
-            flags,
-        }
+        let holding = self
+            .tree
+            .locate_in_envelope_intersecting(&envelope)
+            .map(|boundary_box| boundary_box.boundary_id)
+            .filter(|&boundary_id| {
+                self.shapes
+                    .covers(self.boundaries[boundary_id].shape, lon, lat)
+            })
+            .map(|boundary_id| {
+                let boundary = &self.boundaries[boundary_id];
+                let stated = source_value_for_layer(boundary.layer, source_context)
+                    .is_some_and(|value| same_text(value, &boundary.name));
+                (self.key(boundary_id), stated)
+            });
+        areas::chain_of(holding)
     }
 }
 
@@ -1647,30 +1647,15 @@ fn representative_point(geometry: &MultiPolygon<f64>) -> Option<[f64; 2]> {
     geometry.centroid().map(|point| [point.x(), point.y()])
 }
 
-fn compare_boundary(
-    layer: PlaceLayer,
-    left: &AcceptedBoundary,
-    right: &AcceptedBoundary,
-    source_context: &SourceContext<'_>,
-) -> Ordering {
-    let source_value = source_value_for_layer(layer, source_context);
-    let left_match = source_value
-        .map(|value| same_text(value, &left.name))
-        .unwrap_or(false);
-    let right_match = source_value
-        .map(|value| same_text(value, &right.name))
-        .unwrap_or(false);
-
-    // An admin boundary of the layer wins over a place drawn as an area,
-    // which fills the layers admin boundaries leave empty.
-    right_match
-        .cmp(&left_match)
-        .then_with(|| left.admin_level.is_none().cmp(&right.admin_level.is_none()))
-        .then_with(|| {
-            left.area
-                .partial_cmp(&right.area)
-                .unwrap_or(Ordering::Equal)
-        })
+/// How the build ranks the areas of one layer holding a point, once the
+/// names the record states have had their say: an admin boundary of the
+/// layer before a place drawn as an area, which fills the layers admin
+/// boundaries leave empty, then the smallest.
+fn rank_order(left: &AcceptedBoundary, right: &AcceptedBoundary) -> Ordering {
+    left.admin_level
+        .is_none()
+        .cmp(&right.admin_level.is_none())
+        .then_with(|| left.area.total_cmp(&right.area))
         .then_with(|| left.admin_level.cmp(&right.admin_level))
         .then_with(|| {
             source_type_rank(left.source_object_type)
@@ -1948,6 +1933,7 @@ fn object_type_of(code: u8) -> crate::error::Result<ObjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::CONTEXT_FLAG_AMBIGUOUS_ADMIN;
 
     #[test]
     fn exact_polygon_chooses_real_boundary_after_bbox_overlap() {

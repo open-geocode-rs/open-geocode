@@ -4,9 +4,13 @@ use crate::error::Result;
 use serde::Serialize;
 
 use crate::{
+    areas,
+    context::AdminContextTuple,
     labels,
     pack::{self, ContextRecord, RecordId},
-    record::{AddressComponents, AddressRecord, InterpolationAddressComponents, Layer, Record},
+    record::{
+        AddressComponents, AddressRecord, InterpolationAddressComponents, Layer, PlaceLayer, Record,
+    },
     spatial_index,
 };
 
@@ -15,11 +19,24 @@ const INTERPOLATION_RADIUS_M: f64 = 30.0;
 const STREET_RADIUS_M: f64 = 30.0;
 const CONTEXT_RADIUS_M: f64 = 50_000.0;
 const CANDIDATE_LIMIT: usize = 16;
+/// The tiers [`Context`] has a slot for, finest first. A `Sub` tier shares
+/// its record layer with the tier above but is not that tier: the
+/// sub-locality Ville-Haute is no locality of its own.
+const TIERS: [PlaceLayer; 6] = [
+    PlaceLayer::Neighbourhood,
+    PlaceLayer::Locality,
+    PlaceLayer::District,
+    PlaceLayer::Region,
+    PlaceLayer::Country,
+    PlaceLayer::Place,
+];
 
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
     pack: Arc<pack::Reader>,
     spatial: spatial_index::Reader,
+    /// `None` for a Pack built before it kept its areas.
+    areas: Option<areas::Reader>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,7 +149,12 @@ impl PackReverseGeocoder {
     /// Open the spatial index using an existing shared pack reader.
     pub fn from_pack(pack: Arc<pack::Reader>) -> Result<Self> {
         let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
-        Ok(Self { pack, spatial })
+        let areas = areas::Reader::open(pack.container())?;
+        Ok(Self {
+            pack,
+            spatial,
+            areas,
+        })
     }
 
     pub fn reverse(&self, options: GeocodeOptions) -> Result<GeocodeResponse> {
@@ -215,9 +237,10 @@ impl PackReverseGeocoder {
             return Ok(None);
         };
 
-        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+        let chain =
+            self.name_record_areas(candidate.record_id, options, context, context_record_ids)?;
         apply_address_context(context, address);
-        self.enrich_context(options, context, context_record_ids)?;
+        self.enrich_context(options, context, context_record_ids, &chain)?;
 
         Ok(Some(GeocodeResult {
             match_kind: MatchKind::ExplicitAddress,
@@ -258,9 +281,10 @@ impl PackReverseGeocoder {
                 continue;
             };
             let number = interpolation.interpolation.number_at(candidate.fraction);
-            self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+            let chain =
+                self.name_record_areas(candidate.record_id, options, context, context_record_ids)?;
             apply_interpolation_context(context, &interpolation.address);
-            self.enrich_context(options, context, context_record_ids)?;
+            self.enrich_context(options, context, context_record_ids, &chain)?;
             let primary = labels::estimated_address_name(number, &interpolation.address)
                 .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
 
@@ -307,8 +331,9 @@ impl PackReverseGeocoder {
         };
 
         set_if_missing(&mut context.street, street.name.clone());
-        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
-        self.enrich_context(options, context, context_record_ids)?;
+        let chain =
+            self.name_record_areas(candidate.record_id, options, context, context_record_ids)?;
+        self.enrich_context(options, context, context_record_ids, &chain)?;
 
         Ok(Some(GeocodeResult {
             match_kind: MatchKind::NearestStreet,
@@ -350,11 +375,12 @@ impl PackReverseGeocoder {
             return Ok(None);
         };
 
-        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+        let chain =
+            self.name_record_areas(candidate.record_id, options, context, context_record_ids)?;
         if let Some(address) = &poi.address {
             apply_address_context(context, address);
         }
-        self.enrich_context(options, context, context_record_ids)?;
+        self.enrich_context(options, context, context_record_ids, &chain)?;
 
         Ok(Some(GeocodeResult {
             match_kind: MatchKind::Poi,
@@ -383,7 +409,9 @@ impl PackReverseGeocoder {
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
-        self.enrich_context(options, context, context_record_ids)?;
+        let chain = self.held(options)?;
+        self.name_areas(&chain, context, context_record_ids)?;
+        self.enrich_context(options, context, context_record_ids, &chain)?;
         for &record_id in context_record_ids.iter() {
             let Some(record) = self.pack.context_record(record_id)? else {
                 continue;
@@ -391,9 +419,15 @@ impl PackReverseGeocoder {
             if record.layer != layer.as_str() {
                 continue;
             }
+            // A town is labelled with the areas holding it, not with the
+            // neighbourhood the point is in.
+            let label = match tier_of(layer) {
+                Some(tier) => compose_label(&record.name, &coarser(context, tier)),
+                None => compose_label(&record.name, context),
+            };
             return Ok(Some(GeocodeResult {
                 match_kind: MatchKind::ContextOnly,
-                label: compose_label(&record.name, context),
+                label,
                 primary_record_id: Some(record_id),
                 id: Some(record.id),
                 layer: Some(record.layer),
@@ -415,7 +449,9 @@ impl PackReverseGeocoder {
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
-        self.enrich_context(options, context, context_record_ids)?;
+        let chain = self.held(options)?;
+        self.name_areas(&chain, context, context_record_ids)?;
+        self.enrich_context(options, context, context_record_ids, &chain)?;
         let Some(primary_record_id) = context_record_ids.first().copied() else {
             return Ok(None);
         };
@@ -442,11 +478,21 @@ impl PackReverseGeocoder {
         }))
     }
 
+    /// Fill the slots `chain` left empty from the nearest area points within
+    /// reach, each the nearest of its layer.
+    ///
+    /// Inside some area, a point names an area drawn only as a point, and
+    /// only one lying in areas that all hold the point too. The nearest
+    /// point of a layer is otherwise often of an area across a border, or of
+    /// a town whose shape the point is outside of. A village drawn only as a
+    /// point still names the point beside it. A postcode has no shape, so
+    /// its nearest point stands.
     fn enrich_context(
         &self,
         options: GeocodeOptions,
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
+        chain: &AdminContextTuple,
     ) -> Result<()> {
         let mut seen = context_record_ids.iter().copied().collect::<BTreeSet<_>>();
         for candidate in self.spatial.context_candidates(
@@ -459,6 +505,12 @@ impl PackReverseGeocoder {
             if !seen.insert(candidate.record_id) {
                 continue;
             }
+            if !chain.is_empty()
+                && candidate.layer != Layer::Postcode
+                && !self.lies_within(candidate.record_id, chain)?
+            {
+                continue;
+            }
             if let Some(record) = self.pack.context_record(candidate.record_id)?
                 && apply_context_record(context, &record)
             {
@@ -468,24 +520,70 @@ impl PackReverseGeocoder {
         Ok(())
     }
 
-    fn enrich_record_context(
+    /// The chain of the areas holding the point; empty when the Pack keeps
+    /// no areas.
+    fn held(&self, options: GeocodeOptions) -> Result<AdminContextTuple> {
+        match &self.areas {
+            Some(areas) => areas.chain_at(options.lon, options.lat),
+            None => Ok(AdminContextTuple::default()),
+        }
+    }
+
+    /// Whether the record lies in at least one area, and only in areas of
+    /// `chain`. An area keeps no chain of its own, so one whose shape misses
+    /// the point never passes, even when its centre lies outside it.
+    fn lies_within(&self, record_id: RecordId, chain: &AdminContextTuple) -> Result<bool> {
+        let Some(own) = self.pack.boundary_context(record_id)? else {
+            return Ok(false);
+        };
+        let entries = own.admin_context.entries();
+        Ok(!entries.is_empty()
+            && entries.iter().all(|entry| {
+                chain
+                    .entries()
+                    .iter()
+                    .any(|held| held.record_id == entry.record_id)
+            }))
+    }
+
+    /// Name the areas of the record answering at the point: those the build
+    /// found it in, else those holding the point. Returns the chain named.
+    fn name_record_areas(
         &self,
         record_id: RecordId,
+        options: GeocodeOptions,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<AdminContextTuple> {
+        let chain = match self.pack.boundary_context(record_id)? {
+            Some(own) if !own.admin_context.is_empty() => own.admin_context,
+            _ => self.held(options)?,
+        };
+        self.name_areas(&chain, context, context_record_ids)?;
+        Ok(chain)
+    }
+
+    /// Put each area of `chain` in the slot of its tier, finest first, and
+    /// list it once.
+    fn name_areas(
+        &self,
+        chain: &AdminContextTuple,
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<()> {
-        let Some(boundary_context) = self.pack.boundary_context(record_id)? else {
-            return Ok(());
-        };
         let mut seen = context_record_ids.iter().copied().collect::<BTreeSet<_>>();
-        for context_record_id in boundary_context.admin_context.parent_record_ids() {
-            if !seen.insert(context_record_id) {
+        for tier in TIERS {
+            let Some(record_id) = chain.get(tier) else {
                 continue;
-            }
-            if let Some(record) = self.pack.context_record(context_record_id)?
-                && apply_context_record(context, &record)
+            };
+            let Some(record) = self.pack.context_record(record_id)? else {
+                continue;
+            };
+            if let Some(slot) = slot(context, tier)
+                && set_if_missing(slot, record.name)
+                && seen.insert(record_id)
             {
-                context_record_ids.push(context_record_id);
+                context_record_ids.push(record_id);
             }
         }
         Ok(())
@@ -521,6 +619,55 @@ fn apply_context_record(context: &mut Context, record: &ContextRecord) -> bool {
         "place" => set_if_missing(&mut context.place, record.name.clone()),
         _ => false,
     }
+}
+
+fn tier_of(layer: Layer) -> Option<PlaceLayer> {
+    match layer {
+        Layer::Neighbourhood => Some(PlaceLayer::Neighbourhood),
+        Layer::Locality => Some(PlaceLayer::Locality),
+        Layer::District => Some(PlaceLayer::District),
+        Layer::Region => Some(PlaceLayer::Region),
+        Layer::Country => Some(PlaceLayer::Country),
+        Layer::Place => Some(PlaceLayer::Place),
+        Layer::Address | Layer::Interpolation | Layer::Street | Layer::Poi | Layer::Postcode => {
+            None
+        }
+    }
+}
+
+/// The slot of a tier of [`TIERS`]; `None` for a `Sub` tier.
+fn slot(context: &mut Context, tier: PlaceLayer) -> Option<&mut Option<String>> {
+    match tier {
+        PlaceLayer::Neighbourhood => Some(&mut context.neighbourhood),
+        PlaceLayer::Locality => Some(&mut context.locality),
+        PlaceLayer::District => Some(&mut context.district),
+        PlaceLayer::Region => Some(&mut context.region),
+        PlaceLayer::Country => Some(&mut context.country),
+        PlaceLayer::Place => Some(&mut context.place),
+        PlaceLayer::SubRegion
+        | PlaceLayer::SubDistrict
+        | PlaceLayer::SubLocality
+        | PlaceLayer::SubNeighbourhood => None,
+    }
+}
+
+/// The admin areas of `context` that hold an area of `tier`, to label it:
+/// a locality is named with its district and country, not with the
+/// neighbourhood the point is in.
+fn coarser(context: &Context, tier: PlaceLayer) -> Context {
+    let mut held = Context {
+        street: None,
+        postcode: None,
+        ..context.clone()
+    };
+    for finer in TIERS {
+        if (finer >= tier || finer == PlaceLayer::Place)
+            && let Some(slot) = slot(&mut held, finer)
+        {
+            *slot = None;
+        }
+    }
+    held
 }
 
 fn compose_label(primary: &str, context: &Context) -> String {
@@ -705,6 +852,59 @@ mod tests {
 
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
         assert_eq!(result.evidence.context_record_ids, vec![locality_id]);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// A sub-locality's record is of the locality layer, yet it is no
+    /// locality: Ville-Haute is a quarter of the commune of Luxembourg. The
+    /// locality an address names is the commune.
+    #[test]
+    fn a_sub_locality_takes_no_locality_slot() {
+        let temp_dir = temp_pack_dir("sub-locality");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let place = |name: &str, id| PlaceRecord {
+            name: name.to_string(),
+            source: SourceProvenance::osm(ObjectType::Relation, id),
+            ..place_record()
+        };
+        let commune = writer
+            .write(
+                &Record::Place(PlaceLayer::Locality, place("Luxembourg", 407_489)),
+                None,
+            )
+            .expect("commune");
+        let quarter = writer
+            .write(
+                &Record::Place(PlaceLayer::SubLocality, place("Ville-Haute", 533_345)),
+                None,
+            )
+            .expect("quarter");
+        let mut address = address_record();
+        address.address.locality = None;
+        writer
+            .write(
+                &address.into(),
+                Some(RecordContext {
+                    admin_context: AdminContextTuple::from_tiers([
+                        (PlaceLayer::Locality, commune),
+                        (PlaceLayer::SubLocality, quarter),
+                    ]),
+                    flags: 0,
+                }),
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let result = geocoder
+            .reverse(GeocodeOptions::at(-79.0, 43.0))
+            .expect("reverse")
+            .result
+            .expect("result");
+
+        assert_eq!(result.context.locality.as_deref(), Some("Luxembourg"));
+        assert_eq!(result.evidence.context_record_ids, vec![commune]);
 
         let _ = fs::remove_dir_all(temp_dir);
     }
