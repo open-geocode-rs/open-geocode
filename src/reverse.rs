@@ -591,11 +591,6 @@ fn same_text(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use geojson::{Geometry, GeometryValue};
 
     use crate::{
@@ -611,7 +606,7 @@ mod tests {
 
     #[test]
     fn reverse_prefers_explicit_address() {
-        let temp_dir = temp_pack_dir("explicit");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         writer
@@ -628,13 +623,11 @@ mod tests {
         assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
         assert_eq!(result.primary_record_id, Some(1));
         assert_eq!(result.evidence.explicit_address_record_id, Some(1));
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn reverse_estimates_address_from_interpolation() {
-        let temp_dir = temp_pack_dir("interpolation");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(&interpolation_record().into(), None)
@@ -650,13 +643,11 @@ mod tests {
         assert_eq!(result.match_kind, MatchKind::EstimatedAddress);
         assert!(result.label.starts_with("50 Queen Street"));
         assert_eq!(result.evidence.interpolation_record_id, Some(0));
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn reverse_falls_back_to_street() {
-        let temp_dir = temp_pack_dir("street");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         writer.finish().expect("finish");
@@ -670,13 +661,11 @@ mod tests {
         assert_eq!(result.match_kind, MatchKind::NearestStreet);
         assert!(result.label.starts_with("Queen Street"));
         assert_eq!(result.evidence.street_record_id, Some(0));
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn reverse_prefers_materialized_boundary_context_over_source_locality() {
-        let temp_dir = temp_pack_dir("boundary-context");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let locality_id = writer
             .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
@@ -705,24 +694,11 @@ mod tests {
 
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
         assert_eq!(result.evidence.context_record_ids, vec![locality_id]);
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    fn temp_pack_dir(label: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "open-geocode-reverse-{label}-{}-{nanos}",
-            std::process::id()
-        ))
     }
 
     #[test]
     fn reverse_answers_with_the_address_beside_a_poi_not_the_poi() {
-        let temp_dir = temp_pack_dir("poi");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.write(&street_record().into(), None).expect("street");
         // An unaddressed POI on top of the query point is not an address.
@@ -783,13 +759,11 @@ mod tests {
         assert_eq!(result.layer.as_deref(), Some("address"));
         assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
         assert_eq!(result.evidence.explicit_address_record_id, Some(3));
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_layer_answers_with_its_nearest_record_and_lists_no_other_area() {
-        let temp_dir = temp_pack_dir("layer");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let locality_id = writer
             .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
@@ -850,8 +824,6 @@ mod tests {
 
         assert!(at(Layer::Interpolation).is_none());
         assert!(at(Layer::Country).is_none());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     fn address_record() -> AddressRecord {

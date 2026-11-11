@@ -541,13 +541,13 @@ mod tests {
 
     #[test]
     fn reads_the_address_entries_of_the_covered_countries_from_a_collection() {
-        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("dir");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let coverage = Coverage {
             countries: BTreeSet::from(["NZ".to_string()]),
             ..Coverage::default()
         };
-        let files = Collection::new(collection(&dir))
+        let files = Collection::new(collection(dir))
             .files(&coverage)
             .expect("files");
         assert_eq!(
@@ -581,6 +581,5 @@ mod tests {
                 ("3".to_string(), Some("Lambton Quay".to_string())),
             ]
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 }

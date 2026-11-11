@@ -1176,10 +1176,12 @@ mod tests {
         })
     }
 
-    /// Build a Pack holding only records and the spatial index.
-    fn build(records: &[Record]) -> (Reader, Commit) {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
+    /// Build a Pack holding only records and the spatial index, returned
+    /// after the temp directory that holds it. Bound first, the directory
+    /// drops after the mapping. Windows cannot delete a mapped file.
+    fn build(records: &[Record]) -> (tempfile::TempDir, Reader, Commit) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let mut writer = records::Writer::create(&scratch, &crate::memory::Budget::unlimited())
             .expect("records");
@@ -1196,6 +1198,7 @@ mod tests {
         let container = Container::open(&path).expect("open");
         let records = records::Reader::open(&container).expect("records reader");
         (
+            temp,
             Reader::open(&container, records).expect("spatial reader"),
             commit,
         )
@@ -1211,7 +1214,7 @@ mod tests {
                 id,
             ));
         }
-        let (reader, commit) = build(&records);
+        let (_temp, reader, commit) = build(&records);
         assert_eq!(commit.point_count, 1_001);
         assert_eq!(commit.block_count, 1_001_u64.div_ceil(BLOCK_RECORDS));
 
@@ -1280,8 +1283,8 @@ mod tests {
             .enumerate()
             .map(|(index, [lon, lat])| address(*lon, *lat, index as i64))
             .collect::<Vec<_>>();
-        let (postcodes, _) = build(&postcodes);
-        let (addresses, _) = build(&addresses);
+        let (_postcode_dir, postcodes, _) = build(&postcodes);
+        let (_address_dir, addresses, _) = build(&addresses);
         let distances =
             |hits: &[PointCandidate]| hits.iter().map(|hit| hit.distance_m).collect::<Vec<_>>();
         for (lon, lat) in [(-79.4, 43.7), (-79.6, 43.9), (-79.1, 43.5), (-78.0, 43.0)] {
@@ -1317,7 +1320,8 @@ mod tests {
 
     #[test]
     fn finds_points_across_the_antimeridian() {
-        let (reader, _) = build(&[address(179.99995, -44.0, 1), address(-179.99995, -44.0, 2)]);
+        let (_temp, reader, _) =
+            build(&[address(179.99995, -44.0, 1), address(-179.99995, -44.0, 2)]);
         let hits = reader
             .point_candidates(-179.99999, -44.0, Layer::Address, 50.0, 0)
             .expect("hits");
@@ -1329,7 +1333,7 @@ mod tests {
 
     #[test]
     fn indexes_context_points_apart_from_addresses() {
-        let (reader, commit) = build(&[
+        let (_temp, reader, commit) = build(&[
             address(-79.4, 43.6, 1),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".to_string(),
@@ -1367,7 +1371,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Way, object_id),
             })
         };
-        let (reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);
+        let (_temp, reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);
         assert_eq!(commit.line_count, 2);
         let hits = reader
             .segment_candidates(-79.00001, 43.00075, Layer::Street, 5.0, 1)
@@ -1409,7 +1413,7 @@ mod tests {
             representative_point: [-79.0, 43.0005],
             source: SourceProvenance::osm(ObjectType::Way, 1),
         });
-        let (reader, commit) = build(&[street]);
+        let (_temp, reader, commit) = build(&[street]);
         assert_eq!(commit.line_count, 1);
         let hits = reader
             .segment_candidates(-78.99001, 43.0005, Layer::Street, 5.0, 1)

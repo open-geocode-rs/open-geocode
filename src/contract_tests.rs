@@ -71,7 +71,7 @@ async fn committed_openapi_is_the_served_contract() {
         crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert_committed("openapi.json", &document);
 
-    let pack = contract_pack();
+    let (_temp, pack) = contract_pack();
     let router = build_router(
         AppState::open(
             &pack,
@@ -99,7 +99,6 @@ async fn committed_openapi_is_the_served_contract() {
         document,
         "/openapi.json differs from the committed contract"
     );
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// The committed contract survives release-please rewriting its version.
@@ -213,25 +212,18 @@ fn write_the_contract_pack() {
 }
 
 /// A Pack holding the handful of records the examples are built from, in a
-/// directory of its own so tests can run side by side.
-fn contract_pack() -> PathBuf {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-contract-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+/// temp directory of its own so tests can run side by side. The directory
+/// also takes the jobs directory the server keeps beside the Pack.
+fn contract_pack() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pack = temp.path().join("pack");
     write_pack(&pack);
-    pack
+    (temp, pack)
 }
 
 #[tokio::test]
 async fn responses_match_the_committed_examples() {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-contract-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_pack(&pack);
+    let (_temp, pack) = contract_pack();
     let router = build_router(
         AppState::open(
             &pack,
@@ -489,8 +481,6 @@ async fn responses_match_the_committed_examples() {
     let unfiltered = get(&router, "/geocode?q=king").await;
     let filtered = get(&router, "/geocode?q=king&country=CA").await;
     assert_eq!(unfiltered["features"], filtered["features"]);
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// One batch result, its answer kept as the bytes it was sent as.
@@ -511,7 +501,7 @@ struct RawBatch {
 /// a batch alike, byte for byte too.
 #[tokio::test]
 async fn batch_results_are_their_get_answers() {
-    let pack = contract_pack();
+    let (_temp, pack) = contract_pack();
     let router = build_router(
         AppState::open(
             &pack,
@@ -615,8 +605,6 @@ async fn batch_results_are_their_get_answers() {
     let example: Value = serde_json::from_slice(&example).expect("batch is JSON");
     assert_example("batch-geocode", &example);
     batch_schemas_match_the_rendered_body(&example);
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// A `/places` batch answers ids and names side by side, each item in its
@@ -624,7 +612,7 @@ async fn batch_results_are_their_get_answers() {
 /// its item. The batch item limit caps the items and, item by item, the ids.
 #[tokio::test]
 async fn places_batch_answers_ids_and_names_in_order() {
-    let pack = contract_pack();
+    let (_temp, pack) = contract_pack();
     let limits = crate::limits::Limits {
         max_batch_items: std::num::NonZeroUsize::new(3).expect("3"),
         ..crate::limits::Limits::DEFAULT
@@ -729,8 +717,6 @@ async fn places_batch_answers_ids_and_names_in_order() {
     assert_eq!(empty.0, StatusCode::OK);
     let empty: Value = serde_json::from_slice(&empty.1).expect("batch is JSON");
     assert_eq!(empty["results"], json!([]));
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// The batch schemas in the contract are mirrors, like `Problem`'s, so this

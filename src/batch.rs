@@ -1112,8 +1112,8 @@ mod tests {
             },
         };
 
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-batch-{}", uuid::Uuid::new_v4()));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let mut writer = Writer::create(root.join("pack")).expect("writer");
         for (object_id, number, street, lon) in [
             (1, "10", "King Street", -79.40),
@@ -1294,9 +1294,8 @@ mod tests {
 
     #[test]
     fn refuses_to_overwrite_the_input() {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-batch-same-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("dir");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let input = root.join("in.csv");
         let contents = "id,street
 a,10 King Street

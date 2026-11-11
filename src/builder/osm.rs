@@ -3129,15 +3129,6 @@ mod tests {
         *,
     };
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "open-geocode-build-{name}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&dir).expect("dir");
-        dir
-    }
-
     /// A small town: a locality inside a region, addresses, a street, a
     /// building, an interpolation range, and a few objects that must be
     /// rejected. Split over several blocks like a real extract.
@@ -3327,7 +3318,8 @@ mod tests {
     /// router rests on, so scores stay comparable across them.
     #[test]
     fn builds_one_pack_covering_two_extracts() {
-        let dir = temp_dir("two-countries");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let (first, second) = (dir.join("town.osm.pbf"), dir.join("other.osm.pbf"));
         write_pbf(&first, &town());
         write_pbf(&second, &other_country());
@@ -3443,7 +3435,8 @@ mod tests {
 
     #[test]
     fn imports_addresses_and_leaves_out_the_ones_osm_has() {
-        let dir = temp_dir("imported");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let csv = dir.join("addresses.csv");
@@ -3512,7 +3505,6 @@ mod tests {
         assert_eq!(top("16 King Street"), vec!["openaddresses:test:row:2"]);
         assert_eq!(top("10 King Street"), vec!["osm:node:1"]);
         assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// A source's rows lie in the area it names. A row outside is left out;
@@ -3520,7 +3512,8 @@ mod tests {
     /// latitude swapped, is left out whole.
     #[test]
     fn leaves_out_the_rows_of_a_source_outside_its_area() {
-        let dir = temp_dir("outside-area");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let file = |name: &str, rows: &str| {
@@ -3571,7 +3564,6 @@ mod tests {
         );
         let reader = Reader::open(dir.join("pack")).expect("reader");
         assert_eq!(reader.manifest().layer_counts["address"], 5 + 1);
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// A region one of whose rings is left open, as Russia's mainland in
@@ -3579,7 +3571,8 @@ mod tests {
     /// by them, and its rows on the open part are kept.
     #[test]
     fn keeps_a_source_whose_area_left_a_ring_open() {
-        let dir = temp_dir("open-ring-area");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         let mut elements = town();
         elements[1].extend([
@@ -3629,7 +3622,6 @@ mod tests {
         );
         let reader = Reader::open(dir.join("pack")).expect("reader");
         assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// A row naming a house OSM has, placed a few hundred metres away, is
@@ -3637,7 +3629,8 @@ mod tests {
     /// Farther, or in another postcode, it is a house of its own.
     #[test]
     fn keeps_one_record_of_a_house_two_sources_place_apart() {
-        let dir = temp_dir("disputed");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let csv = dir.join("addresses.csv");
@@ -3695,7 +3688,6 @@ mod tests {
             !disputed("openaddresses:test:row:3"),
             "another postcode: another house"
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// One source placing one house at several points a few hundred metres
@@ -3704,7 +3696,8 @@ mod tests {
     /// apart still dispute it.
     #[test]
     fn a_house_one_source_places_apart_is_repeated_not_disputed() {
-        let dir = temp_dir("one-source-apart");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let file = |name: &str, rows: &str| {
@@ -3765,7 +3758,6 @@ mod tests {
             [true],
             "one record of 30, disputed"
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// The first [`addresses::SAMPLE_ROWS`] rows judge a source; rows past
@@ -3773,7 +3765,8 @@ mod tests {
     /// not most; a sample with no point judges nothing.
     #[test]
     fn judges_a_source_by_its_first_rows_alone() {
-        let dir = temp_dir("sample-rows");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let (inside, outside, swapped) = ("-79.45,43.65", "-78.50,43.65", "43.65,-79.45");
@@ -3841,7 +3834,6 @@ mod tests {
                 ("empty", 0, 0, vec![]),
             ]
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// New Zealand writes a flat "UNIT/NUMBER". Read from the plain numbers
@@ -3849,7 +3841,8 @@ mod tests {
     /// number, never standing for house 10.
     #[test]
     fn reads_a_slash_number_as_a_flat_of_its_building() {
-        let dir = temp_dir("slash");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("slash.osm.pbf");
         let address = |id, lon, number: &'static str| {
             node(
@@ -3933,12 +3926,12 @@ mod tests {
             top("1300 Eruera Street"),
             vec!["derived:estimate:1300:osm:node:11:osm:node:13"]
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn builds_a_searchable_reverse_geocodable_pack_from_pbf() {
-        let dir = temp_dir("town");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let report = build(&dir.join("pack"), &input, None);
@@ -4133,7 +4126,8 @@ mod tests {
     /// and a street with an English name.
     #[test]
     fn indexes_every_name_and_accepts_block_scheme_addresses() {
-        let dir = temp_dir("ward");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("ward.osm.pbf");
         write_pbf(
             &input,
@@ -4260,7 +4254,8 @@ mod tests {
     /// area. The address inside them lies in both.
     #[test]
     fn places_drawn_as_areas_are_places_and_context() {
-        let dir = temp_dir("island");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("island.osm.pbf");
         write_pbf(
             &input,
@@ -4422,7 +4417,8 @@ mod tests {
 
     #[test]
     fn builds_named_pois_findable_by_name_locality_and_address() {
-        let dir = temp_dir("pois");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town_with_pois());
         let report = build(&dir.join("pack"), &input, None);
@@ -4549,7 +4545,8 @@ mod tests {
 
     #[test]
     fn one_cafe_mapped_twice_is_one_place_found_by_either_id() {
-        let dir = temp_dir("one-place");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("cafes.osm.pbf");
         let cafe = [("name", "Cafetaria De Pindol"), ("amenity", "cafe")];
         // Its building, its point inside it with its address, and a cafe of
@@ -4615,7 +4612,8 @@ mod tests {
 
     #[test]
     fn a_place_drawn_as_a_multipolygon_is_a_place_inside_its_outline() {
-        let dir = temp_dir("place-relations");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("stadium.osm.pbf");
         // Plain centre lies in the hole.
         let nodes = vec![
@@ -4674,7 +4672,8 @@ mod tests {
 
     #[test]
     fn a_place_is_found_by_its_brand_and_codes_and_drops_are_counted() {
-        let dir = temp_dir("brands");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("brands.osm.pbf");
         write_pbf(
             &input,
@@ -4751,7 +4750,8 @@ mod tests {
 
     #[test]
     fn a_place_whose_wikidata_item_is_read_more_ranks_first() {
-        let dir = temp_dir("qrank");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("cafes.osm.pbf");
         let cafe = |id: i64, item: &'static str| {
             node(
@@ -4803,7 +4803,8 @@ mod tests {
 
     #[test]
     fn joins_the_ways_of_a_street_and_labels_it_with_its_town() {
-        let dir = temp_dir("street-join");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("streets.osm.pbf");
         let square = |first: i64, low: f64, high: f64| {
             [
@@ -4926,12 +4927,12 @@ mod tests {
         assert_eq!(found(703), ["osm:way:703"], "the far road stays its own");
         assert_eq!(found(711), ["osm:way:710"]);
         assert!(found(720).is_empty(), "a platform is no street");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn spilling_to_disk_builds_the_same_pack() {
-        let dir = temp_dir("spill");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town_with_pois());
         let in_memory = build(&dir.join("memory"), &input, None);
@@ -5011,7 +5012,8 @@ mod tests {
 
     #[test]
     fn a_build_past_its_scratch_budget_stops_early_and_says_why() {
-        let dir = temp_dir("scratch-budget");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town_with_pois());
         let options = BuildOsmOptions {
@@ -5040,12 +5042,12 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("--scratch-budget-mb"), "{message}");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn rejects_inputs_whose_nodes_are_not_sorted() {
-        let dir = temp_dir("unsorted");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("unsorted.osm.pbf");
         write_pbf(
             &input,
@@ -5098,7 +5100,8 @@ mod tests {
 
     #[test]
     fn tells_the_observer_every_stage_in_order_with_its_work() {
-        let dir = temp_dir("observed");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let recorder = Arc::new(Recorder::default());
@@ -5159,7 +5162,8 @@ mod tests {
 
     #[test]
     fn a_cancelled_build_publishes_nothing() {
-        let dir = temp_dir("cancelled");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town());
         let error = build_osm_pack(&BuildOsmOptions {
@@ -5318,10 +5322,11 @@ mod tests {
     /// every sorter builds the same Pack.
     #[test]
     fn imported_rows_repeat_dispute_and_lend_by_their_place_in_the_address_book() {
-        let dir = temp_dir("address-book");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let input = dir.join("flats.osm.pbf");
         write_pbf(&input, &flats());
-        let files = flat_rows(&dir);
+        let files = flat_rows(dir);
         let in_memory = pack_contents(&dir.join("memory"), &[&input], files.clone(), None);
         let spilled = pack_contents(&dir.join("spilled"), &[&input], files.clone(), Some(4));
         assert_eq!(in_memory, spilled);
@@ -5397,7 +5402,6 @@ mod tests {
                 "{unlent}: the row stating 3020 repeats OSM's 7 Tui Road"
             );
         }
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// Every record and the context of each, in Pack order.
@@ -5459,11 +5463,12 @@ mod tests {
     #[test]
     fn a_build_resumed_after_any_step_makes_the_same_pack() {
         for budget in [Some(4), None] {
-            let dir = temp_dir("resume");
+            let temp = tempfile::tempdir().expect("temp dir");
+            let dir = temp.path();
             let options = BuildOsmOptions {
                 memory_budget_bytes: budget,
                 force: budget.is_some(),
-                ..resumable_inputs(&dir)
+                ..resumable_inputs(dir)
             };
             let whole = build_osm_pack(&BuildOsmOptions {
                 pack: dir.join("whole"),
@@ -5538,16 +5543,16 @@ mod tests {
                 resumed.parser_training.trained,
                 whole.parser_training.trained
             );
-            let _ = fs::remove_dir_all(dir);
         }
     }
 
     #[test]
     fn a_stopped_build_is_reported_and_refuses_changed_inputs() {
-        let dir = temp_dir("resume-refused");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let options = BuildOsmOptions {
             pack: dir.join("pack"),
-            ..resumable_inputs(&dir)
+            ..resumable_inputs(dir)
         };
         fail_before(&options, Step::Contexts);
 
@@ -5584,6 +5589,5 @@ mod tests {
             .expect("generations")
             .count();
         assert_eq!(generations, 1, "the stopped build's generation is gone");
-        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -2677,9 +2677,15 @@ mod tests {
         records
     }
 
-    fn write_store(records: &[Record], contexts: &[Option<ContextRef>]) -> Reader {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-records-{}", uuid::Uuid::new_v4()));
+    /// The store, returned after the temp directory that holds its file.
+    /// Bound first, the directory drops after the mapping. Windows cannot
+    /// delete a mapped file.
+    fn write_store(
+        records: &[Record],
+        contexts: &[Option<ContextRef>],
+    ) -> (tempfile::TempDir, Reader) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let mut writer = Writer::create(&scratch, &Budget::unlimited()).expect("writer");
         for (index, record) in records.iter().enumerate() {
@@ -2692,13 +2698,14 @@ mod tests {
         let mut pack = container::Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
-        Reader::open(&Container::open(&path).expect("open")).expect("reader")
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
+        (temp, reader)
     }
 
     #[test]
     fn round_trips_every_layer_and_matches_summaries() {
         let records = sample_records();
-        let reader = write_store(&records, &[]);
+        let (_temp, reader) = write_store(&records, &[]);
         assert_eq!(reader.record_count(), records.len() as u64);
         for (id, record) in records.iter().enumerate() {
             let id = id as u64;
@@ -2783,8 +2790,8 @@ mod tests {
 
     #[test]
     fn string_dictionary_is_bounded_by_the_segment() {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-segments-{}", uuid::Uuid::new_v4()));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let budget = Budget::unlimited();
         let mut writer = Writer::create(&scratch, &budget)
@@ -2822,8 +2829,8 @@ mod tests {
 
     #[test]
     fn string_dictionary_stays_within_its_share_of_a_small_budget() {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-dictionary-{}", uuid::Uuid::new_v4()));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let budget = Budget::new(64 << 20);
         let mut writer = Writer::create(&scratch, &budget).expect("writer");
@@ -2880,7 +2887,7 @@ mod tests {
                 ambiguous: index % 2 == 0,
             }));
         }
-        let reader = write_store(&records, &contexts);
+        let (_temp, reader) = write_store(&records, &contexts);
         for (index, record) in records.iter().enumerate() {
             assert_eq!(&reader.record(index as u64).expect("record"), record);
             assert_eq!(
@@ -2951,7 +2958,7 @@ mod tests {
             records.push(record);
             contexts.push(context);
         }
-        let reader = write_store(&records, &contexts);
+        let (_temp, reader) = write_store(&records, &contexts);
         let mut scanned = Vec::new();
         for block in 0..reader.block_count() {
             reader
@@ -3028,7 +3035,7 @@ mod tests {
             }
             records.push(record);
         }
-        let reader = write_store(&records, &[]);
+        let (_temp, reader) = write_store(&records, &[]);
         for (index, record) in records.iter().enumerate() {
             let id = index as u64;
             assert_eq!(&reader.record(id).expect("record"), record, "record {id}");
@@ -3049,7 +3056,7 @@ mod tests {
     fn line_geometry_follows_the_summary_fields() {
         let mut records = sample_records();
         records.truncate(2);
-        let reader = write_store(&records, &[]);
+        let (_temp, reader) = write_store(&records, &[]);
         let entry = reader.body(1).expect("body");
         let (header, fields) = (entry.header, entry.fields);
         let mut cursor = fields;

@@ -9057,8 +9057,7 @@ mod tests {
 
     #[test]
     fn equal_scores_prefer_the_closest_label_then_points_then_lower_ids() {
-        let temp_dir = temp_pack_path("search-ties");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut prince =
@@ -9092,14 +9091,11 @@ mod tests {
             .map(|hit| hit.record.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["osm:node:5", "osm:node:7", "osm:way:9"]);
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn equal_hits_prefer_an_address_no_source_disputes() {
-        let temp_dir = temp_pack_path("search-disputed");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut disputed = address_record("osm:node:5", "", "342", "Albert Street", None, None);
         disputed.disputed = true;
@@ -9116,15 +9112,13 @@ mod tests {
             top_ids(&searcher, "342 Albert Street"),
             vec!["osm:node:7", "osm:node:5"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn answers_carry_a_confidence_only_from_a_calibrated_pack() {
         use crate::confidence::{FEATURES, Model};
 
-        let temp_dir = temp_pack_path("search-confidence");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for record in [
             address_record("osm:node:1", "", "10", "King Street", None, Some("M5V 1A1")),
@@ -9191,8 +9185,7 @@ mod tests {
         assert!(suggestions.iter().all(|hit| hit.features.prefix));
 
         // A model fit to another Pack is refused, not misread.
-        let other = temp_pack_path("search-confidence-other");
-        let _ = std::fs::remove_dir_all(&other);
+        let other = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&other).expect("writer");
         writer
             .write(&street_record("osm:way:9", "Queen Street").into(), None)
@@ -9205,8 +9198,6 @@ mod tests {
         )
         .expect("copy");
         assert!(TextSearcher::open(&other).is_err());
-        let _ = std::fs::remove_dir_all(other);
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     fn search_near(
@@ -9233,8 +9224,7 @@ mod tests {
 
     #[test]
     fn a_focus_breaks_ties_toward_the_caller_and_nothing_else() {
-        let temp_dir = temp_pack_path("search-focus");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         // Forty streets of one name the query cannot tell apart, more than
         // the rank window holds for one hit, the nearest written last.
@@ -9270,15 +9260,13 @@ mod tests {
             "osm:node:2",
             "a focus never outranks a better match"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn of_equal_scores_the_window_keeps_the_closest_name_then_the_larger_place() {
         use crate::record::{PlaceLayer, PlaceRecord, Record};
 
-        let temp_dir = temp_pack_path("search-window-ties");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         // More roads of the name than the rank window holds, written first,
         // so a window that kept any of the tie would keep only roads.
@@ -9326,7 +9314,6 @@ mod tests {
             "the town, then the hamlet, before any road"
         );
         assert_eq!(top_ids(&searcher, "Queen Street")[0], "osm:way:202");
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -9337,8 +9324,7 @@ mod tests {
             record::{PlaceLayer, PlaceRecord, Record},
         };
 
-        let temp_dir = temp_pack_path("search-loose-areas");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut locality = |name: &str, object_id: i64| {
             writer
@@ -9453,13 +9439,11 @@ mod tests {
             )[0],
             "osm:way:1"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_bounding_box_keeps_only_the_records_inside_it() {
-        let temp_dir = temp_pack_path("search-bbox");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         // One street group whose addresses run across the box's east edge,
         // and the same street name far away.
@@ -9518,7 +9502,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["osm:node:2"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     fn geocode(
@@ -9543,8 +9526,7 @@ mod tests {
 
     #[test]
     fn geocode_rejects_hits_in_a_different_postcode() {
-        let temp_dir = temp_pack_path("geocode-postcode");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
@@ -9569,13 +9551,11 @@ mod tests {
             geocode(&searcher, "10 King Street", None, Some("M5V")).as_deref(),
             Some("osm:node:1")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn geocode_filters_hits_ranked_beyond_the_requested_limit() {
-        let temp_dir = temp_pack_path("geocode-filter-before-limit");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         // Twelve identical streets without a postcode tie with, and sort ahead
         // of, the one inside the requested postcode area. Only the postcode
@@ -9619,13 +9599,11 @@ mod tests {
                 .map(|hit| hit.hit.record.id);
             assert_eq!(hit.as_deref(), Some("osm:node:99"), "limit {limit}");
         }
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn geocode_ranks_hits_by_distance_from_the_named_postcode() {
-        let temp_dir = temp_pack_path("geocode-postcode-distance");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut write_postcode = |postcode: &str, lon: f64| {
             writer
@@ -9686,13 +9664,11 @@ mod tests {
             .expect("geocode")
             .map(|hit| hit.hit.record.id);
         assert_eq!(hit.as_deref(), Some("osm:node:99"));
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn geocode_infers_the_postcode_area_of_hits_without_one() {
-        let temp_dir = temp_pack_path("geocode-inferred-postcode");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         // An address without addr:postcode, inside postcode area K0J.
         let mut cobden = address_record("osm:node:1", "", "44", "Gould Street", None, None);
@@ -9729,7 +9705,6 @@ mod tests {
             geocode(&searcher, "7 Far Road", None, Some("M5V 1A1")).as_deref(),
             Some("osm:node:2")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -9747,8 +9722,7 @@ mod tests {
             ("NZ", "2113", 174.980, -37.120),
         ];
         for (country, lon, lat) in [("NZ", 174.945, -37.066), ("AU", 151.151, -33.831)] {
-            let temp_dir = temp_pack_path(&format!("geocode-postcode-shared-{country}"));
-            let _ = std::fs::remove_dir_all(&temp_dir);
+            let temp_dir = tempfile::tempdir().expect("temp dir");
             let mut writer = Writer::create(&temp_dir).expect("writer");
             for (code_country, code, code_lon, code_lat) in codes {
                 writer
@@ -9787,7 +9761,6 @@ mod tests {
                 Some(format!("derived:osm:postcode:{other}:{foreign}")),
                 "{foreign} contradicts the {country} address"
             );
-            let _ = std::fs::remove_dir_all(temp_dir);
         }
     }
 
@@ -9796,8 +9769,7 @@ mod tests {
     /// decides, and the house in that postcode's neighbourhood wins.
     #[test]
     fn a_house_between_its_streets_postcodes_lies_in_the_one_asked_for() {
-        let temp_dir = temp_pack_path("search-postcode-between");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (code, lon) in [
             ("M4M 1L2", -79.3330),
@@ -9841,13 +9813,11 @@ mod tests {
                 "limit {limit}"
             );
         }
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn geocode_accepts_hits_near_a_busier_neighbouring_postcode_area() {
-        let temp_dir = temp_pack_path("geocode-postcode-border");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut border = address_record("osm:node:1", "", "5", "Line Road", None, None);
         border.geometry = point_geometry(-79.0, 43.0);
@@ -9886,7 +9856,6 @@ mod tests {
             geocode(&searcher, "5 Line Road", None, Some("C3C 3C3")),
             None
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -9897,8 +9866,7 @@ mod tests {
             record::{PlaceLayer, PlaceRecord, Record},
         };
 
-        let temp_dir = temp_pack_path("geocode-variants");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut locality = |name: &str, object_id: i64| {
             writer
@@ -9955,7 +9923,6 @@ mod tests {
             geocode(&searcher, "10 King St W", Some("Toronto"), None).as_deref(),
             Some("osm:node:2")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -9966,8 +9933,7 @@ mod tests {
             record::{PlaceLayer, PlaceRecord, PoiRecord, Record},
         };
 
-        let temp_dir = temp_pack_path("search-poi-repeats");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let township = writer
             .write(
@@ -10059,15 +10025,13 @@ mod tests {
         let place = |query: &str| top_ids(&places, query)[0].clone();
         assert_eq!(place("Walmer Road Parkette"), "osm:node:4");
         assert_eq!(place("Fire Station, Muskoka Lakes Township"), "osm:node:2");
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// A Pack of one street: a POI named after the street, a shop at one of
     /// its addresses and a bakery off it.
     #[test]
     fn address_search_answers_no_poi_and_place_search_finds_them() {
-        let temp_dir = temp_pack_path("search-addresses-beat-pois");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut street = street_record("osm:way:1", "Walmer Road");
         street.geometry = queen_street_line();
@@ -10141,7 +10105,6 @@ mod tests {
             layers_of(&places, "Walmer Road Variety")[0].0,
             "osm:node:10"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// More records of one name than the tie window holds: the best known
@@ -10149,8 +10112,7 @@ mod tests {
     /// index.
     #[test]
     fn the_best_known_of_many_same_named_places_wins() {
-        let temp_dir = temp_pack_path("search-place-prominence");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let known = Prominence {
             importance: 160,
@@ -10211,7 +10173,6 @@ mod tests {
             ["osm:node:9999", "osm:node:1"]
         );
         assert_eq!(top_ids(&searcher.places(), "Paris")[0], "osm:node:9998");
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// A place the query names by any of its names leads, nearest the
@@ -10220,8 +10181,8 @@ mod tests {
     /// and a street of the name never takes the lead for fame it has none of.
     #[test]
     fn a_place_named_by_any_of_its_names_leads_by_fame() {
-        let pack = TempPack::new("search-place-any-name");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = tempfile::tempdir().expect("temp dir");
+        let mut writer = Writer::create(&pack).expect("writer");
         let fame = |importance| Prominence {
             importance,
             linked: true,
@@ -10287,7 +10248,7 @@ mod tests {
             writer.write(&record, None).expect("record");
         }
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let searcher = TextSearcher::open(&pack).expect("searcher");
 
         assert_eq!(
             top_ids(&searcher, "Rome")[..2],
@@ -10317,8 +10278,8 @@ mod tests {
     /// and a way, answers once, and an alternate name finds it.
     #[test]
     fn a_poi_mapped_twice_answers_once() {
-        let pack = TempPack::new("search-poi-one-item");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = tempfile::tempdir().expect("temp dir");
+        let mut writer = Writer::create(&pack).expect("writer");
         let colosseo = |object_type, object_id, wikidata| {
             Record::from(PoiRecord {
                 alt_names: vec!["Colosseum".to_string()],
@@ -10346,7 +10307,7 @@ mod tests {
             writer.write(&record, None).expect("poi");
         }
         writer.finish().expect("finish");
-        let places = TextSearcher::open(&pack.0).expect("searcher").places();
+        let places = TextSearcher::open(&pack).expect("searcher").places();
         assert_eq!(top_ids(&places, "Colosseum"), ["osm:node:1", "osm:node:3"]);
     }
 
@@ -10354,8 +10315,7 @@ mod tests {
     /// show better known first, never ahead of an address it ties with.
     #[test]
     fn equal_pois_prefer_the_better_known() {
-        let temp_dir = temp_pack_path("search-poi-prominence");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let cafe = |object_id, prominence| PoiRecord {
             alt_names: Vec::new(),
@@ -10397,7 +10357,6 @@ mod tests {
             top_ids(&searcher, "Blue Door"),
             ["osm:node:3", "osm:node:2", "osm:node:1"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
 
         // At a full tie a record of another layer stays ahead of a POI,
         // however well known.
@@ -10502,8 +10461,7 @@ mod tests {
 
     #[test]
     fn search_reports_queries_that_cannot_be_parsed() {
-        let temp_dir = temp_pack_path("search-parse-error");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
@@ -10525,13 +10483,11 @@ mod tests {
             })
             .expect_err("unparseable query");
         assert!(matches!(error, Error::UnparsableQuery { .. }));
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn searches_and_hydrates_records_from_pack() {
-        let temp_dir = temp_pack_path("search-hydrates");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10580,14 +10536,11 @@ mod tests {
         assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.id, "osm:node:1");
         assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn filters_hits_by_layer() {
-        let temp_dir = temp_pack_path("search-layer");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10624,14 +10577,11 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 1);
         assert_eq!(hits[0].record.layer, "street");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn searches_postcode_text() {
-        let temp_dir = temp_pack_path("search-postcode");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10663,14 +10613,11 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.layer, "postcode");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn autocompletes_prefixes_and_hydrates_records_from_pack() {
-        let temp_dir = temp_pack_path("autocomplete-prefix");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10718,14 +10665,11 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn autocompletes_multi_token_prefixes() {
-        let temp_dir = temp_pack_path("autocomplete-multi-token");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10758,14 +10702,11 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 0);
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn autocompletes_with_layer_filter() {
-        let temp_dir = temp_pack_path("autocomplete-layer");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10802,14 +10743,11 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 1);
         assert_eq!(hits[0].record.layer, "street");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn autocompletes_postcode_but_not_standalone_house_number_prefixes() {
-        let temp_dir = temp_pack_path("autocomplete-postcode-house-number");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10853,14 +10791,11 @@ mod tests {
         assert_eq!(postcode_hits.len(), 1);
         assert!(number_hits.is_empty());
         assert_eq!(postcode_hits[0].record_id, 0);
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn autocompletes_house_number_with_street_prefix() {
-        let temp_dir = temp_pack_path("autocomplete-number-street-prefix");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10893,14 +10828,11 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, 0);
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn autocomplete_ignores_blank_and_short_queries() {
-        let temp_dir = temp_pack_path("autocomplete-short");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
@@ -10960,8 +10892,6 @@ mod tests {
                 .expect("two character autocomplete")
                 .is_empty()
         );
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     fn top_ids(searcher: &TextSearcher, query: &str) -> Vec<String> {
@@ -10992,8 +10922,7 @@ mod tests {
 
     #[test]
     fn a_street_stands_in_only_for_a_house_number_no_record_has() {
-        let temp_dir = temp_pack_path("search-lenient");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
@@ -11020,13 +10949,11 @@ mod tests {
             geocode(&searcher, "99 King Street", None, Some("M5V 1A1")),
             None
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_long_word_with_its_second_and_third_letters_swapped_is_one_typo() {
-        let temp_dir = temp_pack_path("search-swapped-letters");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
@@ -11050,13 +10977,11 @@ mod tests {
                 .map(String::as_str),
             Some("osm:node:1")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn an_abbreviated_street_type_ranks_the_street_of_that_type_first() {
-        let temp_dir = temp_pack_path("search-street-type-abbreviation");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, street) in [
             ("osm:node:1", "Highfield Way"),
@@ -11081,13 +11006,11 @@ mod tests {
                 .map(String::as_str),
             Some("osm:node:2")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn the_street_the_query_names_beats_one_with_more_words() {
-        let temp_dir = temp_pack_path("search-exact-street-name");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut flat = address_record("osm:node:1", "", "45", "Lomond Crescent", None, None);
         flat.address.unit = Some("2".to_string());
@@ -11125,7 +11048,6 @@ mod tests {
                 .map(String::as_str),
             Some("osm:node:3")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -11134,8 +11056,7 @@ mod tests {
             InterpolationAddressComponents, InterpolationRange, InterpolationRecord,
         };
 
-        let temp_dir = temp_pack_path("search-tiers");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut street = street_record("osm:way:30", "Queen Street");
         street.geometry = queen_street_line();
@@ -11205,7 +11126,6 @@ mod tests {
 
         // An odd number is not on an even range: only the street is left.
         assert_eq!(top_ids(&searcher, "51 Queen Street"), vec!["osm:way:30"]);
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -11219,8 +11139,7 @@ mod tests {
             },
         };
 
-        let temp_dir = temp_pack_path("search-localities");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut locality = |name: &str, object_id: i64| {
             writer
@@ -11372,13 +11291,11 @@ mod tests {
             top_ids(&searcher, "5 Ontario St, St. Catharines"),
             vec!["osm:node:6"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_postcode_ranks_records_by_how_much_of_it_they_share() {
-        let temp_dir = temp_pack_path("search-postcode-rank");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.set_postcode_areas(PostcodeAreas::new([(
             "A1A 1A1".to_string(),
@@ -11416,7 +11333,6 @@ mod tests {
         let mut ids = top_ids(&searcher, "5 Main Street, Z9Z 9Z9");
         ids.sort();
         assert_eq!(ids, vec!["osm:node:1", "osm:node:2", "osm:node:3"]);
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// A stated house number in the wrong postcode used to win the strict
@@ -11424,8 +11340,7 @@ mod tests {
     /// right street never ran.
     #[test]
     fn a_hit_contradicting_the_stated_postcode_does_not_end_the_search() {
-        let temp_dir = temp_pack_path("search-postcode-rejects-strict");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         // The number exists, but only in the wrong postcode.
         let mut elsewhere =
@@ -11447,7 +11362,6 @@ mod tests {
         );
         // A query that states no postcode still reaches it.
         assert!(top_ids(&searcher, "8 High Street").contains(&"osm:node:1".to_string()));
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -11456,8 +11370,7 @@ mod tests {
             InterpolationAddressComponents, InterpolationRange, InterpolationRecord,
         };
 
-        let temp_dir = temp_pack_path("search-rank-order");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer.set_postcode_areas(PostcodeAreas::new([
             ("M5C 1A1".to_string(), [-79.0, 43.0005]),
@@ -11530,7 +11443,6 @@ mod tests {
             top_ids(&searcher, "7 Elm St, Atlantis, M5C 1A1"),
             vec!["osm:node:4", "osm:way:30"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     fn line(lon: f64, lats: [f64; 2]) -> geojson::Geometry {
@@ -11541,8 +11453,7 @@ mod tests {
 
     #[test]
     fn a_missing_number_is_placed_between_its_stated_neighbours() {
-        let temp_dir = temp_pack_path("search-neighbours");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut street = |id: &str, name: &str, lon: f64| {
             let mut street = street_record(id, name);
@@ -11607,13 +11518,11 @@ mod tests {
         );
         // 81 and 91 are on different Victoria Streets.
         assert_eq!(top("85 Victoria St").layer, "street");
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn geocoding_no_number_names_no_house() {
-        let temp_dir = temp_pack_path("geocode-no-number");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, number) in [("osm:node:1", "1"), ("osm:node:2", "3")] {
             writer
@@ -11630,13 +11539,11 @@ mod tests {
         // the query never named.
         assert_eq!(top_ids(&searcher, "Elizabeth Street")[0], "osm:node:1");
         assert_eq!(geocode(&searcher, "Elizabeth Street", None, None), None);
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_house_number_needs_its_street_not_a_name() {
-        let temp_dir = temp_pack_path("search-number-street");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let dental = address_record(
             "osm:node:1",
@@ -11699,7 +11606,6 @@ mod tests {
             vec!["osm:node:1"],
             "the dentist's address is its street's"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// Tokens labelled as the parser labels them, written `word/label`.
@@ -11997,8 +11903,7 @@ mod tests {
 
     #[test]
     fn searches_written_house_numbers_then_the_number_they_start_with() {
-        let temp_dir = temp_pack_path("search-house-number-forms");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, number, street) in [
             ("osm:node:1", "1384 1/2", "Queen Street East"),
@@ -12025,13 +11930,11 @@ mod tests {
             top_ids(&searcher, "8 The Donway E, Unit-B"),
             vec!["osm:node:6"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn finds_each_address_of_a_street_group_by_its_number_and_unit() {
-        let temp_dir = temp_pack_path("search-street-group");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut records = Vec::new();
         for (index, number) in ["1", "3", "5", "5", "5A", "7", "9;11", "13"]
@@ -12098,7 +12001,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["osm:node:8"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -12109,8 +12011,7 @@ mod tests {
             record::{PlaceLayer, PlaceRecord, Record},
         };
 
-        let temp_dir = temp_pack_path("geocode-community");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let huron_east = writer
             .write(
@@ -12175,7 +12076,6 @@ mod tests {
             geocode(&searcher, "18 Main Street South", Some("Goderich"), None),
             None
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -12186,8 +12086,7 @@ mod tests {
             record::{PlaceLayer, PlaceRecord, Record},
         };
 
-        let temp_dir = temp_pack_path("geocode-areas");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let mut area = |layer: PlaceLayer, name: &str, object_id: i64| {
             writer
@@ -12280,7 +12179,6 @@ mod tests {
             geocode(&searcher, "123 Crummer Road", Some("Ponsonby"), None),
             None
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// One labelled reading of a query, searched as one reading of
@@ -12397,8 +12295,7 @@ mod tests {
     fn a_stated_country_or_region_the_pack_knows_removes_a_record_elsewhere() {
         use crate::record::PlaceLayer::{Country, Locality, Region};
 
-        let temp_dir = temp_pack_path("search-countries");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let at = [-83.2, 35.05];
         let us = place(
@@ -12599,15 +12496,13 @@ mod tests {
                 .is_empty(),
             "a town the Pack does not know is no answer"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_postal_town_or_a_settlement_point_nearby_agrees_with_a_record_outside_it() {
         use crate::record::PlaceLayer::{District, Locality, Neighbourhood};
 
-        let temp_dir = temp_pack_path("search-postal-towns");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let franconia_at = [-77.15, 38.78];
         let franconia = place(
@@ -12755,15 +12650,13 @@ mod tests {
             )
             .is_empty()
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_locality_run_is_read_as_the_places_named_in_it() {
         use crate::record::PlaceLayer::{Locality, Neighbourhood};
 
-        let temp_dir = temp_pack_path("search-locality-runs");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let at = [10.6, 47.03];
         let serfaus = place(
@@ -12876,13 +12769,11 @@ mod tests {
             ),
             ["osm:node:13"]
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_street_whose_direction_or_type_contradicts_the_query_ranks_after() {
-        let temp_dir = temp_pack_path("search-descriptors");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         writer
             .write(
@@ -12948,7 +12839,6 @@ mod tests {
             )[0],
             "osm:way:22"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// A place search answers first with the places whose names hold every
@@ -12956,8 +12846,7 @@ mod tests {
     /// the address reading of the query takes the words.
     #[test]
     fn a_place_search_answers_with_the_places_so_named_the_best_known_first() {
-        let temp_dir = temp_pack_path("search-places-by-name");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let place = |id: i64, name: &str, importance: u8, lon: f64| PoiRecord {
             alt_names: if name == "Luchthaven Schiphol" {
@@ -13011,15 +12900,13 @@ mod tests {
             "osm:node:5",
             "an exact other name of the better known"
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// Two streets whose names differ only by the type glued onto them key
     /// alike, and are two streets: the one of the type written answers.
     #[test]
     fn a_street_whose_glued_type_contradicts_the_query_ranks_after() {
-        let temp_dir = temp_pack_path("search-glued-types");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, street, lon) in [
             ("osm:node:1", "Wilderinksstraat", 6.7930),
@@ -13046,13 +12933,11 @@ mod tests {
             );
             assert_eq!(tagged[0], id, "{street}: {tagged:?}");
         }
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn noise_around_an_address_leaves_the_address() {
-        let temp_dir = temp_pack_path("search-noise");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for record in [
             address_record(
@@ -13182,7 +13067,6 @@ mod tests {
             .expect("search");
         assert_eq!(hits[0].record.id, "osm:node:13");
         assert_eq!(typo_distance("\u{fffd}tretat", "etretat"), Some(1));
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     /// The rule #36 rests on: a known locality that disagrees still rejects,
@@ -13191,8 +13075,7 @@ mod tests {
     fn a_known_town_the_record_is_not_in_rejects_it() {
         use crate::record::PlaceLayer::{Locality, Neighbourhood, Region};
 
-        let temp_dir = temp_pack_path("search-ponsonby");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         let (auckland_at, wellington_at, christchurch_at) =
             ([174.76, -36.85], [174.776, -41.286], [172.63, -43.53]);
@@ -13316,13 +13199,11 @@ mod tests {
             ["osm:relation:6"]
         );
         assert!(fallback[0].fallback);
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn the_structured_stage_answers_as_the_text_search_does() {
-        let temp_dir = temp_pack_path("search-structured-stage");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, number, street, town, postcode, at) in [
             (
@@ -13441,13 +13322,11 @@ mod tests {
         let query = "10 Queen Street Toronto K1P 5G4";
         let found = ids(&structured, query);
         assert_eq!(found, ids(&plain, query));
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn a_stated_postcode_outweighs_a_town_the_answer_is_not_in() {
-        let temp_dir = temp_pack_path("search-postcode-over-town");
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut writer = Writer::create(&temp_dir).expect("writer");
         for (id, number, street, town, postcode, at) in [
             (
@@ -13514,29 +13393,6 @@ mod tests {
         let found = ids(&structured, query);
         assert!(!LAST_STRUCTURED.with(Cell::get).answered);
         assert_eq!(found, ids(&plain, query));
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    /// A temporary Pack directory, removed when it goes out of scope, a
-    /// failed assertion included.
-    struct TempPack(std::path::PathBuf);
-
-    impl TempPack {
-        fn new(name: &str) -> Self {
-            let path = temp_pack_path(name);
-            let _ = std::fs::remove_dir_all(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempPack {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_pack_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-{name}-{}", std::process::id()))
     }
 
     fn address_record(
