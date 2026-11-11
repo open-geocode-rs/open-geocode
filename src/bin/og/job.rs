@@ -439,8 +439,8 @@ fn run(
         let url = &input.region.osm.url;
         let (download_step, check_step) = (offset, offset + 1);
         progress.start(download_step, Some(input.region.osm.bytes));
-        let expected = net::published_md5(url)?;
-        let partial = net::download(url, &input.extract, cancel, |done, total| {
+        let published = net::published(url)?;
+        let partial = net::download(&published, &input.extract, cancel, |done, total| {
             if let Some(total) = total {
                 progress.steps.lock().expect("steps lock")[download_step].total = Some(total);
             }
@@ -449,7 +449,7 @@ fn run(
         progress.finish(download_step);
         let bytes = fs::metadata(&partial)?.len();
         progress.start(check_step, Some(bytes));
-        if let Err(error) = net::check_md5(&partial, &expected, cancel, |done| {
+        if let Err(error) = net::check_md5(&partial, &published.md5, cancel, |done| {
             progress.done.store(done, Ordering::Relaxed);
         }) {
             // A file that does not match is no use to continue from.
@@ -467,7 +467,7 @@ fn run(
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        fs::write(&md5, format!("{expected}  {name}\n"))?;
+        fs::write(&md5, format!("{}  {name}\n", published.md5))?;
         offset += 2;
     }
 

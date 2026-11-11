@@ -3,6 +3,10 @@
 *
 !Cargo.toml
 !Cargo.lock
+!LICENSE
+!NOTICE
+!about.toml
+!about.hbs
 !src
 !catalog/places.json
 !catalog/licences.json

@@ -549,6 +549,12 @@ pub(crate) struct House {
 }
 
 impl House {
+    /// Whether both are rows of one imported file. OSM's addresses carry
+    /// dataset 0 too, the first file's index.
+    pub(super) fn same_source(&self, other: &Self) -> bool {
+        self.imported && other.imported && self.dataset == other.dataset
+    }
+
     /// Whether two addresses of one house key state where they are
     /// differently: both state a postcode, a locality or areas, and they
     /// differ. Then they are two houses, however close.
