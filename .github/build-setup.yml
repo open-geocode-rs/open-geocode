@@ -1,0 +1,8 @@
+# dist puts these steps before each release build. Every archive ships
+# THIRD-PARTY-LICENSES, generated from Cargo.lock by about.toml and about.hbs.
+- name: Install cargo-about
+  shell: bash
+  run: cargo install cargo-about --locked --features cli --version 0.9.3
+- name: Generate THIRD-PARTY-LICENSES
+  shell: bash
+  run: cargo about generate --all-features --locked --fail -o THIRD-PARTY-LICENSES about.hbs

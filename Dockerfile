@@ -5,7 +5,8 @@
 # and raised p99 under load sixfold. Builder and runtime are both Debian 13, so glibc versions match.
 
 FROM rust:1.99.1-slim-trixie@sha256:7eab7ce19273ce785e0ca7578bdf7bc1fcbae621775a8197379a04c9f6e03cd5 AS chef
-RUN cargo install cargo-chef --locked --version 0.1.78
+RUN cargo install cargo-chef --locked --version 0.1.78 \
+ && cargo install cargo-about --locked --features cli --version 0.9.3
 WORKDIR /src
 
 FROM chef AS planner
@@ -19,10 +20,13 @@ RUN cargo chef cook --profile dist --locked --bin open-geocode --recipe-path rec
 COPY . .
 RUN cargo build --profile dist --locked --bin open-geocode \
  && strip target/dist/open-geocode
+# The image ships open-geocode alone, so the og interface's crates are left out.
+RUN cargo about generate --locked --fail -o THIRD-PARTY-LICENSES about.hbs
 
 # Distroless cc: glibc, libgcc and CA certificates only. No shell, no package manager, uid 65532.
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
 COPY --from=build /src/target/dist/open-geocode /usr/local/bin/open-geocode
+COPY --from=build /src/LICENSE /src/NOTICE /src/THIRD-PARTY-LICENSES /usr/share/doc/open-geocode/
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD ["open-geocode", "health"]
 ENTRYPOINT ["open-geocode"]
