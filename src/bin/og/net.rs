@@ -606,15 +606,13 @@ mod tests {
             Answer::Body(b"monaco 261110".to_vec()),
         );
 
-        let dir = std::env::temp_dir().join(format!("og-net-{}", std::process::id()));
-        let path = dir.join("monaco.osm.pbf");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("monaco.osm.pbf");
         let result =
             download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
                 check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
                 Ok(fs::read(&partial)?)
             });
-        let _ = fs::remove_dir_all(&dir);
-
         assert_eq!(result.unwrap(), old);
     }
 }

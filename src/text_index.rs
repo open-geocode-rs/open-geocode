@@ -1724,12 +1724,12 @@ mod tests {
 
     #[test]
     fn documents_run_in_chunks_of_neighbours_in_one_segment() {
-        let dir =
-            std::env::temp_dir().join(format!("open-geocode-text-parts-{}", uuid::Uuid::new_v4()));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         // Each address on a street of its own, so each is a document; past
         // two chunks, so a part's chunk ends inside the index.
         let count = 2 * CHUNK_DOCUMENTS + 5;
-        let mut writer = crate::pack::Writer::create(&dir).expect("writer");
+        let mut writer = crate::pack::Writer::create(dir).expect("writer");
         for index in 0..count {
             let record = AddressRecord {
                 disputed: false,
@@ -1752,7 +1752,7 @@ mod tests {
             writer.write(&record.into(), None).expect("address");
         }
         writer.finish().expect("finish");
-        let pack = crate::pack::Reader::open(&dir).expect("pack");
+        let pack = crate::pack::Reader::open(dir).expect("pack");
         let searcher = open_text_index(pack.container())
             .expect("text index")
             .reader()
@@ -1765,7 +1765,6 @@ mod tests {
             .map(|(_, bytes)| bytes)
             .sum::<u64>();
         let segments = searcher.segment_readers();
-        let _ = fs::remove_dir_all(&dir);
         assert!(
             store_bytes < 1_024,
             "{count} documents keep no store of their own: {store_bytes} bytes"

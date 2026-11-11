@@ -196,6 +196,9 @@ path = "src/bin/og/main.rs"
 required-features = ["tui"]
 
 [dev-dependencies]
+# Test scratch directories, removed when the test ends, a failed assertion
+# included. Already in the tree through Tantivy.
+tempfile = "3.27"
 # Used only by the in-crate router tests to drive the Router via `oneshot`.
 tower = { version = "0.5", features = ["util"] }
 # Holds a batch result's `response` as the bytes it was sent as, so the

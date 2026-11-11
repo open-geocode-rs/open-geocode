@@ -1182,10 +1182,6 @@ mod tests {
 
     use super::*;
 
-    fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-{name}-{}", uuid::Uuid::new_v4()))
-    }
-
     fn address_record(object_id: i64, number: &str, street: &str) -> Record {
         Record::Address(AddressRecord {
             disputed: false,
@@ -1233,9 +1229,10 @@ mod tests {
 
     #[test]
     fn writes_one_file_and_reads_records_by_row_layer_and_source_id() {
-        let root = temp_root("pack");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let manifest = write_pack(
-            &root,
+            root,
             &[
                 address_record(1, "10", "King Street"),
                 address_record(2, "20", "Queen Street"),
@@ -1245,7 +1242,7 @@ mod tests {
         assert_eq!(manifest.text_document_count, 2);
         assert_eq!(manifest.spatial.point_count, 2);
 
-        let reader = Reader::open(&root).expect("reader");
+        let reader = Reader::open(root).expect("reader");
         assert_eq!(
             reader.path().file_name().and_then(|name| name.to_str()),
             Some(PACK_FILE)
@@ -1273,10 +1270,10 @@ mod tests {
         assert!(sections.contains_key("records/blocks"));
         assert!(sections.keys().any(|name| name.starts_with("text/")));
         assert!(sections.contains_key("spatial/blocks"));
-        assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
+        assert_eq!(first_hit(root, "queen").as_deref(), Some("osm:node:2"));
 
         // The Pack file alone is a complete Pack.
-        let copy = temp_root("copy").with_extension("ogp");
+        let copy = temp.path().join("copy.ogp");
         fs::copy(reader.path(), &copy).expect("copy");
         assert_eq!(first_hit(&copy, "king").as_deref(), Some("osm:node:1"));
         assert!(!reader.path().parent().unwrap().join(SCRATCH_DIR).exists());
@@ -1284,17 +1281,18 @@ mod tests {
 
     #[test]
     fn failed_osm_rebuild_preserves_published_pack() {
-        let root = temp_root("rebuild");
-        write_pack(&root, &[address_record(1, "10", "King Street")]);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        write_pack(root, &[address_record(1, "10", "King Street")]);
         let generations = fs::read_dir(root.join("generations")).expect("dir").count();
 
         let result = crate::builder::build_osm_pack(&crate::builder::BuildOsmOptions {
             inputs: vec![root.join("missing.osm.pbf")],
-            pack: root.clone(),
+            pack: root.to_path_buf(),
             ..crate::builder::BuildOsmOptions::default()
         });
         assert!(result.is_err());
-        assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+        assert_eq!(first_hit(root, "king").as_deref(), Some("osm:node:1"));
         assert_eq!(
             fs::read_dir(root.join("generations")).expect("dir").count(),
             generations,
@@ -1304,19 +1302,20 @@ mod tests {
 
     #[test]
     fn publishes_replacement_without_changing_existing_readers() {
-        let root = temp_root("publish");
-        write_pack(&root, &[address_record(1, "10", "King Street")]);
-        let original = Reader::open(&root).expect("original reader");
-        let searcher = TextSearcher::open(&root).expect("original searcher");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        write_pack(root, &[address_record(1, "10", "King Street")]);
+        let original = Reader::open(root).expect("original reader");
+        let searcher = TextSearcher::open(root).expect("original searcher");
 
-        let mut replacement = Writer::create(&root).expect("replacement");
+        let mut replacement = Writer::create(root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
-        assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+        assert_eq!(first_hit(root, "king").as_deref(), Some("osm:node:1"));
         replacement.finish().expect("publish");
 
-        assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
+        assert_eq!(first_hit(root, "queen").as_deref(), Some("osm:node:2"));
         assert_eq!(
             original.record_summary(0).expect("original").id,
             "osm:node:1"
@@ -1336,11 +1335,12 @@ mod tests {
 
     #[test]
     fn validation_failure_does_not_publish_replacement() {
-        let root = temp_root("validation");
-        write_pack(&root, &[address_record(1, "10", "King Street")]);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        write_pack(root, &[address_record(1, "10", "King Street")]);
         let published = fs::read(root.join("CURRENT")).expect("pointer");
 
-        let mut replacement = Writer::create(&root).expect("replacement");
+        let mut replacement = Writer::create(root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -1357,16 +1357,17 @@ mod tests {
         assert!(sealed.publish().is_err());
         assert_eq!(fs::read(root.join("CURRENT")).expect("pointer"), published);
         assert!(!generation.exists());
-        assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+        assert_eq!(first_hit(root, "king").as_deref(), Some("osm:node:1"));
     }
 
     #[test]
     fn publishing_refuses_a_pack_corrupted_inside_a_section() {
-        let root = temp_root("checksum");
-        write_pack(&root, &[address_record(1, "10", "King Street")]);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        write_pack(root, &[address_record(1, "10", "King Street")]);
         let published = fs::read(root.join("CURRENT")).expect("pointer");
 
-        let mut replacement = Writer::create(&root).expect("replacement");
+        let mut replacement = Writer::create(root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -1385,9 +1386,10 @@ mod tests {
 
     #[test]
     fn a_failure_after_the_pointer_switch_keeps_the_published_generation() {
-        let root = temp_root("switch-failure");
-        write_pack(&root, &[address_record(1, "10", "King Street")]);
-        let mut replacement = Writer::create(&root).expect("replacement");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        write_pack(root, &[address_record(1, "10", "King Street")]);
+        let mut replacement = Writer::create(root).expect("replacement");
         replacement
             .write(&address_record(2, "20", "Queen Street"), None)
             .expect("address");
@@ -1398,15 +1400,16 @@ mod tests {
         publication::FAIL_AFTER_SWITCH.set(false);
         assert!(result.is_err());
         // CURRENT already names the new generation, so it must still exist.
-        assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
+        assert_eq!(first_hit(root, "queen").as_deref(), Some("osm:node:2"));
     }
 
     #[test]
     fn text_index_memory_fits_the_budget_and_waits_for_records() {
-        let root = temp_root("text-memory");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
         let memory = Budget::new(64 << 20);
         let mut writer = Writer::create_with(
-            &root,
+            root,
             &WriterOptions {
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
@@ -1429,13 +1432,12 @@ mod tests {
             memory.limit()
         );
         writer.finish().expect("finish");
-        assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+        assert_eq!(first_hit(root, "king").as_deref(), Some("osm:node:1"));
     }
 
     #[test]
     fn rejects_paths_without_a_pack() {
-        let root = temp_root("empty");
-        fs::create_dir_all(&root).expect("dir");
+        let root = tempfile::tempdir().expect("temp dir");
         assert!(Reader::open(&root).is_err());
     }
 }

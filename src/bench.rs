@@ -642,9 +642,9 @@ mod tests {
 
     #[test]
     fn samples_unique_pois_and_scores_hits_at_one_and_five() {
-        let temp_dir = temp_pack_path("bench-poi-fixture");
-        let _ = fs::remove_dir_all(&temp_dir);
-        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let temp_dir = temp.path();
+        let mut writer = Writer::create(temp_dir).expect("writer");
         let mut area = |layer, name: &str, object_id| {
             writer
                 .write(
@@ -720,7 +720,7 @@ mod tests {
             writer.write(&poi.into(), context).expect("POI");
         }
         writer.finish().expect("finish");
-        let reader = Reader::open(&temp_dir).expect("reader");
+        let reader = Reader::open(temp_dir).expect("reader");
         let riverdale = reader
             .find_by_source_id("osm:node:13")
             .expect("lookup")
@@ -733,7 +733,7 @@ mod tests {
 
         let sample = |seed| {
             sample_poi_fixture(&PoiFixtureOptions {
-                pack: temp_dir.clone(),
+                pack: temp_dir.to_path_buf(),
                 count: 10,
                 seed,
             })
@@ -779,7 +779,7 @@ mod tests {
         )
         .expect("write fixture");
         let report = benchmark_pack(&PackBenchmarkOptions {
-            pack: temp_dir.clone(),
+            pack: temp_dir.to_path_buf(),
             queries: Some(fixture_path),
             iterations: 1,
             warmup: 0,
@@ -792,18 +792,16 @@ mod tests {
         );
         assert_eq!(report.queries.search.cases[3].expected_rank, None);
         assert!(report.queries.autocomplete.accuracy.is_none());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn reports_pack_metrics_without_query_fixture() {
-        let temp_dir = temp_pack_path("bench-metrics");
-        let _ = fs::remove_dir_all(&temp_dir);
-        write_test_pack(&temp_dir);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let temp_dir = temp.path();
+        write_test_pack(temp_dir);
 
         let report = benchmark_pack(&PackBenchmarkOptions {
-            pack: temp_dir.clone(),
+            pack: temp_dir.to_path_buf(),
             queries: None,
             iterations: 2,
             warmup: 1,
@@ -821,15 +819,13 @@ mod tests {
         );
         assert!(report.open.pack_reader_ms >= 0.0);
         assert_eq!(report.queries.search.case_count, 0);
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn benchmarks_query_fixture_cases() {
-        let temp_dir = temp_pack_path("bench-queries");
-        let _ = fs::remove_dir_all(&temp_dir);
-        write_test_pack(&temp_dir);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let temp_dir = temp.path();
+        write_test_pack(temp_dir);
 
         let fixture_path = temp_dir.join("queries.json");
         fs::write(
@@ -843,7 +839,7 @@ mod tests {
         .expect("write fixture");
 
         let report = benchmark_pack(&PackBenchmarkOptions {
-            pack: temp_dir.clone(),
+            pack: temp_dir.to_path_buf(),
             queries: Some(fixture_path),
             iterations: 2,
             warmup: 1,
@@ -857,8 +853,6 @@ mod tests {
         assert_eq!(report.queries.autocomplete.cases[0].hit_count, 1);
         assert!(report.queries.reverse.cases[0].result_present);
         assert!(report.queries.search.latency.is_some());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     fn write_test_pack(path: &Path) {
@@ -888,9 +882,5 @@ mod tests {
             )
             .expect("write address");
         writer.finish().expect("finish");
-    }
-
-    fn temp_pack_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-{name}-{}", std::process::id()))
     }
 }

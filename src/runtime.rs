@@ -1385,12 +1385,16 @@ mod router_tests {
         point_geometry,
     };
 
-    fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-http-{name}-{}", std::process::id()))
+    /// A one-address Pack in a temp directory that also takes the jobs
+    /// directory the server keeps beside it.
+    fn temp_pack() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pack = temp.path().join("pack");
+        write_pack(&pack);
+        (temp, pack)
     }
 
     fn write_pack(dir: &Path) {
-        let _ = std::fs::remove_dir_all(dir);
         let mut writer = Writer::create(dir).expect("writer");
         writer
             .write(
@@ -1492,10 +1496,9 @@ mod router_tests {
 
     #[tokio::test]
     async fn health_endpoints_reflect_readiness() {
-        let pack = temp_path("health");
-        write_pack(&pack);
-        let demo = temp_path("health-demo");
-        let no_basemap = temp_path("health-no-basemap");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let no_basemap = temp.path().join("no-basemap");
 
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
         assert_eq!(
@@ -1514,14 +1517,11 @@ mod router_tests {
             send(not_ready, request("GET", "/readyz")).await.status,
             StatusCode::SERVICE_UNAVAILABLE
         );
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn version_names_the_build_and_the_pack() {
-        let pack = temp_path("version");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let reader = Reader::open(&pack).expect("pack");
         let manifest = reader.manifest();
         let router = build_router(state_for(&pack, true), None, None);
@@ -1551,15 +1551,13 @@ mod router_tests {
             send(router, request("HEAD", "/version")).await.status,
             StatusCode::METHOD_NOT_ALLOWED
         );
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn search_enforces_query_and_limit_bounds() {
-        let pack = temp_path("search-bounds");
-        write_pack(&pack);
-        let demo = temp_path("search-demo");
-        let no_basemap = temp_path("search-no-basemap");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let no_basemap = temp.path().join("no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // Empty query -> 400 invalid_query, Problem Details.
@@ -1630,16 +1628,13 @@ mod router_tests {
         let reply = send(router, request("GET", "/geocode?q=King%20Street&limit=5")).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.content_type(), "application/json");
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn reverse_validates_coordinates() {
-        let pack = temp_path("reverse-bounds");
-        write_pack(&pack);
-        let demo = temp_path("reverse-demo");
-        let no_basemap = temp_path("reverse-no-basemap");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let no_basemap = temp.path().join("no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         let reply = send(router.clone(), request("GET", "/reverse?lon=999&lat=0")).await;
@@ -1652,18 +1647,15 @@ mod router_tests {
 
         let reply = send(router, request("GET", "/reverse?lon=-79.0&lat=43.0")).await;
         assert_eq!(reply.status, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// The cases the endpoint was asked for: a hit inside the postcode, a
     /// miss in another one, and a missing address.
     #[tokio::test]
     async fn geocode_keeps_hits_in_the_given_postcode() {
-        let pack = temp_path("geocode");
-        write_pack(&pack);
-        let demo = temp_path("geocode-demo");
-        let no_basemap = temp_path("geocode-no-basemap");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let no_basemap = temp.path().join("no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // The address is in this postcode, so it is found.
@@ -1719,16 +1711,13 @@ mod router_tests {
         .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["error_code"], "malformed_parameter");
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn methods_unknown_paths_and_request_ids() {
-        let pack = temp_path("methods");
-        write_pack(&pack);
-        let demo = temp_path("methods-demo");
-        let no_basemap = temp_path("methods-no-basemap");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let no_basemap = temp.path().join("no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
         // POST to a GET-only route -> 405 with Allow: GET.
@@ -1764,8 +1753,6 @@ mod router_tests {
         let reply = send(router, tagged).await;
         assert_eq!(reply.request_id().as_deref(), Some("ray-abc-123"));
         assert_eq!(reply.json()["request_id"], "ray-abc-123");
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
@@ -1774,10 +1761,9 @@ mod router_tests {
         // there is deliberately no full-file fetch guard here (that is a
         // deployment-layer concern, ADR 0017 Decision 35a). The bare binary hands
         // back exactly what was asked for.
-        let pack = temp_path("basemap");
-        write_pack(&pack);
-        let demo = temp_path("basemap-demo");
-        let basemap = temp_path("basemap.pmtiles");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let basemap = temp.path().join("basemap.pmtiles");
         std::fs::write(&basemap, vec![0u8; 600_000]).expect("write basemap");
 
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&basemap));
@@ -1800,9 +1786,6 @@ mod router_tests {
         // HEAD works too.
         let reply = send(router, request("HEAD", "/basemap.pmtiles")).await;
         assert_eq!(reply.status, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&pack);
-        let _ = std::fs::remove_file(&basemap);
     }
 
     /// A router whose routes fail on purpose, behind the same request-id layer
@@ -1896,10 +1879,9 @@ mod router_tests {
 
     #[tokio::test]
     async fn user_errors_are_not_logged() {
-        let pack = temp_path("user-errors");
-        write_pack(&pack);
-        let demo = temp_path("user-errors-demo");
-        let no_basemap = temp_path("user-errors-no-basemap");
+        let (temp, pack) = temp_pack();
+        let demo = temp.path().join("demo");
+        let no_basemap = temp.path().join("no-basemap");
         let log = ErrorLog::capture();
         let mut state = state_for(&pack, true);
         state.error_log = log.clone();
@@ -1926,8 +1908,6 @@ mod router_tests {
             }
         }
         assert!(log.lines().is_empty());
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     fn batch_request(method: &str, uri: &str, body: impl Into<String>) -> Request<Body> {
@@ -1975,8 +1955,7 @@ mod router_tests {
     /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]
     async fn jobs_stream_a_csv_back_with_each_rows_answer() {
-        let pack = temp_path("jobs-csv");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         let body = "ref,street,town,zip\n\
@@ -2042,16 +2021,13 @@ mod router_tests {
         )
         .await;
         assert_eq!(again.body, reply.body);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// JSONL rows are batch items, answered as their `GET` is, each tagged
     /// with its place in the upload.
     #[tokio::test]
     async fn jobs_answer_jsonl_rows_as_their_get() {
-        let pack = temp_path("jobs-jsonl");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         let body = "{\"id\": \"p\", \"lon\": -79.0, \"lat\": 43.0}\n\
@@ -2082,16 +2058,13 @@ mod router_tests {
         assert_eq!(lines[1]["status"], 400);
         assert_eq!(lines[1]["error"]["error_code"], "invalid_coordinate");
         assert_eq!(lines[2]["error"]["error_code"], "malformed_body");
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// `Prefer: respond-async` is answered once the upload is in, and the
     /// results are read from the job.
     #[tokio::test]
     async fn jobs_answer_at_once_when_asked() {
-        let pack = temp_path("jobs-async");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         let mut request_ = upload("/jobs", "text/csv", "Address,City\n10 King Street,\n");
@@ -2120,15 +2093,12 @@ mod router_tests {
         assert_eq!(deleted.status, StatusCode::NO_CONTENT);
         let gone = send(router.clone(), request("GET", &format!("/jobs/{id}"))).await;
         assert_eq!(gone.status, StatusCode::NOT_FOUND);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// What `/jobs` cannot read is refused before it starts.
     #[tokio::test]
     async fn jobs_refuse_what_they_cannot_read() {
-        let pack = temp_path("jobs-refused");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
         let code = |reply: &Reply| reply.json()["error_code"].as_str().map(str::to_string);
 
@@ -2188,18 +2158,14 @@ mod router_tests {
             );
             assert_eq!(header_value(&reply, "allow"), Some(allow));
         }
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// A finished job is still served after a restart, and one that was
     /// running when the server stopped is failed, not left running forever.
     #[tokio::test]
     async fn jobs_outlive_a_restart() {
-        let pack = temp_path("jobs-restart");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let spool = pack.with_extension("jobs");
-        let _ = std::fs::remove_dir_all(&spool);
         let router = build_router(state_for(&pack, true), None, None);
         let reply = send(
             router,
@@ -2239,17 +2205,13 @@ mod router_tests {
             .json();
         assert_eq!(interrupted["status"], "failed");
         assert!(interrupted["error"].as_str().unwrap().contains("restarted"));
-
-        let _ = std::fs::remove_dir_all(&pack);
-        let _ = std::fs::remove_dir_all(&spool);
     }
 
     /// Each item is answered as its own `GET` would be, a bad item fails
     /// alone, ids are echoed and the query string scopes every item.
     #[tokio::test]
     async fn batch_answers_each_item_alone() {
-        let pack = temp_path("batch-items");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         let reply = send(
@@ -2325,16 +2287,13 @@ mod router_tests {
             body["summary"],
             serde_json::json!({"total": 7, "succeeded": 3, "failed": 4})
         );
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// JSON keeps the last of two equal keys, but `GET` refuses a repeated
     /// parameter, so the item is refused the same way.
     #[tokio::test]
     async fn batch_item_with_a_repeated_field_fails_as_get_does() {
-        let pack = temp_path("batch-repeated");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         let get = send(
@@ -2354,16 +2313,13 @@ mod router_tests {
         let result = &batch.json()["results"][0];
         assert_eq!(result["status"], get.status.as_u16());
         assert_eq!(result["error"]["error_code"], get.json()["error_code"]);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// With every slot taken a batch is refused at once, told when to retry,
     /// and single lookups still answer.
     #[tokio::test]
     async fn batch_is_refused_when_every_slot_is_taken() {
-        let pack = temp_path("batch-busy");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let state = state_for(&pack, true);
         let slots = Arc::clone(state.batch_slots());
         let taken = Arc::clone(&slots)
@@ -2387,14 +2343,11 @@ mod router_tests {
         drop(taken);
         let reply = send(router, batch_request("POST", "/geocode", body)).await;
         assert_eq!(reply.status, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn batch_rejects_a_bad_request_whole() {
-        let pack = temp_path("batch-request-errors");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let limits =
             limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(3).expect("3"));
         let router = build_router(state_with(&pack, true, limits), None, None);
@@ -2470,8 +2423,6 @@ mod router_tests {
             reply.json()["summary"],
             serde_json::json!({"total": 0, "succeeded": 0, "failed": 0})
         );
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// QUERY reaches the batch, every answer of a batchable route says how
@@ -2479,8 +2430,7 @@ mod router_tests {
     /// ones it does.
     #[tokio::test]
     async fn batchable_routes_take_query_and_post() {
-        let pack = temp_path("batch-methods");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         let body = r#"[{"lon": -79.0, "lat": 43.0}, {"lon": 999, "lat": 0}]"#;
@@ -2540,8 +2490,6 @@ mod router_tests {
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(header_value(&reply, "allow"), Some("GET"));
         assert!(header_value(&reply, "accept-query").is_none());
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[derive(Debug, Deserialize)]
@@ -2558,8 +2506,7 @@ mod router_tests {
     /// and the items around it are answered.
     #[tokio::test]
     async fn batch_item_panic_fails_only_that_item() {
-        let pack = temp_path("batch-panic");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let log = ErrorLog::capture();
         let mut state = state_for(&pack, true);
         state.error_log = log.clone();
@@ -2620,8 +2567,6 @@ mod router_tests {
                 .expect("cause")
                 .contains("label 7 out of range")
         );
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// `country` is parsed like `layer`: a value that cannot be a code is a
@@ -2661,8 +2606,7 @@ mod router_tests {
     /// the next time.
     #[tokio::test]
     async fn a_lookup_past_its_timeout_stops_with_a_503() {
-        let pack = temp_path("lookup-timeout");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let limits = limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::MIN);
         let router = Router::new()
             .route(
@@ -2687,16 +2631,13 @@ mod router_tests {
             "the lookup took longer than the server allows, 1 ms"
         );
         assert!(header_value(&reply, "retry-after").is_none());
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// With every lookup slot taken a single lookup is refused at once with
     /// 503 `busy` and a `Retry-After`, and answers again once a slot frees.
     #[tokio::test]
     async fn a_lookup_is_refused_while_every_lookup_slot_is_taken() {
-        let pack = temp_path("lookup-busy");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let limits = limits_with(|limits| limits.max_concurrent_lookups = Some(NonZeroUsize::MIN));
         let state = state_with(&pack, true, limits);
         let taken = Arc::clone(&state.lookup_slots)
@@ -2723,8 +2664,6 @@ mod router_tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     fn slow_when_asked(state: &AppState, query: String) -> Result<ForwardCollection> {
@@ -2739,8 +2678,7 @@ mod router_tests {
     /// the items around it are answered.
     #[tokio::test]
     async fn a_batch_item_past_its_timeout_fails_alone() {
-        let pack = temp_path("batch-timeout");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let limits =
             limits_with(|limits| limits.lookup_timeout_ms = NonZeroU64::new(5).expect("5"));
         let router = Router::new()
@@ -2773,18 +2711,13 @@ mod router_tests {
         assert_eq!(statuses, [200, 503, 200]);
         assert_eq!(body["results"][1]["error"]["error_code"], "timeout");
         assert_eq!(body["summary"]["failed"], 1);
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// A job reads at most the server's row cap, then fails naming it, with
     /// the rows it read answered.
     #[tokio::test]
     async fn a_job_stops_reading_at_the_row_cap() {
-        let pack = temp_path("jobs-row-cap");
-        write_pack(&pack);
-        let spool = pack.with_extension("jobs");
-        let _ = std::fs::remove_dir_all(&spool);
+        let (_temp, pack) = temp_pack();
         let limits = limits_with(|limits| limits.max_job_rows = NonZeroUsize::new(2).expect("2"));
         let router = build_router(state_with(&pack, true, limits), None, None);
 
@@ -2802,18 +2735,13 @@ mod router_tests {
             status["error"],
             "a job holds at most 2 rows; the rest were not read"
         );
-
-        let _ = std::fs::remove_dir_all(&pack);
-        let _ = std::fs::remove_dir_all(&spool);
     }
 
     /// An upload declared over the server's upload limit is refused before
     /// a byte of it is read.
     #[tokio::test]
     async fn a_job_upload_over_the_limit_is_refused() {
-        let pack = temp_path("jobs-upload-cap");
-        write_pack(&pack);
-        let spool = pack.with_extension("jobs");
+        let (_temp, pack) = temp_pack();
         let limits = limits_with(|limits| limits.max_job_upload_mib = Some(NonZeroU64::MIN));
         let router = build_router(state_with(&pack, true, limits), None, None);
 
@@ -2825,19 +2753,14 @@ mod router_tests {
         let reply = send(router, declared).await;
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(reply.json()["error_code"], "body_too_large");
-
-        let _ = std::fs::remove_dir_all(&pack);
-        let _ = std::fs::remove_dir_all(&spool);
     }
 
     /// While the results kept fill the job store, a new job is refused with
     /// 503 `busy`, and the kept ones are still served.
     #[tokio::test]
     async fn a_full_job_store_refuses_new_jobs() {
-        let pack = temp_path("jobs-store-full");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let spool = pack.with_extension("jobs");
-        let _ = std::fs::remove_dir_all(&spool);
         std::fs::create_dir_all(&spool).expect("spool");
         // Sparse: the store counts the length, and the disk holds none of it.
         std::fs::File::create(spool.join("kept.results"))
@@ -2872,17 +2795,13 @@ mod router_tests {
         assert_eq!(header_value(&reply, "retry-after"), Some("60"));
         let kept = send(router, request("GET", "/jobs/kept")).await;
         assert_eq!(kept.status, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&pack);
-        let _ = std::fs::remove_dir_all(&spool);
     }
 
     /// `/openapi.json` states the batch item cap this server was started
     /// with.
     #[tokio::test]
     async fn the_served_spec_states_the_servers_limits() {
-        let pack = temp_path("spec-limits");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let limits =
             limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(7).expect("7"));
         let router = build_router(state_with(&pack, true, limits), None, None);
@@ -2896,8 +2815,6 @@ mod router_tests {
                 "{path}"
             );
         }
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     fn raw_get(addr: SocketAddr, path: &str) -> std::io::Result<(u16, String)> {
@@ -2944,8 +2861,7 @@ mod router_tests {
 
     #[tokio::test]
     async fn shutdown_lets_an_in_flight_request_finish() {
-        let pack = temp_path("shutdown-drain");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let state = state_for(&pack, true);
         let started = Arc::new(tokio::sync::Notify::new());
         let app = drain_app(state.clone(), Arc::clone(&started));
@@ -2978,15 +2894,12 @@ mod router_tests {
         let (status, body) = client.await.expect("client").expect("reply");
         assert_eq!((status, body.as_str()), (200, "done"));
         server.await.expect("server").expect("clean stop");
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn shutdown_gives_up_on_a_stuck_request_after_its_timeout() {
         use std::io::Write;
-        let pack = temp_path("shutdown-timeout");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let state = state_for(&pack, true);
         let started = Arc::new(tokio::sync::Notify::new());
         let app = drain_app(state.clone(), Arc::clone(&started));
@@ -3011,16 +2924,12 @@ mod router_tests {
             .expect("server")
             .expect("clean stop");
         assert!(began.elapsed() >= Duration::from_millis(300));
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[tokio::test]
     async fn shutdown_cancels_a_running_job_and_stops_at_once() {
-        let pack = temp_path("shutdown-job");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let spool = pack.with_extension("jobs");
-        let _ = std::fs::remove_dir_all(&spool);
         let state = state_for(&pack, true);
         let router = build_router(state.clone(), None, None);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3105,8 +3014,6 @@ mod router_tests {
         assert!(record.contains("\"cancelled\""), "{record}");
 
         drop(upload);
-        let _ = std::fs::remove_dir_all(&pack);
-        let _ = std::fs::remove_dir_all(&spool);
     }
 
     /// How a text parameter is sent in one cell of the matrix below.
@@ -3300,8 +3207,7 @@ mod router_tests {
     /// each endpoint says what each means.
     #[tokio::test]
     async fn every_text_parameter_missing_empty_or_filled_answers_by_the_rules() {
-        let pack = temp_path("param-matrix");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
         for rules in rules() {
             let mut stated = rules
@@ -3434,15 +3340,13 @@ mod router_tests {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// `q` sent empty beside an address field is two ways of giving the
     /// address, in a batch item as in `GET`.
     #[tokio::test]
     async fn an_empty_q_beside_address_fields_is_both() {
-        let pack = temp_path("param-both");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
         for uri in [
             "/geocode?q=&address=10%20King%20Street",
@@ -3482,15 +3386,13 @@ mod router_tests {
             "give the address as q or as address, locality, region and postcode, not both"
         );
         assert_eq!(results[1]["status"], 200);
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// `ids` holds at most the server's batch item limit, in `GET` and in
     /// each batch item alike.
     #[tokio::test]
     async fn ids_past_the_limit_are_refused_however_many() {
-        let pack = temp_path("param-ids");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let limits =
             limits_with(|limits| limits.max_batch_items = NonZeroUsize::new(7).expect("7"));
         let router = build_router(state_with(&pack, true, limits), None, None);
@@ -3533,7 +3435,6 @@ mod router_tests {
         let refused = place_ids(&huge, 7).unwrap_err();
         assert_eq!(refused.error_code().as_str(), "limit_too_large");
         assert_eq!(refused.invalid_params()[0].reason, "at most 7 ids");
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     fn with_headers(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
@@ -3551,8 +3452,7 @@ mod router_tests {
     async fn responses_are_compressed_as_the_client_accepts() {
         use std::io::Read;
 
-        let pack = temp_path("compress");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
         let uri = "/geocode?q=10%20King%20Street";
 
@@ -3595,8 +3495,6 @@ mod router_tests {
         )
         .await;
         assert!(tiny.headers.get(header::CONTENT_ENCODING).is_none());
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Compression must not hold a job's rows back until the upload ends, nor
@@ -3607,8 +3505,7 @@ mod router_tests {
         use std::convert::Infallible;
         use std::io::Read;
 
-        let pack = temp_path("compress-stream");
-        write_pack(&pack);
+        let (_temp, pack) = temp_pack();
         let router = build_router(state_for(&pack, true), None, None);
 
         for encoding in ["gzip", "zstd"] {
@@ -3668,8 +3565,6 @@ mod router_tests {
             .expect("decode");
             assert_eq!(decoded.split(|byte| *byte == b'\n').count() - 1, rows);
         }
-
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Canary for tower-rs/tower-http#732. Passes while tower-http compression

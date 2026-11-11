@@ -1859,8 +1859,8 @@ mod tests {
             builder.add(RecordNames::default(), Some(&context));
         }
         let names = HashMap::from([(9, vec!["千代田区".to_string(), "Chiyoda".to_string()])]);
-        let dir = std::env::temp_dir().join(format!("og-dictionary-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let path = dir.join("pack.ogp");
         let mut pack = Writer::create(&path).expect("pack");
         builder
@@ -1878,7 +1878,6 @@ mod tests {
                 "{key}"
             );
         }
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1921,8 +1920,8 @@ mod tests {
             (4, vec!["京都市".to_string()]),
             (5, vec!["宇治市".to_string()]),
         ]);
-        let dir = std::env::temp_dir().join(format!("og-aliases-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let path = dir.join("pack.ogp");
         let mut pack = Writer::create(&path).expect("pack");
         builder
@@ -1943,7 +1942,6 @@ mod tests {
         assert!(!dictionaries.nest(&[1], &[4]), "Kyoto is not in Aichi");
         assert!(!dictionaries.nest(&[4], &[5]), "two cities of one region");
         assert!(dictionaries.areas("札幌").is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1986,8 +1984,8 @@ mod tests {
             builder.add(RecordNames::of(&address(&format!("Bay {index}"))), None);
         }
         builder.add(RecordNames::of(&address("Booth 1")), None);
-        let dir = std::env::temp_dir().join(format!("og-units-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
         let path = dir.join("pack.ogp");
         let mut pack = Writer::create(&path).expect("pack");
         builder
@@ -2000,7 +1998,6 @@ mod tests {
         assert!(!dictionaries.contains(Field::Unit, "booth"), "too few");
         assert!(dictionaries.contains(Field::Unit, "suite"), "vendored");
         assert!(dictionaries.keys(Field::Unit).contains(&"bay".to_string()));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

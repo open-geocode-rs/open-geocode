@@ -468,8 +468,8 @@ mod tests {
 
     #[test]
     fn interns_tuples_and_resolves_references() {
-        let path =
-            std::env::temp_dir().join(format!("open-geocode-context-{}", uuid::Uuid::new_v4()));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("context.ogp");
         let tuple = AdminContextTuple::from_tiers([
             (PlaceLayer::Country, 1),
             (PlaceLayer::Region, 2),

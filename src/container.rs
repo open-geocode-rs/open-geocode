@@ -577,17 +577,11 @@ unsafe impl stable_deref_trait::StableDeref for SharedMmap {}
 mod tests {
     use super::*;
 
-    fn temp_file(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "open-geocode-container-{name}-{}",
-            uuid::Uuid::new_v4()
-        ))
-    }
-
     #[test]
     fn round_trips_aligned_sections() {
-        let path = temp_file("round-trip");
-        let source = temp_file("source");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("round-trip");
+        let source = temp.path().join("source");
         std::fs::write(&source, b"from a file").expect("source");
         let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 3, b"abc").expect("alpha");
@@ -629,7 +623,8 @@ mod tests {
 
     #[test]
     fn verify_catches_a_flipped_byte_inside_a_section() {
-        let path = temp_file("checksum");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("checksum");
         let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 1, &[7u8; 4096]).expect("alpha");
         writer.add("beta", 1, b"untouched").expect("beta");
@@ -651,7 +646,8 @@ mod tests {
 
     #[test]
     fn appends_sections_to_a_finished_file() {
-        let path = temp_file("append");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("append");
         let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 1, b"first").expect("alpha");
         writer.finish().expect("finish");
@@ -677,7 +673,8 @@ mod tests {
 
     #[test]
     fn reads_in_the_sections_of_a_prefix_only_when_they_fit() {
-        let path = temp_file("prefault");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("prefault");
         let mut writer = Writer::create(&path).expect("writer");
         writer.add("parse/street", 1, &[1; 300]).expect("street");
         writer
@@ -693,12 +690,12 @@ mod tests {
             "over half the memory"
         );
         assert_eq!(container.prefault_sections("spatial/", 1 << 20), 0);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn rejects_truncated_files() {
-        let path = temp_file("truncated");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("truncated");
         let mut writer = Writer::create(&path).expect("writer");
         writer.add("alpha", 1, b"abcdef").expect("alpha");
         writer.finish().expect("finish");

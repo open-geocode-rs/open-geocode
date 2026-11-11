@@ -240,8 +240,9 @@ mod tests {
 
     #[test]
     fn finds_every_place_by_its_id_and_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
-        let mut writer = Writer::create(&dir).expect("writer");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
+        let mut writer = Writer::create(dir).expect("writer");
         for index in 0..300 {
             let lon = -79.0 + f64::from(index) * 1e-4;
             let record: Record = match index % 3 {
@@ -294,7 +295,7 @@ mod tests {
             writer.write(&record, None).expect("write");
         }
         writer.finish().expect("finish");
-        let pack = Reader::open(&dir).expect("pack");
+        let pack = Reader::open(dir).expect("pack");
         let catalogue = Catalogue::open(pack.container())
             .expect("open")
             .expect("a catalogue");
@@ -328,12 +329,12 @@ mod tests {
                 .is_empty(),
             "an id no record has"
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn a_street_answers_to_each_of_its_ways_and_a_place_comes_first() {
-        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
-        let mut writer = Writer::create(&dir).expect("writer");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
+        let mut writer = Writer::create(dir).expect("writer");
         let street = |own: i64, other_ways: Vec<i64>, lon: f64| -> Record {
             Record::Street(StreetRecord {
                 name: "Ponsonby Road".to_string(),
@@ -376,7 +377,7 @@ mod tests {
             .write(&street(20_000, vec![1_400_000_000], 175.1), None)
             .expect("write");
         writer.finish().expect("finish");
-        let pack = Reader::open(&dir).expect("pack");
+        let pack = Reader::open(dir).expect("pack");
         let catalogue = Catalogue::open(pack.container())
             .expect("open")
             .expect("a catalogue");
@@ -399,6 +400,5 @@ mod tests {
         );
         assert_eq!(find(1_400_000_000)[0].1, "Ponsonby Road");
         assert!(find(703).is_empty(), "a way of no street");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

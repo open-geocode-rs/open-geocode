@@ -534,8 +534,8 @@ mod tests {
             );
         }
         // A pasted row is answered as a row of a file is.
-        let dir = std::env::temp_dir().join(format!("og-pasted-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let address = "carrer prat de la creu 70, andorra la vella";
         std::fs::write(dir.join("in.csv"), format!("address\n\"{address}\"\n")).unwrap();
         open_geocode::batch::run_batch_geocode(&open_geocode::batch::GeocodeOptions {
@@ -552,7 +552,6 @@ mod tests {
             written.contains(&format!("{:.7},{:.7}", hit.lat, hit.lon)),
             "{written}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Quitting during a build leaves no unfinished Pack generation behind

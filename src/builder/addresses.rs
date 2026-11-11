@@ -463,13 +463,11 @@ fn address(
 mod tests {
     use super::*;
 
-    fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("open-geocode-addresses-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join(name);
+    fn temp_file(name: &str, contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join(name);
         std::fs::write(&path, contents).expect("write");
-        path
+        (temp, path)
     }
 
     fn read(path: PathBuf) -> (Vec<AddressRecord>, ImportReport) {
@@ -508,7 +506,8 @@ mod tests {
             std::io::Write::write_all(&mut encoder, lines.as_bytes()).expect("gzip");
             encoder.finish().expect("gzip");
         }
-        let (records, report) = read(temp_file("source.geojson.gz", &gzipped));
+        let (_temp, path) = temp_file("source.geojson.gz", &gzipped);
+        let (records, report) = read(path);
         assert_eq!(records.len(), 1);
         let address = &records[0].address;
         assert_eq!(address.number, "12");
@@ -539,7 +538,8 @@ mod tests {
     #[test]
     fn reads_openaddresses_csv_with_columns_in_any_order() {
         let csv = "street,NUMBER,Lat,lon,unit\nKing St,10,43.6,-79.4,2\nKing St,11,oops,-79.4,\n";
-        let (records, report) = read(temp_file("addresses.csv", csv.as_bytes()));
+        let (_temp, path) = temp_file("addresses.csv", csv.as_bytes());
+        let (records, report) = read(path);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].address.unit.as_deref(), Some("2"));
         assert_eq!(
@@ -547,7 +547,7 @@ mod tests {
             BTreeMap::from([("bad_coordinates".to_string(), 1)])
         );
 
-        let missing = temp_file("addresses.csv", b"lon,lat,number\n1,2,3\n");
+        let (_temp, missing) = temp_file("addresses.csv", b"lon,lat,number\n1,2,3\n");
         assert!(
             read_file(
                 &AddressFile {

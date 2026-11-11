@@ -854,11 +854,9 @@ mod tests {
     #[test]
     fn an_answer_credits_openstreetmap_and_each_imported_data_set_it_holds() {
         use crate::record::{AddressRecord, LocationPrecision, SourceProvenance, point_geometry};
-        let dir = std::env::temp_dir().join(format!(
-            "open-geocode-api-attribution-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut writer = crate::pack::Writer::create(&dir).expect("writer");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path();
+        let mut writer = crate::pack::Writer::create(dir).expect("writer");
         writer
             .write(
                 &AddressRecord {
@@ -887,14 +885,13 @@ mod tests {
             )
             .expect("address");
         writer.finish().expect("finish");
-        let pack = std::sync::Arc::new(Reader::open(&dir).expect("pack"));
+        let pack = std::sync::Arc::new(Reader::open(dir).expect("pack"));
         let geocoder =
             reverse::PackReverseGeocoder::from_pack(std::sync::Arc::clone(&pack)).expect("reverse");
         let response = geocoder
             .reverse(reverse::GeocodeOptions::at(-58.38, -34.6))
             .expect("answer");
         let collection = reverse_collection(&pack, &response).expect("collection");
-        let _ = std::fs::remove_dir_all(&dir);
         let credits = serde_json::to_value(&collection.geocoding.attribution).expect("json");
         assert_eq!(
             credits,
