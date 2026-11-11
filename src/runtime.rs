@@ -3798,7 +3798,7 @@ mod router_tests {
         assert!(cors::layer(&["*".to_string()]).unwrap().is_some());
         assert!(cors::layer(&["bad\norigin".to_string()]).is_err());
     }
-    
+
     /// Canary for tower-rs/tower-http#732. Passes while tower-http compression
     /// polls a body past its end, which is why `tail()` in `jobs.rs` fuses its
     /// stream. Fails once a tower-http bump carries the fix: then drop that
