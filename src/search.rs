@@ -246,6 +246,13 @@ const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 /// Terms and postcode records read to find the area of a postcode the query
 /// names (see [`TextSearcher::postcode_areas`]): a sample, enough to place
 /// it and measure how far it reaches.
+/// How far from the town a query names a fallback answers a place written
+/// before it. Nearer, it is a locality the town serves. Farther, a namesake.
+const FALLBACK_NEAR_TOWN_M: f64 = 50_000.0;
+/// The namesakes a fallback looks through for one near a place. A town's
+/// fame outranks its nearness, and Cambridge in England comes before the one
+/// in New Zealand.
+const FALLBACK_NAMESAKES: usize = 10;
 const POSTCODE_AREA_TERMS: usize = 256;
 const POSTCODE_AREA_RECORDS: usize = 64;
 /// The least a postcode area reaches, so a few postcodes standing close
@@ -4120,13 +4127,20 @@ impl TextSearcher {
                     .flat_map(|part| &part.words),
             )?;
             let areas = plan.area_plans(|part| self.stated_names(part, &known));
-            let spellings = self.spellings(areas.iter().map(|(area, _)| area))?;
-            for (area, layers) in areas {
-                let area = self.spelt(&area, &spellings)?;
+            let spellings = self.spellings(areas.iter().flat_map(|area| &area.names))?;
+            // The hits of the first of `layers` that has any `keep` keeps, of
+            // the best `window`. `None` once the budget is spent.
+            let seek = |area: &QueryPlan,
+                        layers: &[Layer],
+                        focus: Option<[f64; 2]>,
+                        window: usize,
+                        keep: &dyn Fn(&TextSearchHit) -> bool|
+             -> Result<Option<Vec<TextSearchHit>>> {
+                let area = self.spelt(area, &spellings)?;
                 for layer in layers {
                     crate::stop::check()?;
                     if !session.allows_search() {
-                        return Ok(Vec::new());
+                        return Ok(None);
                     }
                     let filters = Filters {
                         layer: Some(layer.as_str()),
@@ -4139,18 +4153,97 @@ impl TextSearcher {
                         &query_words,
                         &filters,
                         focus,
-                        limit,
+                        window,
                         &session,
                         &mut |_, _, _, _| Ok(true),
                     )?;
                     hits.extend(contradicted);
-                    hits.truncate(limit);
+                    hits.retain(|hit| keep(hit));
                     if !hits.is_empty() {
-                        for hit in &mut hits {
-                            hit.fallback = true;
-                        }
-                        return Ok(hits);
+                        return Ok(Some(hits));
                     }
+                }
+                Ok(Some(Vec::new()))
+            };
+            for area in &areas {
+                let AreaPlan { names, layers } = area;
+                let hits = 'names: {
+                    // Of several names, one found only misspelt or with
+                    // words of it dropped is another place, as Port Hublé
+                    // is for "Port Chalmers". A lone name is all there is.
+                    let whole = |hit: &TextSearchHit| {
+                        names.len() == 1
+                            || (hit.features.edits == 0 && hit.features.dropped_words == 0)
+                    };
+                    for town in (0..names.len()).rev() {
+                        let Some(hits) = seek(&names[town], layers, focus, limit, &whole)? else {
+                            break 'names None;
+                        };
+                        let Some(first) = hits.first() else {
+                            continue;
+                        };
+                        // A name written before the town is a place in it
+                        // when one lies near the town, or near a town of
+                        // its name ("Maungatautari, Cambridge" is in New
+                        // Zealand, not England). Elsewhere it is a namesake.
+                        let near = |at: Point| {
+                            move |hit: &TextSearchHit| {
+                                whole(hit)
+                                    && hit.record.point.is_some_and(|point| {
+                                        haversine_m(at.lon, at.lat, point.lon, point.lat)
+                                            <= FALLBACK_NEAR_TOWN_M
+                                    })
+                            }
+                        };
+                        if let Some(at) = first.record.point {
+                            for name in names[..town].iter().rev() {
+                                let Some(place) = seek(
+                                    name,
+                                    layers,
+                                    Some([at.lon, at.lat]),
+                                    FALLBACK_NAMESAKES,
+                                    &near(at),
+                                )?
+                                else {
+                                    break 'names Some(hits);
+                                };
+                                if !place.is_empty() {
+                                    break 'names Some(place);
+                                }
+                                let Some(place) = seek(name, layers, focus, limit, &whole)? else {
+                                    break 'names Some(hits);
+                                };
+                                let Some(there) = place.first().and_then(|hit| hit.record.point)
+                                else {
+                                    continue;
+                                };
+                                let at = Some([there.lon, there.lat]);
+                                match seek(
+                                    &names[town],
+                                    layers,
+                                    at,
+                                    FALLBACK_NAMESAKES,
+                                    &near(there),
+                                )? {
+                                    None => break 'names Some(hits),
+                                    Some(town) if !town.is_empty() => break 'names Some(place),
+                                    Some(_) => {}
+                                }
+                            }
+                        }
+                        break 'names Some(hits);
+                    }
+                    Some(Vec::new())
+                };
+                let Some(mut hits) = hits else {
+                    return Ok(Vec::new());
+                };
+                hits.truncate(limit);
+                if !hits.is_empty() {
+                    for hit in &mut hits {
+                        hit.fallback = true;
+                    }
+                    return Ok(hits);
                 }
             }
         }
@@ -8817,13 +8910,11 @@ impl QueryPlan {
     /// Plans of the areas the plan names, finest first, each with the layers
     /// an area of its kind is: its postcode (and the code a postcode written
     /// with an extension starts with), each name of each locality (see
-    /// [`TextSearcher::stated_names`], `names`), its region, its country.
+    /// [`TextSearcher::stated_names`], `names`; see [`AreaPlan::Names`]), its
+    /// region, its country.
     /// Each seeks its area in the coarser areas the plan names, and is ranked
     /// by its postcode (see [`TextSearcher::fallback`]).
-    fn area_plans(
-        &self,
-        names: impl Fn(&ContextPart) -> Option<StatedNames>,
-    ) -> Vec<(Self, &'static [Layer])> {
+    fn area_plans(&self, names: impl Fn(&ContextPart) -> Option<StatedNames>) -> Vec<AreaPlan> {
         const POSTCODE: &[Layer] = &[Layer::Postcode];
         const LOCALITY: &[Layer] = &[
             Layer::Locality,
@@ -8839,8 +8930,7 @@ impl QueryPlan {
             Label::Region => 2,
             _ => 3,
         };
-        let mut plans = Vec::new();
-        let mut add = |words: Vec<String>, label: Label, layers: &'static [Layer]| {
+        let plan = |words: Vec<String>, label: Label| {
             let context = self
                 .context
                 .iter()
@@ -8858,19 +8948,31 @@ impl QueryPlan {
                     required: true,
                 })
                 .collect();
-            plans.push((
-                Self {
-                    subject,
-                    context,
-                    ..Self::default()
-                },
+            Self {
+                subject,
+                context,
+                ..Self::default()
+            }
+        };
+        let mut plans = Vec::new();
+        let add = |plans: &mut Vec<AreaPlan>,
+                   words: Vec<String>,
+                   label: Label,
+                   layers: &'static [Layer]| {
+            plans.push(AreaPlan {
+                names: vec![plan(words, label)],
                 layers,
-            ));
+            });
         };
         for part in self.context.iter().rev().filter(|part| part.is_postcode()) {
-            add(part.words.clone(), Label::Postcode, POSTCODE);
+            add(&mut plans, part.words.clone(), Label::Postcode, POSTCODE);
             if part.words.len() > 1 {
-                add(vec![part.words[0].clone()], Label::Postcode, POSTCODE);
+                add(
+                    &mut plans,
+                    vec![part.words[0].clone()],
+                    Label::Postcode,
+                    POSTCODE,
+                );
             }
         }
         for part in self
@@ -8878,18 +8980,40 @@ impl QueryPlan {
             .iter()
             .filter(|part| part.label == Label::Locality)
         {
-            let named = names(part).map_or_else(|| vec![part.words.clone()], |names| names.names);
-            for name in named {
-                add(name, Label::Locality, LOCALITY);
-            }
+            let Some(stated) = names(part) else {
+                add(&mut plans, part.words.clone(), Label::Locality, LOCALITY);
+                continue;
+            };
+            plans.push(AreaPlan {
+                names: stated
+                    .names
+                    .into_iter()
+                    .map(|name| plan(name, Label::Locality))
+                    .collect(),
+                layers: LOCALITY,
+            });
         }
         for (label, layers) in [(Label::Region, REGION), (Label::Country, COUNTRY)] {
             for part in self.context.iter().filter(|part| part.label == label) {
-                add(part.words.clone(), label, layers);
+                add(&mut plans, part.words.clone(), label, layers);
             }
         }
         plans
     }
+}
+
+/// One step of [`TextSearcher::fallback`] (see [`QueryPlan::area_plans`]),
+/// an area or the names of one locality in the order written.
+///
+/// Of several names the town is the last found, as words of a street or
+/// building spilt into the locality come before it. A name written before
+/// the town answers when it names a place within [`FALLBACK_NEAR_TOWN_M`] of
+/// it, or of a town of the town's name. Alone it finds any namesake, and
+/// "St Just" of "Chemin de St-Just, Aubignan" is in Cornwall.
+#[derive(Debug, Clone)]
+struct AreaPlan {
+    names: Vec<QueryPlan>,
+    layers: &'static [Layer],
 }
 
 /// A house number as the address number field indexes it ("407a", "993 5").
@@ -12875,6 +12999,142 @@ mod tests {
                 "10/house_number eden/street road/street mount/locality eden/locality auckland/locality"
             ),
             ["osm:node:13"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_fallback_answers_a_name_written_before_the_town_only_near_it() {
+        use crate::record::PlaceLayer::{Locality, Neighbourhood};
+
+        let temp_dir = temp_pack_path("search-fallback-locality-runs");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut named = Vec::new();
+        let mut add_place = |writer: &mut Writer, layer, name: &'static str, id, at, context| {
+            let record = place(writer, layer, name, ObjectType::Relation, id, at, context);
+            named.push((record, vec![name.to_string()]));
+            // A place is indexed in the names of its areas known when it is written.
+            writer.set_context_names(named.iter().cloned().collect());
+            record
+        };
+        let st_just = add_place(&mut writer, Locality, "St Just", 1, [-5.68, 50.12], None);
+        let aubignan = add_place(&mut writer, Locality, "Aubignan", 2, [5.03, 44.1], None);
+        let auckland = add_place(&mut writer, Locality, "Auckland", 3, [174.76, -36.85], None);
+        let mount_eden = add_place(
+            &mut writer,
+            Neighbourhood,
+            "Mount Eden",
+            4,
+            [174.76, -36.88],
+            chain(&[(Locality, auckland)]),
+        );
+        let namesake = add_place(
+            &mut writer,
+            Locality,
+            "Mount Eden",
+            5,
+            [-85.15, 38.04],
+            None,
+        );
+        let tavros = add_place(&mut writer, Locality, "Tavros", 6, [23.69, 37.97], None);
+        let attica_estate = add_place(
+            &mut writer,
+            Locality,
+            "Attica Workers Houses",
+            8,
+            [24.04, 37.72],
+            None,
+        );
+        // A locality beside its town, in no area named for it.
+        let burleigh = add_place(&mut writer, Locality, "Burleigh", 9, [173.95, -41.51], None);
+        let blenheim = add_place(
+            &mut writer,
+            Locality,
+            "Blenheim",
+            10,
+            [173.96, -41.52],
+            None,
+        );
+        let far_burleigh = add_place(
+            &mut writer,
+            Locality,
+            "Burleigh",
+            11,
+            [153.45, -28.09],
+            None,
+        );
+        for (id, street, context) in [
+            ("osm:node:10", "Bank Square", chain(&[(Locality, st_just)])),
+            (
+                "osm:node:11",
+                "Route de Carpentras",
+                chain(&[(Locality, aubignan)]),
+            ),
+            (
+                "osm:node:12",
+                "Eden Road",
+                chain(&[(Locality, auckland), (Neighbourhood, mount_eden)]),
+            ),
+            ("osm:node:13", "Main Street", chain(&[(Locality, namesake)])),
+            ("osm:node:14", "Doridos", chain(&[(Locality, tavros)])),
+            ("osm:node:15", "Agias", chain(&[(Locality, attica_estate)])),
+            (
+                "osm:node:16",
+                "Harvard Road",
+                chain(&[(Locality, burleigh)]),
+            ),
+            (
+                "osm:node:17",
+                "Market Street",
+                chain(&[(Locality, blenheim)]),
+            ),
+            (
+                "osm:node:18",
+                "Gold Coast Highway",
+                chain(&[(Locality, far_burleigh)]),
+            ),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", "1", street, None, None).into(),
+                    context,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let fallback = |street: &str, locality: &str| {
+            searcher
+                .fallback(
+                    street,
+                    &[ContextPart::of(Label::Locality, Some(locality)).expect("part")],
+                    &Filters::default(),
+                    None,
+                    5,
+                )
+                .expect("fallback")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+
+        // Words of the street spilt into the locality, the town after them.
+        assert_eq!(
+            fallback("972 Chemin de", "St Just Aubignan"),
+            ["osm:relation:2"]
+        );
+        // A suburb in its city, not its namesake elsewhere.
+        assert_eq!(
+            fallback("999 Nowhere Lane", "Mount Eden Auckland"),
+            ["osm:relation:4"]
+        );
+        // A town and its region, which only a place named for the region names.
+        assert_eq!(fallback("2 Eirinis", "Tavros Attica"), ["osm:relation:6"]);
+        // A locality written before its town, near it.
+        assert_eq!(
+            fallback("10A Harvard Road", "Burleigh Blenheim"),
+            ["osm:relation:9"]
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
