@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use uuid::Uuid;
 
 use super::{Manifest, PACK_FILE, Reader};
@@ -23,18 +23,14 @@ pub fn resolve_pack_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let current = match fs::read_to_string(path.join(CURRENT)) {
         Ok(current) => current,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(Error::IoPath {
-                action: "no Pack at",
-                path: path.to_path_buf(),
-                source: error,
-            });
+            return Err(Error::io_path("no Pack at", path, error));
         }
         Err(error) => {
-            return Err(Error::IoPath {
-                action: "failed to read the CURRENT pointer of",
-                path: path.to_path_buf(),
-                source: error,
-            });
+            return Err(Error::io_path(
+                "failed to read the CURRENT pointer of",
+                path,
+                error,
+            ));
         }
     };
     let id = Uuid::parse_str(current.trim())
@@ -59,11 +55,11 @@ pub fn unpublished_generations(destination: &Path) -> Result<Vec<PathBuf>> {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
-            return Err(Error::IoPath {
-                action: "failed to read the generations of",
-                path: destination.to_path_buf(),
+            return Err(Error::io_path(
+                "failed to read the generations of",
+                destination,
                 source,
-            });
+            ));
         }
     };
     let mut generations = Vec::new();
@@ -80,11 +76,7 @@ pub fn unpublished_generations(destination: &Path) -> Result<Vec<PathBuf>> {
 
 pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
     let generations = destination.join(GENERATIONS);
-    fs::create_dir_all(&generations).map_err(|source| Error::IoPath {
-        action: "failed to create",
-        path: generations.clone(),
-        source,
-    })?;
+    fs::create_dir_all(&generations).at("failed to create", &generations)?;
     let generation = generations.join(Uuid::new_v4().to_string());
     fs::create_dir(&generation)?;
     Ok(generation)
@@ -150,11 +142,11 @@ pub(super) fn publish(
         // CURRENT still names the previous generation.
         *keep = false;
         let _ = fs::remove_file(&pending);
-        return Err(Error::IoPath {
-            action: "failed to publish the CURRENT pointer of",
-            path: destination.to_path_buf(),
-            source: error,
-        });
+        return Err(Error::io_path(
+            "failed to publish the CURRENT pointer of",
+            destination,
+            error,
+        ));
     }
     #[cfg(test)]
     if FAIL_AFTER_SWITCH.get() {

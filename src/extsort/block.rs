@@ -35,7 +35,7 @@ use super::{
     scratch::{Owner, Scratch, Shortfall},
 };
 use crate::{
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     util::codec::Delta,
 };
 
@@ -326,11 +326,11 @@ impl RunWriter {
                 Err(source) => {
                     scratch.release(&self.run.owner, bytes);
                     let path = self.run.chunks.back().expect("chunk").path.clone();
-                    return Err(Failure::Error(Error::IoPath {
-                        action: "failed to create scratch file",
-                        path,
+                    return Err(Failure::Error(Error::io_path(
+                        "failed to create scratch file",
+                        &path,
                         source,
-                    }));
+                    )));
                 }
             }
         }
@@ -544,11 +544,7 @@ impl Cursor {
                 return Ok(None);
             }
             let (path, position) = self.chunk.as_mut().expect("chunk");
-            let mut file = File::open(&*path).map_err(|source| Error::IoPath {
-                action: "failed to open scratch file",
-                path: path.clone(),
-                source,
-            })?;
+            let mut file = File::open(&*path).at("failed to open scratch file", &path)?;
             file.seek(SeekFrom::Start(*position))?;
             let mut header = [0u8; HEADER_BYTES];
             match read_full(&mut file, &mut header)? {

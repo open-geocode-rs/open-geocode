@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     memory::{Budget, Reservation},
 };
 
@@ -24,11 +24,7 @@ pub struct QRank {
 
 impl QRank {
     pub fn load(path: &Path, budget: &Arc<Budget>) -> Result<Self> {
-        let file = File::open(path).map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let file = File::open(path).at("failed to open", path)?;
         let mut reader = BufReader::new(file);
         let gzipped = reader.fill_buf()?.starts_with(&[0x1f, 0x8b]);
         let reader: Box<dyn Read> = if gzipped {

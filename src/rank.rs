@@ -285,11 +285,7 @@ impl Ranker {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
-                return Err(Error::IoPath {
-                    action: "failed to read",
-                    path,
-                    source,
-                });
+                return Err(Error::io_path("failed to read", &path, source));
             }
         };
         let stored: Stored = serde_json::from_slice(&text)?;
@@ -326,11 +322,7 @@ impl Ranker {
         let mut text = serde_json::to_vec(&stored)?;
         text.push(b'\n');
         let pending = path.with_extension(format!("{SIDECAR_EXTENSION}.{}", uuid::Uuid::new_v4()));
-        let failed = |action, source| Error::IoPath {
-            action,
-            path: path.clone(),
-            source,
-        };
+        let failed = |action, source| Error::io_path(action, &path, source);
         std::fs::write(&pending, &text).map_err(|source| failed("failed to write", source))?;
         std::fs::rename(&pending, &path).map_err(|source| {
             let _ = std::fs::remove_file(&pending);

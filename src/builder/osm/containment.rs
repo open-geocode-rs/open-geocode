@@ -19,7 +19,7 @@ use geo::MultiPolygon;
 use memmap2::Mmap;
 
 use crate::{
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     extsort::{Scratch, ScratchFile},
 };
 
@@ -281,18 +281,10 @@ impl Shapes {
         let map = if file.bytes() == 0 {
             None
         } else {
-            let read = File::open(&path).map_err(|source| Error::IoPath {
-                action: "failed to open boundary shape file",
-                path: path.clone(),
-                source,
-            })?;
+            let read = File::open(&path).at("failed to open boundary shape file", &path)?;
             // SAFETY: the file is this build's own scratch and is not
             // written again while mapped.
-            Some(unsafe { Mmap::map(&read) }.map_err(|source| Error::IoPath {
-                action: "failed to map boundary shape file",
-                path,
-                source,
-            })?)
+            Some(unsafe { Mmap::map(&read) }.at("failed to map boundary shape file", &path)?)
         };
         Ok(Self { map, file })
     }

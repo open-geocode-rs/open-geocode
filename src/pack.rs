@@ -27,7 +27,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1064,11 +1064,7 @@ impl Reader {
             .parent()
             .map(|dir| dir.join(AUDIT_DIR).join(REJECTIONS_FILE))
             .ok_or_else(|| Error::Inconsistent("Pack file has no parent directory".into()))?;
-        let file = fs::File::open(&path).map_err(|source| Error::IoPath {
-            action: "failed to open build audit",
-            path: path.clone(),
-            source,
-        })?;
+        let file = fs::File::open(&path).at("failed to open build audit", &path)?;
         let mut rejections = Vec::new();
         for line in BufReader::new(file).lines() {
             if limit > 0 && rejections.len() >= limit {

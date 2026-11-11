@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 pub use tantivy::directory::OwnedBytes as Bytes;
@@ -88,11 +88,7 @@ impl fmt::Debug for OpenSection {
 impl Writer {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::create(&path).map_err(|source| Error::IoPath {
-            action: "failed to create",
-            path: path.clone(),
-            source,
-        })?;
+        let file = File::create(&path).at("failed to create", &path)?;
         let mut file = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
         file.write_all(MAGIC)?;
         file.write_all(&CONTAINER_VERSION.to_le_bytes())?;
@@ -122,16 +118,9 @@ impl Writer {
         let mut file = OpenOptions::new()
             .write(true)
             .open(&path)
-            .map_err(|source| Error::IoPath {
-                action: "failed to open",
-                path: path.clone(),
-                source,
-            })?;
-        file.set_len(end).map_err(|source| Error::IoPath {
-            action: "failed to cut the table of contents of",
-            path: path.clone(),
-            source,
-        })?;
+            .at("failed to open", &path)?;
+        file.set_len(end)
+            .at("failed to cut the table of contents of", &path)?;
         file.seek(SeekFrom::Start(end))?;
         Ok(Self {
             path,
@@ -154,11 +143,7 @@ impl Writer {
         self.file
             .get_mut()
             .sync_all()
-            .map_err(|source| Error::IoPath {
-                action: "failed to sync",
-                path: self.path.clone(),
-                source,
-            })?;
+            .at("failed to sync", &self.path)?;
         Ok(State {
             offset: self.offset,
             sections: self.sections.clone(),
@@ -170,11 +155,7 @@ impl Writer {
     /// cut off.
     pub fn resume(path: impl AsRef<Path>, state: &State) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let failed = |source| Error::IoPath {
-            action: "failed to reopen",
-            path: path.clone(),
-            source,
-        };
+        let failed = |source| Error::io_path("failed to reopen", &path, source);
         let mut file = OpenOptions::new().write(true).open(&path).map_err(failed)?;
         if file.metadata().map_err(failed)?.len() < state.offset {
             return Err(Error::Truncated);
@@ -239,16 +220,8 @@ impl Writer {
 
     pub fn add_file(&mut self, name: &str, version: u32, path: &Path) -> Result<()> {
         self.begin(name, version)?;
-        let mut source = File::open(path).map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        io::copy(&mut source, self).map_err(|source| Error::IoPath {
-            action: "failed to copy into the Pack",
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mut source = File::open(path).at("failed to open", path)?;
+        io::copy(&mut source, self).at("failed to copy into the Pack", path)?;
         self.end()
     }
 
@@ -275,11 +248,7 @@ impl Writer {
         self.file.write_all(TRAILER_MAGIC)?;
         self.file.flush()?;
         let file = self.file.get_mut();
-        file.sync_all().map_err(|source| Error::IoPath {
-            action: "failed to sync",
-            path: self.path.clone(),
-            source,
-        })?;
+        file.sync_all().at("failed to sync", &self.path)?;
         Ok(file.stream_position()?)
     }
 }
@@ -320,17 +289,9 @@ impl std::fmt::Debug for Container {
 impl Container {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path).map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let file = File::open(path).at("failed to open", path)?;
         // SAFETY: Pack files are immutable once published and mapped read-only.
-        let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|source| Error::IoPath {
-            action: "failed to mmap",
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mmap = unsafe { MmapOptions::new().map(&file) }.at("failed to mmap", path)?;
         let sections = parse_toc(&mmap)?;
         Ok(Self {
             bytes: SharedMmap(Arc::new(mmap)),

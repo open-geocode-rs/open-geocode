@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use rstar::{RTree, primitives::GeomWithData};
 use tantivy::{
     Index, IndexWriter, TantivyDocument,
@@ -85,11 +85,7 @@ fn part_count(memory_bytes: usize) -> usize {
 }
 
 fn create_dir(path: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(path).map_err(|source| Error::IoPath {
-        action: "failed to create",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    fs::create_dir_all(path).at("failed to create", path)?;
     Ok(path.to_path_buf())
 }
 const LABEL: &str = "pack-text";
@@ -383,11 +379,7 @@ impl Writer {
     ) -> Result<Self> {
         let (schema, fields) = build_schema();
         let path = scratch.path().join(DIRECTORY);
-        fs::create_dir_all(&path).map_err(|source| Error::IoPath {
-            action: "failed to create",
-            path: path.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&path).at("failed to create", &path)?;
         // Tantivy writes its segments itself, so the ledger measures them
         // at checkpoints instead of reserving each write.
         scratch.watch(LABEL, &path);

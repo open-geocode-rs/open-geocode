@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, Request, State, rejection::QueryRejection},
@@ -327,11 +327,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 
     let listener = TcpListener::bind(options.bind)
         .await
-        .map_err(|source| Error::IoPath {
-            action: "failed to bind",
-            path: options.pack.clone(),
-            source,
-        })?;
+        .at("failed to bind", &options.pack)?;
     println!(
         "Serving {} at http://{}",
         options.pack.display(),

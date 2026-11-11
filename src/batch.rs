@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use csv::{ByteRecord, ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 
@@ -395,11 +395,7 @@ const SNIFF_BYTES: usize = 64 << 10;
 pub fn detect_delimiter(path: &Path) -> Result<u8> {
     let mut sample = Vec::with_capacity(SNIFF_BYTES);
     File::open(path)
-        .map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: path.to_path_buf(),
-            source,
-        })?
+        .at("failed to open", path)?
         .take(SNIFF_BYTES as u64)
         .read_to_end(&mut sample)?;
     // A line cut short by the sample's end would count against every
@@ -455,11 +451,7 @@ const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 fn starts_with_byte_order_mark(path: &Path) -> Result<bool> {
     let mut start = Vec::with_capacity(BYTE_ORDER_MARK.len());
     File::open(path)
-        .map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: path.to_path_buf(),
-            source,
-        })?
+        .at("failed to open", path)?
         .take(BYTE_ORDER_MARK.len() as u64)
         .read_to_end(&mut start)?;
     Ok(start == BYTE_ORDER_MARK)
@@ -725,22 +717,14 @@ fn create_csv(
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|source| Error::IoPath {
-            action: "failed to create",
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        std::fs::create_dir_all(parent).at("failed to create", parent)?;
     }
     let file_name = path
         .file_name()
         .ok_or_else(|| Error::BadOptions("output is not a file path".into()))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = File::create(&temporary).map_err(|source| Error::IoPath {
-        action: "failed to create",
-        path: temporary.clone(),
-        source,
-    })?;
+    let mut file = File::create(&temporary).at("failed to create", &temporary)?;
     if byte_order_mark {
         file.write_all(BYTE_ORDER_MARK)?;
     }
@@ -769,11 +753,7 @@ impl PendingCsv {
     }
 
     fn finish(mut self) -> Result<()> {
-        self.writer.flush().map_err(|source| Error::IoPath {
-            action: "failed to flush",
-            path: self.path.clone(),
-            source,
-        })?;
+        self.writer.flush().at("failed to flush", &self.path)?;
         std::fs::rename(&self.temporary, &self.path)?;
         self.finished = true;
         Ok(())
@@ -793,11 +773,7 @@ impl Drop for PendingCsv {
 fn ensure_distinct_paths(input: &Path, output: &Path, audit: Option<&Path>) -> Result<()> {
     let resolve = |path: &Path| -> Result<PathBuf> {
         if path.exists() {
-            return path.canonicalize().map_err(|source| Error::IoPath {
-                action: "failed to resolve",
-                path: path.to_path_buf(),
-                source,
-            });
+            return path.canonicalize().at("failed to resolve", path);
         }
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
