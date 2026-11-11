@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::{
     builder::addresses::{AddressFile, AddressSource, Coverage},
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
 };
 
 pub const TOKEN_VARIABLE: &str = "OA_TOKEN";
@@ -111,7 +111,7 @@ impl OpenAddresses {
             return Ok(path);
         }
         let parent = path.parent().expect("cache files have a directory");
-        fs::create_dir_all(parent).map_err(|error| io_error("failed to create", parent, error))?;
+        fs::create_dir_all(parent).at("failed to create", parent)?;
         let url = format!("{API}/job/{}/output/source.geojson.gz", source.job);
         // Written beside its final name, so an interrupted download is never
         // taken for a cached one.
@@ -127,7 +127,7 @@ impl OpenAddresses {
                 },
             }
         }
-        fs::rename(&partial, &path).map_err(|error| io_error("failed to move", &partial, error))?;
+        fs::rename(&partial, &path).at("failed to move", &partial)?;
         Ok(path)
     }
 
@@ -150,18 +150,22 @@ impl OpenAddresses {
                 }
                 error => Attempt::Again(fetch_error(url, error)),
             })?;
-        let mut file = BufWriter::new(
-            File::create(partial)
-                .map_err(|error| Attempt::Final(io_error("failed to create", partial, error)))?,
-        );
+        let mut file =
+            BufWriter::new(File::create(partial).map_err(|error| {
+                Attempt::Final(Error::io_path("failed to create", partial, error))
+            })?);
         io::copy(&mut response.body_mut().as_reader(), &mut file)
             .map_err(|error| Attempt::Again(fetch_error(url, error)))?;
         file.into_inner()
             .map_err(|error| {
-                Attempt::Final(io_error("failed to write", partial, error.into_error()))
+                Attempt::Final(Error::io_path(
+                    "failed to write",
+                    partial,
+                    error.into_error(),
+                ))
             })?
             .sync_all()
-            .map_err(|error| Attempt::Final(io_error("failed to write", partial, error)))
+            .map_err(|error| Attempt::Final(Error::io_path("failed to write", partial, error)))
     }
 }
 
@@ -229,8 +233,7 @@ impl Collection {
 
     /// Every address source in the archive, with the entry that holds it.
     fn listed(&self) -> Result<Vec<(Source, String)>> {
-        let file = File::open(&self.path)
-            .map_err(|error| io_error("failed to open", &self.path, error))?;
+        let file = File::open(&self.path).at("failed to open", &self.path)?;
         let bad = |detail: String| Error::BadInput(format!("{}: {detail}", self.path.display()));
         let mut archive = zip::ZipArchive::new(io::BufReader::new(file))
             .map_err(|error| bad(format!("not a readable zip archive: {error}")))?;
@@ -389,14 +392,6 @@ fn fetch_error(url: &str, error: impl std::fmt::Display) -> Error {
     Error::Fetch {
         url: url.to_string(),
         message: error.to_string(),
-    }
-}
-
-fn io_error(action: &'static str, path: &Path, source: io::Error) -> Error {
-    Error::IoPath {
-        action,
-        path: path.to_path_buf(),
-        source,
     }
 }
 

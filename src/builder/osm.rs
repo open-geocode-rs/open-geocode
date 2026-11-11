@@ -83,7 +83,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use rayon::prelude::*;
 
 use crate::{
@@ -605,11 +605,7 @@ impl<'a> Run<'a> {
                 )?;
                 file.sync_all()
             })
-            .map_err(|source| Error::IoPath {
-                action: "failed to write",
-                path: pointer,
-                source,
-            })?;
+            .at("failed to write", &pointer)?;
         let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
         let mut build = Build {
             report: BuilderReport {
@@ -657,11 +653,8 @@ impl<'a> Run<'a> {
         mut fingerprint: Fingerprint,
         found: &Found,
     ) -> Result<Self> {
-        let manifest = fs::read(found.manifest()).map_err(|source| Error::IoPath {
-            action: "failed to read the build checkpoint",
-            path: found.manifest(),
-            source,
-        })?;
+        let path = found.manifest();
+        let manifest = fs::read(&path).at("failed to read the build checkpoint", &path)?;
         let manifest: Manifest<State> = serde_json::from_slice(&manifest)?;
         if manifest.format != FORMAT_VERSION {
             return Err(Error::BadOptions(
@@ -1999,11 +1992,7 @@ impl<'a> Run<'a> {
         } = self;
         audit.finish(&report)?;
         let pointer = sealed.generation().join(SCRATCH_POINTER_FILE);
-        fs::remove_file(&pointer).map_err(|source| Error::IoPath {
-            action: "failed to remove",
-            path: pointer,
-            source,
-        })?;
+        fs::remove_file(&pointer).at("failed to remove", &pointer)?;
         drop(scratch);
         sealed.publish()?;
         Ok(report)
@@ -3043,17 +3032,9 @@ struct Audit {
 impl Audit {
     fn create(generation: &Path) -> Result<Self> {
         let dir = generation.join(AUDIT_DIR);
-        fs::create_dir_all(&dir).map_err(|source| Error::IoPath {
-            action: "failed to create",
-            path: dir.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&dir).at("failed to create", &dir)?;
         let path = dir.join(REJECTIONS_FILE);
-        let file = File::create(&path).map_err(|source| Error::IoPath {
-            action: "failed to create",
-            path: path.clone(),
-            source,
-        })?;
+        let file = File::create(&path).at("failed to create", &path)?;
         Ok(Self {
             dir,
             rejections: BufWriter::with_capacity(1 << 20, file),
@@ -3066,11 +3047,7 @@ impl Audit {
     fn reopen(generation: &Path, state: &AuditState) -> Result<Self> {
         let dir = generation.join(AUDIT_DIR);
         let path = dir.join(REJECTIONS_FILE);
-        let failed = |source| Error::IoPath {
-            action: "failed to reopen",
-            path: path.clone(),
-            source,
-        };
+        let failed = |source| Error::io_path("failed to reopen", &path, source);
         let mut file = fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -3105,11 +3082,7 @@ impl Audit {
     fn finish(mut self, report: &BuilderReport) -> Result<()> {
         self.rejections.flush()?;
         let path = self.dir.join(BUILD_REPORT_FILE);
-        let file = File::create(&path).map_err(|source| Error::IoPath {
-            action: "failed to create",
-            path: path.clone(),
-            source,
-        })?;
+        let file = File::create(&path).at("failed to create", &path)?;
         serde_json::to_writer_pretty(BufWriter::new(file), report).map_err(Error::from)
     }
 }

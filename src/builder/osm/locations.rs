@@ -384,11 +384,7 @@ impl MappedSlots {
         let owner = scratch.owner(LOCATIONS_LABEL);
         scratch.reserve(&owner, bytes)?;
         let path = scratch.new_file(LOCATIONS_LABEL);
-        let io = |source| Error::IoPath {
-            action: "failed to create node location file",
-            path: path.clone(),
-            source,
-        };
+        let io = |source| Error::io_path("failed to create node location file", &path, source);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -432,11 +428,7 @@ impl MappedSlots {
     /// The file a checkpoint saved, `len` coordinates in it, mapped again.
     fn reopen(scratch: &Arc<Scratch>, name: &str, len: usize) -> Result<Self> {
         let path = scratch.path().join(name);
-        let failed = |source| Error::IoPath {
-            action: "failed to reopen node location file",
-            path: path.clone(),
-            source,
-        };
+        let failed = |source| Error::io_path("failed to reopen node location file", &path, source);
         let file = OpenOptions::new()
             .read(true)
             .write(true)

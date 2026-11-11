@@ -35,7 +35,7 @@ use tantivy::DocId;
 
 use crate::{
     container::{Bytes, Container},
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     pack,
     parse::lattice::automaton_builder,
     search::TextSearcher,
@@ -279,11 +279,7 @@ impl Place {
 type Visit<'a> = dyn FnMut(&[u8], &[u8], u64) -> bool + 'a;
 
 fn map_file(path: &Path) -> Result<Mmap> {
-    let file = fs::File::open(path).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file = fs::File::open(path).at("failed to open", path)?;
     // SAFETY: a build's scratch file, written before it is mapped and
     // removed after the Pack holds it.
     Ok(unsafe { Mmap::map(&file)? })

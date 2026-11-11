@@ -26,7 +26,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     record::{
         AddressComponents, AddressRecord, LocationPrecision, SourceProvenance, point_geometry,
     },
@@ -81,11 +81,7 @@ impl AddressFile {
             Some(entry) => Ok(zip_entry(&self.path, entry)?.compressed_bytes),
             None => std::fs::metadata(&self.path)
                 .map(|metadata| metadata.len())
-                .map_err(|source| Error::IoPath {
-                    action: "failed to read",
-                    path: self.path.clone(),
-                    source,
-                }),
+                .at("failed to read", &self.path),
         }
     }
 
@@ -107,11 +103,7 @@ struct ZipEntry {
 
 /// Find `entry` in the archive's central directory.
 fn zip_entry(path: &Path, entry: &str) -> Result<ZipEntry> {
-    let file = File::open(path).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file = File::open(path).at("failed to open", path)?;
     let bad = |detail: String| Error::BadInput(format!("{}: {detail}", path.display()));
     let mut archive = zip::ZipArchive::new(BufReader::new(file))
         .map_err(|error| bad(format!("not a readable zip archive: {error}")))?;
@@ -373,11 +365,7 @@ fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead>> {
         compressed_bytes,
         deflated,
     } = zip_entry(path, entry)?;
-    let failed = |source| Error::IoPath {
-        action: "failed to read",
-        path: path.to_path_buf(),
-        source,
-    };
+    let failed = |source| Error::io_path("failed to read", path, source);
     let mut file = File::open(path).map_err(failed)?;
     file.seek(SeekFrom::Start(data_start)).map_err(failed)?;
     let data = BufReader::with_capacity(1 << 20, file).take(compressed_bytes);
@@ -393,11 +381,7 @@ fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead>> {
 
 /// The file's text, gunzipped when it starts with the gzip magic.
 fn open(path: &Path) -> Result<Box<dyn BufRead>> {
-    let failed = |source| Error::IoPath {
-        action: "failed to open",
-        path: path.to_path_buf(),
-        source,
-    };
+    let failed = |source| Error::io_path("failed to open", path, source);
     let mut magic = [0; 2];
     let gzipped = File::open(path)
         .map_err(failed)?

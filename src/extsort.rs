@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::util::codec::Delta;
 use crate::{
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     memory::{Budget, Reservation, Spillable},
     util::codec::{get_delta, get_u64, put_delta, put_u64},
 };
@@ -748,18 +748,10 @@ pub struct IndexedState {
 impl<T> IndexedSpoolFile<T> {
     fn map(file: ScratchFile, offsets: Vec<u64>, saved: Option<ScratchFile>) -> Result<Self> {
         let path = file.path().to_path_buf();
-        let read = File::open(&path).map_err(|source| Error::IoPath {
-            action: "failed to open scratch file",
-            path: path.clone(),
-            source,
-        })?;
+        let read = File::open(&path).at("failed to open scratch file", &path)?;
         // SAFETY: the scratch file is this build's own and is not written
         // again while mapped.
-        let map = unsafe { memmap2::Mmap::map(&read) }.map_err(|source| Error::IoPath {
-            action: "failed to map scratch file",
-            path,
-            source,
-        })?;
+        let map = unsafe { memmap2::Mmap::map(&read) }.at("failed to map scratch file", &path)?;
         Ok(Self {
             map: Some(map),
             file,

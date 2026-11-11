@@ -5,7 +5,10 @@
 //! are what `http::problem` maps to status codes, so a new variant has to be
 //! classified there before it compiles.
 
-use std::{borrow::Cow, path::PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 /// Anything the library can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -194,5 +197,59 @@ impl Error {
                 | Self::BadOptions(_)
                 | Self::MissingColumn { .. }
         )
+    }
+
+    pub(crate) fn io_path(
+        action: &'static str,
+        path: impl AsRef<Path>,
+        source: std::io::Error,
+    ) -> Self {
+        Self::IoPath {
+            action,
+            path: path.as_ref().to_path_buf(),
+            source,
+        }
+    }
+}
+
+/// Puts the path on an io failure as [`Error::IoPath`], so no call site spells
+/// the variant out by hand or leaves the path off.
+pub(crate) trait IoPathExt<T> {
+    fn at(self, action: &'static str, path: impl AsRef<Path>) -> Result<T>;
+}
+
+impl<T> IoPathExt<T> for std::io::Result<T> {
+    fn at(self, action: &'static str, path: impl AsRef<Path>) -> Result<T> {
+        self.map_err(|source| Error::io_path(action, path, source))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn at_names_the_action_and_path_of_an_io_failure() {
+        let failed: io::Result<()> = Err(io::ErrorKind::NotFound.into());
+        let error = failed
+            .at("failed to open", Path::new("/packs/monaco"))
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::IoPath { action: "failed to open", path, source }
+                if path == Path::new("/packs/monaco") && source.kind() == io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            error.to_string(),
+            "failed to open /packs/monaco: entity not found"
+        );
+    }
+
+    #[test]
+    fn at_passes_a_success_through() {
+        let read: io::Result<u32> = Ok(7);
+        assert_eq!(read.at("failed to read", "/packs/monaco").unwrap(), 7);
     }
 }

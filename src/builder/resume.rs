@@ -61,11 +61,7 @@ pub struct FileStamp {
 
 impl FileStamp {
     pub fn of(path: &Path) -> Result<Self> {
-        let failed = |source| Error::IoPath {
-            action: "failed to read",
-            path: path.to_path_buf(),
-            source,
-        };
+        let failed = |source| Error::io_path("failed to read", path, source);
         let mut file = File::open(path).map_err(failed)?;
         let metadata = file.metadata().map_err(failed)?;
         let bytes = metadata.len();
@@ -324,11 +320,11 @@ pub fn clear(found: &Found) -> Result<()> {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(Error::IoPath {
-                    action: "failed to clear the stopped build at",
-                    path: path.clone(),
+                return Err(Error::io_path(
+                    "failed to clear the stopped build at",
+                    path,
                     source,
-                });
+                ));
             }
         }
     }

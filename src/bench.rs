@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{IoPathExt, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -248,11 +248,7 @@ fn read_fixture(path: Option<&Path>) -> Result<BenchmarkFixture> {
     let Some(path) = path else {
         return Ok(BenchmarkFixture::default());
     };
-    let file = fs::File::open(path).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file = fs::File::open(path).at("failed to open", path)?;
     Ok(serde_json::from_reader(file)?)
 }
 
@@ -294,11 +290,7 @@ fn read_build_report(pack_file: &Path) -> Result<Option<BuilderReport>> {
     else {
         return Ok(None);
     };
-    let file = fs::File::open(&path).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: path.clone(),
-        source,
-    })?;
+    let file = fs::File::open(&path).at("failed to open", &path)?;
     Ok(Some(serde_json::from_reader(file)?))
 }
 

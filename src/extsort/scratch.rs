@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     builder::BuildCancelled,
-    error::{Error, Result},
+    error::{Error, IoPathExt, Result},
     resources,
 };
 
@@ -255,11 +255,7 @@ impl From<Shortfall> for Error {
 impl Scratch {
     pub fn create(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
         let path = path.into();
-        fs::create_dir_all(&path).map_err(|source| Error::IoPath {
-            action: "failed to create scratch directory",
-            path: path.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&path).at("failed to create scratch directory", &path)?;
         Ok(Arc::new(Self::with_counter(path, 0)))
     }
 
@@ -275,15 +271,7 @@ impl Scratch {
     ) -> Result<Arc<Self>> {
         let path = path.into();
         let named = files.iter().collect::<HashSet<_>>();
-        let io = |action: &'static str, path: &Path| {
-            let path = path.to_path_buf();
-            move |source| Error::IoPath {
-                action,
-                path,
-                source,
-            }
-        };
-        for entry in fs::read_dir(&path).map_err(io("failed to read scratch directory", &path))? {
+        for entry in fs::read_dir(&path).at("failed to read scratch directory", &path)? {
             let entry = entry?;
             let found = entry.path();
             if entry.file_name() == MANIFEST_FILE || named.contains(&found) {
@@ -294,7 +282,7 @@ impl Scratch {
             } else {
                 fs::remove_file(&found)
             };
-            removed.map_err(io("failed to remove leftover scratch", &found))?;
+            removed.at("failed to remove leftover scratch", &found)?;
         }
         let scratch = Self::with_counter(path, next_file);
         {
@@ -533,11 +521,7 @@ impl Scratch {
     /// it while the last checkpoint names it.
     pub fn remove_dir(&self, path: &Path) -> Result<()> {
         if !self.retire(path, directory_bytes(path)) {
-            fs::remove_dir_all(path).map_err(|source| Error::IoPath {
-                action: "failed to remove",
-                path: path.to_path_buf(),
-                source,
-            })?;
+            fs::remove_dir_all(path).at("failed to remove", path)?;
         }
         self.unwatch(path);
         Ok(())
@@ -593,11 +577,7 @@ impl Scratch {
         }
         let pending = self.path.join(format!("{MANIFEST_FILE}.pending"));
         let target = self.path.join(MANIFEST_FILE);
-        let io = |source| Error::IoPath {
-            action: "failed to write the build checkpoint",
-            path: target.clone(),
-            source,
-        };
+        let io = |source| Error::io_path("failed to write the build checkpoint", &target, source);
         let mut file = File::create(&pending).map_err(io)?;
         file.write_all(manifest).map_err(io)?;
         file.sync_all().map_err(io)?;
@@ -881,11 +861,7 @@ fn remove_path(path: &Path) {
 /// Flush `path` to the disk: a file, or every file of a directory and of
 /// the directories below it.
 fn sync_path(path: &Path) -> Result<()> {
-    let io = |source| Error::IoPath {
-        action: "failed to sync scratch file",
-        path: path.to_path_buf(),
-        source,
-    };
+    let io = |source| Error::io_path("failed to sync scratch file", path, source);
     if path.is_dir() {
         for entry in fs::read_dir(path).map_err(io)? {
             sync_path(&entry.map_err(io)?.path())?;
@@ -959,11 +935,9 @@ impl ScratchFile {
     /// `label`'s.
     pub fn create(scratch: &Arc<Scratch>, label: &str, name: &str) -> Result<Self> {
         let path = scratch.path().join(name);
-        let file = scratch.create_file(&path).map_err(|source| Error::IoPath {
-            action: "failed to create scratch file",
-            path: path.clone(),
-            source,
-        })?;
+        let file = scratch
+            .create_file(&path)
+            .at("failed to create scratch file", &path)?;
         Ok(Self {
             file: Some(file),
             path,
@@ -977,11 +951,7 @@ impl ScratchFile {
     /// after them.
     pub fn reopen(scratch: &Arc<Scratch>, label: &str, name: &str, bytes: u64) -> Result<Self> {
         let path = scratch.path().join(name);
-        let failed = |source| Error::IoPath {
-            action: "failed to reopen scratch file",
-            path: path.clone(),
-            source,
-        };
+        let failed = |source| Error::io_path("failed to reopen scratch file", &path, source);
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)

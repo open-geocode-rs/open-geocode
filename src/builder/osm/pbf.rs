@@ -10,7 +10,7 @@ use std::{
     time::Instant,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, IoPathExt, Result};
 use osmpbf::{Blob, BlobDecode, BlobReader, ByteOffset, PrimitiveBlock};
 use rayon::prelude::*;
 
@@ -47,11 +47,7 @@ where
         None => input_bytes(input)?,
     };
     progress.start(stage, Some(total))?;
-    let file = File::open(input).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: input.to_path_buf(),
-        source,
-    })?;
+    let file = File::open(input).at("failed to open", input)?;
     let read_bytes = Arc::new(AtomicU64::new(0));
     let reader = Buffered {
         inner: BufReader::with_capacity(
@@ -138,11 +134,7 @@ where
 /// states it, in seconds since the Unix epoch. `None` when the header does
 /// not say; Geofabrik and planet extracts do.
 pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
-    let file = File::open(input).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: input.to_path_buf(),
-        source,
-    })?;
+    let file = File::open(input).at("failed to open", input)?;
     let mut blobs = BlobReader::new(BufReader::new(file));
     let Some(blob) = blobs.next() else {
         return Ok(None);
@@ -157,11 +149,7 @@ pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
 /// The bounding box the extract's header states, `[min_lon, min_lat, max_lon,
 /// max_lat]`; Geofabrik sets it to the bounds of the extract's polygon.
 pub(crate) fn header_bbox(input: &Path) -> Result<Option<[f64; 4]>> {
-    let file = File::open(input).map_err(|source| Error::IoPath {
-        action: "failed to open",
-        path: input.to_path_buf(),
-        source,
-    })?;
+    let file = File::open(input).at("failed to open", input)?;
     let mut blobs = BlobReader::new(BufReader::new(file));
     let Some(blob) = blobs.next() else {
         return Ok(None);
