@@ -11024,6 +11024,35 @@ mod tests {
     }
 
     #[test]
+    fn a_street_with_its_ordinal_written_out_is_the_numbered_street() {
+        let temp_dir = temp_pack_path("search-spelled-ordinals");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, number, street) in [
+            ("osm:node:1", "350", "5th Avenue"),
+            ("osm:node:2", "200", "Fifth Street"),
+            ("osm:node:3", "350", "Main Street"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", number, street, None, None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(top_ids(&searcher, "350 Fifth Avenue"), ["osm:node:1"]);
+        assert_eq!(top_ids(&searcher, "200 5th St"), ["osm:node:2"]);
+        assert_eq!(
+            geocode(&searcher, "350 Fifth Ave", None, None).as_deref(),
+            Some("osm:node:1")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn a_long_word_with_its_second_and_third_letters_swapped_is_one_typo() {
         let temp_dir = temp_pack_path("search-swapped-letters");
         let _ = std::fs::remove_dir_all(&temp_dir);
