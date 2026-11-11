@@ -108,7 +108,7 @@ geojson = "1.0"
 # already in the tree through ureq's url.
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_properties = "2.3"
-indicatif = "0.17"
+indicatif = "0.18"
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"
 # Checks a downloaded extract against the MD5 sum Geofabrik publishes.
@@ -158,7 +158,7 @@ ureq = { version = "3.4.2", features = ["json"] }
 utoipa = { version = "6.0.0", features = ["axum_extras", "preserve_order"] }
 uuid = { version = "1", features = ["v4"] }
 # Reads OpenAddresses collection archives without unpacking them.
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # Compresses build scratch blocks: 2-5x less spill disk and I/O at zstd-1
 # speeds far above the scratch disk's. Already in the tree through Tantivy.

@@ -127,8 +127,11 @@ fn zip_entry(path: &Path, entry: &str) -> Result<ZipEntry> {
             )));
         }
     };
+    let data_start = found
+        .data_start()
+        .ok_or_else(|| bad(format!("{entry} has no local header")))?;
     Ok(ZipEntry {
-        data_start: found.data_start(),
+        data_start,
         compressed_bytes: found.compressed_size(),
         deflated,
     })
