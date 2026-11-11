@@ -2632,6 +2632,19 @@ fn find_repeated_houses(
         houses.push(address?.house(at as u64))?;
     }
     let mut verdicts = ExternalSorter::new(scratch, "house-verdicts", memory, budget);
+    // Dropped rows find their file by dataset id, not by name. A planet
+    // build drops 332 million rows from 3,141 files. Scanning names per row
+    // costs 3.2e11 string comparisons on this one thread.
+    let import_of = datasets
+        .names()
+        .iter()
+        .map(|name| {
+            report
+                .imports
+                .iter()
+                .position(|import| import.dataset == *name)
+        })
+        .collect::<Vec<_>>();
     let mut kept: Vec<House> = Vec::new();
     for house in houses.finish()? {
         let house = house?;
@@ -2671,12 +2684,10 @@ fn find_repeated_houses(
             verdicts.push((at, DISPUTED))?;
         }
         verdicts.push((house.at, DROPPED))?;
-        let dataset = datasets.name(house.dataset)?;
-        if let Some(import) = report
-            .imports
-            .iter_mut()
-            .find(|import| import.dataset == dataset)
-        {
+        let import = *import_of
+            .get(house.dataset as usize)
+            .ok_or(Error::Decode("unknown address dataset"))?;
+        if let Some(import) = import.and_then(|at| report.imports.get_mut(at)) {
             if repeated {
                 import.duplicates += 1;
             } else {
@@ -3764,6 +3775,68 @@ mod tests {
             kept(&["openaddresses:lots:row:3", "openaddresses:register:row:1"]),
             [true],
             "one record of 30, disputed"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A dropped row counts on the first file of its dataset, whatever ids
+    /// the datasets got. A file with no address takes none, and a second
+    /// file of a dataset adds to the first one's counts.
+    #[test]
+    fn a_dropped_row_counts_on_the_first_file_of_its_dataset() {
+        let dir = temp_dir("dropped-row-file");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let file = |name: &str, dataset: &str, rows: &str| {
+            let path = dir.join(format!("{name}.csv"));
+            fs::write(&path, format!("LON,LAT,NUMBER,STREET,CITY\n{rows}")).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:{dataset}"),
+                path,
+                entry: None,
+                area: None,
+            }
+        };
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file("empty", "empty", "-79.40,43.600,,King Street,Toronto\n"),
+                file(
+                    "lots",
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n\
+                     -79.40,43.604,20,King Street,Toronto\n\
+                     -79.40,43.600,30,King Street,Toronto\n",
+                ),
+                file(
+                    "register",
+                    "register",
+                    "-79.40,43.604,30,King Street,Toronto\n",
+                ),
+                file(
+                    "lots-again",
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n",
+                ),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let counts = report
+            .imports
+            .iter()
+            .map(|import| (import.dataset.as_str(), import.duplicates, import.disputes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            [
+                ("openaddresses:empty", 0, 0),
+                ("openaddresses:lots", 2, 0),
+                ("openaddresses:register", 0, 1),
+                ("openaddresses:lots", 0, 0),
+            ]
         );
         let _ = fs::remove_dir_all(dir);
     }
