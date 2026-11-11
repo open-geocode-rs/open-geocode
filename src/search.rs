@@ -232,8 +232,9 @@ pub struct AddressGeocodeHit {
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 /// How long a query searches before it answers with the best it found: the
-/// readings run best first, so what the budget cuts off is the least
-/// likely to answer, and the tail of slow queries ends here.
+/// readings run best first, each in its localities before any out of them,
+/// so what the budget cuts off is the least likely to answer, and the tail
+/// of slow queries ends here.
 #[cfg(not(test))]
 pub const SEARCH_BUDGET: Duration = Duration::from_millis(300);
 /// Tests run unoptimised on a loaded machine: a clock would make their
@@ -3913,6 +3914,12 @@ impl TextSearcher {
 
     /// Search `readings[range]` into `pool`, best first, each search only
     /// when it could outweigh the best [`Evidence`] found so far.
+    ///
+    /// Every reading is searched in its localities before any is searched
+    /// out of them, as a stricter pass outweighs any reading's score. An
+    /// open search of a reading that cut the street wrong ("34 r de" in
+    /// "luxembourg roedgen") can match millions of records for seconds. Run
+    /// first, it spends the budget the next reading needs to answer.
     fn gather(
         &self,
         readings: &[Reading],
@@ -3923,12 +3930,12 @@ impl TextSearcher {
         pool: &mut Pool,
     ) -> Result<()> {
         let mut best = None::<Evidence>;
-        for index in range {
-            let reading = &readings[index];
-            if best.is_some_and(|held| !held.open()) {
-                break;
-            }
-            for scope in Scope::ALL {
+        for scope in Scope::ALL {
+            for index in range.clone() {
+                let reading = &readings[index];
+                if best.is_some_and(|held| !held.open()) {
+                    return Ok(());
+                }
                 if !scope.searches(&reading.plan) {
                     continue;
                 }
@@ -12340,6 +12347,70 @@ mod tests {
             }
         }
         contradicted
+    }
+
+    #[test]
+    fn every_reading_is_searched_in_its_localities_before_any_out_of_them() {
+        let pack = TempPack::new("search-scoped-readings-first");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        for (id, street, locality) in [
+            ("osm:node:1", "Rue de Dover", "Ashford"),
+            ("osm:node:2", "Rue de Paris", "Dover"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", "12", street, Some(locality), None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        // The parser's best reading cuts the street short, so Dover is read
+        // as a second town and nothing lies in both.
+        let readings = [
+            "12/house_number rue/street de/street dover/locality ashford/locality",
+            "12/house_number rue/street de/street dover/street ashford/locality",
+        ]
+        .map(|text| Reading {
+            text: text.to_string(),
+            plan: reading_plan(&searcher, text),
+            score: 0.0,
+            pieces: tagged(text),
+        });
+        let query_words = QueryWords::new("12 Rue de Dover, Ashford");
+        let placed = HashSet::new();
+        let search = Search {
+            placed: &placed,
+            query_words: &query_words,
+            filters: Filters::default(),
+            focus: None,
+            limit: 5,
+        };
+        let pooled = |searches: usize| {
+            let session = Session::new(SEARCH_BUDGET);
+            session.searches.set(MAX_SEARCHES - searches);
+            let mut pool = Pool::default();
+            searcher
+                .gather(
+                    &readings,
+                    0..readings.len(),
+                    &search,
+                    &session,
+                    &mut |_, _, _, _| Ok(true),
+                    &mut pool,
+                )
+                .expect("gather");
+            pool.candidates
+                .iter()
+                .map(|candidate| (candidate.reading, candidate.hit.record.id.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // Two searches left reach the second reading in its town, not the
+        // first reading out of its towns.
+        assert_eq!(pooled(2), [(1, "osm:node:1".to_string())]);
+        assert_eq!(pooled(MAX_SEARCHES), [(1, "osm:node:1".to_string())]);
     }
 
     /// A place record, an area when `object_type` is a relation, else a
