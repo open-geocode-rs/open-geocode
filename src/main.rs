@@ -874,6 +874,7 @@ fn address_files_of(files: &[String]) -> Result<Vec<AddressFile>> {
                 dataset,
                 path,
                 entry: None,
+                area: None,
             })
         })
         .collect()

@@ -491,6 +491,9 @@ impl Writer {
             dictionaries,
             ..
         } = self;
+        // Merging the text index's segments is most of the sealing, and on
+        // one thread: it starts now, beside the parts sealed before it.
+        let text = Merging::start(text);
         let mut pack = container::Writer::create(generation.path.join(PACK_FILE))?;
         let counts = SealCounts {
             record_count: records.record_count(),
@@ -539,12 +542,79 @@ pub struct Sealing {
     scratch: Arc<Scratch>,
     pack: container::Writer,
     records: Option<records::Writer>,
-    text: Option<text_index::Writer>,
+    text: Option<Merging>,
     spatial: Option<spatial_index::Writer>,
     counts: SealCounts,
     /// Last, so it drops after every writer of a file in it (see
     /// [`Generation`]'s drop).
     generation: Generation,
+}
+
+/// The text index, its segments merging on a thread of their own until the
+/// index is asked for.
+#[derive(Debug)]
+struct Merging {
+    path: PathBuf,
+    state: MergeState,
+}
+
+#[derive(Debug)]
+enum MergeState {
+    Running(std::thread::JoinHandle<(text_index::Writer, Result<()>)>),
+    Done(Box<text_index::Writer>),
+    /// The merge failed or panicked, and its error was handed on.
+    Failed,
+}
+
+impl Merging {
+    fn start(mut text: text_index::Writer) -> Self {
+        Self {
+            path: text.path().to_path_buf(),
+            state: MergeState::Running(std::thread::spawn(move || {
+                let merged = text.merge();
+                (text, merged)
+            })),
+        }
+    }
+
+    /// The index once its merge is over.
+    fn writer(&mut self) -> Result<&mut text_index::Writer> {
+        if matches!(self.state, MergeState::Running(_))
+            && let MergeState::Running(merging) =
+                std::mem::replace(&mut self.state, MergeState::Failed)
+        {
+            let (text, merged) = merging
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            merged?;
+            self.state = MergeState::Done(Box::new(text));
+        }
+        match &mut self.state {
+            MergeState::Done(text) => Ok(text),
+            _ => Err(Error::Inconsistent(
+                "the text index was asked for after its merge failed".into(),
+            )),
+        }
+    }
+
+    fn into_writer(mut self) -> Result<text_index::Writer> {
+        self.writer()?;
+        match std::mem::replace(&mut self.state, MergeState::Failed) {
+            MergeState::Done(text) => Ok(*text),
+            _ => unreachable!("the merge is over"),
+        }
+    }
+}
+
+impl Drop for Merging {
+    /// A sealing dropped on an error waits for the merge: the scratch it
+    /// writes to goes only after it.
+    fn drop(&mut self) {
+        if let MergeState::Running(merging) = std::mem::replace(&mut self.state, MergeState::Failed)
+        {
+            let _ = merging.join();
+        }
+    }
 }
 
 /// What the Pack manifest counts, gathered as the parts are sealed.
@@ -575,28 +645,11 @@ impl Sealing {
     pub fn seal_part(&mut self) -> Result<Option<&'static str>> {
         self.scratch.check_cancelled()?;
         if let Some(records) = self.records.take() {
-            // The text index is sealed next, and merging its segments is most
-            // of that: it merges on threads of its own while the records are
-            // copied in.
-            let (copied, merged) = std::thread::scope(|scope| {
-                let merging = self
-                    .text
-                    .as_mut()
-                    .map(|text| scope.spawn(move || text.merge()));
-                let copied = records.finish(&mut self.pack);
-                let merged = merging.map(|merging| {
-                    merging
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                });
-                (copied, merged)
-            });
-            copied?;
-            merged.transpose()?;
+            records.finish(&mut self.pack)?;
             return Ok(Some("records"));
         }
         if let Some(text) = self.text.take() {
-            self.counts.text = Some(text.finish(&mut self.pack)?);
+            self.counts.text = Some(text.into_writer()?.finish(&mut self.pack)?);
             return Ok(Some("text index"));
         }
         if let Some(spatial) = self.spatial.take() {
@@ -615,11 +668,10 @@ impl Sealing {
                 .as_mut()
                 .map(records::Writer::state)
                 .transpose()?,
-            text: self
-                .text
-                .as_mut()
-                .map(text_index::Writer::state)
-                .transpose()?,
+            text: match &mut self.text {
+                Some(text) => Some(text.writer()?.state()?),
+                None => None,
+            },
             spatial: match &mut self.spatial {
                 Some(spatial) => Some(spatial.state(&self.scratch)?),
                 None => None,
@@ -635,7 +687,7 @@ impl Sealing {
             files.extend(records.files());
         }
         if let Some(text) = &self.text {
-            files.push(text.path().to_path_buf());
+            files.push(text.path.clone());
         }
         if let Some(spatial) = &self.spatial {
             files.extend(spatial.files());
@@ -668,6 +720,7 @@ impl Sealing {
                         options.text_index_memory_bytes,
                         text,
                     )
+                    .map(Merging::start)
                 })
                 .transpose()?,
             spatial: state

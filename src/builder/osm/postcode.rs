@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use rayon::prelude::*;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{
@@ -20,7 +21,12 @@ const SAMPLE_POINTS: usize = 16;
 /// "2110" apart, and a country split over two extracts makes one of each code.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Accumulator {
-    groups: BTreeMap<(Option<CountryCode>, String), Group>,
+    /// Where each postcode's group is in `groups`.
+    index: BTreeMap<(Option<CountryCode>, String), usize>,
+    groups: Vec<Group>,
+    /// Addresses come in street order, where neighbours mostly state the
+    /// same postcode: the last one as stated, and its group if it has one.
+    last: Option<(Option<CountryCode>, String, Option<usize>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,23 +45,55 @@ impl Accumulator {
         postcode: Option<&str>,
         [lon, lat]: [f64; 2],
     ) {
-        let Some(postcode) = postcode.and_then(clean_postcode) else {
+        let Some(stated) = postcode else {
             return;
         };
-        let group = self.groups.entry((country, postcode)).or_default();
+        let at = match &self.last {
+            Some((last_country, last_stated, at))
+                if *last_country == country && last_stated == stated =>
+            {
+                *at
+            }
+            _ => {
+                let at = clean_postcode(stated).map(|postcode| {
+                    let next = self.groups.len();
+                    let at = *self.index.entry((country, postcode)).or_insert(next);
+                    if at == next {
+                        self.groups.push(Group::default());
+                    }
+                    at
+                });
+                self.last = Some((country, stated.to_string(), at));
+                at
+            }
+        };
+        let Some(at) = at else {
+            return;
+        };
+        let group = &mut self.groups[at];
         group.record_count += 1;
         group.offer((hash_point(lon, lat), [lon, lat]));
     }
 
     pub(crate) fn into_records(self) -> impl Iterator<Item = PostcodeRecord> {
-        self.groups
+        // A medoid is 256 great-circle distances, and a country has
+        // hundreds of thousands of postcodes.
+        let points = self
+            .groups
+            .par_iter()
+            .map(Group::medoid)
+            .collect::<Vec<_>>();
+        let groups = self.groups;
+        self.index
             .into_iter()
-            .map(|((country, postcode), group)| group.to_record(country, postcode))
+            .map(move |((country, postcode), at)| {
+                groups[at].to_record(country, postcode, points[at])
+            })
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.groups.len()
+        self.index.len()
     }
 }
 
@@ -66,6 +104,9 @@ impl Accumulator {
 pub(crate) struct Street {
     key: Vec<u8>,
     postcodes: Vec<String>,
+    /// The postcode the street's last address stated, as stated: the same
+    /// one again adds nothing.
+    stated: Option<String>,
 }
 
 impl Street {
@@ -75,15 +116,19 @@ impl Street {
         if self.key != key {
             self.key = key.to_vec();
             self.postcodes.clear();
+            self.stated = None;
         }
         // No street, no street to borrow from: the key is the cell alone.
         address.subject()?;
         match address.postcode {
             Some(postcode) => {
-                if let Some(postcode) = clean_postcode(postcode)
-                    && let Err(at) = self.postcodes.binary_search(&postcode)
-                {
-                    self.postcodes.insert(at, postcode);
+                if self.stated.as_deref() != Some(postcode) {
+                    if let Some(cleaned) = clean_postcode(postcode)
+                        && let Err(at) = self.postcodes.binary_search(&cleaned)
+                    {
+                        self.postcodes.insert(at, cleaned);
+                    }
+                    self.stated = Some(postcode.to_string());
                 }
                 None
             }
@@ -123,8 +168,12 @@ impl Group {
             .expect("a postcode group has at least one member")
     }
 
-    fn to_record(&self, country: Option<CountryCode>, postcode: String) -> PostcodeRecord {
-        let [lon, lat] = self.medoid();
+    fn to_record(
+        &self,
+        country: Option<CountryCode>,
+        postcode: String,
+        [lon, lat]: [f64; 2],
+    ) -> PostcodeRecord {
         PostcodeRecord {
             postcode,
             country,
@@ -163,6 +212,32 @@ mod tests {
     use geojson::GeometryValue;
 
     use super::*;
+
+    #[test]
+    fn repeated_postcodes_count_under_their_own_country() {
+        let nl = CountryCode::parse("NL");
+        let mut accumulator = Accumulator::default();
+        accumulator.accept(nl, Some("1011 ab"), [4.9, 52.37]);
+        accumulator.accept(nl, Some("1011 ab"), [4.91, 52.37]);
+        accumulator.accept(None, Some("1011 ab"), [4.92, 52.37]);
+        accumulator.accept(None, Some("--"), [4.93, 52.37]);
+        accumulator.accept(None, Some("--"), [4.94, 52.37]);
+        accumulator.accept(nl, Some("1011AB"), [4.95, 52.37]);
+        accumulator.accept(nl, Some("1011 AB"), [4.96, 52.37]);
+
+        let counts = accumulator
+            .into_records()
+            .map(|record| (record.country, record.postcode, record.source.record_count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            vec![
+                (None, "1011 AB".to_string(), 1),
+                (nl, "1011 AB".to_string(), 3),
+                (nl, "1011AB".to_string(), 1),
+            ]
+        );
+    }
 
     #[test]
     fn derives_postcode_record_from_accepted_addresses() {
@@ -219,7 +294,7 @@ mod tests {
         for step in 0..100 {
             accumulator.accept(None, Some("M5V 2T6"), [-79.0 + step as f64 * 0.001, 43.0]);
         }
-        let group = &accumulator.groups[&(None, "M5V 2T6".to_string())];
+        let group = &accumulator.groups[accumulator.index[&(None, "M5V 2T6".to_string())]];
         assert_eq!(group.sample.len(), SAMPLE_POINTS);
         assert_eq!(group.record_count, 100);
     }

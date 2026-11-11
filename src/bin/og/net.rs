@@ -18,7 +18,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
 use open_geocode::builder::BuildCancelled;
-use ureq::{Agent, http::Response};
+use ureq::{Agent, ResponseExt, http::Response};
 
 use crate::format;
 
@@ -84,25 +84,42 @@ pub(crate) fn state_timestamp(url: &str) -> Result<i64> {
         .with_context(|| format!("{url} names no timestamp"))
 }
 
-/// The MD5 sum an extract is published with, from `<url>.md5`.
-pub(crate) fn published_md5(url: &str) -> Result<String> {
-    let url = format!("{url}.md5");
-    let text = agent()
-        .get(&url)
+/// An extract where its server keeps it now, and the MD5 sum published
+/// beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub url: String,
+    pub md5: String,
+}
+
+/// Follows `url`'s redirects to the file they land on and reads its
+/// `<file>.md5`. Geofabrik sends `-latest` to a dated file (`monaco-261109`),
+/// or for its biggest extracts to a mirror that alone has the `.md5`. The sum
+/// and the download both use that one URL, so for a dated file a new
+/// snapshot published between them cannot split them.
+pub(crate) fn published(url: &str) -> Result<Published> {
+    let response = agent()
+        .head(url)
         .call()
-        .with_context(|| format!("failed to reach {url}"))?
+        .with_context(|| format!("failed to reach {url}"))?;
+    let url = response.get_uri().to_string();
+    let md5_url = format!("{url}.md5");
+    let text = agent()
+        .get(&md5_url)
+        .call()
+        .with_context(|| format!("failed to reach {md5_url}"))?
         .body_mut()
         .read_to_string()
-        .with_context(|| format!("failed to read {url}"))?;
-    let sum = text
+        .with_context(|| format!("failed to read {md5_url}"))?;
+    let md5 = text
         .split_whitespace()
         .next()
         .unwrap_or_default()
         .to_lowercase();
-    if sum.len() != 32 || !sum.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("{url} holds no MD5 sum");
+    if md5.len() != 32 || !md5.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("{md5_url} holds no MD5 sum");
     }
-    Ok(sum)
+    Ok(Published { url, md5 })
 }
 
 /// The file a download is written to until it is complete and checked.
@@ -135,12 +152,12 @@ pub(crate) fn discard(partial: &Path) {
     let _ = fs::remove_file(version_path(partial));
 }
 
-/// Downloads `url` to the partial file of `path`, continuing an earlier
-/// download that stopped while the server still has the same version of
-/// the file, and starting over when it does not. `progress` is told the
+/// Downloads the published file to the partial file of `path`, continuing
+/// an earlier download that stopped while the server still has the same
+/// version of the file, and starting over when it does not. `progress` is told the
 /// bytes on disk so far and the whole size, when the server says it.
 pub(crate) fn download(
-    url: &str,
+    published: &Published,
     path: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, Option<u64>),
@@ -149,6 +166,7 @@ pub(crate) fn download(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    let url = &published.url;
     let partial = partial_path(path);
     let have = fs::metadata(&partial).map_or(0, |meta| meta.len());
     let version = fs::read_to_string(version_path(&partial))
@@ -345,4 +363,258 @@ pub(crate) fn check_md5(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+    };
+
+    use super::*;
+
+    /// What a route answers: a body, or a redirect to a path or a full URL.
+    #[derive(Clone)]
+    enum Answer {
+        Body(Vec<u8>),
+        Redirect(String),
+    }
+
+    /// A local HTTP server whose routes a test can change while it runs.
+    /// Unknown paths answer 404.
+    struct Server {
+        base: String,
+        routes: Arc<Mutex<Vec<(String, Answer)>>>,
+    }
+
+    impl Server {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let routes: Arc<Mutex<Vec<(String, Answer)>>> = Arc::default();
+            let served = Arc::clone(&routes);
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).unwrap() <= 2 {
+                            break;
+                        }
+                    }
+                    let answer = served
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(route, _)| *route == path)
+                        .map(|(_, answer)| answer.clone());
+                    let (head, body) = match answer {
+                        Some(Answer::Body(body)) => (
+                            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n", body.len()),
+                            body,
+                        ),
+                        Some(Answer::Redirect(to)) => (
+                            format!(
+                                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {to}\r\ncontent-length: 0\r\n"
+                            ),
+                            Vec::new(),
+                        ),
+                        None => (
+                            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n".to_string(),
+                            Vec::new(),
+                        ),
+                    };
+                    let _ = stream.write_all(format!("{head}connection: close\r\n\r\n").as_bytes());
+                    if method != "HEAD" {
+                        let _ = stream.write_all(&body);
+                    }
+                }
+            });
+            Self { base, routes }
+        }
+
+        fn route(&self, path: &str, answer: Answer) {
+            let mut routes = self.routes.lock().unwrap();
+            routes.retain(|(route, _)| route != path);
+            routes.push((path.to_string(), answer));
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{path}", self.base)
+        }
+    }
+
+    fn md5_hex(bytes: &[u8]) -> String {
+        Md5::digest(bytes)
+            .iter()
+            .fold(String::new(), |mut sum, byte| {
+                let _ = write!(sum, "{byte:02x}");
+                sum
+            })
+    }
+
+    fn md5_file(sum: &str, name: &str) -> Answer {
+        Answer::Body(format!("{sum}  {name}\n").into_bytes())
+    }
+
+    #[test]
+    fn the_sum_is_read_beside_an_extract_served_where_it_is_asked_for() {
+        let server = Server::start();
+        let sum = md5_hex(b"kosovo");
+        server.route("/kosovo-latest.osm.pbf", Answer::Body(b"kosovo".to_vec()));
+        server.route(
+            "/kosovo-latest.osm.pbf.md5",
+            md5_file(&sum, "kosovo-latest.osm.pbf"),
+        );
+
+        let published = published(&server.url("/kosovo-latest.osm.pbf")).unwrap();
+
+        assert_eq!(
+            published,
+            Published {
+                url: server.url("/kosovo-latest.osm.pbf"),
+                md5: sum,
+            }
+        );
+    }
+
+    #[test]
+    fn the_sum_is_read_beside_the_dated_file_latest_redirects_to() {
+        let server = Server::start();
+        let sum = md5_hex(b"monaco 261109");
+        server.route(
+            "/monaco-latest.osm.pbf",
+            Answer::Redirect("/monaco-261109.osm.pbf".into()),
+        );
+        server.route(
+            "/monaco-261109.osm.pbf",
+            Answer::Body(b"monaco 261109".to_vec()),
+        );
+        server.route(
+            "/monaco-261109.osm.pbf.md5",
+            md5_file(&sum, "monaco-261109.osm.pbf"),
+        );
+
+        let published = published(&server.url("/monaco-latest.osm.pbf")).unwrap();
+
+        assert_eq!(
+            published,
+            Published {
+                url: server.url("/monaco-261109.osm.pbf"),
+                md5: sum,
+            }
+        );
+    }
+
+    /// Geofabrik's biggest extracts: `-latest` redirects to a mirror, and only
+    /// the mirror has the `.md5`.
+    #[test]
+    fn the_sum_is_read_from_the_mirror_latest_redirects_to() {
+        let (origin, mirror) = (Server::start(), Server::start());
+        let sum = md5_hex(b"europe");
+        origin.route(
+            "/europe-latest.osm.pbf",
+            Answer::Redirect(mirror.url("/geofabrik/europe-latest.osm.pbf")),
+        );
+        mirror.route(
+            "/geofabrik/europe-latest.osm.pbf",
+            Answer::Body(b"europe".to_vec()),
+        );
+        mirror.route(
+            "/geofabrik/europe-latest.osm.pbf.md5",
+            md5_file(&sum, "europe-261108.osm.pbf"),
+        );
+
+        let published = published(&origin.url("/europe-latest.osm.pbf")).unwrap();
+
+        assert_eq!(
+            published,
+            Published {
+                url: mirror.url("/geofabrik/europe-latest.osm.pbf"),
+                md5: sum,
+            }
+        );
+    }
+
+    #[test]
+    fn an_extract_with_no_sum_beside_it_is_an_error_naming_the_sum_url() {
+        let server = Server::start();
+        server.route("/europe-latest.osm.pbf", Answer::Body(b"europe".to_vec()));
+
+        let error = published(&server.url("/europe-latest.osm.pbf")).unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "failed to reach {}: http status: 404",
+                server.url("/europe-latest.osm.pbf.md5")
+            )
+        );
+    }
+
+    #[test]
+    fn a_sum_file_without_a_sum_is_an_error() {
+        let server = Server::start();
+        server.route("/kosovo-latest.osm.pbf", Answer::Body(b"kosovo".to_vec()));
+        server.route(
+            "/kosovo-latest.osm.pbf.md5",
+            Answer::Body(b"not a sum\n".to_vec()),
+        );
+
+        let error = published(&server.url("/kosovo-latest.osm.pbf")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} holds no MD5 sum",
+                server.url("/kosovo-latest.osm.pbf.md5")
+            )
+        );
+    }
+
+    /// `-latest` moves on to a new snapshot after its sum was read: the
+    /// download still fetches the snapshot the sum is of.
+    #[test]
+    fn a_snapshot_published_after_the_sum_is_read_does_not_reach_the_download() {
+        let server = Server::start();
+        let old = b"monaco 261109".to_vec();
+        server.route(
+            "/monaco-latest.osm.pbf",
+            Answer::Redirect("/monaco-261109.osm.pbf".into()),
+        );
+        server.route("/monaco-261109.osm.pbf", Answer::Body(old.clone()));
+        server.route(
+            "/monaco-261109.osm.pbf.md5",
+            md5_file(&md5_hex(&old), "monaco-261109.osm.pbf"),
+        );
+
+        let published = published(&server.url("/monaco-latest.osm.pbf")).unwrap();
+        server.route(
+            "/monaco-latest.osm.pbf",
+            Answer::Redirect("/monaco-261110.osm.pbf".into()),
+        );
+        server.route(
+            "/monaco-261110.osm.pbf",
+            Answer::Body(b"monaco 261110".to_vec()),
+        );
+
+        let dir = std::env::temp_dir().join(format!("og-net-{}", std::process::id()));
+        let path = dir.join("monaco.osm.pbf");
+        let result =
+            download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
+                check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
+                Ok(fs::read(&partial)?)
+            });
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result.unwrap(), old);
+    }
 }
