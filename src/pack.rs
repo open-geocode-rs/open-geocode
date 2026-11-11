@@ -421,8 +421,8 @@ impl Writer {
         }
     }
 
-    /// Append a prepared batch. The store, the text index and the spatial
-    /// pairs take records one at a time, in order.
+    /// Append a prepared batch. The dictionaries, the text index and the
+    /// store with its spatial pairs each take every record in order.
     pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
         let first = self.records.record_count();
         if batch.first != first {
@@ -431,39 +431,73 @@ impl Writer {
                 batch.first
             )));
         }
-        for (offset, prepared) in batch.records.into_iter().enumerate() {
-            let PreparedRecord {
-                record,
-                context,
-                document,
-                names,
-            } = prepared;
-            let record_id = first + offset as u64;
-            if let Some(context) = &context
-                && names.is_place()
-            {
-                self.dictionaries.add_place(record_id, context, &names);
-            }
-            self.dictionaries.add(names, context.as_ref());
-            let context = match context {
-                Some(context) => self.contexts.intern(context)?,
-                None => None,
-            };
-            self.records.write(&record, context)?;
-            match document {
-                text_index::Prepared::Document(document) => self.text.add(document)?,
-                text_index::Prepared::Address(document, numbers) => {
-                    self.text.add_address(document, numbers)?
-                }
-            }
-            self.spatial.add(record_id, &record)?;
-            if let Record::Postcode(postcode) = &record {
-                self.postcode_addresses
-                    .add(postcode.country, postcode.source.record_count);
-            }
-            *self.layer_counts.entry(record.layer()).or_default() += 1;
+        let mut placed = Vec::with_capacity(batch.records.len());
+        let mut names = Vec::with_capacity(batch.records.len());
+        let mut documents = Vec::with_capacity(batch.records.len());
+        for prepared in batch.records {
+            placed.push((prepared.record, prepared.context));
+            names.push(prepared.names);
+            documents.push(prepared.document);
         }
-        Ok(())
+        let Self {
+            records,
+            contexts,
+            text,
+            spatial,
+            layer_counts,
+            postcode_addresses,
+            dictionaries,
+            ..
+        } = self;
+        let placed = &placed;
+        // None of the three reads another's state, and one thread feeding
+        // them in turn bound the whole step. Each runs on its own, joined
+        // per batch, so each still takes records in order.
+        std::thread::scope(|scope| {
+            let named = scope.spawn(move || {
+                for (offset, (names, (_, context))) in names.into_iter().zip(placed).enumerate() {
+                    if let Some(context) = context
+                        && names.is_place()
+                    {
+                        dictionaries.add_place(first + offset as u64, context, &names);
+                    }
+                    dictionaries.add(names, context.as_ref());
+                }
+            });
+            let indexed = scope.spawn(move || {
+                documents
+                    .into_iter()
+                    .try_for_each(|document| match document {
+                        text_index::Prepared::Document(document) => text.add(document),
+                        text_index::Prepared::Address(document, numbers) => {
+                            text.add_address(document, numbers)
+                        }
+                    })
+            });
+            let stored = placed
+                .iter()
+                .enumerate()
+                .try_for_each(|(offset, (record, context))| {
+                    let context = match context {
+                        Some(context) => contexts.intern(context)?,
+                        None => None,
+                    };
+                    records.write(record, context)?;
+                    spatial.add(first + offset as u64, record)?;
+                    if let Record::Postcode(postcode) = record {
+                        postcode_addresses.add(postcode.country, postcode.source.record_count);
+                    }
+                    *layer_counts.entry(record.layer()).or_default() += 1;
+                    Ok(())
+                });
+            named
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            indexed
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            stored
+        })
     }
 
     /// Write the Pack file without publishing it.
