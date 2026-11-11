@@ -34,7 +34,7 @@
         "label": "50 Queen Street, Toronto",
         "layer": "interpolation",
         "name": "50 Queen Street",
-        "score": 0.0,
+        "score": 2.3420389,
         "source": {
           "dataset": "osm"
         }

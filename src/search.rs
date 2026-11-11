@@ -19,8 +19,8 @@ use tantivy::{
     columnar::{Column, StrColumn},
     index::SegmentId,
     query::{
-        BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery,
-        Query, RangeQuery, TermQuery,
+        BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EnableScoring, Occur,
+        PhrasePrefixQuery, Query, RangeQuery, TermQuery, Weight,
     },
     schema::{Field, IndexRecordOption},
 };
@@ -804,6 +804,114 @@ impl TextSearcher {
         filters: &Filters<'_>,
         areas: &AreaWords,
     ) -> Result<Box<dyn Query>> {
+        Ok(Box::new(BooleanQuery::new(
+            self.query_clauses(plan, pass, filters, areas)?,
+        )))
+    }
+
+    /// The text search's score of a document for `plan` in `pass`, what
+    /// [`Self::build_query`] scores it. One short of a required word, such
+    /// as a neighbour without the house number, scores what it shares
+    /// instead of nothing.
+    fn text_score(
+        &self,
+        searcher: &Searcher,
+        plan: &QueryPlan,
+        pass: Pass,
+        filters: &Filters<'_>,
+        areas: &AreaWords,
+    ) -> Result<TextScore> {
+        let clauses = self.query_clauses(plan, pass, filters, areas)?;
+        let relaxed = clauses
+            .iter()
+            .map(|(occur, query)| match occur {
+                Occur::Must => (Occur::Should, query.box_clone()),
+                _ => (*occur, query.box_clone()),
+            })
+            .collect();
+        let scoring = || EnableScoring::enabled_from_searcher(searcher);
+        Ok(TextScore {
+            exact: BooleanQuery::new(clauses).weight(scoring())?,
+            relaxed: BooleanQuery::new(relaxed).weight(scoring())?,
+        })
+    }
+
+    /// The hits of `found`, each scored as the text search scores its
+    /// document for the reading that found it (see [`Self::text_score`]).
+    /// Scored here, once the stage has chosen, not as each candidate is
+    /// hydrated. Reading what a plan's words say of areas costs more than
+    /// the stage's own lookups.
+    fn structured_scored(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        found: impl Iterator<Item = StructuredFound>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let searcher = self.reader.searcher();
+        let mut scores = Vec::<(usize, TextScore)>::new();
+        let mut hits = Vec::new();
+        for StructuredFound {
+            mut hit,
+            doc,
+            reading,
+            ..
+        } in found
+        {
+            if let Some(doc) = doc {
+                let at = match scores.iter().position(|(held, _)| *held == reading) {
+                    Some(at) => at,
+                    None => {
+                        let plan = &cx.readings[reading].plan;
+                        let score = self.structured_score(&searcher, plan, &cx.search.filters)?;
+                        scores.push((reading, score));
+                        scores.len() - 1
+                    }
+                };
+                hit.score = scores[at].1.of(&searcher, doc)?;
+            }
+            hits.push(hit);
+        }
+        Ok(hits)
+    }
+
+    /// The text score of a structured-stage answer to `plan`, from the
+    /// clauses of the text search's first pass (see [`Self::text_score`]).
+    fn structured_score(
+        &self,
+        searcher: &Searcher,
+        plan: &QueryPlan,
+        filters: &Filters<'_>,
+    ) -> Result<TextScore> {
+        let postcode = self.query_postcode(plan)?;
+        let postcode = (!postcode.forms.is_empty()).then_some(postcode.exact.as_str());
+        let (areas, _) = self.plan_areas(plan, postcode)?;
+        self.text_score(searcher, plan, Scope::Scoped.pass(), filters, &areas)
+    }
+
+    /// What the Pack says of the words of `plan` that may name where a
+    /// record is, and the localities it states (see
+    /// [`Self::localities_stated`]).
+    fn plan_areas(
+        &self,
+        plan: &QueryPlan,
+        postcode: Option<&str>,
+    ) -> Result<(AreaWords, Vec<Option<StatedArea>>)> {
+        let (known, localities_stated) = self.localities_stated(plan, postcode)?;
+        let areas = AreaWords {
+            known,
+            postcodes: self.postcode_weights(&plan.area_terms())?,
+            stand_ins: self.stand_in_weights(plan)?,
+        };
+        Ok((areas, localities_stated))
+    }
+
+    /// The clauses of [`Self::build_query`].
+    fn query_clauses(
+        &self,
+        plan: &QueryPlan,
+        pass: Pass,
+        filters: &Filters<'_>,
+        areas: &AreaWords,
+    ) -> Result<Vec<(Occur, Box<dyn Query>)>> {
         let mut clauses = Vec::new();
         if let Some(number) = &plan.house_number {
             clauses.push((
@@ -829,7 +937,7 @@ impl TextSearcher {
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
-        Ok(Box::new(BooleanQuery::new(clauses)))
+        Ok(clauses)
     }
 
     /// The documents whose extent meets `bbox`, scored at zero like every
@@ -2103,12 +2211,14 @@ impl TextSearcher {
         }
         let reading = &cx.readings[best.found.reading];
         let hits_of = |explained: StructuredExplained| {
-            explained
-                .scored
-                .into_iter()
-                .map(|scored| scored.found.hit)
-                .take(cx.search.limit)
-                .collect::<Vec<_>>()
+            self.structured_scored(
+                cx,
+                explained
+                    .scored
+                    .into_iter()
+                    .map(|scored| scored.found)
+                    .take(cx.search.limit),
+            )
         };
         let decline = |hits: Vec<TextSearchHit>| {
             Some(Declined {
@@ -2118,7 +2228,7 @@ impl TextSearcher {
             })
         };
         if logistic(&P_STRUCTURED, &features) - logistic(&P_TEXT, &features) < STRUCTURED_DELTA {
-            *declined = decline(hits_of(explained));
+            *declined = decline(hits_of(explained)?);
             return Ok(None);
         }
         // A lone name may be a street, a place or a business: the text
@@ -2130,11 +2240,11 @@ impl TextSearcher {
                 .iter()
                 .any(|word| self.describes_street(&word.text));
         if best.found.form == FORM_STREET && lone_name {
-            *declined = decline(hits_of(explained));
+            *declined = decline(hits_of(explained)?);
             return Ok(None);
         }
         let (hits, towns_known) =
-            self.structured_judged(&reading.plan, hits_of(explained), cx.search, cx.session)?;
+            self.structured_judged(&reading.plan, hits_of(explained)?, cx.search, cx.session)?;
         if !self.verified(&hits[0], towns_known, cx) {
             // Outside the towns the query states, an answer is never given,
             // not even when the text search finds nothing.
@@ -2281,6 +2391,7 @@ impl TextSearcher {
                     }
                     found.push(StructuredFound {
                         hit,
+                        doc: None,
                         point: [point.lon, point.lat],
                         support: 1000 * (parts.len() - 1),
                         form,
@@ -2417,6 +2528,7 @@ impl TextSearcher {
                 }
                 return Ok(Some(StructuredFound {
                     hit,
+                    doc: Some(address),
                     point,
                     support: 1000,
                     form,
@@ -2735,12 +2847,13 @@ impl TextSearcher {
                 let spots = spots_of(best);
                 let mut found = Vec::new();
                 for spot in &spots {
-                    if let Some(hit) = self.structured_side(plan, &ranking, &spot.docs)?
+                    if let Some((hit, doc)) = self.structured_side(plan, &ranking, &spot.docs)?
                         && keep(&hit)?
                         && let Some(point) = hit.record.point
                     {
                         found.push(StructuredFound {
                             hit,
+                            doc: Some(doc),
                             point: [point.lon, point.lat],
                             support: most,
                             form: FORM_INTERPOLATION,
@@ -2751,12 +2864,14 @@ impl TextSearcher {
                     }
                 }
                 if found.is_empty()
-                    && let Some(hit) = self.structured_neighbour(plan, &ranking, &best_docs)?
+                    && let Some((hit, doc)) =
+                        self.structured_neighbour(plan, &ranking, &best_docs)?
                     && keep(&hit)?
                     && let Some(point) = hit.record.point
                 {
                     found.push(StructuredFound {
                         hit,
+                        doc: Some(doc),
                         point: [point.lon, point.lat],
                         support: most,
                         form: FORM_NEIGHBOUR,
@@ -2768,10 +2883,11 @@ impl TextSearcher {
                 if found.is_empty() {
                     let mut pieces = Vec::new();
                     for spot in &spots {
-                        if let Some(street) =
+                        if let Some((street, doc)) =
                             self.street_answer(&searcher, spot, &street_ranking, &mut keep)?
                         {
                             let found = StructuredFound {
+                                doc: Some(doc),
                                 point: [
                                     street.record.point.map_or(0.0, |point| point.lon),
                                     street.record.point.map_or(0.0, |point| point.lat),
@@ -2850,13 +2966,15 @@ impl TextSearcher {
                     self.rank_documents(&searcher, vec![(key, address)], ranking, 1, &mut keep)?
                         .into_iter()
                         .next()
+                        .map(|hit| (hit, address))
                 }
             };
-            if let Some(hit) = hit
+            if let Some((hit, doc)) = hit
                 && let Some(point) = hit.record.point
             {
                 let one = StructuredFound {
                     hit,
+                    doc: Some(doc),
                     point: [point.lon, point.lat],
                     support,
                     form,
@@ -2889,7 +3007,7 @@ impl TextSearcher {
         spot: &Spot,
         ranking: &Ranking,
         keep: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
-    ) -> Result<Option<TextSearchHit>> {
+    ) -> Result<Option<(TextSearchHit, DocAddress)>> {
         let Some(address) = self.doc_address(spot.head.doc) else {
             return Ok(None);
         };
@@ -2914,7 +3032,7 @@ impl TextSearcher {
             return Ok(None);
         };
         street_at(record, point);
-        Ok(Some(hit))
+        Ok(Some((hit, address)))
     }
 
     /// The street answers `pieces` (each with its spot's address points)
@@ -2971,7 +3089,7 @@ impl TextSearcher {
         plan: &QueryPlan,
         ranking: &Ranking,
         docs: &[DocId],
-    ) -> Result<Option<TextSearchHit>> {
+    ) -> Result<Option<(TextSearchHit, DocAddress)>> {
         let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
             return Ok(None);
         };
@@ -2996,7 +3114,7 @@ impl TextSearcher {
             .filter(|neighbour| side(neighbour) && neighbour.number > number)
             .collect::<Vec<_>>();
         let mut hit = self.place_between(number, &lower, &higher, ROAD_SETBACK_M)?;
-        if let Some(hit) = &mut hit {
+        if let Some((hit, _)) = &mut hit {
             hit.record.layer = Layer::Interpolation.as_str().to_string();
         }
         Ok(hit)
@@ -3578,7 +3696,7 @@ impl TextSearcher {
         plan: &QueryPlan,
         ranking: &Ranking,
         docs: &[DocId],
-    ) -> Result<Option<TextSearchHit>> {
+    ) -> Result<Option<(TextSearchHit, DocAddress)>> {
         let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
             return Ok(None);
         };
@@ -4235,12 +4353,7 @@ impl TextSearcher {
         // Every stated locality, known or not, for what the hits rest on.
         let postcode =
             (!ranking.postcode.forms.is_empty()).then_some(ranking.postcode.exact.as_str());
-        let (known, localities_stated) = self.localities_stated(plan, postcode)?;
-        let areas = AreaWords {
-            known,
-            postcodes: self.postcode_weights(&plan.area_terms())?,
-            stand_ins: self.stand_in_weights(plan)?,
-        };
+        let (areas, localities_stated) = self.plan_areas(plan, postcode)?;
         let stated = if pass.requires_locality() {
             Vec::new()
         } else {
@@ -4267,7 +4380,8 @@ impl TextSearcher {
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str());
         if estimated
-            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking, &areas)?
+            && let Some(estimate) =
+                self.place_between_neighbours(plan, pass, &filters, &ranking, &areas)?
             && keep(&estimate)?
         {
             candidates.insert(0, estimate);
@@ -5806,6 +5920,7 @@ impl TextSearcher {
         &self,
         plan: &QueryPlan,
         pass: Pass,
+        filters: &Filters<'_>,
         ranking: &Ranking,
         areas: &AreaWords,
     ) -> Result<Option<TextSearchHit>> {
@@ -5813,7 +5928,16 @@ impl TextSearcher {
             return Ok(None);
         };
         let (lower, higher) = self.neighbours(plan, pass, ranking, areas, number)?;
-        self.place_between(number, &lower, &higher, NEIGHBOUR_STREET_RADIUS_M)
+        let Some((mut hit, doc)) =
+            self.place_between(number, &lower, &higher, NEIGHBOUR_STREET_RADIUS_M)?
+        else {
+            return Ok(None);
+        };
+        let searcher = self.reader.searcher();
+        hit.score = self
+            .text_score(&searcher, plan, pass, filters, areas)?
+            .of(&searcher, doc)?;
+        Ok(Some(hit))
     }
 
     /// `number` placed between the nearest of its neighbours `lower` and
@@ -5827,7 +5951,7 @@ impl TextSearcher {
         lower: &[Neighbour],
         higher: &[Neighbour],
         setback_m: f64,
-    ) -> Result<Option<TextSearchHit>> {
+    ) -> Result<Option<(TextSearchHit, DocAddress)>> {
         if lower.is_empty() {
             return Ok(None);
         }
@@ -5947,7 +6071,7 @@ impl TextSearcher {
                     } else {
                         &mut higher
                     };
-                    side.push((base, record_id, postcode_agreement));
+                    side.push((base, record_id, postcode_agreement, doc));
                 }
             };
             let (first, count) = self.document_records(searcher, doc)?;
@@ -5967,14 +6091,14 @@ impl TextSearcher {
                 _ => {}
             }
         }
-        lower.sort_by_key(|&(base, record_id, _)| (std::cmp::Reverse(base), record_id));
-        higher.sort_by_key(|&(base, record_id, _)| (base, record_id));
-        let found = |candidates: Vec<(u32, RecordId, u8)>| -> Result<Vec<Neighbour>> {
+        lower.sort_by_key(|&(base, record_id, ..)| (std::cmp::Reverse(base), record_id));
+        higher.sort_by_key(|&(base, record_id, ..)| (base, record_id));
+        let found = |candidates: Vec<(u32, RecordId, u8, DocAddress)>| -> Result<Vec<Neighbour>> {
             let mut neighbours = Vec::new();
-            for (number, record_id, postcode_agreement) in
+            for (number, record_id, postcode_agreement, doc) in
                 candidates.into_iter().take(NEIGHBOUR_CANDIDATES)
             {
-                neighbours.extend(self.neighbour(record_id, number, postcode_agreement)?);
+                neighbours.extend(self.neighbour(record_id, doc, number, postcode_agreement)?);
             }
             Ok(neighbours)
         };
@@ -5986,6 +6110,7 @@ impl TextSearcher {
     fn neighbour(
         &self,
         record_id: RecordId,
+        doc: DocAddress,
         number: u32,
         postcode_agreement: u8,
     ) -> Result<Option<Neighbour>> {
@@ -6008,6 +6133,7 @@ impl TextSearcher {
         let (_, lon, lat) = self.pack.records().point(record_id)?;
         Ok(Some(Neighbour {
             record_id,
+            doc,
             number,
             point: [lon, lat],
             street,
@@ -6068,14 +6194,16 @@ impl TextSearcher {
 
     /// The hit for `number` placed at `point` between `low` and `high`,
     /// labelled like the nearer of the two with the number in its place. It
-    /// stands on the nearer record for the context checks of a geocoded row.
+    /// stands on the nearer record for the context checks of a geocoded row,
+    /// and its score is what the nearer's document, given with it, scores
+    /// for the caller's query.
     fn neighbour_estimate(
         &self,
         number: u32,
         low: &Neighbour,
         high: &Neighbour,
         [lon, lat]: [f64; 2],
-    ) -> Result<TextSearchHit> {
+    ) -> Result<(TextSearchHit, DocAddress)> {
         let nearer = if number - low.number <= high.number - number {
             low
         } else {
@@ -6094,36 +6222,39 @@ impl TextSearcher {
         let id = |neighbour: &Neighbour| -> Result<String> {
             Ok(self.pack.records().summary(neighbour.record_id)?.id)
         };
-        Ok(TextSearchHit {
-            record_id: nearer.record_id,
-            score: 0.0,
-            record: Summary {
-                id: labels::estimated_address_id(number, &id(low)?, &id(high)?),
-                layer: Layer::Address.as_str().to_string(),
-                name: labels::address_name(&address),
-                label: labels::address_label(&address),
-                address: Address::from(&address),
-                category: None,
-                road_class: None,
-                brand: None,
-                point: Some(Point {
-                    lon,
-                    lat,
-                    precision: PointPrecision::Estimated,
-                }),
-                source: Source {
-                    dataset: "osm".to_string(),
-                    object_type: None,
-                    object_id: None,
-                    derived_from: Some(DERIVED_FROM_ADDRESS_RECORDS.to_string()),
-                    record_count: Some(2),
+        Ok((
+            TextSearchHit {
+                record_id: nearer.record_id,
+                score: 0.0,
+                record: Summary {
+                    id: labels::estimated_address_id(number, &id(low)?, &id(high)?),
+                    layer: Layer::Address.as_str().to_string(),
+                    name: labels::address_name(&address),
+                    label: labels::address_label(&address),
+                    address: Address::from(&address),
+                    category: None,
+                    road_class: None,
+                    brand: None,
+                    point: Some(Point {
+                        lon,
+                        lat,
+                        precision: PointPrecision::Estimated,
+                    }),
+                    source: Source {
+                        dataset: "osm".to_string(),
+                        object_type: None,
+                        object_id: None,
+                        derived_from: Some(DERIVED_FROM_ADDRESS_RECORDS.to_string()),
+                        record_count: Some(2),
+                    },
                 },
+                features: Features::default(),
+                confidence: None,
+                fallback: false,
+                signals: Signals::default(),
             },
-            features: Features::default(),
-            confidence: None,
-            fallback: false,
-            signals: Signals::default(),
-        })
+            nearer.doc,
+        ))
     }
 }
 
@@ -6208,6 +6339,8 @@ impl Parts {
 #[derive(Debug)]
 struct Neighbour {
     record_id: RecordId,
+    /// The text index document that holds it.
+    doc: DocAddress,
     /// The number its house number starts with.
     number: u32,
     point: [f64; 2],
@@ -6215,6 +6348,39 @@ struct Neighbour {
     street: String,
     address: AddressComponents,
     postcode_agreement: u8,
+}
+
+/// The text search's score of a document for one reading (see
+/// [`TextSearcher::text_score`]). Answers found without the text search
+/// carry the score it would give them, so one response's scores mean one
+/// thing.
+struct TextScore {
+    /// The text search's own query.
+    exact: Box<dyn Weight>,
+    /// Its required clauses optional. Kept apart from `exact`, since summed
+    /// in another order the same matches score a few ulps off, enough to
+    /// list a tie out of order.
+    relaxed: Box<dyn Weight>,
+}
+
+impl TextScore {
+    /// The score of `doc`, `0.0` when it matches no clause.
+    fn of(&self, searcher: &Searcher, doc: DocAddress) -> Result<Score> {
+        let reader = searcher.segment_reader(doc.segment_ord);
+        for weight in [&self.exact, &self.relaxed] {
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            // A scorer starts on its first match, which may lie past `doc`;
+            // `seek` never goes back.
+            let at = match scorer.doc() < doc.doc_id {
+                true => scorer.seek(doc.doc_id),
+                false => scorer.doc(),
+            };
+            if at == doc.doc_id {
+                return Ok(scorer.score());
+            }
+        }
+        Ok(0.0)
+    }
 }
 
 /// What ranks a hit, as a sequence of questions, each deciding only between
@@ -7211,6 +7377,9 @@ struct Declined {
 /// [`TextSearcher::structured_reading`]).
 struct StructuredFound {
     hit: TextSearchHit,
+    /// The text index document its score is read from, its own or an
+    /// estimate's nearer neighbour's. `None` for an area, which has none.
+    doc: Option<DocAddress>,
     point: [f64; 2],
     /// How many of the reading's place words hold it.
     support: usize,
@@ -13442,6 +13611,65 @@ mod tests {
         let found = ids(&structured, query);
         assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A structured answer scores what the text search scores its record,
+    /// so a response lists its scores highest first and `score` keeps one
+    /// meaning. An estimate between two neighbours scores what the nearer
+    /// one's document does.
+    #[test]
+    fn a_structured_answer_scores_as_the_text_search_does() {
+        let pack = TempPack::new("search-structured-score");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let mut street = street_record("osm:way:1", "Bayview Avenue");
+        street.geometry = line(-79.0, [43.0, 43.01]);
+        street.representative_point = [-79.0, 43.005];
+        writer.write(&street.into(), None).expect("street");
+        for (id, number, lat) in [
+            ("osm:node:10", "10", 43.001),
+            ("osm:node:11", "20", 43.002),
+            ("osm:node:12", "30", 43.003),
+        ] {
+            let mut address = address_record(id, "", number, "Bayview Avenue", None, None);
+            address.geometry = point_geometry(-79.0002, lat);
+            writer.write(&address.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let structured = TextSearcher::open(&pack.0).expect("searcher");
+        let plain = TextSearcher::open(&pack.0)
+            .expect("searcher")
+            .without_structured();
+        let scored = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(&TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 3,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| (hit.record.id, hit.score))
+                .collect::<Vec<_>>()
+        };
+        let query = "20 Bayview Ave";
+        let found = scored(&structured, query);
+        assert!(LAST_STRUCTURED.with(Cell::get).answered);
+        assert_eq!(found, scored(&plain, query));
+        assert_eq!(found[0].0, "osm:node:11");
+        // The estimate rests on the street's words alone, as the street does.
+        let query = "14 Bayview Ave";
+        let found = scored(&structured, query);
+        assert!(LAST_STRUCTURED.with(Cell::get).answered);
+        assert_eq!(found, scored(&plain, query));
+        let [(estimate, estimate_score), (street, street_score)] = &found[..] else {
+            panic!("an estimate and its street: {found:?}");
+        };
+        assert_eq!(estimate, "derived:estimate:14:osm:node:10:osm:node:11");
+        assert_eq!(street, "osm:way:1");
+        assert_eq!(estimate_score, street_score);
     }
 
     #[test]
