@@ -169,6 +169,14 @@ ph = { version = "=0.11.0", default-features = false, features = ["xxhash-rust"]
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# musl's malloc maps a fresh region for each mid-size C allocation and unmaps
+# it on free. zstd allocates a 96 KB context per Tantivy term-dictionary block
+# it reads, about 20 per forward lookup, and each unmap stops every server
+# thread for a TLB flush: /geocode served 4 times fewer requests than on
+# glibc. The global allocator never sees C allocations; override does.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["v2", "override"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

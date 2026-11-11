@@ -1300,4 +1300,24 @@ mod tests {
             Some(ureq::Error::Io(io)) if io.kind() == std::io::ErrorKind::ConnectionRefused
         ));
     }
+
+    #[cfg(target_env = "musl")]
+    #[test]
+    fn c_malloc_is_mimalloc_on_musl() {
+        // In libmimalloc-sys only behind its `extended` bindings; the C symbol
+        // is always built.
+        unsafe extern "C" {
+            fn mi_is_in_heap_region(pointer: *const std::ffi::c_void) -> bool;
+        }
+        // The size of zstd's decompression context, the C allocation musl maps
+        // and unmaps per Tantivy term-dictionary block.
+        // SAFETY: malloc has no preconditions; the pointer is freed once below.
+        let pointer = unsafe { libc::malloc(95_992) };
+        assert!(!pointer.is_null());
+        // SAFETY: only compares the address with mimalloc's regions.
+        let owned = unsafe { mi_is_in_heap_region(pointer) };
+        // SAFETY: from malloc above, freed once.
+        unsafe { libc::free(pointer) };
+        assert!(owned, "C malloc is musl's, not mimalloc's");
+    }
 }

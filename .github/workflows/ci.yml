@@ -103,6 +103,27 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+  test-musl:
+    name: Test (musl)
+    # The Linux release ships the musl build, whose libc allocator is not
+    # glibc's. The binary's tests check C code allocates from mimalloc there.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Run the binary's tests
+        run: cargo test --target x86_64-unknown-linux-musl --bin open-geocode
+
   binary-size:
     name: Binary size
     # Pull requests only. In the merge queue and on main the job is skipped,
