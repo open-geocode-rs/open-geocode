@@ -1990,8 +1990,7 @@ impl TextSearcher {
             && first.is_none()
             && let Some(declined) = declined
         {
-            let (hits, _) =
-                self.structured_judged(&declined.plan, declined.hits, &search, &session)?;
+            let hits = self.structured_judged(&declined.plan, declined.hits, &search, &session)?;
             return Ok((declined.text, hits));
         }
         Ok(match first {
@@ -2133,14 +2132,20 @@ impl TextSearcher {
             *declined = decline(hits_of(explained));
             return Ok(None);
         }
-        let (hits, towns_known) =
-            self.structured_judged(&reading.plan, hits_of(explained), cx.search, cx.session)?;
-        if !self.verified(&hits[0], towns_known, cx) {
-            // Outside the towns the query states, an answer is never given,
-            // not even when the text search finds nothing.
-            if Self::in_stated_towns(&hits[0].features, towns_known) {
-                *declined = decline(hits);
-            }
+        let hits = hits_of(explained);
+        let judged_best = hits.first().map(|hit| hit.record_id);
+        let hits = self.structured_judged(&reading.plan, hits, cx.search, cx.session)?;
+        // Models judged the best alone. Outside the stated towns it is no
+        // answer, and none after it stands in for it, not even when the
+        // text search finds nothing.
+        let Some(best) = hits
+            .first()
+            .filter(|hit| Some(hit.record_id) == judged_best)
+        else {
+            return Ok(None);
+        };
+        if !self.verified(best, cx) {
+            *declined = decline(hits);
             return Ok(None);
         }
         #[cfg(test)]
@@ -2153,16 +2158,16 @@ impl TextSearcher {
         Ok(Some((reading.text.clone(), hits)))
     }
 
-    /// The structured stage's answers to `plan`, in its order, each with the
-    /// [`Features`] the text search would give it (see [`Self::judged`]),
-    /// and whether the Pack knows every town `plan` states.
+    /// The structured stage's answers to `plan` that lie in the towns it
+    /// states (see [`Self::in_stated_towns`]), in its order, each with the
+    /// [`Features`] the text search would give it (see [`Self::judged`]).
     fn structured_judged(
         &self,
         plan: &QueryPlan,
         hits: Vec<TextSearchHit>,
         search: &Search<'_>,
         session: &Session,
-    ) -> Result<(Vec<TextSearchHit>, bool)> {
+    ) -> Result<Vec<TextSearchHit>> {
         let postcode = self.query_postcode(plan)?;
         let stated = (!postcode.forms.is_empty()).then(|| postcode.exact.clone());
         let (_, localities) = self.localities_stated(plan, stated.as_deref())?;
@@ -2178,9 +2183,15 @@ impl TextSearcher {
             session,
             usize::MAX,
         )?;
-        let mut hits = kept.into_iter().chain(contradicted).collect::<Vec<_>>();
+        // Every answer, not only the best: the street of the next town is
+        // no answer to a query that names this one.
+        let mut hits = kept
+            .into_iter()
+            .chain(contradicted)
+            .filter(|hit| Self::in_stated_towns(&hit.features, towns_known))
+            .collect::<Vec<_>>();
         hits.sort_by_key(|hit| order.iter().position(|id| *id == hit.record_id));
-        Ok((hits, towns_known))
+        Ok(hits)
     }
 
     /// The finest area each of `readings` names, when the structured stage finds
@@ -2356,6 +2367,7 @@ impl TextSearcher {
             .collect::<Vec<_>>();
         names.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
         let searcher = self.reader.searcher();
+        let stated = self.stated_places(&plan.context);
         for (_, name) in names.into_iter().take(MATCHED_STREETS) {
             let mut docs = Vec::new();
             for list in structured.street_lists(&name, &countries) {
@@ -2398,7 +2410,7 @@ impl TextSearcher {
                     vec![(RankKey::text(0.0), address)],
                     &ranking,
                     1,
-                    &mut |hit| Ok(cx.search.filters.admit(hit)),
+                    &mut |hit| self.structured_admits(cx, &stated, hit),
                 )?
                 .into_iter()
                 .next();
@@ -2631,9 +2643,12 @@ impl TextSearcher {
             self.query_postcode_unplaced(plan)?,
         );
         let descriptors = self.descriptors(plan.subject.iter().map(|word| word.text.as_str()));
+        let stated = self.stated_places(&plan.context);
         let mut keep = |hit: &TextSearchHit| -> Result<bool> {
             crate::stop::check()?;
-            if !cx.search.filters.admit(hit) || self.street_contradicts(&descriptors, hit) {
+            if !self.structured_admits(cx, &stated, hit)?
+                || self.street_contradicts(&descriptors, hit)
+            {
                 return Ok(false);
             }
             accept(cx.session, plan, &ranking.postcode, hit)
@@ -3516,21 +3531,14 @@ impl TextSearcher {
     /// (see [`Self::structured_judged`]): only when the rules the text search
     /// ranks by hold, as the text search's own best would. It is not a
     /// business, which the text search weighs by its name; its postcode
-    /// does not contradict the stated one; it lies in the stated towns (see
-    /// [`Self::in_stated_towns`]); it states the unit asked for; and its
-    /// street's type or direction does not contradict the query's. Else the
-    /// text search answers.
-    fn verified(
-        &self,
-        hit: &TextSearchHit,
-        towns_known: bool,
-        cx: &StructuredContext<'_, '_>,
-    ) -> bool {
+    /// does not contradict the stated one; it states the unit asked for;
+    /// and its street's type or direction does not contradict the query's.
+    /// Else the text search answers.
+    fn verified(&self, hit: &TextSearchHit, cx: &StructuredContext<'_, '_>) -> bool {
         let features = &hit.features;
         let descriptors = self.descriptors(cx.search.query_words.search.iter().map(String::as_str));
         hit.record.layer != Layer::Poi.as_str()
             && features.postcode != Agreement::Contradicts
-            && Self::in_stated_towns(features, towns_known)
             && features.unit != Some(false)
             && !self.street_contradicts(&descriptors, hit)
     }
@@ -3547,6 +3555,21 @@ impl TextSearcher {
             Agreement::Unknown => !towns_known,
             Agreement::Contradicts => features.postcode == Agreement::Agrees,
         }
+    }
+
+    /// Whether the structured stage may weigh `hit`: it passes the caller's
+    /// filters and lies in no other country or region than `stated` names,
+    /// as the text search holds its own hits (see [`Self::kept`]). Checked
+    /// before weighing, not after: a namesake street in another state would
+    /// outscore every street of the stated one.
+    fn structured_admits(
+        &self,
+        cx: &StructuredContext<'_, '_>,
+        stated: &StatedPlaces,
+        hit: &TextSearchHit,
+    ) -> Result<bool> {
+        Ok(cx.search.filters.admit(hit)
+            && self.region_agreement(hit, stated, cx.session)? != Some(false))
     }
 
     /// The countries a structured-stage lookup is held to: those the caller asks
@@ -13515,6 +13538,238 @@ mod tests {
         assert!(!LAST_STRUCTURED.with(Cell::get).answered);
         assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The structured stage holds its answers to the region the query
+    /// states, as the text search does: "Columbus, Indiana" is never
+    /// answered by the Main Street of Columbus, Ohio.
+    #[test]
+    fn a_stated_region_removes_a_structured_answer_in_another_region() {
+        use crate::record::PlaceLayer::{Country, Locality, Region};
+
+        let pack = TempPack::new("search-structured-region");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let ohio_at = [-83.0, 39.96];
+        let indiana_at = [-85.92, 39.2];
+        let us = place(
+            &mut writer,
+            Country,
+            "United States",
+            ObjectType::Relation,
+            1,
+            ohio_at,
+            None,
+        );
+        writer.set_country_codes(
+            [(us, CountryCode::parse("US").expect("code"))]
+                .into_iter()
+                .collect(),
+        );
+        let ohio = place(
+            &mut writer,
+            Region,
+            "Ohio",
+            ObjectType::Relation,
+            2,
+            ohio_at,
+            chain(&[(Country, us)]),
+        );
+        let indiana = place(
+            &mut writer,
+            Region,
+            "Indiana",
+            ObjectType::Relation,
+            3,
+            indiana_at,
+            chain(&[(Country, us)]),
+        );
+        let in_region = |region| chain(&[(Country, us), (Region, region)]);
+        let columbus_oh = place(
+            &mut writer,
+            Locality,
+            "Columbus",
+            ObjectType::Relation,
+            4,
+            ohio_at,
+            in_region(ohio),
+        );
+        let columbus_in = place(
+            &mut writer,
+            Locality,
+            "Columbus",
+            ObjectType::Relation,
+            5,
+            indiana_at,
+            in_region(indiana),
+        );
+        writer.set_context_names(
+            [
+                (us, "United States"),
+                (ohio, "Ohio"),
+                (indiana, "Indiana"),
+                (columbus_oh, "Columbus"),
+                (columbus_in, "Columbus"),
+            ]
+            .into_iter()
+            .map(|(id, name)| (id, vec![name.to_string()]))
+            .collect(),
+        );
+        let in_town =
+            |region, locality| chain(&[(Country, us), (Region, region), (Locality, locality)]);
+        for (id, number, street, region, town, [lon, lat]) in [
+            (
+                "osm:node:10",
+                "100",
+                "Main Street",
+                ohio,
+                columbus_oh,
+                ohio_at,
+            ),
+            (
+                "osm:node:11",
+                "102",
+                "Main Street",
+                ohio,
+                columbus_oh,
+                [-83.0001, 39.96],
+            ),
+            (
+                "osm:node:12",
+                "5",
+                "Washington Street",
+                indiana,
+                columbus_in,
+                indiana_at,
+            ),
+        ] {
+            let record = located(
+                address_record(id, "", number, street, Some("Columbus"), None),
+                [lon, lat],
+            );
+            writer
+                .write(&record.into(), in_town(region, town))
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let plain = TextSearcher::open(&pack.0)
+            .expect("searcher")
+            .without_structured();
+        let ids = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(&TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 1,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&searcher, "100 Main Street, Columbus, Ohio"),
+            ["osm:node:10"]
+        );
+        // Columbus, Indiana has no Main Street: the answer is the town,
+        // marked a fallback, as the text search alone gives it.
+        let query = "100 Main Street, Columbus, Indiana";
+        assert_eq!(ids(&plain, query), ["osm:relation:5"]);
+        assert_eq!(ids(&searcher, query), ["osm:relation:5"]);
+    }
+
+    /// Every structured answer, not only the best, lies in the towns the
+    /// query states, as the text search's do: "Dorpsstraat 3, Leiden" is
+    /// never also answered by the Dorpsstraat of the next town.
+    #[test]
+    fn a_stated_town_removes_every_structured_answer_in_another_town() {
+        use crate::record::PlaceLayer::{Locality, Region};
+
+        let pack = TempPack::new("search-structured-town");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let leiden_at = [4.49, 52.16];
+        let zoeterwoude_at = [4.5, 52.15];
+        let holland = place(
+            &mut writer,
+            Region,
+            "Zuid-Holland",
+            ObjectType::Relation,
+            1,
+            leiden_at,
+            None,
+        );
+        let leiden = place(
+            &mut writer,
+            Locality,
+            "Leiden",
+            ObjectType::Relation,
+            2,
+            leiden_at,
+            chain(&[(Region, holland)]),
+        );
+        let zoeterwoude = place(
+            &mut writer,
+            Locality,
+            "Zoeterwoude",
+            ObjectType::Relation,
+            3,
+            zoeterwoude_at,
+            chain(&[(Region, holland)]),
+        );
+        writer.set_context_names(
+            [
+                (holland, "Zuid-Holland"),
+                (leiden, "Leiden"),
+                (zoeterwoude, "Zoeterwoude"),
+            ]
+            .into_iter()
+            .map(|(id, name)| (id, vec![name.to_string()]))
+            .collect(),
+        );
+        for (id, town, name, at) in [
+            ("osm:node:10", leiden, "Leiden", leiden_at),
+            ("osm:node:11", zoeterwoude, "Zoeterwoude", zoeterwoude_at),
+        ] {
+            let record = located(
+                address_record(id, "", "3", "Dorpsstraat", Some(name), None),
+                at,
+            );
+            writer
+                .write(
+                    &record.into(),
+                    chain(&[(Region, holland), (Locality, town)]),
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let plain = TextSearcher::open(&pack.0)
+            .expect("searcher")
+            .without_structured();
+        let ids = |searcher: &TextSearcher, query: &str| {
+            searcher
+                .search(&TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&searcher, "Dorpsstraat 3, Leiden"), ["osm:node:10"]);
+        assert_eq!(ids(&plain, "Dorpsstraat 3, Leiden"), ["osm:node:10"]);
+        assert_eq!(
+            ids(&searcher, "Dorpsstraat 3, Zoeterwoude"),
+            ["osm:node:11"]
+        );
     }
 
     /// A temporary Pack directory, removed when it goes out of scope, a
