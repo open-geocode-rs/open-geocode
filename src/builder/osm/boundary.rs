@@ -152,6 +152,10 @@ struct BuiltBoundary {
     bounds: Rect<f64>,
     area: f64,
     representative_point: [f64; 2],
+    /// Whether every outer way closed into a ring. A relation one of whose
+    /// rings is left open, such as Russia's mainland, keeps the rings that
+    /// closed (Kaliningrad) and covers only them.
+    rings_closed: bool,
 }
 
 #[derive(Clone)]
@@ -453,6 +457,39 @@ impl BoundarySet {
                 .is_some_and(|country| whole.contains(country))
         });
         coverage
+    }
+
+    /// Whether a point lies in the country (`JP`) or region (`CA-ON`) of
+    /// ISO 3166 code `code`; `None` when the Pack has no boundary of that
+    /// code to tell by, or one of its boundaries left a ring open and so
+    /// covers only part of the area.
+    pub(crate) fn area(&self, code: &str) -> Option<impl Fn([f64; 2]) -> bool + '_> {
+        let region = code.contains('-');
+        let boundaries = self
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.boundary)
+            .filter(|boundary| {
+                if region {
+                    boundary
+                        .subdivision_code
+                        .as_deref()
+                        .is_some_and(|held| held.eq_ignore_ascii_case(code))
+                } else {
+                    boundary.layer == PlaceLayer::Country
+                        && boundary
+                            .inferred_country_code
+                            .as_deref()
+                            .is_some_and(|held| held.eq_ignore_ascii_case(code))
+                }
+            })
+            .collect::<Vec<_>>();
+        let closed = boundaries.iter().all(|boundary| boundary.rings_closed);
+        (!boundaries.is_empty() && closed).then_some(move |point| {
+            boundaries
+                .iter()
+                .any(|boundary| covers_point(&self.shapes, boundary, point))
+        })
     }
 
     /// The country code of each country record, by record id: the country
@@ -770,7 +807,7 @@ fn boundary_from_way(way: &BoundaryWay) -> Option<(BuiltBoundary, Vec<u8>)> {
     if polygon.unsigned_area() <= f64::EPSILON {
         return None;
     }
-    built(parts, &way.tags, &MultiPolygon::new(vec![polygon]))
+    built(parts, &way.tags, &MultiPolygon::new(vec![polygon]), true)
 }
 
 fn boundary_from_relation(
@@ -780,10 +817,11 @@ fn boundary_from_relation(
     let Some(parts) = area_parts(&stub.tags) else {
         return Ok(None);
     };
-    let Some(geometry) = member_lines(stub, member_line)?.and_then(rings_geometry) else {
+    let Some((geometry, rings_closed)) = member_lines(stub, member_line)?.and_then(rings_geometry)
+    else {
         return Ok(None);
     };
-    Ok(built(parts, &stub.tags, &geometry))
+    Ok(built(parts, &stub.tags, &geometry, rings_closed))
 }
 
 /// Point inside the outline, not the centre: a ring's centre can lie in its
@@ -806,7 +844,7 @@ pub(crate) fn place_relations(
                 .flatten()
                 .map(|vertex| vertex.node_id)
                 .collect();
-            let Some(geometry) = rings_geometry(lines) else {
+            let Some((geometry, _)) = rings_geometry(lines) else {
                 return Ok(None);
             };
             let Some(point) = geometry.interior_point() else {
@@ -856,13 +894,18 @@ fn member_lines(
     }))
 }
 
-fn rings_geometry(lines: MemberLines) -> Option<MultiPolygon<f64>> {
-    let outer_rings = stitch_rings(lines.outer);
+/// The shape the rings of `lines` make, and whether every outer way closed
+/// into a ring.
+fn rings_geometry(lines: MemberLines) -> Option<(MultiPolygon<f64>, bool)> {
+    let (outer_rings, outer_closed) = stitch_rings(lines.outer);
     if outer_rings.is_empty() {
         return None;
     }
-    let inner_rings = stitch_rings(lines.inner);
-    multipolygon_from_rings(outer_rings, inner_rings)
+    let (inner_rings, _) = stitch_rings(lines.inner);
+    Some((
+        multipolygon_from_rings(outer_rings, inner_rings)?,
+        outer_closed,
+    ))
 }
 
 /// The boundary an area's tags and geometry make, and the block of its
@@ -872,6 +915,7 @@ fn built(
     parts: AreaParts,
     tags: &BTreeMap<String, String>,
     geometry: &MultiPolygon<f64>,
+    rings_closed: bool,
 ) -> Option<(BuiltBoundary, Vec<u8>)> {
     let AreaParts {
         layer,
@@ -903,6 +947,7 @@ fn built(
             bounds,
             area: geometry.unsigned_area(),
             representative_point,
+            rings_closed,
         },
         block,
     ))
@@ -948,9 +993,12 @@ fn ring_line_string(ring: &[Vertex]) -> LineString<f64> {
     )
 }
 
-fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> Vec<Vec<Vertex>> {
+/// The rings `segments` join into, and whether every segment ended in one:
+/// a chain that cannot close is left out.
+fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> (Vec<Vec<Vertex>>, bool) {
     segments.retain(|segment| segment.len() >= 2);
     let mut rings = Vec::new();
+    let mut closed = true;
 
     while let Some(mut ring) = segments.pop() {
         loop {
@@ -960,6 +1008,7 @@ fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> Vec<Vec<Vertex>> {
             }
 
             let Some(index) = segments.iter().position(|segment| can_join(&ring, segment)) else {
+                closed = false;
                 break;
             };
             let segment = segments.swap_remove(index);
@@ -967,7 +1016,7 @@ fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> Vec<Vec<Vertex>> {
         }
     }
 
-    rings
+    (rings, closed)
 }
 
 fn ends(line: &[Vertex]) -> Option<(i64, i64)> {
@@ -1764,6 +1813,7 @@ impl crate::extsort::Spill for SetItem {
                 {
                     out.extend_from_slice(&value.to_bits().to_le_bytes());
                 }
+                out.push(u8::from(boundary.rings_closed));
             }
             Self::DerivedCountry(code, record) => {
                 out.push(1);
@@ -1826,6 +1876,11 @@ impl crate::extsort::Spill for SetItem {
                     *value = super::checkpoint::get_f64(input)?;
                 }
                 let [min_x, min_y, max_x, max_y, area, lon, lat] = values;
+                let rings_closed = match get_u8(input)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Decode("a saved boundary's ring flag is not 0 or 1")),
+                };
                 Self::Candidate(Box::new(BoundaryCandidate {
                     source_object_type,
                     source_object_id,
@@ -1845,6 +1900,7 @@ impl crate::extsort::Spill for SetItem {
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
                         area,
                         representative_point: [lon, lat],
+                        rings_closed,
                     },
                 }))
             }
@@ -2016,6 +2072,46 @@ mod tests {
         );
     }
 
+    /// A saved boundary keeps whether its rings closed, so a resumed build
+    /// judges sources by it as the first did.
+    #[test]
+    fn a_saved_boundary_keeps_whether_its_rings_closed() {
+        use crate::extsort::Spill;
+        for rings_closed in [false, true] {
+            let mut boundary = test_boundary(PlaceLayer::Region);
+            boundary.rings_closed = rings_closed;
+            let mut bytes = Vec::new();
+            SetItem::Candidate(Box::new(BoundaryCandidate {
+                source_object_type: ObjectType::Relation,
+                source_object_id: 60189,
+                boundary,
+            }))
+            .encode(&mut bytes);
+            let SetItem::Candidate(read) = SetItem::decode(&mut bytes.as_slice()).expect("decode")
+            else {
+                panic!("not a candidate");
+            };
+            assert_eq!(read.boundary.rings_closed, rings_closed);
+        }
+        let mut bytes = Vec::new();
+        SetItem::Candidate(Box::new(BoundaryCandidate {
+            source_object_type: ObjectType::Relation,
+            source_object_id: 60189,
+            boundary: test_boundary(PlaceLayer::Region),
+        }))
+        .encode(&mut bytes);
+        *bytes.last_mut().expect("flag") = 2;
+        assert_eq!(
+            SetItem::decode(&mut bytes.as_slice())
+                .err()
+                .map(|error| error.to_string()),
+            Some(
+                crate::error::Error::Decode("a saved boundary's ring flag is not 0 or 1")
+                    .to_string()
+            )
+        );
+    }
+
     fn test_boundary(layer: PlaceLayer) -> BuiltBoundary {
         let ring = LineString::from(vec![
             (-1.0, -1.0),
@@ -2041,6 +2137,7 @@ mod tests {
             area: geometry.unsigned_area(),
             prominence: Default::default(),
             wikidata: None,
+            rings_closed: true,
         }
     }
 
@@ -2406,6 +2503,7 @@ mod tests {
                     area,
                     prominence: Default::default(),
                     wikidata: None,
+                    rings_closed: true,
                 },
             });
         }

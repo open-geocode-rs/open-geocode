@@ -88,8 +88,9 @@ impl OpenAddresses {
         })
     }
 
-    /// The sources whose data a Pack covering `countries` needs.
-    pub fn sources(coverage: &Coverage) -> Result<Vec<Source>> {
+    /// The sources whose data a Pack covering `coverage` needs, each with
+    /// the code of the area its rows lie in.
+    pub fn sources(coverage: &Coverage) -> Result<Vec<(Source, String)>> {
         let url = format!("{API}/data?layer=addresses");
         let listed: Vec<Source> = agent()
             .get(&url)
@@ -169,11 +170,12 @@ impl AddressSource for OpenAddresses {
         let sources = Self::sources(coverage)?;
         sources
             .iter()
-            .map(|source| {
+            .map(|(source, area)| {
                 Ok(AddressFile {
                     dataset: dataset_of(source, &sources),
                     path: self.download(source)?,
                     entry: None,
+                    area: Some(area.clone()),
                 })
             })
             .collect()
@@ -182,10 +184,10 @@ impl AddressSource for OpenAddresses {
 
 /// The dataset a source's records name: its path, and its name too when the
 /// source has several data sets.
-fn dataset_of(source: &Source, sources: &[Source]) -> String {
+fn dataset_of(source: &Source, sources: &[(Source, String)]) -> String {
     let shared = sources
         .iter()
-        .filter(|other| other.source == source.source)
+        .filter(|(other, _)| other.source == source.source)
         .count()
         > 1;
     if shared {
@@ -285,13 +287,14 @@ impl AddressSource for Collection {
             .collect::<std::collections::HashMap<_, _>>();
         Ok(sources
             .iter()
-            .filter_map(|source| {
+            .filter_map(|(source, area)| {
                 let entry =
                     entries.get(&(source.source.clone(), source.name.clone(), source.job))?;
                 Some(AddressFile {
                     dataset: dataset_of(source, &sources),
                     path: self.path.clone(),
                     entry: Some(entry.clone()),
+                    area: Some(area.clone()),
                 })
             })
             .collect())
@@ -333,49 +336,32 @@ fn dotenv_value(text: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Of the listed sources, those `coverage` needs. A country covered whole takes
-/// its `countrywide` source alone when it has one, since that holds what the
-/// others do, else all of its sources; a region of a country covered in part
-/// takes the sources under its path (`CA-ON` the ones under `ca/on/`), and
-/// never the countrywide one, which would bring in the rest of the country.
-/// A data set listed twice is taken once, at its latest job.
-fn select(mut listed: Vec<Source>, coverage: &Coverage) -> Vec<Source> {
+/// Of the listed sources, those `coverage` needs, each with the ISO 3166
+/// code of the area its rows must lie in. A country covered whole takes
+/// every source under its path, `countrywide` and the others alike: they
+/// come from different publishers and need not cover the same addresses, and
+/// the build drops a row repeating an address another source has. A region
+/// of a country covered in part takes the sources under its path (`CA-ON` the
+/// ones under `ca/on/`), and never the countrywide one, which would bring in
+/// the rest of the country. A data set listed twice is taken once, at its
+/// latest job.
+fn select(mut listed: Vec<Source>, coverage: &Coverage) -> Vec<(Source, String)> {
     listed.sort_by(|left, right| {
         (&left.source, &left.name)
             .cmp(&(&right.source, &right.name))
             .then(right.job.cmp(&left.job))
     });
     listed.dedup_by(|later, earlier| later.source == earlier.source && later.name == earlier.name);
+    let areas = coverage.subdivisions.iter().chain(&coverage.countries);
     let mut selected = Vec::new();
-    for subdivision in &coverage.subdivisions {
-        let prefix = format!(
-            "{}/",
-            subdivision.to_ascii_lowercase().replacen('-', "/", 1)
-        );
+    for area in areas {
+        let prefix = format!("{}/", area.to_ascii_lowercase().replacen('-', "/", 1));
         selected.extend(
             listed
                 .iter()
                 .filter(|source| source.source.starts_with(&prefix))
-                .cloned(),
+                .map(|source| (source.clone(), area.clone())),
         );
-    }
-    for country in &coverage.countries {
-        let prefix = format!("{}/", country.to_ascii_lowercase());
-        let of_country = listed
-            .iter()
-            .filter(|source| source.source.starts_with(&prefix))
-            .collect::<Vec<_>>();
-        let countrywide = format!("{prefix}countrywide");
-        let whole = of_country
-            .iter()
-            .filter(|source| source.source == countrywide)
-            .map(|source| (*source).clone())
-            .collect::<Vec<_>>();
-        if whole.is_empty() {
-            selected.extend(of_country.into_iter().cloned());
-        } else {
-            selected.extend(whole);
-        }
     }
     selected
 }
@@ -467,16 +453,22 @@ mod tests {
         ]
     }
 
+    fn within(area: &str, sources: &[(&str, u64)]) -> Vec<(Source, String)> {
+        sources
+            .iter()
+            .map(|(name, job)| (source(name, *job), area.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn takes_a_countrywide_source_alone_else_every_source_of_the_country() {
+    fn takes_every_source_of_a_country_covered_whole_countrywide_or_not() {
         let coverage = Coverage {
             countries: BTreeSet::from(["AU".to_string(), "US".to_string()]),
             subdivisions: BTreeSet::new(),
         };
-        assert_eq!(
-            select(listed(), &coverage),
-            vec![source("au/countrywide", 7), source("us/ny/nyc", 8)]
-        );
+        let mut expected = within("AU", &[("au/countrywide", 7), ("au/nsw/statewide", 3)]);
+        expected.extend(within("US", &[("us/ny/nyc", 8)]));
+        assert_eq!(select(listed(), &coverage), expected);
     }
 
     #[test]
@@ -487,10 +479,10 @@ mod tests {
         };
         assert_eq!(
             select(listed(), &coverage),
-            vec![
-                source("ca/on/city_of_ottawa", 9),
-                source("ca/on/city_of_toronto", 5),
-            ],
+            within(
+                "CA-ON",
+                &[("ca/on/city_of_ottawa", 9), ("ca/on/city_of_toronto", 5)]
+            ),
             "not ca/countrywide, which holds Quebec too"
         );
     }
@@ -564,6 +556,7 @@ mod tests {
             "only New Zealand's address layer: {files:?}"
         );
         assert_eq!(files[0].dataset, "openaddresses:nz/countrywide");
+        assert_eq!(files[0].area.as_deref(), Some("NZ"));
         assert_eq!(
             files[0].entry.as_deref(),
             Some("nz/countrywide-addresses-country.geojson")
