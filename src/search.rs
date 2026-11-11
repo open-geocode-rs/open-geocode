@@ -2183,7 +2183,7 @@ impl TextSearcher {
             session,
             usize::MAX,
         )?;
-        // Every answer, not only the best: the street of the next town is
+        // Every answer, not only the best. The street of the next town is
         // no answer to a query that names this one.
         let mut hits = kept
             .into_iter()
@@ -3557,11 +3557,12 @@ impl TextSearcher {
         }
     }
 
-    /// Whether the structured stage may weigh `hit`: it passes the caller's
-    /// filters and lies in no other country or region than `stated` names,
-    /// as the text search holds its own hits (see [`Self::kept`]). Checked
-    /// before weighing, not after: a namesake street in another state would
-    /// outscore every street of the stated one.
+    /// Whether the structured stage may weigh `hit`, which passes the
+    /// caller's filters and lies in no other country or region than
+    /// `stated` names, as the text search holds its own hits (see
+    /// [`Self::kept`]). Checked before weighing, not after, since a namesake
+    /// street in another state would outscore every street of the stated
+    /// one.
     fn structured_admits(
         &self,
         cx: &StructuredContext<'_, '_>,
@@ -13541,7 +13542,7 @@ mod tests {
     }
 
     /// The structured stage holds its answers to the region the query
-    /// states, as the text search does: "Columbus, Indiana" is never
+    /// states, as the text search does. "Columbus, Indiana" is never
     /// answered by the Main Street of Columbus, Ohio.
     #[test]
     fn a_stated_region_removes_a_structured_answer_in_another_region() {
@@ -13674,7 +13675,7 @@ mod tests {
             ids(&searcher, "100 Main Street, Columbus, Ohio"),
             ["osm:node:10"]
         );
-        // Columbus, Indiana has no Main Street: the answer is the town,
+        // Columbus, Indiana has no Main Street. The answer is the town,
         // marked a fallback, as the text search alone gives it.
         let query = "100 Main Street, Columbus, Indiana";
         assert_eq!(ids(&plain, query), ["osm:relation:5"]);
@@ -13682,7 +13683,7 @@ mod tests {
     }
 
     /// Every structured answer, not only the best, lies in the towns the
-    /// query states, as the text search's do: "Dorpsstraat 3, Leiden" is
+    /// query states, as the text search's do. "Dorpsstraat 3, Leiden" is
     /// never also answered by the Dorpsstraat of the next town.
     #[test]
     fn a_stated_town_removes_every_structured_answer_in_another_town() {
