@@ -181,8 +181,8 @@ fn band_of(lat: f64, lo: f64, hi: f64, bands: usize) -> usize {
 }
 
 /// A shape block whose length agrees with the counts it states. Every
-/// offset and index it holds is still checked as it is read: a Pack is
-/// external data.
+/// offset and index it holds is still checked as it is read, since a Pack
+/// is external data.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Shape<'a> {
     block: &'a [u8],
@@ -305,7 +305,7 @@ impl<'a> Shape<'a> {
         Ok(inside)
     }
 
-    /// The box around the area, in fixed point: west, south, east, north.
+    /// The box around the area in fixed point, as west, south, east, north.
     /// Inverted when the block holds no vertex.
     pub(crate) fn bounds(&self) -> Result<[i32; 4]> {
         let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
@@ -326,13 +326,13 @@ impl<'a> Shape<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AreaKey {
     pub record_id: RecordId,
-    /// The layer it is ranked in: one area per layer holds a point.
+    /// The layer it is ranked in. One area per layer holds a point.
     pub layer: PlaceLayer,
     /// Everything it is. Usually just `layer`, but Berlin is a state and a
     /// city.
     pub tiers: TierSet,
-    /// Its place among every area of the Pack, lowest first: admin
-    /// boundaries before places drawn as areas, then the smallest.
+    /// Its place among every area of the Pack, lowest first. Admin
+    /// boundaries come before places drawn as areas, then the smallest.
     pub rank: u32,
     /// The country its `ISO3166-2` code names, for a region whose country
     /// has no boundary in the input.
@@ -588,7 +588,7 @@ mod tests {
         );
     }
 
-    /// A Pack's blocks are external data: one that does not add up is an
+    /// A Pack's blocks are external data. One that does not add up is an
     /// error, never a read past its end.
     #[test]
     fn a_damaged_shape_is_an_error() {

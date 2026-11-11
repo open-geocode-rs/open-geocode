@@ -3938,8 +3938,8 @@ mod tests {
     }
 
     /// Reverse geocoding names the areas holding the point, tested against
-    /// the shapes the build placed its records in: in a field far from any
-    /// record, and beside the point of an area it is not in.
+    /// the shapes the build placed its records in. Asked in a field far from
+    /// any record, and beside the point of an area it is not in.
     #[test]
     fn reverse_names_the_areas_that_hold_the_point() {
         let dir = temp_dir("held");

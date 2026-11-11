@@ -20,7 +20,7 @@ const STREET_RADIUS_M: f64 = 30.0;
 const CONTEXT_RADIUS_M: f64 = 50_000.0;
 const CANDIDATE_LIMIT: usize = 16;
 /// The tiers [`Context`] has a slot for, finest first. A `Sub` tier shares
-/// its record layer with the tier above but is not that tier: the
+/// its record layer with the tier above but is not that tier. The
 /// sub-locality Ville-Haute is no locality of its own.
 const TIERS: [PlaceLayer; 6] = [
     PlaceLayer::Neighbourhood,
@@ -546,7 +546,7 @@ impl PackReverseGeocoder {
             }))
     }
 
-    /// Name the areas of the record answering at the point: those the build
+    /// Name the areas of the record answering at the point, those the build
     /// found it in, else those holding the point. Returns the chain named.
     fn name_record_areas(
         &self,
@@ -857,7 +857,7 @@ mod tests {
     }
 
     /// A sub-locality's record is of the locality layer, yet it is no
-    /// locality: Ville-Haute is a quarter of the commune of Luxembourg. The
+    /// locality. Ville-Haute is a quarter of the commune of Luxembourg. The
     /// locality an address names is the commune.
     #[test]
     fn a_sub_locality_takes_no_locality_slot() {

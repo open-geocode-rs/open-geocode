@@ -1648,8 +1648,8 @@ fn representative_point(geometry: &MultiPolygon<f64>) -> Option<[f64; 2]> {
 }
 
 /// How the build ranks the areas of one layer holding a point, once the
-/// names the record states have had their say: an admin boundary of the
-/// layer before a place drawn as an area, which fills the layers admin
+/// names the record states have had their say. An admin boundary of the
+/// layer comes before a place drawn as an area, which fills the layers admin
 /// boundaries leave empty, then the smallest.
 fn rank_order(left: &AcceptedBoundary, right: &AcceptedBoundary) -> Ordering {
     left.admin_level
