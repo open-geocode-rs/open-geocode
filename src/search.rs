@@ -45,7 +45,7 @@ use crate::{
     },
     records::{dequantize, quantize},
     road,
-    spatial_index::{self, haversine_m},
+    spatial_index::{self, chord_m, haversine_m, unit_vector},
     text_index::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
         INTERPOLATION_END_FIELD, INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD,
@@ -104,13 +104,37 @@ struct SegmentColumns {
     rank_postcode: Option<StrColumn>,
     area_postcode: Option<StrColumn>,
     country_code: Option<StrColumn>,
+    extent: ExtentColumns,
+    name_words: Column<u64>,
+    place_rank: Column<u64>,
+    prominence: Column<u64>,
+}
+
+/// A segment's columns of each document's [`Extent`], in 1e-7 degrees.
+#[derive(Clone)]
+struct ExtentColumns {
     min_lon: Column<i64>,
     min_lat: Column<i64>,
     max_lon: Column<i64>,
     max_lat: Column<i64>,
-    name_words: Column<u64>,
-    place_rank: Column<u64>,
-    prominence: Column<u64>,
+}
+
+impl ExtentColumns {
+    /// Document `doc`'s extent, west, south, east and north, `None` when it
+    /// has none or a bound out of range.
+    fn of(&self, doc: DocId) -> Option<[i32; 4]> {
+        let bound = |column: &Column<i64>| {
+            column
+                .first(doc)
+                .and_then(|value| i32::try_from(value).ok())
+        };
+        Some([
+            bound(&self.min_lon)?,
+            bound(&self.min_lat)?,
+            bound(&self.max_lon)?,
+            bound(&self.max_lat)?,
+        ])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,10 +445,12 @@ impl TextSearcher {
                     rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
                     area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
                     country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
-                    min_lon: fast_fields.i64(MIN_LON_FIELD)?,
-                    min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
-                    max_lon: fast_fields.i64(MAX_LON_FIELD)?,
-                    max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
+                    extent: ExtentColumns {
+                        min_lon: fast_fields.i64(MIN_LON_FIELD)?,
+                        min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
+                        max_lon: fast_fields.i64(MAX_LON_FIELD)?,
+                        max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
+                    },
                     name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
                     place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
                     prominence: fast_fields.u64(PROMINENCE_FIELD)?,
@@ -3683,13 +3709,7 @@ impl TextSearcher {
     /// it has none.
     pub(crate) fn doc_point(&self, doc: DocId) -> Option<[i32; 2]> {
         let (columns, doc) = self.doc_columns(doc)?;
-        let bound = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
-        let extent = [
-            bound(&columns.min_lon)?,
-            bound(&columns.min_lat)?,
-            bound(&columns.max_lon)?,
-            bound(&columns.max_lat)?,
-        ];
+        let extent = columns.extent.of(doc)?;
         Some(extent_middle(extent)).filter(|point| *point != [0, 0])
     }
 
@@ -3778,16 +3798,7 @@ impl TextSearcher {
             Ok(text)
         };
         keyed.country = first(&columns.country_code)?;
-        let bound = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
-        let extent = match (
-            bound(&columns.min_lon),
-            bound(&columns.min_lat),
-            bound(&columns.max_lon),
-            bound(&columns.max_lat),
-        ) {
-            (Some(west), Some(south), Some(east), Some(north)) => Some([west, south, east, north]),
-            _ => None,
-        };
+        let extent = columns.extent.of(doc);
         let record = records.record(record_id)?;
         let postcode_keys = |postcode: &str, names: &mut Vec<String>| {
             let Some(key) = search_key(postcode) else {
@@ -5036,10 +5047,8 @@ impl TextSearcher {
             .into_values()
             .map(|members| {
                 let neighbour_m = self.nearest_other_postcode_m(&members)?;
-                Ok(PostcodeArea::new(
-                    members.into_iter().map(|(_, point)| point).collect(),
-                    neighbour_m,
-                ))
+                let points = members.iter().map(|(_, point)| *point).collect::<Vec<_>>();
+                Ok(PostcodeArea::new(&points, neighbour_m))
             })
             .collect()
     }
@@ -5357,7 +5366,6 @@ impl TextSearcher {
             let keys = RankKeys {
                 ranking,
                 columns: &self.columns,
-                pack: &self.pack,
             };
             searcher.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
         } else {
@@ -5378,7 +5386,6 @@ impl TextSearcher {
         let keys = RankKeys {
             ranking,
             columns: &self.columns,
-            pack: &self.pack,
         };
         let mut tweakers = HashMap::<u32, SegmentRankKeys>::new();
         let mut top_docs = Vec::with_capacity(scored.len());
@@ -6337,23 +6344,14 @@ fn focus_band(distance_m: f64) -> u8 {
 /// The caller's focus, against the extents of a segment's documents.
 struct SegmentFocus {
     focus: [f64; 2],
-    min_lon: Column<i64>,
-    min_lat: Column<i64>,
-    max_lon: Column<i64>,
-    max_lat: Column<i64>,
+    extent: ExtentColumns,
 }
 
 impl SegmentFocus {
     /// [`RankKey::nearness`] of a document: the band of the point of its
     /// extent nearest the focus, counted down from the nearest.
     fn nearness(&self, doc: DocId) -> u8 {
-        let read = |column: &Column<i64>| column.first(doc).map(|value| value as i32);
-        let (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) = (
-            read(&self.min_lon),
-            read(&self.min_lat),
-            read(&self.max_lon),
-            read(&self.max_lat),
-        ) else {
+        let Some([min_lon, min_lat, max_lon, max_lat]) = self.extent.of(doc) else {
             return 0;
         };
         let [lon, lat] = self.focus;
@@ -6369,7 +6367,6 @@ impl SegmentFocus {
 struct RankKeys<'a> {
     ranking: &'a Ranking,
     columns: &'a HashMap<SegmentId, SegmentColumns>,
-    pack: &'a Arc<pack::Reader>,
 }
 
 struct SegmentRankKeys {
@@ -6458,12 +6455,13 @@ impl PostcodeColumn {
 }
 
 /// Ranks a matched record with no postcode of its own by its distance from
-/// the records of the postcode a query names. The first address of a street
-/// group stands for all of it: they share a street, their areas and the
-/// postcode nearest them.
+/// the records of the postcode a query names. The middle of its extent
+/// stands for it, read from the index's columns. A run of tied matches keys
+/// every one of millions, and a point read from the Pack decodes a record
+/// block for each. A street group's addresses share a street, their areas
+/// and the postcode nearest them, and the nearest band is 1 km wide.
 struct PostcodeNearness {
-    record_id: Column<u64>,
-    pack: Arc<pack::Reader>,
+    extent: ExtentColumns,
     postcode: QueryPostcode,
 }
 
@@ -6472,11 +6470,8 @@ impl PostcodeNearness {
     /// Beyond the last (a code shared with another country) only the
     /// nearest postcode centroid ranks, as without the postcode's records.
     fn band(&self, doc: DocId) -> Option<u8> {
-        let distance = self
-            .record_id
-            .first(doc)
-            .and_then(|record_id| self.pack.records().point(record_id).ok())
-            .and_then(|(_, lon, lat)| self.postcode.distance_m(lon, lat))?;
+        let [lon, lat] = extent_middle(self.extent.of(doc)?);
+        let distance = self.postcode.distance_m(dequantize(lon), dequantize(lat))?;
         POSTCODE_NEARNESS_BANDS_M
             .iter()
             .position(|band| distance <= *band)
@@ -6508,10 +6503,7 @@ impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
             prominence: columns.prominence.clone(),
             focus: self.focus.map(|focus| SegmentFocus {
                 focus,
-                min_lon: columns.min_lon.clone(),
-                min_lat: columns.min_lat.clone(),
-                max_lon: columns.max_lon.clone(),
-                max_lat: columns.max_lat.clone(),
+                extent: columns.extent.clone(),
             }),
         })
     }
@@ -6547,8 +6539,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
                 own: column(&columns.rank_postcode)?,
                 area: column(&columns.area_postcode)?,
                 nearness: (!named.areas.is_empty()).then(|| PostcodeNearness {
-                    record_id: columns.record_id.clone(),
-                    pack: Arc::clone(self.pack),
+                    extent: columns.extent.clone(),
                     postcode: named.clone(),
                 }),
             }),
@@ -6563,10 +6554,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             postcode,
             focus: self.ranking.focus.map(|focus| SegmentFocus {
                 focus,
-                min_lon: columns.min_lon.clone(),
-                min_lat: columns.min_lat.clone(),
-                max_lon: columns.max_lon.clone(),
-                max_lat: columns.max_lat.clone(),
+                extent: columns.extent.clone(),
             }),
         })
     }
@@ -8025,12 +8013,15 @@ struct QueryPostcode {
 /// or to the nearest other postcode when that lies farther.
 #[derive(Debug, Clone)]
 struct PostcodeArea {
-    points: Vec<[f64; 2]>,
+    /// As [`unit_vector`]s. A run of tied matches measures every one of
+    /// millions against each point, and a straight line needs no
+    /// trigonometry per point.
+    points: Vec<[f64; 3]>,
     reach_m: f64,
 }
 
 impl PostcodeArea {
-    fn new(points: Vec<[f64; 2]>, neighbour_m: f64) -> Self {
+    fn new(points: &[[f64; 2]], neighbour_m: f64) -> Self {
         let count = points.len() as f64;
         let lon = points.iter().map(|[lon, _]| lon).sum::<f64>() / count;
         let lat = points.iter().map(|[_, lat]| lat).sum::<f64>() / count;
@@ -8038,14 +8029,29 @@ impl PostcodeArea {
             .iter()
             .map(|[point_lon, point_lat]| haversine_m(lon, lat, *point_lon, *point_lat))
             .fold(neighbour_m.max(POSTCODE_AREA_REACH_FLOOR_M), f64::max);
-        Self { points, reach_m }
+        Self {
+            points: points
+                .iter()
+                .map(|[lon, lat]| unit_vector(*lon, *lat))
+                .collect(),
+            reach_m,
+        }
     }
 
-    fn distance_m(&self, lon: f64, lat: f64) -> f64 {
-        self.points
+    /// Metres from the [`unit_vector`] `at` to the nearest point.
+    fn distance_m(&self, at: [f64; 3]) -> f64 {
+        let chord_squared = self
+            .points
             .iter()
-            .map(|[point_lon, point_lat]| haversine_m(lon, lat, *point_lon, *point_lat))
-            .fold(f64::INFINITY, f64::min)
+            .map(|point| {
+                point
+                    .iter()
+                    .zip(at)
+                    .map(|(point, at)| (point - at) * (point - at))
+                    .sum::<f64>()
+            })
+            .fold(f64::INFINITY, f64::min);
+        chord_m(chord_squared.sqrt())
     }
 }
 
@@ -8118,9 +8124,10 @@ impl QueryPostcode {
     /// How far a point lies from the nearest record placing the postcode,
     /// when the Pack has any.
     fn distance_m(&self, lon: f64, lat: f64) -> Option<f64> {
+        let at = unit_vector(lon, lat);
         self.areas
             .iter()
-            .map(|area| area.distance_m(lon, lat))
+            .map(|area| area.distance_m(at))
             .min_by(f64::total_cmp)
     }
 
@@ -8129,10 +8136,11 @@ impl QueryPostcode {
     /// it does not, and between, or with no area, nothing says. Of the
     /// areas of several countries the one it lies nearest decides.
     fn placement(&self, lon: f64, lat: f64) -> Option<bool> {
+        let at = unit_vector(lon, lat);
         let reaches = self
             .areas
             .iter()
-            .map(|area| area.distance_m(lon, lat) / area.reach_m)
+            .map(|area| area.distance_m(at) / area.reach_m)
             .min_by(f64::total_cmp)?;
         if reaches <= 1.0 {
             Some(true)
@@ -9842,6 +9850,48 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Where a street without a postcode lies, against the postcode a query
+    /// names, is the middle of its extent. The text index holds it for every
+    /// match, so a run of millions of tied matches reads no record.
+    #[test]
+    fn a_street_without_a_postcode_ranks_by_the_middle_of_its_extent() {
+        let pack = TempPack::new("search-postcode-nearness-extent");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        writer
+            .write(
+                &PostcodeRecord {
+                    postcode: "M4M 1L2".to_string(),
+                    country: None,
+                    geometry: point_geometry(-79.333, 43.65),
+                    source: DerivedSourceProvenance::osm_address_records(3),
+                }
+                .into(),
+                None,
+            )
+            .expect("postcode");
+        // One runs from 5 km west of the postcode to 11 km east of it, its
+        // middle 3 km off, its point at its east end. The other lies 7 km
+        // east.
+        for (id, [west, east], point) in [
+            ("osm:way:1", [-79.40, -79.20], -79.20),
+            ("osm:way:2", [-79.25, -79.24], -79.245),
+        ] {
+            let mut street = street_record(id, "Carlaw Avenue");
+            street.geometry = geojson::Geometry::new(geojson::GeometryValue::LineString {
+                coordinates: vec![vec![west, 43.65].into(), vec![east, 43.65].into()],
+            });
+            street.representative_point = [point, 43.65];
+            writer.write(&street.into(), None).expect("street");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        assert_eq!(
+            top_ids(&searcher, "Carlaw Avenue, M4M 1L2"),
+            ["osm:way:1", "osm:way:2"]
+        );
     }
 
     #[test]
