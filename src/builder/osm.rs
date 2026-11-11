@@ -4929,6 +4929,112 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// France in the planet has levels no table row names above its
+    /// communes (3, France métropolitaine; 5, Collectivité européenne
+    /// d'Alsace). A street is still labelled and found by its commune, not by
+    /// the arrondissement named for the commune that is its seat.
+    #[test]
+    fn a_french_street_is_labelled_and_found_by_its_commune() {
+        let dir = temp_dir("french-communes");
+        let input = dir.join("france.osm.pbf");
+        let mut nodes = vec![
+            node(1, 2.5, 2.5, &[]),
+            node(2, 2.5, 2.501, &[]),
+            node(3, 3.5, 3.5, &[]),
+            node(4, 3.5, 3.501, &[]),
+            // Each commune's point names it, as in OSM.
+            node(5, 2.6, 2.6, &[("place", "city"), ("name", "Poitiers")]),
+            node(6, 3.6, 3.6, &[("place", "village"), ("name", "Ligugé")]),
+        ];
+        let mut ways = Vec::new();
+        let mut relations = Vec::new();
+        // Admin level, the corners of its square, its tags.
+        type Area<'a> = (&'a str, f64, f64, &'a [(&'a str, &'a str)]);
+        let areas: [Area; 9] = [
+            (
+                "2",
+                0.0,
+                10.0,
+                &[("name", "France"), ("ISO3166-1:alpha2", "FR")],
+            ),
+            ("3", 0.5, 9.5, &[("name", "France métropolitaine")]),
+            (
+                "4",
+                1.0,
+                5.0,
+                &[("name", "Nouvelle-Aquitaine"), ("ISO3166-2", "FR-NAQ")],
+            ),
+            (
+                "5",
+                6.0,
+                9.0,
+                &[("name", "Collectivité européenne d'Alsace")],
+            ),
+            ("6", 1.5, 4.5, &[("name", "Vienne"), ("ISO3166-2", "FR-86")]),
+            ("7", 2.0, 4.0, &[("name", "Poitiers")]),
+            ("8", 2.1, 2.9, &[("name", "Poitiers")]),
+            ("8", 3.1, 3.9, &[("name", "Ligugé")]),
+            ("8", 6.5, 7.5, &[("name", "Strasbourg")]),
+        ];
+        for (index, (level, low, high, tags)) in areas.into_iter().enumerate() {
+            let id = 100 + 10 * index as i64;
+            nodes.extend([
+                node(id, low, low, &[]),
+                node(id + 1, low, high, &[]),
+                node(id + 2, high, high, &[]),
+                node(id + 3, high, low, &[]),
+            ]);
+            ways.push(way(id, &[id, id + 1, id + 2, id + 3, id], &[]));
+            let mut tags = tags.to_vec();
+            tags.extend([("boundary", "administrative"), ("admin_level", level)]);
+            relations.push(relation(id, &[(id, "outer")], &tags));
+        }
+        let road = [("highway", "residential"), ("name", "Grande Rue")];
+        ways.extend([way(700, &[1, 2], &road), way(701, &[3, 4], &road)]);
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut streets = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| {
+                (
+                    street["id"].as_str().expect("id").to_string(),
+                    street["label"].as_str().expect("label").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        streets.sort();
+        assert_eq!(
+            streets,
+            [
+                (
+                    "osm:way:700".to_string(),
+                    "Grande Rue, Poitiers".to_string()
+                ),
+                ("osm:way:701".to_string(), "Grande Rue, Ligugé".to_string()),
+            ]
+        );
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let found = searcher
+            .search(&TextSearchOptions {
+                query: "Grande Rue, Poitiers".to_string(),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(found, ["osm:way:700"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn spilling_to_disk_builds_the_same_pack() {
         let dir = temp_dir("spill");
