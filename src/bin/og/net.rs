@@ -95,8 +95,8 @@ pub(crate) struct Published {
 /// Follows `url`'s redirects to the file they land on and reads its
 /// `<file>.md5`. Geofabrik sends `-latest` to a dated file (`monaco-261109`),
 /// or for its biggest extracts to a mirror that alone has the `.md5`. The sum
-/// and the download both use that one file, so a new snapshot published
-/// between them cannot split them.
+/// and the download both use that one URL, so for a dated file a new
+/// snapshot published between them cannot split them.
 pub(crate) fn published(url: &str) -> Result<Published> {
     let response = agent()
         .head(url)
