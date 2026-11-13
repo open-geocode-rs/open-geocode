@@ -3126,7 +3126,7 @@ mod tests {
         for len in [0, 1, 7, SHUFFLE_WINDOW, SHUFFLE_WINDOW + 4_321] {
             let order = shuffled_order(len, &mut Random::new(len as u64));
             assert_eq!(order, through_window(len, &mut Random::new(len as u64)));
-            let mut sorted = order.clone();
+            let mut sorted = order;
             sorted.sort_unstable();
             assert!(sorted.into_iter().eq(0..len as u32), "every row once");
         }
