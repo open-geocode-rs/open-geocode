@@ -136,7 +136,7 @@ serde_json = "1.0"
 # parser axum's `Query` uses. Already in the tree through axum.
 serde_urlencoded = "0.7"
 # Stops `og build` cleanly on Ctrl-C.
-signal-hook = { version = "0.3", default-features = false, optional = true }
+signal-hook = { version = "0.4", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
 stable_deref_trait = "1.2"
 tantivy = "0.25.0"
