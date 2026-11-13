@@ -20,6 +20,7 @@ use serde::Deserialize;
 use crate::{
     builder::addresses::{AddressFile, AddressSource, Coverage},
     error::{Error, Result},
+    licences::{Licences, openaddresses_use},
 };
 
 pub const TOKEN_VARIABLE: &str = "OA_TOKEN";
@@ -42,6 +43,7 @@ pub const DATASET_PREFIX: &str = "openaddresses:";
 pub struct OpenAddresses {
     token: String,
     cache: PathBuf,
+    licences: Licences,
 }
 
 impl std::fmt::Debug for OpenAddresses {
@@ -49,6 +51,7 @@ impl std::fmt::Debug for OpenAddresses {
         formatter
             .debug_struct("OpenAddresses")
             .field("cache", &self.cache)
+            .field("licences", &self.licences)
             .finish_non_exhaustive()
     }
 }
@@ -85,12 +88,19 @@ impl OpenAddresses {
         Ok(Self {
             token,
             cache: cache.into(),
+            licences: Licences::default(),
         })
+    }
+
+    /// Take only the data sets `licences` lets a build take.
+    pub fn licences(mut self, licences: Licences) -> Self {
+        self.licences = licences;
+        self
     }
 
     /// The sources whose data a Pack covering `coverage` needs, each with
     /// the code of the area its rows lie in.
-    pub fn sources(coverage: &Coverage) -> Result<Vec<(Source, String)>> {
+    pub fn sources(coverage: &Coverage, licences: Licences) -> Result<Vec<(Source, String)>> {
         let url = format!("{API}/data?layer=addresses");
         let listed: Vec<Source> = agent()
             .get(&url)
@@ -99,7 +109,7 @@ impl OpenAddresses {
             .body_mut()
             .read_json()
             .map_err(|error| fetch_error(&url, error))?;
-        Ok(select(listed, coverage))
+        Ok(select(listed, coverage, licences))
     }
 
     fn download(&self, source: &Source) -> Result<PathBuf> {
@@ -167,7 +177,7 @@ impl OpenAddresses {
 
 impl AddressSource for OpenAddresses {
     fn files(&self, coverage: &Coverage) -> Result<Vec<AddressFile>> {
-        let sources = Self::sources(coverage)?;
+        let sources = Self::sources(coverage, self.licences)?;
         sources
             .iter()
             .map(|(source, area)| {
@@ -206,6 +216,7 @@ fn dataset_of(source: &Source, sources: &[(Source, String)]) -> String {
 #[derive(Debug, Clone)]
 pub struct Collection {
     path: PathBuf,
+    licences: Licences,
 }
 
 /// What a `.geojson.meta` entry says of its source.
@@ -224,7 +235,16 @@ struct EntryMeta {
 
 impl Collection {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            licences: Licences::default(),
+        }
+    }
+
+    /// Take only the data sets `licences` lets a build take.
+    pub fn licences(mut self, licences: Licences) -> Self {
+        self.licences = licences;
+        self
     }
 
     /// Every address source in the archive, with the entry that holds it.
@@ -275,6 +295,7 @@ impl AddressSource for Collection {
         let sources = select(
             listed.iter().map(|(source, _)| source.clone()).collect(),
             coverage,
+            self.licences,
         );
         let entries = listed
             .into_iter()
@@ -344,8 +365,13 @@ fn dotenv_value(text: &str, name: &str) -> Option<String> {
 /// of a country covered in part takes the sources under its path (`CA-ON` the
 /// ones under `ca/on/`), and never the countrywide one, which would bring in
 /// the rest of the country. A data set listed twice is taken once, at its
-/// latest job.
-fn select(mut listed: Vec<Source>, coverage: &Coverage) -> Vec<(Source, String)> {
+/// latest job, and one whose terms `licences` does not take is left out.
+fn select(
+    mut listed: Vec<Source>,
+    coverage: &Coverage,
+    licences: Licences,
+) -> Vec<(Source, String)> {
+    listed.retain(|source| licences.takes(openaddresses_use(&source.source, &source.name)));
     listed.sort_by(|left, right| {
         (&left.source, &left.name)
             .cmp(&(&right.source, &right.name))
@@ -468,7 +494,7 @@ mod tests {
         };
         let mut expected = within("AU", &[("au/countrywide", 7), ("au/nsw/statewide", 3)]);
         expected.extend(within("US", &[("us/ny/nyc", 8)]));
-        assert_eq!(select(listed(), &coverage), expected);
+        assert_eq!(select(listed(), &coverage, Licences::Permitted), expected);
     }
 
     #[test]
@@ -478,12 +504,37 @@ mod tests {
             subdivisions: BTreeSet::from(["CA-ON".to_string()]),
         };
         assert_eq!(
-            select(listed(), &coverage),
+            select(listed(), &coverage, Licences::Permitted),
             within(
                 "CA-ON",
                 &[("ca/on/city_of_ottawa", 9), ("ca/on/city_of_toronto", 5)]
             ),
             "not ca/countrywide, which holds Quebec too"
+        );
+    }
+
+    #[test]
+    fn leaves_out_a_data_set_whose_terms_a_build_does_not_take() {
+        let coverage = Coverage {
+            countries: BTreeSet::from(["US".to_string()]),
+            subdivisions: BTreeSet::new(),
+        };
+        let listed = vec![
+            Source {
+                name: "county".to_string(),
+                ..source("us/wa/spokane", 4)
+            },
+            source("us/ny/nyc", 8),
+        ];
+        assert_eq!(
+            select(listed.clone(), &coverage, Licences::Permitted),
+            within("US", &[("us/ny/nyc", 8)]),
+            "Spokane's CC BY-NC-SA rows are never taken"
+        );
+        assert_eq!(
+            select(listed, &coverage, Licences::Open),
+            Vec::new(),
+            "nyc states no licence in the catalog"
         );
     }
 

@@ -26,6 +26,7 @@ use open_geocode::{
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     ids::{self, Catalogue},
+    licences::Licences,
     limits::Limits,
     openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
@@ -186,6 +187,14 @@ enum PackCommand {
         /// instead: no token, and nothing unpacked.
         #[arg(long, value_name = "ZIP", conflicts_with = "openaddresses")]
         openaddresses_zip: Option<PathBuf>,
+
+        /// Which OpenAddresses data sets to take, by what their terms let a
+        /// Pack do: `permitted` leaves out the ones whose terms forbid
+        /// serving them (non-commercial, all rights reserved), `open` also
+        /// the ones that state no open licence. catalog/licences.json says
+        /// which is which.
+        #[arg(long, value_enum, default_value_t = Licences::Permitted)]
+        openaddresses_licences: Licences,
 
         /// Add the address points of a file: OpenAddresses GeoJSON, one
         /// feature per line, or CSV with LON, LAT, NUMBER and STREET columns,
@@ -602,6 +611,7 @@ async fn main() -> Result<()> {
             fresh,
             openaddresses,
             openaddresses_zip,
+            openaddresses_licences,
             address_files,
             qrank,
         }) => {
@@ -611,6 +621,7 @@ async fn main() -> Result<()> {
                 &pack,
                 openaddresses,
                 openaddresses_zip.as_deref(),
+                openaddresses_licences,
                 &address_files,
             )?;
             let options = BuildOsmOptions {
@@ -827,16 +838,17 @@ fn address_sources(
     pack: &Path,
     openaddresses: bool,
     collection: Option<&Path>,
+    licences: Licences,
     files: &[String],
 ) -> Result<Option<Arc<dyn AddressSource>>> {
     let mut sources: Vec<Arc<dyn AddressSource>> = Vec::new();
     if openaddresses {
-        sources.push(Arc::new(OpenAddresses::from_env(
-            pack.join("openaddresses"),
-        )?));
+        sources.push(Arc::new(
+            OpenAddresses::from_env(pack.join("openaddresses"))?.licences(licences),
+        ));
     }
     if let Some(collection) = collection {
-        sources.push(Arc::new(Collection::new(collection)));
+        sources.push(Arc::new(Collection::new(collection).licences(licences)));
     }
     if !files.is_empty() {
         sources.push(Arc::new(AddressFiles(address_files_of(files)?)));
