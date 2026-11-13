@@ -781,12 +781,55 @@ impl TextSearcher {
 
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
         let tokens = autocomplete_query_tokens(&query_text);
-        let number = autocomplete_number(&tokens);
-        let words = &tokens[usize::from(number.is_some())..];
-        if words.is_empty() {
-            return Ok(Vec::new());
+        if let Some(number) = autocomplete_number(&tokens) {
+            return self.autocomplete_reading(
+                options,
+                completion,
+                Some(number),
+                &tokens[1..],
+                &filters,
+            );
         }
-        let query = self.autocomplete_query(completion, number, words, &filters);
+        let as_typed = self.autocomplete_reading(options, completion, None, &tokens, &filters)?;
+        let [street @ .., last] = tokens.as_slice() else {
+            return Ok(as_typed);
+        };
+        if street.is_empty() || !is_address_number_token(last) {
+            return Ok(as_typed);
+        }
+        // A trailing number is a word of the name ("Pier 39"), else the house
+        // number after its street ("Kerkstraat 12"), as most of Europe writes
+        // it. One matching only a postcode ("Kerkstraat, 1211CK") is neither.
+        let names_it = |hit: &TextSearchHit| {
+            search_key(&hit.record.name).is_some_and(|name| {
+                name.split_whitespace()
+                    .any(|word| types_word(last, word, true))
+            })
+        };
+        if as_typed.iter().any(names_it) {
+            return Ok(as_typed);
+        }
+        let numbered =
+            self.autocomplete_reading(options, completion, Some(last), street, &filters)?;
+        Ok(if numbered.is_empty() {
+            as_typed
+        } else {
+            numbered
+        })
+    }
+
+    /// The suggestions for one reading of the typed words: `words`, after
+    /// house number `number` when the reading has one.
+    fn autocomplete_reading(
+        &self,
+        options: &TextAutocompleteOptions,
+        completion: Completion,
+        number: Option<&str>,
+        words: &[String],
+        filters: &Filters<'_>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let limit = effective_autocomplete_limit(options.limit);
+        let query = self.autocomplete_query(completion, number, words, filters);
         let ranking = Ranking {
             query_words: QueryWords::new(&options.query),
             number_text: number.map(str::to_string),
@@ -11140,6 +11183,86 @@ mod tests {
         assert_eq!(suggested("pike place mar"), ["osm:node:4"]);
         // A contraction no table lists is not required, but ranks.
         assert_eq!(suggested("pike mkt"), ["osm:node:4", "osm:node:5"]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A house number after its street, as most of Europe writes it, unless
+    /// the number is a word of a name. A postcode starting as the number
+    /// typed is neither.
+    #[test]
+    fn autocompletes_a_house_number_after_its_street() {
+        let temp_dir = temp_pack_path("autocomplete-number-after-street");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, number, postcode) in [
+            ("osm:node:1", "12", "1017AA"),
+            ("osm:node:2", "29", "1211CK"),
+        ] {
+            writer
+                .write(
+                    &address_record(
+                        id,
+                        "",
+                        number,
+                        "Kerkstraat",
+                        Some("Amsterdam"),
+                        Some(postcode),
+                    )
+                    .into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer
+            .write(
+                &PoiRecord {
+                    alt_names: Vec::new(),
+                    name: "Pier 39".to_string(),
+                    category: "tourism:attraction".to_string(),
+                    address: None,
+                    geometry: point_geometry(-122.41, 37.81),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::osm(ObjectType::Node, 3),
+                    prominence: Default::default(),
+                    wikidata: None,
+                    brand: None,
+                    aliases: Vec::new(),
+                }
+                .into(),
+                None,
+            )
+            .expect("poi");
+        writer
+            .write(
+                &address_record("osm:node:4", "", "39", "Pier Street", None, None).into(),
+                None,
+            )
+            .expect("pier street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let places = searcher.places();
+        let first = |query: &str| {
+            suggest(
+                &searcher,
+                &places,
+                &TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                },
+            )
+            .expect("suggest")
+            .first()
+            .map(|hit| hit.record.id.clone())
+        };
+
+        assert_eq!(first("kerkstraat 12").as_deref(), Some("osm:node:1"));
+        assert_eq!(first("12 kerkstraat").as_deref(), Some("osm:node:1"));
+        assert_eq!(first("pier 39").as_deref(), Some("osm:node:3"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
