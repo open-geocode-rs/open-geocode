@@ -1255,9 +1255,34 @@ mod tests {
         assert_eq!(build_budget(None).expect("derived"), None);
     }
 
+    /// A collection archive with one Spokane address entry whose job states
+    /// CC BY-NC-SA, as OpenAddresses writes it.
+    fn non_commercial_collection(path: &Path) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).expect("zip"));
+        let stored = zip::write::SimpleFileOptions::default();
+        zip.start_file("us/wa/spokane-addresses-county.geojson", stored)
+            .expect("entry");
+        zip.write_all(
+            br#"{"type":"Feature","properties":{"number":"2","street":"Main Street"},"geometry":{"type":"Point","coordinates":[-117.4,47.66]}}"#,
+        )
+        .expect("write");
+        zip.start_file("us/wa/spokane-addresses-county.geojson.meta", stored)
+            .expect("meta");
+        zip.write_all(
+            br#"{"id":11,"source_name":"us/wa/spokane","layer":"addresses","name":"county","license":{"text":"CC BY-NC-SA 4.0"}}"#,
+        )
+        .expect("write");
+        zip.finish().expect("finish");
+    }
+
     #[test]
     fn the_non_commercial_flag_reaches_the_openaddresses_source() {
-        let parsed = |extra: &[&'static str]| {
+        let dir = std::env::temp_dir().join(format!("og-flag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let archive = dir.join("collection.zip");
+        non_commercial_collection(&archive);
+        let picked = |extra: &[&str]| {
             let mut args = vec![
                 "open-geocode",
                 "pack",
@@ -1267,38 +1292,63 @@ mod tests {
                 "--pack",
                 "pack",
                 "--openaddresses-zip",
-                "collection.zip",
+                archive.to_str().expect("utf-8 path"),
             ];
             args.extend(extra);
-            match Cli::try_parse_from(args).expect("parsed").command {
-                Commands::Pack(PackCommand::Build {
-                    openaddresses_zip,
-                    openaddresses_non_commercial,
-                    ..
-                }) => (openaddresses_zip, openaddresses_non_commercial),
-                _ => unreachable!("parsed a build command"),
-            }
-        };
-        for (extra, taken) in [
-            (&[][..], false),
-            (&["--openaddresses-non-commercial"][..], true),
-        ] {
-            let (zip, non_commercial) = parsed(extra);
-            assert_eq!(non_commercial, taken);
-            let sources = address_sources(
+            let Commands::Pack(PackCommand::Build {
+                openaddresses_zip,
+                openaddresses_non_commercial,
+                ..
+            }) = Cli::try_parse_from(args).expect("parsed").command
+            else {
+                unreachable!("parsed a build command")
+            };
+            let coverage = open_geocode::builder::addresses::Coverage {
+                countries: std::collections::BTreeSet::from(["US".to_string()]),
+                ..Default::default()
+            };
+            let picked = address_sources(
                 Path::new("pack"),
                 false,
-                zip.as_deref(),
-                non_commercial,
+                openaddresses_zip.as_deref(),
+                openaddresses_non_commercial,
                 &[],
             )
             .expect("sources")
-            .expect("a collection");
-            assert!(
-                format!("{sources:?}").contains(&format!("non_commercial: {taken}")),
-                "{sources:?}"
-            );
-        }
+            .expect("a collection")
+            .pick(&coverage)
+            .expect("picked");
+            (
+                openaddresses_non_commercial,
+                picked
+                    .files
+                    .into_iter()
+                    .map(|file| file.dataset)
+                    .collect::<Vec<_>>(),
+                picked.left_out,
+            )
+        };
+        let default = picked(&[]);
+        let non_commercial = picked(&["--openaddresses-non-commercial"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            default,
+            (
+                false,
+                Vec::new(),
+                vec![
+                    "openaddresses:us/wa/spokane left out: its licence forbids commercial use (\"CC BY-NC-SA 4.0\"); --openaddresses-non-commercial takes it for a non-commercial Pack".to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            non_commercial,
+            (
+                true,
+                vec!["openaddresses:us/wa/spokane".to_string()],
+                Vec::new()
+            )
+        );
     }
 
     /// Answers one request with `status`, as the server's /readyz would, and

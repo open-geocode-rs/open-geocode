@@ -182,32 +182,20 @@ impl OpenAddresses {
             .cache
             .join(source.source.replace('/', "_"))
             .join(format!("{}.job.json", source.job));
-        let text = if path.is_file() {
-            fs::read_to_string(&path).map_err(|error| io_error("failed to read", &path, error))?
-        } else {
-            let url = format!("{API}/job/{}", source.job);
-            let text = agent()
-                .get(&url)
-                .call()
-                .map_err(|error| fetch_error(&url, error))?
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| fetch_error(&url, error))?;
-            let parent = path.parent().expect("cache files have a directory");
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error("failed to create", parent, error))?;
-            let partial = path.with_extension("json.part");
-            fs::write(&partial, &text)
-                .map_err(|error| io_error("failed to write", &partial, error))?;
-            fs::rename(&partial, &path)
-                .map_err(|error| io_error("failed to write", &path, error))?;
-            text
-        };
-        let job: Job = serde_json::from_str(&text).map_err(|error| {
-            Error::BadInput(format!(
-                "{}: not an OpenAddresses job: {error}",
-                path.display()
-            ))
+        if let Some(job) = cached_job(&path) {
+            return Ok(job_licence(job.license));
+        }
+        let url = format!("{API}/job/{}", source.job);
+        let text = agent()
+            .get(&url)
+            .call()
+            .map_err(|error| fetch_error(&url, error))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| fetch_error(&url, error))?;
+        let job = store_job(&path, &text).map_err(|error| match error {
+            Error::BadInput(detail) => Error::BadInput(format!("{url}: {detail}")),
+            other => other,
         })?;
         Ok(job_licence(job.license))
     }
@@ -256,6 +244,33 @@ fn job_licence(license: Option<serde_json::Value>) -> Option<Stated> {
         _ => return None,
     };
     (stated.text.is_some() || stated.url.is_some()).then_some(stated)
+}
+
+/// The job record kept at `path`, or none when there is none or it is not
+/// one: an unreadable record is removed, so the next build asks again
+/// instead of failing on it.
+fn cached_job(path: &Path) -> Option<Job> {
+    let text = fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(job) => Some(job),
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            None
+        }
+    }
+}
+
+/// Keeps job record `text` at `path` once it reads as one, written beside
+/// its final name, so a cut-off or garbled reply is never cached.
+fn store_job(path: &Path, text: &str) -> Result<Job> {
+    let job: Job = serde_json::from_str(text)
+        .map_err(|error| Error::BadInput(format!("not an OpenAddresses job: {error}")))?;
+    let parent = path.parent().expect("cache files have a directory");
+    fs::create_dir_all(parent).map_err(|error| io_error("failed to create", parent, error))?;
+    let partial = path.with_extension("json.part");
+    fs::write(&partial, text).map_err(|error| io_error("failed to write", &partial, error))?;
+    fs::rename(&partial, path).map_err(|error| io_error("failed to write", path, error))?;
+    Ok(job)
 }
 
 /// The part of a job record a build reads.
@@ -674,16 +689,19 @@ mod tests {
         );
         let (kept, left_out) = judged(&sources, false, |_| None);
         assert_eq!(kept, ["openaddresses:us/ny/nyc"]);
-        assert_eq!(left_out.len(), 1, "{left_out:?}");
-        assert!(
-            left_out[0].starts_with("openaddresses:us/wa/spokane left out")
-                && left_out[0].contains("CC BY-NC-SA 4.0")
-                && left_out[0].contains("--openaddresses-non-commercial"),
-            "{left_out:?}"
+        assert_eq!(
+            left_out,
+            [
+                "openaddresses:us/wa/spokane left out: its licence forbids commercial use (\"CC BY-NC-SA 4.0\"); --openaddresses-non-commercial takes it for a non-commercial Pack"
+            ]
         );
         let (kept, left_out) = judged(&sources, true, |_| None);
-        assert_eq!(kept.len(), 2, "a non-commercial Pack takes Spokane");
-        assert!(left_out.is_empty());
+        assert_eq!(
+            kept,
+            ["openaddresses:us/ny/nyc", "openaddresses:us/wa/spokane"],
+            "a non-commercial Pack takes Spokane"
+        );
+        assert_eq!(left_out, Vec::<String>::new());
     }
 
     #[test]
@@ -703,10 +721,11 @@ mod tests {
             }),
         });
         assert_eq!(kept, ["openaddresses:us/wa/spokane"], "now CC0");
-        assert!(
-            left_out[0]
-                .starts_with("openaddresses:us/ny/nyc left out: its licence forbids serving it"),
-            "{left_out:?}"
+        assert_eq!(
+            left_out,
+            [
+                "openaddresses:us/ny/nyc left out: its licence forbids serving it (\"All rights reserved\")"
+            ]
         );
         let (kept, _) = judged(&sources, true, |source| {
             (source.source == "us/ny/nyc").then(|| Stated {
@@ -870,7 +889,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let picked = picked.expect("picked");
         assert_eq!(datasets(&picked), ["openaddresses:us/ia/polk"]);
-        assert_eq!(picked.left_out.len(), 2, "{:?}", picked.left_out);
+        assert_eq!(
+            picked.left_out,
+            [
+                "openaddresses:us/ia/linn left out: its licence forbids serving it (\"No person shall sell, give, reproduce\")",
+                "openaddresses:us/wa/spokane left out: its licence forbids commercial use (\"CC BY-NC-SA 4.0\"); --openaddresses-non-commercial takes it for a non-commercial Pack"
+            ]
+        );
         let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("dir");
         let archive = collection_with(
@@ -888,7 +913,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let picked = picked.expect("picked");
         assert_eq!(datasets(&picked), ["openaddresses:us/wa/spokane"]);
-        assert!(picked.left_out[0].starts_with("openaddresses:us/ia/linn left out"));
+        assert_eq!(
+            picked.left_out,
+            [
+                "openaddresses:us/ia/linn left out: its licence forbids serving it (\"No person shall sell, give, reproduce\")"
+            ]
+        );
     }
 
     #[test]
@@ -913,5 +943,37 @@ mod tests {
         assert_eq!(read("false"), None, "a job of a source that states none");
         assert_eq!(read(r#"{"text":" ","attribution":false}"#), None);
         assert_eq!(job_licence(None), None);
+    }
+
+    #[test]
+    fn a_job_record_is_cached_only_once_it_reads_as_one() {
+        let dir = std::env::temp_dir().join(format!("og-job-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("us_wa_spokane").join("42.job.json");
+        let cut_off = store_job(&path, r#"{"license":"#);
+        let missing = path.exists();
+        let stored = store_job(&path, r#"{"id":42,"license":{"text":"CC BY-NC-SA 4.0"}}"#);
+        let reread = cached_job(&path).map(|job| job_licence(job.license));
+        fs::write(&path, r#"{"license":"#).expect("garble the cache");
+        let garbled = cached_job(&path).is_none();
+        let removed = !path.exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            cut_off.err().map(|error| error.to_string()),
+            Some(
+                "not an OpenAddresses job: EOF while parsing a value at line 1 column 11"
+                    .to_string()
+            )
+        );
+        assert!(!missing, "a cut-off reply is never cached");
+        let spokane = Some(Some(Stated {
+            text: Some("CC BY-NC-SA 4.0".to_string()),
+            url: None,
+        }));
+        assert_eq!(stored.ok().map(|job| job_licence(job.license)), spokane);
+        assert_eq!(reread, spokane);
+        assert!(
+            garbled && removed,
+            "a garbled cache is dropped and asked again"
+        );
     }
 }
