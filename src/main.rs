@@ -187,6 +187,13 @@ enum PackCommand {
         #[arg(long, value_name = "ZIP", conflicts_with = "openaddresses")]
         openaddresses_zip: Option<PathBuf>,
 
+        /// Also take the OpenAddresses data sets whose licence forbids
+        /// commercial use, such as CC BY-NC. The Pack is then for
+        /// non-commercial use only. Data sets whose licence forbids serving
+        /// them at all stay out.
+        #[arg(long)]
+        openaddresses_non_commercial: bool,
+
         /// Add the address points of a file: OpenAddresses GeoJSON, one
         /// feature per line, or CSV with LON, LAT, NUMBER and STREET columns,
         /// gzipped or not. `DATASET=PATH` names the dataset its records
@@ -602,6 +609,7 @@ async fn main() -> Result<()> {
             fresh,
             openaddresses,
             openaddresses_zip,
+            openaddresses_non_commercial,
             address_files,
             qrank,
         }) => {
@@ -611,6 +619,7 @@ async fn main() -> Result<()> {
                 &pack,
                 openaddresses,
                 openaddresses_zip.as_deref(),
+                openaddresses_non_commercial,
                 &address_files,
             )?;
             let options = BuildOsmOptions {
@@ -827,16 +836,19 @@ fn address_sources(
     pack: &Path,
     openaddresses: bool,
     collection: Option<&Path>,
+    non_commercial: bool,
     files: &[String],
 ) -> Result<Option<Arc<dyn AddressSource>>> {
     let mut sources: Vec<Arc<dyn AddressSource>> = Vec::new();
     if openaddresses {
-        sources.push(Arc::new(OpenAddresses::from_env(
-            pack.join("openaddresses"),
-        )?));
+        sources.push(Arc::new(
+            OpenAddresses::from_env(pack.join("openaddresses"))?.non_commercial(non_commercial),
+        ));
     }
     if let Some(collection) = collection {
-        sources.push(Arc::new(Collection::new(collection)));
+        sources.push(Arc::new(
+            Collection::new(collection).non_commercial(non_commercial),
+        ));
     }
     if !files.is_empty() {
         sources.push(Arc::new(AddressFiles(address_files_of(files)?)));
@@ -1241,6 +1253,102 @@ mod tests {
         assert_eq!(build_budget(Some("64")).expect("minimum"), Some(64));
         assert_eq!(build_budget(Some("16384")).expect("planet"), Some(16_384));
         assert_eq!(build_budget(None).expect("derived"), None);
+    }
+
+    /// A collection archive with one Spokane address entry whose job states
+    /// CC BY-NC-SA, as OpenAddresses writes it.
+    fn non_commercial_collection(path: &Path) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).expect("zip"));
+        let stored = zip::write::SimpleFileOptions::default();
+        zip.start_file("us/wa/spokane-addresses-county.geojson", stored)
+            .expect("entry");
+        zip.write_all(
+            br#"{"type":"Feature","properties":{"number":"2","street":"Main Street"},"geometry":{"type":"Point","coordinates":[-117.4,47.66]}}"#,
+        )
+        .expect("write");
+        zip.start_file("us/wa/spokane-addresses-county.geojson.meta", stored)
+            .expect("meta");
+        zip.write_all(
+            br#"{"id":11,"source_name":"us/wa/spokane","layer":"addresses","name":"county","license":{"text":"CC BY-NC-SA 4.0"}}"#,
+        )
+        .expect("write");
+        zip.finish().expect("finish");
+    }
+
+    #[test]
+    fn the_non_commercial_flag_reaches_the_openaddresses_source() {
+        let dir = std::env::temp_dir().join(format!("og-flag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let archive = dir.join("collection.zip");
+        non_commercial_collection(&archive);
+        let picked = |extra: &[&str]| {
+            let mut args = vec![
+                "open-geocode",
+                "pack",
+                "build",
+                "--input",
+                "in.osm.pbf",
+                "--pack",
+                "pack",
+                "--openaddresses-zip",
+                archive.to_str().expect("utf-8 path"),
+            ];
+            args.extend(extra);
+            let Commands::Pack(PackCommand::Build {
+                openaddresses_zip,
+                openaddresses_non_commercial,
+                ..
+            }) = Cli::try_parse_from(args).expect("parsed").command
+            else {
+                unreachable!("parsed a build command")
+            };
+            let coverage = open_geocode::builder::addresses::Coverage {
+                countries: std::collections::BTreeSet::from(["US".to_string()]),
+                ..Default::default()
+            };
+            let picked = address_sources(
+                Path::new("pack"),
+                false,
+                openaddresses_zip.as_deref(),
+                openaddresses_non_commercial,
+                &[],
+            )
+            .expect("sources")
+            .expect("a collection")
+            .pick(&coverage)
+            .expect("picked");
+            (
+                openaddresses_non_commercial,
+                picked
+                    .files
+                    .into_iter()
+                    .map(|file| file.dataset)
+                    .collect::<Vec<_>>(),
+                picked.left_out,
+            )
+        };
+        let default = picked(&[]);
+        let non_commercial = picked(&["--openaddresses-non-commercial"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            default,
+            (
+                false,
+                Vec::new(),
+                vec![
+                    "openaddresses:us/wa/spokane left out: its licence forbids commercial use (\"CC BY-NC-SA 4.0\"); --openaddresses-non-commercial takes it for a non-commercial Pack".to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            non_commercial,
+            (
+                true,
+                vec!["openaddresses:us/wa/spokane".to_string()],
+                Vec::new()
+            )
+        );
     }
 
     /// Answers one request with `status`, as the server's /readyz would, and

@@ -680,11 +680,49 @@ def print_unresolved(unresolved):
             log(f"  {item}")
 
 
+LICENCE_TERMS = ("permitted", "restricted")
+
+
+def licence_decisions(datasets):
+    """curation.toml [licences]: licence texts read by hand, by source path,
+    each pinned to the sha256 of the text read. The build judges every other
+    text by its own rules (src/licences.rs). A decision whose text upstream
+    changed stops the generator, so a stale reading never decides new terms."""
+    with open(CURATION, "rb") as f:
+        curation = tomllib.load(f).get("licences", {})
+    texts = {}
+    for d in datasets:
+        lic = d.get("license") or {}
+        if lic.get("name"):
+            texts.setdefault(d["source"], set()).add(lic["name"])
+    decisions, problems = {}, []
+    for terms in LICENCE_TERMS:
+        table = curation.get(terms, {})
+        if table and not str(table.get("why", "")).strip():
+            problems.append(f"curation: [licences.{terms}] has no why")
+        for source, pin in table.get("set", {}).items():
+            if source in decisions:
+                problems.append(f"curation: {source} is decided twice in [licences]")
+                continue
+            read = [text for text in sorted(texts.get(source, ())) if sha256(text.encode("utf-8"))[:len(pin)] == pin]
+            if not read:
+                problems.append(f"curation: [licences.{terms}] {source}: no licence text of it hashes to {pin}; "
+                                f"read its text again and pin the new hash")
+                continue
+            decisions[source] = dict(terms=terms, text=read[0])
+    if problems:
+        raise SystemExit("\n".join(problems))
+    return dict(sorted(decisions.items()))
+
+
 def licences_text():
     """The license of each OpenAddresses data set that states one, by source and
-    name, for the Pack to credit the data sets an answer comes from."""
+    name, for the Pack to credit the data sets an answer comes from, and the
+    licence texts read by hand, for the build to judge them by."""
+    datasets = load_snapshot("openaddresses")["datasets"]
+    decisions = licence_decisions(datasets)
     rows = []
-    for d in load_snapshot("openaddresses")["datasets"]:
+    for d in datasets:
         lic = d.get("license")
         if not lic:
             continue
@@ -692,7 +730,7 @@ def licences_text():
                    attribution=lic.get("attribution"), attribution_name=lic.get("attribution_name"))
         rows.append({k: v for k, v in row.items() if v not in (None, "")})
     rows.sort(key=lambda r: (r["source"], r["name"]))
-    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"]), "datasets", rows)
+    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"], decisions=decisions), "datasets", rows)
 
 
 def places_text():

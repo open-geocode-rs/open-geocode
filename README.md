@@ -123,6 +123,8 @@ og serve canada-ontario
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
 `GET /version` returns the server version and the Pack it serves: content id, schema version, and which og version built it and when.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
+A build leaves out the OpenAddresses data sets whose licence forbids commercial use or serving them at all, judged by the licence each job states, and warns of each one.
+`open-geocode pack build --openaddresses-non-commercial` takes the non-commercial ones too, for a Pack used only for non-commercial purposes.
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 
