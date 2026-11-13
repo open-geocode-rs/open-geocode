@@ -5480,7 +5480,7 @@ mod tests {
                     pack: pack.clone(),
                     ..options.clone()
                 };
-                let error = fail_before(&options.clone(), *step);
+                let error = fail_before(&options, *step);
                 assert!(format!("{error}").contains("injected"), "{error}");
                 let found = resume::find(&pack).expect("find");
                 if at == 0 {
@@ -5521,10 +5521,10 @@ mod tests {
             let pack = dir.join("untrained");
             let options = BuildOsmOptions {
                 pack: pack.clone(),
-                ..options.clone()
+                ..options
             };
             FAIL_BEFORE_TRAINING.set(true);
-            let failed = build_osm_pack(&options.clone());
+            let failed = build_osm_pack(&options);
             FAIL_BEFORE_TRAINING.set(false);
             assert!(failed.is_err());
             let resumed = build_osm_pack(&BuildOsmOptions {
