@@ -48,7 +48,7 @@ use crate::{
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{
         AddressGeocodeOptions, TextAutocompleteOptions, TextSearchHit, TextSearchOptions,
-        TextSearcher, mix_suggestions,
+        TextSearcher, suggest,
     },
     stop::{self, CancelOnDrop, Stop},
     util::hilbert::hilbert_key,
@@ -867,6 +867,10 @@ fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
 /// list. A query that starts with a house number suggests addresses first; a
 /// place whose name starts as the query does comes before the addresses. An
 /// empty or very short `q` returns no results.
+///
+/// When nothing starts as typed, the words are matched in any order, as the
+/// area a result is in (`starbucks ballard`) and as the words an
+/// abbreviation stands for (`pike pl mkt`, `2101 n 34`).
 #[utoipa::path(
     get,
     path = "/autocomplete",
@@ -946,12 +950,7 @@ pub(crate) async fn autocomplete(
                 ..options
             })?,
             Some(_) => worker.searcher.autocomplete(&options)?,
-            None => mix_suggestions(
-                &options.query,
-                worker.searcher.autocomplete(&options)?,
-                worker.places.autocomplete(&options)?,
-                options.limit,
-            ),
+            None => suggest(&worker.searcher, &worker.places, &options)?,
         };
         api::forward_collection(&worker.pack, query, hits)
     })

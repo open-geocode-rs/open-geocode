@@ -743,7 +743,25 @@ impl TextSearcher {
             .map(|hit| AddressGeocodeHit { query, hit }))
     }
 
+    /// Suggestions for `options.query`. Those that start as typed come
+    /// alone, and only when none do, those that match its words another
+    /// way (see [`Completion`]).
     pub fn autocomplete(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
+        for completion in Completion::ALL {
+            let hits = self.autocomplete_as(options, completion)?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// The suggestions that match `options.query` as `completion` says.
+    fn autocomplete_as(
+        &self,
+        options: &TextAutocompleteOptions,
+        completion: Completion,
+    ) -> Result<Vec<TextSearchHit>> {
         let limit = effective_autocomplete_limit(options.limit);
         if limit == 0 {
             return Ok(Vec::new());
@@ -762,11 +780,13 @@ impl TextSearcher {
         }
 
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
-        let Some(query) = self.build_autocomplete_query(&query_text, &filters)? else {
-            return Ok(Vec::new());
-        };
         let tokens = autocomplete_query_tokens(&query_text);
         let number = autocomplete_number(&tokens);
+        let words = &tokens[usize::from(number.is_some())..];
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = self.autocomplete_query(completion, number, words, &filters);
         let ranking = Ranking {
             query_words: QueryWords::new(&options.query),
             number_text: number.map(str::to_string),
@@ -776,18 +796,29 @@ impl TextSearcher {
         let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |hit| {
             Ok(filters.admit(hit))
         })?;
-        let words = &tokens[usize::from(number.is_some())..];
         for hit in &mut hits {
             let features = &mut hit.features;
             features.prefix = true;
             features.number = number.map(|number| states_number(&hit.record, number, None));
-            // The last word may be cut short by the typing.
             let label = label_words(&hit.record);
             features.dropped_words = count(words.iter().enumerate().filter(|(index, word)| {
-                !label.iter().any(|label| {
-                    label == *word || (index + 1 == words.len() && label.starts_with(word.as_str()))
-                })
+                // The last word may be cut short by the typing.
+                let last = index + 1 == words.len();
+                !label.iter().any(|label| types_word(word, label, last))
             }));
+        }
+        // Contraction no table lists ranks by label alone, which index lacks.
+        // "mkt" is a word of "Pike Place Market" only.
+        if completion == Completion::AllWords {
+            hits.sort_by_cached_key(|hit| {
+                let label = label_words(&hit.record);
+                count(words.iter().enumerate().filter(|&(at, word)| {
+                    unlisted_contraction(word)
+                        && !label
+                            .iter()
+                            .any(|label| types_word(word, label, at + 1 == words.len()))
+                }))
+            });
         }
         self.rate(&mut hits);
         hits.truncate(limit);
@@ -5155,59 +5186,102 @@ impl TextSearcher {
             .collect()
     }
 
-    fn build_autocomplete_query(
+    /// The query of the suggestions that match the typed `words` as
+    /// `completion` says, after a house number when `number` is one. Of
+    /// [`Completion::AllWords`], a word may be one of what a record is or
+    /// of where it is ("starbucks ballard"), but one at least must be of
+    /// what it is. Every place of a town is no suggestion for the town's
+    /// name.
+    fn autocomplete_query(
         &self,
-        query_text: &str,
+        completion: Completion,
+        number: Option<&str>,
+        words: &[String],
         filters: &Filters<'_>,
-    ) -> Result<Option<Box<dyn Query>>> {
-        let tokens = autocomplete_query_tokens(query_text);
-        if tokens.is_empty() {
-            return Ok(None);
+    ) -> Box<dyn Query> {
+        let subject = self.fields.autocomplete_subject_text;
+        let last = words.len() - 1;
+        let word = |field, at: usize| self.autocomplete_word_query(field, &words[at], at == last);
+        let mut clauses = Vec::new();
+        match completion {
+            Completion::InOrder => {
+                clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
+            }
+            Completion::AllWords => {
+                let optional = |at: usize| {
+                    unlisted_contraction(&words[at])
+                        && words.iter().any(|other| !unlisted_contraction(other))
+                };
+                let of_subject = (0..words.len())
+                    .map(|at| (Occur::Should, word(subject, at)))
+                    .collect();
+                clauses.push((Occur::Must, Box::new(BooleanQuery::new(of_subject))));
+                for at in 0..words.len() {
+                    let either: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+                        (Occur::Should, word(subject, at)),
+                        (Occur::Should, word(self.fields.context_text, at)),
+                    ]));
+                    let occur = if optional(at) {
+                        Occur::Should
+                    } else {
+                        Occur::Must
+                    };
+                    clauses.push((occur, either));
+                }
+            }
         }
-
-        let mut subqueries = Vec::new();
-
-        let subject_tokens = if let Some(number) = autocomplete_number(&tokens) {
-            subqueries.push((
+        if let Some(number) = number {
+            clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.address_number, number),
                     IndexRecordOption::Basic,
-                )) as Box<dyn Query>,
+                )),
             ));
-            &tokens[1..]
-        } else {
-            tokens.as_slice()
-        };
-
-        if subject_tokens.is_empty() {
-            return Ok(None);
         }
-
-        subqueries.push((
-            Occur::Must,
-            autocomplete_subject_query(self.fields.autocomplete_subject_text, subject_tokens),
-        ));
-
         if let Some(layer) = filters
             .layer
             .map(str::trim)
             .filter(|layer| !layer.is_empty())
         {
-            subqueries.push((
+            clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.layer, layer),
                     IndexRecordOption::Basic,
-                )) as Box<dyn Query>,
+                )),
             ));
         }
         if let Some(bbox) = filters.bbox {
-            subqueries.push((Occur::Must, self.bbox_query(bbox)));
+            clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
-        subqueries.push(self.product_clause());
+        clauses.push(self.product_clause());
+        Box::new(BooleanQuery::new(clauses))
+    }
 
-        Ok(Some(Box::new(BooleanQuery::new(subqueries))))
+    /// A typed word in `field`, as written or as the words it abbreviates
+    /// ("pl" is "place"), and the word still being typed as the start of
+    /// one.
+    fn autocomplete_word_query(&self, field: Field, word: &str, last: bool) -> Box<dyn Query> {
+        let mut alternatives = std::iter::once(word.to_string())
+            .chain(lattice::other_forms(word))
+            .map(|form| -> (Occur, Box<dyn Query>) {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, &form),
+                        IndexRecordOption::WithFreqs,
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+        if last {
+            alternatives.push((
+                Occur::Should,
+                autocomplete_subject_query(field, std::slice::from_ref(&word.to_string())),
+            ));
+        }
+        Box::new(BooleanQuery::new(alternatives))
     }
 
     /// The address reading takes a town's or street's words in a name
@@ -6835,6 +6909,23 @@ enum Parses {
     Numbered,
 }
 
+/// How a suggestion matches what was typed, closest first. Suggestions
+/// are looked for in this order, the second only when the first finds none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    /// The words in order, the last cut short, as a name, street or
+    /// postcode starts.
+    InOrder,
+    /// Every word, in any order, of what the record is or where it is, in
+    /// its other forms too ("pike pl mar", "starbucks ballard"); a
+    /// contraction no table lists only ranks (see [`unlisted_contraction`]).
+    AllWords,
+}
+
+impl Completion {
+    const ALL: [Self; 2] = [Self::InOrder, Self::AllWords];
+}
+
 /// The retrieval passes of [`TextSearcher::search_variants`], in order,
 /// strictest first. The order is also how strongly a hit found by each
 /// answers the query.
@@ -7498,6 +7589,38 @@ fn context_words(plan: &QueryPlan) -> Vec<String> {
         .iter()
         .flat_map(|part| part.words.iter().cloned())
         .collect()
+}
+
+/// Whether a typed word stands for `word` of a record. It may be written
+/// as is, cut short when it is the `last` word, still being typed, or as
+/// an abbreviation of it, listed ("n" of "north") or a contraction ("mkt"
+/// of "market", see [`contraction`]).
+fn types_word(typed: &str, word: &str, last: bool) -> bool {
+    typed == word
+        || (last && word.starts_with(typed))
+        || (contraction(typed) && abbreviates(typed, word))
+        || lattice::forms_both_ways(typed)
+            .iter()
+            .any(|form| form == word)
+}
+
+/// Whether `typed` may be a contraction (see [`abbreviates`]). It has two
+/// to four letters and no vowel after the first, as a contraction drops
+/// them. One that keeps them is a word cut short, so "cit" is no
+/// contraction of "chipotle".
+fn contraction(typed: &str) -> bool {
+    (2..=4).contains(&typed.chars().count())
+        && !typed
+            .chars()
+            .skip(1)
+            .any(|character| character.is_ascii_digit() || "aeiou".contains(character))
+}
+
+/// A [`contraction`] no abbreviation table lists ("mkt"). The index cannot
+/// say which of its words it shortens, as almost any long word holds its
+/// letters in order, so it is not required of a record, only ranked by.
+fn unlisted_contraction(typed: &str) -> bool {
+    contraction(typed) && lattice::forms_both_ways(typed).is_empty()
 }
 
 /// Whether `short` is written with letters of `long` in order from its
@@ -8221,6 +8344,30 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
+/// Suggestions of addresses and places for `options.query` in one list.
+/// Those that start as typed come alone, and only when neither searcher
+/// has one, those that match its words another way (see [`Completion`]).
+/// The fallback reads planet-wide postings, so a query that starts as
+/// typed never pays for it.
+pub fn suggest(
+    addresses: &TextSearcher,
+    places: &TextSearcher,
+    options: &TextAutocompleteOptions,
+) -> Result<Vec<TextSearchHit>> {
+    for completion in Completion::ALL {
+        let mixed = mix_suggestions(
+            &options.query,
+            addresses.autocomplete_as(options, completion)?,
+            places.autocomplete_as(options, completion)?,
+            options.limit,
+        );
+        if !mixed.is_empty() {
+            return Ok(mixed);
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// Scores over different fields do not compare, so the query decides the
 /// order: a leading house number puts addresses first; else a place whose
 /// name starts as the query, then addresses, then other places.
@@ -8232,22 +8379,39 @@ pub fn mix_suggestions(
 ) -> Vec<TextSearchHit> {
     let limit = effective_autocomplete_limit(limit);
     let key = search_key(query.trim()).unwrap_or_default();
-    let numbered = autocomplete_number(&autocomplete_query_tokens(&key)).is_some();
+    let tokens = autocomplete_query_tokens(&key);
+    let numbered = autocomplete_number(&tokens).is_some();
     let mut mixed = Vec::with_capacity(addresses.len() + places.len());
     if numbered {
         mixed.extend(addresses);
         mixed.extend(places);
     } else {
-        let (named, others): (Vec<_>, Vec<_>) = places.into_iter().partition(|hit| {
-            !key.is_empty()
-                && search_key(&hit.record.name).is_some_and(|name| name.starts_with(&key))
-        });
+        let (named, others): (Vec<_>, Vec<_>) = places
+            .into_iter()
+            .partition(|hit| name_starts_as(&hit.record.name, &tokens));
         mixed.extend(named);
         mixed.extend(addresses);
         mixed.extend(others);
     }
     mixed.truncate(limit);
     mixed
+}
+
+/// Whether `name` starts as the typed `words` do, each standing for the
+/// name's word in its place (see [`types_word`]). So "pike pl mar" starts
+/// "Pike Place Market".
+fn name_starts_as(name: &str, words: &[String]) -> bool {
+    let Some(name) = search_key(name) else {
+        return false;
+    };
+    let name = name.split_whitespace().collect::<Vec<_>>();
+    !words.is_empty()
+        && words.len() <= name.len()
+        && words
+            .iter()
+            .zip(&name)
+            .enumerate()
+            .all(|(at, (typed, word))| types_word(typed, word, at + 1 == words.len()))
 }
 
 fn effective_autocomplete_limit(limit: usize) -> usize {
@@ -10895,6 +11059,114 @@ mod tests {
         assert_eq!(hits[0].record_id, 0);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Issue 172. A search box sends the area after the name, or a word
+    /// abbreviated, and finds what `/places` and `/geocode` find.
+    #[test]
+    fn autocompletes_area_words_and_abbreviated_words() {
+        let temp_dir = temp_pack_path("autocomplete-area-abbreviated");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, number: &str, street: &str, area: &str| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: Some(
+                address_record("osm:node:0", "", number, street, Some(area), None).address,
+            ),
+            geometry: point_geometry(-122.34, 47.61),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        for record in [
+            poi(1, "Starbucks", "915", "Northwest 45th Street", "Ballard"),
+            poi(2, "Starbucks", "3400", "Fremont Avenue North", "Fremont"),
+            poi(3, "Fred Meyer", "915", "Northwest 45th Street", "Ballard"),
+            poi(4, "Pike Place Market", "85", "Pike Street", "Seattle"),
+            poi(5, "Pike Place Chowder", "1530", "Post Alley", "Seattle"),
+        ] {
+            writer.write(&record.into(), None).expect("poi");
+        }
+        for (id, number, street) in [
+            ("osm:node:6", "2101", "North 34th Street"),
+            ("osm:node:7", "2101", "1st Avenue"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", number, street, Some("Seattle"), None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let places = searcher.places();
+        let suggested = |query: &str| {
+            suggest(
+                &searcher,
+                &places,
+                &TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                },
+            )
+            .expect("suggest")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(suggested("starbucks ballard"), ["osm:node:1"]);
+        assert_eq!(suggested("ballard starbucks"), ["osm:node:1"]);
+        assert_eq!(suggested("fred meyer ballard"), ["osm:node:3"]);
+        assert_eq!(suggested("starbucks ba"), ["osm:node:1"]);
+        assert_eq!(suggested("pike pl mar")[0], "osm:node:4");
+        assert_eq!(suggested("pike pl mkt")[0], "osm:node:4");
+        assert_eq!(suggested("2101 N 34th St")[0], "osm:node:6");
+        assert_eq!(suggested("2101 n 34")[0], "osm:node:6");
+        // A town's name is no suggestion of every place in it.
+        assert!(!suggested("ballard").contains(&"osm:node:3".to_string()));
+        // What starts as typed is all that is suggested when anything does.
+        // Words in any order are looked for only when nothing is.
+        assert_eq!(suggested("pike place mar"), ["osm:node:4"]);
+        // A contraction no table lists is not required, but ranks.
+        assert_eq!(suggested("pike mkt"), ["osm:node:4", "osm:node:5"]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_typed_word_stands_for_its_forms_prefixes_and_contractions() {
+        assert!(types_word("market", "market", false));
+        assert!(types_word("mar", "market", true));
+        assert!(!types_word("mar", "market", false));
+        assert!(types_word("pl", "place", false));
+        assert!(types_word("n", "north", false));
+        assert!(types_word("north", "n", false));
+        assert!(types_word("mkt", "market", false));
+        // A word that keeps its vowels is cut short, no contraction.
+        assert!(!types_word("cit", "chipotle", true));
+        assert!(unlisted_contraction("mkt"));
+        assert!(!unlisted_contraction("pl"));
+        assert!(!unlisted_contraction("market"));
+
+        let words = |query: &str| autocomplete_query_tokens(query);
+        assert!(name_starts_as("Pike Place Market", &words("pike pl mkt")));
+        assert!(name_starts_as(
+            "Pike Place Market",
+            &words("pike place mar")
+        ));
+        assert!(!name_starts_as("Pike Place Market", &words("place pike")));
+        assert!(!name_starts_as("Pike", &words("pike place")));
     }
 
     #[test]
