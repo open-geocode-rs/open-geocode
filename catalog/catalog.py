@@ -14,7 +14,7 @@ snapshots and catalog/curation.toml, so two runs give byte-identical output.
 `generate` and `check` need only the standard library. `update overture`
 needs the packages in catalog/requirements.txt.
 """
-import argparse, datetime, email.utils, hashlib, json, os, re, sys, time, tomllib
+import argparse, datetime, email.utils, hashlib, json, os, sys, time, tomllib
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -680,82 +680,57 @@ def print_unresolved(unresolved):
             log(f"  {item}")
 
 
-# Licences that let anyone use, change and redistribute data, commercial use
-# included, at most with credit and share-alike. Matched on a data set's
-# licence name and URL together, since many sources state only one of them.
-OPEN_LICENCE = re.compile(
-    r"\bcc[- ]?by\b|creativecommons\.org/licen[cs]es/by(-sa)?/|\bcc[- ]?0\b|publicdomain/zero|"
-    r"creative commons attribution|public domain|\bpddl\b|\bodbl\b|opendatacommons\.org|opendefinition\.org|"
-    r"licence ouverte|etalab|open government licen[cs]e|open data licen[cs]e|dl-de|datenlizenz deutschland|"
-    r"\biodl\b|dati\.gov\.it/iodl|libreusomx|datos abiertos del uruguay",
-    re.IGNORECASE)
-
-# Words of terms that may forbid what a Pack does. A data set whose terms hold
-# one is decided by hand in curation.toml [licences], never by OPEN_LICENCE:
-# "CC BY-NC-SA" matches both.
-RESTRICTIVE = re.compile(
-    r"non-?commercial|not for commercial|\bby-nc|-nc-|\bnc\b|-nd\b|no derivatives|all rights reserved|"
-    r"shall (not )?sell|prohibited|resale",
-    re.IGNORECASE)
+LICENCE_TERMS = ("permitted", "restricted")
 
 
-def licence_curation():
-    """curation.toml [licences]: the data sets a Pack never takes, with the
-    terms that forbid it; free-text terms read as open; and terms read as
-    granting nothing clear and forbidding nothing a Pack does."""
+def licence_decisions(datasets):
+    """curation.toml [licences]: licence texts read by hand, by source path,
+    each pinned to the sha256 of the text read. The build judges every other
+    text by its own rules (src/licences.rs). A decision whose text upstream
+    changed stops the generator, so a stale reading never decides new terms."""
     with open(CURATION, "rb") as f:
         curation = tomllib.load(f).get("licences", {})
-    for name in ("restricted", "open", "unclear"):
-        if not str(curation.get(name, {}).get("why", "")).strip():
-            raise SystemExit(f"curation: [licences.{name}] has no why")
-    decided = {"restricted": set(curation["restricted"]["set"]),
-               "open": set(curation["open"]["ids"]), "unclear": set(curation["unclear"]["ids"])}
-    for a, b in (("restricted", "open"), ("restricted", "unclear"), ("open", "unclear")):
-        if decided[a] & decided[b]:
-            raise SystemExit(f"curation: decided both {a} and {b}: {sorted(decided[a] & decided[b])}")
-    return decided
-
-
-def licence_use(source, lic, decided):
-    """`restricted`, `open` or None for unknown: what a data set's terms let a
-    Pack do with its rows."""
-    if source in decided["restricted"]:
-        return "restricted"
-    if source in decided["open"]:
-        return "open"
-    if source in decided["unclear"]:
-        return None
-    terms = " ".join(str(lic.get(k, "")) for k in ("name", "url"))
-    if RESTRICTIVE.search(terms):
-        raise SystemExit(f"curation: {source} has terms to read by hand and decide in [licences]: {terms[:200]}")
-    return "open" if OPEN_LICENCE.search(terms) else None
+    texts = {}
+    for d in datasets:
+        lic = d.get("license") or {}
+        if lic.get("name"):
+            texts.setdefault(d["source"], set()).add(lic["name"])
+    decisions, problems = {}, []
+    for terms in LICENCE_TERMS:
+        table = curation.get(terms, {})
+        if table and not str(table.get("why", "")).strip():
+            problems.append(f"curation: [licences.{terms}] has no why")
+        for source, pin in table.get("set", {}).items():
+            if source in decisions:
+                problems.append(f"curation: {source} is decided twice in [licences]")
+                continue
+            read = [text for text in sorted(texts.get(source, ())) if sha256(text.encode("utf-8"))[:len(pin)] == pin]
+            if not read:
+                problems.append(f"curation: [licences.{terms}] {source}: no licence text of it hashes to {pin}; "
+                                f"read its text again and pin the new hash")
+                continue
+            decisions[source] = dict(terms=terms, text=read[0])
+    if problems:
+        raise SystemExit("\n".join(problems))
+    return dict(sorted(decisions.items()))
 
 
 def licences_text():
     """The license of each OpenAddresses data set that states one, by source and
-    name, for the Pack to credit the data sets an answer comes from, and what
-    its terms let a Pack do: `use` is `open` or `restricted`, and a data set
-    without it, or not listed, is unknown."""
-    decided = licence_curation()
-    every = set().union(*decided.values())
+    name, for the Pack to credit the data sets an answer comes from, and the
+    licence texts read by hand, for the build to judge them by."""
     datasets = load_snapshot("openaddresses")["datasets"]
-    sources = {d["source"] for d in datasets}
-    missing = sorted(every - sources)
-    if missing:
-        raise SystemExit(f"curation: [licences] names data sets OpenAddresses does not list: {missing}")
+    decisions = licence_decisions(datasets)
     rows = []
     for d in datasets:
         lic = d.get("license")
         if not lic:
-            if d["source"] in every:
-                raise SystemExit(f"curation: [licences] decides {d['source']}, which states no licence")
             continue
         row = dict(source=d["source"], name=d["name"], licence=lic.get("name"), url=lic.get("url"),
-                   attribution=lic.get("attribution"), attribution_name=lic.get("attribution_name"),
-                   use=licence_use(d["source"], lic, decided))
+                   attribution=lic.get("attribution"), attribution_name=lic.get("attribution_name"))
         rows.append({k: v for k, v in row.items() if v not in (None, "")})
     rows.sort(key=lambda r: (r["source"], r["name"]))
-    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"]), "datasets", rows)
+    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"], decisions=decisions), "datasets", rows)
 
 
 def places_text():

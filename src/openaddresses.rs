@@ -18,9 +18,9 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    builder::addresses::{AddressFile, AddressSource, Coverage},
+    builder::addresses::{AddressFile, AddressSource, Coverage, Picked},
     error::{Error, Result},
-    licences::{Licences, openaddresses_use},
+    licences::{self, Stated, Terms},
 };
 
 pub const TOKEN_VARIABLE: &str = "OA_TOKEN";
@@ -43,7 +43,7 @@ pub const DATASET_PREFIX: &str = "openaddresses:";
 pub struct OpenAddresses {
     token: String,
     cache: PathBuf,
-    licences: Licences,
+    non_commercial: bool,
 }
 
 impl std::fmt::Debug for OpenAddresses {
@@ -51,7 +51,7 @@ impl std::fmt::Debug for OpenAddresses {
         formatter
             .debug_struct("OpenAddresses")
             .field("cache", &self.cache)
-            .field("licences", &self.licences)
+            .field("non_commercial", &self.non_commercial)
             .finish_non_exhaustive()
     }
 }
@@ -88,19 +88,20 @@ impl OpenAddresses {
         Ok(Self {
             token,
             cache: cache.into(),
-            licences: Licences::default(),
+            non_commercial: false,
         })
     }
 
-    /// Take only the data sets `licences` lets a build take.
-    pub fn licences(mut self, licences: Licences) -> Self {
-        self.licences = licences;
+    /// Take the data sets whose licence forbids use for gain too, for a
+    /// non-commercial Pack.
+    pub fn non_commercial(mut self, non_commercial: bool) -> Self {
+        self.non_commercial = non_commercial;
         self
     }
 
     /// The sources whose data a Pack covering `coverage` needs, each with
     /// the code of the area its rows lie in.
-    pub fn sources(coverage: &Coverage, licences: Licences) -> Result<Vec<(Source, String)>> {
+    pub fn sources(coverage: &Coverage) -> Result<Vec<(Source, String)>> {
         let url = format!("{API}/data?layer=addresses");
         let listed: Vec<Source> = agent()
             .get(&url)
@@ -109,7 +110,7 @@ impl OpenAddresses {
             .body_mut()
             .read_json()
             .map_err(|error| fetch_error(&url, error))?;
-        Ok(select(listed, coverage, licences))
+        Ok(select(listed, coverage))
     }
 
     fn download(&self, source: &Source) -> Result<PathBuf> {
@@ -173,23 +174,143 @@ impl OpenAddresses {
             .sync_all()
             .map_err(|error| Attempt::Final(io_error("failed to write", partial, error)))
     }
+
+    /// The licence the job that made `source`'s output states, read from
+    /// the service once and kept beside the output.
+    fn job_licence(&self, source: &Source) -> Result<Option<Stated>> {
+        let path = self
+            .cache
+            .join(source.source.replace('/', "_"))
+            .join(format!("{}.job.json", source.job));
+        let text = if path.is_file() {
+            fs::read_to_string(&path).map_err(|error| io_error("failed to read", &path, error))?
+        } else {
+            let url = format!("{API}/job/{}", source.job);
+            let text = agent()
+                .get(&url)
+                .call()
+                .map_err(|error| fetch_error(&url, error))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|error| fetch_error(&url, error))?;
+            let parent = path.parent().expect("cache files have a directory");
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("failed to create", parent, error))?;
+            let partial = path.with_extension("json.part");
+            fs::write(&partial, &text)
+                .map_err(|error| io_error("failed to write", &partial, error))?;
+            fs::rename(&partial, &path)
+                .map_err(|error| io_error("failed to write", &path, error))?;
+            text
+        };
+        let job: Job = serde_json::from_str(&text).map_err(|error| {
+            Error::BadInput(format!(
+                "{}: not an OpenAddresses job: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(job_licence(job.license))
+    }
 }
 
 impl AddressSource for OpenAddresses {
-    fn files(&self, coverage: &Coverage) -> Result<Vec<AddressFile>> {
-        let sources = Self::sources(coverage, self.licences)?;
-        sources
-            .iter()
-            .map(|(source, area)| {
+    fn pick(&self, coverage: &Coverage) -> Result<Picked> {
+        let sources = Self::sources(coverage)?;
+        let Licensed { kept, left_out } = licensed(&sources, self.non_commercial, |source| {
+            self.job_licence(source)
+        })?;
+        let files = kept
+            .into_iter()
+            .map(|(source, area, dataset)| {
                 Ok(AddressFile {
-                    dataset: dataset_of(source, &sources),
+                    dataset,
                     path: self.download(source)?,
                     entry: None,
                     area: Some(area.clone()),
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        Ok(Picked { files, left_out })
     }
+}
+
+/// What a job record says of its output's licence: an object of the terms,
+/// the terms as bare text in older jobs, or `false` for none.
+fn job_licence(license: Option<serde_json::Value>) -> Option<Stated> {
+    let filled = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let stated = match license? {
+        serde_json::Value::Object(terms) => Stated {
+            text: filled(terms.get("text")),
+            url: filled(terms.get("url")),
+        },
+        text @ serde_json::Value::String(_) => Stated {
+            text: filled(Some(&text)),
+            url: None,
+        },
+        _ => return None,
+    };
+    (stated.text.is_some() || stated.url.is_some()).then_some(stated)
+}
+
+/// The part of a job record a build reads.
+#[derive(Debug, Deserialize)]
+struct Job {
+    #[serde(default)]
+    license: Option<serde_json::Value>,
+}
+
+/// Of the sources a Pack needs, the ones whose licence a build takes, each
+/// with its area and dataset, and a warning for each one left out. A job
+/// that states no licence is judged by its source's in the pinned catalog,
+/// and one with none there states no licence, which a build takes.
+/// Datasets are named from every needed source, so leaving one out never
+/// renames another's records.
+fn licensed(
+    sources: &[(Source, String)],
+    non_commercial: bool,
+    mut stated: impl FnMut(&Source) -> Result<Option<Stated>>,
+) -> Result<Licensed<'_>> {
+    let mut kept = Vec::new();
+    let mut left_out = Vec::new();
+    for (source, area) in sources {
+        let dataset = dataset_of(source, sources);
+        let licence =
+            stated(source)?.unwrap_or_else(|| licences::pinned(&source.source, &source.name));
+        let terms = licences::judge(&source.source, &licence);
+        if terms.taken(non_commercial) {
+            kept.push((source, area, dataset));
+            continue;
+        }
+        let quoted: String = [licence.text.as_deref(), licence.url.as_deref()]
+            .into_iter()
+            .flatten()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(80)
+            .collect();
+        left_out.push(match terms {
+            Terms::NonCommercial => format!(
+                "{dataset} left out: its licence forbids commercial use (\"{quoted}\"); \
+                 --openaddresses-non-commercial takes it for a non-commercial Pack"
+            ),
+            _ => format!("{dataset} left out: its licence forbids serving it (\"{quoted}\")"),
+        });
+    }
+    Ok(Licensed { kept, left_out })
+}
+
+/// The sources a build takes, each with its area and dataset, and a warning
+/// for each one left out.
+struct Licensed<'a> {
+    kept: Vec<(&'a Source, &'a String, String)>,
+    left_out: Vec<String>,
 }
 
 /// The dataset a source's records name: its path, and its name too when the
@@ -216,7 +337,7 @@ fn dataset_of(source: &Source, sources: &[(Source, String)]) -> String {
 #[derive(Debug, Clone)]
 pub struct Collection {
     path: PathBuf,
-    licences: Licences,
+    non_commercial: bool,
 }
 
 /// What a `.geojson.meta` entry says of its source.
@@ -231,24 +352,29 @@ struct EntryMeta {
     id: u64,
     #[serde(default)]
     size: Option<u64>,
+    /// The whole job record is the meta, licence included.
+    #[serde(default)]
+    license: Option<serde_json::Value>,
 }
 
 impl Collection {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            licences: Licences::default(),
+            non_commercial: false,
         }
     }
 
-    /// Take only the data sets `licences` lets a build take.
-    pub fn licences(mut self, licences: Licences) -> Self {
-        self.licences = licences;
+    /// Take the data sets whose licence forbids use for gain too, for a
+    /// non-commercial Pack.
+    pub fn non_commercial(mut self, non_commercial: bool) -> Self {
+        self.non_commercial = non_commercial;
         self
     }
 
-    /// Every address source in the archive, with the entry that holds it.
-    fn listed(&self) -> Result<Vec<(Source, String)>> {
+    /// Every address source in the archive, with the entry that holds it
+    /// and the licence its job states.
+    fn listed(&self) -> Result<Vec<(Source, String, Option<Stated>)>> {
         let file = File::open(&self.path)
             .map_err(|error| io_error("failed to open", &self.path, error))?;
         let bad = |detail: String| Error::BadInput(format!("{}: {detail}", self.path.display()));
@@ -283,6 +409,7 @@ impl Collection {
                     size: meta.size,
                 },
                 entry,
+                job_licence(meta.license),
             ));
         }
         Ok(listed)
@@ -290,35 +417,40 @@ impl Collection {
 }
 
 impl AddressSource for Collection {
-    fn files(&self, coverage: &Coverage) -> Result<Vec<AddressFile>> {
+    fn pick(&self, coverage: &Coverage) -> Result<Picked> {
         let listed = self.listed()?;
         let sources = select(
-            listed.iter().map(|(source, _)| source.clone()).collect(),
+            listed.iter().map(|(source, _, _)| source.clone()).collect(),
             coverage,
-            self.licences,
         );
         let entries = listed
             .into_iter()
-            .map(|(source, entry)| {
+            .map(|(source, entry, licence)| {
                 (
                     (source.source.clone(), source.name.clone(), source.job),
-                    entry,
+                    (entry, licence),
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
-        Ok(sources
-            .iter()
-            .filter_map(|(source, area)| {
-                let entry =
-                    entries.get(&(source.source.clone(), source.name.clone(), source.job))?;
+        let key = |source: &Source| (source.source.clone(), source.name.clone(), source.job);
+        let Licensed { kept, left_out } = licensed(&sources, self.non_commercial, |source| {
+            Ok(entries
+                .get(&key(source))
+                .and_then(|(_, licence)| licence.clone()))
+        })?;
+        let files = kept
+            .into_iter()
+            .filter_map(|(source, area, dataset)| {
+                let (entry, _) = entries.get(&key(source))?;
                 Some(AddressFile {
-                    dataset: dataset_of(source, &sources),
+                    dataset,
                     path: self.path.clone(),
                     entry: Some(entry.clone()),
                     area: Some(area.clone()),
                 })
             })
-            .collect())
+            .collect();
+        Ok(Picked { files, left_out })
     }
 }
 
@@ -365,13 +497,8 @@ fn dotenv_value(text: &str, name: &str) -> Option<String> {
 /// of a country covered in part takes the sources under its path (`CA-ON` the
 /// ones under `ca/on/`), and never the countrywide one, which would bring in
 /// the rest of the country. A data set listed twice is taken once, at its
-/// latest job, and one whose terms `licences` does not take is left out.
-fn select(
-    mut listed: Vec<Source>,
-    coverage: &Coverage,
-    licences: Licences,
-) -> Vec<(Source, String)> {
-    listed.retain(|source| licences.takes(openaddresses_use(&source.source, &source.name)));
+/// latest job.
+fn select(mut listed: Vec<Source>, coverage: &Coverage) -> Vec<(Source, String)> {
     listed.sort_by(|left, right| {
         (&left.source, &left.name)
             .cmp(&(&right.source, &right.name))
@@ -494,7 +621,7 @@ mod tests {
         };
         let mut expected = within("AU", &[("au/countrywide", 7), ("au/nsw/statewide", 3)]);
         expected.extend(within("US", &[("us/ny/nyc", 8)]));
-        assert_eq!(select(listed(), &coverage, Licences::Permitted), expected);
+        assert_eq!(select(listed(), &coverage), expected);
     }
 
     #[test]
@@ -504,7 +631,7 @@ mod tests {
             subdivisions: BTreeSet::from(["CA-ON".to_string()]),
         };
         assert_eq!(
-            select(listed(), &coverage, Licences::Permitted),
+            select(listed(), &coverage),
             within(
                 "CA-ON",
                 &[("ca/on/city_of_ottawa", 9), ("ca/on/city_of_toronto", 5)]
@@ -513,34 +640,96 @@ mod tests {
         );
     }
 
-    #[test]
-    fn leaves_out_a_data_set_whose_terms_a_build_does_not_take() {
-        let coverage = Coverage {
+    fn us() -> Coverage {
+        Coverage {
             countries: BTreeSet::from(["US".to_string()]),
             subdivisions: BTreeSet::new(),
-        };
-        let listed = vec![
-            Source {
-                name: "county".to_string(),
-                ..source("us/wa/spokane", 4)
-            },
-            source("us/ny/nyc", 8),
-        ];
-        assert_eq!(
-            select(listed.clone(), &coverage, Licences::Permitted),
-            within("US", &[("us/ny/nyc", 8)]),
-            "Spokane's CC BY-NC-SA rows are never taken"
+        }
+    }
+
+    fn judged(
+        sources: &[(Source, String)],
+        non_commercial: bool,
+        stated: impl Fn(&Source) -> Option<Stated>,
+    ) -> (Vec<String>, Vec<String>) {
+        let Licensed { kept, left_out } =
+            licensed(sources, non_commercial, |source| Ok(stated(source))).expect("judged");
+        (
+            kept.into_iter().map(|(_, _, dataset)| dataset).collect(),
+            left_out,
+        )
+    }
+
+    #[test]
+    fn a_renamed_data_set_is_judged_by_its_sources_licence() {
+        let sources = select(
+            vec![
+                Source {
+                    name: "renamed".to_string(),
+                    ..source("us/wa/spokane", 4)
+                },
+                source("us/ny/nyc", 8),
+            ],
+            &us(),
         );
+        let (kept, left_out) = judged(&sources, false, |_| None);
+        assert_eq!(kept, ["openaddresses:us/ny/nyc"]);
+        assert_eq!(left_out.len(), 1, "{left_out:?}");
+        assert!(
+            left_out[0].starts_with("openaddresses:us/wa/spokane left out")
+                && left_out[0].contains("CC BY-NC-SA 4.0")
+                && left_out[0].contains("--openaddresses-non-commercial"),
+            "{left_out:?}"
+        );
+        let (kept, left_out) = judged(&sources, true, |_| None);
+        assert_eq!(kept.len(), 2, "a non-commercial Pack takes Spokane");
+        assert!(left_out.is_empty());
+    }
+
+    #[test]
+    fn the_licence_a_job_states_now_decides_over_the_pinned_one() {
+        let sources = select(
+            vec![source("us/wa/spokane", 4), source("us/ny/nyc", 8)],
+            &us(),
+        );
+        let (kept, left_out) = judged(&sources, false, |source| match source.source.as_str() {
+            "us/wa/spokane" => Some(Stated {
+                text: Some("CC0 1.0".to_string()),
+                url: None,
+            }),
+            _ => Some(Stated {
+                text: Some("All rights reserved".to_string()),
+                url: None,
+            }),
+        });
+        assert_eq!(kept, ["openaddresses:us/wa/spokane"], "now CC0");
+        assert!(
+            left_out[0]
+                .starts_with("openaddresses:us/ny/nyc left out: its licence forbids serving it"),
+            "{left_out:?}"
+        );
+        let (kept, _) = judged(&sources, true, |source| {
+            (source.source == "us/ny/nyc").then(|| Stated {
+                text: Some("All rights reserved".to_string()),
+                url: None,
+            })
+        });
         assert_eq!(
-            select(listed, &coverage, Licences::Open),
-            Vec::new(),
-            "nyc states no licence in the catalog"
+            kept,
+            ["openaddresses:us/wa/spokane"],
+            "a restricted data set stays out of a non-commercial Pack"
         );
     }
 
     /// An archive laid out as OpenAddresses' collections are: each job's
     /// output beside its `.meta`, deflated, in several layers.
     fn collection(dir: &Path) -> PathBuf {
+        collection_with(dir, &[])
+    }
+
+    /// The archive of [`collection`], with `licensed` address entries added:
+    /// (source, job, the `license` of its job record as JSON).
+    fn collection_with(dir: &Path, licensed: &[(&str, u64, &str)]) -> PathBuf {
         use std::io::Write;
         let path = dir.join("collection.zip");
         let mut zip = zip::ZipWriter::new(File::create(&path).expect("zip"));
@@ -586,6 +775,20 @@ mod tests {
             )
             .expect("write");
         }
+        for (source, job, license) in licensed {
+            let name = format!("{}-addresses-county", source.replace('/', "-"));
+            zip.start_file(format!("{name}.geojson"), deflated)
+                .expect("entry");
+            zip.write_all(feature("2", "Main Street", -117.4).as_bytes())
+                .expect("write");
+            zip.start_file(format!("{name}.geojson.meta"), deflated)
+                .expect("meta");
+            write!(
+                zip,
+                "{{\"id\":{job},\"source_name\":\"{source}\",\"layer\":\"addresses\",\"name\":\"county\",\"license\":{license}}}"
+            )
+            .expect("write");
+        }
         zip.finish().expect("finish");
         path
     }
@@ -599,8 +802,9 @@ mod tests {
             ..Coverage::default()
         };
         let files = Collection::new(collection(&dir))
-            .files(&coverage)
-            .expect("files");
+            .pick(&coverage)
+            .expect("files")
+            .files;
         assert_eq!(
             files.len(),
             1,
@@ -633,5 +837,81 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_collection_leaves_out_the_entries_whose_job_licence_a_build_does_not_take() {
+        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let archive = collection_with(
+            &dir,
+            &[
+                (
+                    "us/wa/spokane",
+                    11,
+                    r#"{"text":"CC BY-NC-SA 4.0","url":"https://creativecommons.org/licenses/by-nc-sa/4.0/"}"#,
+                ),
+                (
+                    "us/ia/linn",
+                    12,
+                    r#""No person shall sell, give, reproduce""#,
+                ),
+                ("us/ia/polk", 13, "false"),
+            ],
+        );
+        let datasets = |picked: &Picked| {
+            picked
+                .files
+                .iter()
+                .map(|file| file.dataset.clone())
+                .collect::<Vec<_>>()
+        };
+        let picked = Collection::new(&archive).pick(&us());
+        let _ = fs::remove_dir_all(&dir);
+        let picked = picked.expect("picked");
+        assert_eq!(datasets(&picked), ["openaddresses:us/ia/polk"]);
+        assert_eq!(picked.left_out.len(), 2, "{:?}", picked.left_out);
+        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let archive = collection_with(
+            &dir,
+            &[
+                ("us/wa/spokane", 11, r#"{"text":"CC BY-NC-SA 4.0"}"#),
+                (
+                    "us/ia/linn",
+                    12,
+                    r#""No person shall sell, give, reproduce""#,
+                ),
+            ],
+        );
+        let picked = Collection::new(&archive).non_commercial(true).pick(&us());
+        let _ = fs::remove_dir_all(&dir);
+        let picked = picked.expect("picked");
+        assert_eq!(datasets(&picked), ["openaddresses:us/wa/spokane"]);
+        assert!(picked.left_out[0].starts_with("openaddresses:us/ia/linn left out"));
+    }
+
+    #[test]
+    fn reads_a_job_licence_in_every_shape_openaddresses_writes() {
+        let read = |json: &str| job_licence(serde_json::from_str(json).expect("json"));
+        assert_eq!(
+            read(
+                r#"{"text":"CC BY-NC-SA 4.0","url":"https://creativecommons.org/licenses/by-nc-sa/4.0/","attribution":true}"#
+            ),
+            Some(Stated {
+                text: Some("CC BY-NC-SA 4.0".to_string()),
+                url: Some("https://creativecommons.org/licenses/by-nc-sa/4.0/".to_string()),
+            })
+        );
+        assert_eq!(
+            read(r#""Public Domain""#),
+            Some(Stated {
+                text: Some("Public Domain".to_string()),
+                url: None,
+            })
+        );
+        assert_eq!(read("false"), None, "a job of a source that states none");
+        assert_eq!(read(r#"{"text":" ","attribution":false}"#), None);
+        assert_eq!(job_licence(None), None);
     }
 }

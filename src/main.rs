@@ -26,7 +26,6 @@ use open_geocode::{
     calibration,
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     ids::{self, Catalogue},
-    licences::Licences,
     limits::Limits,
     openaddresses::{Collection, OpenAddresses},
     pack::{Reader, RecordId},
@@ -188,13 +187,12 @@ enum PackCommand {
         #[arg(long, value_name = "ZIP", conflicts_with = "openaddresses")]
         openaddresses_zip: Option<PathBuf>,
 
-        /// Which OpenAddresses data sets to take, by what their terms let a
-        /// Pack do: `permitted` leaves out the ones whose terms forbid
-        /// serving them (non-commercial, all rights reserved), `open` also
-        /// the ones that state no open licence. catalog/licences.json says
-        /// which is which.
-        #[arg(long, value_enum, default_value_t = Licences::Permitted)]
-        openaddresses_licences: Licences,
+        /// Also take the OpenAddresses data sets whose licence forbids
+        /// commercial use, such as CC BY-NC. The Pack is then for
+        /// non-commercial use only. Data sets whose licence forbids serving
+        /// them at all stay out.
+        #[arg(long)]
+        openaddresses_non_commercial: bool,
 
         /// Add the address points of a file: OpenAddresses GeoJSON, one
         /// feature per line, or CSV with LON, LAT, NUMBER and STREET columns,
@@ -611,7 +609,7 @@ async fn main() -> Result<()> {
             fresh,
             openaddresses,
             openaddresses_zip,
-            openaddresses_licences,
+            openaddresses_non_commercial,
             address_files,
             qrank,
         }) => {
@@ -621,7 +619,7 @@ async fn main() -> Result<()> {
                 &pack,
                 openaddresses,
                 openaddresses_zip.as_deref(),
-                openaddresses_licences,
+                openaddresses_non_commercial,
                 &address_files,
             )?;
             let options = BuildOsmOptions {
@@ -838,17 +836,19 @@ fn address_sources(
     pack: &Path,
     openaddresses: bool,
     collection: Option<&Path>,
-    licences: Licences,
+    non_commercial: bool,
     files: &[String],
 ) -> Result<Option<Arc<dyn AddressSource>>> {
     let mut sources: Vec<Arc<dyn AddressSource>> = Vec::new();
     if openaddresses {
         sources.push(Arc::new(
-            OpenAddresses::from_env(pack.join("openaddresses"))?.licences(licences),
+            OpenAddresses::from_env(pack.join("openaddresses"))?.non_commercial(non_commercial),
         ));
     }
     if let Some(collection) = collection {
-        sources.push(Arc::new(Collection::new(collection).licences(licences)));
+        sources.push(Arc::new(
+            Collection::new(collection).non_commercial(non_commercial),
+        ));
     }
     if !files.is_empty() {
         sources.push(Arc::new(AddressFiles(address_files_of(files)?)));
@@ -1253,6 +1253,52 @@ mod tests {
         assert_eq!(build_budget(Some("64")).expect("minimum"), Some(64));
         assert_eq!(build_budget(Some("16384")).expect("planet"), Some(16_384));
         assert_eq!(build_budget(None).expect("derived"), None);
+    }
+
+    #[test]
+    fn the_non_commercial_flag_reaches_the_openaddresses_source() {
+        let parsed = |extra: &[&'static str]| {
+            let mut args = vec![
+                "open-geocode",
+                "pack",
+                "build",
+                "--input",
+                "in.osm.pbf",
+                "--pack",
+                "pack",
+                "--openaddresses-zip",
+                "collection.zip",
+            ];
+            args.extend(extra);
+            match Cli::try_parse_from(args).expect("parsed").command {
+                Commands::Pack(PackCommand::Build {
+                    openaddresses_zip,
+                    openaddresses_non_commercial,
+                    ..
+                }) => (openaddresses_zip, openaddresses_non_commercial),
+                _ => unreachable!("parsed a build command"),
+            }
+        };
+        for (extra, taken) in [
+            (&[][..], false),
+            (&["--openaddresses-non-commercial"][..], true),
+        ] {
+            let (zip, non_commercial) = parsed(extra);
+            assert_eq!(non_commercial, taken);
+            let sources = address_sources(
+                Path::new("pack"),
+                false,
+                zip.as_deref(),
+                non_commercial,
+                &[],
+            )
+            .expect("sources")
+            .expect("a collection");
+            assert!(
+                format!("{sources:?}").contains(&format!("non_commercial: {taken}")),
+                "{sources:?}"
+            );
+        }
     }
 
     /// Answers one request with `status`, as the server's /readyz would, and

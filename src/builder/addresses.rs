@@ -44,9 +44,18 @@ pub struct Coverage {
 
 /// Where a build finds addresses to add to the input's own.
 pub trait AddressSource: Send + Sync + fmt::Debug {
-    /// The files to read for a Pack covering `coverage`. Called once, after
-    /// the boundaries are built; it may download.
-    fn files(&self, coverage: &Coverage) -> Result<Vec<AddressFile>>;
+    /// The files to read for a Pack covering `coverage`, and the data sets
+    /// left out. Called once, after the boundaries are built; it may
+    /// download.
+    fn pick(&self, coverage: &Coverage) -> Result<Picked>;
+}
+
+/// What an [`AddressSource`] gives a build: the files to read, and each data
+/// set it left out with the reason, for the build to warn of.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Picked {
+    pub files: Vec<AddressFile>,
+    pub left_out: Vec<String>,
 }
 
 /// One file of address points and the dataset its records name as their
@@ -142,8 +151,11 @@ fn zip_entry(path: &Path, entry: &str) -> Result<ZipEntry> {
 pub struct AddressFiles(pub Vec<AddressFile>);
 
 impl AddressSource for AddressFiles {
-    fn files(&self, _coverage: &Coverage) -> Result<Vec<AddressFile>> {
-        Ok(self.0.clone())
+    fn pick(&self, _coverage: &Coverage) -> Result<Picked> {
+        Ok(Picked {
+            files: self.0.clone(),
+            left_out: Vec::new(),
+        })
     }
 }
 
@@ -152,12 +164,14 @@ impl AddressSource for AddressFiles {
 pub struct AddressSources(pub Vec<std::sync::Arc<dyn AddressSource>>);
 
 impl AddressSource for AddressSources {
-    fn files(&self, coverage: &Coverage) -> Result<Vec<AddressFile>> {
-        let mut files = Vec::new();
+    fn pick(&self, coverage: &Coverage) -> Result<Picked> {
+        let mut picked = Picked::default();
         for source in &self.0 {
-            files.extend(source.files(coverage)?);
+            let one = source.pick(coverage)?;
+            picked.files.extend(one.files);
+            picked.left_out.extend(one.left_out);
         }
-        Ok(files)
+        Ok(picked)
     }
 }
 

@@ -1293,10 +1293,14 @@ impl<'a> Run<'a> {
             .boundaries
             .as_ref()
             .ok_or_else(|| missing("the boundaries"))?;
-        let files = match &self.options.addresses {
-            Some(source) => source.files(&boundaries.coverage())?,
-            None => Vec::new(),
+        let picked = match &self.options.addresses {
+            Some(source) => source.pick(&boundaries.coverage())?,
+            None => addresses::Picked::default(),
         };
+        for why in &picked.left_out {
+            self.options.observer.warned(why);
+        }
+        let files = picked.files;
         let import_bytes = files
             .iter()
             .map(addresses::AddressFile::bytes)
@@ -3435,9 +3439,12 @@ mod tests {
     }
 
     impl AddressSource for RecordingSource {
-        fn files(&self, coverage: &addresses::Coverage) -> Result<Vec<addresses::AddressFile>> {
+        fn pick(&self, coverage: &addresses::Coverage) -> Result<addresses::Picked> {
             self.asked.lock().expect("lock").push(coverage.clone());
-            Ok(self.files.clone())
+            Ok(addresses::Picked {
+                files: self.files.clone(),
+                left_out: Vec::new(),
+            })
         }
     }
 
