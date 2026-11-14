@@ -34,7 +34,7 @@
         "label": "10 King Street, M5V 1A1",
         "layer": "address",
         "name": "10 King Street",
-        "score": 0.0,
+        "score": 2.8319635,
         "source": {
           "dataset": "osm"
         }
