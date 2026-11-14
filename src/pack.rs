@@ -69,6 +69,8 @@ const POSTCODE_ADDRESSES_SECTION: &str = "postcode_addresses";
 const POSTCODE_ADDRESSES_VERSION: u32 = 1;
 const COUNTRY_CODES_SECTION: &str = "country_codes";
 const COUNTRY_CODES_VERSION: u32 = 1;
+const SUBDIVISION_CODES_SECTION: &str = "subdivision_codes";
+const SUBDIVISION_CODES_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -182,6 +184,41 @@ fn country_codes_from_bytes(bytes: &[u8]) -> Result<HashMap<RecordId, CountryCod
         .collect()
 }
 
+/// Each entry is the area record's id, little-endian, then its code's length
+/// in one byte and the code itself: `CA-ON`.
+fn subdivision_codes_to_bytes(codes: &HashMap<RecordId, String>) -> Vec<u8> {
+    let mut sorted = codes
+        .iter()
+        .filter(|(_, code)| u8::try_from(code.len()).is_ok())
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut bytes = Vec::new();
+    for (record_id, code) in sorted {
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        bytes.push(u8::try_from(code.len()).expect("filtered to fit"));
+        bytes.extend_from_slice(code.as_bytes());
+    }
+    bytes
+}
+
+fn subdivision_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, String>> {
+    let truncated = || Error::Decode("subdivision codes are truncated");
+    let mut codes = HashMap::new();
+    while !bytes.is_empty() {
+        let (record_id, rest) = bytes.split_at_checked(8).ok_or_else(truncated)?;
+        let (&length, rest) = rest.split_first().ok_or_else(truncated)?;
+        let (code, rest) = rest
+            .split_at_checked(usize::from(length))
+            .ok_or_else(truncated)?;
+        let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
+        let code = std::str::from_utf8(code)
+            .map_err(|_| Error::Decode("a subdivision code is not text"))?;
+        codes.insert(record_id, code.to_string());
+        bytes = rest;
+    }
+    Ok(codes)
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
     /// Pool every buffer of the build reserves from.
@@ -236,6 +273,7 @@ pub struct Writer {
     layer_counts: BTreeMap<Layer, u64>,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
+    subdivision_codes: HashMap<RecordId, String>,
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
@@ -381,6 +419,7 @@ impl Writer {
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
             country_codes: Arc::default(),
+            subdivision_codes: HashMap::new(),
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
@@ -418,6 +457,12 @@ impl Writer {
         // holds one entry per country record, not per record.
         self.country_codes = Arc::new(codes.clone());
         self.dictionaries.set_country_codes(codes);
+    }
+
+    /// The ISO 3166-2 code of each area record below a country that has one
+    /// (`CA-ON`), by the area's id.
+    pub fn set_subdivision_codes(&mut self, codes: HashMap<RecordId, String>) {
+        self.subdivision_codes = codes;
     }
 
     /// The groups of regions each region lies in, by the region's id.
@@ -557,6 +602,7 @@ impl Writer {
             layer_counts,
             context_names,
             country_codes,
+            subdivision_codes,
             postcode_addresses,
             dictionaries,
             ..
@@ -591,6 +637,12 @@ impl Writer {
             &country_codes_to_bytes(&country_codes),
         )?;
         drop(country_codes);
+        pack.add(
+            SUBDIVISION_CODES_SECTION,
+            SUBDIVISION_CODES_VERSION,
+            &subdivision_codes_to_bytes(&subdivision_codes),
+        )?;
+        drop(subdivision_codes);
         Ok(Sealing {
             generation,
             scratch,
@@ -963,6 +1015,8 @@ pub struct Reader {
     postcode_addresses: PostcodeAddresses,
     /// The code of each country record, by its id.
     country_codes: HashMap<RecordId, CountryCode>,
+    /// The ISO 3166-2 code of each area record that has one, by its id.
+    subdivision_codes: HashMap<RecordId, String>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -1004,6 +1058,13 @@ impl Reader {
         } else {
             HashMap::new()
         };
+        let subdivision_codes = if container.sections().contains_key(SUBDIVISION_CODES_SECTION) {
+            subdivision_codes_from_bytes(
+                &container.section(SUBDIVISION_CODES_SECTION, SUBDIVISION_CODES_VERSION)?,
+            )?
+        } else {
+            HashMap::new()
+        };
         Ok(Self {
             path,
             container,
@@ -1012,6 +1073,7 @@ impl Reader {
             context,
             postcode_addresses,
             country_codes,
+            subdivision_codes,
         })
     }
 
@@ -1037,6 +1099,13 @@ impl Reader {
     /// and for every record of a Pack sealed without country codes.
     pub fn country_code(&self, record_id: RecordId) -> Option<CountryCode> {
         self.country_codes.get(&record_id).copied()
+    }
+
+    /// The ISO 3166-2 code of an area record below a country (`CA-ON`).
+    /// `None` for an area OpenStreetMap gives no code, for any other record,
+    /// and for every record of a Pack sealed without subdivision codes.
+    pub fn subdivision_code(&self, record_id: RecordId) -> Option<&str> {
+        self.subdivision_codes.get(&record_id).map(String::as_str)
     }
 
     /// See [`PostcodeAddresses`].
@@ -1275,6 +1344,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn subdivision_codes_survive_the_section_and_a_cut_one_fails() {
+        let codes = HashMap::from([(3, "CA-ON".to_string()), (9, "NZ-AUK".to_string())]);
+        let bytes = subdivision_codes_to_bytes(&codes);
+        assert_eq!(
+            subdivision_codes_from_bytes(&bytes).expect("decodes"),
+            codes
+        );
+        assert!(subdivision_codes_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("open-geocode-{name}-{}", uuid::Uuid::new_v4()))

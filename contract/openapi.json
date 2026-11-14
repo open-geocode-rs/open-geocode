@@ -207,7 +207,7 @@
       "ContextArea": {
         "properties": {
           "code": {
-            "description": "ISO 3166-1 alpha-2 code, such as `NZ`. Present only on `country`.",
+            "description": "ISO code of the area. On `country` its ISO 3166-1 alpha-2 code, such\nas `NZ`. On an area below it, its ISO 3166-2 code, such as `CA-ON`,\nwhen the source data gives one.",
             "example": "NZ",
             "type": "string"
           },

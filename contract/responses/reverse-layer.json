@@ -21,6 +21,7 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
