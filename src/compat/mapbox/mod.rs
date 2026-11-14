@@ -319,6 +319,8 @@ struct Area {
     street_name: Option<String>,
     country_code: Option<String>,
     country_code_alpha_3: Option<&'static str>,
+    region_code: Option<String>,
+    region_code_full: Option<String>,
 }
 
 impl Area {
@@ -330,11 +332,25 @@ impl Area {
         }
     }
 
+    /// An area og found the result in. A country's code is its own two
+    /// letters; any other area's is its subdivision code, written on the
+    /// region only.
     fn of(area: &crate::api::ContextArea) -> Self {
         let mut layer = Self::named(Some(encode_id(&area.id)), &area.name);
-        if let Some(code) = &area.code {
+        if let Some(code) = area.code.as_deref().filter(|code| !code.contains('-')) {
             layer.country_code_alpha_3 = iso::alpha3(code);
-            layer.country_code = Some(code.clone());
+            layer.country_code = Some(code.to_string());
+        }
+        layer
+    }
+
+    /// The region og found the result in, with its code (`ON` of `CA-ON`)
+    /// and its full code.
+    fn region(area: &crate::api::ContextArea) -> Self {
+        let mut layer = Self::of(area);
+        if let Some((_, own)) = area.code.as_deref().and_then(|code| code.split_once('-')) {
+            layer.region_code = Some(own.to_string());
+            layer.region_code_full.clone_from(&area.code);
         }
         layer
     }
@@ -352,6 +368,10 @@ struct LayerFields {
     country_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     country_code_alpha_3: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region_code_full: Option<String>,
 }
 
 impl Area {
@@ -366,6 +386,8 @@ impl Area {
                 street_name: self.street_name,
                 country_code: self.country_code,
                 country_code_alpha_3: self.country_code_alpha_3,
+                region_code: self.region_code,
+                region_code_full: self.region_code_full,
             },
         )
     }
@@ -567,7 +589,7 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
         region: areas
             .region
             .as_ref()
-            .map(Area::of)
+            .map(Area::region)
             .or_else(|| stated(&parts.region)),
         country: areas
             .country
@@ -632,15 +654,17 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
         Layer::Country => &mut context.country,
         Layer::Address | Layer::Poi => return context,
     };
-    // An area is its own layer; a country keeps the code og gave its tier.
-    let code = slot
+    // An area is its own layer; a country or region keeps the codes og
+    // gave its tier.
+    let coded = slot
         .take()
         .filter(|area| area.id.as_deref() == Some(mapbox_id))
-        .map(|area| (area.country_code, area.country_code_alpha_3))
         .unwrap_or_default();
     *slot = Some(Area {
-        country_code: code.0,
-        country_code_alpha_3: code.1,
+        country_code: coded.country_code,
+        country_code_alpha_3: coded.country_code_alpha_3,
+        region_code: coded.region_code,
+        region_code_full: coded.region_code_full,
         ..own()
     });
     context

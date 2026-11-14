@@ -103,6 +103,7 @@ fn write_pack(dir: &Path) {
         .into_iter()
         .collect(),
     );
+    writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -288,7 +289,6 @@ fn assert_carries(feature: &Value, result: &Value) {
         (&address["street"], &carried["street"]),
         (&address["unit"], &carried["unit"]),
         (&address["postcode"], &carried["postalCode"]),
-        (&address["region"], &carried["admin1"]["shortName"]),
         (&context["region"]["name"], &carried["admin1"]["longName"]),
         (&context["locality"]["name"], &carried["city"]["longName"]),
         (&context["district"]["name"], &carried["admin2"]["longName"]),
@@ -309,6 +309,17 @@ fn assert_carries(feature: &Value, result: &Value) {
     for (og, precisely) in pairs {
         assert_eq!(og, precisely, "{feature} as {result}");
     }
+    // The region's own code is its short name; the region the record states
+    // stands in when og knows no code.
+    let short = context["region"]["code"]
+        .as_str()
+        .and_then(|code| code.split_once('-'))
+        .map(|(_, own)| json!(own))
+        .unwrap_or_else(|| address["region"].clone());
+    assert_eq!(
+        carried["admin1"]["shortName"], short,
+        "{feature} as {result}"
+    );
     let code = context["country"]["code"].as_str().expect("country code");
     assert_eq!(
         carried["country"]["isoAlpha3Code"].as_str(),

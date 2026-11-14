@@ -41,6 +41,7 @@ struct Properties {
 struct Address {
     housenumber: Option<String>,
     unit: Option<String>,
+    unit_type: Option<String>,
     street: Option<String>,
     place: Option<String>,
     #[serde(default)]
@@ -105,6 +106,8 @@ pub(super) struct ResponseAddress {
     pub(super) street: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) unit_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) place_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,9 +227,16 @@ impl Feature {
         };
         // The record states the region as its address writes it, often an
         // abbreviation (`NJ`); the area containing it has the full name.
+        // The region's code within its country (`ON` of `CA-ON`) is its short
+        // name when og knows it.
+        let region_code = context
+            .region
+            .as_ref()
+            .and_then(|region| region.code.as_deref()?.split_once('-'))
+            .map(|(_, own)| own.to_string());
         let admin1 = match (area(&context.region), address.region.clone()) {
             (Some(long_name), stated) => Some(AdminField {
-                short_name: stated.filter(|stated| *stated != long_name),
+                short_name: region_code.or(stated).filter(|short| *short != long_name),
                 long_name,
             }),
             (None, stated) => admin(stated),
@@ -271,7 +281,18 @@ impl Feature {
                 formatted_location_address: location_line,
                 address_number: address.housenumber.clone(),
                 street,
-                unit: address.unit.clone(),
+                // The unit's type apart from its value: `STE` and `300` of
+                // `STE 300`.
+                unit: match (&address.unit, &address.unit_type) {
+                    (Some(unit), Some(kind)) => unit
+                        .strip_prefix(kind.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| Some(unit.clone())),
+                    (unit, _) => unit.clone(),
+                },
+                unit_type: address.unit_type.clone(),
                 place_name: (layer == "poi").then(|| properties.name.clone()),
                 neighborhood: admin(neighborhood),
                 suburb: admin(suburb),

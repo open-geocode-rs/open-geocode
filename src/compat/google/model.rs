@@ -245,10 +245,23 @@ fn address_components(common: &Common) -> Vec<AddressComponent> {
     for (level, text) in lower.iter().enumerate().rev() {
         push(Some(text), &[LOWER_ADMIN[level], "political"]);
     }
-    push(
-        name(&context.region).or(address.region.as_deref()),
-        &["administrative_area_level_1", "political"],
-    );
+    // The region's short text is its code within its country (`ON` of
+    // `CA-ON`) when og knows it.
+    match &context.region {
+        Some(region) => components.push(AddressComponent {
+            long_text: region.name.clone(),
+            short_text: region
+                .code
+                .as_deref()
+                .and_then(|code| code.split_once('-'))
+                .map_or_else(|| region.name.clone(), |(_, own)| own.to_string()),
+            types: vec!["administrative_area_level_1", "political"],
+        }),
+        None => push(
+            address.region.as_deref(),
+            &["administrative_area_level_1", "political"],
+        ),
+    }
     match &context.country {
         Some(country) => components.push(AddressComponent {
             long_text: country.name.clone(),

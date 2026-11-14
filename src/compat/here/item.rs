@@ -119,6 +119,8 @@ pub(super) struct ItemAddress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) country_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) state_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) county: Option<String>,
@@ -243,6 +245,12 @@ fn address(properties: &Properties) -> ItemAddress {
         label: Some(properties.label.clone()),
         country_code,
         country_name: area(&context.country).or_else(|| own(Layer::Country)),
+        // The region's code within its country: `ON` of `CA-ON`.
+        state_code: context
+            .region
+            .as_ref()
+            .and_then(|region| region.code.as_deref()?.split_once('-'))
+            .map(|(_, own)| own.to_string()),
         state: area(&context.region)
             .or_else(|| stated.region.clone())
             .or_else(|| own(Layer::Region)),

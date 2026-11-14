@@ -73,6 +73,7 @@ fn write_pack() -> Pack {
         .into_iter()
         .collect(),
     );
+    writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -214,7 +215,12 @@ fn areas() -> Value {
     json!({
         "neighborhood": {"mapbox_id": id("osm:relation:4"), "name": "Downtown"},
         "place": {"mapbox_id": id("osm:relation:3"), "name": "Toronto"},
-        "region": {"mapbox_id": id("osm:relation:2"), "name": "Ontario"},
+        "region": {
+            "mapbox_id": id("osm:relation:2"),
+            "name": "Ontario",
+            "region_code": "ON",
+            "region_code_full": "CA-ON",
+        },
         "country": {
             "mapbox_id": id("osm:relation:1"),
             "name": "Canada",
@@ -637,7 +643,12 @@ async fn search_box_suggest_then_retrieve() {
         "neighborhood": {"id": id("osm:relation:4"), "name": "Downtown"},
         "postcode": {"name": "M5V 1A1"},
         "place": {"id": id("osm:relation:3"), "name": "Toronto"},
-        "region": {"id": id("osm:relation:2"), "name": "Ontario"},
+        "region": {
+            "id": id("osm:relation:2"),
+            "name": "Ontario",
+            "region_code": "ON",
+            "region_code_full": "CA-ON",
+        },
         "country": {
             "id": id("osm:relation:1"),
             "name": "Canada",
