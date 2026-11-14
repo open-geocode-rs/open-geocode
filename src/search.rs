@@ -5287,11 +5287,7 @@ impl TextSearcher {
                 clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
             }
             Completion::InOrder => {
-                // Phrase prefix checks every completion at each document of
-                // the head: "north sh" is millions times 1,024. Phrases of
-                // two words walk the rarer list and skip through the other.
-                // A longer head is rare already, and each phrase would walk
-                // it again.
+                // Phrase prefix tries 1,024 completions per "north" document.
                 let phrases = self
                     .first_completions(subject, &words[last])?
                     .iter()
