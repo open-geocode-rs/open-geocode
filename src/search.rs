@@ -5647,6 +5647,9 @@ impl TextSearcher {
                 )),
             ));
         }
+        if let Some(countries) = self.countries_query(filters.countries) {
+            clauses.push((Occur::Must, countries));
+        }
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
@@ -5854,6 +5857,9 @@ impl TextSearcher {
             .collect::<Vec<_>>();
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
+        }
+        if let Some(countries) = self.countries_query(filters.countries) {
+            clauses.push((Occur::Must, countries));
         }
         clauses.push(self.product_clause());
         let ranking = Ranking {

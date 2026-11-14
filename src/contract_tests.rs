@@ -483,6 +483,21 @@ async fn responses_match_the_committed_examples() {
         0,
         "a country the Pack does not hold answers with no features"
     );
+    // Places and suggestions are filtered alike, names and addresses both.
+    for uri in [
+        "/places?q=Queen%20Bakery",
+        "/autocomplete?q=Queen%20Bak",
+        "/autocomplete?q=10%20King",
+    ] {
+        let found = get(&router, &format!("{uri}&country=CA")).await;
+        assert_eq!(
+            found["features"].as_array().expect("features").len(),
+            1,
+            "{uri}"
+        );
+        let elsewhere = get(&router, &format!("{uri}&country=FR")).await;
+        assert_eq!(elsewhere["features"], json!([]), "{uri}");
+    }
 
     // The country the contract Pack is built from finds the same places the
     // unfiltered query does, so the filter narrows without changing ranking.
