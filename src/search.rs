@@ -18,6 +18,7 @@ use tantivy::{
     collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
     columnar::{Column, StrColumn},
     index::SegmentId,
+    postings::SegmentPostings,
     query::{
         BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery,
         PhraseQuery, Query, RangeQuery, TermQuery,
@@ -804,8 +805,7 @@ impl TextSearcher {
         if street.is_empty() || !is_address_number_token(last) {
             return Ok(as_typed);
         }
-        // Trailing number names a place ("Pier 39") or is the house number
-        // ("Kerkstraat 12"). Postcode prefix ("1211CK") is neither.
+        // "Pier 39" names a place, "Kerkstraat 12" a house, "1211CK" neither.
         let names_it = |hit: &TextSearchHit| {
             search_key(&hit.record.name).is_some_and(|name| {
                 name.split_whitespace()
@@ -845,6 +845,9 @@ impl TextSearcher {
             near_first: options.focus.is_some(),
             typed_words: u8::try_from(words.len() + usize::from(number.is_some()))
                 .unwrap_or(u8::MAX),
+            whole_last: words
+                .last()
+                .map(|word| Term::from_field_text(self.fields.autocomplete_subject_text, word)),
             ..Ranking::default()
         };
         let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |hit| {
@@ -4395,6 +4398,7 @@ impl TextSearcher {
             focus,
             near_first: false,
             typed_words: 0,
+            whole_last: None,
             sought: plan
                 .subject
                 .iter()
@@ -6655,6 +6659,9 @@ struct SegmentRankKeys {
     numbered: bool,
     near_first: bool,
     typed_words: u8,
+    /// Postings of [`Ranking::whole_last`], read forward as the keyed scan
+    /// visits documents in order.
+    whole_last: Option<SegmentPostings>,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     name_words: Column<u64>,
@@ -6838,6 +6845,12 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
             numbered: self.ranking.numbered,
             near_first: self.ranking.near_first,
             typed_words: self.ranking.typed_words,
+            whole_last: match &self.ranking.whole_last {
+                Some(term) => segment
+                    .inverted_index(term.field())?
+                    .read_postings(term, IndexRecordOption::Basic)?,
+                None => None,
+            },
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
@@ -6885,9 +6898,14 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
             }
         }
         if self.near_first {
+            let mut whole = || {
+                self.whole_last
+                    .as_mut()
+                    .is_some_and(|postings| postings.doc() <= doc && postings.seek(doc) == doc)
+            };
             key.named_place = key.place_rank != u8::MAX
                 && key.name_words <= self.typed_words
-                && (key.near > 0 || known_abroad(key.prominence));
+                && (key.near > 0 || (known_abroad(key.prominence) && whole()));
         }
         key
     }
@@ -8324,6 +8342,8 @@ struct Ranking {
     /// Words the query types, so a place whose name has no more is named
     /// whole (see [`RankKey::named_place`]).
     typed_words: u8,
+    /// The last typed word whole: far away, "amazon" is not yet Amazonas.
+    whole_last: Option<Term>,
     /// The words of what the query seeks, its subject and unplaced words:
     /// what an address or street
     /// must account for to rank above a POI (see
@@ -8644,8 +8664,13 @@ fn mix(
         let (named, others): (Vec<_>, Vec<_>) = places
             .into_iter()
             .partition(|hit| name_starts_as(&hit.record.name, &tokens));
+        let start = mixed.len();
         mixed.extend(named);
         mixed.extend(addresses);
+        // Else a far POI of the name buries the street of it nearby.
+        if near_first {
+            mixed[start..].sort_by_key(|hit| usize::from(hit.signals.focus_band).min(BIAS_BANDS));
+        }
         mixed.extend(others);
     }
     mixed.truncate(limit);
@@ -11714,6 +11739,99 @@ mod tests {
 
         assert_eq!(first("paris"), "osm:node:1");
         assert_eq!(first("pike"), "osm:node:4");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// With a focus, the street of the name nearby leads a far POI of it.
+    #[test]
+    fn autocompletes_a_near_street_before_a_far_poi_of_its_name() {
+        let temp_dir = temp_pack_path("autocomplete-near-street");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(&street_record("osm:way:1", "Pike Place").into(), None)
+            .expect("street");
+        writer
+            .write(
+                &PoiRecord {
+                    alt_names: Vec::new(),
+                    name: "Pike Place".to_string(),
+                    category: "amenity:cafe".to_string(),
+                    address: None,
+                    geometry: point_geometry(-122.34, 47.61),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::osm(ObjectType::Node, 2),
+                    prominence: Default::default(),
+                    wikidata: None,
+                    brand: None,
+                    aliases: Vec::new(),
+                }
+                .into(),
+                None,
+            )
+            .expect("poi");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "pike place".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: Some([-79.0, 43.0]),
+            bbox: None,
+        };
+
+        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:way:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Far away, a known town leads only once its whole name is typed.
+    #[test]
+    fn a_far_town_needs_its_whole_name_typed_to_lead() {
+        let temp_dir = temp_pack_path("autocomplete-far-town-prefix");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Region,
+                    crate::record::PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: "Amazonas".to_string(),
+                        place_type: "state".to_string(),
+                        geometry: point_geometry(-64.6, -4.2),
+                        source: SourceProvenance::osm(ObjectType::Node, 1),
+                        prominence: Prominence {
+                            importance: 0,
+                            linked: true,
+                            languages: 30,
+                        },
+                        wikidata: None,
+                    },
+                ),
+                None,
+            )
+            .expect("region");
+        let mut street = street_record("osm:way:2", "Amazon Street");
+        street.geometry = point_geometry(-122.34, 47.61);
+        street.representative_point = [-122.34, 47.61];
+        writer.write(&street.into(), None).expect("street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "amazon".to_string(),
+            limit: 1,
+            layer: None,
+            countries: Vec::new(),
+            focus: Some([-122.33, 47.61]),
+            bbox: None,
+        };
+
+        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:way:2");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
