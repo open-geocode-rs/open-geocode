@@ -97,6 +97,7 @@ fn write_pack(dir: &Path) {
         .into_iter()
         .collect(),
     );
+    writer.set_subdivision_codes([(tiers[1].1, "CA-ON".to_string())].into_iter().collect());
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers(tiers),
         flags: 0,
@@ -220,7 +221,7 @@ fn bakery_components() -> Value {
         {"longText": "Toronto", "shortText": "Toronto", "types": ["locality", "political"]},
         {"longText": "York", "shortText": "York", "types": ["administrative_area_level_3", "political"]},
         {"longText": "Golden Horseshoe", "shortText": "Golden Horseshoe", "types": ["administrative_area_level_2", "political"]},
-        {"longText": "Ontario", "shortText": "Ontario", "types": ["administrative_area_level_1", "political"]},
+        {"longText": "Ontario", "shortText": "ON", "types": ["administrative_area_level_1", "political"]},
         {"longText": "Canada", "shortText": "CA", "types": ["country", "political"]},
         {"longText": "M5V 1A1", "shortText": "M5V 1A1", "types": ["postal_code"]},
     ])
@@ -612,7 +613,7 @@ fn address_result() -> Value {
             {"longText": "Toronto", "shortText": "Toronto", "types": ["locality", "political"]},
             {"longText": "York", "shortText": "York", "types": ["administrative_area_level_3", "political"]},
             {"longText": "Golden Horseshoe", "shortText": "Golden Horseshoe", "types": ["administrative_area_level_2", "political"]},
-            {"longText": "Ontario", "shortText": "Ontario", "types": ["administrative_area_level_1", "political"]},
+            {"longText": "Ontario", "shortText": "ON", "types": ["administrative_area_level_1", "political"]},
             {"longText": "Canada", "shortText": "CA", "types": ["country", "political"]},
             {"longText": "M5V 1A1", "shortText": "M5V 1A1", "types": ["postal_code"]},
         ],

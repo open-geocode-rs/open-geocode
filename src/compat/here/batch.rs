@@ -1916,6 +1916,7 @@ fn cell_of(item: &Item, column: &str) -> String {
         "addressLabel" => text(&address.label),
         "addressCountryCode" => address.country_code.unwrap_or_default().to_string(),
         "addressCountryName" => text(&address.country_name),
+        "addressStateCode" => text(&address.state_code),
         "addressState" => text(&address.state),
         "addressCounty" => text(&address.county),
         "addressCity" => text(&address.city),

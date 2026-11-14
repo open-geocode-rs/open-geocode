@@ -99,6 +99,7 @@ pub(super) fn pack(name: &str) -> TestPack {
         .into_iter()
         .collect(),
     );
+    writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -315,6 +316,7 @@ fn king_address() -> Value {
         "label": "10 King Street, Unit 5, M5V 1A1",
         "countryCode": "CAN",
         "countryName": "Canada",
+        "stateCode": "ON",
         "state": "Ontario",
         "county": "Toronto Division",
         "city": "Toronto",
@@ -367,7 +369,8 @@ fn bakery(distance: Option<i64>) -> Value {
             "label": "Queen Bakery, 12 King Street, Old Town, M5V 1A1",
             "countryCode": "CAN",
             "countryName": "Canada",
-            "state": "Ontario",
+            "stateCode": "ON",
+        "state": "Ontario",
             "county": "Toronto Division",
             "city": "Toronto",
             "district": "Old Toronto",
