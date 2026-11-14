@@ -1207,6 +1207,44 @@ struct Want {
     stated: bool,
 }
 
+/// The level of a country that anchors the locality tier, the tier an
+/// address query matches a town on. It is the outermost level the table
+/// calls a city, else the outermost below the district -- Australia's level
+/// 9 is tagged a suburb and is still the town an address names, and without
+/// an anchor an Australian Pack answers no structured query at all.
+fn anchor_level(levels: &BTreeMap<u8, Want>) -> Option<u8> {
+    levels
+        .iter()
+        .find(|(_, want)| want.layer == Some(PlaceLayer::Locality))
+        .or_else(|| {
+            levels
+                .iter()
+                .find(|(_, want)| want.layer.is_none_or(|layer| layer > PlaceLayer::District))
+        })
+        .map(|(level, _)| *level)
+}
+
+/// The levels above a country's anchor that give up a tier of their own,
+/// when more levels lie above the anchor than tiers above `locality_at`.
+/// They are the outermost of the levels that claim no tier, as many as it
+/// takes.
+/// France in the planet has 3 (France métropolitaine) and 5 (Collectivité
+/// européenne d'Alsace), which no table row names, beside 2, 4, 6 and 7
+/// above its communes. Without this its arrondissements took the locality
+/// tier and the communes the one below.
+fn folded_levels(levels: &BTreeMap<u8, Want>, locality_at: usize) -> BTreeSet<u8> {
+    let Some(anchor) = anchor_level(levels) else {
+        return BTreeSet::new();
+    };
+    let above = levels.range(..anchor).count();
+    levels
+        .range(..anchor)
+        .filter(|(_, want)| want.layer.is_none())
+        .take(above.saturating_sub(locality_at))
+        .map(|(level, _)| *level)
+        .collect()
+}
+
 /// Layers that admin boundaries are ranked into, outermost first. `Place` is
 /// left out: it belongs to place nodes, not to administrative boundaries.
 const ADMIN_LAYER_ORDER: [PlaceLayer; 9] = PlaceLayer::ADMIN;
@@ -1313,22 +1351,14 @@ fn assign_layers_by_containment(
     // chain keeps the outermost of the pair rather than dropping it.
     const LOCALITY_AT: usize = 5;
     let mut assigned: BTreeMap<(CountryId, u8), PlaceLayer> = BTreeMap::new();
-    for (country, levels) in &wanted {
-        // One level of each country anchors the locality tier, the tier an
-        // address query matches a town on. It is the outermost level the
-        // table calls a city, else the outermost below the district --
-        // Australia's level 9 is tagged a suburb and is still the town an
-        // address names, and without an anchor an Australian Pack answers no
-        // structured query at all.
-        let anchor = levels
+    for (country, all_levels) in &wanted {
+        let folded = folded_levels(all_levels, LOCALITY_AT);
+        let levels = &all_levels
             .iter()
-            .find(|(_, want)| want.layer == Some(PlaceLayer::Locality))
-            .or_else(|| {
-                levels
-                    .iter()
-                    .find(|(_, want)| want.layer.is_none_or(|layer| layer > PlaceLayer::District))
-            })
-            .map(|(level, _)| *level);
+            .filter(|(level, _)| !folded.contains(level))
+            .map(|(level, want)| (*level, *want))
+            .collect::<BTreeMap<_, _>>();
+        let anchor = anchor_level(levels);
         let anchor_index = anchor.and_then(|level| levels.keys().position(|at| *at == level));
 
         let mut next = 0usize;
@@ -1381,6 +1411,18 @@ fn assign_layers_by_containment(
             .min(innermost);
             assigned.insert((*country, level), ADMIN_LAYER_ORDER[at]);
             next = at + 1;
+        }
+        // A folded level shares the tier of the level inside it, where the
+        // smaller boundary wins (see [`compare_boundary`]), so
+        // Nouvelle-Aquitaine wins over France métropolitaine.
+        for &level in &folded {
+            if let Some(layer) = levels
+                .range(level..)
+                .next()
+                .and_then(|(inner, _)| assigned.get(&(*country, *inner)).copied())
+            {
+                assigned.insert((*country, level), layer);
+            }
         }
     }
 
@@ -2379,6 +2421,30 @@ mod tests {
         assert_eq!(layers[&4], PlaceLayer::Region);
     }
 
+    /// France in the planet has levels no table row names (3, France
+    /// métropolitaine; 5, Collectivité européenne d'Alsace) beside the ones
+    /// a row names. Its communes (8) are still its towns, and the outermost
+    /// unnamed level shares the regions' tier.
+    #[test]
+    fn a_country_with_unnamed_outer_levels_keeps_its_town_the_locality() {
+        use PlaceLayer::*;
+
+        assert_eq!(
+            layers_for_levels_in(Some("fr"), &[2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            BTreeMap::from([
+                (2, Country),
+                (3, Region),
+                (4, Region),
+                (5, SubRegion),
+                (6, District),
+                (7, SubDistrict),
+                (8, Locality),
+                (9, SubLocality),
+                (10, Neighbourhood),
+            ])
+        );
+    }
+
     #[test]
     fn keeps_the_subdivision_code_of_a_province_ranked_below_the_region_tier() {
         let tags = BTreeMap::from([("ISO3166-2".to_string(), "ca-on".to_string())]);
@@ -2390,15 +2456,24 @@ mod tests {
     }
 
     /// Ten levels for nine tiers, as a Pack of Canada with every level from 2
-    /// to 11 has: the deepest two share the innermost tier.
+    /// to 11 has: 3, which no table row names, shares the tier inside it, so
+    /// the town keeps the locality tier and the innermost level the last.
     #[test]
     fn a_country_deeper_than_the_tiers_ends_on_the_innermost() {
         let levels = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let layers = layers_for_levels_in(Some("ca"), &levels);
         assert_eq!(layers.len(), levels.len(), "every level keeps a tier");
         assert_eq!(layers[&2], PlaceLayer::Country);
+        assert_eq!(
+            (layers[&3], layers[&4]),
+            (PlaceLayer::Region, PlaceLayer::Region)
+        );
+        assert_eq!(layers[&8], PlaceLayer::Locality);
         let innermost = *ADMIN_LAYER_ORDER.last().expect("tiers");
-        assert_eq!((layers[&10], layers[&11]), (innermost, innermost));
+        assert_eq!(
+            (layers[&10], layers[&11]),
+            (PlaceLayer::Neighbourhood, innermost)
+        );
         let tiers = levels.iter().map(|level| layers[level]).collect::<Vec<_>>();
         assert!(
             tiers.windows(2).all(|pair| pair[0] <= pair[1]),
