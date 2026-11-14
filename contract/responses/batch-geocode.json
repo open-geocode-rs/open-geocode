@@ -17,7 +17,11 @@
               "address": {
                 "housenumber": "10",
                 "postcode": "M5V 1A1",
-                "street": "King Street"
+                "street": "King Street",
+                "street_parts": {
+                  "name": "King",
+                  "type": "Street"
+                }
               },
               "confidence": 0.9890131,
               "context": {

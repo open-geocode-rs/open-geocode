@@ -330,9 +330,82 @@ pub struct Address {
     pub postcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+    /// `unit`'s designator as written, such as `Apt` of `Apt 4`. Absent
+    /// when the unit starts with none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Apt")]
+    pub unit_type: Option<String>,
+    /// `street` split into its parts as written. Absent when the street has
+    /// no type or direction to split off, such as `Broadway`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street_parts: Option<StreetParts>,
 }
 
+/// The parts of a street name, as written: `W Main St N` is the prefix `W`,
+/// the name `Main`, the type `St` and the suffix `N`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct StreetParts {
+    /// Direction before the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The street's own name, without its type and directions.
+    pub name: String,
+    /// Street type, such as `Street` or `Ave`.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Direction after the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+}
+
+/// Words a unit starts with that say what kind of unit it is.
+const UNIT_TYPES: [&str; 18] = [
+    "apartment",
+    "apt",
+    "building",
+    "bldg",
+    "flat",
+    "floor",
+    "fl",
+    "level",
+    "lot",
+    "office",
+    "room",
+    "rm",
+    "shop",
+    "space",
+    "ste",
+    "suite",
+    "unit",
+    "#",
+];
+
 impl Address {
+    /// Fills the parts read from `street` and `unit`.
+    pub fn with_parts(mut self) -> Self {
+        self.street_parts = self
+            .street
+            .as_deref()
+            .and_then(crate::road::StreetParts::of)
+            .map(|parts| StreetParts {
+                prefix: parts.prefix.map(str::to_string),
+                name: parts.name,
+                kind: parts.kind.map(str::to_string),
+                suffix: parts.suffix.map(str::to_string),
+            });
+        self.unit_type = self.unit.as_deref().and_then(|unit| {
+            let mut words = unit.split_whitespace();
+            let first = words.next()?;
+            // A designator with nothing after it is the whole unit, not its type.
+            words.next()?;
+            let key = first.trim_end_matches('.').to_lowercase();
+            UNIT_TYPES
+                .contains(&key.as_str())
+                .then(|| first.to_string())
+        });
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -363,6 +436,7 @@ impl From<&AddressComponents> for Address {
             region: stated(address.region.as_deref()),
             postcode: stated(address.postcode.as_deref()),
             country: stated(address.country.as_deref()),
+            ..Self::default()
         }
     }
 }
@@ -778,7 +852,7 @@ fn common(
         category: summary.category,
         road_class: summary.road_class,
         brand: summary.brand,
-        address: summary.address,
+        address: summary.address.with_parts(),
         context: contexts.of(record_id)?,
         source: Source {
             dataset: summary.source.dataset,
@@ -881,6 +955,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_unit_names_its_type_only_when_it_starts_with_one() {
+        let unit_type = |unit: &str| {
+            Address {
+                unit: Some(unit.to_string()),
+                ..Address::default()
+            }
+            .with_parts()
+            .unit_type
+        };
+        assert_eq!(unit_type("Apt 4").as_deref(), Some("Apt"));
+        assert_eq!(unit_type("Ste. 200").as_deref(), Some("Ste."));
+        assert_eq!(unit_type("4"), None);
+        assert_eq!(unit_type("Penthouse B"), None);
+        assert_eq!(unit_type("Suite"), None);
+    }
 
     #[test]
     fn an_answer_credits_openstreetmap_and_each_imported_data_set_it_holds() {
