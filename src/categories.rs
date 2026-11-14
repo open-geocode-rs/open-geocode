@@ -170,27 +170,6 @@ pub fn presets_for_word(word: &str) -> Vec<&'static str> {
     search_key(word).map_or_else(Vec::new, |key| for_key(&key, false))
 }
 
-/// The categories a whole query names: one word or phrase of the table, or a
-/// last word typed past its minimum prefix length. `None` when it names none.
-pub fn of_query(query: &str) -> Option<Vec<&'static str>> {
-    let key = search_key(query)?;
-    let mut found = presets_for_word(&key);
-    if found.is_empty() && !key.contains(' ') {
-        found = presets_for_prefix(&key);
-    }
-    (!found.is_empty()).then_some(found)
-}
-
-/// Whether a record's category (`amenity:pharmacy`) is one of `categories`
-/// as [`of_query`] gives them (`amenity pharmacy`, or `shop` for any value).
-pub fn holds(categories: &[&str], category: &str) -> bool {
-    let (key, value) = category.split_once(':').unwrap_or((category, ""));
-    categories.iter().any(|named| match named.split_once(' ') {
-        Some((named_key, named_value)) => named_key == key && named_value == value,
-        None => *named == key,
-    })
-}
-
 /// The categories a typed prefix names, sorted. It names those of every word
 /// it spells out in full, and of every group word whose minimum prefix length
 /// it reaches. A word with no minimum length matches only in full. Weaker
