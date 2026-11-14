@@ -54,8 +54,7 @@ impl Query for PhrasePrefix {
                 entry.name()
             )));
         }
-        // Tantivy scores a one word head 1 whatever the boost, and a longer
-        // one as the head phrase's BM25 from the searcher's statistics.
+        // As tantivy scores it, so ranking stays as it was.
         let bm25 = match enable_scoring {
             EnableScoring::Enabled { searcher, .. } if self.head.len() > 1 => {
                 Some(Bm25Weight::for_terms(searcher, &self.head)?)
@@ -239,8 +238,7 @@ impl PhrasePrefixScorer {
                 self.queue.push(Reverse((doc, at)));
             }
         }
-        // A rare head leaves most completions behind each of its documents.
-        // Past n / log n sifts, one pass and a rebuild cost less.
+        // A rare head strands most completions; past n / log n, rebuild.
         let len = self.queue.len();
         let mut sifts = len / (len.max(1).ilog2() as usize + 1);
         loop {
@@ -448,9 +446,7 @@ mod tests {
     #[test]
     fn matches_and_scores_as_tantivy_phrase_prefix() {
         let (searcher, text) = index();
-        // First segment's 1,024 are "la" and la0000 to la1022, so 1,023
-        // numbered rows match, with "rue de la", the repeated head and the
-        // long row. Second segment has only la1100 and lac, so both count.
+        // The 1,024 cap keeps la0000 to la1022 in the first segment.
         let cases: [(&[&str], usize); 6] = [
             (&["rue", "de", "la"], 1_028),
             (&["de", "la"], 1_029),
