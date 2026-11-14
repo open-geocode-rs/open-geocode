@@ -18,9 +18,10 @@ use tantivy::{
     collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
     columnar::{Column, StrColumn},
     index::SegmentId,
+    postings::SegmentPostings,
     query::{
         BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery,
-        Query, RangeQuery, TermQuery,
+        PhraseQuery, Query, RangeQuery, TermQuery,
     },
     schema::{Field, IndexRecordOption},
 };
@@ -210,6 +211,9 @@ pub struct TextSearchHit {
     /// What the ranker knows of the answer besides its features.
     #[serde(skip)]
     pub signals: Signals,
+    /// See [`RankKey::named_place`].
+    #[serde(skip)]
+    pub named_place: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +247,9 @@ pub const SEARCH_BUDGET: Duration = Duration::from_secs(3_600);
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
+/// Planet Pack holds 33,000 words of "mar" (7 ms to read) and 606,000 of "s"
+/// (210 ms, read per search per keystroke).
+const MAX_COMPLETION_SCAN: usize = 1 << 16;
 /// Terms and postcode records read to find the area of a postcode the query
 /// names (see [`TextSearcher::postcode_areas`]): a sample, enough to place
 /// it and measure how far it reaches.
@@ -319,7 +326,7 @@ const AREA_STANDS_IN_BOOST: Score = 0.5;
 const CORRECTED_BOOST: Score = 0.5;
 /// Words shorter than this are only matched as written: one edit turns most
 /// words of two or three letters into many others.
-const MIN_TYPO_CHARS: usize = 4;
+pub(crate) const MIN_TYPO_CHARS: usize = 4;
 /// Words at least this long may be two edits from a record's; shorter ones
 /// one edit.
 const LONG_TYPO_CHARS: usize = 7;
@@ -375,6 +382,7 @@ impl TextSearchHit {
     /// A record asked for by its id rather than found by words: no score.
     pub fn of_record(record_id: RecordId, record: Summary) -> Self {
         Self {
+            named_place: false,
             record_id,
             score: 0.0,
             record,
@@ -743,6 +751,79 @@ impl TextSearcher {
             .map(|hit| AddressGeocodeHit { query, hit }))
     }
 
+    /// How many documents hold the categories' words, an upper bound on the
+    /// POIs of them (`amenity pharmacy`, or a bare key).
+    pub fn category_count(&self, categories: &[&str]) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        let mut count = 0;
+        for category in categories {
+            let word = category.rsplit(' ').next().unwrap_or(category);
+            let Some(word) = search_key(word) else {
+                continue;
+            };
+            count += searcher.doc_freq(&Term::from_field_text(self.fields.content_text, &word))?;
+        }
+        Ok(count)
+    }
+
+    /// The POIs of `categories` nearest `focus`, by the near-first order.
+    /// For a category too rare for a walk outward from the focus to reach.
+    pub fn nearest_of_categories(
+        &self,
+        categories: &[&str],
+        focus: [f64; 2],
+        limit: usize,
+        countries: &[String],
+        bbox: Option<BoundingBox>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let field = self.fields.content_text;
+        let term = |word: &str| search_key(word).map(|word| Term::from_field_text(field, &word));
+        let clauses = categories
+            .iter()
+            .filter_map(|category| -> Option<(Occur, Box<dyn Query>)> {
+                let query: Box<dyn Query> = match category.split_once(' ') {
+                    // The field keeps no positions, so both words, not a phrase.
+                    Some((key, value)) => Box::new(BooleanQuery::intersection(vec![
+                        Box::new(TermQuery::new(term(key)?, IndexRecordOption::Basic)),
+                        Box::new(TermQuery::new(term(value)?, IndexRecordOption::Basic)),
+                    ])),
+                    None => Box::new(TermQuery::new(term(category)?, IndexRecordOption::Basic)),
+                };
+                Some((Occur::Should, query))
+            })
+            .collect::<Vec<_>>();
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = vec![(
+            Occur::Must,
+            Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>,
+        )];
+        query.extend(
+            self.countries_query(countries)
+                .map(|countries| (Occur::Must, countries)),
+        );
+        query.extend(bbox.map(|bbox| (Occur::Must, self.bbox_query(bbox))));
+        let ranking = Ranking {
+            focus: Some(focus),
+            near_first: true,
+            ..Ranking::default()
+        };
+        let filters = Filters::new(None, countries, bbox);
+        let records = self.pack.records();
+        // The field holds names too: a cafe named "Pharmacy" is no pharmacy.
+        self.ranked_hits(&BooleanQuery::new(query), &ranking, limit, &mut |hit| {
+            Ok(hit.record.layer == Layer::Poi.as_str()
+                && filters.admit(hit)
+                && hit.record.point.is_some_and(|point| {
+                    haversine_m(focus[0], focus[1], point.lon, point.lat) <= BIAS_RADIUS_M
+                })
+                && records.poi_category_is(hit.record_id, |category| {
+                    crate::categories::holds(categories, category)
+                })?)
+        })
+    }
+
     /// Fallback only when nothing starts as typed. It reads planet-wide
     /// postings.
     pub fn autocomplete(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
@@ -785,10 +866,12 @@ impl TextSearcher {
                 completion,
                 Some(number),
                 &tokens[1..],
+                true,
                 &filters,
             );
         }
-        let as_typed = self.autocomplete_reading(options, completion, None, &tokens, &filters)?;
+        let as_typed =
+            self.autocomplete_reading(options, completion, None, &tokens, true, &filters)?;
         let [street @ .., last] = tokens.as_slice() else {
             return Ok(as_typed);
         };
@@ -806,7 +889,7 @@ impl TextSearcher {
             return Ok(as_typed);
         }
         let numbered =
-            self.autocomplete_reading(options, completion, Some(last), street, &filters)?;
+            self.autocomplete_reading(options, completion, Some(last), street, false, &filters)?;
         Ok(if numbered.is_empty() {
             as_typed
         } else {
@@ -820,14 +903,24 @@ impl TextSearcher {
         completion: Completion,
         number: Option<&str>,
         words: &[String],
+        typing: bool,
         filters: &Filters<'_>,
     ) -> Result<Vec<TextSearchHit>> {
         let limit = effective_autocomplete_limit(options.limit);
-        let query = self.autocomplete_query(completion, number, words, filters);
+        let Some(query) = self.autocomplete_query(completion, number, words, typing, filters)?
+        else {
+            return Ok(Vec::new());
+        };
         let ranking = Ranking {
             query_words: QueryWords::new(&options.query),
             number_text: number.map(str::to_string),
             focus: options.focus,
+            near_first: options.focus.is_some(),
+            typed_words: u8::try_from(words.len() + usize::from(number.is_some()))
+                .unwrap_or(u8::MAX),
+            whole_last: words
+                .last()
+                .map(|word| Term::from_field_text(self.fields.autocomplete_subject_text, word)),
             ..Ranking::default()
         };
         let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |hit| {
@@ -845,7 +938,7 @@ impl TextSearcher {
             }));
         }
         // Index cannot match "mkt" to "market". Label can.
-        if completion == Completion::AllWords {
+        if matches!(completion, Completion::AllWords | Completion::Typos) {
             hits.sort_by_cached_key(|hit| {
                 let label = label_words(&hit.record);
                 count(words.iter().enumerate().filter(|&(at, word)| {
@@ -2335,6 +2428,7 @@ impl TextSearcher {
                         _ => FORM_TOWN,
                     };
                     let hit = TextSearchHit {
+                        named_place: false,
                         record_id: id,
                         score: 0.0,
                         record,
@@ -4375,6 +4469,9 @@ impl TextSearcher {
             numbered: plan.house_number.is_some(),
             postcode,
             focus,
+            near_first: false,
+            typed_words: 0,
+            whole_last: None,
             sought: plan
                 .subject
                 .iter()
@@ -5229,17 +5326,135 @@ impl TextSearcher {
         completion: Completion,
         number: Option<&str>,
         words: &[String],
+        typing: bool,
         filters: &Filters<'_>,
-    ) -> Box<dyn Query> {
+    ) -> Result<Option<Box<dyn Query>>> {
         let subject = self.fields.autocomplete_subject_text;
         let last = words.len() - 1;
-        let word = |field, at: usize| self.autocomplete_word_query(field, &words[at], at == last);
+        // Street before a trailing house number is typed whole. In-order
+        // lookup skips the lists, so a query it answers costs what it did.
+        let lists = match completion {
+            Completion::InOrder => None,
+            _ if !typing => None,
+            _ => self
+                .common_completions(subject, &words[last])?
+                .zip(self.common_completions(self.fields.context_text, &words[last])?),
+        };
+        let completes = lists.is_some();
+        let (subject_completions, context_completions) = lists.unwrap_or_default();
+        let mut near = HashMap::<(Field, usize), Vec<String>>::new();
+        if completion == Completion::Typos {
+            let searcher = self.reader.searcher();
+            for field in [subject, self.fields.context_text] {
+                for (at, typed) in words.iter().enumerate() {
+                    let Some(most) = allowed_edits(typed) else {
+                        continue;
+                    };
+                    let builder = automaton_builder(most);
+                    let first = first_chars(typed);
+                    let dfa = builder.build_dfa(typed);
+                    let mut terms = self.near_terms(&searcher, field, typed, &dfa, first, None)?;
+                    // "pharmcy" is "pharmacy" one edit away before "pharma" two.
+                    let edits = |term: &String| match dfa.eval(term) {
+                        Distance::Exact(edits) => edits,
+                        Distance::AtLeast(edits) => edits,
+                    };
+                    if let Some(fewest) = terms.iter().map(edits).min() {
+                        terms.retain(|term| edits(term) == fewest);
+                    }
+                    // Cut short ("strabu") only when no whole word is near ("seatle").
+                    if terms.is_empty() && at == last && typing {
+                        let dfa = builder.build_prefix_dfa(typed);
+                        terms = self.near_terms(&searcher, field, typed, &dfa, first, None)?;
+                        let edits = |term: &String| match dfa.eval(term) {
+                            Distance::Exact(edits) | Distance::AtLeast(edits) => edits,
+                        };
+                        if let Some(fewest) = terms.iter().map(edits).min() {
+                            terms.retain(|term| edits(term) == fewest);
+                        }
+                    }
+                    if !terms.is_empty() {
+                        near.insert((field, at), terms);
+                    }
+                }
+            }
+            if near.is_empty() {
+                return Ok(None);
+            }
+        }
+        let word = |field, at: usize| -> Box<dyn Query> {
+            let completions = if field == subject {
+                &subject_completions.0
+            } else {
+                &context_completions.0
+            };
+            let typed = match () {
+                _ if at != last || !typing => Typed::Whole,
+                _ if completes => Typed::Completions(completions),
+                _ => Typed::Prefix,
+            };
+            let query = self.autocomplete_word_query(field, &words[at], typed);
+            let Some(terms) = near.get(&(field, at)) else {
+                return query;
+            };
+            let mut either = vec![(Occur::Should, query)];
+            for term in terms {
+                either.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, term),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
+            }
+            Box::new(BooleanQuery::new(either))
+        };
         let mut clauses = Vec::new();
         match completion {
+            Completion::InOrder if !typing => {
+                let terms = words
+                    .iter()
+                    .map(|word| Term::from_field_text(subject, word))
+                    .collect::<Vec<_>>();
+                let whole: Box<dyn Query> = match terms.len() {
+                    1 => Box::new(TermQuery::new(
+                        terms[0].clone(),
+                        IndexRecordOption::WithFreqs,
+                    )),
+                    _ => Box::new(PhraseQuery::new(terms)),
+                };
+                clauses.push((Occur::Must, whole));
+            }
             Completion::InOrder => {
                 clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
             }
-            Completion::AllWords => {
+            Completion::CommonCompletions => {
+                let (completions, cut) = &subject_completions;
+                if !cut {
+                    return Ok(None);
+                }
+                let head = &words[..last];
+                let phrases = completions
+                    .iter()
+                    .map(|completion| -> (Occur, Box<dyn Query>) {
+                        let terms = head
+                            .iter()
+                            .chain(std::iter::once(completion))
+                            .map(|word| Term::from_field_text(subject, word))
+                            .collect::<Vec<_>>();
+                        let query: Box<dyn Query> = match terms.len() {
+                            1 => Box::new(TermQuery::new(
+                                terms[0].clone(),
+                                IndexRecordOption::WithFreqs,
+                            )),
+                            _ => Box::new(PhraseQuery::new(terms)),
+                        };
+                        (Occur::Should, query)
+                    })
+                    .collect();
+                clauses.push((Occur::Must, Box::new(BooleanQuery::new(phrases))));
+            }
+            Completion::AllWords | Completion::Typos => {
                 let optional = |at: usize| {
                     unlisted_contraction(&words[at])
                         && words.iter().any(|other| !unlisted_contraction(other))
@@ -5288,10 +5503,52 @@ impl TextSearcher {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
         clauses.push(self.product_clause());
-        Box::new(BooleanQuery::new(clauses))
+        Ok(Some(Box::new(BooleanQuery::new(clauses))))
     }
 
-    fn autocomplete_word_query(&self, field: Field, word: &str, last: bool) -> Box<dyn Query> {
+    /// Ties keep index order, so the same input picks the same words. `None`
+    /// past [`MAX_COMPLETION_SCAN`]. "s" then stands only for "south".
+    fn common_completions(
+        &self,
+        field: Field,
+        prefix: &str,
+    ) -> Result<Option<(Vec<String>, bool)>> {
+        let searcher = self.reader.searcher();
+        let mut used = HashMap::<Vec<u8>, u64>::new();
+        for segment in searcher.segment_readers() {
+            let index = segment.inverted_index(field)?;
+            let mut stream = index.terms().range().ge(prefix.as_bytes()).into_stream()?;
+            while stream.advance() {
+                if !stream.key().starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                *used.entry(stream.key().to_vec()).or_default() +=
+                    u64::from(stream.value().doc_freq);
+                if used.len() > MAX_COMPLETION_SCAN {
+                    return Ok(None);
+                }
+            }
+        }
+        let cap = AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS as usize;
+        let mut words = used.into_iter().collect::<Vec<_>>();
+        let cut = words.len() > cap;
+        words.sort_by(|(a, a_used), (b, b_used)| b_used.cmp(a_used).then_with(|| a.cmp(b)));
+        words.truncate(cap);
+        Ok(Some((
+            words
+                .into_iter()
+                .filter_map(|(word, _)| String::from_utf8(word).ok())
+                .collect(),
+            cut,
+        )))
+    }
+
+    fn autocomplete_word_query(
+        &self,
+        field: Field,
+        word: &str,
+        typed: Typed<'_>,
+    ) -> Box<dyn Query> {
         let mut alternatives = std::iter::once(word.to_string())
             .chain(lattice::other_forms(word))
             .map(|form| -> (Occur, Box<dyn Query>) {
@@ -5304,23 +5561,129 @@ impl TextSearcher {
                 )
             })
             .collect::<Vec<_>>();
-        if last {
-            alternatives.push((
+        match typed {
+            Typed::Whole => {}
+            Typed::Prefix => alternatives.push((
                 Occur::Should,
                 autocomplete_subject_query(field, std::slice::from_ref(&word.to_string())),
-            ));
+            )),
+            Typed::Completions(completions) => {
+                for completion in completions {
+                    alternatives.push((
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, completion),
+                            IndexRecordOption::Basic,
+                        )),
+                    ));
+                }
+            }
         }
         Box::new(BooleanQuery::new(alternatives))
     }
 
     /// The address reading takes a town's or street's words in a name
     /// ("Rijksmuseum Twenthe") for where it is, and passes the place over.
+    /// Where the place `words` name lies, as `/places` finds it by name
+    /// (exact names first): the nearest within [`BIAS_RADIUS_M`] of `focus`,
+    /// and the best known anywhere. A region or a country is too wide to
+    /// search around.
+    /// Near, a town's name must be the words; with `prefix`, a POI's need
+    /// only start with them ("pike place" for Pike Place Market).
+    pub fn place_point(
+        &self,
+        words: &str,
+        focus: Option<[f64; 2]>,
+        prefix: bool,
+    ) -> Result<PlacePoint> {
+        let wide = [Layer::Country, Layer::Region, Layer::District].map(Layer::as_str);
+        let typed = search_key(words);
+        let records = self.pack.records();
+        // Exact by any of its names, as `/places` takes "Rome" for Roma.
+        let exact = |hit: &TextSearchHit| -> Result<bool> {
+            Ok(records
+                .names(hit.record_id)?
+                .iter()
+                .any(|name| search_key(name) == typed))
+        };
+        let first = |focus| -> Result<Option<(TextSearchHit, bool)>> {
+            let Some(hit) = self
+                .places_by_name_keeping(words, &Filters::default(), focus, 5, true)?
+                .into_iter()
+                .find(|hit| {
+                    !wide.contains(&hit.record.layer.as_str()) && hit.record.point.is_some()
+                })
+            else {
+                return Ok(None);
+            };
+            let exact = exact(&hit)?;
+            let abroad = records
+                .prominence(hit.record_id)?
+                .is_some_and(|prominence| known_abroad(prominence.rank()));
+            Ok(Some((hit, exact && abroad)))
+        };
+        let point = |hit: &TextSearchHit| hit.record.point.map(|point| [point.lon, point.lat]);
+        let tokens = autocomplete_query_tokens(typed.as_deref().unwrap_or_default());
+        let named = |hit: &TextSearchHit| -> Result<bool> {
+            Ok(match prefix {
+                true => name_starts_as(&hit.record.name, &tokens, false) || exact(hit)?,
+                false => exact(hit)?,
+            })
+        };
+        let mut near = None;
+        if let Some([lon, lat]) = focus {
+            let hits = self.places_by_name_keeping(
+                words,
+                &Filters::default(),
+                focus,
+                NAMED_PLACES_WINDOW,
+                true,
+            )?;
+            for hit in &hits {
+                if wide.contains(&hit.record.layer.as_str()) || !named(hit)? {
+                    continue;
+                }
+                if let Some(point) = point(hit)
+                    && haversine_m(lon, lat, point[0], point[1]) <= BIAS_RADIUS_M
+                {
+                    near = Some(point);
+                    break;
+                }
+            }
+        }
+        let known = match near {
+            Some(_) => None,
+            None => first(None)?,
+        };
+        Ok(PlacePoint {
+            near,
+            known_abroad: known
+                .as_ref()
+                .filter(|(_, abroad)| *abroad)
+                .and_then(|(hit, _)| point(hit)),
+            known: known.as_ref().and_then(|(hit, _)| point(hit)),
+        })
+    }
+
     fn places_by_name(
         &self,
         query_text: &str,
         filters: &Filters<'_>,
         focus: Option<[f64; 2]>,
         limit: usize,
+    ) -> Result<Vec<TextSearchHit>> {
+        self.places_by_name_keeping(query_text, filters, focus, limit, false)
+    }
+
+    /// [`Self::places_by_name`]; with `streets`, the address product keeps a
+    /// street of the name too, for a place to search around.
+    fn places_by_name_keeping(
+        &self,
+        query_text: &str,
+        filters: &Filters<'_>,
+        focus: Option<[f64; 2]>,
+        limit: usize,
+        streets: bool,
     ) -> Result<Vec<TextSearchHit>> {
         let Some(key) = search_key(query_text) else {
             return Ok(Vec::new());
@@ -5412,7 +5775,7 @@ impl TextSearcher {
         if !self.places {
             hits.retain(|hit| {
                 let (exact, _, _, _, _, known) = order[&hit.record_id];
-                exact.0 && known
+                exact.0 && (known || (streets && hit.record.layer == Layer::Street.as_str()))
             });
         }
         self.one_per_item(&mut hits, limit)?;
@@ -5447,7 +5810,10 @@ impl TextSearcher {
         // ("Richmond" the town among a hundred Richmond Roads, the one near
         // the caller among many Main Streets): the run is collected whole,
         // up to [`TIE_WINDOW`].
-        let mut scored = searcher.search(query, &TopDocs::with_limit(window))?;
+        let mut scored = match ranking.near_first {
+            true => Vec::new(),
+            false => searcher.search(query, &TopDocs::with_limit(window))?,
+        };
         let tie = |scored: &[(Score, DocAddress)], window: usize| {
             scored.len() == window && window > 1 && scored[window - 1].0 == scored[window - 2].0
         };
@@ -5456,7 +5822,8 @@ impl TextSearcher {
         }
         // A run past the tie window keeps an arbitrary part of it ("Paris"),
         // so every match is keyed: no skipping, paid by such runs alone.
-        let top_docs = if tie(&scored, TIE_WINDOW) {
+        // Near first ranks a lower score above, so every match is keyed.
+        let top_docs = if ranking.near_first || tie(&scored, TIE_WINDOW) {
             let keys = RankKeys {
                 ranking,
                 columns: &self.columns,
@@ -5549,6 +5916,7 @@ impl TextSearcher {
                 let records = self.pack.records();
                 let disputed = records.header(record_id)?.disputed;
                 let hit = TextSearchHit {
+                    named_place: false,
                     record_id,
                     score: key.text_score,
                     record,
@@ -5626,6 +5994,7 @@ impl TextSearcher {
                     window_rank: rank.min(usize::from(u16::MAX)) as u16,
                     ..Signals::default()
                 };
+                hit.named_place = key.named_place;
                 hit
             })
             .collect())
@@ -6198,6 +6567,7 @@ impl TextSearcher {
             Ok(self.pack.records().summary(neighbour.record_id)?.id)
         };
         Ok(TextSearchHit {
+            named_place: false,
             record_id: nearer.record_id,
             score: 0.0,
             record: Summary {
@@ -6334,14 +6704,21 @@ struct RankKey {
     /// See [`QueryPostcode::rank`].
     postcode_agreement: u8,
     stated: bool,
+    /// A place whose whole name the query types, under
+    /// [`Ranking::near_first`]: "tacoma" from Seattle is the city, not
+    /// Tacoma Screw down the road.
+    named_place: bool,
+    /// [`Self::nearness`] within [`BIAS_BANDS`], 0 beyond or unless
+    /// [`Ranking::near_first`].
+    near: u8,
     text_score: Score,
     /// Words of the record's own name: of names a query matches alike, the
     /// one it covers with fewest left over ("Richmond" before "Richmond
     /// Road", "Queen Street" before "Upper Queen Street"). [`TieBreak`]
     /// asks the same of the hits.
     name_words: u8,
-    /// See [`Prominence::rank`], larger better known; 0 for an address or
-    /// a street. Before the size of a place: Salzburg the city is better
+    /// See [`Prominence::rank`], larger better known; 0 for an address, a
+    /// street or a POI. Before the size of a place: Salzburg the city is better
     /// known than the state, Paris in France than Paris in Benin, though
     /// both are cities.
     prominence: u64,
@@ -6354,6 +6731,10 @@ struct RankKey {
     /// the hits are ranked by [`Self::cmp_evidence`] and then by
     /// [`TieBreak`], whose own focus band follows what the query states.
     nearness: u8,
+    /// A POI's [`Prominence::rank`], after nearness as in [`TieBreak::poi`]:
+    /// else the window holds the best known of a chain's thousand equal
+    /// names, and the ones near the caller never make it.
+    poi_prominence: u64,
 }
 
 impl RankKey {
@@ -6363,11 +6744,14 @@ impl RankKey {
             house_level: true,
             postcode_agreement: 0,
             stated: true,
+            named_place: false,
+            near: 0,
             text_score,
             name_words: u8::MAX,
             prominence: 0,
             place_rank: u8::MAX,
             nearness: 0,
+            poi_prominence: 0,
         }
     }
 
@@ -6378,12 +6762,16 @@ impl RankKey {
             self.house_level,
             self.postcode_agreement,
             self.stated,
+            self.named_place,
+            self.near,
             self.text_score,
         )
             .partial_cmp(&(
                 other.house_level,
                 other.postcode_agreement,
                 other.stated,
+                other.named_place,
+                other.near,
                 other.text_score,
             ))
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -6398,12 +6786,14 @@ impl PartialOrd for RankKey {
                 self.prominence,
                 other.place_rank,
                 self.nearness,
+                self.poi_prominence,
             )
                 .cmp(&(
                     self.name_words,
                     other.prominence,
                     self.place_rank,
                     other.nearness,
+                    other.poi_prominence,
                 ))
         }))
     }
@@ -6427,6 +6817,19 @@ const FOCUS_BANDS_M: [f64; 11] = [
     1_000_000.0,
     2_000_000.0,
 ];
+
+/// Bands of [`FOCUS_BANDS_M`] up to 50 km, as far as a map view's bias
+/// reaches. Beyond, a better match wins: "paris" from Seattle is France.
+const BIAS_BANDS: usize = 6;
+/// The reach of [`BIAS_BANDS`].
+pub(crate) const BIAS_RADIUS_M: f64 = FOCUS_BANDS_M[BIAS_BANDS - 1];
+
+/// [`Prominence::rank`] of a place known beyond its own language: read on
+/// Wikipedia, or linked to Wikidata and named in another language. New York
+/// is; Pike County, Arkansas, and Albert, Somme, are not.
+fn known_abroad(prominence: u64) -> bool {
+    prominence >> 8 > 0 || (prominence & 0x80 != 0 && prominence & 0x7f > 0)
+}
 
 /// The first of [`FOCUS_BANDS_M`] a point `distance_m` from the focus lies
 /// within, smaller nearer; one past the last beyond it.
@@ -6477,6 +6880,11 @@ struct RankKeys<'a> {
 
 struct SegmentRankKeys {
     numbered: bool,
+    near_first: bool,
+    typed_words: u8,
+    /// Postings of [`Ranking::whole_last`], read forward as the keyed scan
+    /// visits documents in order.
+    whole_last: Option<SegmentPostings>,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     name_words: Column<u64>,
@@ -6658,6 +7066,14 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
         };
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
+            near_first: self.ranking.near_first,
+            typed_words: self.ranking.typed_words,
+            whole_last: match &self.ranking.whole_last {
+                Some(term) => segment
+                    .inverted_index(term.field())?
+                    .read_postings(term, IndexRecordOption::Basic)?,
+                None => None,
+            },
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
@@ -6683,8 +7099,14 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         let small =
             |value: Option<u64>| value.map_or(u8::MAX, |value| value.min(u64::from(u8::MAX)) as u8);
         key.name_words = small(self.name_words.first(doc));
-        key.prominence = self.prominence.first(doc).unwrap_or_default();
-        key.place_rank = small(self.place_rank.first(doc));
+        let prominence = self.prominence.first(doc).unwrap_or_default();
+        match self.place_rank.first(doc) {
+            Some(rank) => {
+                key.prominence = prominence;
+                key.place_rank = small(Some(rank));
+            }
+            None => key.poi_prominence = prominence,
+        }
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
             key.stated = false;
@@ -6694,6 +7116,19 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         }
         if let Some(focus) = &self.focus {
             key.nearness = focus.nearness(doc);
+            if self.near_first && usize::from(key.nearness) > FOCUS_BANDS_M.len() - BIAS_BANDS {
+                key.near = key.nearness;
+            }
+        }
+        if self.near_first {
+            let mut whole = || {
+                self.whole_last
+                    .as_mut()
+                    .is_some_and(|postings| postings.doc() <= doc && postings.seek(doc) == doc)
+            };
+            key.named_place = key.place_rank != u8::MAX
+                && key.name_words <= self.typed_words
+                && (key.near > 0 || (known_abroad(key.prominence) && whole()));
         }
         key
     }
@@ -6938,15 +7373,35 @@ enum Parses {
     Numbered,
 }
 
+#[derive(Clone, Copy)]
+enum Typed<'a> {
+    Whole,
+    /// Too many index words start with it to list them ("s"). First ones in
+    /// index order, as before the lists.
+    Prefix,
+    Completions(&'a [String]),
+}
+
 /// Tried in order. Later ones only when earlier find nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Completion {
     InOrder,
+    /// Index order stops at [`AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS`] words
+    /// before common ones on a planet Pack. "mar" never reaches "market".
+    CommonCompletions,
     AllWords,
+    /// Words in any order, each also as the indexed words a typo away, as
+    /// `/geocode` and `/places` forgive them ("starbuks", "pharmcy").
+    Typos,
 }
 
 impl Completion {
-    const ALL: [Self; 2] = [Self::InOrder, Self::AllWords];
+    const ALL: [Self; 4] = [
+        Self::InOrder,
+        Self::CommonCompletions,
+        Self::AllWords,
+        Self::Typos,
+    ];
 }
 
 /// The retrieval passes of [`TextSearcher::search_variants`], in order,
@@ -8111,6 +8566,15 @@ struct Ranking {
     postcode: QueryPostcode,
     /// Where the caller is, `[lon, lat]`.
     focus: Option<[f64; 2]>,
+    /// Nearness within [`BIAS_BANDS`] ranks before the text score. A map
+    /// search box means the one near: "starbucks ballard" in Seattle is not
+    /// the one on Ballard Road in Oklahoma, though it matches better.
+    near_first: bool,
+    /// Words the query types, so a place whose name has no more is named
+    /// whole (see [`RankKey::named_place`]).
+    typed_words: u8,
+    /// The last typed word whole: far away, "amazon" is not yet Amazonas.
+    whole_last: Option<Term>,
     /// The words of what the query seeks, its subject and unplaced words:
     /// what an address or street
     /// must account for to rank above a POI (see
@@ -8367,18 +8831,95 @@ pub fn suggest(
     places: &TextSearcher,
     options: &TextAutocompleteOptions,
 ) -> Result<Vec<TextSearchHit>> {
-    for completion in Completion::ALL {
-        let mixed = mix_suggestions(
-            &options.query,
-            addresses.autocomplete_as(options, completion)?,
-            places.autocomplete_as(options, completion)?,
-            options.limit,
-        );
-        if !mixed.is_empty() {
-            return Ok(mixed);
+    let near = |hit: &TextSearchHit, [lon, lat]: [f64; 2]| {
+        hit.record
+            .point
+            .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
+    };
+    // Near first, before the mix cuts to the limit and far hits fill it.
+    let tier = |completion, only_near: bool| -> Result<Vec<TextSearchHit>> {
+        let mut addresses = addresses.autocomplete_as(options, completion)?;
+        let mut places = places.autocomplete_as(options, completion)?;
+        if let (true, Some(focus)) = (only_near, options.focus) {
+            addresses.retain(|hit| near(hit, focus));
+            places.retain(|hit| near(hit, focus));
         }
+        Ok(mix(
+            &options.query,
+            addresses,
+            places,
+            options.limit,
+            options.focus.is_some(),
+            completion == Completion::Typos,
+        ))
+    };
+    for completion in Completion::ALL {
+        let mixed = tier(completion, false)?;
+        if mixed.is_empty() {
+            continue;
+        }
+        // Nothing near as typed: a typo of a name nearby ("starbuks" in
+        // Seattle) before the far place spelt that way.
+        if let Some(focus) = options.focus
+            && completion != Completion::Typos
+            && last_word_may_be_a_typo(&options.query)
+            && !mixed.iter().any(|hit| near(hit, focus))
+        {
+            let mut typos = tier(Completion::Typos, true)?;
+            if !typos.is_empty() {
+                for hit in mixed {
+                    if !typos.iter().any(|kept| kept.record_id == hit.record_id) {
+                        typos.push(hit);
+                    }
+                }
+                typos.truncate(effective_autocomplete_limit(options.limit));
+                return Ok(typos);
+            }
+        }
+        return Ok(mixed);
     }
     Ok(Vec::new())
+}
+
+/// The kinds of place a one-word query names through a typo ("pharmcy"),
+/// by the whole names and group words fewest edits away.
+pub(crate) fn category_typo(query: &str) -> Option<Vec<&'static str>> {
+    let word = search_key(query.trim())?;
+    if word.contains(' ') {
+        return None;
+    }
+    allowed_edits(&word)?;
+    let first = first_chars(&word);
+    let mut fewest = None;
+    let mut found = Vec::new();
+    for candidate in crate::categories::strong_words().filter(|key| key.starts_with(first)) {
+        let Some(edits) = typo_distance(&word, candidate) else {
+            continue;
+        };
+        if fewest.is_none_or(|fewest| edits < fewest) {
+            fewest = Some(edits);
+            found.clear();
+        }
+        if fewest == Some(edits) {
+            found.push(candidate);
+        }
+    }
+    let categories = found
+        .into_iter()
+        .filter_map(crate::categories::of_query)
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+    (!categories.is_empty()).then(|| categories.into_iter().collect())
+}
+
+/// Whether the last word is long enough to hold a typo. Shorter, it is still
+/// being typed, and the retry would cost a search of every word it starts.
+fn last_word_may_be_a_typo(query: &str) -> bool {
+    search_key(query.trim()).is_some_and(|key| {
+        key.split_whitespace()
+            .last()
+            .is_some_and(|last| allowed_edits(last).is_some())
+    })
 }
 
 /// Scores over different fields do not compare, so the query decides the
@@ -8390,6 +8931,19 @@ pub fn mix_suggestions(
     places: Vec<TextSearchHit>,
     limit: usize,
 ) -> Vec<TextSearchHit> {
+    mix(query, addresses, places, limit, false, false)
+}
+
+/// With `near_first`, a town or region typed whole leads: near POIs that
+/// start with its name ("Tacoma Screw") would else bury it.
+fn mix(
+    query: &str,
+    mut addresses: Vec<TextSearchHit>,
+    places: Vec<TextSearchHit>,
+    limit: usize,
+    near_first: bool,
+    typos: bool,
+) -> Vec<TextSearchHit> {
     let limit = effective_autocomplete_limit(limit);
     let key = search_key(query.trim()).unwrap_or_default();
     let tokens = autocomplete_query_tokens(&key);
@@ -8399,9 +8953,25 @@ pub fn mix_suggestions(
         mixed.extend(addresses);
         mixed.extend(places);
     } else {
+        if near_first {
+            let (whole, rest): (Vec<_>, Vec<_>) = addresses.into_iter().partition(|hit| {
+                // Far, only once typed out: "amazon" is not yet Amazonas.
+                hit.named_place
+                    && search_key(&hit.record.name).is_some_and(|name| {
+                        if usize::from(hit.signals.focus_band) < BIAS_BANDS {
+                            name.split_whitespace().count() == tokens.len()
+                                && name_starts_as(&hit.record.name, &tokens, typos)
+                        } else {
+                            name == tokens.join(" ")
+                        }
+                    })
+            });
+            mixed.extend(whole);
+            addresses = rest;
+        }
         let (named, others): (Vec<_>, Vec<_>) = places
             .into_iter()
-            .partition(|hit| name_starts_as(&hit.record.name, &tokens));
+            .partition(|hit| name_starts_as(&hit.record.name, &tokens, typos));
         mixed.extend(named);
         mixed.extend(addresses);
         mixed.extend(others);
@@ -8410,7 +8980,7 @@ pub fn mix_suggestions(
     mixed
 }
 
-fn name_starts_as(name: &str, words: &[String]) -> bool {
+pub(crate) fn name_starts_as(name: &str, words: &[String], typos: bool) -> bool {
     let Some(name) = search_key(name) else {
         return false;
     };
@@ -8421,10 +8991,25 @@ fn name_starts_as(name: &str, words: &[String]) -> bool {
             .iter()
             .zip(&name)
             .enumerate()
-            .all(|(at, (typed, word))| types_word(typed, word, at + 1 == words.len()))
+            .all(|(at, (typed, word))| {
+                let last = at + 1 == words.len();
+                // A typo starts the name too, as the typo tier found it.
+                let cut = match last {
+                    true => word.chars().take(typed.chars().count()).collect::<String>(),
+                    false => word.to_string(),
+                };
+                types_word(typed, word, last)
+                    || (typos
+                        && (typo_distance(typed, word).is_some()
+                            || typo_distance(typed, &cut).is_some()))
+            })
 }
 
-fn effective_autocomplete_limit(limit: usize) -> usize {
+pub(crate) fn autocomplete_tokens(query: &str) -> Vec<String> {
+    search_key(query.trim()).map_or_else(Vec::new, |key| autocomplete_query_tokens(&key))
+}
+
+pub(crate) fn effective_autocomplete_limit(limit: usize) -> usize {
     let limit = effective_limit(limit);
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
 }
@@ -9189,13 +9774,32 @@ fn autocomplete_query_tokens(query_text: &str) -> Vec<String> {
 }
 
 fn autocomplete_subject_query(field: Field, tokens: &[String]) -> Box<dyn Query> {
-    let terms = tokens
+    let mut head = tokens
         .iter()
         .map(|token| Term::from_field_text(field, token))
         .collect::<Vec<_>>();
-    let mut query = PhrasePrefixQuery::new(terms);
-    query.set_max_expansions(AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS);
-    Box::new(query)
+    let prefix = head.pop().expect("an autocomplete query has a word");
+    if head.is_empty() {
+        let mut query = PhrasePrefixQuery::new(vec![prefix]);
+        query.set_max_expansions(AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS);
+        return Box::new(query);
+    }
+    Box::new(PhrasePrefix::new(
+        head,
+        prefix,
+        AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS,
+    ))
+}
+
+/// Where a place a query names lies: one near the caller, else the best
+/// known anywhere (see [`TextSearcher::place_point`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacePoint {
+    pub near: Option<[f64; 2]>,
+    /// The best known, when its whole name is typed and it is known beyond
+    /// its own language (see [`RankKey::named_place`]).
+    pub known_abroad: Option<[f64; 2]>,
+    pub known: Option<[f64; 2]>,
 }
 
 /// The house number an autocomplete query starts with, when words follow it.
@@ -9213,6 +9817,10 @@ fn is_address_number_token(token: &str) -> bool {
 mod named;
 
 mod choose;
+
+mod phrase_prefix;
+
+use phrase_prefix::PhrasePrefix;
 
 #[cfg(test)]
 mod tests {
@@ -10608,6 +11216,7 @@ mod tests {
     #[test]
     fn suggestions_mix_addresses_and_places_by_what_the_query_says() {
         let hit = |id: &str, layer: &str, name: &str| TextSearchHit {
+            named_place: false,
             record_id: 0,
             score: 1.0,
             record: Summary {
@@ -11227,6 +11836,602 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// #179
+    #[test]
+    fn autocompletes_a_common_word_past_the_expansion_cap() {
+        let temp_dir = temp_pack_path("autocomplete-common-completion");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: String| PoiRecord {
+            alt_names: Vec::new(),
+            name,
+            category: "shop:convenience".to_string(),
+            address: None,
+            geometry: point_geometry(-122.34, 47.61),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        let cap = AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS as i64;
+        for at in 0..cap + 76 {
+            writer
+                .write(&poi(at + 10, format!("Mara{at:04}")).into(), None)
+                .expect("filler");
+        }
+        for (at, name) in ["Pike Place Market", "Fish Market", "Flower Market"]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .write(&poi(at as i64 + 1, name.to_string()).into(), None)
+                .expect("market");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let places = searcher.places();
+        let options = TextAutocompleteOptions {
+            query: "pike place mar".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+
+        assert!(
+            places
+                .autocomplete_as(&options, Completion::InOrder)
+                .expect("in order")
+                .is_empty()
+        );
+        let found = suggest(&searcher, &places, &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #180: a chain's best known branches far away must not fill the
+    /// window before the one near the caller.
+    #[test]
+    fn autocompletes_the_branch_near_the_focus_before_known_far_ones() {
+        let temp_dir = temp_pack_path("autocomplete-near-branch");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let cafe = |object_id, [lon, lat]: [f64; 2], prominence| PoiRecord {
+            alt_names: Vec::new(),
+            name: "Starbucks".to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence,
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        let known = Prominence {
+            importance: 30,
+            linked: true,
+            languages: 5,
+        };
+        for at in 0..MAX_RANK_WINDOW as i64 {
+            writer
+                .write(&cafe(at + 10, [-1.0, 53.0], known).into(), None)
+                .expect("far");
+        }
+        writer
+            .write(&cafe(1, [4.89, 52.37], Prominence::default()).into(), None)
+            .expect("near");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "starbucks".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: Some([4.89, 52.37]),
+            bbox: None,
+        };
+
+        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #180: within 50 km of the focus the near match leads, though a far
+    /// one matches better; beyond, the better match does.
+    #[test]
+    fn autocompletes_the_near_match_before_a_better_far_one() {
+        let temp_dir = temp_pack_path("autocomplete-near-match");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, [lon, lat]: [f64; 2]| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        writer
+            .write(&poi(1, "Pike Place", [-97.26, 34.74]).into(), None)
+            .expect("far");
+        writer
+            .write(
+                &poi(2, "Pike Place Fish Market", [-122.34, 47.61]).into(),
+                None,
+            )
+            .expect("near");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let first = |focus| {
+            let options = TextAutocompleteOptions {
+                query: "pike place".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: Some(focus),
+                bbox: None,
+            };
+            suggest(&searcher, &searcher.places(), &options).expect("suggest")[0]
+                .record
+                .id
+                .clone()
+        };
+
+        assert_eq!(first([-122.33, 47.61]), "osm:node:2");
+        // 80 km from the near one: past the bias, the better match leads.
+        assert_eq!(first([-123.4, 47.61]), "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #180: a town typed whole leads near shops named after it when known
+    /// beyond its own language; a hamlet that is not leaves them first.
+    #[test]
+    fn autocompletes_a_known_town_typed_whole_before_near_shops() {
+        let temp_dir = temp_pack_path("autocomplete-known-town");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let town = |object_id, name: &str, [lon, lat]: [f64; 2], prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence,
+                    wikidata: None,
+                },
+            )
+        };
+        let shop = |object_id, name: &str| {
+            Record::from(PoiRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                category: "shop:bakery".to_string(),
+                address: None,
+                geometry: point_geometry(-122.34, 47.61),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, object_id),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
+            })
+        };
+        let known = Prominence {
+            importance: 0,
+            linked: true,
+            languages: 40,
+        };
+        writer
+            .write(&town(1, "Paris", [2.35, 48.86], known), None)
+            .expect("paris");
+        writer
+            .write(&town(2, "Pike", [-96.3, 33.3], Prominence::default()), None)
+            .expect("pike");
+        writer
+            .write(&shop(3, "Paris Bakery"), None)
+            .expect("bakery");
+        writer
+            .write(&shop(4, "Pike Grocery"), None)
+            .expect("grocery");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let first = |query: &str| {
+            let options = TextAutocompleteOptions {
+                query: query.to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: Some([-122.33, 47.61]),
+                bbox: None,
+            };
+            suggest(&searcher, &searcher.places(), &options).expect("suggest")[0]
+                .record
+                .id
+                .clone()
+        };
+
+        assert_eq!(first("paris"), "osm:node:1");
+        assert_eq!(first("pike"), "osm:node:4");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Far away, a known town leads only once its whole name is typed.
+    #[test]
+    fn a_far_town_needs_its_whole_name_typed_to_lead() {
+        let temp_dir = temp_pack_path("autocomplete-far-town-prefix");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Region,
+                    crate::record::PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: "Amazonas".to_string(),
+                        place_type: "state".to_string(),
+                        geometry: point_geometry(-64.6, -4.2),
+                        source: SourceProvenance::osm(ObjectType::Node, 1),
+                        prominence: Prominence {
+                            importance: 0,
+                            linked: true,
+                            languages: 30,
+                        },
+                        wikidata: None,
+                    },
+                ),
+                None,
+            )
+            .expect("region");
+        let mut street = street_record("osm:way:2", "Amazon Street");
+        street.geometry = point_geometry(-122.34, 47.61);
+        street.representative_point = [-122.34, 47.61];
+        writer.write(&street.into(), None).expect("street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "amazon".to_string(),
+            limit: 1,
+            layer: None,
+            countries: Vec::new(),
+            focus: Some([-122.33, 47.61]),
+            bbox: None,
+        };
+
+        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:way:2");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A category read from the index answers its POIs near the focus,
+    /// nearest first, and none past the bias.
+    #[test]
+    fn finds_the_nearest_pois_of_a_category() {
+        let temp_dir = temp_pack_path("nearest-of-category");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, category: &str, [lon, lat]: [f64; 2]| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: category.to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        for record in [
+            poi(1, "Apotheek Dam", "amenity:pharmacy", [4.89, 52.37]),
+            poi(2, "Pharmacy Neumann", "amenity:pharmacy", [4.71, 52.01]),
+            poi(3, "Pharmacy", "amenity:pharmacy", [6.57, 51.33]),
+            poi(4, "Etos", "shop:chemist", [4.89, 52.37]),
+            poi(5, "Pharmacy Cafe", "amenity:cafe", [4.89, 52.371]),
+        ] {
+            writer.write(&record.into(), None).expect("poi");
+        }
+        writer.finish().expect("finish");
+        let places = TextSearcher::open(&temp_dir).expect("searcher").places();
+
+        // An upper bound: the cafe's name counts too.
+        assert_eq!(
+            places.category_count(&["amenity pharmacy"]).expect("count"),
+            4
+        );
+        let ids = |bbox| {
+            places
+                .nearest_of_categories(&["amenity pharmacy"], [4.89, 52.37], 5, &[], bbox)
+                .expect("nearest")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(None), ["osm:node:1", "osm:node:2"]);
+        let amsterdam = BoundingBox {
+            min_lon: 4.8,
+            min_lat: 52.3,
+            max_lon: 5.0,
+            max_lat: 52.4,
+        };
+        assert_eq!(ids(Some(amsterdam)), ["osm:node:1"]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A word a typo away answers when nothing matches as typed, the last
+    /// one while it is still being typed.
+    #[test]
+    fn autocompletes_through_a_typo() {
+        let temp_dir = temp_pack_path("autocomplete-typo");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(-122.34, 47.61),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        writer
+            .write(&poi(1, "Starbucks").into(), None)
+            .expect("cafe");
+        writer
+            .write(&poi(2, "Pike Place Market").into(), None)
+            .expect("market");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let first = |query: &str| {
+            let options = TextAutocompleteOptions {
+                query: query.to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            };
+            suggest(&searcher, &searcher.places(), &options)
+                .expect("suggest")
+                .first()
+                .map(|hit| hit.record.id.clone())
+        };
+
+        assert_eq!(first("starbuks").as_deref(), Some("osm:node:1"));
+        assert_eq!(first("strabu").as_deref(), Some("osm:node:1"));
+        assert_eq!(first("pike plcae mark").as_deref(), Some("osm:node:2"));
+        assert_eq!(first("xtarbucks"), None);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// With a focus, a typo of a name nearby leads the far place that is
+    /// spelt as typed.
+    #[test]
+    fn a_near_typo_leads_a_far_exact_spelling() {
+        let temp_dir = temp_pack_path("autocomplete-near-typo");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, [lon, lat]: [f64; 2]| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        writer
+            .write(&poi(1, "Starbuks", [127.02, 37.62]).into(), None)
+            .expect("far");
+        for id in 2..5 {
+            writer
+                .write(&poi(id, "Starbucks", [-122.34, 47.61]).into(), None)
+                .expect("near");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = |focus| TextAutocompleteOptions {
+            query: "starbuks".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus,
+            bbox: None,
+        };
+
+        let near = suggest(
+            &searcher,
+            &searcher.places(),
+            &options(Some([-122.33, 47.61])),
+        )
+        .expect("suggest");
+        assert_eq!(near[0].record.name, "Starbucks");
+        assert!(near.iter().any(|hit| hit.record.id == "osm:node:1"));
+        let anywhere = suggest(&searcher, &searcher.places(), &options(None)).expect("suggest");
+        assert_eq!(anywhere[0].record.id, "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The typo retry keeps a street nearby though far POIs of the typo
+    /// would fill the limit.
+    #[test]
+    fn a_near_typo_street_outlasts_far_pois() {
+        let temp_dir = temp_pack_path("autocomplete-near-typo-street");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(127.02, 37.62),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        writer
+            .write(&poi(1, "Starbuks").into(), None)
+            .expect("far typo");
+        writer
+            .write(&poi(2, "Starbucks").into(), None)
+            .expect("far");
+        writer
+            .write(&poi(3, "Starbucks").into(), None)
+            .expect("far");
+        writer
+            .write(&street_record("osm:way:4", "Starbucks Road").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "starbuks".to_string(),
+            limit: 1,
+            layer: None,
+            countries: Vec::new(),
+            focus: Some([-79.0, 43.0]),
+            bbox: None,
+        };
+
+        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:way:4");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_typo_of_a_kind_of_place_names_it() {
+        assert!(category_typo("pharmcy").is_some_and(|found| found.contains(&"amenity pharmacy")));
+        assert!(category_typo("apoteek").is_some_and(|found| found.contains(&"amenity pharmacy")));
+        assert_eq!(category_typo("ph"), None);
+        assert_eq!(category_typo("pharmacy near"), None);
+    }
+
+    /// A place named in a query is the one near the caller when there is one,
+    /// else the best known: from Seattle "amsterdam" is in the Netherlands.
+    #[test]
+    fn a_named_place_is_near_else_best_known() {
+        let pack = TempPack::new("place-point");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let town = |object_id, [lon, lat]: [f64; 2], prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Amsterdam".to_string(),
+                    place_type: "town".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence,
+                    wikidata: None,
+                },
+            )
+        };
+        let known = Prominence {
+            importance: 40,
+            linked: true,
+            languages: 100,
+        };
+        writer
+            .write(&town(1, [4.89, 52.37], known), None)
+            .expect("netherlands");
+        writer
+            .write(&town(2, [-111.3, 45.8], Prominence::default()), None)
+            .expect("montana");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        let from_seattle = searcher
+            .place_point("amsterdam", Some([-122.33, 47.61]), false)
+            .expect("place");
+        assert_eq!(from_seattle.near, None);
+        assert_eq!(from_seattle.known, Some([4.89, 52.37]));
+        let from_bozeman = searcher
+            .place_point("amsterdam", Some([-111.2, 45.7]), false)
+            .expect("place");
+        assert_eq!(from_bozeman.near, Some([-111.3, 45.8]));
+    }
+
+    /// A place to search around is exact by any of its names, and may be a
+    /// street.
+    #[test]
+    fn a_named_place_may_be_an_alternate_name_or_a_street() {
+        let pack = TempPack::new("place-point-alternate");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Locality,
+                    crate::record::PlaceRecord {
+                        alt_names: vec!["Rome".to_string()],
+                        name: "Roma".to_string(),
+                        place_type: "city".to_string(),
+                        geometry: point_geometry(-79.0, 43.0),
+                        source: SourceProvenance::osm(ObjectType::Node, 1),
+                        prominence: Default::default(),
+                        wikidata: None,
+                    },
+                ),
+                None,
+            )
+            .expect("roma");
+        writer
+            .write(&street_record("osm:way:2", "Queen Street").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        let near = |words| {
+            searcher
+                .place_point(words, Some([-79.01, 43.0]), false)
+                .expect("place")
+                .near
+        };
+        assert_eq!(near("rome"), Some([-79.0, 43.0]));
+        assert!(near("queen street").is_some());
+    }
+
+    #[test]
+    fn a_typo_of_a_kind_splits_from_its_place() {
+        let request = crate::categories::of_request_with("pharmcy amsterdam", |kind| {
+            crate::categories::of_query(kind).or_else(|| category_typo(kind))
+        })
+        .expect("request");
+        assert!(request.categories.contains(&"amenity pharmacy"));
+        assert_eq!(request.place.as_deref(), Some("amsterdam"));
+    }
+
     #[test]
     fn a_typed_word_stands_for_its_forms_prefixes_and_contractions() {
         assert!(types_word("market", "market", false));
@@ -11242,13 +12447,33 @@ mod tests {
         assert!(!unlisted_contraction("market"));
 
         let words = |query: &str| autocomplete_query_tokens(query);
-        assert!(name_starts_as("Pike Place Market", &words("pike pl mkt")));
         assert!(name_starts_as(
             "Pike Place Market",
-            &words("pike place mar")
+            &words("pike pl mkt"),
+            false
         ));
-        assert!(!name_starts_as("Pike Place Market", &words("place pike")));
-        assert!(!name_starts_as("Pike", &words("pike place")));
+        assert!(name_starts_as(
+            "Pike Place Market",
+            &words("pike place mar"),
+            false
+        ));
+        assert!(!name_starts_as(
+            "Pike Place Market",
+            &words("place pike"),
+            false
+        ));
+        assert!(!name_starts_as("Pike", &words("pike place"), false));
+        assert!(!name_starts_as(
+            "Pike Place Market",
+            &words("pike plcae mar"),
+            false
+        ));
+        assert!(name_starts_as(
+            "Pike Place Market",
+            &words("pike plcae mar"),
+            true
+        ));
+        assert!(name_starts_as("Space Needle", &words("spce"), true));
     }
 
     #[test]

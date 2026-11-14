@@ -28,6 +28,7 @@ use tower_http::{
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
+    categories,
     http::{
         batch::{self, Lookup},
         bounds, health,
@@ -47,11 +48,13 @@ use crate::{
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{
-        AddressGeocodeOptions, TextAutocompleteOptions, TextSearchHit, TextSearchOptions,
-        TextSearcher, suggest,
+        AddressGeocodeOptions, BIAS_RADIUS_M, TextAutocompleteOptions, TextSearchHit,
+        TextSearchOptions, TextSearcher, autocomplete_tokens, category_typo,
+        effective_autocomplete_limit, name_starts_as, suggest,
     },
+    spatial_index::haversine_m,
     stop::{self, CancelOnDrop, Stop},
-    util::hilbert::hilbert_key,
+    util::{fold::search_key, hilbert::hilbert_key},
 };
 
 /// Seconds a refused single lookup is told to wait: lookups take
@@ -950,13 +953,139 @@ pub(crate) async fn autocomplete(
                 ..options
             })?,
             Some(_) => worker.searcher.autocomplete(&options)?,
-            None => suggest(&worker.searcher, &worker.places, &options)?,
+            None => {
+                let named = suggest(&worker.searcher, &worker.places, &options)?;
+                nearest_of_category(&worker, &options, named)?
+            }
         };
         api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
 
     Ok(Json(collection))
+}
+
+/// A query that only names a kind of place ("pharmacy", "apotheek") means
+/// the nearest ones, whatever their names. A place near the caller named as
+/// typed ("Subway") still answers, so a brand that is also a category word
+/// keeps its meaning. What else matched fills the rest.
+fn nearest_of_category(
+    state: &AppState,
+    options: &TextAutocompleteOptions,
+    named: Vec<TextSearchHit>,
+) -> Result<Vec<TextSearchHit>> {
+    // Through a typo the kind is never the whole query's own name.
+    let typo = |kind: &str| category_typo(kind);
+    let (request, through_typo) = match categories::of_request(&options.query) {
+        Some(request) => (request, false),
+        None => match categories::of_request_with(&options.query, typo) {
+            Some(request) => (
+                categories::Request {
+                    whole: false,
+                    ..request
+                },
+                true,
+            ),
+            None => return Ok(named),
+        },
+    };
+    let typed = search_key(&options.query);
+    let tokens = autocomplete_tokens(&options.query);
+    let near = |hit: &TextSearchHit| {
+        options.focus.is_some_and(|[lon, lat]| {
+            hit.record
+                .point
+                .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
+        })
+    };
+    // A name nearby as typed ("subway"), or being typed ("bank of amer"), wins.
+    let named_near = named
+        .first()
+        .is_some_and(|hit| near(hit) && search_key(&hit.record.name) == typed)
+        || (!request.whole
+            && named
+                .iter()
+                .any(|hit| near(hit) && name_starts_as(&hit.record.name, &tokens, false)));
+    if named_near {
+        return Ok(named);
+    }
+    // A place in the words outranks where the map is.
+    let focus = match &request.place {
+        None => options.focus,
+        Some(words) => place_named(state, options, words, through_typo)?,
+    };
+    let (Some(focus), categories) = (focus, request.categories) else {
+        return Ok(named);
+    };
+    let limit = effective_autocomplete_limit(options.limit);
+    // Past the categories' own count, reading them from the index costs less.
+    let count = state.places.category_count(&categories)?;
+    if count == 0 {
+        return Ok(named);
+    }
+    // The walk knows no country, so a country filter reads the index.
+    let walked = match options.countries.is_empty() {
+        true => state.reverse_geocoder.nearest_pois(
+            focus,
+            BIAS_RADIUS_M,
+            limit,
+            count,
+            |lon, lat| options.bbox.is_none_or(|bbox| bbox.contains(lon, lat)),
+            |category| categories::holds(&categories, category),
+        )?,
+        false => None,
+    };
+    let mut hits = match walked {
+        Some(nearest) => nearest
+            .into_iter()
+            .map(|record_id| {
+                Ok(TextSearchHit::of_record(
+                    record_id,
+                    state.pack.record_summary(record_id)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => state.places.nearest_of_categories(
+            &categories,
+            focus,
+            limit,
+            &options.countries,
+            options.bbox,
+        )?,
+    };
+    if hits.is_empty() {
+        return Ok(named);
+    }
+    for hit in named {
+        if hits.len() >= limit {
+            break;
+        }
+        if !hits.iter().any(|kept| kept.record_id == hit.record_id) {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
+}
+
+/// The point of the place `words` name, a town, a street or a POI.
+fn place_named(
+    state: &AppState,
+    options: &TextAutocompleteOptions,
+    words: &str,
+    towns_only: bool,
+) -> Result<Option<[f64; 2]>> {
+    // A town nearby, then one known abroad ("new york"), then a POI nearby
+    // ("pike place" is the market here, not a street in Auckland).
+    let towns = state.searcher.place_point(words, options.focus, false)?;
+    if let Some(point) = towns.near.or(towns.known_abroad) {
+        return Ok(Some(point));
+    }
+    // Through a typo of the kind, the rest is more often a name being typed.
+    if towns_only {
+        return Ok(None);
+    }
+    let pois = state.places.place_point(words, options.focus, true)?;
+    Ok(pois.near.or(towns.known).or(pois.known))
 }
 
 // For callers holding street, town and postcode in separate fields: joined
