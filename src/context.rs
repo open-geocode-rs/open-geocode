@@ -290,7 +290,7 @@ pub struct TupleWriter {
 
 impl TupleWriter {
     /// Reference for a record's context; `None` when there is no admin context.
-    pub fn intern(&mut self, context: RecordContext) -> Result<Option<ContextRef>> {
+    pub fn intern(&mut self, context: &RecordContext) -> Result<Option<ContextRef>> {
         if context.admin_context.is_empty() {
             return Ok(None);
         }
@@ -313,7 +313,7 @@ impl TupleWriter {
                 let id = u32::try_from(self.tuples.len())
                     .map_err(|_| Error::Inconsistent("context table is full".into()))?;
                 self.tuples.push(context.admin_context.clone());
-                self.ids.insert(context.admin_context, id);
+                self.ids.insert(context.admin_context.clone(), id);
                 id
             }
         };
@@ -477,14 +477,14 @@ mod tests {
         ]);
         let mut writer = TupleWriter::default();
         let first = writer
-            .intern(RecordContext {
+            .intern(&RecordContext {
                 admin_context: tuple.clone(),
                 flags: 0,
             })
             .expect("intern")
             .expect("reference");
         let second = writer
-            .intern(RecordContext {
+            .intern(&RecordContext {
                 admin_context: tuple.clone(),
                 flags: CONTEXT_FLAG_AMBIGUOUS_ADMIN,
             })
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(first.tuple_id, second.tuple_id);
         assert!(second.ambiguous);
         assert_eq!(
-            writer.intern(RecordContext::default()).expect("empty"),
+            writer.intern(&RecordContext::default()).expect("empty"),
             None
         );
         assert_eq!(writer.tuple_count(), 1);

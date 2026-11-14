@@ -18,8 +18,7 @@ FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --profile dist --locked --bin open-geocode --recipe-path recipe.json
 COPY . .
-RUN cargo build --profile dist --locked --bin open-geocode \
- && strip target/dist/open-geocode
+RUN cargo build --profile dist --locked --bin open-geocode
 # The image ships open-geocode alone, so the og interface's crates are left out.
 RUN cargo about generate --locked --fail -o THIRD-PARTY-LICENSES about.hbs
 

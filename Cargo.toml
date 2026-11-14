@@ -136,7 +136,7 @@ serde_json = "1.0"
 # parser axum's `Query` uses. Already in the tree through axum.
 serde_urlencoded = "0.7"
 # Stops `og build` cleanly on Ctrl-C.
-signal-hook = { version = "0.3", default-features = false, optional = true }
+signal-hook = { version = "0.4", default-features = false, optional = true }
 # Lets Pack sections share the file mapping with Tantivy (`OwnedBytes`).
 stable_deref_trait = "1.2"
 tantivy = "0.25.0"
@@ -148,7 +148,7 @@ tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread", "sig
 # Stop token shared by the server and its jobs. Already in the tree through
 # tower-http.
 tokio-util = { version = "0.7", default-features = false }
-tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd", "fs"] }
+tower-http = { version = "0.7", features = ["compression-gzip", "compression-zstd", "fs"] }
 # The Unicode Script property: which characters the parser reads as a
 # script written without spaces.
 unicode-script = "0.5.7"
@@ -205,4 +205,10 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
+# Whole-program LTO in one unit inlines across og, tantivy and fst and drops
+# duplicate generic copies. Smaller, faster binary for a slower build.
+lto = "fat"
+codegen-units = 1
+# dist does not strip what it ships, so the profile does. Panics stay unwind,
+# since batch answers a panicking item as an error.
+strip = "symbols"

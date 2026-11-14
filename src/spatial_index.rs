@@ -757,6 +757,61 @@ impl Reader {
         Ok(closest_candidates(candidates, limit))
     }
 
+    /// The nearest POIs `accept` keeps, nearest first; `None` once it has
+    /// tested `budget` POIs without settling `limit` of them.
+    pub fn poi_candidates_where(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+        budget: u64,
+        accept: impl Fn(RecordId, f64, f64) -> Result<bool>,
+    ) -> Result<Option<Vec<PointCandidate>>> {
+        let mut candidates = Vec::new();
+        let mut closest = Closest::new(limit);
+        let window = DegreeWindow::around(lat, radius_m);
+        let mut tested = 0;
+        for (block, bound) in self.blocks.nearest(lon, lat, radius_m) {
+            if closest.settled(bound) {
+                break;
+            }
+            if tested > budget {
+                return Ok(None);
+            }
+            crate::stop::check()?;
+            self.records.block_points(
+                block as u64,
+                |record_id, layer, point_lon, point_lat, line| {
+                    if line || layer != Layer::Poi {
+                        return Ok(());
+                    }
+                    let (point_lon, point_lat) = (dequantize(point_lon), dequantize(point_lat));
+                    if !window.holds(lon, lat, point_lon, point_lat) {
+                        return Ok(());
+                    }
+                    let distance_m = haversine_m(lon, lat, point_lon, point_lat);
+                    if distance_m > radius_m {
+                        return Ok(());
+                    }
+                    tested += 1;
+                    if accept(record_id, point_lon, point_lat)? {
+                        closest.add(distance_m);
+                        candidates.push(PointCandidate {
+                            record_id,
+                            layer,
+                            lon: point_lon,
+                            lat: point_lat,
+                            distance_m,
+                        });
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(Some(closest_candidates(candidates, limit)))
+    }
+
     pub fn context_candidates(
         &self,
         lon: f64,
@@ -1174,6 +1229,51 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, object_id),
         })
+    }
+
+    fn poi(lon: f64, lat: f64, object_id: i64, category: &str) -> Record {
+        Record::from(crate::record::PoiRecord {
+            alt_names: Vec::new(),
+            name: "Somewhere".to_string(),
+            category: category.to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        })
+    }
+
+    /// The walk finds the nearest POI of a kind past others, and gives up
+    /// once it has tested its budget.
+    #[test]
+    fn walks_to_the_nearest_poi_of_a_category_within_a_budget() {
+        let mut records = (0..200)
+            .map(|id| poi(-79.0 + id as f64 * 1e-5, 43.0, id, "amenity:cafe"))
+            .collect::<Vec<_>>();
+        records.push(poi(-79.01, 43.0, 900, "amenity:pharmacy"));
+        let (reader, _) = build(&records);
+        let pharmacy = |record_id, _, _| {
+            reader
+                .records
+                .poi_category_is(record_id, |category| category == "amenity:pharmacy")
+        };
+
+        let found = reader
+            .poi_candidates_where(-79.0, 43.0, 5_000.0, 1, 1_000, pharmacy)
+            .expect("walk")
+            .expect("within budget");
+        assert_eq!(found.len(), 1);
+        assert!((found[0].lon + 79.01).abs() < 1e-6);
+        assert!(
+            reader
+                .poi_candidates_where(-79.0, 43.0, 5_000.0, 1, 10, pharmacy)
+                .expect("walk")
+                .is_none()
+        );
     }
 
     /// Build a Pack holding only records and the spatial index.

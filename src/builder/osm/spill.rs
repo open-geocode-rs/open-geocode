@@ -350,6 +350,13 @@ impl PendingAddress {
         }
     }
 
+    /// The address as pushed `seq`th, from `dataset`.
+    pub(super) fn numbered(mut self, seq: u64, dataset: u32) -> Self {
+        self.seq = seq;
+        self.source.dataset = dataset;
+        self
+    }
+
     /// The same address stating `address` instead.
     pub(super) fn restated(&self, address: &AddressComponents) -> Self {
         Self::from_parts(address, self.point, self.precision, self.source, self.seq)

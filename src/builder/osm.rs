@@ -1337,29 +1337,39 @@ impl<'a> Run<'a> {
                 }
                 None => false,
             };
-            let imported = addresses::read_file(file, |record| {
-                progress.check()?;
-                if broken {
-                    return Ok(Some("source_outside_area"));
-                }
-                let Some(point) = point_lon_lat(&record.geometry) else {
-                    return Ok(Some("outside_extract"));
-                };
-                let [lon, lat] = point;
-                let inside = extracts.as_ref().is_none_or(|boxes| {
-                    boxes
-                        .iter()
-                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
-                });
-                if !inside {
-                    return Ok(Some("outside_extract"));
-                }
-                if area.is_some_and(|area| !area(point)) {
-                    return Ok(Some("outside_area"));
-                }
-                build.push(Record::Address(record), None)?;
-                Ok(None)
-            })?;
+            let mut dataset = None;
+            let imported = addresses::read_file_prepared(
+                file,
+                |record| {
+                    progress.check()?;
+                    if broken {
+                        return Ok(Err("source_outside_area"));
+                    }
+                    let Some(point) = point_lon_lat(&record.geometry) else {
+                        return Ok(Err("outside_extract"));
+                    };
+                    let [lon, lat] = point;
+                    let inside = extracts.as_ref().is_none_or(|boxes| {
+                        boxes
+                            .iter()
+                            .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
+                    });
+                    if !inside {
+                        return Ok(Err("outside_extract"));
+                    }
+                    if area.as_ref().is_some_and(|area| !area(point)) {
+                        return Ok(Err("outside_area"));
+                    }
+                    Ok(Ok(PendingAddress::new(&record, 0, 0)?))
+                },
+                |address| {
+                    // Given at the file's first address, as for OSM's. A
+                    // file whose rows are all left out names no dataset.
+                    let id = *dataset.get_or_insert_with(|| build.datasets.id(&file.dataset));
+                    build.push_address(address, id)?;
+                    Ok(None)
+                },
+            )?;
             progress.advance(imported.bytes);
             progress
                 .input(&file.path)
@@ -2114,11 +2124,7 @@ impl Build {
         }
         for item in ready {
             match item {
-                Ready::Address(mut address) => {
-                    address.seq = self.seq;
-                    self.seq += 1;
-                    open(&mut self.addresses, "addresses")?.push(address)?;
-                }
+                Ready::Address(address) => self.push_address(address, 0)?,
                 Ready::Record(record) => self.push(*record, None)?,
             }
         }
@@ -2136,18 +2142,20 @@ impl Build {
         open(&mut self.places, "places")?.push(PendingNamed::place(place, self.seq - 1)?)
     }
 
+    /// An address cut into its sort key off this thread, numbered as it
+    /// takes its place in input order.
+    fn push_address(&mut self, address: PendingAddress, dataset: u32) -> Result<()> {
+        self.seq += 1;
+        open(&mut self.addresses, "addresses")?.push(address.numbered(self.seq - 1, dataset))
+    }
+
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
         if let Record::Address(address) = record {
             let dataset = match address.source.object_type {
                 ObjectType::Row => self.datasets.id(&address.source.dataset),
                 _ => 0,
             };
-            self.seq += 1;
-            return open(&mut self.addresses, "addresses")?.push(PendingAddress::new(
-                &address,
-                self.seq - 1,
-                dataset,
-            )?);
+            return self.push_address(PendingAddress::new(&address, 0, 0)?, dataset);
         }
         if let Record::Street(street) = record {
             self.seq += 1;
@@ -2636,6 +2644,19 @@ fn find_repeated_houses(
         houses.push(address?.house(at as u64))?;
     }
     let mut verdicts = ExternalSorter::new(scratch, "house-verdicts", memory, budget);
+    // Dropped rows find their file by dataset id, not by name. A planet
+    // build drops 332 million rows from 3,141 files. Scanning names per row
+    // costs 3.2e11 string comparisons on this one thread.
+    let import_of = datasets
+        .names()
+        .iter()
+        .map(|name| {
+            report
+                .imports
+                .iter()
+                .position(|import| import.dataset == *name)
+        })
+        .collect::<Vec<_>>();
     let mut kept: Vec<House> = Vec::new();
     for house in houses.finish()? {
         let house = house?;
@@ -2675,12 +2696,10 @@ fn find_repeated_houses(
             verdicts.push((at, DISPUTED))?;
         }
         verdicts.push((house.at, DROPPED))?;
-        let dataset = datasets.name(house.dataset)?;
-        if let Some(import) = report
-            .imports
-            .iter_mut()
-            .find(|import| import.dataset == dataset)
-        {
+        let import = *import_of
+            .get(house.dataset as usize)
+            .ok_or(Error::Decode("unknown address dataset"))?;
+        if let Some(import) = import.and_then(|at| report.imports.get_mut(at)) {
             if repeated {
                 import.duplicates += 1;
             } else {
@@ -3771,6 +3790,68 @@ mod tests {
             kept(&["openaddresses:lots:row:3", "openaddresses:register:row:1"]),
             [true],
             "one record of 30, disputed"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A dropped row counts on the first file of its dataset, whatever ids
+    /// the datasets got. A file with no address takes none, and a second
+    /// file of a dataset adds to the first one's counts.
+    #[test]
+    fn a_dropped_row_counts_on_the_first_file_of_its_dataset() {
+        let dir = temp_dir("dropped-row-file");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let file = |name: &str, dataset: &str, rows: &str| {
+            let path = dir.join(format!("{name}.csv"));
+            fs::write(&path, format!("LON,LAT,NUMBER,STREET,CITY\n{rows}")).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:{dataset}"),
+                path,
+                entry: None,
+                area: None,
+            }
+        };
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file("empty", "empty", "-79.40,43.600,,King Street,Toronto\n"),
+                file(
+                    "lots",
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n\
+                     -79.40,43.604,20,King Street,Toronto\n\
+                     -79.40,43.600,30,King Street,Toronto\n",
+                ),
+                file(
+                    "register",
+                    "register",
+                    "-79.40,43.604,30,King Street,Toronto\n",
+                ),
+                file(
+                    "lots-again",
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n",
+                ),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let counts = report
+            .imports
+            .iter()
+            .map(|import| (import.dataset.as_str(), import.duplicates, import.disputes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            [
+                ("openaddresses:empty", 0, 0),
+                ("openaddresses:lots", 2, 0),
+                ("openaddresses:register", 0, 1),
+                ("openaddresses:lots", 0, 0),
+            ]
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -4933,6 +5014,112 @@ mod tests {
         assert_eq!(found(703), ["osm:way:703"], "the far road stays its own");
         assert_eq!(found(711), ["osm:way:710"]);
         assert!(found(720).is_empty(), "a platform is no street");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// France in the planet has levels no table row names above its
+    /// communes (3, France métropolitaine; 5, Collectivité européenne
+    /// d'Alsace). A street is still labelled and found by its commune, not by
+    /// the arrondissement named for the commune that is its seat.
+    #[test]
+    fn a_french_street_is_labelled_and_found_by_its_commune() {
+        let dir = temp_dir("french-communes");
+        let input = dir.join("france.osm.pbf");
+        let mut nodes = vec![
+            node(1, 2.5, 2.5, &[]),
+            node(2, 2.5, 2.501, &[]),
+            node(3, 3.5, 3.5, &[]),
+            node(4, 3.5, 3.501, &[]),
+            // Each commune's point names it, as in OSM.
+            node(5, 2.6, 2.6, &[("place", "city"), ("name", "Poitiers")]),
+            node(6, 3.6, 3.6, &[("place", "village"), ("name", "Ligugé")]),
+        ];
+        let mut ways = Vec::new();
+        let mut relations = Vec::new();
+        // Admin level, the corners of its square, its tags.
+        type Area<'a> = (&'a str, f64, f64, &'a [(&'a str, &'a str)]);
+        let areas: [Area; 9] = [
+            (
+                "2",
+                0.0,
+                10.0,
+                &[("name", "France"), ("ISO3166-1:alpha2", "FR")],
+            ),
+            ("3", 0.5, 9.5, &[("name", "France métropolitaine")]),
+            (
+                "4",
+                1.0,
+                5.0,
+                &[("name", "Nouvelle-Aquitaine"), ("ISO3166-2", "FR-NAQ")],
+            ),
+            (
+                "5",
+                6.0,
+                9.0,
+                &[("name", "Collectivité européenne d'Alsace")],
+            ),
+            ("6", 1.5, 4.5, &[("name", "Vienne"), ("ISO3166-2", "FR-86")]),
+            ("7", 2.0, 4.0, &[("name", "Poitiers")]),
+            ("8", 2.1, 2.9, &[("name", "Poitiers")]),
+            ("8", 3.1, 3.9, &[("name", "Ligugé")]),
+            ("8", 6.5, 7.5, &[("name", "Strasbourg")]),
+        ];
+        for (index, (level, low, high, tags)) in areas.into_iter().enumerate() {
+            let id = 100 + 10 * index as i64;
+            nodes.extend([
+                node(id, low, low, &[]),
+                node(id + 1, low, high, &[]),
+                node(id + 2, high, high, &[]),
+                node(id + 3, high, low, &[]),
+            ]);
+            ways.push(way(id, &[id, id + 1, id + 2, id + 3, id], &[]));
+            let mut tags = tags.to_vec();
+            tags.extend([("boundary", "administrative"), ("admin_level", level)]);
+            relations.push(relation(id, &[(id, "outer")], &tags));
+        }
+        let road = [("highway", "residential"), ("name", "Grande Rue")];
+        ways.extend([way(700, &[1, 2], &road), way(701, &[3, 4], &road)]);
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut streets = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| {
+                (
+                    street["id"].as_str().expect("id").to_string(),
+                    street["label"].as_str().expect("label").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        streets.sort();
+        assert_eq!(
+            streets,
+            [
+                (
+                    "osm:way:700".to_string(),
+                    "Grande Rue, Poitiers".to_string()
+                ),
+                ("osm:way:701".to_string(), "Grande Rue, Ligugé".to_string()),
+            ]
+        );
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let found = searcher
+            .search(&TextSearchOptions {
+                query: "Grande Rue, Poitiers".to_string(),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(found, ["osm:way:700"]);
         let _ = fs::remove_dir_all(dir);
     }
 
