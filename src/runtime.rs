@@ -976,13 +976,16 @@ fn nearest_of_category(
 ) -> Result<Vec<TextSearchHit>> {
     // Through a typo the kind is never the whole query's own name.
     let typo = |kind: &str| category_typo(kind);
-    let request = match categories::of_request(&options.query) {
-        Some(request) => request,
+    let (request, through_typo) = match categories::of_request(&options.query) {
+        Some(request) => (request, false),
         None => match categories::of_request_with(&options.query, typo) {
-            Some(request) => categories::Request {
-                whole: false,
-                ..request
-            },
+            Some(request) => (
+                categories::Request {
+                    whole: false,
+                    ..request
+                },
+                true,
+            ),
             None => return Ok(named),
         },
     };
@@ -1009,7 +1012,7 @@ fn nearest_of_category(
     // A place in the words outranks where the map is.
     let focus = match &request.place {
         None => options.focus,
-        Some(words) => place_named(state, options, words)?,
+        Some(words) => place_named(state, options, words, through_typo)?,
     };
     let (Some(focus), categories) = (focus, request.categories) else {
         return Ok(named);
@@ -1069,12 +1072,17 @@ fn place_named(
     state: &AppState,
     options: &TextAutocompleteOptions,
     words: &str,
+    towns_only: bool,
 ) -> Result<Option<[f64; 2]>> {
     // A town nearby, then one known abroad ("new york"), then a POI nearby
     // ("pike place" is the market here, not a street in Auckland).
     let towns = state.searcher.place_point(words, options.focus, false)?;
     if let Some(point) = towns.near.or(towns.known_abroad) {
         return Ok(Some(point));
+    }
+    // Through a typo of the kind, the rest is more often a name being typed.
+    if towns_only {
+        return Ok(None);
     }
     let pois = state.places.place_point(words, options.focus, true)?;
     Ok(pois.near.or(towns.known).or(pois.known))
