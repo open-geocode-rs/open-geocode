@@ -1014,7 +1014,7 @@
   "paths": {
     "/autocomplete": {
       "get": {
-        "description": "Suggests addresses and places for partial text, as a user types, in one\nlist. A query that starts with a house number suggests addresses first; a\nplace whose name starts as the query does comes before the addresses. An\nempty or very short `q` returns no results.",
+        "description": "Suggests addresses and places for partial text, as a user types, in one\nlist. A query that starts with a house number suggests addresses first; a\nplace whose name starts as the query does comes before the addresses. An\nempty or very short `q` returns no results.\n\nWhen nothing starts as typed, the words are matched in any order, as the\narea a result is in (`starbucks ballard`) and as the words an\nabbreviation stands for (`pike pl mkt`, `2101 n 34`).",
         "operationId": "autocomplete",
         "parameters": [
           {
