@@ -8711,13 +8711,8 @@ fn mix(
         let (named, others): (Vec<_>, Vec<_>) = places
             .into_iter()
             .partition(|hit| name_starts_as(&hit.record.name, &tokens));
-        let start = mixed.len();
         mixed.extend(named);
         mixed.extend(addresses);
-        // Else a far POI of the name buries the street of it nearby.
-        if near_first {
-            mixed[start..].sort_by_key(|hit| usize::from(hit.signals.focus_band).min(BIAS_BANDS));
-        }
         mixed.extend(others);
     }
     mixed.truncate(limit);
@@ -11798,51 +11793,6 @@ mod tests {
 
         assert_eq!(first("paris"), "osm:node:1");
         assert_eq!(first("pike"), "osm:node:4");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    /// With a focus, the street of the name nearby leads a far POI of it.
-    #[test]
-    fn autocompletes_a_near_street_before_a_far_poi_of_its_name() {
-        let temp_dir = temp_pack_path("autocomplete-near-street");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer
-            .write(&street_record("osm:way:1", "Pike Place").into(), None)
-            .expect("street");
-        writer
-            .write(
-                &PoiRecord {
-                    alt_names: Vec::new(),
-                    name: "Pike Place".to_string(),
-                    category: "amenity:cafe".to_string(),
-                    address: None,
-                    geometry: point_geometry(-122.34, 47.61),
-                    location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(ObjectType::Node, 2),
-                    prominence: Default::default(),
-                    wikidata: None,
-                    brand: None,
-                    aliases: Vec::new(),
-                }
-                .into(),
-                None,
-            )
-            .expect("poi");
-        writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let options = TextAutocompleteOptions {
-            query: "pike place".to_string(),
-            limit: 5,
-            layer: None,
-            countries: Vec::new(),
-            focus: Some([-79.0, 43.0]),
-            bbox: None,
-        };
-
-        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
-        assert_eq!(found[0].record.id, "osm:way:1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
