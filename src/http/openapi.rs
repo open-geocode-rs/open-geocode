@@ -38,11 +38,12 @@ use utoipa::OpenApi;
 
 use crate::{
     api::{
-        Accuracy, Address, Attribution, Common, Context, ContextArea, FeatureCollectionType,
-        FeatureType, ForwardCollection, ForwardFeature, ForwardGeocoding, ForwardProperties,
-        LonLat, Point, PointType, ReverseCollection, ReverseFeature, ReverseGeocoding,
-        ReverseProperties, Source, Version,
+        Accuracy, Address, Attribution, Common, Context, ContextArea, EnclosingArea,
+        FeatureCollectionType, FeatureType, ForwardCollection, ForwardFeature, ForwardGeocoding,
+        ForwardProperties, LonLat, Point, PointType, ReverseCollection, ReverseFeature,
+        ReverseGeocoding, ReverseProperties, Source, Version,
     },
+    enclosing::AreaTags,
     http::batch,
     limits::Limits,
     record::{Brand, Layer, RoadClass},
@@ -112,6 +113,8 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Address,
         Context,
         ContextArea,
+        EnclosingArea,
+        AreaTags,
         Source,
         RoadClass,
         Brand,
@@ -255,6 +258,8 @@ pub(crate) struct GeocodeItem {
     /// ISO 3166-1 alpha-2 codes, comma-separated.
     #[schema(example = "CA")]
     pub country: Option<String>,
+    /// `true` lists every area each result lies in, as on `GET`.
+    pub enclosing: Option<bool>,
 }
 
 /// One item of a `/places` batch: `GET /places`' parameters and an `id`.
@@ -287,6 +292,8 @@ pub(crate) struct PlacesItem {
     /// `min_lon,min_lat,max_lon,max_lat`.
     #[schema(example = "4.73,52.28,5.07,52.43")]
     pub bbox: Option<String>,
+    /// `true` lists every area each result lies in, as on `GET`.
+    pub enclosing: Option<bool>,
 }
 
 /// One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.
@@ -304,6 +311,8 @@ pub(crate) struct ReverseItem {
     #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
     pub lat: Option<f64>,
     pub layer: Option<Layer>,
+    /// `true` lists every area each result lies in, as on `GET`.
+    pub enclosing: Option<bool>,
 }
 
 /// A forward batch's answer: one result per item, in input order.

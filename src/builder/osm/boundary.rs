@@ -13,6 +13,7 @@ use rstar::{AABB, RTree, RTreeObject};
 use crate::{
     builder::report::BuilderReport,
     context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext, TierSet},
+    enclosing::AreaTags,
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
@@ -150,6 +151,7 @@ struct BuiltBoundary {
     /// `CA-ON`. Kept whatever tier the boundary is ranked at, which for a
     /// country with many levels need not be the region tier.
     subdivision_code: Option<String>,
+    area_tags: AreaTags,
     /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
@@ -337,6 +339,9 @@ impl BoundaryCandidate {
             + text(&boundary.designation)
             + text(&boundary.inferred_country_code)
             + text(&boundary.subdivision_code)
+            + text(&boundary.area_tags.admin_level)
+            + text(&boundary.area_tags.boundary)
+            + text(&boundary.area_tags.place)
     }
 }
 
@@ -525,6 +530,17 @@ impl BoundarySet {
         boundaries.chain(countries).collect()
     }
 
+    pub(crate) fn area_tags(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> BTreeMap<RecordId, AreaTags> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.area_tags.clone()))
+            .collect()
+    }
+
     /// What the boundaries cover: the countries whose own boundary is
     /// whole, and the regions of the others. A country boundary assembles only
     /// from every one of its ways, so an extract of one province has the
@@ -685,7 +701,11 @@ impl BoundarySet {
 /// Admin context for a record, from the boundaries covering its display point.
 /// Values the source data states (an `addr:city`, a place's own name) win ties
 /// between overlapping boundaries.
-pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<RecordContext> {
+pub(crate) fn record_context(
+    index: &BoundaryIndex,
+    record: &Record,
+    own_area: Option<f64>,
+) -> Option<RecordContext> {
     let [lon, lat] = record.display_point()?;
     let source = match record {
         Record::Address(record) => SourceContext {
@@ -721,7 +741,7 @@ pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<R
         },
         Record::Street(_) | Record::Postcode(_) => SourceContext::default(),
     };
-    Some(index.context_for_point(lon, lat, &source))
+    Some(index.context_around(lon, lat, &source, own_area))
 }
 
 pub(crate) fn boundary_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -762,6 +782,26 @@ impl BoundaryIndex {
         lon: f64,
         lat: f64,
         source_context: &SourceContext<'_>,
+    ) -> RecordContext {
+        self.context_around(lon, lat, source_context, None)
+    }
+
+    /// The area of the boundary a [`ContextOrigin::Boundary`] record was made from.
+    pub(crate) fn area_of(&self, origin: u32) -> Option<f64> {
+        self.boundaries
+            .get(usize::try_from(origin).ok()?)
+            .map(|boundary| boundary.area)
+    }
+
+    /// [`Self::context_for_point`], with `enclosing` listing only the areas
+    /// larger than `own_area`: the point of an area is a centroid, which can lie
+    /// outside its outline and inside areas that it does not lie in.
+    pub(crate) fn context_around(
+        &self,
+        lon: f64,
+        lat: f64,
+        source_context: &SourceContext<'_>,
+        own_area: Option<f64>,
     ) -> RecordContext {
         if self.boundaries.is_empty() || !lon.is_finite() || !lat.is_finite() {
             return RecordContext::default();
@@ -804,16 +844,33 @@ impl BoundaryIndex {
                     boundary.tiers.iter().map(|at| (at, boundary.record_id))
                 })
             }));
+        let mut derived_country = None;
         if tuple.country_record_id().is_none()
             && let Some(country) = best[PlaceLayer::Region as usize]
                 .and_then(|region| region.inferred_country_record_id)
         {
             tuple.set(PlaceLayer::Country, country);
+            derived_country = Some(country);
         }
 
+        // Size orders them; it does not prove one lies in the next. Ties break
+        // on the source object so one input gives one order.
+        let source = |boundary: &AcceptedBoundary| {
+            let object_type = source_type_rank(boundary.source_object_type);
+            (object_type, boundary.source_object_id)
+        };
+        covered.sort_by(|left, right| {
+            (left.area.total_cmp(&right.area)).then_with(|| source(left).cmp(&source(right)))
+        });
+        covered.retain(|boundary| own_area.is_none_or(|own| boundary.area > own));
         RecordContext {
             admin_context: tuple,
             flags,
+            enclosing: covered
+                .iter()
+                .map(|boundary| boundary.record_id)
+                .chain(derived_country)
+                .collect(),
         }
     }
 }
@@ -1040,6 +1097,7 @@ fn built(
             designation,
             inferred_country_code: country_code_from_tags(tags, layer),
             subdivision_code: subdivision_code_from_tags(tags, layer),
+            area_tags: AreaTags::from_osm(tags),
             shape: ShapeRef::default(),
             bounds,
             area: geometry.unsigned_area(),
@@ -2004,6 +2062,7 @@ impl crate::extsort::Spill for SetItem {
                 put_opt_str(out, boundary.designation.as_deref());
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
                 put_opt_str(out, boundary.subdivision_code.as_deref());
+                boundary.area_tags.put(out);
                 put_u64(out, boundary.shape.offset);
                 put_u64(out, boundary.shape.bytes);
                 let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
@@ -2072,6 +2131,7 @@ impl crate::extsort::Spill for SetItem {
                 let designation = get_opt_string(input)?;
                 let inferred_country_code = get_opt_string(input)?;
                 let subdivision_code = get_opt_string(input)?;
+                let area_tags = AreaTags::get(input)?;
                 let shape = ShapeRef {
                     offset: get_u64(input)?,
                     bytes: get_u64(input)?,
@@ -2107,6 +2167,7 @@ impl crate::extsort::Spill for SetItem {
                         designation,
                         inferred_country_code,
                         subdivision_code,
+                        area_tags,
                         shape,
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
                         area,
@@ -2426,6 +2487,7 @@ mod tests {
             designation: None,
             inferred_country_code: None,
             subdivision_code: None,
+            area_tags: AreaTags::default(),
             representative_point: representative_point(&geometry).expect("point"),
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
@@ -2828,6 +2890,7 @@ mod tests {
                         .map(str::to_ascii_uppercase)
                         .or_else(|| (level <= 2).then(|| "AU".to_string())),
                     subdivision_code: None,
+                    area_tags: AreaTags::default(),
                     representative_point: representative_point(&geometry).expect("point"),
                     shape,
                     bounds,

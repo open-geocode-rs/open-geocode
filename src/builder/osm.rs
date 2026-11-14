@@ -99,6 +99,7 @@ use crate::{
         },
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
     },
+    enclosing::AreaTags,
     extsort::{
         ExternalSorter, IndexedSpool, RunState, Scratch, ScratchFile, Sorted, SorterState, Spill,
         Spool, SpoolFile,
@@ -441,6 +442,7 @@ struct Contexts {
     settled: HashSet<RecordId>,
     index: BoundaryIndex,
     area_names: HashMap<RecordId, Vec<String>>,
+    area_tags: BTreeMap<RecordId, AreaTags>,
     country_codes: HashMap<RecordId, CountryCode>,
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
@@ -458,6 +460,7 @@ impl Contexts {
     ) -> Self {
         let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
         let area_names = boundaries.context_names(&boundary_ids, &country_ids);
+        let area_tags = boundaries.area_tags(&boundary_ids);
         let region_groups = boundaries.region_groups(&boundary_ids);
         let index = boundaries.into_index(&boundary_ids, &country_ids);
         Self {
@@ -467,6 +470,7 @@ impl Contexts {
             settled,
             index,
             area_names,
+            area_tags,
             country_codes,
             region_groups,
         }
@@ -1686,6 +1690,7 @@ impl<'a> Run<'a> {
             ordered,
             index,
             area_names,
+            area_tags,
             country_codes,
             region_groups,
             ..
@@ -1703,6 +1708,7 @@ impl<'a> Run<'a> {
             &self.writer_options(),
         )?;
         writer.set_context_names(area_names);
+        writer.set_area_tags(area_tags);
         writer.set_country_codes(country_codes);
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
@@ -3062,12 +3068,25 @@ fn write_ordered(
                                         ranked_ref.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                let located = record_context(index, &record);
+                                let own_area = match &origin {
+                                    Some(ContextOrigin::Boundary(boundary)) => {
+                                        index.area_of(*boundary)
+                                    }
+                                    _ => None,
+                                };
+                                let located = record_context(index, &record, own_area);
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
-                                let context: Option<RecordContext> = match origin {
-                                    Some(_) => None,
+                                // A country derived from regions has none around it.
+                                let context = match origin {
+                                    Some(ContextOrigin::DerivedCountry(_)) => None,
+                                    Some(ContextOrigin::Boundary(_)) => located
+                                        .map(|located| RecordContext {
+                                            enclosing: located.enclosing,
+                                            ..Default::default()
+                                        })
+                                        .filter(RecordContext::is_area_list),
                                     None => located,
                                 };
                                 ((record, context), country)
@@ -3185,9 +3204,11 @@ mod tests {
     use crate::{
         builder::progress::StageUnit,
         pack::{PointPrecision, Reader},
+        parse::lattice::dictionary::Dictionaries,
         record::Record,
         reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
         search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
+        util::temp::TempPath,
     };
 
     use super::{
@@ -5637,15 +5658,136 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Every record and the context of each, in Pack order.
+    /// The district wins the locality tier from a `place=city` area around it,
+    /// as in Moscow; the list keeps both. The ward is a way and a relation of
+    /// one outline, so only the tie-break orders them. An area lists the
+    /// larger areas only, whatever lies around its point, which for a hook
+    /// shape is not in the area at all.
+    #[test]
+    fn a_pack_lists_the_areas_a_record_lies_in_with_their_raw_tags() {
+        let dir = TempPath::new("build-enclosing");
+        fs::create_dir_all(&dir).expect("dir");
+        let input = dir.join("enclosing.osm.pbf");
+        let mut blocks = town();
+        let corners = [
+            (43.55, -79.55),
+            (43.55, -79.25),
+            (43.8, -79.25),
+            (43.8, -79.55),
+        ];
+        let nodes = (2001..)
+            .zip(corners)
+            .map(|(id, (lat, lon))| node(id, lat, lon, &[]));
+        blocks[1].extend(nodes);
+        let south = [("addr:housenumber", "7"), ("addr:street", "King Street")];
+        blocks[1].push(node(2010, 43.52, -79.4, &south));
+        let village = [("place", "village"), ("name", "Lonely")];
+        blocks[1].push(node(2011, 10.0, 10.0, &village));
+        let city = [
+            ("place", "city"),
+            ("boundary", "administrative"),
+            ("name", "Metro"),
+        ];
+        blocks[2].push(way(700, &[2001, 2002, 2003, 2004, 2001], &city));
+        // The centroid of the hook lies in its hollow, in the smaller pocket.
+        let hook = [
+            (43.85, -79.95),
+            (43.85, -79.75),
+            (43.87, -79.75),
+            (43.87, -79.93),
+        ];
+        let hook = [
+            &hook[..],
+            &[
+                (43.93, -79.93),
+                (43.93, -79.75),
+                (43.95, -79.75),
+                (43.95, -79.95),
+            ],
+        ]
+        .concat();
+        let pocket = [
+            (43.89, -79.87),
+            (43.89, -79.85),
+            (43.91, -79.85),
+            (43.91, -79.87),
+        ];
+        for (way_id, first, level, name, ring) in [
+            (710, 3000, "9", "Hook", &hook[..]),
+            (711, 3100, "10", "Pocket", &pocket[..]),
+        ] {
+            let ids = (first..).take(ring.len()).collect::<Vec<_>>();
+            blocks[1].extend(
+                ids.iter()
+                    .zip(ring)
+                    .map(|(id, (lat, lon))| node(*id, *lat, *lon, &[])),
+            );
+            let tags = [
+                ("boundary", "administrative"),
+                ("admin_level", level),
+                ("name", name),
+            ];
+            blocks[2].push(way(way_id, &[&ids[..], &ids[..1]].concat(), &tags));
+        }
+        write_pbf(&input, &blocks);
+        build(&dir.join("pack"), &input, None);
+        let pack = Reader::open(dir.join("pack")).expect("reader");
+
+        let id = |source: &str| pack.find_by_source_id(source).unwrap().expect(source);
+        let [hook, pocket] = ["way:710", "way:711"].map(|source| id(&format!("osm:{source}")));
+        let [toronto, metro, ontario] =
+            ["relation:900", "way:700", "relation:901"].map(|source| id(&format!("osm:{source}")));
+        let (king, south, bay) = (id("osm:node:1"), id("osm:node:2010"), id("osm:way:602"));
+        let (ward, ward_relation) = (id("osm:way:605"), id("osm:relation:902"));
+        let context = pack.boundary_context(king).unwrap().expect("context");
+        assert_eq!(context.admin_context.locality_record_id(), Some(toronto));
+        // The country is derived from the region's code and shares its source id.
+        let canada = context.admin_context.country_record_id().expect("country");
+
+        let lists = [
+            (king, vec![toronto, metro, ontario, canada]),
+            (south, vec![toronto, ontario, canada]),
+            (
+                bay,
+                vec![ward_relation, ward, toronto, metro, ontario, canada],
+            ),
+            (toronto, vec![metro, ontario, canada]),
+            (metro, vec![ontario, canada]),
+            (canada, vec![]),
+            (hook, vec![ontario, canada]),
+            (pocket, vec![ontario, canada]),
+        ];
+        for (record, list) in lists {
+            assert_eq!(pack.enclosing_areas(record).unwrap(), list, "{record}");
+        }
+        // An area's list is no context: its names stay out of the parser's places,
+        // and a place outside every area keeps its own.
+        let dictionaries = Dictionaries::open(pack.container()).expect("dictionaries");
+        assert!(dictionaries.areas("metro").is_empty());
+        assert_eq!(dictionaries.areas("lonely"), [id("osm:node:2011") as u32]);
+        let admin = Some("administrative");
+        for (area, tags) in [
+            (toronto, Some(AreaTags::of(None, admin, Some("8")))),
+            (metro, Some(AreaTags::of(Some("city"), admin, None))),
+            (canada, None),
+        ] {
+            assert_eq!(pack.area_tags(area).unwrap(), tags, "{area}");
+            assert!(pack.boundary_context(area).unwrap().is_none(), "{area}");
+        }
+    }
+
+    /// Every record and the context of each, in Pack order, with the areas
+    /// each lies in and its own tags.
     fn records_and_contexts(pack: &Path) -> Vec<(serde_json::Value, Option<RecordContext>)> {
         let reader = Reader::open(pack).expect("reader");
         (0..reader.manifest().record_count)
             .map(|id| {
-                (
-                    reader.record_json(id).expect("record"),
-                    reader.boundary_context(id).expect("context"),
-                )
+                let record = serde_json::json!({
+                    "record": reader.record_json(id).expect("record"),
+                    "enclosing": reader.enclosing_areas(id).expect("areas"),
+                    "tags": reader.area_tags(id).expect("tags"),
+                });
+                (record, reader.boundary_context(id).expect("context"))
             })
             .collect()
     }

@@ -276,7 +276,7 @@ where
 {
     let prepared = items
         .into_iter()
-        .map(|item| prepare(state, lookup, shared, item))
+        .map(|item| prepare(state, lookup, shared, item, &|_| Ok(())))
         .collect::<Vec<_>>();
     map_in_order(
         &prepared,
@@ -338,12 +338,14 @@ fn finish<A>(
 }
 
 /// Check one item by the rules its `GET` is checked with. A panic fails the
-/// item, not the batch.
+/// item, not the batch. `refuse` may fail the item on its query string once
+/// that parses, before the lookup is prepared.
 pub(crate) fn prepare<P, Q, A, K>(
     state: &AppState,
     lookup: Lookup<P, Q, A, K>,
     shared: &[(String, String)],
     item: RawItem,
+    refuse: &dyn Fn(&str) -> Result<(), Problem>,
 ) -> Prepared<Q>
 where
     P: DeserializeOwned,
@@ -373,6 +375,7 @@ where
         let key = item_query(shared, &fields)?;
         let params =
             serde_urlencoded::from_str::<P>(&key).map_err(|_| Problem::unparsable_parameters())?;
+        refuse(&key)?;
         Ok((key, (lookup.prepare)(state, params)?))
     }))
     .unwrap_or_else(|payload| Err(Problem::panicked(payload.as_ref())));
