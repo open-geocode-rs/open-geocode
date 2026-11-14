@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -312,6 +312,28 @@ impl JobStore {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+
+    /// Where the store keeps its files. A vendor upload staged for a job
+    /// lives here too, under the same retention.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn status(&self, id: &str) -> Option<JobStatus> {
+        self.get(id).map(|job| job.snapshot())
+    }
+
+    /// Stop a job's rows; those already answered are kept.
+    pub(crate) fn cancel(&self, id: &str) -> Option<JobStatus> {
+        let job = self.get(id)?;
+        job.cancel.store(true, Ordering::Relaxed);
+        Some(job.snapshot())
+    }
+
+    /// The job's results file, written as `output_format`.
+    pub(crate) fn results_path(&self, id: &str) -> Option<PathBuf> {
+        self.get(id).map(|job| job.results.clone())
     }
 
     fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -802,7 +824,9 @@ pub(crate) async fn create(State(state): State<AppState>, request: Request) -> R
     }
 }
 
-async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
+/// [`create`], with the Problem left to the caller. A vendor route starts
+/// its jobs here and answers a refusal in the vendor's own shape.
+pub(crate) async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
     let started = Instant::now();
     let input = batch::media_type(request.headers())
         .and_then(Format::of)
@@ -1601,8 +1625,8 @@ pub(crate) async fn status(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
-    Ok(axum::Json(job.snapshot()).into_response())
+    let status = state.jobs().status(&id).ok_or_else(no_such_job)?;
+    Ok(axum::Json(status).into_response())
 }
 
 /// Get a job's results
@@ -1658,9 +1682,8 @@ pub(crate) async fn cancel(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
-    job.cancel.store(true, Ordering::Relaxed);
-    Ok(axum::Json(job.snapshot()).into_response())
+    let status = state.jobs().cancel(&id).ok_or_else(no_such_job)?;
+    Ok(axum::Json(status).into_response())
 }
 
 /// Delete a job
@@ -1699,5 +1722,6 @@ pub(crate) async fn sweep_forever(state: AppState) {
     loop {
         every.tick().await;
         state.jobs().sweep();
+        crate::compat::precisely::sweep(&state);
     }
 }

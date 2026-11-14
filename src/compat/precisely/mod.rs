@@ -1,0 +1,351 @@
+//! `/compat/precisely`, Precisely's Data Integrity Suite APIs. The token
+//! call, real-time Geo Addressing v1 and Bulk Geo Addressing v2.
+//!
+//! Real-time calls answer each item with og's own lookup. Bulk jobs are og
+//! `/jobs`. The uploaded CSV streams into a job as JSONL, and the job's JSONL
+//! results stream back out as Precisely's output CSV.
+
+mod auth;
+mod bulk;
+mod realtime;
+mod result;
+#[cfg(test)]
+mod tests;
+
+use axum::{
+    Router,
+    body::{Body, Bytes},
+    extract::Request,
+    http::{HeaderMap, StatusCode},
+    routing::{delete, get, post, put},
+};
+use futures_util::StreamExt;
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::json;
+use tokio::sync::mpsc;
+
+use super::{VendorError, retry_after};
+use crate::{http::problem::Problem, runtime::AppState};
+
+pub(crate) use bulk::sweep;
+
+pub(crate) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/auth/v2/token", post(auth::token).fallback(not_found))
+        .route("/v1/geocode", post(realtime::geocode).fallback(not_found))
+        .route(
+            "/v1/reverse-geocode",
+            post(realtime::reverse).fallback(not_found),
+        )
+        .route("/v1/lookup", post(realtime::lookup).fallback(not_found))
+        .route("/v1/verify", post(not_implemented).fallback(not_found))
+        .route(
+            "/v1/autocomplete",
+            post(realtime::autocomplete).fallback(not_found),
+        )
+        // Same request and response as `/v1/autocomplete`; v2 adds a
+        // filter or bias og cannot honour.
+        .route(
+            "/v1/express-autocomplete",
+            post(realtime::autocomplete).fallback(not_found),
+        )
+        .route(
+            "/v2/express-autocomplete",
+            post(realtime::autocomplete).fallback(not_found),
+        )
+        .route(
+            "/v1/autocomplete/postal-city",
+            post(not_implemented).fallback(not_found),
+        )
+        .route(
+            "/v1/explain-addresscode",
+            post(not_implemented).fallback(not_found),
+        )
+        .route(
+            "/v1/proximity-search",
+            post(not_implemented).fallback(not_found),
+        )
+        .route(
+            "/v2/files/upload-url",
+            post(bulk::upload_url).fallback(not_found),
+        )
+        .route("/v2/files", get(bulk::list_files).fallback(not_found))
+        .route(
+            "/v2/files/{file_id}",
+            delete(bulk::delete_file).fallback(not_found),
+        )
+        .route(
+            "/v2/files/{file_id}/content",
+            put(bulk::put_content).fallback(not_found),
+        )
+        .route("/v2/bulk-geocode", post(bulk::submit).fallback(not_found))
+        // Verify checks deliverability against a postal file; og has none,
+        // so a geocode dressed as a verification would mislead.
+        .route("/v2/bulk-verify", post(not_implemented).fallback(not_found))
+        .route("/v2/bulk/jobs", get(bulk::list_jobs).fallback(not_found))
+        .route(
+            "/v2/bulk/jobs/{job_id}",
+            get(bulk::job_status)
+                .delete(bulk::cancel_job)
+                .fallback(not_found),
+        )
+        .route(
+            "/v2/bulk/jobs/{job_id}/output",
+            get(bulk::output).fallback(not_found),
+        )
+        .fallback(not_found)
+}
+
+/// Precisely's error envelope. `status` names the failure; the message ends
+/// with Precisely's error code in parentheses, as Precisely writes it.
+pub(super) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> VendorError {
+    VendorError::new(
+        status,
+        json!({"errors": [{"status": code, "errorMessage": message.into()}]}),
+    )
+}
+
+/// Precisely documents no 404 or 405; a wrong method answers this too.
+async fn not_found() -> VendorError {
+    error(
+        StatusCode::NOT_FOUND,
+        "NOT_FOUND",
+        "No such resource on this server",
+    )
+}
+
+async fn not_implemented() -> VendorError {
+    error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NOT_IMPLEMENTED",
+        "This API is not implemented by this server",
+    )
+}
+
+pub(super) const INTERNAL_MESSAGE: &str =
+    "Issue with internal services. Please try again after sometime (DIS-1003)";
+const MAX_RESULTS_MESSAGE: &str = "Invalid value for maxResults (DIS-LI-1036)";
+const UNAVAILABLE_MESSAGE: &str =
+    "Issue with internal services. Please try again after sometime (DIS-LI-1011)";
+
+/// A failure og answered with, as Precisely names it. The HTTP status a
+/// whole request would get, the `status` value and the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Failure {
+    pub(super) http: StatusCode,
+    pub(super) status: &'static str,
+    pub(super) message: String,
+    /// The request's own preferences were refused, which fails every item
+    /// alike, so the whole request answers it.
+    pub(super) of_request: bool,
+}
+
+impl Failure {
+    /// `country` is the value the client sent, named in the message when og
+    /// refuses it.
+    pub(super) fn of(problem: &Problem, country: Option<&str>) -> Self {
+        let params = problem
+            .invalid_params()
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>();
+        Self::from_parts(
+            problem.status(),
+            problem.error_code().as_str(),
+            problem.detail(),
+            &params,
+            country,
+        )
+    }
+
+    pub(super) fn from_parts(
+        status: u16,
+        code: &str,
+        detail: Option<&str>,
+        params: &[&str],
+        country: Option<&str>,
+    ) -> Self {
+        if code == "limit_too_large" {
+            return Self {
+                http: StatusCode::BAD_REQUEST,
+                status: "INVALID_REQUEST",
+                message: MAX_RESULTS_MESSAGE.to_string(),
+                of_request: true,
+            };
+        }
+        let (http, status, message) = match (status, code) {
+            (400, _) if params.contains(&"country") => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                match country {
+                    Some(country) => {
+                        format!("Not able to identify {country} country (DIS-LI-1016)")
+                    }
+                    None => "Not able to identify requested country (DIS-LI-1016)".to_string(),
+                },
+            ),
+            (_, "timeout") => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "REQUEST_TIMEOUT",
+                UNAVAILABLE_MESSAGE.to_string(),
+            ),
+            (503, _) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
+                UNAVAILABLE_MESSAGE.to_string(),
+            ),
+            (400..500, _) => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                match detail {
+                    Some(detail) => format!("{detail} (DIS-LI-1018)"),
+                    None => "Request Body is not valid (DIS-LI-1018)".to_string(),
+                },
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                INTERNAL_MESSAGE.to_string(),
+            ),
+        };
+        Self {
+            http,
+            status,
+            message,
+            of_request: false,
+        }
+    }
+
+    pub(super) fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            http: StatusCode::BAD_REQUEST,
+            status: "INVALID_REQUEST",
+            message: message.into(),
+            of_request: false,
+        }
+    }
+
+    /// The whole request failing for this reason, with og's Problem behind
+    /// it for the log and its `Retry-After`.
+    pub(super) fn into_error(self, problem: Problem) -> VendorError {
+        let retry = retry_after(&problem);
+        let mut error = error(self.http, self.status, self.message).caused_by(problem);
+        if let Some((name, value)) = retry {
+            error = error.with_header(name, value);
+        }
+        error
+    }
+}
+
+/// The two-letter code og filters by, from the alpha-2, alpha-3 or numeric
+/// code Precisely takes. Anything else goes to og as sent, which refuses it
+/// unless it has two letters; then og answers it as a country it does not
+/// cover, with nothing.
+fn country_code(country: &str) -> String {
+    let country = country.trim();
+    if country.len() == 3 {
+        let mapped = if country.bytes().all(|byte| byte.is_ascii_digit()) {
+            super::iso::alpha2_of_numeric(country)
+        } else {
+            super::iso::alpha2_of(country)
+        };
+        if let Some(alpha2) = mapped {
+            return alpha2.to_string();
+        }
+    }
+    country.to_string()
+}
+
+/// A field Precisely sends as `""` when it has no value.
+fn given(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// `preferences`, the fields og can honour. The rest, and their types, are
+/// not read, since `clientLocale` comes as a string or an object.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Preferences {
+    max_results: Option<i64>,
+}
+
+/// Precisely answers one candidate unless asked for more.
+const DEFAULT_MAX_RESULTS: i64 = 1;
+
+impl Preferences {
+    fn max_results(&self) -> Result<usize, VendorError> {
+        let max = self.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+        usize::try_from(max)
+            .ok()
+            .filter(|max| *max > 0)
+            .ok_or_else(|| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_REQUEST",
+                    MAX_RESULTS_MESSAGE,
+                )
+            })
+    }
+}
+
+/// The JSON body, refused in Precisely's shape when it is missing, too
+/// large or not the request's schema.
+async fn read_json<T: DeserializeOwned>(
+    state: &AppState,
+    request: Request,
+    invalid_status: &'static str,
+) -> Result<T, VendorError> {
+    let limit = state.limits().max_batch_body_bytes();
+    let bytes = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "INVALID_REQUEST",
+                format!("Request body is over {limit} bytes (DIS-LI-1018)"),
+            )
+        })?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            invalid_status,
+            "Request body is not specified in the request (DIS-LI-1019)",
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        error(
+            StatusCode::BAD_REQUEST,
+            invalid_status,
+            "Request Body is not valid (DIS-LI-1018)",
+        )
+    })
+}
+
+/// `scheme://host` the client reached og by, so a URL handed back for it
+/// to call works through the proxy in front of og too.
+fn base_url(headers: &HeaderMap) -> String {
+    let forwarded = |name: &str| {
+        super::header(headers, name)
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let scheme = forwarded("x-forwarded-proto")
+        .filter(|scheme| matches!(*scheme, "http" | "https"))
+        .unwrap_or("http");
+    let host = forwarded("x-forwarded-host")
+        .or_else(|| super::header(headers, "host"))
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}/compat/precisely")
+}
+
+/// A body fed from a blocking writer through `chunks`; an `Err` ends it
+/// broken, so a reader can tell a cut-off file from a whole one.
+fn channel_body(chunks: mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Body {
+    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move {
+        chunks.recv().await.map(|chunk| (chunk, chunks))
+    });
+    // Fused, since tower-http compression polls a body once more after its
+    // end, and unfold panics when polled past its end (see `jobs::tail`).
+    Body::from_stream(stream.fuse())
+}
