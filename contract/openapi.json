@@ -206,6 +206,11 @@
       },
       "ContextArea": {
         "properties": {
+          "code": {
+            "description": "ISO 3166-1 alpha-2 code, such as `NZ`. Present only on `country`.",
+            "example": "NZ",
+            "type": "string"
+          },
           "id": {
             "description": "Stable ID from the source data, as in a result's `id`.",
             "type": "string"

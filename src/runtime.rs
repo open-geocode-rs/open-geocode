@@ -28,7 +28,7 @@ use tower_http::{
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
-    categories,
+    categories, compat,
     http::{
         batch::{self, Lookup},
         bounds, health,
@@ -426,7 +426,8 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/openapi.json", get_only(openapi::openapi_json))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz))
-        .route("/version", get_only(version::version));
+        .route("/version", get_only(version::version))
+        .merge(compat::router());
 
     // The basemap PMTiles lives with the other data artifacts (not in the demo
     // dir), so serve it explicitly. ServeFile honors HTTP range requests, which

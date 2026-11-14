@@ -262,7 +262,7 @@ async fn responses_match_the_committed_examples() {
         json!({
             "locality": {"id": "osm:relation:3", "name": "Toronto"},
             "region": {"id": "osm:relation:2", "name": "Ontario"},
-            "country": {"id": "osm:relation:1", "name": "Canada"},
+            "country": {"id": "osm:relation:1", "name": "Canada", "code": "CA"},
         })
     );
     assert!(properties["score"].is_number());
