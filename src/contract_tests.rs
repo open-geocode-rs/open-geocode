@@ -261,7 +261,7 @@ async fn responses_match_the_committed_examples() {
         properties["context"],
         json!({
             "locality": {"id": "osm:relation:3", "name": "Toronto"},
-            "region": {"id": "osm:relation:2", "name": "Ontario"},
+            "region": {"id": "osm:relation:2", "name": "Ontario", "code": "CA-ON"},
             "country": {"id": "osm:relation:1", "name": "Canada", "code": "CA"},
         })
     );
@@ -916,6 +916,7 @@ fn write_pack(dir: &PathBuf) {
         .into_iter()
         .collect(),
     );
+    writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),

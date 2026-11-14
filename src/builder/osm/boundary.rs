@@ -689,6 +689,22 @@ impl BoundarySet {
         boundaries.chain(derived).collect()
     }
 
+    /// The ISO 3166-2 code of each area record below a country whose
+    /// boundary states one (`CA-ON`), by record id.
+    pub(crate) fn subdivision_codes(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, String> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter_map(|(candidate, record_id)| {
+                let code = candidate.boundary.subdivision_code.clone()?;
+                Some((*record_id, code))
+            })
+            .collect()
+    }
+
     /// The groups of regions each admin region lies in, by record id: the
     /// larger admin regions of another name covering its representative
     /// point ("関東地方" of "千葉県"). A record keeps the smaller region as
