@@ -8737,6 +8737,7 @@ pub fn suggest(
         // Seattle) before the far place spelt that way.
         if let Some(focus) = options.focus
             && completion != Completion::Typos
+            && last_word_may_be_a_typo(&options.query)
             && !mixed.iter().any(|hit| near(hit, focus))
         {
             let mut typos = tier(Completion::Typos)?;
@@ -8754,6 +8755,16 @@ pub fn suggest(
         return Ok(mixed);
     }
     Ok(Vec::new())
+}
+
+/// Whether the last word is long enough to hold a typo. Shorter, it is still
+/// being typed, and the retry would cost a search of every word it starts.
+fn last_word_may_be_a_typo(query: &str) -> bool {
+    search_key(query.trim()).is_some_and(|key| {
+        key.split_whitespace()
+            .last()
+            .is_some_and(|last| allowed_edits(last).is_some())
+    })
 }
 
 /// Scores over different fields do not compare, so the query decides the
