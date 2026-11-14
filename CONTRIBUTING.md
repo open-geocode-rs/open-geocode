@@ -86,3 +86,8 @@ A draft is not reviewed until it is marked ready.
 Then a maintainer reviews it.
 
 Only maintainers can start a Devin review by hand with `/devin review`.
+
+## Licence
+
+open-geocode is licensed under the [Apache License 2.0](LICENSE).
+By opening a pull request, you agree that your contribution is licensed under it too.
