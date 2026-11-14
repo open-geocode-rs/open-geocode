@@ -690,9 +690,7 @@ pub(crate) fn other_forms(word: &str) -> Vec<String> {
     forms
 }
 
-/// [`other_forms`], and the one-word abbreviations of `word` as a full form
-/// ("n" of "north"). A record may state either, as "N 34TH ST" or "North
-/// 34th Street".
+/// Records write either form, "N 34TH ST" or "North 34th Street".
 pub(crate) fn forms_both_ways(word: &str) -> Vec<String> {
     let mut forms = other_forms(word);
     for form in abbreviations::abbreviations().short_forms(word) {

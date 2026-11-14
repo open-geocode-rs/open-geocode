@@ -743,9 +743,8 @@ impl TextSearcher {
             .map(|hit| AddressGeocodeHit { query, hit }))
     }
 
-    /// Suggestions for `options.query`. Those that start as typed come
-    /// alone, and only when none do, those that match its words another
-    /// way (see [`Completion`]).
+    /// Fallback only when nothing starts as typed. It reads planet-wide
+    /// postings.
     pub fn autocomplete(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
         for completion in Completion::ALL {
             let hits = self.autocomplete_as(options, completion)?;
@@ -756,7 +755,6 @@ impl TextSearcher {
         Ok(Vec::new())
     }
 
-    /// The suggestions that match `options.query` as `completion` says.
     fn autocomplete_as(
         &self,
         options: &TextAutocompleteOptions,
@@ -797,9 +795,8 @@ impl TextSearcher {
         if street.is_empty() || !is_address_number_token(last) {
             return Ok(as_typed);
         }
-        // A trailing number is a word of the name ("Pier 39"), else the house
-        // number after its street ("Kerkstraat 12"), as most of Europe writes
-        // it. One matching only a postcode ("Kerkstraat, 1211CK") is neither.
+        // Trailing number names a place ("Pier 39") or is the house number
+        // ("Kerkstraat 12"). Postcode prefix ("1211CK") is neither.
         let names_it = |hit: &TextSearchHit| {
             search_key(&hit.record.name).is_some_and(|name| {
                 name.split_whitespace()
@@ -818,8 +815,6 @@ impl TextSearcher {
         })
     }
 
-    /// The suggestions for one reading of the typed words: `words`, after
-    /// house number `number` when the reading has one.
     fn autocomplete_reading(
         &self,
         options: &TextAutocompleteOptions,
@@ -850,8 +845,7 @@ impl TextSearcher {
                 !label.iter().any(|label| types_word(word, label, last))
             }));
         }
-        // Contraction no table lists ranks by label alone, which index lacks.
-        // "mkt" is a word of "Pike Place Market" only.
+        // Index cannot match "mkt" to "market". Label can.
         if completion == Completion::AllWords {
             hits.sort_by_cached_key(|hit| {
                 let label = label_words(&hit.record);
@@ -5229,12 +5223,8 @@ impl TextSearcher {
             .collect()
     }
 
-    /// The query of the suggestions that match the typed `words` as
-    /// `completion` says, after a house number when `number` is one. Of
-    /// [`Completion::AllWords`], a word may be one of what a record is or
-    /// of where it is ("starbucks ballard"), but one at least must be of
-    /// what it is. Every place of a town is no suggestion for the town's
-    /// name.
+    /// One word must match the record itself, else "ballard" suggests every
+    /// place in Ballard.
     fn autocomplete_query(
         &self,
         completion: Completion,
@@ -5302,9 +5292,6 @@ impl TextSearcher {
         Box::new(BooleanQuery::new(clauses))
     }
 
-    /// A typed word in `field`, as written or as the words it abbreviates
-    /// ("pl" is "place"), and the word still being typed as the start of
-    /// one.
     fn autocomplete_word_query(&self, field: Field, word: &str, last: bool) -> Box<dyn Query> {
         let mut alternatives = std::iter::once(word.to_string())
             .chain(lattice::other_forms(word))
@@ -6952,16 +6939,10 @@ enum Parses {
     Numbered,
 }
 
-/// How a suggestion matches what was typed, closest first. Suggestions
-/// are looked for in this order, the second only when the first finds none.
+/// Tried in order. Later ones only when earlier find nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Completion {
-    /// The words in order, the last cut short, as a name, street or
-    /// postcode starts.
     InOrder,
-    /// Every word, in any order, of what the record is or where it is, in
-    /// its other forms too ("pike pl mar", "starbucks ballard"); a
-    /// contraction no table lists only ranks (see [`unlisted_contraction`]).
     AllWords,
 }
 
@@ -7634,10 +7615,6 @@ fn context_words(plan: &QueryPlan) -> Vec<String> {
         .collect()
 }
 
-/// Whether a typed word stands for `word` of a record. It may be written
-/// as is, cut short when it is the `last` word, still being typed, or as
-/// an abbreviation of it, listed ("n" of "north") or a contraction ("mkt"
-/// of "market", see [`contraction`]).
 fn types_word(typed: &str, word: &str, last: bool) -> bool {
     typed == word
         || (last && word.starts_with(typed))
@@ -7647,10 +7624,8 @@ fn types_word(typed: &str, word: &str, last: bool) -> bool {
             .any(|form| form == word)
 }
 
-/// Whether `typed` may be a contraction (see [`abbreviates`]). It has two
-/// to four letters and no vowel after the first, as a contraction drops
-/// them. One that keeps them is a word cut short, so "cit" is no
-/// contraction of "chipotle".
+/// Contractions drop vowels. "cit" keeps one, so it is "city" cut short,
+/// not "chipotle".
 fn contraction(typed: &str) -> bool {
     (2..=4).contains(&typed.chars().count())
         && !typed
@@ -7659,9 +7634,8 @@ fn contraction(typed: &str) -> bool {
             .any(|character| character.is_ascii_digit() || "aeiou".contains(character))
 }
 
-/// A [`contraction`] no abbreviation table lists ("mkt"). The index cannot
-/// say which of its words it shortens, as almost any long word holds its
-/// letters in order, so it is not required of a record, only ranked by.
+/// Not required of a record. Almost any long word holds "mkt" in order, so
+/// the index cannot tell which one it shortens.
 fn unlisted_contraction(typed: &str) -> bool {
     contraction(typed) && lattice::forms_both_ways(typed).is_empty()
 }
@@ -8387,11 +8361,8 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
-/// Suggestions of addresses and places for `options.query` in one list.
-/// Those that start as typed come alone, and only when neither searcher
-/// has one, those that match its words another way (see [`Completion`]).
-/// The fallback reads planet-wide postings, so a query that starts as
-/// typed never pays for it.
+/// Fallback only when neither searcher has an in-order match, so a query
+/// that answered before keeps its answer and speed.
 pub fn suggest(
     addresses: &TextSearcher,
     places: &TextSearcher,
@@ -8440,9 +8411,6 @@ pub fn mix_suggestions(
     mixed
 }
 
-/// Whether `name` starts as the typed `words` do, each standing for the
-/// name's word in its place (see [`types_word`]). So "pike pl mar" starts
-/// "Pike Place Market".
 fn name_starts_as(name: &str, words: &[String]) -> bool {
     let Some(name) = search_key(name) else {
         return false;
@@ -11104,8 +11072,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    /// Issue 172. A search box sends the area after the name, or a word
-    /// abbreviated, and finds what `/places` and `/geocode` find.
+    /// #172
     #[test]
     fn autocompletes_area_words_and_abbreviated_words() {
         let temp_dir = temp_pack_path("autocomplete-area-abbreviated");
@@ -11178,18 +11145,12 @@ mod tests {
         assert_eq!(suggested("2101 n 34")[0], "osm:node:6");
         // A town's name is no suggestion of every place in it.
         assert!(!suggested("ballard").contains(&"osm:node:3".to_string()));
-        // What starts as typed is all that is suggested when anything does.
-        // Words in any order are looked for only when nothing is.
         assert_eq!(suggested("pike place mar"), ["osm:node:4"]);
-        // A contraction no table lists is not required, but ranks.
         assert_eq!(suggested("pike mkt"), ["osm:node:4", "osm:node:5"]);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    /// A house number after its street, as most of Europe writes it, unless
-    /// the number is a word of a name. A postcode starting as the number
-    /// typed is neither.
     #[test]
     fn autocompletes_a_house_number_after_its_street() {
         let temp_dir = temp_pack_path("autocomplete-number-after-street");
@@ -11276,7 +11237,6 @@ mod tests {
         assert!(types_word("n", "north", false));
         assert!(types_word("north", "n", false));
         assert!(types_word("mkt", "market", false));
-        // A word that keeps its vowels is cut short, no contraction.
         assert!(!types_word("cit", "chipotle", true));
         assert!(unlisted_contraction("mkt"));
         assert!(!unlisted_contraction("pl"));
