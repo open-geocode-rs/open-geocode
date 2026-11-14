@@ -1065,6 +1065,20 @@ pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
 }
 
+/// A point on the unit sphere, where straight-line nearness is nearness on
+/// the sphere.
+pub(crate) fn unit_vector(lon: f64, lat: f64) -> [f64; 3] {
+    let (lon, lat) = (lon.to_radians(), lat.to_radians());
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+}
+
+/// Metres along the sphere between two [`unit_vector`]s a straight `chord`
+/// apart. The same as [`haversine_m`], whose `h` is the square of half the
+/// chord.
+pub(crate) fn chord_m(chord: f64) -> f64 {
+    2.0 * EARTH_RADIUS_M * (chord / 2.0).min(1.0).asin()
+}
+
 trait CandidateDistance {
     fn distance_m(&self) -> f64;
 }
@@ -1125,6 +1139,29 @@ mod tests {
         records,
     };
     use geojson::GeometryValue;
+
+    #[test]
+    fn the_chord_between_unit_vectors_measures_as_haversine_does() {
+        for [a, b] in [
+            [[6.1296, 49.6116], [6.1296, 49.6116]],
+            [[6.1296, 49.6116], [6.1297, 49.6116]],
+            [[-79.333, 43.65], [-79.20, 43.65]],
+            [[-46.6333, -23.5505], [-43.1729, -22.9068]],
+            [[179.9, 0.0], [-179.9, 0.0]],
+            [[0.0, 0.0], [180.0, 0.0]],
+            [[0.0, 90.0], [0.0, -90.0]],
+        ] {
+            let [ax, ay, az] = unit_vector(a[0], a[1]);
+            let [bx, by, bz] = unit_vector(b[0], b[1]);
+            let chord = ((ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2)).sqrt();
+            let expected = haversine_m(a[0], a[1], b[0], b[1]);
+            let measured = chord_m(chord);
+            assert!(
+                (measured - expected).abs() <= 1e-6 * expected.max(1.0),
+                "{a:?} to {b:?}: {measured} m, haversine {expected} m"
+            );
+        }
+    }
 
     #[test]
     fn closest_candidates_matches_stable_full_sort() {

@@ -36,7 +36,7 @@ use crate::{
         Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord, place_rank,
     },
     records::quantize,
-    spatial_index::haversine_m,
+    spatial_index::{haversine_m, unit_vector},
     util::{fold::search_key, geo::line_parts, text::collapse_whitespace},
 };
 
@@ -1627,11 +1627,6 @@ impl PostcodeAreas {
         (haversine_m(lon, lat, *centroid_lon, *centroid_lat) <= POSTCODE_AREA_RADIUS_M)
             .then_some(postcode.as_str())
     }
-}
-
-fn unit_vector(lon: f64, lat: f64) -> [f64; 3] {
-    let (lon, lat) = (lon.to_radians(), lat.to_radians());
-    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
 }
 
 /// Text as the searchable fields index it: normalized, with address
