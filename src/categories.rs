@@ -178,16 +178,14 @@ pub fn presets_for_prefix(prefix: &str) -> Vec<&'static str> {
     search_key(prefix).map_or_else(Vec::new, |key| for_key(&key, true))
 }
 
-/// The categories a whole query names, by the rules of [`presets_for_word`],
-/// and for a single word also of [`presets_for_prefix`]. `None` when it names
-/// none.
+/// The categories a whole query names when it is a type's whole name or a
+/// group word, typed out. A word inside a name ("for", "van") or a search
+/// term names a kind of place in some language but is more often typed as a
+/// name, so it does not take over the answer. `None` when it names none.
 pub fn of_query(query: &str) -> Option<Vec<&'static str>> {
+    let table = table();
     let key = search_key(query)?;
-    // "park" typed whole is a park, not yet the start of "parking".
-    let mut found = for_key(&key, false);
-    if found.is_empty() && !key.contains(' ') {
-        found = for_key(&key, true);
-    }
+    let found = names(table, table.strong.get(&key).into_iter().flatten().copied());
     (!found.is_empty()).then_some(found)
 }
 
@@ -307,11 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn query_uses_prefixes_only_for_one_word() {
-        assert_eq!(of_query("phar"), Some(vec!["amenity pharmacy"]));
-        assert_eq!(of_query("Coffee"), Some(presets_for_word("coffee")));
-        assert_eq!(of_query("drug store"), Some(presets_for_word("drug store")));
-        assert_eq!(of_query("phar store"), None);
+    fn query_takes_whole_names_and_group_words_only() {
+        assert_eq!(of_query("Pharmacy"), Some(vec!["amenity pharmacy"]));
+        assert_eq!(of_query("phar"), None);
+        assert_eq!(of_query("for"), None);
+        assert_eq!(
+            of_query("gas station"),
+            Some(presets_for_word("gas station"))
+        );
         assert_eq!(of_query(""), None);
         assert_eq!(of_query("zzzqqq"), None);
     }
