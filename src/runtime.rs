@@ -1021,12 +1021,18 @@ fn nearest_of_category(
     if count == 0 {
         return Ok(named);
     }
-    let walked =
-        state
-            .reverse_geocoder
-            .nearest_pois(focus, BIAS_RADIUS_M, limit, count, |category| {
-                categories::holds(&categories, category)
-            })?;
+    // The walk knows no country, so a country filter reads the index.
+    let walked = match options.countries.is_empty() {
+        true => state.reverse_geocoder.nearest_pois(
+            focus,
+            BIAS_RADIUS_M,
+            limit,
+            count,
+            |lon, lat| options.bbox.is_none_or(|bbox| bbox.contains(lon, lat)),
+            |category| categories::holds(&categories, category),
+        )?,
+        false => None,
+    };
     let mut hits = match walked {
         Some(nearest) => nearest
             .into_iter()
@@ -1037,9 +1043,13 @@ fn nearest_of_category(
                 ))
             })
             .collect::<Result<Vec<_>>>()?,
-        None => state
-            .places
-            .nearest_of_categories(&categories, focus, limit)?,
+        None => state.places.nearest_of_categories(
+            &categories,
+            focus,
+            limit,
+            &options.countries,
+            options.bbox,
+        )?,
     };
     if hits.is_empty() {
         return Ok(named);
