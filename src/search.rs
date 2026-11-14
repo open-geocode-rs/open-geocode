@@ -210,6 +210,9 @@ pub struct TextSearchHit {
     /// What the ranker knows of the answer besides its features.
     #[serde(skip)]
     pub signals: Signals,
+    /// See [`RankKey::named_place`].
+    #[serde(skip)]
+    pub named_place: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +381,7 @@ impl TextSearchHit {
     /// A record asked for by its id rather than found by words: no score.
     pub fn of_record(record_id: RecordId, record: Summary) -> Self {
         Self {
+            named_place: false,
             record_id,
             score: 0.0,
             record,
@@ -838,6 +842,9 @@ impl TextSearcher {
             query_words: QueryWords::new(&options.query),
             number_text: number.map(str::to_string),
             focus: options.focus,
+            near_first: options.focus.is_some(),
+            typed_words: u8::try_from(words.len() + usize::from(number.is_some()))
+                .unwrap_or(u8::MAX),
             ..Ranking::default()
         };
         let mut hits = self.ranked_hits(&query, &ranking, limit + 1, &mut |hit| {
@@ -2345,6 +2352,7 @@ impl TextSearcher {
                         _ => FORM_TOWN,
                     };
                     let hit = TextSearchHit {
+                        named_place: false,
                         record_id: id,
                         score: 0.0,
                         record,
@@ -4385,6 +4393,8 @@ impl TextSearcher {
             numbered: plan.house_number.is_some(),
             postcode,
             focus,
+            near_first: false,
+            typed_words: 0,
             sought: plan
                 .subject
                 .iter()
@@ -5626,7 +5636,10 @@ impl TextSearcher {
         // ("Richmond" the town among a hundred Richmond Roads, the one near
         // the caller among many Main Streets): the run is collected whole,
         // up to [`TIE_WINDOW`].
-        let mut scored = searcher.search(query, &TopDocs::with_limit(window))?;
+        let mut scored = match ranking.near_first {
+            true => Vec::new(),
+            false => searcher.search(query, &TopDocs::with_limit(window))?,
+        };
         let tie = |scored: &[(Score, DocAddress)], window: usize| {
             scored.len() == window && window > 1 && scored[window - 1].0 == scored[window - 2].0
         };
@@ -5635,7 +5648,8 @@ impl TextSearcher {
         }
         // A run past the tie window keeps an arbitrary part of it ("Paris"),
         // so every match is keyed: no skipping, paid by such runs alone.
-        let top_docs = if tie(&scored, TIE_WINDOW) {
+        // Near first ranks a lower score above, so every match is keyed.
+        let top_docs = if ranking.near_first || tie(&scored, TIE_WINDOW) {
             let keys = RankKeys {
                 ranking,
                 columns: &self.columns,
@@ -5728,6 +5742,7 @@ impl TextSearcher {
                 let records = self.pack.records();
                 let disputed = records.header(record_id)?.disputed;
                 let hit = TextSearchHit {
+                    named_place: false,
                     record_id,
                     score: key.text_score,
                     record,
@@ -5805,6 +5820,7 @@ impl TextSearcher {
                     window_rank: rank.min(usize::from(u16::MAX)) as u16,
                     ..Signals::default()
                 };
+                hit.named_place = key.named_place;
                 hit
             })
             .collect())
@@ -6377,6 +6393,7 @@ impl TextSearcher {
             Ok(self.pack.records().summary(neighbour.record_id)?.id)
         };
         Ok(TextSearchHit {
+            named_place: false,
             record_id: nearer.record_id,
             score: 0.0,
             record: Summary {
@@ -6513,6 +6530,13 @@ struct RankKey {
     /// See [`QueryPostcode::rank`].
     postcode_agreement: u8,
     stated: bool,
+    /// A place whose whole name the query types, under
+    /// [`Ranking::near_first`]: "tacoma" from Seattle is the city, not
+    /// Tacoma Screw down the road.
+    named_place: bool,
+    /// [`Self::nearness`] within [`BIAS_BANDS`], 0 beyond or unless
+    /// [`Ranking::near_first`].
+    near: u8,
     text_score: Score,
     /// Words of the record's own name: of names a query matches alike, the
     /// one it covers with fewest left over ("Richmond" before "Richmond
@@ -6546,6 +6570,8 @@ impl RankKey {
             house_level: true,
             postcode_agreement: 0,
             stated: true,
+            named_place: false,
+            near: 0,
             text_score,
             name_words: u8::MAX,
             prominence: 0,
@@ -6562,12 +6588,16 @@ impl RankKey {
             self.house_level,
             self.postcode_agreement,
             self.stated,
+            self.named_place,
+            self.near,
             self.text_score,
         )
             .partial_cmp(&(
                 other.house_level,
                 other.postcode_agreement,
                 other.stated,
+                other.named_place,
+                other.near,
                 other.text_score,
             ))
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -6613,6 +6643,17 @@ const FOCUS_BANDS_M: [f64; 11] = [
     1_000_000.0,
     2_000_000.0,
 ];
+
+/// Bands of [`FOCUS_BANDS_M`] up to 50 km, as far as a map view's bias
+/// reaches. Beyond, a better match wins: "paris" from Seattle is France.
+const BIAS_BANDS: usize = 6;
+
+/// [`Prominence::rank`] of a place known beyond its own language: read on
+/// Wikipedia, or linked to Wikidata and named in another language. New York
+/// is; Pike County, Arkansas, and Albert, Somme, are not.
+fn known_abroad(prominence: u64) -> bool {
+    prominence >> 8 > 0 || (prominence & 0x80 != 0 && prominence & 0x7f > 0)
+}
 
 /// The first of [`FOCUS_BANDS_M`] a point `distance_m` from the focus lies
 /// within, smaller nearer; one past the last beyond it.
@@ -6663,6 +6704,8 @@ struct RankKeys<'a> {
 
 struct SegmentRankKeys {
     numbered: bool,
+    near_first: bool,
+    typed_words: u8,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     name_words: Column<u64>,
@@ -6844,6 +6887,8 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
         };
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
+            near_first: self.ranking.near_first,
+            typed_words: self.ranking.typed_words,
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
@@ -6886,6 +6931,14 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         }
         if let Some(focus) = &self.focus {
             key.nearness = focus.nearness(doc);
+            if self.near_first && usize::from(key.nearness) > FOCUS_BANDS_M.len() - BIAS_BANDS {
+                key.near = key.nearness;
+            }
+        }
+        if self.near_first {
+            key.named_place = key.place_rank != u8::MAX
+                && key.name_words <= self.typed_words
+                && (key.near > 0 || known_abroad(key.prominence));
         }
         key
     }
@@ -8315,6 +8368,13 @@ struct Ranking {
     postcode: QueryPostcode,
     /// Where the caller is, `[lon, lat]`.
     focus: Option<[f64; 2]>,
+    /// Nearness within [`BIAS_BANDS`] ranks before the text score. A map
+    /// search box means the one near: "starbucks ballard" in Seattle is not
+    /// the one on Ballard Road in Oklahoma, though it matches better.
+    near_first: bool,
+    /// Words the query types, so a place whose name has no more is named
+    /// whole (see [`RankKey::named_place`]).
+    typed_words: u8,
     /// The words of what the query seeks, its subject and unplaced words:
     /// what an address or street
     /// must account for to rank above a POI (see
@@ -8572,11 +8632,12 @@ pub fn suggest(
     options: &TextAutocompleteOptions,
 ) -> Result<Vec<TextSearchHit>> {
     for completion in Completion::ALL {
-        let mixed = mix_suggestions(
+        let mixed = mix(
             &options.query,
             addresses.autocomplete_as(options, completion)?,
             places.autocomplete_as(options, completion)?,
             options.limit,
+            options.focus.is_some(),
         );
         if !mixed.is_empty() {
             return Ok(mixed);
@@ -8594,6 +8655,18 @@ pub fn mix_suggestions(
     places: Vec<TextSearchHit>,
     limit: usize,
 ) -> Vec<TextSearchHit> {
+    mix(query, addresses, places, limit, false)
+}
+
+/// With `near_first`, a town or region typed whole leads: near POIs that
+/// start with its name ("Tacoma Screw") would else bury it.
+fn mix(
+    query: &str,
+    mut addresses: Vec<TextSearchHit>,
+    places: Vec<TextSearchHit>,
+    limit: usize,
+    near_first: bool,
+) -> Vec<TextSearchHit> {
     let limit = effective_autocomplete_limit(limit);
     let key = search_key(query.trim()).unwrap_or_default();
     let tokens = autocomplete_query_tokens(&key);
@@ -8603,6 +8676,22 @@ pub fn mix_suggestions(
         mixed.extend(addresses);
         mixed.extend(places);
     } else {
+        if near_first {
+            let (whole, rest): (Vec<_>, Vec<_>) = addresses.into_iter().partition(|hit| {
+                // Far, only once typed out: "amazon" is not yet Amazonas.
+                hit.named_place
+                    && search_key(&hit.record.name).is_some_and(|name| {
+                        if usize::from(hit.signals.focus_band) < BIAS_BANDS {
+                            name.split_whitespace().count() == tokens.len()
+                                && name_starts_as(&hit.record.name, &tokens)
+                        } else {
+                            name == tokens.join(" ")
+                        }
+                    })
+            });
+            mixed.extend(whole);
+            addresses = rest;
+        }
         let (named, others): (Vec<_>, Vec<_>) = places
             .into_iter()
             .partition(|hit| name_starts_as(&hit.record.name, &tokens));
@@ -10836,6 +10925,7 @@ mod tests {
     #[test]
     fn suggestions_mix_addresses_and_places_by_what_the_query_says() {
         let hit = |id: &str, layer: &str, name: &str| TextSearchHit {
+            named_place: false,
             record_id: 0,
             score: 1.0,
             record: Summary {
@@ -11558,6 +11648,135 @@ mod tests {
 
         let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
         assert_eq!(found[0].record.id, "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #180: within 50 km of the focus the near match leads, though a far
+    /// one matches better; beyond, the better match does.
+    #[test]
+    fn autocompletes_the_near_match_before_a_better_far_one() {
+        let temp_dir = temp_pack_path("autocomplete-near-match");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, [lon, lat]: [f64; 2]| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        writer
+            .write(&poi(1, "Pike Place", [-97.26, 34.74]).into(), None)
+            .expect("far");
+        writer
+            .write(
+                &poi(2, "Pike Place Fish Market", [-122.34, 47.61]).into(),
+                None,
+            )
+            .expect("near");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let first = |focus| {
+            let options = TextAutocompleteOptions {
+                query: "pike place".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: Some(focus),
+                bbox: None,
+            };
+            suggest(&searcher, &searcher.places(), &options).expect("suggest")[0]
+                .record
+                .id
+                .clone()
+        };
+
+        assert_eq!(first([-122.33, 47.61]), "osm:node:2");
+        // 80 km from the near one: past the bias, the better match leads.
+        assert_eq!(first([-123.4, 47.61]), "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #180: a town typed whole leads near shops named after it when known
+    /// beyond its own language; a hamlet that is not leaves them first.
+    #[test]
+    fn autocompletes_a_known_town_typed_whole_before_near_shops() {
+        let temp_dir = temp_pack_path("autocomplete-known-town");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let town = |object_id, name: &str, [lon, lat]: [f64; 2], prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence,
+                    wikidata: None,
+                },
+            )
+        };
+        let shop = |object_id, name: &str| {
+            Record::from(PoiRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                category: "shop:bakery".to_string(),
+                address: None,
+                geometry: point_geometry(-122.34, 47.61),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, object_id),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                aliases: Vec::new(),
+            })
+        };
+        let known = Prominence {
+            importance: 0,
+            linked: true,
+            languages: 40,
+        };
+        writer
+            .write(&town(1, "Paris", [2.35, 48.86], known), None)
+            .expect("paris");
+        writer
+            .write(&town(2, "Pike", [-96.3, 33.3], Prominence::default()), None)
+            .expect("pike");
+        writer
+            .write(&shop(3, "Paris Bakery"), None)
+            .expect("bakery");
+        writer
+            .write(&shop(4, "Pike Grocery"), None)
+            .expect("grocery");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let first = |query: &str| {
+            let options = TextAutocompleteOptions {
+                query: query.to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: Some([-122.33, 47.61]),
+                bbox: None,
+            };
+            suggest(&searcher, &searcher.places(), &options).expect("suggest")[0]
+                .record
+                .id
+                .clone()
+        };
+
+        assert_eq!(first("paris"), "osm:node:1");
+        assert_eq!(first("pike"), "osm:node:4");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
