@@ -6468,8 +6468,8 @@ struct RankKey {
     /// Road", "Queen Street" before "Upper Queen Street"). [`TieBreak`]
     /// asks the same of the hits.
     name_words: u8,
-    /// See [`Prominence::rank`], larger better known; 0 for an address or
-    /// a street. Before the size of a place: Salzburg the city is better
+    /// See [`Prominence::rank`], larger better known; 0 for an address, a
+    /// street or a POI. Before the size of a place: Salzburg the city is better
     /// known than the state, Paris in France than Paris in Benin, though
     /// both are cities.
     prominence: u64,
@@ -6482,6 +6482,10 @@ struct RankKey {
     /// the hits are ranked by [`Self::cmp_evidence`] and then by
     /// [`TieBreak`], whose own focus band follows what the query states.
     nearness: u8,
+    /// A POI's [`Prominence::rank`], after nearness as in [`TieBreak::poi`]:
+    /// else the window holds the best known of a chain's thousand equal
+    /// names, and the ones near the caller never make it.
+    poi_prominence: u64,
 }
 
 impl RankKey {
@@ -6496,6 +6500,7 @@ impl RankKey {
             prominence: 0,
             place_rank: u8::MAX,
             nearness: 0,
+            poi_prominence: 0,
         }
     }
 
@@ -6526,12 +6531,14 @@ impl PartialOrd for RankKey {
                 self.prominence,
                 other.place_rank,
                 self.nearness,
+                self.poi_prominence,
             )
                 .cmp(&(
                     self.name_words,
                     other.prominence,
                     self.place_rank,
                     other.nearness,
+                    other.poi_prominence,
                 ))
         }))
     }
@@ -6811,8 +6818,14 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         let small =
             |value: Option<u64>| value.map_or(u8::MAX, |value| value.min(u64::from(u8::MAX)) as u8);
         key.name_words = small(self.name_words.first(doc));
-        key.prominence = self.prominence.first(doc).unwrap_or_default();
-        key.place_rank = small(self.place_rank.first(doc));
+        let prominence = self.prominence.first(doc).unwrap_or_default();
+        match self.place_rank.first(doc) {
+            Some(rank) => {
+                key.prominence = prominence;
+                key.place_rank = small(Some(rank));
+            }
+            None => key.poi_prominence = prominence,
+        }
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
             key.stated = false;
@@ -11419,6 +11432,56 @@ mod tests {
                 .is_empty()
         );
         let found = suggest(&searcher, &places, &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #180: a chain's best known branches far away must not fill the
+    /// window before the one near the caller.
+    #[test]
+    fn autocompletes_the_branch_near_the_focus_before_known_far_ones() {
+        let temp_dir = temp_pack_path("autocomplete-near-branch");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let cafe = |object_id, [lon, lat]: [f64; 2], prominence| PoiRecord {
+            alt_names: Vec::new(),
+            name: "Starbucks".to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence,
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        let known = Prominence {
+            importance: 30,
+            linked: true,
+            languages: 5,
+        };
+        for at in 0..MAX_RANK_WINDOW as i64 {
+            writer
+                .write(&cafe(at + 10, [-1.0, 53.0], known).into(), None)
+                .expect("far");
+        }
+        writer
+            .write(&cafe(1, [4.89, 52.37], Prominence::default()).into(), None)
+            .expect("near");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "starbucks".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: Some([4.89, 52.37]),
+            bbox: None,
+        };
+
+        let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
         assert_eq!(found[0].record.id, "osm:node:1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
