@@ -207,7 +207,6 @@ impl Problem {
         self.0.retry_after
     }
 
-    #[cfg(test)]
     pub(crate) fn invalid_params(&self) -> &[InvalidParam] {
         &self.0.invalid_params
     }
