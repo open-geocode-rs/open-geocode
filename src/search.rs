@@ -757,11 +757,17 @@ impl TextSearcher {
         let searcher = self.reader.searcher();
         let mut count = 0;
         for category in categories {
-            let word = category.rsplit(' ').next().unwrap_or(category);
-            let Some(word) = search_key(word) else {
-                continue;
-            };
-            count += searcher.doc_freq(&Term::from_field_text(self.fields.content_text, &word))?;
+            // "amenity fast_food" is three words; the rarest bounds the documents holding all.
+            let mut fewest = None::<u64>;
+            for word in search_key(category)
+                .iter()
+                .flat_map(|key| key.split_whitespace())
+            {
+                let docs =
+                    searcher.doc_freq(&Term::from_field_text(self.fields.content_text, word))?;
+                fewest = Some(fewest.map_or(docs, |fewest| fewest.min(docs)));
+            }
+            count += fewest.unwrap_or_default();
         }
         Ok(count)
     }
@@ -777,19 +783,20 @@ impl TextSearcher {
         bbox: Option<BoundingBox>,
     ) -> Result<Vec<TextSearchHit>> {
         let field = self.fields.content_text;
-        let term = |word: &str| search_key(word).map(|word| Term::from_field_text(field, &word));
         let clauses = categories
             .iter()
             .filter_map(|category| -> Option<(Occur, Box<dyn Query>)> {
-                let query: Box<dyn Query> = match category.split_once(' ') {
-                    // The field keeps no positions, so both words, not a phrase.
-                    Some((key, value)) => Box::new(BooleanQuery::intersection(vec![
-                        Box::new(TermQuery::new(term(key)?, IndexRecordOption::Basic)),
-                        Box::new(TermQuery::new(term(value)?, IndexRecordOption::Basic)),
-                    ])),
-                    None => Box::new(TermQuery::new(term(category)?, IndexRecordOption::Basic)),
-                };
-                Some((Occur::Should, query))
+                // The field keeps no positions, so every word, not a phrase ("fast food").
+                let words = search_key(category)?
+                    .split_whitespace()
+                    .map(|word| -> Box<dyn Query> {
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, word),
+                            IndexRecordOption::Basic,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Some((Occur::Should, Box::new(BooleanQuery::intersection(words))))
             })
             .collect::<Vec<_>>();
         if clauses.is_empty() {
@@ -12452,6 +12459,7 @@ mod tests {
             poi(3, "Pharmacy", "amenity:pharmacy", [6.57, 51.33]),
             poi(4, "Etos", "shop:chemist", [4.89, 52.37]),
             poi(5, "Pharmacy Cafe", "amenity:cafe", [4.89, 52.371]),
+            poi(6, "Snackbar", "amenity:fast_food", [4.891, 52.37]),
         ] {
             writer.write(&record.into(), None).expect("poi");
         }
@@ -12479,6 +12487,22 @@ mod tests {
             max_lat: 52.4,
         };
         assert_eq!(ids(Some(amsterdam)), ["osm:node:1"]);
+        // A value of two words ("fast_food") is found by both.
+        assert!(
+            places
+                .category_count(&["amenity fast_food"])
+                .expect("count")
+                > 0
+        );
+        assert_eq!(
+            places
+                .nearest_of_categories(&["amenity fast_food"], [4.89, 52.37], 5, &[], None)
+                .expect("nearest")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>(),
+            ["osm:node:6"]
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
