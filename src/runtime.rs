@@ -30,7 +30,7 @@ use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     http::{
         batch::{self, Lookup},
-        bounds, health,
+        bounds, cors, health,
         jobs::{self, JobStore},
         method, openapi,
         param::Param,
@@ -77,6 +77,9 @@ pub struct ServeOptions {
     /// Longest the server takes to stop once Ctrl-C or SIGTERM arrives;
     /// what is still open then is dropped. Zero drops it at once.
     pub shutdown_timeout: Duration,
+    /// Origins a browser page may call the API from, `*` for any. Empty
+    /// sends no CORS headers.
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -319,11 +322,14 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
     let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
     tokio::spawn(jobs::sweep_forever(state.clone()));
-    let app = build_router(
+    let mut app = build_router(
         state.clone(),
         options.demo.as_deref(),
         options.basemap.as_deref(),
     );
+    if let Some(cors) = cors::layer(&options.cors_origins)? {
+        app = app.layer(cors);
+    }
 
     let listener = TcpListener::bind(options.bind)
         .await
@@ -3548,6 +3554,121 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn cors_headers_are_absent_unless_an_origin_is_allowed() {
+        let pack = temp_path("cors-off");
+        write_pack(&pack);
+        assert!(cors::layer(&[]).unwrap().is_none());
+        let router = build_router(state_for(&pack, true), None, None);
+
+        for request in [
+            with_headers(
+                "GET",
+                "/places?q=King%20Street",
+                &[("origin", "https://app.example")],
+            ),
+            with_headers(
+                "OPTIONS",
+                "/geocode",
+                &[
+                    ("origin", "https://app.example"),
+                    ("access-control-request-method", "QUERY"),
+                ],
+            ),
+        ] {
+            let reply = send(router.clone(), request).await;
+            assert!(
+                reply
+                    .headers
+                    .keys()
+                    .all(|name| !name.as_str().starts_with("access-control-")),
+                "{:?}",
+                reply.headers
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn cors_answers_a_preflight_before_the_method_restricted_routes() {
+        let pack = temp_path("cors-on");
+        write_pack(&pack);
+        let cors = cors::layer(&["https://app.example/".to_string()])
+            .unwrap()
+            .unwrap();
+        let router = build_router(state_for(&pack, true), None, None).layer(cors);
+
+        for (path, method) in [
+            ("/geocode", "POST"),
+            ("/geocode", "QUERY"),
+            ("/reverse", "QUERY"),
+            ("/jobs", "POST"),
+            ("/jobs/abc", "DELETE"),
+            ("/places", "GET"),
+        ] {
+            let reply = send(
+                router.clone(),
+                with_headers(
+                    "OPTIONS",
+                    path,
+                    &[
+                        ("origin", "https://app.example"),
+                        ("access-control-request-method", method),
+                        ("access-control-request-headers", "content-type"),
+                    ],
+                ),
+            )
+            .await;
+            assert!(
+                reply.status.is_success(),
+                "{method} {path}: {}",
+                reply.status
+            );
+            assert_eq!(
+                header_value(&reply, "access-control-allow-origin"),
+                Some("https://app.example")
+            );
+            let methods = header_value(&reply, "access-control-allow-methods").unwrap();
+            assert!(methods.contains(method), "{methods}");
+            let allowed = header_value(&reply, "access-control-allow-headers")
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(allowed.contains("content-type"), "{allowed}");
+        }
+
+        let reply = send(
+            router.clone(),
+            with_headers(
+                "GET",
+                "/places?q=King%20Street",
+                &[("origin", "https://app.example")],
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            header_value(&reply, "access-control-allow-origin"),
+            Some("https://app.example")
+        );
+        let exposed = header_value(&reply, "access-control-expose-headers")
+            .unwrap()
+            .to_ascii_lowercase();
+        for name in ["etag", "content-location", "location", "x-request-id"] {
+            assert!(exposed.contains(name), "{exposed}");
+        }
+
+        let other = send(
+            router,
+            with_headers(
+                "GET",
+                "/places?q=King%20Street",
+                &[("origin", "https://evil.example")],
+            ),
+        )
+        .await;
+        assert!(header_value(&other, "access-control-allow-origin").is_none());
+        let _ = std::fs::remove_dir_all(&pack);
+    }
     async fn responses_are_compressed_as_the_client_accepts() {
         use std::io::Read;
 
@@ -3670,6 +3791,12 @@ mod router_tests {
         }
 
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn cors_allows_any_origin_and_rejects_a_bad_one() {
+        assert!(cors::layer(&["*".to_string()]).unwrap().is_some());
+        assert!(cors::layer(&["bad\norigin".to_string()]).is_err());
     }
 
     /// Canary for tower-rs/tower-http#732. Passes while tower-http compression
