@@ -2665,6 +2665,7 @@ impl TextSearcher {
                     let street = form == FORM_STREET && layer == structured::LAYER_STREET;
                     Some(Keyed {
                         order: (support, form, street, postcode(doc, ranking)),
+                        record_id: self.doc_record(doc)?,
                         doc,
                         base,
                         address: layer == structured::LAYER_ADDRESS,
@@ -2672,8 +2673,12 @@ impl TextSearcher {
                     })
                 })
                 .collect::<Vec<_>>();
-            keyed
-                .sort_by(|left, right| right.order.cmp(&left.order).then(left.doc.cmp(&right.doc)));
+            keyed.sort_by(|left, right| {
+                right
+                    .order
+                    .cmp(&left.order)
+                    .then(left.record_id.cmp(&right.record_id))
+            });
             let mut spots = Vec::<Spot>::new();
             for item in keyed {
                 let room = spots.len() < STRUCTURED_SPOTS;
@@ -3673,10 +3678,19 @@ impl TextSearcher {
     /// The layer of document `doc` as the structured index tells layers apart (see
     /// [`structured_layer`]): its first record's.
     pub(crate) fn doc_layer(&self, doc: DocId) -> Option<u8> {
-        let (columns, doc) = self.doc_columns(doc)?;
-        let record_id = columns.record_id.first(doc)?;
-        let layer = self.pack.records().header(record_id).ok()?.layer;
+        let layer = self
+            .pack
+            .records()
+            .header(self.doc_record(doc)?)
+            .ok()?
+            .layer;
         Some(structured_layer(layer))
+    }
+
+    /// The first record of document `doc`.
+    fn doc_record(&self, doc: DocId) -> Option<RecordId> {
+        let (columns, doc) = self.doc_columns(doc)?;
+        columns.record_id.first(doc)
     }
 
     /// The middle of document `doc`'s extent in 1e-7 degrees, `None` when
@@ -5148,8 +5162,7 @@ impl TextSearcher {
             ),
         ]);
         let searcher = self.reader.searcher();
-        searcher
-            .search(&query, &TopDocs::with_limit(limit))?
+        self.top_scored(&searcher, &query, limit)?
             .into_iter()
             .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
             .collect()
@@ -5262,7 +5275,7 @@ impl TextSearcher {
         )?;
         let top_docs = docs
             .into_iter()
-            .map(|((_, _, text_score), doc)| (RankKey::text(text_score), doc))
+            .map(|((_, _, text_score, _), doc)| (RankKey::text(text_score), doc))
             .collect();
         let mut hits = self.rank_documents(&searcher, top_docs, &ranking, window, &mut |hit| {
             Ok(filters.admit(hit))
@@ -5344,16 +5357,17 @@ impl TextSearcher {
         // ("Richmond" the town among a hundred Richmond Roads, the one near
         // the caller among many Main Streets): the run is collected whole,
         // up to [`TIE_WINDOW`].
-        let mut scored = searcher.search(query, &TopDocs::with_limit(window))?;
-        let tie = |scored: &[(Score, DocAddress)], window: usize| {
-            scored.len() == window && window > 1 && scored[window - 1].0 == scored[window - 2].0
-        };
-        if tie(&scored, window) && window < TIE_WINDOW {
-            scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
+        // One document past the cut tells whether it falls inside a run.
+        let collect = |limit: usize| searcher.search(query, &TopDocs::with_limit(limit + 1));
+        let mut cut = window;
+        let mut scored = collect(cut)?;
+        if cut_in_tie(&scored, cut) && cut < TIE_WINDOW {
+            cut = TIE_WINDOW;
+            scored = collect(cut)?;
         }
         // A run past the tie window keeps an arbitrary part of it ("Paris"),
         // so every match is keyed: no skipping, paid by such runs alone.
-        let top_docs = if tie(&scored, TIE_WINDOW) {
+        let top_docs = if cut_in_tie(&scored, cut) {
             let keys = RankKeys {
                 ranking,
                 columns: &self.columns,
@@ -5361,6 +5375,7 @@ impl TextSearcher {
             };
             searcher.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
         } else {
+            scored.truncate(cut);
             let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
             top_docs.truncate(window);
             top_docs
@@ -5395,6 +5410,31 @@ impl TextSearcher {
             right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(top_docs)
+    }
+
+    /// The best `limit` documents `query` matches by text score, equal
+    /// scores by smaller first record. Collected by score alone unless the
+    /// cut falls inside a run of equal scores, so the index still skips the
+    /// documents that cannot make it.
+    fn top_scored(
+        &self,
+        searcher: &Searcher,
+        query: &dyn Query,
+        limit: usize,
+    ) -> Result<Vec<(Score, DocAddress)>> {
+        let mut scored = searcher.search(query, &TopDocs::with_limit(limit.saturating_add(1)))?;
+        if !cut_in_tie(&scored, limit) {
+            scored.truncate(limit);
+            return Ok(scored);
+        }
+        let order = RecordOrder {
+            columns: &self.columns,
+        };
+        Ok(searcher
+            .search(query, &TopDocs::with_limit(limit).tweak_score(order))?
+            .into_iter()
+            .map(|((score, _), doc)| (score, doc))
+            .collect())
     }
 
     /// The best `limit` hits of `top_docs`, keyed documents best first, that
@@ -5896,10 +5936,7 @@ impl TextSearcher {
         let searcher = self.reader.searcher();
         let mut clauses = self.subject_clauses(plan, pass, areas);
         clauses.push((Occur::Must, self.layer_query(Layer::Address.as_str())));
-        let docs = searcher.search(
-            &BooleanQuery::new(clauses),
-            &TopDocs::with_limit(NEIGHBOUR_DOCUMENTS),
-        )?;
+        let docs = self.top_scored(&searcher, &BooleanQuery::new(clauses), NEIGHBOUR_DOCUMENTS)?;
         self.neighbours_of(
             &searcher,
             docs.into_iter().map(|(_, doc)| doc).collect(),
@@ -6251,6 +6288,11 @@ struct RankKey {
     /// the hits are ranked by [`Self::cmp_evidence`] and then by
     /// [`TieBreak`], whose own focus band follows what the query states.
     nearness: u8,
+    /// The document's first record, smaller first. Of documents equal on all
+    /// else, the index keeps them in document order, which follows how many
+    /// parts the build indexed in, so it differs between two builds of one
+    /// Pack. Record ids do not. 0 where the documents come ranked already.
+    record_id: RecordId,
 }
 
 impl RankKey {
@@ -6265,6 +6307,7 @@ impl RankKey {
             prominence: 0,
             place_rank: u8::MAX,
             nearness: 0,
+            record_id: 0,
         }
     }
 
@@ -6295,15 +6338,24 @@ impl PartialOrd for RankKey {
                 self.prominence,
                 other.place_rank,
                 self.nearness,
+                other.record_id,
             )
                 .cmp(&(
                     self.name_words,
                     other.prominence,
                     self.place_rank,
                     other.nearness,
+                    self.record_id,
                 ))
         }))
     }
+}
+
+/// Whether cutting `scored`, best first, to `limit` splits a run of equal
+/// scores. Which of such a run make the cut follows document order, and so
+/// how the build split the text index into parts.
+fn cut_in_tie(scored: &[(Score, DocAddress)], limit: usize) -> bool {
+    limit > 0 && scored.len() > limit && scored[limit].0 == scored[limit - 1].0
 }
 
 /// How a caller's focus ranks a hit: hits in one band tie on it. The bands
@@ -6374,6 +6426,7 @@ struct RankKeys<'a> {
 
 struct SegmentRankKeys {
     numbered: bool,
+    record_id: Column<u64>,
     house_number: Column<u64>,
     interpolation_start: Column<u64>,
     name_words: Column<u64>,
@@ -6493,11 +6546,16 @@ struct FameKeys<'a> {
 }
 
 struct SegmentFameKeys {
+    record_id: Column<u64>,
     prominence: Column<u64>,
     focus: Option<SegmentFocus>,
 }
 
-impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
+/// Nearness, fame, text score, then the document's first record, smaller
+/// first, for the reason [`RankKey::record_id`] gives.
+type FameKey = (u8, u64, Score, std::cmp::Reverse<RecordId>);
+
+impl ScoreTweaker<FameKey> for FameKeys<'_> {
     type Child = SegmentFameKeys;
 
     fn segment_tweaker(&self, segment: &SegmentReader) -> tantivy::Result<SegmentFameKeys> {
@@ -6505,6 +6563,7 @@ impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
             tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
         })?;
         Ok(SegmentFameKeys {
+            record_id: columns.record_id.clone(),
             prominence: columns.prominence.clone(),
             focus: self.focus.map(|focus| SegmentFocus {
                 focus,
@@ -6517,12 +6576,43 @@ impl ScoreTweaker<(u8, u64, Score)> for FameKeys<'_> {
     }
 }
 
-impl ScoreSegmentTweaker<(u8, u64, Score)> for SegmentFameKeys {
-    fn score(&mut self, doc: DocId, text_score: Score) -> (u8, u64, Score) {
+impl ScoreSegmentTweaker<FameKey> for SegmentFameKeys {
+    fn score(&mut self, doc: DocId, text_score: Score) -> FameKey {
         (
             self.focus.as_ref().map_or(0, |focus| focus.nearness(doc)),
             self.prominence.first(doc).unwrap_or_default(),
             text_score,
+            std::cmp::Reverse(self.record_id.first(doc).unwrap_or_default()),
+        )
+    }
+}
+
+/// Ranks documents by text score, then by first record, smaller first, for
+/// the reason [`RankKey::record_id`] gives.
+struct RecordOrder<'a> {
+    columns: &'a HashMap<SegmentId, SegmentColumns>,
+}
+
+type RecordOrderKey = (Score, std::cmp::Reverse<RecordId>);
+
+struct SegmentRecordOrder(Column<u64>);
+
+impl ScoreTweaker<RecordOrderKey> for RecordOrder<'_> {
+    type Child = SegmentRecordOrder;
+
+    fn segment_tweaker(&self, segment: &SegmentReader) -> tantivy::Result<SegmentRecordOrder> {
+        let columns = self.columns.get(&segment.segment_id()).ok_or_else(|| {
+            tantivy::TantivyError::InternalError("text index segment has no fast fields".into())
+        })?;
+        Ok(SegmentRecordOrder(columns.record_id.clone()))
+    }
+}
+
+impl ScoreSegmentTweaker<RecordOrderKey> for SegmentRecordOrder {
+    fn score(&mut self, doc: DocId, text_score: Score) -> RecordOrderKey {
+        (
+            text_score,
+            std::cmp::Reverse(self.0.first(doc).unwrap_or_default()),
         )
     }
 }
@@ -6555,6 +6645,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
         };
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
+            record_id: columns.record_id.clone(),
             house_number: columns.house_number.clone(),
             interpolation_start: columns.interpolation_start.clone(),
             name_words: columns.name_words.clone(),
@@ -6582,6 +6673,7 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
         key.name_words = small(self.name_words.first(doc));
         key.prominence = self.prominence.first(doc).unwrap_or_default();
         key.place_rank = small(self.place_rank.first(doc));
+        key.record_id = self.record_id.first(doc).unwrap_or_default();
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
             key.stated = false;
@@ -7227,6 +7319,10 @@ struct Keyed {
     /// Support, number form, whether it is the street's own record, and
     /// postcode agreement: larger is better.
     order: (usize, u8, bool, u8),
+    /// The document's first record, which breaks ties in `order`. Document
+    /// ids follow how the build split the text index into parts, so they
+    /// differ between two builds of one Pack.
+    record_id: RecordId,
     doc: DocId,
     base: bool,
     address: bool,
@@ -9094,6 +9190,96 @@ mod tests {
         assert_eq!(ids, vec!["osm:node:5", "osm:node:7", "osm:way:9"]);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A cut that ends on the first of a run of equal scores is inside the
+    /// run too, which only the score past the cut shows.
+    #[test]
+    fn a_cut_is_in_a_tie_when_the_score_past_it_ties_the_last_kept() {
+        let scored = |scores: &[Score]| {
+            scores
+                .iter()
+                .zip(0..)
+                .map(|(&score, doc)| (score, DocAddress::new(0, doc)))
+                .collect::<Vec<_>>()
+        };
+        assert!(cut_in_tie(&scored(&[3.0, 2.0, 2.0]), 2));
+        assert!(cut_in_tie(&scored(&[2.0, 2.0, 2.0]), 2));
+        assert!(!cut_in_tie(&scored(&[3.0, 3.0, 2.0]), 2));
+        assert!(!cut_in_tie(&scored(&[3.0, 2.0]), 2));
+        assert!(!cut_in_tie(&scored(&[3.0, 3.0]), 0));
+    }
+
+    /// One Pack built twice, its text index in one part and in two. Past the
+    /// first chunk a part takes, the two indexes hold the documents in
+    /// another order. Streets the text cannot tell apart rank by record in
+    /// both, on every path that cuts a run of them.
+    #[test]
+    fn equal_streets_rank_alike_in_an_index_of_one_part_or_two() {
+        let chunk = 8_192;
+        let build = |parts: usize| {
+            let temp_dir = temp_pack_path(&format!("search-parts-{parts}"));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(parts)
+                .build()
+                .expect("pool");
+            pool.install(|| {
+                let mut writer = Writer::create(&temp_dir).expect("writer");
+                for index in 0..2 * chunk + 10 {
+                    // Ten at the start of the second chunk and ten at the
+                    // start of the third, which the second part does not take,
+                    // more than any rank window holds.
+                    let name = match index >= chunk && index % chunk < 10 {
+                        true => "Kirchgasse".to_string(),
+                        false => format!("Street {index}"),
+                    };
+                    let mut street = street_record(&format!("osm:way:{}", index + 1), &name);
+                    let lon = index as f64 * 1e-3;
+                    street.geometry = point_geometry(lon, 0.0);
+                    street.representative_point = [lon, 0.0];
+                    writer.write(&street.into(), None).expect("write");
+                }
+                writer.finish().expect("finish");
+            });
+            temp_dir
+        };
+        let (one, two) = (build(1), build(2));
+        let ids = |dir: &std::path::Path, query: &str, limit: usize| {
+            top_ids_limited(&TextSearcher::open(dir).expect("searcher"), query, limit)
+        };
+        let completed = |dir: &std::path::Path, query: &str, limit: usize| {
+            TextSearcher::open(dir)
+                .expect("searcher")
+                .autocomplete(&TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("autocomplete")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        let first = ["osm:way:8193", "osm:way:8194", "osm:way:8195"];
+
+        let answers = [&one, &two].map(|dir| {
+            (
+                ids(dir, "Kirchgasse", 1),
+                ids(dir, "Kirchgasse", 3),
+                completed(dir, "Kirchg", 3),
+            )
+        });
+        let _ = std::fs::remove_dir_all(one);
+        let _ = std::fs::remove_dir_all(two);
+        for (single, three, prefix) in answers {
+            assert_eq!(single, first[..1]);
+            assert_eq!(three, first);
+            assert_eq!(prefix, first);
+        }
     }
 
     #[test]
