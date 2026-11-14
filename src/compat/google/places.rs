@@ -1,0 +1,457 @@
+//! Text Search, Autocomplete and Place Details of Places API (New) v1.
+
+use axum::{
+    body::Bytes,
+    extract::{Path, RawQuery, State},
+    http::HeaderMap,
+    response::Response,
+};
+use serde::{Deserialize, Serialize};
+
+use super::{
+    Area, Code, LatLng, QueryParams, body, both_shapes, error, field_mask, from_problem, invalid,
+    model::{Kind, Place, after_name},
+    proto_int, respond, run,
+};
+use crate::{
+    api::ForwardFeature,
+    compat::{Args, VendorError, decode_id, native},
+    runtime::AppState,
+    spatial_index::haversine_m,
+};
+
+/// Google's own cap on one page of Text Search results.
+const MAX_PAGE_SIZE: i64 = 20;
+
+/// Google's cap on suggestions in one Autocomplete answer.
+const MAX_SUGGESTIONS: usize = 5;
+
+const METERS_PER_DEGREE: f64 = 111_320.0;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SearchTextRequest {
+    #[serde(alias = "text_query")]
+    text_query: Option<String>,
+    #[serde(alias = "page_size", deserialize_with = "proto_int")]
+    page_size: Option<i64>,
+    #[serde(alias = "max_result_count", deserialize_with = "proto_int")]
+    max_result_count: Option<i64>,
+    #[serde(alias = "location_bias")]
+    location_bias: Option<Area>,
+    #[serde(alias = "location_restriction")]
+    location_restriction: Option<Area>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchTextResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    places: Vec<Place>,
+}
+
+pub(super) async fn search_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    bytes: Bytes,
+) -> Response {
+    run(async {
+        let query = QueryParams::parse(query.as_deref())?;
+        let mask = field_mask(&headers, &query);
+        let request: SearchTextRequest = body(&bytes)?;
+        let text = request
+            .text_query
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| invalid("textQuery is required"))?;
+        let limit = page_size(request.page_size.or(request.max_result_count))?;
+        let (focus, bbox) = bias_and_restriction(
+            request.location_bias.as_ref(),
+            request.location_restriction.as_ref(),
+        )?;
+        let args = Args::new()
+            .set("q", text)
+            .set("limit", limit.to_string())
+            .maybe("focus", focus)
+            .maybe("bbox", bbox);
+        let found = native::places(&state, args).await.map_err(from_problem)?;
+        let answer = SearchTextResponse {
+            places: found.features.iter().map(place).collect(),
+        };
+        Ok(respond(&answer, mask.as_ref()))
+    })
+    .await
+}
+
+/// `pageSize` wins over the older `maxResultCount`; 0 or unset is Google's
+/// default of 20, and more than 20 is cut to 20 rather than refused.
+fn page_size(size: Option<i64>) -> Result<i64, VendorError> {
+    match size {
+        Some(size) if size < 0 => Err(invalid(format!(
+            "pageSize must not be negative, got {size}"
+        ))),
+        Some(size) if size > 0 => Ok(size.min(MAX_PAGE_SIZE)),
+        _ => Ok(MAX_PAGE_SIZE),
+    }
+}
+
+/// og's `focus` from `locationBias` and its `bbox` from a rectangle
+/// `locationRestriction`. Google takes one or the other.
+fn bias_and_restriction(
+    bias: Option<&Area>,
+    restriction: Option<&Area>,
+) -> Result<(Option<String>, Option<String>), VendorError> {
+    if bias.is_some() && restriction.is_some() {
+        return Err(invalid(
+            "locationBias and locationRestriction cannot both be set",
+        ));
+    }
+    let focus = bias
+        .map(|bias| bias.focus("locationBias"))
+        .transpose()?
+        .flatten();
+    let bbox = match restriction {
+        Some(Area {
+            rectangle: Some(rectangle),
+            circle: None,
+        }) => Some(rectangle.bbox("locationRestriction.rectangle")?),
+        Some(Area {
+            rectangle: Some(_),
+            circle: Some(_),
+        }) => return Err(both_shapes("locationRestriction")),
+        Some(Area {
+            circle: Some(_), ..
+        }) => {
+            return Err(invalid(
+                "locationRestriction takes only a rectangle in Text Search",
+            ));
+        }
+        Some(Area {
+            circle: None,
+            rectangle: None,
+        })
+        | None => None,
+    };
+    Ok((focus, bbox))
+}
+
+fn place(feature: &ForwardFeature) -> Place {
+    Place::of(&feature.properties.common, feature.geometry.coordinates)
+}
+
+pub(super) async fn details(
+    State(state): State<AppState>,
+    Path(place_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    run(async {
+        let query = QueryParams::parse(query.as_deref())?;
+        let mask = field_mask(&headers, &query);
+        let feature = by_place_id(&state, &place_id).await?;
+        Ok(respond(&place(&feature), mask.as_ref()))
+    })
+    .await
+}
+
+/// The record a Google place id names, shared with Place Geocoding.
+pub(super) async fn by_place_id(
+    state: &AppState,
+    place_id: &str,
+) -> Result<ForwardFeature, VendorError> {
+    let not_found = || {
+        error(
+            Code::NotFound,
+            format!("Place 'places/{place_id}' was not found."),
+        )
+    };
+    let og_id = decode_id(place_id).ok_or_else(not_found)?;
+    native::by_id(state, &og_id)
+        .await
+        .map_err(from_problem)?
+        .ok_or_else(not_found)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct AutocompleteRequest {
+    input: Option<String>,
+    #[serde(alias = "input_offset", deserialize_with = "proto_int")]
+    input_offset: Option<i64>,
+    #[serde(alias = "location_bias")]
+    location_bias: Option<Area>,
+    #[serde(alias = "location_restriction")]
+    location_restriction: Option<Area>,
+    #[serde(alias = "included_region_codes")]
+    included_region_codes: Vec<String>,
+    origin: Option<LatLng>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutocompleteResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<Suggestion>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Suggestion {
+    place_prediction: PlacePrediction,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlacePrediction {
+    place: String,
+    place_id: String,
+    text: FormattableText,
+    structured_format: StructuredFormat,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    types: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distance_meters: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructuredFormat {
+    main_text: FormattableText,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secondary_text: Option<FormattableText>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct FormattableText {
+    text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    matches: Vec<StringRange>,
+}
+
+/// Offsets in Unicode scalar values, end exclusive. A start of 0 is left
+/// out, as proto3 JSON leaves out a default.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StringRange {
+    #[serde(skip_serializing_if = "is_zero")]
+    start_offset: usize,
+    end_offset: usize,
+}
+
+// serde's `skip_serializing_if` passes a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Where a circle restriction is, once og has searched its bounding box.
+struct Circle {
+    center: [f64; 2],
+    radius: f64,
+}
+
+pub(super) async fn autocomplete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    bytes: Bytes,
+) -> Response {
+    run(async {
+        let query = QueryParams::parse(query.as_deref())?;
+        let mask = field_mask(&headers, &query);
+        let request: AutocompleteRequest = body(&bytes)?;
+        let input = request
+            .input
+            .filter(|input| !input.trim().is_empty())
+            .ok_or_else(|| invalid("input is required"))?;
+        let input = typed_before_cursor(&input, request.input_offset)?;
+        if request.location_bias.is_some() && request.location_restriction.is_some() {
+            return Err(invalid(
+                "locationBias and locationRestriction cannot both be set",
+            ));
+        }
+        let focus = request
+            .location_bias
+            .map(|bias| bias.focus("locationBias"))
+            .transpose()?
+            .flatten();
+        let (bbox, circle) = match request.location_restriction {
+            None => (None, None),
+            Some(area) => restriction(&area)?,
+        };
+        let origin = request
+            .origin
+            .map(|origin| origin.checked("origin"))
+            .transpose()?;
+        let countries = request
+            .included_region_codes
+            .iter()
+            .map(|code| code.trim())
+            .filter(|code| !code.is_empty())
+            .collect::<Vec<_>>();
+        let args = Args::new()
+            .set("q", input.clone())
+            .set("limit", MAX_SUGGESTIONS.to_string())
+            .maybe("focus", focus)
+            .maybe("bbox", bbox)
+            .maybe(
+                "country",
+                (!countries.is_empty()).then(|| countries.join(",")),
+            );
+        let found = native::autocomplete(&state, args)
+            .await
+            .map_err(from_problem)?;
+        let suggestions = found
+            .features
+            .iter()
+            .filter(|feature| {
+                circle.as_ref().is_none_or(|circle| {
+                    let [lon, lat] = feature.geometry.coordinates;
+                    haversine_m(circle.center[0], circle.center[1], lon, lat) <= circle.radius
+                })
+            })
+            .map(|feature| Suggestion {
+                place_prediction: prediction(feature, &input, origin),
+            })
+            .collect();
+        Ok(respond(
+            &AutocompleteResponse { suggestions },
+            mask.as_ref(),
+        ))
+    })
+    .await
+}
+
+/// The text before the cursor, which is what the user has typed so far.
+fn typed_before_cursor(input: &str, offset: Option<i64>) -> Result<String, VendorError> {
+    let Some(offset) = offset else {
+        return Ok(input.to_string());
+    };
+    let offset = usize::try_from(offset)
+        .map_err(|_| invalid(format!("inputOffset must not be negative, got {offset}")))?;
+    let typed = input.chars().take(offset).collect::<String>();
+    if typed.trim().is_empty() {
+        return Err(invalid("input before inputOffset is empty"));
+    }
+    Ok(typed)
+}
+
+/// og's `bbox` for a restriction. A circle is searched as the box around it
+/// and the results outside the circle dropped after, so no result lies
+/// outside it. Clamped at the poles and the antimeridian, which loses only
+/// the part of the circle beyond them.
+fn restriction(area: &Area) -> Result<(Option<String>, Option<Circle>), VendorError> {
+    match (area.circle, area.rectangle) {
+        (Some(_), Some(_)) => Err(both_shapes("locationRestriction")),
+        (None, Some(rectangle)) => {
+            Ok((Some(rectangle.bbox("locationRestriction.rectangle")?), None))
+        }
+        (Some(circle), None) => {
+            let [lon, lat] = circle.center.checked("locationRestriction.circle.center")?;
+            if !(0.0..=50_000.0).contains(&circle.radius) {
+                return Err(invalid(format!(
+                    "locationRestriction.circle.radius must be within [0, 50000], got {}",
+                    circle.radius
+                )));
+            }
+            let lat_delta = circle.radius / METERS_PER_DEGREE;
+            let lon_delta = circle.radius / (METERS_PER_DEGREE * lat.to_radians().cos().max(1e-6));
+            let bbox = format!(
+                "{},{},{},{}",
+                (lon - lon_delta).max(-180.0),
+                (lat - lat_delta).max(-90.0),
+                (lon + lon_delta).min(180.0),
+                (lat + lat_delta).min(90.0),
+            );
+            Ok((
+                Some(bbox),
+                Some(Circle {
+                    center: [lon, lat],
+                    radius: circle.radius,
+                }),
+            ))
+        }
+        (None, None) => Ok((None, None)),
+    }
+}
+
+fn prediction(feature: &ForwardFeature, input: &str, origin: Option<[f64; 2]>) -> PlacePrediction {
+    let common = &feature.properties.common;
+    let place = Place::of(common, feature.geometry.coordinates);
+    let [lon, lat] = feature.geometry.coordinates;
+    PlacePrediction {
+        text: formattable(&common.label, input),
+        structured_format: StructuredFormat {
+            main_text: formattable(&common.name, input),
+            secondary_text: after_name(common).map(|text| formattable(&text, input)),
+        },
+        types: Kind::of(common).types(),
+        // Google leaves the distance out when it is 0.
+        distance_meters: origin
+            .map(|[from_lon, from_lat]| haversine_m(from_lon, from_lat, lon, lat).round() as u64)
+            .filter(|meters| *meters > 0),
+        place: place.name,
+        place_id: place.id,
+    }
+}
+
+fn formattable(text: &str, input: &str) -> FormattableText {
+    FormattableText {
+        text: text.to_string(),
+        matches: matches(text, input),
+    }
+}
+
+/// Where the words typed appear in `text`. Each typed word is matched, case
+/// folded, at the start of a word of `text`. og ranks without recording
+/// which characters matched, so this finds them again in the text shown.
+fn matches(text: &str, input: &str) -> Vec<StringRange> {
+    let folded = text
+        .chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .collect::<Vec<_>>();
+    let starts = (0..folded.len())
+        .filter(|&index| {
+            folded[index].is_alphanumeric() && (index == 0 || !folded[index - 1].is_alphanumeric())
+        })
+        .collect::<Vec<_>>();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for word in input
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        let word = word
+            .chars()
+            .map(|character| character.to_lowercase().next().unwrap_or(character))
+            .collect::<Vec<_>>();
+        let found = starts.iter().copied().find(|&start| {
+            folded[start..].starts_with(&word)
+                && !ranges
+                    .iter()
+                    .any(|&(from, to)| start < to && start + word.len() > from)
+        });
+        if let Some(start) = found {
+            ranges.push((start, start + word.len()));
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    // Words typed together read as one match, the gap between them too.
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last)
+                if folded[last.1..start]
+                    .iter()
+                    .all(|character| !character.is_alphanumeric()) =>
+            {
+                last.1 = end;
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(start_offset, end_offset)| StringRange {
+            start_offset,
+            end_offset,
+        })
+        .collect()
+}
