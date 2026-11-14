@@ -282,6 +282,19 @@ pub(crate) fn alpha2_of(alpha3: &str) -> Option<&'static str> {
         .map(|(alpha2, _, _)| *alpha2)
 }
 
+/// The two-letter code of a numeric one, such as `NZ` for `554`. Leading
+/// zeros are optional, so `36` and `036` are both Australia.
+pub(crate) fn alpha2_of_numeric(numeric: &str) -> Option<&'static str> {
+    if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let wanted = numeric.parse::<u16>().ok()?;
+    CODES
+        .iter()
+        .find(|(_, _, code)| code.parse::<u16>().ok() == Some(wanted))
+        .map(|(alpha2, _, _)| *alpha2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +313,10 @@ mod tests {
         assert_eq!(alpha2_of("deu"), Some("DE"));
         assert_eq!(alpha3("XX"), None);
         assert_eq!(alpha2_of("XXX"), None);
+        assert_eq!(alpha2_of_numeric("554"), Some("NZ"));
+        assert_eq!(alpha2_of_numeric("36"), Some("AU"));
+        assert_eq!(alpha2_of_numeric("036"), Some("AU"));
+        assert_eq!(alpha2_of_numeric("999"), None);
+        assert_eq!(alpha2_of_numeric("+36"), None);
     }
 }
