@@ -909,8 +909,10 @@ def categories_text(places_json):
     """The text of catalog/categories.json. The words that name each searchable place preset,
     in every language its sources have, and the groups that gather presets under one word ("food").
 
-    Presets are a list, so groups and words point at them by index. Words keep case
-    folded only; og normalizes them as it normalizes search text when it loads them.
+    Presets are a list, so groups, names and terms point at them by index. A preset's
+    own name is kept apart from its terms and aliases, which reach wider ("coffee" is a
+    restaurant term). Words keep case folded only; og normalizes them as it normalizes
+    search text when it loads them.
     Returns the text, the presets with no English word, and a coverage report."""
     presets = {pid: p for pid, p in json.loads(places_json)["presets"].items() if not p.get("never")}
     words = load_snapshot("id-tagging-schema-words")
@@ -960,12 +962,12 @@ def categories_text(places_json):
     group_order = sorted(groups)
     group_index = {g: i for i, g in enumerate(group_order)}
 
-    by_lang = {}
+    by_lang = {"names": {}, "terms": {}}
     for pid in order:
         for lang, ws in rows.get(pid, {}).get("words", {}).items():
-            for w in ws:
+            for kind, w in [("names", ws[0])] + [("terms", t) for t in ws[1:]]:
                 if w:
-                    targets = by_lang.setdefault(lang, {}).setdefault(fold(w), [])
+                    targets = by_lang[kind].setdefault(lang, {}).setdefault(fold(w), [])
                     if index[pid] not in targets:
                         targets.append(index[pid])
     no_english = [pid for pid in order if not rows.get(pid, {}).get("words", {}).get("en")]
@@ -973,19 +975,28 @@ def categories_text(places_json):
     preset_lines = [line([pid, category_tag(pid, presets[pid]["tags"]),
                           sorted(group_index[g] for g in member[pid])]) for pid in order]
     group_lines = [line([g, dict(sorted(groups[g].items()))]) for g in group_order]
-    word_lines = [f"{json.dumps(lang)}:{line(dict(sorted(by_lang[lang].items())))}" for lang in sorted(by_lang)]
+    def word_lines(kind):
+        table = by_lang[kind]
+        return ",\n".join(f"{json.dumps(lang)}:{line(dict(sorted(table[lang].items())))}" for lang in sorted(table))
+
     pins = {"id-tagging-schema": words["version"], "category-groups": groups_snapshot["commit"][:12]}
     text = ('{"schema":1,\n"pins":' + line(pins)
             + ',\n"presets":[\n' + ",\n".join(preset_lines)
             + '\n],\n"groups":[\n' + ",\n".join(group_lines)
-            + '\n],\n"words":{\n' + ",\n".join(word_lines) + "\n}}\n")
+            + '\n],\n"names":{\n' + word_lines("names")
+            + '\n},\n"terms":{\n' + word_lines("terms") + "\n}}\n")
 
     def with_words(lang):
         return sum(1 for pid in order if rows.get(pid, {}).get("words", {}).get(lang))
 
+    def with_name(lang):
+        return sum(1 for pid in order if (rows.get(pid, {}).get("words", {}).get(lang) or [None])[0])
+
     grouped = sum(1 for pid in order if member[pid])
-    report = [f"categories: {len(order)} searchable presets, {len(groups)} groups, {len(by_lang)} languages",
+    languages = len(set(by_lang["names"]) | set(by_lang["terms"]))
+    report = [f"categories: {len(order)} searchable presets, {len(groups)} groups, {languages} languages",
               f"  words in en {with_words('en')}, nl {with_words('nl')}, de {with_words('de')}, fr {with_words('fr')}",
+              f"  a name in en {with_name('en')}, nl {with_name('nl')}, de {with_name('de')}, fr {with_name('fr')}",
               f"  {len(order) - grouped} presets in no group"]
     return text, no_english, report
 
