@@ -6,6 +6,7 @@
 //! mapping, so the text index needs no files of its own.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap},
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -41,7 +42,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 14;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 15;
 /// Postcode data within this radius describes where a record is: a record
 /// with no postcode of its own is ranked by the nearest postcode centroid
 /// within it, and the batch check compares the postcode areas within it.
@@ -1433,9 +1434,12 @@ pub(crate) const STREET_TYPE_ABBREVIATIONS: &[(&str, &str)] = &[
 /// follow a street type, in normalized text: "king st w" becomes "king street
 /// west". Indexed text and queries are expanded alike, so either spelling
 /// finds the other. An initial or post-number "st" is left alone: there it is
-/// usually "Saint" ("St Clair Avenue", "12 St George Street").
+/// usually "Saint" ("St Clair Avenue", "12 St George Street"). An English
+/// ordinal written out before a street type is written as its number.
+/// "fifth avenue" is "5th avenue", "twenty first street" is "21st street",
+/// and "first baptist church" keeps its word.
 pub(crate) fn expand_address_abbreviations(value: &str) -> String {
-    let mut expanded = String::with_capacity(value.len() + 8);
+    let mut words = Vec::<Cow<'_, str>>::new();
     let mut previous: Option<&str> = None;
     let mut last_word: Option<&str> = None;
     for token in value.split_whitespace() {
@@ -1453,14 +1457,87 @@ pub(crate) fn expand_address_abbreviations(value: &str) -> String {
                 }),
         };
         let word = replacement.unwrap_or(token);
-        if previous.is_some() {
-            expanded.push(' ');
+        // Checked after expansion, so "fifth ave" finds its type too.
+        if is_street_type(word)
+            && let Some(ordinal) = words.last().and_then(|last| ordinal_number(last))
+        {
+            words.pop();
+            let tens = (ordinal < 10)
+                .then(|| words.last().and_then(|last| tens_number(last)))
+                .flatten();
+            if tens.is_some() {
+                words.pop();
+            }
+            words.push(numbered_ordinal(tens.unwrap_or(0) + ordinal).into());
         }
-        expanded.push_str(word);
+        words.push(word.into());
         previous = Some(token);
         last_word = Some(word);
     }
-    expanded
+    words.join(" ")
+}
+
+/// The number an English ordinal written as one word stands for ("fifth"
+/// is 5), below the hundredth.
+fn ordinal_number(word: &str) -> Option<u32> {
+    Some(match word {
+        "first" => 1,
+        "second" => 2,
+        "third" => 3,
+        "fourth" => 4,
+        "fifth" => 5,
+        "sixth" => 6,
+        "seventh" => 7,
+        "eighth" => 8,
+        "ninth" => 9,
+        "tenth" => 10,
+        "eleventh" => 11,
+        "twelfth" => 12,
+        "thirteenth" => 13,
+        "fourteenth" => 14,
+        "fifteenth" => 15,
+        "sixteenth" => 16,
+        "seventeenth" => 17,
+        "eighteenth" => 18,
+        "nineteenth" => 19,
+        "twentieth" => 20,
+        "thirtieth" => 30,
+        "fortieth" => 40,
+        "fiftieth" => 50,
+        "sixtieth" => 60,
+        "seventieth" => 70,
+        "eightieth" => 80,
+        "ninetieth" => 90,
+        _ => return None,
+    })
+}
+
+/// The tens an English ordinal above the twentieth starts with ("twenty" of
+/// "twenty first").
+fn tens_number(word: &str) -> Option<u32> {
+    Some(match word {
+        "twenty" => 20,
+        "thirty" => 30,
+        "forty" => 40,
+        "fifty" => 50,
+        "sixty" => 60,
+        "seventy" => 70,
+        "eighty" => 80,
+        "ninety" => 90,
+        _ => return None,
+    })
+}
+
+/// `number` as an ordinal written in digits, such as "1st", "12th" or "22nd".
+fn numbered_ordinal(number: u32) -> String {
+    let suffix = match (number % 100, number % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{number}{suffix}")
 }
 
 /// A street name as the street field indexes it: like [`search_text`], and a
@@ -2042,6 +2119,25 @@ mod tests {
         );
         // Only the street field: a name keeps its letters.
         assert_eq!(search_text("Plan E").as_deref(), Some("plan e"));
+    }
+
+    #[test]
+    fn writes_an_ordinal_before_a_street_type_as_its_number() {
+        for (text, indexed) in [
+            ("Fifth Avenue", "5th avenue"),
+            ("5th Avenue", "5th avenue"),
+            ("Second Ave N", "2nd avenue north"),
+            ("West Twentieth St", "west 20th street"),
+            ("Twenty-First Street", "21st street"),
+            ("Thirty Third Ave", "33rd avenue"),
+            ("Twenty Street", "twenty street"),
+            ("Eleventh Avenue", "11th avenue"),
+            ("First Baptist Church", "first baptist church"),
+            ("Avenue Fifth", "avenue fifth"),
+            ("Fifth", "fifth"),
+        ] {
+            assert_eq!(search_text(text).as_deref(), Some(indexed), "{text}");
+        }
     }
 
     #[test]
