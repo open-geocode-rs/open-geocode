@@ -155,7 +155,8 @@ The container health check runs `open-geocode health`, which asks `/readyz`; Kub
 
 ## License
 
-`open-geocode` is licensed under the [MIT License](LICENSE).
+`open-geocode` is licensed under the [Apache License 2.0](LICENSE).
+Versions up to and including 0.1.0 were released under the MIT License, and stay under it.
 
 Third-party code dependencies remain under their own OSS licenses. Generated
 Packs preserve source metadata needed for attribution and auditability; users are

@@ -1004,8 +1004,8 @@
   "info": {
     "description": "Forward, autocomplete and reverse geocoding of addresses, served from a Pack built from OpenStreetMap and OpenAddresses.\n\nEvery response is a GeoJSON FeatureCollection. Forward results carry a `score`, and a `confidence` when the Pack is calibrated. Reverse results carry a `distance_m`.\n\nErrors are RFC 9457 problem documents (`application/problem+json`). Branch on `error_code`. `title` and `detail` are prose and may change.",
     "license": {
-      "identifier": "MIT",
-      "name": "MIT"
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
     },
     "title": "open-geocode",
     "version": "0.1.0"
