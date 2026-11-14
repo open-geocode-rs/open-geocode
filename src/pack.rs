@@ -67,6 +67,8 @@ const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
 const POSTCODE_ADDRESSES_SECTION: &str = "postcode_addresses";
 const POSTCODE_ADDRESSES_VERSION: u32 = 1;
+const COUNTRY_CODES_SECTION: &str = "country_codes";
+const COUNTRY_CODES_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -145,6 +147,39 @@ impl PostcodeAddresses {
         }
         Ok(Self(counts))
     }
+}
+
+/// Bytes of one country code entry: the country record's id and its code as a
+/// `u16`, little-endian.
+const COUNTRY_CODES_ENTRY_BYTES: usize = 10;
+
+fn country_codes_to_bytes(codes: &HashMap<RecordId, CountryCode>) -> Vec<u8> {
+    let mut sorted = codes.iter().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut bytes = Vec::with_capacity(sorted.len() * COUNTRY_CODES_ENTRY_BYTES);
+    for (record_id, code) in sorted {
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        bytes.extend_from_slice(&code.to_u16().to_le_bytes());
+    }
+    bytes
+}
+
+fn country_codes_from_bytes(bytes: &[u8]) -> Result<HashMap<RecordId, CountryCode>> {
+    if !bytes.len().is_multiple_of(COUNTRY_CODES_ENTRY_BYTES) {
+        return Err(Error::Decode("country codes are truncated"));
+    }
+    bytes
+        .as_chunks::<COUNTRY_CODES_ENTRY_BYTES>()
+        .0
+        .iter()
+        .map(|entry| {
+            let (record_id, code) = entry.split_at(8);
+            let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
+            let code = CountryCode::from_u16(u16::from_le_bytes([code[0], code[1]]))
+                .ok_or(Error::Decode("country record's code is not a country code"))?;
+            Ok((record_id, code))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +556,7 @@ impl Writer {
             spatial,
             layer_counts,
             context_names,
+            country_codes,
             postcode_addresses,
             dictionaries,
             ..
@@ -549,6 +585,12 @@ impl Writer {
             POSTCODE_ADDRESSES_VERSION,
             &postcode_addresses.to_bytes(),
         )?;
+        pack.add(
+            COUNTRY_CODES_SECTION,
+            COUNTRY_CODES_VERSION,
+            &country_codes_to_bytes(&country_codes),
+        )?;
+        drop(country_codes);
         Ok(Sealing {
             generation,
             scratch,
@@ -919,6 +961,8 @@ pub struct Reader {
     records: records::Reader,
     context: context::Reader,
     postcode_addresses: PostcodeAddresses,
+    /// The code of each country record, by its id.
+    country_codes: HashMap<RecordId, CountryCode>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -951,6 +995,15 @@ impl Reader {
         let postcode_addresses = PostcodeAddresses::from_bytes(
             &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
         )?;
+        // Optional: a Pack sealed before the section has none, and answers
+        // without country codes rather than failing to open.
+        let country_codes = if container.sections().contains_key(COUNTRY_CODES_SECTION) {
+            country_codes_from_bytes(
+                &container.section(COUNTRY_CODES_SECTION, COUNTRY_CODES_VERSION)?,
+            )?
+        } else {
+            HashMap::new()
+        };
         Ok(Self {
             path,
             container,
@@ -958,6 +1011,7 @@ impl Reader {
             records,
             context,
             postcode_addresses,
+            country_codes,
         })
     }
 
@@ -977,6 +1031,12 @@ impl Reader {
     /// Check every section of the Pack file against its checksum.
     pub fn verify(&self) -> Result<()> {
         self.container.verify()
+    }
+
+    /// The ISO 3166-1 code of a country record. `None` for any other record,
+    /// and for every record of a Pack sealed without country codes.
+    pub fn country_code(&self, record_id: RecordId) -> Option<CountryCode> {
+        self.country_codes.get(&record_id).copied()
     }
 
     /// See [`PostcodeAddresses`].

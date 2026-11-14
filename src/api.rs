@@ -421,6 +421,10 @@ pub struct ContextArea {
     /// Stable ID from the source data, as in a result's `id`.
     pub id: String,
     pub name: String,
+    /// ISO 3166-1 alpha-2 code, such as `NZ`. Present only on `country`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "NZ")]
+    pub code: Option<String>,
 }
 
 impl Point {
@@ -525,6 +529,10 @@ impl<'a> Contexts<'a> {
             .map(|record| ContextArea {
                 id: record.id,
                 name: record.name,
+                code: self
+                    .pack
+                    .country_code(record_id)
+                    .map(|code| code.as_str().to_string()),
             });
         self.areas.insert(record_id, area.clone());
         Ok(area)

@@ -18,6 +18,7 @@
         "category": "shop:bakery",
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },

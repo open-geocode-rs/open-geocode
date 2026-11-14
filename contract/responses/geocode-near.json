@@ -13,6 +13,7 @@
         "confidence": 0.37754068,
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -55,6 +56,7 @@
         "confidence": 0.76852477,
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },

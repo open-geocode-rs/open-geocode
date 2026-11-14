@@ -202,6 +202,11 @@ impl Problem {
         self.0.detail.as_deref()
     }
 
+    /// Seconds a 503 tells the client to wait.
+    pub(crate) fn retry_after(&self) -> Option<u32> {
+        self.0.retry_after
+    }
+
     #[cfg(test)]
     pub(crate) fn invalid_params(&self) -> &[InvalidParam] {
         &self.0.invalid_params
