@@ -15,7 +15,7 @@
 //! aliases, which reach wider ("coffee" is a restaurant term).
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::OnceLock,
 };
 
@@ -189,6 +189,95 @@ pub fn of_query(query: &str) -> Option<Vec<&'static str>> {
     (!found.is_empty()).then_some(found)
 }
 
+/// A query that asks for a kind of place, and where when it names a place
+/// too ("pharmacy amsterdam", "hotel near pike place").
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    pub categories: Vec<&'static str>,
+    /// The words of the place, connectors ("near", "in de buurt van") left
+    /// out; `None` for the caller's own surroundings.
+    pub place: Option<String>,
+}
+
+/// The kind of place a query asks for: all of it, or its longest first or
+/// last words with a place in the rest.
+pub fn of_request(query: &str) -> Option<Request> {
+    let key = search_key(query)?;
+    if let Some(categories) = of_query(&key) {
+        return Some(Request {
+            categories,
+            place: None,
+        });
+    }
+    let tokens = key.split_whitespace().collect::<Vec<_>>();
+    for size in (1..tokens.len()).rev() {
+        let splits = [
+            (&tokens[..size], &tokens[size..]),
+            (
+                &tokens[tokens.len() - size..],
+                &tokens[..tokens.len() - size],
+            ),
+        ];
+        for (kind, rest) in splits {
+            let Some(categories) = of_query(&kind.join(" ")) else {
+                continue;
+            };
+            let place = without_connectors(rest);
+            return Some(Request {
+                categories,
+                place: (!place.is_empty()).then(|| place.join(" ")),
+            });
+        }
+    }
+    None
+}
+
+/// `words` without the "near" words around them, longest first.
+fn without_connectors<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
+    let connectors = connectors();
+    let longest = connectors
+        .iter()
+        .map(|connector| connector.split(' ').count())
+        .max();
+    let longest = longest.unwrap_or(0);
+    let mut cut = true;
+    while cut {
+        cut = false;
+        for size in (1..=longest.min(words.len())).rev() {
+            if connectors.contains(&words[..size].join(" ")) {
+                words = &words[size..];
+                cut = true;
+                break;
+            }
+            if connectors.contains(&words[words.len() - size..].join(" ")) {
+                words = &words[..words.len() - size];
+                cut = true;
+                break;
+            }
+        }
+    }
+    words
+}
+
+/// Words that place what a query asks for ("near", "bij", "in"), every
+/// language the parser knows.
+fn connectors() -> &'static HashSet<String> {
+    static CONNECTORS: OnceLock<HashSet<String>> = OnceLock::new();
+    CONNECTORS.get_or_init(|| {
+        include_str!("parse/lattice/data/near.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .flat_map(|line| line.split('|'))
+            .filter_map(search_key)
+            .collect()
+    })
+}
+
+/// Every whole name and group word, for a typo of one.
+pub fn strong_words() -> impl Iterator<Item = &'static str> {
+    table().strong.keys().map(String::as_str)
+}
+
 /// Whether a record's category (`amenity:pharmacy`) is one of `categories`,
 /// where a bare key (`shop`) holds every value of that key.
 pub fn holds(categories: &[&str], category: &str) -> bool {
@@ -340,5 +429,29 @@ mod tests {
         assert!(park.contains(&"leisure park"));
         assert!(!park.contains(&"amenity parking"));
         assert_eq!(of_query("parking"), Some(vec!["amenity parking"]));
+    }
+
+    #[test]
+    fn a_request_splits_the_kind_from_the_place() {
+        let request = |query: &str| of_request(query).map(|request| request.place);
+        assert_eq!(request("pharmacy"), Some(None));
+        assert_eq!(
+            request("pharmacy amsterdam"),
+            Some(Some("amsterdam".to_string()))
+        );
+        assert_eq!(
+            request("amsterdam pharmacy"),
+            Some(Some("amsterdam".to_string()))
+        );
+        assert_eq!(
+            request("hotel near pike place"),
+            Some(Some("pike place".to_string()))
+        );
+        assert_eq!(
+            request("apotheek in de buurt van dam"),
+            Some(Some("dam".to_string()))
+        );
+        assert_eq!(request("pharmacy near me"), Some(None));
+        assert_eq!(request("starbucks seattle"), None);
     }
 }

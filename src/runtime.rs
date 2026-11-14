@@ -49,7 +49,8 @@ use crate::{
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{
         AddressGeocodeOptions, BIAS_RADIUS_M, TextAutocompleteOptions, TextSearchHit,
-        TextSearchOptions, TextSearcher, effective_autocomplete_limit, suggest,
+        TextSearchOptions, TextSearcher, autocomplete_tokens, category_typo,
+        effective_autocomplete_limit, name_starts_as, suggest,
     },
     spatial_index::haversine_m,
     stop::{self, CancelOnDrop, Stop},
@@ -973,20 +974,43 @@ fn nearest_of_category(
     options: &TextAutocompleteOptions,
     named: Vec<TextSearchHit>,
 ) -> Result<Vec<TextSearchHit>> {
-    let (Some(focus), Some(categories)) = (options.focus, categories::of_query(&options.query))
-    else {
-        return Ok(named);
+    let request = match categories::of_request(&options.query) {
+        Some(request) => request,
+        None => match category_typo(&options.query) {
+            Some(categories) => categories::Request {
+                categories,
+                place: None,
+            },
+            None => return Ok(named),
+        },
     };
     let typed = search_key(&options.query);
+    let tokens = autocomplete_tokens(&options.query);
+    let near = |hit: &TextSearchHit| {
+        options.focus.is_some_and(|[lon, lat]| {
+            hit.record
+                .point
+                .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
+        })
+    };
+    // A place nearby named as typed ("subway"), or being typed ("bank of
+    // amer"), keeps the name.
     let named_near = named.first().is_some_and(|hit| {
-        search_key(&hit.record.name) == typed
-            && hit.record.point.is_some_and(|point| {
-                haversine_m(focus[0], focus[1], point.lon, point.lat) <= BIAS_RADIUS_M
-            })
+        near(hit)
+            && (search_key(&hit.record.name) == typed
+                || (request.place.is_some() && name_starts_as(&hit.record.name, &tokens, false)))
     });
     if named_near {
         return Ok(named);
     }
+    // A place in the words outranks where the map is.
+    let focus = match &request.place {
+        None => options.focus,
+        Some(words) => place_named(state, options, words)?,
+    };
+    let (Some(focus), categories) = (focus, request.categories) else {
+        return Ok(named);
+    };
     let limit = effective_autocomplete_limit(options.limit);
     // Past the categories' own count, reading them from the index costs less.
     let count = state.places.category_count(&categories)?;
@@ -1025,6 +1049,22 @@ fn nearest_of_category(
         }
     }
     Ok(hits)
+}
+
+/// The point of the place `words` name, a town, a street or a POI.
+fn place_named(
+    state: &AppState,
+    options: &TextAutocompleteOptions,
+    words: &str,
+) -> Result<Option<[f64; 2]>> {
+    // A town nearby, then one known abroad ("new york"), then a POI nearby
+    // ("pike place" is the market here, not a street in Auckland).
+    let towns = state.searcher.place_point(words, options.focus, false)?;
+    if let Some(point) = towns.near.or(towns.known_abroad) {
+        return Ok(Some(point));
+    }
+    let pois = state.places.place_point(words, options.focus, true)?;
+    Ok(pois.near.or(towns.known).or(pois.known))
 }
 
 // For callers holding street, town and postcode in separate fields: joined

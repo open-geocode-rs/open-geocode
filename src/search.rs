@@ -5560,6 +5560,66 @@ impl TextSearcher {
 
     /// The address reading takes a town's or street's words in a name
     /// ("Rijksmuseum Twenthe") for where it is, and passes the place over.
+    /// Where the place `words` name lies, as `/places` finds it by name
+    /// (exact names first): the nearest within [`BIAS_RADIUS_M`] of `focus`,
+    /// and the best known anywhere. A region or a country is too wide to
+    /// search around.
+    /// Near, a town's name must be the words; with `prefix`, a POI's need
+    /// only start with them ("pike place" for Pike Place Market).
+    pub fn place_point(
+        &self,
+        words: &str,
+        focus: Option<[f64; 2]>,
+        prefix: bool,
+    ) -> Result<PlacePoint> {
+        let wide = [Layer::Country, Layer::Region, Layer::District].map(Layer::as_str);
+        let typed = search_key(words);
+        let records = self.pack.records();
+        let first = |focus| -> Result<Option<(TextSearchHit, bool)>> {
+            let Some(hit) = self
+                .places_by_name(words, &Filters::default(), focus, 5)?
+                .into_iter()
+                .find(|hit| {
+                    !wide.contains(&hit.record.layer.as_str()) && hit.record.point.is_some()
+                })
+            else {
+                return Ok(None);
+            };
+            let exact = search_key(&hit.record.name) == typed;
+            let abroad = records
+                .prominence(hit.record_id)?
+                .is_some_and(|prominence| known_abroad(prominence.rank()));
+            Ok(Some((hit, exact && abroad)))
+        };
+        let point = |hit: &TextSearchHit| hit.record.point.map(|point| [point.lon, point.lat]);
+        let tokens = autocomplete_query_tokens(typed.as_deref().unwrap_or_default());
+        let named = |hit: &TextSearchHit| match prefix {
+            true => name_starts_as(&hit.record.name, &tokens, false),
+            false => search_key(&hit.record.name) == typed,
+        };
+        let near = match focus {
+            Some([lon, lat]) => self
+                .places_by_name(words, &Filters::default(), focus, NAMED_PLACES_WINDOW)?
+                .iter()
+                .filter(|hit| !wide.contains(&hit.record.layer.as_str()) && named(hit))
+                .filter_map(point)
+                .find(|point| haversine_m(lon, lat, point[0], point[1]) <= BIAS_RADIUS_M),
+            None => None,
+        };
+        let known = match near {
+            Some(_) => None,
+            None => first(None)?,
+        };
+        Ok(PlacePoint {
+            near,
+            known_abroad: known
+                .as_ref()
+                .filter(|(_, abroad)| *abroad)
+                .and_then(|(hit, _)| point(hit)),
+            known: known.as_ref().and_then(|(hit, _)| point(hit)),
+        })
+    }
+
     fn places_by_name(
         &self,
         query_text: &str,
@@ -8757,6 +8817,37 @@ pub fn suggest(
     Ok(Vec::new())
 }
 
+/// The kinds of place a one-word query names through a typo ("pharmcy"),
+/// by the whole names and group words fewest edits away.
+pub(crate) fn category_typo(query: &str) -> Option<Vec<&'static str>> {
+    let word = search_key(query.trim())?;
+    if word.contains(' ') {
+        return None;
+    }
+    allowed_edits(&word)?;
+    let first = first_chars(&word);
+    let mut fewest = None;
+    let mut found = Vec::new();
+    for candidate in crate::categories::strong_words().filter(|key| key.starts_with(first)) {
+        let Some(edits) = typo_distance(&word, candidate) else {
+            continue;
+        };
+        if fewest.is_none_or(|fewest| edits < fewest) {
+            fewest = Some(edits);
+            found.clear();
+        }
+        if fewest == Some(edits) {
+            found.push(candidate);
+        }
+    }
+    let categories = found
+        .into_iter()
+        .filter_map(crate::categories::of_query)
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+    (!categories.is_empty()).then(|| categories.into_iter().collect())
+}
+
 /// Whether the last word is long enough to hold a typo. Shorter, it is still
 /// being typed, and the retry would cost a search of every word it starts.
 fn last_word_may_be_a_typo(query: &str) -> bool {
@@ -8825,7 +8916,7 @@ fn mix(
     mixed
 }
 
-fn name_starts_as(name: &str, words: &[String], typos: bool) -> bool {
+pub(crate) fn name_starts_as(name: &str, words: &[String], typos: bool) -> bool {
     let Some(name) = search_key(name) else {
         return false;
     };
@@ -8845,6 +8936,10 @@ fn name_starts_as(name: &str, words: &[String], typos: bool) -> bool {
                 };
                 types_word(typed, word, last) || (typos && typo_distance(typed, &cut).is_some())
             })
+}
+
+pub(crate) fn autocomplete_tokens(query: &str) -> Vec<String> {
+    search_key(query.trim()).map_or_else(Vec::new, |key| autocomplete_query_tokens(&key))
 }
 
 pub(crate) fn effective_autocomplete_limit(limit: usize) -> usize {
@@ -9627,6 +9722,17 @@ fn autocomplete_subject_query(field: Field, tokens: &[String]) -> Box<dyn Query>
         prefix,
         AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS,
     ))
+}
+
+/// Where a place a query names lies: one near the caller, else the best
+/// known anywhere (see [`TextSearcher::place_point`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacePoint {
+    pub near: Option<[f64; 2]>,
+    /// The best known, when its whole name is typed and it is known beyond
+    /// its own language (see [`RankKey::named_place`]).
+    pub known_abroad: Option<[f64; 2]>,
+    pub known: Option<[f64; 2]>,
 }
 
 /// The house number an autocomplete query starts with, when words follow it.
@@ -12095,6 +12201,59 @@ mod tests {
         assert_eq!(anywhere[0].record.id, "osm:node:1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_typo_of_a_kind_of_place_names_it() {
+        assert!(category_typo("pharmcy").is_some_and(|found| found.contains(&"amenity pharmacy")));
+        assert!(category_typo("apoteek").is_some_and(|found| found.contains(&"amenity pharmacy")));
+        assert_eq!(category_typo("ph"), None);
+        assert_eq!(category_typo("pharmacy near"), None);
+    }
+
+    /// A place named in a query is the one near the caller when there is one,
+    /// else the best known: from Seattle "amsterdam" is in the Netherlands.
+    #[test]
+    fn a_named_place_is_near_else_best_known() {
+        let pack = TempPack::new("place-point");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let town = |object_id, [lon, lat]: [f64; 2], prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Amsterdam".to_string(),
+                    place_type: "town".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(ObjectType::Node, object_id),
+                    prominence,
+                    wikidata: None,
+                },
+            )
+        };
+        let known = Prominence {
+            importance: 40,
+            linked: true,
+            languages: 100,
+        };
+        writer
+            .write(&town(1, [4.89, 52.37], known), None)
+            .expect("netherlands");
+        writer
+            .write(&town(2, [-111.3, 45.8], Prominence::default()), None)
+            .expect("montana");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        let from_seattle = searcher
+            .place_point("amsterdam", Some([-122.33, 47.61]), false)
+            .expect("place");
+        assert_eq!(from_seattle.near, None);
+        assert_eq!(from_seattle.known, Some([4.89, 52.37]));
+        let from_bozeman = searcher
+            .place_point("amsterdam", Some([-111.2, 45.7]), false)
+            .expect("place");
+        assert_eq!(from_bozeman.near, Some([-111.3, 45.8]));
     }
 
     #[test]
