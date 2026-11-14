@@ -7,12 +7,12 @@
 //! A word is matched by its [`search_key`], so "Apotheke" and "apotheke" are
 //! one word, and a phrase ("drug store") is one word of the table.
 //!
-//! Words come in three strengths, and a weaker one answers only when no
-//! stronger one matches. Strongest are a preset's whole name, unless the name
-//! is a regional variant's (en-AU), and every group word. Next are single
-//! words of a name ("coffee" of "Coffee Shop"), which can sit in a narrower
-//! preset's name ("park" of "Park and Ride Lot"). Weakest are terms and
-//! aliases, which reach wider ("coffee" is a restaurant term).
+//! Words come in two strengths, and the weaker answers only when no stronger
+//! one matches. Stronger are a preset's whole name, unless the name is a
+//! regional variant's (en-AU), and every group word. Weaker are single words
+//! of a name ("coffee" of "Coffee Shop"), which can sit in a narrower preset's
+//! name ("park" of "Park and Ride Lot"). Search terms reach wider still
+//! ("coffee" is a restaurant term) and are left out.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -27,12 +27,12 @@ use crate::util::fold::search_key;
 struct Catalog {
     /// `[preset id, category, group indexes]`.
     presets: Vec<(IgnoredAny, String, Vec<usize>)>,
-    /// `[group id, words by language]`.
-    groups: Vec<(IgnoredAny, BTreeMap<String, Vec<GroupWord>>)>,
-    /// Language, then preset name, then preset indexes.
-    names: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
-    /// Language, then term or alias, then preset indexes.
-    terms: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
+    /// `[group id, words of every language]`.
+    groups: Vec<(IgnoredAny, Vec<GroupWord>)>,
+    /// Preset names of every language, then preset indexes.
+    names: BTreeMap<String, Vec<usize>>,
+    /// Names only a regional variant gives (en-AU "Pharmacy" for a chemist).
+    regional: BTreeMap<String, Vec<usize>>,
 }
 
 #[derive(Deserialize)]
@@ -48,7 +48,6 @@ struct Table {
     categories: Vec<String>,
     strong: HashMap<String, Box<[usize]>>,
     name_words: HashMap<String, Box<[usize]>>,
-    weak: HashMap<String, Box<[usize]>>,
     /// Strong words with a minimum prefix length, sorted by word for a range
     /// scan from a typed prefix.
     prefixed: Vec<Prefixed>,
@@ -63,8 +62,11 @@ struct Prefixed {
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let catalog: Catalog = serde_json::from_str(include_str!("../catalog/categories.json"))
-            .expect("catalog/categories.json is a category catalog");
+        // Compressed, a twelfth of the binary it would add as text.
+        let text = zstd::decode_all(&include_bytes!("../catalog/categories.json.zst")[..])
+            .expect("catalog/categories.json.zst is zstd");
+        let catalog: Catalog =
+            serde_json::from_slice(&text).expect("catalog/categories.json is a category catalog");
         build(&catalog)
     })
 }
@@ -96,18 +98,13 @@ fn build(catalog: &Catalog) -> Table {
 
     let mut strong = HashMap::<String, BTreeSet<usize>>::new();
     let mut name_words = HashMap::<String, BTreeSet<usize>>::new();
-    let mut weak = HashMap::<String, BTreeSet<usize>>::new();
     let add = |table: &mut HashMap<String, BTreeSet<usize>>, key: &str, presets: &[usize]| {
         table
             .entry(key.to_string())
             .or_default()
             .extend(presets.iter().map(|&preset| of_preset[preset]));
     };
-    for (language, names) in &catalog.names {
-        // en-AU names the chemist "Pharmacy"; a regional name must not outrank the language's own.
-        let regional = language
-            .split_once('-')
-            .is_some_and(|(base, _)| catalog.names.contains_key(base));
+    for (names, regional) in [(&catalog.names, false), (&catalog.regional, true)] {
         for (name, presets) in names {
             let Some(key) = search_key(name) else {
                 continue;
@@ -123,14 +120,9 @@ fn build(catalog: &Catalog) -> Table {
             }
         }
     }
-    for (term, presets) in catalog.terms.values().flatten() {
-        if let Some(key) = search_key(term) {
-            add(&mut weak, &key, presets);
-        }
-    }
     let mut prefixed = Vec::new();
     for ((_, words), members) in catalog.groups.iter().zip(&members) {
-        for word in words.values().flatten() {
+        for word in words {
             let (word, min_chars) = match word {
                 GroupWord::Whole(word) => (word, None),
                 GroupWord::Prefix(word, min_chars) => (word, Some(*min_chars)),
@@ -159,7 +151,6 @@ fn build(catalog: &Catalog) -> Table {
         categories,
         strong: frozen(strong),
         name_words: frozen(name_words),
-        weak: frozen(weak),
         prefixed,
     }
 }
@@ -315,14 +306,10 @@ fn for_key(key: &str, prefix: bool) -> Vec<&'static str> {
     if !strong.is_empty() {
         return strong;
     }
-    let in_names = names(
+    names(
         table,
         table.name_words.get(key).into_iter().flatten().copied(),
-    );
-    if !in_names.is_empty() {
-        return in_names;
-    }
-    names(table, table.weak.get(key).into_iter().flatten().copied())
+    )
 }
 
 fn names(table: &'static Table, indexes: impl Iterator<Item = usize>) -> Vec<&'static str> {
@@ -388,18 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn terms_answer_when_no_name_matches() {
+    fn search_terms_name_nothing() {
         // "Drugstore" names the chemist; "apothecary" is only a term of both.
         assert_eq!(presets_for_word("drugstore"), vec!["shop chemist"]);
         assert_eq!(presets_for_word("chemist"), vec!["shop chemist"]);
-        assert_eq!(
-            presets_for_word("apothecary"),
-            vec!["amenity pharmacy", "shop chemist"]
-        );
-        assert_eq!(
-            presets_for_prefix("apothecary"),
-            vec!["amenity pharmacy", "shop chemist"]
-        );
+        assert!(presets_for_word("apothecary").is_empty());
     }
 
     #[test]
@@ -462,5 +442,23 @@ mod tests {
         );
         assert_eq!(request("pharmacy near me"), Some(None));
         assert_eq!(request("starbucks seattle"), None);
+    }
+
+    /// The binary carries the compressed copy; it must be the catalog's.
+    /// `OG_UPDATE_CONTRACT=1 cargo test` writes it.
+    #[test]
+    fn the_compressed_catalog_is_current() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("catalog");
+        let text = std::fs::read(root.join("categories.json")).expect("catalog");
+        let compressed = zstd::encode_all(&text[..], 19).expect("compress");
+        let path = root.join("categories.json.zst");
+        if std::env::var_os("OG_UPDATE_CONTRACT").is_some() {
+            std::fs::write(&path, &compressed).expect("write");
+        }
+        let current = std::fs::read(&path).unwrap_or_default();
+        assert!(
+            zstd::decode_all(&current[..]).is_ok_and(|current| current == text),
+            "catalog/categories.json.zst is stale; run OG_UPDATE_CONTRACT=1 cargo test"
+        );
     }
 }
