@@ -283,13 +283,23 @@ fn read_rows(
     };
     match layout(named)? {
         Layout::GeoJson => {
-            for line in input.lines().take(limit) {
-                let line = line?;
-                if line.trim().is_empty() {
+            // Split as bytes: one row of another encoding is that row's
+            // rejection, not the end of the build.
+            for line in input.split(b'\n').take(limit) {
+                let line = line.map_err(|source| Error::IoPath {
+                    action: "failed to read",
+                    path: PathBuf::from(file.describe()),
+                    source,
+                })?;
+                if line.trim_ascii().is_empty() {
                     continue;
                 }
                 take(
-                    serde_json::from_str::<Feature>(&line)
+                    std::str::from_utf8(&line)
+                        .map_err(|_| "invalid_utf8")
+                        .and_then(|line| {
+                            serde_json::from_str::<Feature>(line).map_err(|_| "malformed_row")
+                        })
                         .map(|feature| Row {
                             lon: feature
                                 .geometry
@@ -300,8 +310,7 @@ fn read_rows(
                                 .as_ref()
                                 .and_then(|g| g.coordinates.get(1).copied()),
                             properties: feature.properties,
-                        })
-                        .map_err(|_| "malformed_row"),
+                        }),
                 )?;
             }
         }
@@ -325,9 +334,15 @@ fn read_rows(
             let [unit, city, district, region, postcode] =
                 ["unit", "city", "district", "region", "postcode"].map(column);
             for record in reader.records().take(limit) {
-                let Ok(record) = record else {
-                    take(Err("malformed_row"))?;
-                    continue;
+                let record = match record {
+                    Ok(record) => record,
+                    Err(error) => {
+                        take(Err(match error.kind() {
+                            csv::ErrorKind::Utf8 { .. } => "invalid_utf8",
+                            _ => "malformed_row",
+                        }))?;
+                        continue;
+                    }
                 };
                 let text = |index: Option<usize>| {
                     index
@@ -548,6 +563,50 @@ mod tests {
                 ("missing_number".to_string(), 1),
             ])
         );
+    }
+
+    #[test]
+    fn a_row_not_in_utf8_is_rejected_and_the_rows_after_it_are_read() {
+        let feature = |number: &str, street: &[u8]| {
+            [
+                br#"{"type":"Feature","properties":{"number":""#.as_slice(),
+                number.as_bytes(),
+                br#"","street":""#,
+                street,
+                br#""},"geometry":{"type":"Point","coordinates":[6.13,49.61]}}"#,
+                b"\n",
+            ]
+            .concat()
+        };
+        let geojson = [
+            feature("1", b"Rue Test"),
+            feature("2", b"Rue T\xe9st"),
+            feature("3", b"Rue Test"),
+        ]
+        .concat();
+        let csv = b"lon,lat,number,street\n6.13,49.61,1,Rue Test\n6.13,49.61,2,Rue T\xe9st\n6.13,49.61,3,Rue Test\n";
+        for path in [
+            temp_file("source.geojson", &geojson),
+            temp_file("source.csv", csv),
+        ] {
+            let (records, report) = read(path);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| (record.address.number.as_str(), &record.source))
+                    .collect::<Vec<_>>(),
+                [
+                    ("1", &SourceProvenance::imported("openaddresses:test", 1)),
+                    ("3", &SourceProvenance::imported("openaddresses:test", 3)),
+                ]
+            );
+            assert_eq!(report.rows, 3);
+            assert_eq!(report.accepted, 2);
+            assert_eq!(
+                report.rejected,
+                BTreeMap::from([("invalid_utf8".to_string(), 1)])
+            );
+        }
     }
 
     #[test]
