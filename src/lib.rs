@@ -4,6 +4,7 @@ pub mod batch;
 pub mod bench;
 pub mod builder;
 pub mod calibration;
+pub mod categories;
 pub mod confidence;
 pub mod container;
 pub mod context;
