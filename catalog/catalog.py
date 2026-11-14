@@ -909,10 +909,12 @@ def categories_text(places_json):
     """The text of catalog/categories.json. The words that name each searchable place preset,
     in every language its sources have, and the groups that gather presets under one word ("food").
 
-    Presets are a list, so groups, names and terms point at them by index. A preset's
-    own name is kept apart from its terms and aliases, which reach wider ("coffee" is a
-    restaurant term). Words keep case folded only; og normalizes them as it normalizes
-    search text when it loads them.
+    Presets are a list, so groups and names point at them by index. Only names and
+    group words are kept, every language in one map: terms and aliases reach wider
+    ("coffee" is a restaurant term) and are not searched, and og never asks which
+    language a word is from. A regional name (en-AU "Pharmacy" for a chemist) is kept
+    apart, so the language's own name outranks it. Words keep case folded only; og
+    normalizes them as it normalizes search text when it loads them.
     Returns the text, the presets with no English word, and a coverage report."""
     presets = {pid: p for pid, p in json.loads(places_json)["presets"].items() if not p.get("never")}
     words = load_snapshot("id-tagging-schema-words")
@@ -974,17 +976,35 @@ def categories_text(places_json):
 
     preset_lines = [line([pid, category_tag(pid, presets[pid]["tags"]),
                           sorted(group_index[g] for g in member[pid])]) for pid in order]
-    group_lines = [line([g, dict(sorted(groups[g].items()))]) for g in group_order]
-    def word_lines(kind):
-        table = by_lang[kind]
-        return ",\n".join(f"{json.dumps(lang)}:{line(dict(sorted(table[lang].items())))}" for lang in sorted(table))
+    def merged_group(by_language):
+        # A word some language types short keeps the fewest letters any gives it.
+        least = {}
+        for ws in by_language.values():
+            for w in ws:
+                word, chars = (w[0], w[1]) if isinstance(w, list) else (w, None)
+                known = least.get(word)
+                if word not in least or (chars is not None and (known is None or chars < known)):
+                    least[word] = chars
+        return [[w, n] if n is not None else w for w, n in sorted(least.items())]
+
+    group_lines = [line([g, merged_group(groups[g])]) for g in group_order]
+    names = by_lang["names"]
+    def regional(lang):
+        return "-" in lang and lang.split("-", 1)[0] in names
+    def merged_names(keep):
+        merged = {}
+        for lang in names:
+            if keep(lang):
+                for word, targets in names[lang].items():
+                    merged.setdefault(word, set()).update(targets)
+        return ",\n".join(f"{json.dumps(w, ensure_ascii=False)}:{line(sorted(t))}" for w, t in sorted(merged.items()))
 
     pins = {"id-tagging-schema": words["version"], "category-groups": groups_snapshot["commit"][:12]}
-    text = ('{"schema":1,\n"pins":' + line(pins)
+    text = ('{"schema":2,\n"pins":' + line(pins)
             + ',\n"presets":[\n' + ",\n".join(preset_lines)
             + '\n],\n"groups":[\n' + ",\n".join(group_lines)
-            + '\n],\n"names":{\n' + word_lines("names")
-            + '\n},\n"terms":{\n' + word_lines("terms") + "\n}}\n")
+            + '\n],\n"names":{\n' + merged_names(lambda lang: not regional(lang))
+            + '\n},\n"regional":{\n' + merged_names(regional) + "\n}}\n")
 
     def with_words(lang):
         return sum(1 for pid in order if rows.get(pid, {}).get("words", {}).get(lang))

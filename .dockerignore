@@ -10,4 +10,4 @@
 !src
 !catalog/places.json
 !catalog/licences.json
-!catalog/categories.json
+!catalog/categories.json.zst
