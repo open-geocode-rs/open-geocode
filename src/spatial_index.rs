@@ -766,7 +766,7 @@ impl Reader {
         radius_m: f64,
         limit: usize,
         budget: u64,
-        accept: impl Fn(RecordId) -> Result<bool>,
+        accept: impl Fn(RecordId, f64, f64) -> Result<bool>,
     ) -> Result<Option<Vec<PointCandidate>>> {
         let mut candidates = Vec::new();
         let mut closest = Closest::new(limit);
@@ -795,7 +795,7 @@ impl Reader {
                         return Ok(());
                     }
                     tested += 1;
-                    if accept(record_id)? {
+                    if accept(record_id, point_lon, point_lat)? {
                         closest.add(distance_m);
                         candidates.push(PointCandidate {
                             record_id,
@@ -1256,7 +1256,7 @@ mod tests {
             .collect::<Vec<_>>();
         records.push(poi(-79.01, 43.0, 900, "amenity:pharmacy"));
         let (reader, _) = build(&records);
-        let pharmacy = |record_id| {
+        let pharmacy = |record_id, _, _| {
             reader
                 .records
                 .poi_category_is(record_id, |category| category == "amenity:pharmacy")

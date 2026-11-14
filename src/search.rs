@@ -773,6 +773,8 @@ impl TextSearcher {
         categories: &[&str],
         focus: [f64; 2],
         limit: usize,
+        countries: &[String],
+        bbox: Option<BoundingBox>,
     ) -> Result<Vec<TextSearchHit>> {
         let field = self.fields.content_text;
         let term = |word: &str| search_key(word).map(|word| Term::from_field_text(field, &word));
@@ -793,16 +795,32 @@ impl TextSearcher {
         if clauses.is_empty() {
             return Ok(Vec::new());
         }
+        let mut query = vec![(
+            Occur::Must,
+            Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>,
+        )];
+        query.extend(
+            self.countries_query(countries)
+                .map(|countries| (Occur::Must, countries)),
+        );
+        query.extend(bbox.map(|bbox| (Occur::Must, self.bbox_query(bbox))));
         let ranking = Ranking {
             focus: Some(focus),
             near_first: true,
             ..Ranking::default()
         };
-        self.ranked_hits(&BooleanQuery::new(clauses), &ranking, limit, &mut |hit| {
+        let filters = Filters::new(None, countries, bbox);
+        let records = self.pack.records();
+        // The field holds names too: a cafe named "Pharmacy" is no pharmacy.
+        self.ranked_hits(&BooleanQuery::new(query), &ranking, limit, &mut |hit| {
             Ok(hit.record.layer == Layer::Poi.as_str()
+                && filters.admit(hit)
                 && hit.record.point.is_some_and(|point| {
                     haversine_m(focus[0], focus[1], point.lon, point.lat) <= BIAS_RADIUS_M
-                }))
+                })
+                && records.poi_category_is(hit.record_id, |category| {
+                    crate::categories::holds(categories, category)
+                })?)
         })
     }
 
@@ -11972,23 +11990,34 @@ mod tests {
             poi(2, "Pharmacy Neumann", "amenity:pharmacy", [4.71, 52.01]),
             poi(3, "Pharmacy", "amenity:pharmacy", [6.57, 51.33]),
             poi(4, "Etos", "shop:chemist", [4.89, 52.37]),
+            poi(5, "Pharmacy Cafe", "amenity:cafe", [4.89, 52.371]),
         ] {
             writer.write(&record.into(), None).expect("poi");
         }
         writer.finish().expect("finish");
         let places = TextSearcher::open(&temp_dir).expect("searcher").places();
 
+        // An upper bound: the cafe's name counts too.
         assert_eq!(
             places.category_count(&["amenity pharmacy"]).expect("count"),
-            3
+            4
         );
-        let ids = places
-            .nearest_of_categories(&["amenity pharmacy"], [4.89, 52.37], 5)
-            .expect("nearest")
-            .into_iter()
-            .map(|hit| hit.record.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["osm:node:1", "osm:node:2"]);
+        let ids = |bbox| {
+            places
+                .nearest_of_categories(&["amenity pharmacy"], [4.89, 52.37], 5, &[], bbox)
+                .expect("nearest")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(None), ["osm:node:1", "osm:node:2"]);
+        let amsterdam = BoundingBox {
+            min_lon: 4.8,
+            min_lat: 52.3,
+            max_lon: 5.0,
+            max_lat: 52.4,
+        };
+        assert_eq!(ids(Some(amsterdam)), ["osm:node:1"]);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
