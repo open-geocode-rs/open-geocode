@@ -205,4 +205,10 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
+# Whole-program LTO in one unit inlines across og, tantivy and fst and drops
+# duplicate generic copies. Smaller, faster binary for a slower build.
+lto = "fat"
+codegen-units = 1
+# dist does not strip what it ships, so the profile does. Panics stay unwind,
+# since batch answers a panicking item as an error.
+strip = "symbols"
