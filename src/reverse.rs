@@ -136,20 +136,22 @@ impl PackReverseGeocoder {
     }
 
     /// The `limit` POIs nearest `[lon, lat]` within `radius_m` whose category
-    /// `accept` keeps, nearest first; `None` past `budget` POIs tested.
+    /// `accept` keeps, at a point `within` keeps, nearest first; `None` past
+    /// `budget` POIs tested.
     pub fn nearest_pois(
         &self,
         [lon, lat]: [f64; 2],
         radius_m: f64,
         limit: usize,
         budget: u64,
+        within: impl Fn(f64, f64) -> bool,
         accept: impl Fn(&str) -> bool,
     ) -> Result<Option<Vec<RecordId>>> {
         let records = self.pack.records();
         Ok(self
             .spatial
-            .poi_candidates_where(lon, lat, radius_m, limit, budget, |record_id| {
-                records.poi_category_is(record_id, &accept)
+            .poi_candidates_where(lon, lat, radius_m, limit, budget, |record_id, lon, lat| {
+                Ok(within(lon, lat) && records.poi_category_is(record_id, &accept)?)
             })?
             .map(|candidates| {
                 candidates
