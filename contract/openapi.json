@@ -357,6 +357,11 @@
                 "minimum": 0,
                 "type": "number"
               },
+              "distance_m": {
+                "description": "Distance from the request's `focus` point in meters. Present only\nwhen the request gives `focus`.",
+                "format": "double",
+                "type": "number"
+              },
               "fallback": {
                 "description": "`true` when no match was found and the result is the most precise\narea the query names instead: its postcode, a town or other area,\nits region or its country. `layer` says which. Absent otherwise.",
                 "type": "boolean"
