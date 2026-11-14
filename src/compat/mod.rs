@@ -15,8 +15,6 @@
 //! - Vendor id fields carry og's id as URL-safe base64.
 //! - An endpoint og lacks answers the vendor's own "not implemented".
 
-#![allow(dead_code)]
-
 pub(crate) mod fieldmask;
 pub(crate) mod google;
 pub(crate) mod here;
