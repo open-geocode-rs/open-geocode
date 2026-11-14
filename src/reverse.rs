@@ -718,6 +718,7 @@ mod tests {
                         locality_id,
                     )]),
                     flags: 0,
+                    ..Default::default()
                 }),
             )
             .expect("address");

@@ -1854,6 +1854,7 @@ mod tests {
         let context = RecordContext {
             admin_context: crate::pack::AdminContextTuple::from_tiers([(PlaceLayer::Locality, 9)]),
             flags: 0,
+            ..Default::default()
         };
         for _ in 0..3 {
             builder.add(RecordNames::default(), Some(&context));
@@ -1908,6 +1909,7 @@ mod tests {
                 (PlaceLayer::Locality, locality),
             ]),
             flags: 0,
+            ..Default::default()
         };
         let contexts = [(1, 2), (3, 4), (3, 5)].map(|(region, locality)| context(region, locality));
         for context in &contexts {

@@ -202,6 +202,8 @@ pub(crate) struct PlacesParams {
     country: Param,
     focus: Param,
     bbox: Param,
+    /// See [`parse_enclosing`].
+    enclosing: Param,
 }
 
 /// `/autocomplete`: unlike `/places`, an empty `q` answers no suggestions
@@ -221,6 +223,8 @@ pub(crate) struct AutocompleteParams {
     focus: Param,
     /// `min_lon,min_lat,max_lon,max_lat`; see [`bounds::parse_bbox`].
     bbox: Param,
+    /// See [`parse_enclosing`].
+    enclosing: Param,
 }
 
 /// Resolve the `layer` filter, rejecting a layer that does not exist.
@@ -286,6 +290,39 @@ fn parse_countries(country: &Param) -> Result<Vec<String>, Problem> {
     Ok(codes)
 }
 
+/// Resolve the `enclosing` flag: only `true` and `false`, as written. Empty is
+/// refused, unlike a filter's: it cannot be told from a flag meant off.
+pub(crate) fn parse_enclosing(enclosing: &Param) -> Result<bool, Problem> {
+    match enclosing {
+        Param::Missing => Ok(false),
+        Param::Value(value) if value == "false" || value == "true" => Ok(value == "true"),
+        _ => Err(
+            Problem::malformed_parameter("enclosing must be true or false").with_invalid_params(
+                vec![InvalidParam::new("enclosing", "must be true or false")],
+            ),
+        ),
+    }
+}
+
+/// [`parse_enclosing`], and a Pack that has the areas to list.
+fn enclosing_asked(state: &AppState, enclosing: &Param) -> Result<bool, Problem> {
+    let asked = parse_enclosing(enclosing)?;
+    if asked && !state.pack.has_enclosing() {
+        return Err(Problem::pack_outdated(
+            "this Pack has no enclosing areas: rebuild it",
+        ));
+    }
+    Ok(asked)
+}
+
+/// A checked lookup and whether its answer lists enclosing areas, which
+/// changes the answer's form, never the search.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Asked<R> {
+    pub(crate) request: R,
+    pub(crate) enclosing: bool,
+}
+
 /// `/geocode`: an address as free text in `q`, or one whose parts the
 /// caller already has apart.
 #[derive(Debug, Deserialize)]
@@ -305,6 +342,8 @@ pub(crate) struct GeocodeParams {
     layer: Param,
     /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
     country: Param,
+    /// See [`parse_enclosing`].
+    enclosing: Param,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +352,8 @@ pub(crate) struct ReverseParams {
     lat: f64,
     /// See [`parse_layer`].
     layer: Param,
+    /// See [`parse_enclosing`].
+    enclosing: Param,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -613,6 +654,9 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "4.73,52.28,5.07,52.43"),
+        ("enclosing" = Option<bool>, Query,
+         description = "`true` lists every area each result lies in as `enclosing`, \
+                        with its OSM tags.", example = true),
     ),
     responses(
         (status = 200, description = "Matching places, highest `score` first.",
@@ -628,7 +672,8 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 501, description = "`ids` was given to a Pack built before it had \
-                                      an id catalogue. Rebuild the Pack.",
+                                      an id catalogue, or `enclosing=true` to one \
+                                      built before enclosing areas. Rebuild the Pack.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -684,6 +729,9 @@ pub(crate) async fn places(
          description = "Return only results inside this box, as \
                         `min_lon,min_lat,max_lon,max_lat`. Applies to every item; \
                         an item's own field overrides it."),
+        ("enclosing" = Option<bool>, Query,
+         description = "As on `GET`. Applies to every item; an item's own field \
+                        overrides it."),
     ),
     request_body(content = Vec<openapi::PlacesItem>, content_type = "application/json"),
     responses(
@@ -710,12 +758,13 @@ pub(crate) async fn places_batch(State(state): State<AppState>, request: Request
 /// `/places` as a batch item, in `QUERY /places`. Not a `/jobs` endpoint: a
 /// job is a file of addresses or points too long for one request, and one
 /// batch already holds a saved-place list, ids and names alike.
-pub(crate) const PLACES: Lookup<PlacesParams, PlacesRequest, ForwardCollection, String> = Lookup {
-    route: "/places",
-    prepare: places_request,
-    place: places_place,
-    answer: places_answer,
-};
+pub(crate) const PLACES: Lookup<PlacesParams, Asked<PlacesRequest>, ForwardCollection, String> =
+    Lookup {
+        route: "/places",
+        prepare: places_request,
+        place: places_place,
+        answer: places_answer,
+    };
 
 #[derive(Clone)]
 pub(crate) enum PlacesRequest {
@@ -728,7 +777,8 @@ pub(crate) enum PlacesRequest {
 }
 
 /// `/places`' parameters, checked.
-fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesRequest, Problem> {
+fn places_request(state: &AppState, params: PlacesParams) -> Result<Asked<PlacesRequest>, Problem> {
+    let enclosing = enclosing_asked(state, &params.enclosing)?;
     let q = match (params.q, params.ids) {
         (Param::Missing, Param::Missing) => {
             return Err(Problem::invalid_query("give q, or ids"));
@@ -743,7 +793,8 @@ fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesReques
                     "this Pack has no id catalogue: rebuild it to look places up by id",
                 ));
             };
-            return Ok(PlacesRequest::Ids { catalogue, ids });
+            let request = PlacesRequest::Ids { catalogue, ids };
+            return Ok(Asked { request, enclosing });
         }
         (Param::Empty | Param::Value(_), Param::Empty | Param::Value(_)) => {
             return Err(Problem::malformed_parameter("give q or ids, not both")
@@ -757,24 +808,28 @@ fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesReques
         focus: params.focus,
         bbox: params.bbox,
     })
-    .map(PlacesRequest::Text)
+    .map(|options| Asked {
+        request: PlacesRequest::Text(options),
+        enclosing,
+    })
 }
 
 /// Names that read alike sit together, as `/geocode`'s text queries do. An
 /// id's block is known only once the catalogue is read, so id lookups take no
 /// place and run first.
-fn places_place(request: &PlacesRequest) -> String {
-    match request {
+fn places_place(asked: &Asked<PlacesRequest>) -> String {
+    match &asked.request {
         PlacesRequest::Text(options) => options.query.to_lowercase(),
         PlacesRequest::Ids { .. } => String::new(),
     }
 }
 
-fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardCollection> {
+fn places_answer(state: &AppState, asked: Asked<PlacesRequest>) -> Result<ForwardCollection> {
+    let Asked { request, enclosing } = asked;
     let (catalogue, ids) = match request {
         PlacesRequest::Text(options) => {
             let hits = state.places.search(&options)?;
-            return api::forward_collection(&state.pack, options.query, hits);
+            return api::forward_collection(&state.pack, options.query, hits, enclosing);
         }
         PlacesRequest::Ids { catalogue, ids } => (catalogue, ids),
     };
@@ -792,7 +847,7 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
         .iter()
         .map(|(kind, id)| labels::osm_record_id(*kind, *id))
         .collect::<Vec<_>>();
-    api::forward_collection(&state.pack, asked.join(","), hits)
+    api::forward_collection(&state.pack, asked.join(","), hits, enclosing)
 }
 
 fn no_ids() -> Problem {
@@ -906,6 +961,9 @@ fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
+        ("enclosing" = Option<bool>, Query,
+         description = "`true` lists every area each result lies in as `enclosing`, \
+                        with its OSM tags.", example = true),
     ),
     responses(
         (status = 200, description = "Suggested results, best first.",
@@ -915,6 +973,9 @@ fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
                                       parameter is malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 501, description = "`enclosing=true` was given to a Pack built \
+                                      before enclosing areas. Rebuild the Pack.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -936,6 +997,7 @@ pub(crate) async fn autocomplete(
     let countries = parse_countries(&params.country)?;
     let focus = bounds::parse_focus(&params.focus)?;
     let bbox = bounds::parse_bbox(&params.bbox)?;
+    let enclosing = enclosing_asked(&state, &params.enclosing)?;
 
     let options = TextAutocompleteOptions {
         query: query.clone(),
@@ -958,7 +1020,7 @@ pub(crate) async fn autocomplete(
                 nearest_of_category(&worker, &options, named)?
             }
         };
-        api::forward_collection(&worker.pack, query, hits)
+        api::forward_collection(&worker.pack, query, hits, enclosing)
     })
     .await?;
 
@@ -1157,6 +1219,9 @@ fn place_named(
                         returns `400`. A code the Pack does not cover returns no \
                         results.",
          example = "NZ,AU"),
+        ("enclosing" = Option<bool>, Query,
+         description = "`true` lists every area each result lies in as `enclosing`, \
+                        with its OSM tags.", example = true),
     ),
     responses(
         (status = 200,
@@ -1169,6 +1234,9 @@ fn place_named(
                                       malformed.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 501, description = "`enclosing=true` was given to a Pack built \
+                                      before enclosing areas. Rebuild the Pack.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -1232,6 +1300,9 @@ pub(crate) async fn geocode(
          description = "Comma-separated ISO 3166-1 alpha-2 codes. Applies to every \
                         item; an item's own field overrides it.",
          example = "CA"),
+        ("enclosing" = Option<bool>, Query,
+         description = "As on `GET`. Applies to every item; an item's own field \
+                        overrides it."),
     ),
     request_body(content = Vec<openapi::GeocodeItem>, content_type = "application/json"),
     responses(
@@ -1256,13 +1327,17 @@ pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/geocode` as a batch item, in `QUERY /geocode` and in `/jobs`.
-pub(crate) const GEOCODE: Lookup<GeocodeParams, GeocodeRequest, ForwardCollection, [String; 3]> =
-    Lookup {
-        route: "/geocode",
-        prepare: geocode_request,
-        place: geocode_place,
-        answer: geocode_answer,
-    };
+pub(crate) const GEOCODE: Lookup<
+    GeocodeParams,
+    Asked<GeocodeRequest>,
+    ForwardCollection,
+    [String; 3],
+> = Lookup {
+    route: "/geocode",
+    prepare: geocode_request,
+    place: geocode_place,
+    answer: geocode_answer,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum GeocodeRequest {
@@ -1271,7 +1346,11 @@ pub(crate) enum GeocodeRequest {
 }
 
 /// `/geocode`'s parameters, checked.
-fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest, Problem> {
+fn geocode_request(
+    state: &AppState,
+    params: GeocodeParams,
+) -> Result<Asked<GeocodeRequest>, Problem> {
+    let enclosing = enclosing_asked(state, &params.enclosing)?;
     // A field sent empty is still sent: `q=&address=10 King Street` names two
     // ways of giving the address, and which one the caller meant is a guess.
     let fields = [
@@ -1292,7 +1371,10 @@ fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest
         (Param::Empty, false) => return Err(bounds::empty_query()),
         (Param::Value(q), false) => q.clone(),
         (Param::Missing, _) => {
-            return geocode_fields(&params).map(GeocodeRequest::Fields);
+            return geocode_fields(&params).map(|options| Asked {
+                request: GeocodeRequest::Fields(options),
+                enclosing,
+            });
         }
     };
     let mut options = text_request(TextParams {
@@ -1303,7 +1385,10 @@ fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest
         bbox: params.bbox,
     })?;
     options.layer = parse_layer(&params.layer)?.map(|layer| layer.as_str().to_string());
-    Ok(GeocodeRequest::Text(options))
+    Ok(Asked {
+        request: GeocodeRequest::Text(options),
+        enclosing,
+    })
 }
 
 fn geocode_fields(params: &GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
@@ -1342,9 +1427,9 @@ fn context_field(field: &Param) -> Result<Option<String>, Problem> {
 
 /// Addresses in one postcode and town read the same part of the Pack, so a
 /// batch looks them up together, as `geocode batch` does its rows.
-fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
+fn geocode_place(asked: &Asked<GeocodeRequest>) -> [String; 3] {
     let field = |value: &Option<String>| value.as_deref().unwrap_or_default().to_lowercase();
-    match request {
+    match &asked.request {
         GeocodeRequest::Fields(options) => [
             field(&options.postcode).replace(' ', ""),
             field(&options.region),
@@ -1356,7 +1441,8 @@ fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
     }
 }
 
-fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCollection> {
+fn geocode_answer(state: &AppState, asked: Asked<GeocodeRequest>) -> Result<ForwardCollection> {
+    let Asked { request, enclosing } = asked;
     let (query, hits) = match request {
         GeocodeRequest::Text(options) => {
             let hits = state.searcher.search(&options)?;
@@ -1367,7 +1453,7 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
             None => (options.address, Vec::new()),
         },
     };
-    api::forward_collection(&state.pack, query, hits)
+    api::forward_collection(&state.pack, query, hits, enclosing)
 }
 
 /// Reverse geocode a point
@@ -1388,6 +1474,9 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
          description = "Return only the nearest result of this layer, or for an area \
                         layer the area of that layer the point lies in, and no other \
                         area. An unknown layer returns `400`."),
+        ("enclosing" = Option<bool>, Query,
+         description = "`true` lists every area each result lies in as `enclosing`, \
+                        with its OSM tags.", example = true),
     ),
     responses(
         (status = 200, description = "Results at the point, most precise first. \
@@ -1397,6 +1486,9 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
                                       `layer` is unknown.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
+         body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
+        (status = 501, description = "`enclosing=true` was given to a Pack built \
+                                      before enclosing areas. Rebuild the Pack.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
     ),
 )]
@@ -1438,6 +1530,9 @@ pub(crate) async fn reverse(
         ("layer" = Option<Layer>, Query,
          description = "Return only results of this layer. Applies to every item; an \
                         item's own field overrides it."),
+        ("enclosing" = Option<bool>, Query,
+         description = "As on `GET`. Applies to every item; an item's own field \
+                        overrides it."),
     ),
     request_body(content = Vec<openapi::ReverseItem>, content_type = "application/json"),
     responses(
@@ -1462,36 +1557,49 @@ pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
-pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollection, u64> = Lookup {
-    route: "/reverse",
-    prepare: reverse_request,
-    place: reverse_place,
-    answer: reverse_answer,
-};
+pub(crate) const REVERSE: Lookup<ReverseParams, Asked<GeocodeOptions>, ReverseCollection, u64> =
+    Lookup {
+        route: "/reverse",
+        prepare: reverse_request,
+        place: reverse_place,
+        answer: reverse_answer,
+    };
 
 /// `/reverse`'s parameters, checked.
-fn reverse_request(_: &AppState, params: ReverseParams) -> Result<GeocodeOptions, Problem> {
-    let ReverseParams { lon, lat, layer } = params;
-    bounds::validate_coords(lon, lat)?;
-    Ok(GeocodeOptions {
+fn reverse_request(
+    state: &AppState,
+    params: ReverseParams,
+) -> Result<Asked<GeocodeOptions>, Problem> {
+    let ReverseParams {
         lon,
         lat,
-        layer: parse_layer(&layer)?,
+        layer,
+        enclosing,
+    } = params;
+    let enclosing = enclosing_asked(state, &enclosing)?;
+    bounds::validate_coords(lon, lat)?;
+    Ok(Asked {
+        request: GeocodeOptions {
+            lon,
+            lat,
+            layer: parse_layer(&layer)?,
+        },
+        enclosing,
     })
 }
 
 /// The Pack stores records in Hilbert order, so points close on this curve
 /// read neighbouring pages.
-fn reverse_place(options: &GeocodeOptions) -> u64 {
+fn reverse_place(asked: &Asked<GeocodeOptions>) -> u64 {
     hilbert_key(
-        (options.lon * 1e7).round() as i32,
-        (options.lat * 1e7).round() as i32,
+        (asked.request.lon * 1e7).round() as i32,
+        (asked.request.lat * 1e7).round() as i32,
     )
 }
 
-fn reverse_answer(state: &AppState, options: GeocodeOptions) -> Result<ReverseCollection> {
-    let response = state.reverse_geocoder.reverse(options)?;
-    api::reverse_collection(&state.pack, &response)
+fn reverse_answer(state: &AppState, asked: Asked<GeocodeOptions>) -> Result<ReverseCollection> {
+    let response = state.reverse_geocoder.reverse(asked.request)?;
+    api::reverse_collection(&state.pack, &response, asked.enclosing)
 }
 
 #[cfg(test)]
@@ -1507,11 +1615,11 @@ mod router_tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::pack::Writer;
     use crate::record::{
         AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
         point_geometry,
     };
+    use crate::{pack::Writer, util::temp::TempPath};
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("open-geocode-http-{name}-{}", std::process::id()))
@@ -2679,7 +2787,7 @@ mod router_tests {
 
     fn panic_on_boom(state: &AppState, query: String) -> Result<ForwardCollection> {
         assert_ne!(query, "boom", "label {} out of range", 7);
-        api::forward_collection(&state.pack, query, Vec::new())
+        api::forward_collection(&state.pack, query, Vec::new(), false)
     }
 
     /// A panic fails its item with a bare 500, logged with the item's place,
@@ -2860,7 +2968,7 @@ mod router_tests {
             std::thread::sleep(Duration::from_millis(20));
             stop::check()?;
         }
-        api::forward_collection(&state.pack, query, Vec::new())
+        api::forward_collection(&state.pack, query, Vec::new(), false)
     }
 
     /// An item past the lookup timeout fails alone with 503 `timeout`, and
@@ -3331,7 +3439,7 @@ mod router_tests {
                 route: "/geocode",
                 batchable: true,
                 fields: field_names::<GeocodeParams>(),
-                fixed: &[("limit", "0")],
+                fixed: &[("limit", "0"), ("enclosing", "false")],
                 filled: &[
                     ("q", "10 King Street"),
                     ("focus", "-79,43"),
@@ -3367,7 +3475,7 @@ mod router_tests {
                 route: "/places",
                 batchable: true,
                 fields: field_names::<PlacesParams>(),
-                fixed: &[("limit", "0")],
+                fixed: &[("limit", "0"), ("enclosing", "false")],
                 filled: &[
                     ("q", "King Street"),
                     ("ids", "osm:node:1"),
@@ -3398,7 +3506,7 @@ mod router_tests {
                 route: "/autocomplete",
                 batchable: false,
                 fields: field_names::<AutocompleteParams>(),
-                fixed: &[("limit", "0")],
+                fixed: &[("limit", "0"), ("enclosing", "false")],
                 filled: &[
                     ("q", "10 King"),
                     ("country", "CA"),
@@ -3414,7 +3522,7 @@ mod router_tests {
                 route: "/reverse",
                 batchable: true,
                 fields: field_names::<ReverseParams>(),
-                fixed: &[("lon", "-79"), ("lat", "43")],
+                fixed: &[("lon", "-79"), ("lat", "43"), ("enclosing", "false")],
                 filled: &[("layer", "address")],
                 modes: &["layer"],
                 empty_is_missing: &["layer"],
@@ -3825,5 +3933,143 @@ mod router_tests {
             read.is_err_and(|error| error.is_panic()),
             "tower-http#732 is fixed: drop .fuse() in tail() in jobs.rs, and this test"
         );
+    }
+
+    /// The contract Pack that lists areas, and a copy without the section, as
+    /// a Pack built before enclosing areas is.
+    fn enclosing_routers(name: &str) -> (Router, Router, [TempPath; 2]) {
+        let (pack, old) = (TempPath::new(name), TempPath::new(&format!("{name}-old")));
+        crate::contract_tests::write_enclosing_pack(&pack);
+        let from = crate::pack::resolve_pack_path(&pack).unwrap();
+        let container = crate::container::Container::open(from).unwrap();
+        let mut copy = crate::container::Writer::create(&old).unwrap();
+        for (section, info) in container.sections() {
+            if section != crate::enclosing::SECTION {
+                let bytes = container.raw_section(section).unwrap();
+                copy.add(section, info.version, &bytes).unwrap();
+            }
+        }
+        copy.finish().unwrap();
+        let router = |path: &Path| build_router(state_for(path, true), None, None);
+        (router(&pack), router(&old), [pack, old])
+    }
+
+    async fn json(router: &Router, request: Request<Body>) -> serde_json::Value {
+        send(router.clone(), request).await.json()
+    }
+
+    /// The first feature's `enclosing`, or null.
+    fn enclosing(response: &serde_json::Value) -> &serde_json::Value {
+        &response["features"][0]["properties"]["enclosing"]
+    }
+
+    /// A job over `rows` of JSONL, answered as `accept` says.
+    async fn job(router: &Router, query: &str, rows: &str, accept: &'static str) -> Reply {
+        let mut request = upload(&format!("/jobs?{query}"), "application/jsonl", rows);
+        request
+            .headers_mut()
+            .insert(header::ACCEPT, header::HeaderValue::from_static(accept));
+        send(router.clone(), request).await
+    }
+
+    #[tokio::test]
+    async fn enclosing_lists_every_area_a_result_lies_in() {
+        use serde_json::json;
+        let (router, _, _clean) = enclosing_routers("enclosing-lists");
+        // Toronto holds the locality tier that Metro Area, a `place=city`
+        // area, loses.
+        let admin = |level| json!({"admin_level": level, "boundary": "administrative"});
+        let king = json!([
+            {"id": "osm:relation:3", "name": "Toronto", "tags": admin("8")},
+            {"id": "osm:relation:4", "name": "Metro Area", "tags": {"place": "city"}},
+            {"id": "osm:relation:2", "name": "Ontario", "tags": admin("4")},
+            {"id": "osm:relation:1", "name": "Canada", "tags": admin("2")},
+        ]);
+        let toronto = json!(king.as_array().unwrap()[1..]);
+
+        let gets = [
+            ("/geocode?q=10%20King%20Street", &king),
+            ("/geocode?address=10%20King%20Street", &king),
+            ("/places?q=Queen%20Bakery", &king),
+            ("/places?ids=osm:way:11", &king),
+            ("/places?ids=osm:relation:3", &toronto),
+            ("/autocomplete?q=10%20King", &king),
+            ("/reverse?lon=-79.0&lat=43.0", &king),
+        ];
+        for (uri, areas) in gets {
+            let asked = json(&router, request("GET", &format!("{uri}&enclosing=true"))).await;
+            assert_eq!(enclosing(&asked), areas, "{uri}");
+            let plain = json(&router, request("GET", &format!("{uri}&enclosing=false"))).await;
+            assert!(!plain.to_string().contains("enclosing"), "{uri}");
+        }
+
+        let items = |item: &str| format!(r#"[{{{item}}}, {{{item}, "enclosing": false}}]"#);
+        let batches = [
+            ("QUERY", "/geocode", items(r#""q": "10 King Street""#)),
+            ("POST", "/places", items(r#""ids": "osm:way:11""#)),
+            ("QUERY", "/reverse", items(r#""lon": -79.0, "lat": 43.0"#)),
+        ];
+        for (method, uri, items) in batches {
+            let batch = batch_request(method, &format!("{uri}?enclosing=true"), items);
+            let results = json(&router, batch).await["results"].take();
+            assert_eq!(enclosing(&results[0]["response"]), &king, "{uri}");
+            assert!(!results[1]["response"].to_string().contains("enclosing"));
+        }
+
+        for (endpoint, row) in [
+            ("geocode", r#"{"address": "10 King Street"}"#),
+            ("reverse", r#"{"lon": -79.0, "lat": 43.0}"#),
+        ] {
+            let query = format!("endpoint={endpoint}&enclosing=true");
+            let reply = job(&router, &query, row, "application/jsonl").await;
+            let line: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(enclosing(&line["response"]), &king, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn enclosing_is_true_or_false_and_needs_a_pack_that_lists_areas() {
+        let (router, old, _clean) = enclosing_routers("enclosing-refused");
+        let problem = |reply: Reply| (reply.status, reply.json()["detail"].clone());
+
+        let uri = "/geocode?q=10%20King%20Street&enclosing=";
+        for value in ["", "1", "TRUE", "%20true"] {
+            let reply = send(router.clone(), request("GET", &format!("{uri}{value}"))).await;
+            let invalid =
+                serde_json::json!([{"name": "enclosing", "reason": "must be true or false"}]);
+            assert_eq!(reply.json()["invalid_params"], invalid);
+            let detail = "enclosing must be true or false";
+            assert_eq!(problem(reply), (StatusCode::BAD_REQUEST, detail.into()));
+        }
+        let twice = send(router, request("GET", &format!("{uri}true&enclosing=true"))).await;
+        assert_eq!(problem(twice).1, "could not parse query parameters");
+
+        let detail = "this Pack has no enclosing areas: rebuild it";
+        let reply = send(old.clone(), request("GET", "/places?q=King&enclosing=true")).await;
+        assert_eq!(reply.json()["error_code"], "pack_outdated");
+        assert_eq!(problem(reply), (StatusCode::NOT_IMPLEMENTED, detail.into()));
+        let items = r#"[{"q": "King"}, {"q": "King", "enclosing": false}]"#;
+        let batch = batch_request("QUERY", "/geocode?enclosing=true", items);
+        let results = json(&old, batch).await["results"].take();
+        assert_eq!(results[0]["error"]["detail"], detail);
+        assert!(results[1]["response"].is_object());
+
+        let refused = "CSV results have no column for enclosing areas: ask for JSONL results (Accept: application/jsonl)";
+        let csv = upload(
+            "/jobs?address=street&enclosing=true",
+            "text/csv",
+            "street\n10 King\n",
+        );
+        assert_eq!(
+            problem(send(old.clone(), csv).await),
+            (StatusCode::BAD_REQUEST, refused.into())
+        );
+        let rows = "{\"address\": \"10 King Street\", \"enclosing\": true}\n{\"address\": \"10 King Street\"}\n";
+        let rows = csv_rows(&job(&old, "endpoint=geocode", rows, "text/csv").await.body);
+        assert_eq!(
+            rows[0]["geocode_reason"],
+            format!("malformed_parameter: {refused}")
+        );
+        assert_eq!(rows[1]["geocode_status"], "resolved");
     }
 }

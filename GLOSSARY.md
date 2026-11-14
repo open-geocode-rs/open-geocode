@@ -29,6 +29,11 @@ _Avoid_: document, entry, feature
 The kind of thing a record is: address, street, interpolation, postcode, locality, region, country or POI.
 _Avoid_: type, category
 
+**Enclosing area**:
+Any area of the Pack a record lies in, whether or not it holds a tier of the record's context.
+A Pack keeps them, smallest first, with the OSM `place`, `boundary` and `admin_level` tags of each.
+_Avoid_: parent, ancestor, hierarchy
+
 **Place type**:
 The size class the source gave a place (city, town, village, hamlet, or an administrative level), which breaks ties between places of the same name.
 _Avoid_: importance, population

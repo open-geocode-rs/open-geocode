@@ -1,0 +1,90 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "rooftop",
+        "address": {
+          "housenumber": "10",
+          "postcode": "M5V 1A1",
+          "street": "King Street"
+        },
+        "confidence": 0.975873,
+        "context": {
+          "country": {
+            "id": "osm:relation:1",
+            "name": "Canada"
+          },
+          "locality": {
+            "id": "osm:relation:3",
+            "name": "Toronto"
+          },
+          "region": {
+            "id": "osm:relation:2",
+            "name": "Ontario"
+          }
+        },
+        "enclosing": [
+          {
+            "id": "osm:relation:3",
+            "name": "Toronto",
+            "tags": {
+              "admin_level": "8",
+              "boundary": "administrative"
+            }
+          },
+          {
+            "id": "osm:relation:4",
+            "name": "Metro Area",
+            "tags": {
+              "place": "city"
+            }
+          },
+          {
+            "id": "osm:relation:2",
+            "name": "Ontario",
+            "tags": {
+              "admin_level": "4",
+              "boundary": "administrative"
+            }
+          },
+          {
+            "id": "osm:relation:1",
+            "name": "Canada",
+            "tags": {
+              "admin_level": "2",
+              "boundary": "administrative"
+            }
+          }
+        ],
+        "id": "osm:node:10",
+        "label": "10 King Street, M5V 1A1",
+        "layer": "address",
+        "name": "10 King Street",
+        "score": 0.0,
+        "source": {
+          "dataset": "osm"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
+    "query": "10 King Street",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}
