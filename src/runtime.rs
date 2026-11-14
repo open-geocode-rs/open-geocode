@@ -980,6 +980,7 @@ fn nearest_of_category(
             Some(categories) => categories::Request {
                 categories,
                 place: None,
+                whole: false,
             },
             None => return Ok(named),
         },
@@ -993,13 +994,16 @@ fn nearest_of_category(
                 .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
         })
     };
-    // A place nearby named as typed ("subway"), or being typed ("bank of
-    // amer"), keeps the name.
-    let named_near = named.first().is_some_and(|hit| {
-        near(hit)
-            && (search_key(&hit.record.name) == typed
-                || (request.place.is_some() && name_starts_as(&hit.record.name, &tokens, false)))
-    });
+    // A place nearby named as typed ("subway") keeps the name, and so does
+    // one being typed ("bank of amer", "restauran") unless the whole query
+    // is a kind's name.
+    let named_near = named
+        .first()
+        .is_some_and(|hit| near(hit) && search_key(&hit.record.name) == typed)
+        || (!request.whole
+            && named
+                .iter()
+                .any(|hit| near(hit) && name_starts_as(&hit.record.name, &tokens, false)));
     if named_near {
         return Ok(named);
     }

@@ -197,6 +197,8 @@ pub struct Request {
     /// The words of the place, connectors ("near", "in de buurt van") left
     /// out; `None` for the caller's own surroundings.
     pub place: Option<String>,
+    /// Whether the whole query is the kind's name, not found in part of it.
+    pub whole: bool,
 }
 
 /// The kind of place a query asks for: all of it, or its longest first or
@@ -207,6 +209,7 @@ pub fn of_request(query: &str) -> Option<Request> {
         return Some(Request {
             categories,
             place: None,
+            whole: true,
         });
     }
     let tokens = key.split_whitespace().collect::<Vec<_>>();
@@ -219,13 +222,19 @@ pub fn of_request(query: &str) -> Option<Request> {
             ),
         ];
         for (kind, rest) in splits {
-            let Some(categories) = of_query(&kind.join(" ")) else {
+            let kind = kind.join(" ");
+            // A word as short as "ho" names a kind somewhere and much else.
+            if kind.chars().count() < crate::search::MIN_TYPO_CHARS {
+                continue;
+            }
+            let Some(categories) = of_query(&kind) else {
                 continue;
             };
             let place = without_connectors(rest);
             return Some(Request {
                 categories,
                 place: (!place.is_empty()).then(|| place.join(" ")),
+                whole: false,
             });
         }
     }

@@ -326,7 +326,7 @@ const AREA_STANDS_IN_BOOST: Score = 0.5;
 const CORRECTED_BOOST: Score = 0.5;
 /// Words shorter than this are only matched as written: one edit turns most
 /// words of two or three letters into many others.
-const MIN_TYPO_CHARS: usize = 4;
+pub(crate) const MIN_TYPO_CHARS: usize = 4;
 /// Words at least this long may be two edits from a record's; shorter ones
 /// one edit.
 const LONG_TYPO_CHARS: usize = 7;
