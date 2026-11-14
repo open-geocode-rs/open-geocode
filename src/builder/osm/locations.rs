@@ -348,12 +348,7 @@ impl Location {
     }
 }
 
-/// Degrees from a 1e-7 fixed-point PBF coordinate, computed the way `osmpbf`
-/// computes `lat()`/`lon()` (via nanodegrees), so a coordinate read through
-/// the store is bit-identical to one read from the node itself.
-pub(crate) fn degrees(value: i32) -> f64 {
-    1e-9 * (i64::from(value) * 100) as f64
-}
+pub(crate) use crate::util::geo::degrees;
 
 /// Where the coordinates live.
 #[derive(Debug)]
