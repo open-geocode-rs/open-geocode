@@ -33,6 +33,11 @@ const BUDGET_PERCENT: u64 = 50;
 /// The heap may grow by at most this share of the memory available when the
 /// pool was last sampled before tracked buffers must spill.
 const HEAP_CEILING_PERCENT: u64 = 85;
+/// Least fair share while buffers that cannot spill hold the pool, such as
+/// the node store while ways are assembled. A share of nothing makes a
+/// sorter write a run per item, 1.2 million street runs for the Netherlands
+/// at a 1 GiB budget.
+const MIN_FAIR_SHARE_BYTES: usize = 16 << 20;
 /// The smallest derived budget: below it, sorters spill so often that a
 /// build drowns in tiny run files.
 pub const MIN_BUDGET_BYTES: usize = 256 << 20;
@@ -131,12 +136,17 @@ impl Budget {
     }
 
     /// The bytes one buffer that can spill may hold: a fair share of what
-    /// the buffers that cannot spill leave of the pool.
+    /// the buffers that cannot spill leave of the pool, and at least
+    /// [`MIN_FAIR_SHARE_BYTES`]. A full pool still lets each buffer grow to
+    /// the floor, so the floor is capped at half a fair share of the whole
+    /// pool. All floors together go at most half the limit over it.
     pub fn fair_share(&self) -> usize {
         let unspillable = self
             .used()
             .saturating_sub(self.spillable_used.load(Ordering::Relaxed));
-        self.limit.saturating_sub(unspillable) / self.spillable.load(Ordering::Relaxed).max(1)
+        let spillable = self.spillable.load(Ordering::Relaxed).max(1);
+        let floor = (self.limit / spillable / 2).min(MIN_FAIR_SHARE_BYTES);
+        (self.limit.saturating_sub(unspillable) / spillable).max(floor)
     }
 
     /// Reserve `bytes` if they fit, in the pool and under the heap ceiling.
@@ -358,6 +368,20 @@ mod tests {
         drop(kept);
         drop(second);
         assert_eq!(budget.used(), 200);
+    }
+
+    #[test]
+    fn a_pool_held_by_buffers_that_cannot_spill_leaves_a_floor() {
+        let budget = Budget::new(1 << 30);
+        let _node_store = Reservation::forced(&budget, 1 << 30);
+        let first = Spillable::new(&budget);
+        assert_eq!(first.share(usize::MAX), MIN_FAIR_SHARE_BYTES);
+        assert_eq!(first.share(1_000), 1_000);
+        // A small pool's floor is half a fair share of it.
+        let small = Budget::new(1_000);
+        let _fixed = Reservation::forced(&small, 1_000);
+        let buffers = [Spillable::new(&small), Spillable::new(&small)];
+        assert_eq!(buffers[0].share(usize::MAX), 250);
     }
 
     #[test]
