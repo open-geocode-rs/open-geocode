@@ -4009,10 +4009,7 @@ impl TextSearcher {
                         session,
                         &mut *accept,
                     )?;
-                    // Streets standing in for a number the plan writes
-                    // more of than it starts with leave the number alone
-                    // to try ("46" of "46 к5", "407" of "407a"): it may be
-                    // stated, or placed between its neighbours.
+                    // Street stand-ins for "46 к5" still let "46" be tried.
                     let found = hits.iter().any(|hit| hit.signals.house_level);
                     for hit in hits {
                         let confirmed = !plan.postcode_may_be_house_number()
@@ -5494,6 +5491,7 @@ impl TextSearcher {
         // [`Self::demoted`]), so it holds no place while one may.
         let mut cutoff = None;
         let mut hits = Vec::new();
+        let mut abbreviations = Vec::new();
         let mut placed = 0;
         for (key, doc) in top_docs {
             crate::stop::check()?;
@@ -5505,7 +5503,7 @@ impl TextSearcher {
             }
             let (first, count) = self.document_records(searcher, doc)?;
             let country = self.document_country(searcher, doc)?;
-            for record_id in self.hit_records(first, count, ranking)? {
+            for (record_id, abbreviated) in self.hit_records(first, count, ranking)? {
                 let mut record = self.pack.record_summary(record_id)?;
                 if let Some(number) = ranking.house_number
                     && record.layer == Layer::Interpolation.as_str()
@@ -5556,11 +5554,15 @@ impl TextSearcher {
                     ),
                     hit,
                 ));
+                abbreviations.push(abbreviated);
             }
             if !ranking.numbered && cutoff.is_none() && placed >= limit {
                 cutoff = Some(key);
             }
         }
+        let sure = sure_abbreviations(hits.iter().map(|(_, _, hit)| hit), &abbreviations, ranking);
+        let mut sure = sure.into_iter();
+        hits.retain(|_| sure.next().unwrap_or(true));
         let demoted = self.demoted(hits.iter().map(|(_, _, hit)| hit), ranking)?;
         let mut hits = hits.into_iter().zip(demoted).collect::<Vec<_>>();
         hits.sort_by(
@@ -5771,16 +5773,22 @@ impl TextSearcher {
 
     /// The records a matched document answers: of a street group, the
     /// addresses with the house number the query asks for, or the first of
-    /// them when it asks for none; else the document's own record.
-    fn hit_records(&self, first: RecordId, count: u64, ranking: &Ranking) -> Result<Vec<RecordId>> {
+    /// them when it asks for none; else the document's own record. Each
+    /// with the term it states the number by when it abbreviates its words
+    /// otherwise (see [`sure_abbreviations`]).
+    fn hit_records(
+        &self,
+        first: RecordId,
+        count: u64,
+        ranking: &Ranking,
+    ) -> Result<Vec<(RecordId, Option<String>)>> {
         if ranking.number_texts.is_empty() {
-            return Ok(vec![first]);
+            return Ok(vec![(first, None)]);
         }
         if self.pack.records().header(first)?.layer != Layer::Address {
-            return Ok(vec![first]);
+            return Ok(vec![(first, None)]);
         }
         let mut matched = Vec::new();
-        let mut abbreviated = Vec::<(String, RecordId)>::new();
         self.pack
             .records()
             .address_numbers(first, count, |record_id, stated, unit| {
@@ -5791,23 +5799,14 @@ impl TextSearcher {
                 if address_number_terms(stated).any(|term| sought(&term))
                     || flat_number_term(stated, unit).is_some_and(|term| sought(&term))
                 {
-                    matched.push(record_id);
+                    matched.push((record_id, None));
                 } else if let Some(term) = address_number_terms(stated)
                     .find(|term| ranking.abbreviated_numbers.contains(term))
                 {
-                    abbreviated.push((term, record_id));
+                    matched.push((record_id, Some(term)));
                 }
                 Ok(())
             })?;
-        // A number stated with its words abbreviated otherwise answers only
-        // when one building of the street states it so: of "81 с1" and
-        // "81 соор1", "81 сооружение 1" names neither surely.
-        if matched.is_empty()
-            && let Some((only, _)) = abbreviated.first()
-            && abbreviated.iter().all(|(term, _)| term == only)
-        {
-            matched.extend(abbreviated.into_iter().map(|(_, record_id)| record_id));
-        }
         Ok(matched)
     }
 
@@ -6884,6 +6883,62 @@ fn states_number(record: &Summary, ranking: &Ranking) -> bool {
         .as_deref()
         .and_then(search_key)
         .is_some_and(|stated| ranking.states_number(&stated))
+}
+
+/// Whether each hit may answer: every hit but one that states the number
+/// with a word abbreviated otherwise (`abbreviations`, see
+/// [`TextSearcher::hit_records`]). That one answers only when no hit of its
+/// street states the number in full and every abbreviated hit of the street
+/// names one number: of "81 с1" and "81 соор1", "81 сооружение 1" names
+/// neither surely. A street spans documents that differ in postcode, so
+/// this is decided over all of them.
+fn sure_abbreviations<'h>(
+    hits: impl Iterator<Item = &'h TextSearchHit>,
+    abbreviations: &[Option<String>],
+    ranking: &Ranking,
+) -> Vec<bool> {
+    let street = |hit: &TextSearchHit| {
+        let key = |value: &Option<String>| value.as_deref().and_then(search_key);
+        (
+            key(&hit.record.address.street),
+            key(&hit.record.address.locality),
+        )
+    };
+    let hits = hits.collect::<Vec<_>>();
+    let mut full = HashSet::new();
+    let mut named = HashMap::<_, Vec<Vec<&str>>>::new();
+    for (hit, abbreviated) in hits.iter().zip(abbreviations) {
+        match abbreviated {
+            Some(term) => {
+                let runs = number_runs(term);
+                let numbers = named.entry(street(hit)).or_default();
+                if !numbers.contains(&runs) {
+                    numbers.push(runs);
+                }
+            }
+            None if hit
+                .record
+                .address
+                .housenumber
+                .as_deref()
+                .and_then(search_key)
+                .is_some_and(|stated| ranking.number_texts.contains(&stated)) =>
+            {
+                full.insert(street(hit));
+            }
+            None => {}
+        }
+    }
+    hits.iter()
+        .zip(abbreviations)
+        .map(|(hit, abbreviated)| {
+            abbreviated.is_none() || {
+                let street = street(hit);
+                !full.contains(&street)
+                    && named.get(&street).is_some_and(|numbers| numbers.len() == 1)
+            }
+        })
+        .collect()
 }
 
 /// The words of a record's label, as search keys.
@@ -8674,11 +8729,7 @@ impl QueryPlan {
         for (label, words, corrected) in runs {
             match label {
                 Label::HouseNumber if plan.house_number.is_none() => {
-                    // A number written in parts ("993.5", "1384 1/2") is one
-                    // house number, and so is a run a number starts ("81 к1",
-                    // "12 k2 s1", "81к1"), which the number alone stands in
-                    // for when no record states the run (see
-                    // [`HouseNumber::compound`]).
+                    // "993.5" and "81 к1" are each one house number.
                     if let Some(number) = HouseNumber::parse(&words.join("_")) {
                         plan.house_number = Some(number);
                     } else if let Some(number) = HouseNumber::compound(&words) {
@@ -9113,8 +9164,7 @@ struct ShortNumber {
     text: String,
     /// The other words of the run, which only rank.
     rest: Vec<String>,
-    /// Whether the number is one a plain reading of the run would drop
-    /// (see [`labelled_number`]).
+    /// Whether the number is cut from the run's first word ("81" of "81к1").
     kept: bool,
 }
 
@@ -9132,25 +9182,18 @@ impl HouseNumber {
         if !first.starts_with(|character: char| character.is_ascii_digit()) {
             return None;
         }
+        // Fallback is the leading plot number, never "1" of "12к2 строение 1".
         let short = match Self::parse(first) {
             Some(number) => ShortNumber {
                 text: number.text,
                 rest: words[1..].to_vec(),
                 kept: false,
             },
-            None => {
-                let (at, number) = labelled_number(words)?;
-                ShortNumber {
-                    text: number.text,
-                    rest: words
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, word)| *index != at || !is_numeric_token(word))
-                        .map(|(_, word)| word.clone())
-                        .collect(),
-                    kept: true,
-                }
-            }
+            None => ShortNumber {
+                text: base_house_number(first)?.to_string(),
+                rest: words.to_vec(),
+                kept: true,
+            },
         };
         let text = words.join(" ");
         Some(Self {
@@ -12295,9 +12338,7 @@ mod tests {
             plan("10/house_number king/street st/street").with_base_house_number(),
             None
         );
-        // A run a number starts is one house number, as a record states it
-        // ("81 к1"), and else the number it starts with, its other words
-        // only ranking.
+        // A run is one number; its fallback ranks the other words.
         for (text, number, rest) in [
             (
                 "221/house_number b/house_number baker/street street/street",
@@ -12484,6 +12525,85 @@ mod tests {
         let plot = missing.with_base_house_number().expect("plot");
         assert_eq!(answer_plan(&searcher, &plot)[0].record.id, "osm:node:1");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn an_abbreviated_number_is_sure_only_across_its_whole_street() {
+        let temp_dir = temp_pack_path("search-abbreviated-street");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        // Two postcodes split the street into two documents.
+        for (index, (id, number, postcode)) in [
+            ("osm:node:1", "85 с1", "117335"),
+            ("osm:node:2", "85 соор1", "117336"),
+            ("osm:node:3", "87 к1", "117335"),
+            ("osm:node:4", "87 корпус 1", "117336"),
+            ("osm:node:5", "88к1", "117335"),
+            ("osm:node:6", "88 к1", "117336"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = address_record(
+                id,
+                "",
+                number,
+                "улица Вавилова",
+                Some("Москва"),
+                Some(postcode),
+            );
+            record.geometry = point_geometry(37.54 + index as f64 * 0.001, 55.68);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let houses = |reading: &str| {
+            let mut ids = answer_plan(&searcher, &reading_plan(&searcher, reading))
+                .into_iter()
+                .filter(|hit| hit.signals.house_level)
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+
+        // Two buildings in two documents fit: neither is sure.
+        assert_eq!(
+            houses(
+                "85/house_number сооружение/house_number 1/house_number улица/street вавилова/street москва/locality"
+            ),
+            Vec::<String>::new()
+        );
+        // A record of the street stating the number in full wins.
+        assert_eq!(
+            houses(
+                "87/house_number корпус/house_number 1/house_number улица/street вавилова/street москва/locality"
+            ),
+            ["osm:node:4"]
+        );
+        // One building spaced two ways is still one number.
+        assert_eq!(
+            houses(
+                "88/house_number корпус/house_number 1/house_number улица/street вавилова/street москва/locality"
+            ),
+            ["osm:node:5", "osm:node:6"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_run_falls_back_to_the_plot_number_it_starts_with() {
+        let plan = QueryPlan::from_tagged(
+            &tagged("12к2/house_number строение/house_number 1/house_number вавилова/street"),
+            &[],
+            &[],
+            |_| false,
+        )
+        .expect("plan");
+        let short = plan.with_base_house_number().expect("short");
+        let number = short.house_number.expect("number");
+        assert_eq!((number.text.as_str(), number.base), ("12", 12));
+        assert_eq!(short.optional, ["12к2", "строение", "1"]);
     }
 
     #[test]
