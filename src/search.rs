@@ -20,7 +20,7 @@ use tantivy::{
     index::SegmentId,
     query::{
         BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery,
-        Query, RangeQuery, TermQuery,
+        PhraseQuery, Query, RangeQuery, TermQuery,
     },
     schema::{Field, IndexRecordOption},
 };
@@ -243,6 +243,9 @@ pub const SEARCH_BUDGET: Duration = Duration::from_secs(3_600);
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
+/// Planet Pack holds 33,000 words of "mar" (7 ms to read) and 606,000 of "s"
+/// (210 ms, read per search per keystroke).
+const MAX_COMPLETION_SCAN: usize = 1 << 16;
 /// Terms and postcode records read to find the area of a postcode the query
 /// names (see [`TextSearcher::postcode_areas`]): a sample, enough to place
 /// it and measure how far it reaches.
@@ -785,10 +788,12 @@ impl TextSearcher {
                 completion,
                 Some(number),
                 &tokens[1..],
+                true,
                 &filters,
             );
         }
-        let as_typed = self.autocomplete_reading(options, completion, None, &tokens, &filters)?;
+        let as_typed =
+            self.autocomplete_reading(options, completion, None, &tokens, true, &filters)?;
         let [street @ .., last] = tokens.as_slice() else {
             return Ok(as_typed);
         };
@@ -807,7 +812,7 @@ impl TextSearcher {
             return Ok(as_typed);
         }
         let numbered =
-            self.autocomplete_reading(options, completion, Some(last), street, &filters)?;
+            self.autocomplete_reading(options, completion, Some(last), street, false, &filters)?;
         Ok(if numbered.is_empty() {
             as_typed
         } else {
@@ -821,10 +826,14 @@ impl TextSearcher {
         completion: Completion,
         number: Option<&str>,
         words: &[String],
+        typing: bool,
         filters: &Filters<'_>,
     ) -> Result<Vec<TextSearchHit>> {
         let limit = effective_autocomplete_limit(options.limit);
-        let query = self.autocomplete_query(completion, number, words, filters);
+        let Some(query) = self.autocomplete_query(completion, number, words, typing, filters)?
+        else {
+            return Ok(Vec::new());
+        };
         let ranking = Ranking {
             query_words: QueryWords::new(&options.query),
             number_text: number.map(str::to_string),
@@ -5230,15 +5239,79 @@ impl TextSearcher {
         completion: Completion,
         number: Option<&str>,
         words: &[String],
+        typing: bool,
         filters: &Filters<'_>,
-    ) -> Box<dyn Query> {
+    ) -> Result<Option<Box<dyn Query>>> {
         let subject = self.fields.autocomplete_subject_text;
         let last = words.len() - 1;
-        let word = |field, at: usize| self.autocomplete_word_query(field, &words[at], at == last);
+        // Street before a trailing house number is typed whole. In-order
+        // lookup skips the lists, so a query it answers costs what it did.
+        let lists = match completion {
+            Completion::InOrder => None,
+            _ if !typing => None,
+            _ => self
+                .common_completions(subject, &words[last])?
+                .zip(self.common_completions(self.fields.context_text, &words[last])?),
+        };
+        let completes = lists.is_some();
+        let (subject_completions, context_completions) = lists.unwrap_or_default();
+        let word = |field, at: usize| {
+            let completions = if field == subject {
+                &subject_completions.0
+            } else {
+                &context_completions.0
+            };
+            let typed = match () {
+                _ if at != last || !typing => Typed::Whole,
+                _ if completes => Typed::Completions(completions),
+                _ => Typed::Prefix,
+            };
+            self.autocomplete_word_query(field, &words[at], typed)
+        };
         let mut clauses = Vec::new();
         match completion {
+            Completion::InOrder if !typing => {
+                let terms = words
+                    .iter()
+                    .map(|word| Term::from_field_text(subject, word))
+                    .collect::<Vec<_>>();
+                let whole: Box<dyn Query> = match terms.len() {
+                    1 => Box::new(TermQuery::new(
+                        terms[0].clone(),
+                        IndexRecordOption::WithFreqs,
+                    )),
+                    _ => Box::new(PhraseQuery::new(terms)),
+                };
+                clauses.push((Occur::Must, whole));
+            }
             Completion::InOrder => {
                 clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
+            }
+            Completion::CommonCompletions => {
+                let (completions, cut) = &subject_completions;
+                if !cut {
+                    return Ok(None);
+                }
+                let head = &words[..last];
+                let phrases = completions
+                    .iter()
+                    .map(|completion| -> (Occur, Box<dyn Query>) {
+                        let terms = head
+                            .iter()
+                            .chain(std::iter::once(completion))
+                            .map(|word| Term::from_field_text(subject, word))
+                            .collect::<Vec<_>>();
+                        let query: Box<dyn Query> = match terms.len() {
+                            1 => Box::new(TermQuery::new(
+                                terms[0].clone(),
+                                IndexRecordOption::WithFreqs,
+                            )),
+                            _ => Box::new(PhraseQuery::new(terms)),
+                        };
+                        (Occur::Should, query)
+                    })
+                    .collect();
+                clauses.push((Occur::Must, Box::new(BooleanQuery::new(phrases))));
             }
             Completion::AllWords => {
                 let optional = |at: usize| {
@@ -5289,10 +5362,52 @@ impl TextSearcher {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
         clauses.push(self.product_clause());
-        Box::new(BooleanQuery::new(clauses))
+        Ok(Some(Box::new(BooleanQuery::new(clauses))))
     }
 
-    fn autocomplete_word_query(&self, field: Field, word: &str, last: bool) -> Box<dyn Query> {
+    /// Ties keep index order, so the same input picks the same words. `None`
+    /// past [`MAX_COMPLETION_SCAN`]. "s" then stands only for "south".
+    fn common_completions(
+        &self,
+        field: Field,
+        prefix: &str,
+    ) -> Result<Option<(Vec<String>, bool)>> {
+        let searcher = self.reader.searcher();
+        let mut used = HashMap::<Vec<u8>, u64>::new();
+        for segment in searcher.segment_readers() {
+            let index = segment.inverted_index(field)?;
+            let mut stream = index.terms().range().ge(prefix.as_bytes()).into_stream()?;
+            while stream.advance() {
+                if !stream.key().starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                *used.entry(stream.key().to_vec()).or_default() +=
+                    u64::from(stream.value().doc_freq);
+                if used.len() > MAX_COMPLETION_SCAN {
+                    return Ok(None);
+                }
+            }
+        }
+        let cap = AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS as usize;
+        let mut words = used.into_iter().collect::<Vec<_>>();
+        let cut = words.len() > cap;
+        words.sort_by(|(a, a_used), (b, b_used)| b_used.cmp(a_used).then_with(|| a.cmp(b)));
+        words.truncate(cap);
+        Ok(Some((
+            words
+                .into_iter()
+                .filter_map(|(word, _)| String::from_utf8(word).ok())
+                .collect(),
+            cut,
+        )))
+    }
+
+    fn autocomplete_word_query(
+        &self,
+        field: Field,
+        word: &str,
+        typed: Typed<'_>,
+    ) -> Box<dyn Query> {
         let mut alternatives = std::iter::once(word.to_string())
             .chain(lattice::other_forms(word))
             .map(|form| -> (Occur, Box<dyn Query>) {
@@ -5305,11 +5420,23 @@ impl TextSearcher {
                 )
             })
             .collect::<Vec<_>>();
-        if last {
-            alternatives.push((
+        match typed {
+            Typed::Whole => {}
+            Typed::Prefix => alternatives.push((
                 Occur::Should,
                 autocomplete_subject_query(field, std::slice::from_ref(&word.to_string())),
-            ));
+            )),
+            Typed::Completions(completions) => {
+                for completion in completions {
+                    alternatives.push((
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, completion),
+                            IndexRecordOption::Basic,
+                        )),
+                    ));
+                }
+            }
         }
         Box::new(BooleanQuery::new(alternatives))
     }
@@ -6939,15 +7066,27 @@ enum Parses {
     Numbered,
 }
 
+#[derive(Clone, Copy)]
+enum Typed<'a> {
+    Whole,
+    /// Too many index words start with it to list them ("s"). First ones in
+    /// index order, as before the lists.
+    Prefix,
+    Completions(&'a [String]),
+}
+
 /// Tried in order. Later ones only when earlier find nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Completion {
     InOrder,
+    /// Index order stops at [`AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS`] words
+    /// before common ones on a planet Pack. "mar" never reaches "market".
+    CommonCompletions,
     AllWords,
 }
 
 impl Completion {
-    const ALL: [Self; 2] = [Self::InOrder, Self::AllWords];
+    const ALL: [Self; 3] = [Self::InOrder, Self::CommonCompletions, Self::AllWords];
 }
 
 /// The retrieval passes of [`TextSearcher::search_variants`], in order,
@@ -11224,6 +11363,63 @@ mod tests {
         assert_eq!(first("kerkstraat 12").as_deref(), Some("osm:node:1"));
         assert_eq!(first("12 kerkstraat").as_deref(), Some("osm:node:1"));
         assert_eq!(first("pier 39").as_deref(), Some("osm:node:3"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// #179
+    #[test]
+    fn autocompletes_a_common_word_past_the_expansion_cap() {
+        let temp_dir = temp_pack_path("autocomplete-common-completion");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: String| PoiRecord {
+            alt_names: Vec::new(),
+            name,
+            category: "shop:convenience".to_string(),
+            address: None,
+            geometry: point_geometry(-122.34, 47.61),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        let cap = AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS as i64;
+        for at in 0..cap + 76 {
+            writer
+                .write(&poi(at + 10, format!("Mara{at:04}")).into(), None)
+                .expect("filler");
+        }
+        for (at, name) in ["Pike Place Market", "Fish Market", "Flower Market"]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .write(&poi(at as i64 + 1, name.to_string()).into(), None)
+                .expect("market");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let places = searcher.places();
+        let options = TextAutocompleteOptions {
+            query: "pike place mar".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+
+        assert!(
+            places
+                .autocomplete_as(&options, Completion::InOrder)
+                .expect("in order")
+                .is_empty()
+        );
+        let found = suggest(&searcher, &places, &options).expect("suggest");
+        assert_eq!(found[0].record.id, "osm:node:1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
