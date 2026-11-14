@@ -800,8 +800,7 @@ impl TextSearcher {
         if street.is_empty() || !is_address_number_token(last) {
             return Ok(as_typed);
         }
-        // Trailing number names a place ("Pier 39") or is the house number
-        // ("Kerkstraat 12"). Postcode prefix ("1211CK") is neither.
+        // "Pier 39" names a place, "Kerkstraat 12" a house, "1211CK" neither.
         let names_it = |hit: &TextSearchHit| {
             search_key(&hit.record.name).is_some_and(|name| {
                 name.split_whitespace()
