@@ -805,8 +805,7 @@ impl TextSearcher {
         if street.is_empty() || !is_address_number_token(last) {
             return Ok(as_typed);
         }
-        // Trailing number names a place ("Pier 39") or is the house number
-        // ("Kerkstraat 12"). Postcode prefix ("1211CK") is neither.
+        // "Pier 39" names a place, "Kerkstraat 12" a house, "1211CK" neither.
         let names_it = |hit: &TextSearchHit| {
             search_key(&hit.record.name).is_some_and(|name| {
                 name.split_whitespace()
@@ -5303,11 +5302,7 @@ impl TextSearcher {
                 clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
             }
             Completion::InOrder => {
-                // Phrase prefix checks every completion at each document of
-                // the head: "north sh" is millions times 1,024. Phrases of
-                // two words walk the rarer list and skip through the other.
-                // A longer head is rare already, and each phrase would walk
-                // it again.
+                // Phrase prefix tries 1,024 completions per "north" document.
                 let phrases = self
                     .first_completions(subject, &words[last])?
                     .iter()
