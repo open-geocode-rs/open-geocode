@@ -255,7 +255,12 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(properties["name"], "10 King Street");
     assert_eq!(
         properties["address"],
-        json!({"housenumber": "10", "street": "King Street", "postcode": "M5V 1A1"})
+        json!({
+            "housenumber": "10",
+            "street": "King Street",
+            "street_parts": {"name": "King", "type": "Street"},
+            "postcode": "M5V 1A1",
+        })
     );
     assert_eq!(
         properties["context"],

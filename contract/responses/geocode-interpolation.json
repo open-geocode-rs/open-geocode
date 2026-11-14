@@ -13,7 +13,11 @@
         "address": {
           "housenumber": "50",
           "locality": "Toronto",
-          "street": "Queen Street"
+          "street": "Queen Street",
+          "street_parts": {
+            "name": "Queen",
+            "type": "Street"
+          }
         },
         "confidence": 0.95257413,
         "context": {

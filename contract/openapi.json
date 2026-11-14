@@ -44,7 +44,16 @@
           "street": {
             "type": "string"
           },
+          "street_parts": {
+            "$ref": "#/components/schemas/StreetParts",
+            "description": "`street` split into its parts as written. Absent when the street has\nno type or direction to split off, such as `Broadway`."
+          },
           "unit": {
+            "type": "string"
+          },
+          "unit_type": {
+            "description": "`unit`'s designator as written, such as `Apt` of `Apt 4`. Absent\nwhen the unit starts with none.",
+            "example": "Apt",
             "type": "string"
           }
         },
@@ -981,6 +990,31 @@
         },
         "required": [
           "dataset"
+        ],
+        "type": "object"
+      },
+      "StreetParts": {
+        "description": "The parts of a street name, as written: `W Main St N` is the prefix `W`,\nthe name `Main`, the type `St` and the suffix `N`.",
+        "properties": {
+          "name": {
+            "description": "The street's own name, without its type and directions.",
+            "type": "string"
+          },
+          "prefix": {
+            "description": "Direction before the name.",
+            "type": "string"
+          },
+          "suffix": {
+            "description": "Direction after the name.",
+            "type": "string"
+          },
+          "type": {
+            "description": "Street type, such as `Street` or `Ave`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
