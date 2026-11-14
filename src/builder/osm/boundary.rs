@@ -1412,9 +1412,8 @@ fn assign_layers_by_containment(
             assigned.insert((*country, level), ADMIN_LAYER_ORDER[at]);
             next = at + 1;
         }
-        // A folded level shares the tier of the level inside it, where the
-        // smaller boundary wins (see [`compare_boundary`]), so
-        // Nouvelle-Aquitaine wins over France métropolitaine.
+        // Folded level shares the tier inside it. Smaller boundary wins a tier
+        // (`compare_boundary`), so Nouvelle-Aquitaine beats France métropolitaine.
         for &level in &folded {
             if let Some(layer) = levels
                 .range(level..)
