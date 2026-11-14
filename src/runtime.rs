@@ -974,13 +974,14 @@ fn nearest_of_category(
     options: &TextAutocompleteOptions,
     named: Vec<TextSearchHit>,
 ) -> Result<Vec<TextSearchHit>> {
+    // Through a typo the kind is never the whole query's own name.
+    let typo = |kind: &str| category_typo(kind);
     let request = match categories::of_request(&options.query) {
         Some(request) => request,
-        None => match category_typo(&options.query) {
-            Some(categories) => categories::Request {
-                categories,
-                place: None,
+        None => match categories::of_request_with(&options.query, typo) {
+            Some(request) => categories::Request {
                 whole: false,
+                ..request
             },
             None => return Ok(named),
         },
@@ -994,9 +995,7 @@ fn nearest_of_category(
                 .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
         })
     };
-    // A place nearby named as typed ("subway") keeps the name, and so does
-    // one being typed ("bank of amer", "restauran") unless the whole query
-    // is a kind's name.
+    // A name nearby as typed ("subway"), or being typed ("bank of amer"), wins.
     let named_near = named
         .first()
         .is_some_and(|hit| near(hit) && search_key(&hit.record.name) == typed)

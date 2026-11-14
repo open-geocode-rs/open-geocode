@@ -195,8 +195,17 @@ pub struct Request {
 /// The kind of place a query asks for: all of it, or its longest first or
 /// last words with a place in the rest.
 pub fn of_request(query: &str) -> Option<Request> {
+    of_request_with(query, of_query)
+}
+
+/// [`of_request`], each candidate kind named by `kind` ("pharmcy" through a
+/// typo of it).
+pub fn of_request_with(
+    query: &str,
+    kind: impl Fn(&str) -> Option<Vec<&'static str>>,
+) -> Option<Request> {
     let key = search_key(query)?;
-    if let Some(categories) = of_query(&key) {
+    if let Some(categories) = kind(&key) {
         return Some(Request {
             categories,
             place: None,
@@ -212,13 +221,13 @@ pub fn of_request(query: &str) -> Option<Request> {
                 &tokens[..tokens.len() - size],
             ),
         ];
-        for (kind, rest) in splits {
-            let kind = kind.join(" ");
+        for (words, rest) in splits {
+            let words = words.join(" ");
             // A word as short as "ho" names a kind somewhere and much else.
-            if kind.chars().count() < crate::search::MIN_TYPO_CHARS {
+            if words.chars().count() < crate::search::MIN_TYPO_CHARS {
                 continue;
             }
-            let Some(categories) = of_query(&kind) else {
+            let Some(categories) = kind(&words) else {
                 continue;
             };
             let place = without_connectors(rest);

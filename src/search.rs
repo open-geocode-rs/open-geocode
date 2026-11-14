@@ -5599,9 +5599,16 @@ impl TextSearcher {
         let wide = [Layer::Country, Layer::Region, Layer::District].map(Layer::as_str);
         let typed = search_key(words);
         let records = self.pack.records();
+        // Exact by any of its names, as `/places` takes "Rome" for Roma.
+        let exact = |hit: &TextSearchHit| -> Result<bool> {
+            Ok(records
+                .names(hit.record_id)?
+                .iter()
+                .any(|name| search_key(name) == typed))
+        };
         let first = |focus| -> Result<Option<(TextSearchHit, bool)>> {
             let Some(hit) = self
-                .places_by_name(words, &Filters::default(), focus, 5)?
+                .places_by_name_keeping(words, &Filters::default(), focus, 5, true)?
                 .into_iter()
                 .find(|hit| {
                     !wide.contains(&hit.record.layer.as_str()) && hit.record.point.is_some()
@@ -5609,7 +5616,7 @@ impl TextSearcher {
             else {
                 return Ok(None);
             };
-            let exact = search_key(&hit.record.name) == typed;
+            let exact = exact(&hit)?;
             let abroad = records
                 .prominence(hit.record_id)?
                 .is_some_and(|prominence| known_abroad(prominence.rank()));
@@ -5617,19 +5624,33 @@ impl TextSearcher {
         };
         let point = |hit: &TextSearchHit| hit.record.point.map(|point| [point.lon, point.lat]);
         let tokens = autocomplete_query_tokens(typed.as_deref().unwrap_or_default());
-        let named = |hit: &TextSearchHit| match prefix {
-            true => name_starts_as(&hit.record.name, &tokens, false),
-            false => search_key(&hit.record.name) == typed,
+        let named = |hit: &TextSearchHit| -> Result<bool> {
+            Ok(match prefix {
+                true => name_starts_as(&hit.record.name, &tokens, false) || exact(hit)?,
+                false => exact(hit)?,
+            })
         };
-        let near = match focus {
-            Some([lon, lat]) => self
-                .places_by_name(words, &Filters::default(), focus, NAMED_PLACES_WINDOW)?
-                .iter()
-                .filter(|hit| !wide.contains(&hit.record.layer.as_str()) && named(hit))
-                .filter_map(point)
-                .find(|point| haversine_m(lon, lat, point[0], point[1]) <= BIAS_RADIUS_M),
-            None => None,
-        };
+        let mut near = None;
+        if let Some([lon, lat]) = focus {
+            let hits = self.places_by_name_keeping(
+                words,
+                &Filters::default(),
+                focus,
+                NAMED_PLACES_WINDOW,
+                true,
+            )?;
+            for hit in &hits {
+                if wide.contains(&hit.record.layer.as_str()) || !named(hit)? {
+                    continue;
+                }
+                if let Some(point) = point(hit)
+                    && haversine_m(lon, lat, point[0], point[1]) <= BIAS_RADIUS_M
+                {
+                    near = Some(point);
+                    break;
+                }
+            }
+        }
         let known = match near {
             Some(_) => None,
             None => first(None)?,
@@ -5650,6 +5671,19 @@ impl TextSearcher {
         filters: &Filters<'_>,
         focus: Option<[f64; 2]>,
         limit: usize,
+    ) -> Result<Vec<TextSearchHit>> {
+        self.places_by_name_keeping(query_text, filters, focus, limit, false)
+    }
+
+    /// [`Self::places_by_name`]; with `streets`, the address product keeps a
+    /// street of the name too, for a place to search around.
+    fn places_by_name_keeping(
+        &self,
+        query_text: &str,
+        filters: &Filters<'_>,
+        focus: Option<[f64; 2]>,
+        limit: usize,
+        streets: bool,
     ) -> Result<Vec<TextSearchHit>> {
         let Some(key) = search_key(query_text) else {
             return Ok(Vec::new());
@@ -5741,7 +5775,7 @@ impl TextSearcher {
         if !self.places {
             hits.retain(|hit| {
                 let (exact, _, _, _, _, known) = order[&hit.record_id];
-                exact.0 && known
+                exact.0 && (known || (streets && hit.record.layer == Layer::Street.as_str()))
             });
         }
         self.one_per_item(&mut hits, limit)?;
@@ -12347,6 +12381,55 @@ mod tests {
             .place_point("amsterdam", Some([-111.2, 45.7]), false)
             .expect("place");
         assert_eq!(from_bozeman.near, Some([-111.3, 45.8]));
+    }
+
+    /// A place to search around is exact by any of its names, and may be a
+    /// street.
+    #[test]
+    fn a_named_place_may_be_an_alternate_name_or_a_street() {
+        let pack = TempPack::new("place-point-alternate");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Locality,
+                    crate::record::PlaceRecord {
+                        alt_names: vec!["Rome".to_string()],
+                        name: "Roma".to_string(),
+                        place_type: "city".to_string(),
+                        geometry: point_geometry(-79.0, 43.0),
+                        source: SourceProvenance::osm(ObjectType::Node, 1),
+                        prominence: Default::default(),
+                        wikidata: None,
+                    },
+                ),
+                None,
+            )
+            .expect("roma");
+        writer
+            .write(&street_record("osm:way:2", "Queen Street").into(), None)
+            .expect("street");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+
+        let near = |words| {
+            searcher
+                .place_point(words, Some([-79.01, 43.0]), false)
+                .expect("place")
+                .near
+        };
+        assert_eq!(near("rome"), Some([-79.0, 43.0]));
+        assert!(near("queen street").is_some());
+    }
+
+    #[test]
+    fn a_typo_of_a_kind_splits_from_its_place() {
+        let request = crate::categories::of_request_with("pharmcy amsterdam", |kind| {
+            crate::categories::of_query(kind).or_else(|| category_typo(kind))
+        })
+        .expect("request");
+        assert!(request.categories.contains(&"amenity pharmacy"));
+        assert_eq!(request.place.as_deref(), Some("amsterdam"));
     }
 
     #[test]
