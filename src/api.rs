@@ -3,8 +3,10 @@
 //!
 //! Every response is one GeoJSON FeatureCollection: a `geocoding` block that
 //! says what was asked, then one Feature per answer. Forward features carry a
-//! `score` and, from a calibrated Pack, a `confidence`; reverse features a
-//! `distance_m`; nothing else differs. The types here are the only definition of that shape. The contract tests
+//! `score`, from a calibrated Pack a `confidence`, and a `distance_m` from
+//! the request's `focus` when it gives one; reverse features a `distance_m`
+//! from the queried point; nothing else differs. The types here are the only
+//! definition of that shape. The contract tests
 //! compare real answers with the committed examples in
 //! `contract/responses/`, so a change to the shape lands with its examples.
 //!
@@ -238,6 +240,10 @@ pub struct ForwardProperties {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(value_type = Option<bool>)]
     pub fallback: bool,
+    /// Distance from the request's `focus` point in meters. Present only
+    /// when the request gives `focus`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_m: Option<f64>,
 }
 
 /// Properties of a reverse geocoding result.
@@ -571,6 +577,19 @@ pub fn forward_collection(
     })
 }
 
+/// Sets each result's distance from `focus`, when the request gave one.
+pub fn measure_from(collection: &mut ForwardCollection, focus: Option<[f64; 2]>) {
+    let Some([lon, lat]) = focus else {
+        return;
+    };
+    for feature in &mut collection.features {
+        let [feature_lon, feature_lat] = feature.geometry.coordinates;
+        let metres = crate::spatial_index::haversine_m(lon, lat, feature_lon, feature_lat);
+        // To the centimetre: finer is noise next to the point's own precision.
+        feature.properties.distance_m = Some((metres * 100.0).round() / 100.0);
+    }
+}
+
 /// One search hit as a feature. The hit's summary already holds what search
 /// placed or estimated (an interpolated house number, a street's centre
 /// line), so nothing is read again but its context.
@@ -585,6 +604,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         score: hit.score,
         confidence: hit.confidence,
         fallback: hit.fallback,
+        distance_m: None,
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }

@@ -27,6 +27,7 @@
             "name": "Ontario"
           }
         },
+        "distance_m": 55.6,
         "id": "osm:way:12",
         "label": "King Street",
         "layer": "street",
@@ -71,6 +72,7 @@
             "name": "Ontario"
           }
         },
+        "distance_m": 0.0,
         "id": "osm:node:10",
         "label": "10 King Street, M5V 1A1",
         "layer": "address",

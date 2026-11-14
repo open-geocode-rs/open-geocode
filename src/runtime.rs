@@ -775,7 +775,10 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
     let (catalogue, ids) = match request {
         PlacesRequest::Text(options) => {
             let hits = state.places.search(&options)?;
-            return api::forward_collection(&state.pack, options.query, hits);
+            let focus = options.focus;
+            let mut collection = api::forward_collection(&state.pack, options.query, hits)?;
+            api::measure_from(&mut collection, focus);
+            return Ok(collection);
         }
         PlacesRequest::Ids { catalogue, ids } => (catalogue, ids),
     };
@@ -959,7 +962,9 @@ pub(crate) async fn autocomplete(
                 nearest_of_category(&worker, &options, named)?
             }
         };
-        api::forward_collection(&worker.pack, query, hits)
+        let mut collection = api::forward_collection(&worker.pack, query, hits)?;
+        api::measure_from(&mut collection, focus);
+        Ok(collection)
     })
     .await?;
 
@@ -1358,17 +1363,19 @@ fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
 }
 
 fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCollection> {
-    let (query, hits) = match request {
+    let (query, hits, focus) = match request {
         GeocodeRequest::Text(options) => {
             let hits = state.searcher.search(&options)?;
-            (options.query, hits)
+            (options.query, hits, options.focus)
         }
         GeocodeRequest::Fields(options) => match state.searcher.geocode_address(&options)? {
-            Some(found) => (found.query, vec![found.hit]),
-            None => (options.address, Vec::new()),
+            Some(found) => (found.query, vec![found.hit], None),
+            None => (options.address, Vec::new(), None),
         },
     };
-    api::forward_collection(&state.pack, query, hits)
+    let mut collection = api::forward_collection(&state.pack, query, hits)?;
+    api::measure_from(&mut collection, focus);
+    Ok(collection)
 }
 
 /// Reverse geocode a point
