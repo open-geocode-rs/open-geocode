@@ -1337,29 +1337,39 @@ impl<'a> Run<'a> {
                 }
                 None => false,
             };
-            let imported = addresses::read_file(file, |record| {
-                progress.check()?;
-                if broken {
-                    return Ok(Some("source_outside_area"));
-                }
-                let Some(point) = point_lon_lat(&record.geometry) else {
-                    return Ok(Some("outside_extract"));
-                };
-                let [lon, lat] = point;
-                let inside = extracts.as_ref().is_none_or(|boxes| {
-                    boxes
-                        .iter()
-                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
-                });
-                if !inside {
-                    return Ok(Some("outside_extract"));
-                }
-                if area.is_some_and(|area| !area(point)) {
-                    return Ok(Some("outside_area"));
-                }
-                build.push(Record::Address(record), None)?;
-                Ok(None)
-            })?;
+            let mut dataset = None;
+            let imported = addresses::read_file_prepared(
+                file,
+                |record| {
+                    progress.check()?;
+                    if broken {
+                        return Ok(Err("source_outside_area"));
+                    }
+                    let Some(point) = point_lon_lat(&record.geometry) else {
+                        return Ok(Err("outside_extract"));
+                    };
+                    let [lon, lat] = point;
+                    let inside = extracts.as_ref().is_none_or(|boxes| {
+                        boxes
+                            .iter()
+                            .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
+                    });
+                    if !inside {
+                        return Ok(Err("outside_extract"));
+                    }
+                    if area.as_ref().is_some_and(|area| !area(point)) {
+                        return Ok(Err("outside_area"));
+                    }
+                    Ok(Ok(PendingAddress::new(&record, 0, 0)?))
+                },
+                |address| {
+                    // Given at the file's first address, as for OSM's. A
+                    // file whose rows are all left out names no dataset.
+                    let id = *dataset.get_or_insert_with(|| build.datasets.id(&file.dataset));
+                    build.push_address(address, id)?;
+                    Ok(None)
+                },
+            )?;
             progress.advance(imported.bytes);
             progress
                 .input(&file.path)
@@ -2114,11 +2124,7 @@ impl Build {
         }
         for item in ready {
             match item {
-                Ready::Address(mut address) => {
-                    address.seq = self.seq;
-                    self.seq += 1;
-                    open(&mut self.addresses, "addresses")?.push(address)?;
-                }
+                Ready::Address(address) => self.push_address(address, 0)?,
                 Ready::Record(record) => self.push(*record, None)?,
             }
         }
@@ -2136,18 +2142,20 @@ impl Build {
         open(&mut self.places, "places")?.push(PendingNamed::place(place, self.seq - 1)?)
     }
 
+    /// An address cut into its sort key off this thread, numbered as it
+    /// takes its place in input order.
+    fn push_address(&mut self, address: PendingAddress, dataset: u32) -> Result<()> {
+        self.seq += 1;
+        open(&mut self.addresses, "addresses")?.push(address.numbered(self.seq - 1, dataset))
+    }
+
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
         if let Record::Address(address) = record {
             let dataset = match address.source.object_type {
                 ObjectType::Row => self.datasets.id(&address.source.dataset),
                 _ => 0,
             };
-            self.seq += 1;
-            return open(&mut self.addresses, "addresses")?.push(PendingAddress::new(
-                &address,
-                self.seq - 1,
-                dataset,
-            )?);
+            return self.push_address(PendingAddress::new(&address, 0, 0)?, dataset);
         }
         if let Record::Street(street) = record {
             self.seq += 1;
