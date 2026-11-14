@@ -19,8 +19,8 @@ use tantivy::{
     columnar::{Column, StrColumn},
     index::SegmentId,
     query::{
-        BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery,
-        PhraseQuery, Query, RangeQuery, TermQuery,
+        BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EnableScoring, Occur,
+        PhrasePrefixQuery, PhraseQuery, Query, RangeQuery, TermQuery, Weight,
     },
     schema::{Field, IndexRecordOption},
 };
@@ -5284,8 +5284,34 @@ impl TextSearcher {
                 };
                 clauses.push((Occur::Must, whole));
             }
-            Completion::InOrder => {
+            Completion::InOrder if last != 1 => {
                 clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
+            }
+            Completion::InOrder => {
+                // Phrase prefix checks every completion at each document of
+                // the head: "north sh" is millions times 1,024. Phrases of
+                // two words walk the rarer list and skip through the other.
+                // A longer head is rare already, and each phrase would walk
+                // it again.
+                let phrases = self
+                    .first_completions(subject, &words[last])?
+                    .iter()
+                    .map(|completion| -> (Occur, Box<dyn Query>) {
+                        let terms = vec![
+                            Term::from_field_text(subject, &words[0]),
+                            Term::from_field_text(subject, completion),
+                        ];
+                        (Occur::Should, Box::new(PhraseQuery::new(terms)))
+                    })
+                    .collect();
+                // Phrase prefix scored a one word head 1.
+                clauses.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        Box::new(Unscored(Box::new(BooleanQuery::new(phrases)))),
+                        1.0,
+                    )),
+                ));
             }
             Completion::CommonCompletions => {
                 let (completions, cut) = &subject_completions;
@@ -5367,6 +5393,31 @@ impl TextSearcher {
 
     /// Ties keep index order, so the same input picks the same words. `None`
     /// past [`MAX_COMPLETION_SCAN`]. "s" then stands only for "south".
+    /// The words of `field` that start with `prefix`, first in byte order,
+    /// up to the expansions a phrase prefix took.
+    fn first_completions(&self, field: Field, prefix: &str) -> Result<Vec<String>> {
+        let cap = AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS as usize;
+        let searcher = self.reader.searcher();
+        let mut words = std::collections::BTreeSet::<Vec<u8>>::new();
+        for segment in searcher.segment_readers() {
+            let index = segment.inverted_index(field)?;
+            let mut stream = index.terms().range().ge(prefix.as_bytes()).into_stream()?;
+            let mut taken = 0;
+            while taken < cap && stream.advance() {
+                if !stream.key().starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                words.insert(stream.key().to_vec());
+                taken += 1;
+            }
+        }
+        Ok(words
+            .into_iter()
+            .take(cap)
+            .filter_map(|word| String::from_utf8(word).ok())
+            .collect())
+    }
+
     fn common_completions(
         &self,
         field: Field,
@@ -9349,6 +9400,30 @@ fn autocomplete_subject_query(field: Field, tokens: &[String]) -> Box<dyn Query>
     let mut query = PhrasePrefixQuery::new(terms);
     query.set_max_expansions(AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS);
     Box::new(query)
+}
+
+/// Matches as its query does, never scoring it: under a constant score,
+/// 1,024 phrases would each still read their BM25 statistics.
+#[derive(Debug)]
+struct Unscored(Box<dyn Query>);
+
+impl Clone for Unscored {
+    fn clone(&self) -> Self {
+        Self(self.0.box_clone())
+    }
+}
+
+impl Query for Unscored {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        self.0.weight(match enable_scoring.searcher() {
+            Some(searcher) => EnableScoring::disabled_from_searcher(searcher),
+            None => EnableScoring::disabled_from_schema(enable_scoring.schema()),
+        })
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.0.query_terms(visitor);
+    }
 }
 
 /// The house number an autocomplete query starts with, when words follow it.
