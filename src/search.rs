@@ -751,6 +751,61 @@ impl TextSearcher {
             .map(|hit| AddressGeocodeHit { query, hit }))
     }
 
+    /// How many documents hold the categories' words, an upper bound on the
+    /// POIs of them (`amenity pharmacy`, or a bare key).
+    pub fn category_count(&self, categories: &[&str]) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        let mut count = 0;
+        for category in categories {
+            let word = category.rsplit(' ').next().unwrap_or(category);
+            let Some(word) = search_key(word) else {
+                continue;
+            };
+            count += searcher.doc_freq(&Term::from_field_text(self.fields.content_text, &word))?;
+        }
+        Ok(count)
+    }
+
+    /// The POIs of `categories` nearest `focus`, by the near-first order.
+    /// For a category too rare for a walk outward from the focus to reach.
+    pub fn nearest_of_categories(
+        &self,
+        categories: &[&str],
+        focus: [f64; 2],
+        limit: usize,
+    ) -> Result<Vec<TextSearchHit>> {
+        let field = self.fields.content_text;
+        let term = |word: &str| search_key(word).map(|word| Term::from_field_text(field, &word));
+        let clauses = categories
+            .iter()
+            .filter_map(|category| -> Option<(Occur, Box<dyn Query>)> {
+                let query: Box<dyn Query> = match category.split_once(' ') {
+                    // The field keeps no positions, so both words, not a phrase.
+                    Some((key, value)) => Box::new(BooleanQuery::intersection(vec![
+                        Box::new(TermQuery::new(term(key)?, IndexRecordOption::Basic)),
+                        Box::new(TermQuery::new(term(value)?, IndexRecordOption::Basic)),
+                    ])),
+                    None => Box::new(TermQuery::new(term(category)?, IndexRecordOption::Basic)),
+                };
+                Some((Occur::Should, query))
+            })
+            .collect::<Vec<_>>();
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranking = Ranking {
+            focus: Some(focus),
+            near_first: true,
+            ..Ranking::default()
+        };
+        self.ranked_hits(&BooleanQuery::new(clauses), &ranking, limit, &mut |hit| {
+            Ok(hit.record.layer == Layer::Poi.as_str()
+                && hit.record.point.is_some_and(|point| {
+                    haversine_m(focus[0], focus[1], point.lon, point.lat) <= BIAS_RADIUS_M
+                }))
+        })
+    }
+
     /// Fallback only when nothing starts as typed. It reads planet-wide
     /// postings.
     pub fn autocomplete(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
@@ -6600,6 +6655,8 @@ const FOCUS_BANDS_M: [f64; 11] = [
 /// Bands of [`FOCUS_BANDS_M`] up to 50 km, as far as a map view's bias
 /// reaches. Beyond, a better match wins: "paris" from Seattle is France.
 const BIAS_BANDS: usize = 6;
+/// The reach of [`BIAS_BANDS`].
+pub(crate) const BIAS_RADIUS_M: f64 = FOCUS_BANDS_M[BIAS_BANDS - 1];
 
 /// [`Prominence::rank`] of a place known beyond its own language: read on
 /// Wikipedia, or linked to Wikidata and named in another language. New York
@@ -8686,7 +8743,7 @@ fn name_starts_as(name: &str, words: &[String]) -> bool {
             .all(|(at, (typed, word))| types_word(typed, word, at + 1 == words.len()))
 }
 
-fn effective_autocomplete_limit(limit: usize) -> usize {
+pub(crate) fn effective_autocomplete_limit(limit: usize) -> usize {
     let limit = effective_limit(limit);
     limit.min(MAX_AUTOCOMPLETE_LIMIT)
 }
@@ -11782,6 +11839,52 @@ mod tests {
 
         let found = suggest(&searcher, &searcher.places(), &options).expect("suggest");
         assert_eq!(found[0].record.id, "osm:way:2");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A category read from the index answers its POIs near the focus,
+    /// nearest first, and none past the bias.
+    #[test]
+    fn finds_the_nearest_pois_of_a_category() {
+        let temp_dir = temp_pack_path("nearest-of-category");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, category: &str, [lon, lat]: [f64; 2]| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: category.to_string(),
+            address: None,
+            geometry: point_geometry(lon, lat),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            aliases: Vec::new(),
+        };
+        for record in [
+            poi(1, "Apotheek Dam", "amenity:pharmacy", [4.89, 52.37]),
+            poi(2, "Pharmacy Neumann", "amenity:pharmacy", [4.71, 52.01]),
+            poi(3, "Pharmacy", "amenity:pharmacy", [6.57, 51.33]),
+            poi(4, "Etos", "shop:chemist", [4.89, 52.37]),
+        ] {
+            writer.write(&record.into(), None).expect("poi");
+        }
+        writer.finish().expect("finish");
+        let places = TextSearcher::open(&temp_dir).expect("searcher").places();
+
+        assert_eq!(
+            places.category_count(&["amenity pharmacy"]).expect("count"),
+            3
+        );
+        let ids = places
+            .nearest_of_categories(&["amenity pharmacy"], [4.89, 52.37], 5)
+            .expect("nearest")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["osm:node:1", "osm:node:2"]);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

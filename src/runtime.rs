@@ -28,6 +28,7 @@ use tower_http::{
 
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
+    categories,
     http::{
         batch::{self, Lookup},
         bounds, health,
@@ -47,11 +48,12 @@ use crate::{
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{
-        AddressGeocodeOptions, TextAutocompleteOptions, TextSearchHit, TextSearchOptions,
-        TextSearcher, suggest,
+        AddressGeocodeOptions, BIAS_RADIUS_M, TextAutocompleteOptions, TextSearchHit,
+        TextSearchOptions, TextSearcher, effective_autocomplete_limit, suggest,
     },
+    spatial_index::haversine_m,
     stop::{self, CancelOnDrop, Stop},
-    util::hilbert::hilbert_key,
+    util::{fold::search_key, hilbert::hilbert_key},
 };
 
 /// Seconds a refused single lookup is told to wait: lookups take
@@ -950,13 +952,79 @@ pub(crate) async fn autocomplete(
                 ..options
             })?,
             Some(_) => worker.searcher.autocomplete(&options)?,
-            None => suggest(&worker.searcher, &worker.places, &options)?,
+            None => {
+                let named = suggest(&worker.searcher, &worker.places, &options)?;
+                nearest_of_category(&worker, &options, named)?
+            }
         };
         api::forward_collection(&worker.pack, query, hits)
     })
     .await?;
 
     Ok(Json(collection))
+}
+
+/// A query that only names a kind of place ("pharmacy", "apotheek") means
+/// the nearest ones, whatever their names. A place near the caller named as
+/// typed ("Subway") still answers, so a brand that is also a category word
+/// keeps its meaning. What else matched fills the rest.
+fn nearest_of_category(
+    state: &AppState,
+    options: &TextAutocompleteOptions,
+    named: Vec<TextSearchHit>,
+) -> Result<Vec<TextSearchHit>> {
+    let (Some(focus), Some(categories)) = (options.focus, categories::of_query(&options.query))
+    else {
+        return Ok(named);
+    };
+    let typed = search_key(&options.query);
+    let named_near = named.first().is_some_and(|hit| {
+        search_key(&hit.record.name) == typed
+            && hit.record.point.is_some_and(|point| {
+                haversine_m(focus[0], focus[1], point.lon, point.lat) <= BIAS_RADIUS_M
+            })
+    });
+    if named_near {
+        return Ok(named);
+    }
+    let limit = effective_autocomplete_limit(options.limit);
+    // Past the categories' own count, reading them from the index costs less.
+    let count = state.places.category_count(&categories)?;
+    if count == 0 {
+        return Ok(named);
+    }
+    let walked =
+        state
+            .reverse_geocoder
+            .nearest_pois(focus, BIAS_RADIUS_M, limit, count, |category| {
+                categories::holds(&categories, category)
+            })?;
+    let mut hits = match walked {
+        Some(nearest) => nearest
+            .into_iter()
+            .map(|record_id| {
+                Ok(TextSearchHit::of_record(
+                    record_id,
+                    state.pack.record_summary(record_id)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => state
+            .places
+            .nearest_of_categories(&categories, focus, limit)?,
+    };
+    if hits.is_empty() {
+        return Ok(named);
+    }
+    for hit in named {
+        if hits.len() >= limit {
+            break;
+        }
+        if !hits.iter().any(|kept| kept.record_id == hit.record_id) {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
 }
 
 // For callers holding street, town and postcode in separate fields: joined
