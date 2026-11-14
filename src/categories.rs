@@ -183,7 +183,11 @@ pub fn presets_for_prefix(prefix: &str) -> Vec<&'static str> {
 /// none.
 pub fn of_query(query: &str) -> Option<Vec<&'static str>> {
     let key = search_key(query)?;
-    let found = for_key(&key, !key.contains(' '));
+    // "park" typed whole is a park, not yet the start of "parking".
+    let mut found = for_key(&key, false);
+    if found.is_empty() && !key.contains(' ') {
+        found = for_key(&key, true);
+    }
     (!found.is_empty()).then_some(found)
 }
 
@@ -327,5 +331,13 @@ mod tests {
         assert_eq!(presets_for_word("zzzqqq"), Vec::<&str>::new());
         assert_eq!(presets_for_word(""), Vec::<&str>::new());
         assert_eq!(presets_for_prefix(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_whole_word_beats_the_start_of_another() {
+        let park = of_query("park").expect("park");
+        assert!(park.contains(&"leisure park"));
+        assert!(!park.contains(&"amenity parking"));
+        assert_eq!(of_query("parking"), Some(vec!["amenity parking"]));
     }
 }
