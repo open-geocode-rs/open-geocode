@@ -16,7 +16,7 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
+        Extent, Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
         SourceProvenance, point_geometry,
     },
     util::{geo::point_lon_lat, text::normalize_for_compare},
@@ -24,7 +24,7 @@ use crate::{
 
 use super::{
     admin_levels::{self, admin_levels},
-    containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
+    containment::{ShapeRef, ShapeWriter, Shapes, encode_shape, narrowest_extent},
     place::place_layer,
     poi::{PoiCandidate, outline},
     street::is_settlement,
@@ -155,6 +155,9 @@ struct BuiltBoundary {
     /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
+    /// The box an answer gives: `bounds` the short way round, which for an
+    /// area over the antimeridian is not the least and greatest longitude.
+    extent: Extent,
     area: f64,
     representative_point: [f64; 2],
     /// Whether every outer way closed into a ring. A relation one of whose
@@ -727,6 +730,15 @@ impl BoundarySet {
             .collect()
     }
 
+    /// The box around each area, by record id.
+    pub(crate) fn extents(&self, boundary_record_ids: &[RecordId]) -> Vec<(RecordId, Extent)> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.extent))
+            .collect()
+    }
+
     /// The groups of regions each admin region lies in, by record id: the
     /// larger admin regions of another name covering its representative
     /// point ("関東地方" of "千葉県"). A record keeps the smaller region as
@@ -1147,6 +1159,7 @@ fn built(
     let bounds = geometry.bounding_rect()?;
     let mut block = Vec::new();
     encode_shape(geometry, &mut block);
+    let extent = narrowest_extent(&block)?;
     Some((
         BuiltBoundary {
             layer,
@@ -1163,6 +1176,7 @@ fn built(
             subdivision_code: subdivision_code_from_tags(tags, layer),
             shape: ShapeRef::default(),
             bounds,
+            extent,
             area: geometry.unsigned_area(),
             representative_point,
             rings_closed,
@@ -2153,7 +2167,7 @@ impl BoundarySet {
 
 impl crate::extsort::Spill for SetItem {
     fn encode(&self, out: &mut Vec<u8>) {
-        use crate::util::codec::{put_i64, put_opt_str, put_str, put_u64};
+        use crate::util::codec::{put_extent, put_i64, put_opt_str, put_str, put_u64};
         match self {
             Self::Candidate(candidate) => {
                 out.push(0);
@@ -2198,6 +2212,7 @@ impl crate::extsort::Spill for SetItem {
                     put_str(out, name);
                 }
                 out.push(u8::from(boundary.settled));
+                put_extent(out, boundary.extent);
                 out.push(u8::from(boundary.rings_closed));
             }
             Self::DerivedCountry(code, record) => {
@@ -2218,7 +2233,7 @@ impl crate::extsort::Spill for SetItem {
     fn decode(input: &mut &[u8]) -> crate::error::Result<Self> {
         use crate::{
             error::Error,
-            util::codec::{get_i64, get_opt_string, get_string, get_u8, get_u64},
+            util::codec::{get_extent, get_i64, get_opt_string, get_string, get_u8, get_u64},
         };
         let layer = |code: u8| {
             PlaceLayer::ALL
@@ -2273,6 +2288,7 @@ impl crate::extsort::Spill for SetItem {
                     _ => Err(Error::Decode(what)),
                 };
                 let settled = flag(input, "a saved boundary's settled flag is not 0 or 1")?;
+                let extent = get_extent(input)?;
                 let rings_closed = flag(input, "a saved boundary's ring flag is not 0 or 1")?;
                 Self::Candidate(Box::new(BoundaryCandidate {
                     source_object_type,
@@ -2293,6 +2309,7 @@ impl crate::extsort::Spill for SetItem {
                         subdivision_code,
                         shape,
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
+                        extent,
                         area,
                         representative_point: [lon, lat],
                         rings_closed,
@@ -2490,6 +2507,10 @@ mod tests {
                 panic!("not a candidate");
             };
             assert_eq!(read.boundary.rings_closed, rings_closed);
+            assert_eq!(
+                read.boundary.extent,
+                [-10_000_000, -10_000_000, 10_000_000, 10_000_000]
+            );
         }
         let mut bytes = Vec::new();
         SetItem::Candidate(Box::new(BoundaryCandidate {
@@ -2670,6 +2691,7 @@ mod tests {
             representative_point: representative_point(&geometry).expect("point"),
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
+            extent: [-10_000_000, -10_000_000, 10_000_000, 10_000_000],
             area: geometry.unsigned_area(),
             prominence: Default::default(),
             wikidata: None,
@@ -3073,6 +3095,13 @@ mod tests {
                     representative_point: representative_point(&geometry).expect("point"),
                     shape,
                     bounds,
+                    extent: [
+                        bounds.min().x,
+                        bounds.min().y,
+                        bounds.max().x,
+                        bounds.max().y,
+                    ]
+                    .map(|side| (side * 1e7) as i32),
                     area,
                     prominence: Default::default(),
                     wikidata: None,

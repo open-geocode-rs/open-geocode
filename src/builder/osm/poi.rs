@@ -493,14 +493,16 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
         own.contact.unwrap_or_default(),
         theirs.contact.unwrap_or_default(),
     );
-    leader.details = PoiDetails::stated(
-        Contact::stated(
+    leader.details = PoiDetails {
+        contact: Contact::stated(
             ours.phone.or(other.phone),
             ours.website.or(other.website),
             ours.email.or(other.email),
         ),
-        own.opening_hours.or(theirs.opening_hours),
-    );
+        opening_hours: own.opening_hours.or(theirs.opening_hours),
+        extent: own.extent.or(theirs.extent),
+    }
+    .kept();
     leader.prominence = leader.prominence.max(member.prominence);
     for name in std::iter::once(member.name).chain(member.alt_names) {
         let known = std::iter::once(&leader.name)
@@ -620,14 +622,20 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         prominence: prominence(tags),
         wikidata: item(tags, "wikidata"),
         brand: brand(tags),
-        details: PoiDetails::stated(
-            contact(tags),
+        details: PoiDetails {
+            contact: contact(tags),
             // Whitespace is its syntax's separator: only the ends are trimmed.
-            tags.get("opening_hours")
+            opening_hours: tags
+                .get("opening_hours")
                 .map(|hours| hours.trim())
                 .filter(|hours| !hours.is_empty())
                 .map(str::to_string),
-        ),
+            extent: candidate
+                .outline
+                .as_deref()
+                .and_then(containment::narrowest_extent),
+        }
+        .kept(),
         aliases: Vec::new(),
     };
     out.report.accept_poi(&record);
@@ -1232,7 +1240,7 @@ mod tests {
                 website: website.map(str::to_string),
                 email: email.map(str::to_string),
             }),
-            opening_hours: None,
+            ..PoiDetails::default()
         }
     }
 
@@ -1252,6 +1260,7 @@ mod tests {
                     email: Some("Peize@Shell.nl".into()),
                 }),
                 opening_hours: Some("Mo-Fr 08:00-18:00;  Sa 09:00-13:00".into()),
+                extent: None,
             })
         );
         assert_eq!(
@@ -1315,6 +1324,7 @@ mod tests {
             Some(PoiDetails {
                 contact: None,
                 opening_hours: Some("24/7".into()),
+                extent: None,
             })
         );
         assert_eq!(

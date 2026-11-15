@@ -21,6 +21,8 @@ use memmap2::Mmap;
 use crate::{
     error::{Error, Result},
     extsort::{Scratch, ScratchFile},
+    record::Extent,
+    util::geo::{box_around, narrowest_box},
 };
 
 use super::locations::degrees;
@@ -226,6 +228,25 @@ pub(crate) fn extent(block: &[u8]) -> [f64; 4] {
     [west, f64_at(16), east, f64_at(24)]
 }
 
+/// The narrowest box around the area of `block`, which crosses the
+/// antimeridian when the area does. None for a block of no ring.
+pub(crate) fn narrowest_extent(block: &[u8]) -> Option<Extent> {
+    let u32_at = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"));
+    let i32_at = |at: usize| i32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"));
+    let rings = u32_at(4) as usize;
+    let coords_at = HEADER_BYTES + 4 * rings;
+    let mut start = 0;
+    narrowest_box((0..rings).filter_map(|ring| {
+        let end = u32_at(HEADER_BYTES + 4 * ring) as usize;
+        let vertices = (start..end).map(|index| {
+            let at = coords_at + 8 * index;
+            [i32_at(at), i32_at(at + 4)]
+        });
+        start = end;
+        box_around(vertices)
+    }))
+}
+
 /// The shape file as it is written, one block after another.
 pub(crate) struct ShapeWriter {
     file: BufWriter<ScratchFile>,
@@ -402,6 +423,43 @@ mod tests {
                 bounds.max().y
             ]
         );
+    }
+
+    #[test]
+    fn the_narrowest_extent_is_the_box_of_the_rings_the_short_way_round() {
+        let square = |west: f64, south: f64, east: f64, north: f64| {
+            Polygon::new(
+                LineString::from(vec![
+                    (west, south),
+                    (east, south),
+                    (east, north),
+                    (west, north),
+                    (west, south),
+                ]),
+                Vec::new(),
+            )
+        };
+        let block = |polygons: Vec<Polygon<f64>>| {
+            let mut block = Vec::new();
+            encode_shape(&MultiPolygon::new(polygons), &mut block);
+            block
+        };
+        assert_eq!(
+            narrowest_extent(&block(vec![square(
+                7.4090279, 43.7247599, 7.4398704, 43.7519311
+            )])),
+            Some([74_090_279, 437_247_599, 74_398_704, 437_519_311])
+        );
+        // Drawn as OSM draws an area over the antimeridian: one ring each
+        // side, meeting at 180 and -180.
+        assert_eq!(
+            narrowest_extent(&block(vec![
+                square(177.0, -19.0, 180.0, -16.0),
+                square(-180.0, -18.0, -178.5, -15.5),
+            ])),
+            Some([1_770_000_000, -190_000_000, -1_785_000_000, -155_000_000])
+        );
+        assert_eq!(narrowest_extent(&block(Vec::new())), None);
     }
 
     #[test]

@@ -6752,6 +6752,7 @@ impl TextSearcher {
                 brand: None,
                 contact: None,
                 opening_hours: None,
+                bbox: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -11675,6 +11676,7 @@ mod tests {
             brand: None,
             contact: None,
             opening_hours: None,
+            bbox: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),

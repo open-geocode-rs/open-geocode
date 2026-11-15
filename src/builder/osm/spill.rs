@@ -19,9 +19,9 @@ use crate::{
     },
     util::{
         codec::{
-            Delta, get_bytes, get_delta, get_front, get_i64, get_opt_string, get_string, get_u8,
-            get_u32, get_u64, put_bytes, put_delta, put_front, put_i64, put_opt_str, put_str,
-            put_u64,
+            Delta, get_bytes, get_delta, get_front, get_i64, get_opt_extent, get_opt_string,
+            get_string, get_u8, get_u32, get_u64, put_bytes, put_delta, put_front, put_i64,
+            put_opt_extent, put_opt_str, put_str, put_u64,
         },
         geo::line_parts,
     },
@@ -1253,6 +1253,7 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             ] {
                 put_opt_str(out, value);
             }
+            put_opt_extent(out, record.extent());
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1345,14 +1346,16 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 let wikidata = spilled_item(input)?;
                 name.map(|name| Brand { name, wikidata })
             },
-            details: PoiDetails::stated(
-                Contact::stated(
+            details: PoiDetails {
+                contact: Contact::stated(
                     get_opt_string(input)?,
                     get_opt_string(input)?,
                     get_opt_string(input)?,
                 ),
-                get_opt_string(input)?,
-            ),
+                opening_hours: get_opt_string(input)?,
+                extent: get_opt_extent(input)?,
+            }
+            .kept(),
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -2181,6 +2184,11 @@ mod tests {
             None,
             PoiDetails::stated(None, text("24/7")),
             PoiDetails::stated(Contact::stated(None, None, text("peize@shell.nl")), None),
+            PoiDetails {
+                extent: Some([65_660_000, 532_190_000, 65_670_000, 532_198_000]),
+                ..PoiDetails::default()
+            }
+            .kept(),
             PoiDetails::stated(
                 Contact::stated(
                     text("+31 50 123 4567"),

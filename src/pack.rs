@@ -42,7 +42,7 @@ use crate::{
         CountryCode,
         dictionary::{Builder, RecordNames},
     },
-    record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
+    record::{Extent, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records, spatial_index,
     text_index::{self, PostcodeAreas},
 };
@@ -73,6 +73,8 @@ const SUBDIVISION_CODES_SECTION: &str = "subdivision_codes";
 const SUBDIVISION_CODES_VERSION: u32 = 1;
 const LANGUAGE_NAMES_SECTION: &str = "language_names";
 const LANGUAGE_NAMES_VERSION: u32 = 1;
+const EXTENTS_SECTION: &str = "extents";
+const EXTENTS_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -292,6 +294,58 @@ fn language_names_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, Langu
     Ok(all)
 }
 
+/// Bytes of one extent entry: the area record's id, then its west, south,
+/// east and north sides in 1e-7 degrees, all little-endian.
+const EXTENT_ENTRY_BYTES: usize = 24;
+
+fn extents_to_bytes(mut extents: Vec<(RecordId, Extent)>) -> Vec<u8> {
+    extents.sort_unstable();
+    extents.dedup_by_key(|(record_id, _)| *record_id);
+    let mut bytes = Vec::with_capacity(extents.len() * EXTENT_ENTRY_BYTES);
+    for (record_id, extent) in extents {
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        for side in extent {
+            bytes.extend_from_slice(&side.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// The box around each area record, in id order and read where the Pack
+/// holds it: a planet has an area for every town and suburb.
+#[derive(Debug, Default)]
+struct Extents(Option<container::Bytes>);
+
+impl Extents {
+    fn open(bytes: container::Bytes) -> Result<Self> {
+        let (entries, rest) = bytes.as_chunks::<EXTENT_ENTRY_BYTES>();
+        if !rest.is_empty() {
+            return Err(Error::Decode("area extents are truncated"));
+        }
+        let id = |entry: &[u8; EXTENT_ENTRY_BYTES]| {
+            RecordId::from_le_bytes(entry[..8].try_into().expect("eight bytes"))
+        };
+        if !entries.is_sorted_by(|left, right| id(left) < id(right)) {
+            return Err(Error::Decode("area extents are out of order"));
+        }
+        Ok(Self(Some(bytes)))
+    }
+
+    fn get(&self, record_id: RecordId) -> Option<Extent> {
+        let entries = self.0.as_ref()?.as_chunks::<EXTENT_ENTRY_BYTES>().0;
+        let at = entries
+            .binary_search_by_key(&record_id, |entry| {
+                RecordId::from_le_bytes(entry[..8].try_into().expect("eight bytes"))
+            })
+            .ok()?;
+        let entry = &entries[at];
+        Some(std::array::from_fn(|index| {
+            let from = 8 + 4 * index;
+            i32::from_le_bytes(entry[from..from + 4].try_into().expect("four bytes"))
+        }))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
     /// Pool every buffer of the build reserves from.
@@ -348,6 +402,7 @@ pub struct Writer {
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
     subdivision_codes: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, LanguageNames>,
+    extents: Vec<(RecordId, Extent)>,
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
@@ -495,6 +550,7 @@ impl Writer {
             country_codes: Arc::default(),
             subdivision_codes: HashMap::new(),
             language_names: HashMap::new(),
+            extents: Vec::new(),
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
@@ -544,6 +600,11 @@ impl Writer {
     /// area's id.
     pub fn set_language_names(&mut self, names: HashMap<RecordId, LanguageNames>) {
         self.language_names = names;
+    }
+
+    /// The box around each area record, by the area's id.
+    pub fn set_extents(&mut self, extents: Vec<(RecordId, Extent)>) {
+        self.extents = extents;
     }
 
     /// The groups of regions each region lies in, by the region's id.
@@ -685,6 +746,7 @@ impl Writer {
             country_codes,
             subdivision_codes,
             language_names,
+            extents,
             postcode_addresses,
             dictionaries,
             ..
@@ -731,6 +793,7 @@ impl Writer {
             &language_names_to_bytes(&language_names),
         )?;
         drop(language_names);
+        pack.add(EXTENTS_SECTION, EXTENTS_VERSION, &extents_to_bytes(extents))?;
         Ok(Sealing {
             generation,
             scratch,
@@ -1107,6 +1170,7 @@ pub struct Reader {
     subdivision_codes: HashMap<RecordId, String>,
     /// The names of each area record in other languages, by its id.
     language_names: HashMap<RecordId, LanguageNames>,
+    extents: Extents,
 }
 
 impl std::fmt::Debug for Reader {
@@ -1162,6 +1226,11 @@ impl Reader {
         } else {
             HashMap::new()
         };
+        let extents = if container.sections().contains_key(EXTENTS_SECTION) {
+            Extents::open(container.section(EXTENTS_SECTION, EXTENTS_VERSION)?)?
+        } else {
+            Extents::default()
+        };
         Ok(Self {
             path,
             container,
@@ -1172,6 +1241,7 @@ impl Reader {
             country_codes,
             subdivision_codes,
             language_names,
+            extents,
         })
     }
 
@@ -1244,9 +1314,13 @@ impl Reader {
     }
 
     /// The summary search and autocomplete return. A POI whose address states
-    /// no locality is labelled with the locality it lies in.
+    /// no locality is labelled with the locality it lies in, and an area
+    /// carries the box around it.
     pub fn record_summary(&self, record_id: RecordId) -> Result<Summary> {
         let mut summary = self.records.summary(record_id)?;
+        if summary.bbox.is_none() {
+            summary.bbox = self.extents.get(record_id).map(records::bbox);
+        }
         if summary.layer == Layer::Poi.as_str()
             && let Record::Poi(poi) = self.records.record(record_id)?
             && poi
@@ -1477,6 +1551,35 @@ mod tests {
         let bytes = language_names_to_bytes(&names);
         assert_eq!(language_names_from_bytes(&bytes).expect("decodes"), names);
         assert!(language_names_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn extents_are_found_by_record_id_and_a_bad_section_fails() {
+        let crossing = [1_770_000_000, -190_000_000, -1_785_000_000, -155_000_000];
+        let monaco = [74_090_279, 437_247_599, 74_398_704, 437_519_311];
+        let bytes = extents_to_bytes(vec![(9, crossing), (3, monaco), (3, crossing)]);
+        assert_eq!(bytes.len(), 2 * EXTENT_ENTRY_BYTES);
+        let extents = Extents::open(container::Bytes::new(bytes.clone())).expect("opens");
+        assert_eq!(extents.get(3), Some(monaco));
+        assert_eq!(extents.get(9), Some(crossing));
+        assert_eq!(extents.get(4), None);
+        assert_eq!(Extents::default().get(3), None);
+        assert!(matches!(
+            Extents::open(container::Bytes::new(bytes[..bytes.len() - 1].to_vec())),
+            Err(Error::Decode("area extents are truncated"))
+        ));
+        let mut swapped = bytes[EXTENT_ENTRY_BYTES..].to_vec();
+        swapped.extend_from_slice(&bytes[..EXTENT_ENTRY_BYTES]);
+        assert!(matches!(
+            Extents::open(container::Bytes::new(swapped)),
+            Err(Error::Decode("area extents are out of order"))
+        ));
+        let mut twice = bytes[..EXTENT_ENTRY_BYTES].to_vec();
+        twice.extend_from_slice(&bytes[..EXTENT_ENTRY_BYTES]);
+        assert!(matches!(
+            Extents::open(container::Bytes::new(twice)),
+            Err(Error::Decode("area extents are out of order"))
+        ));
     }
 
     #[test]

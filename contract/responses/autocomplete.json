@@ -19,6 +19,12 @@
             "type": "Street"
           }
         },
+        "bbox": [
+          -79.0051,
+          42.99992,
+          -79.0049,
+          43.00008
+        ],
         "category": "shop:bakery",
         "contact": {
           "email": "hello@queenbakery.example",
