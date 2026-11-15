@@ -1323,6 +1323,17 @@ mod tests {
         );
     }
 
+    /// A lifecycle prefix makes another key, which no preset reads: what is
+    /// closed for good is no place, so no record can say it is closed.
+    #[test]
+    fn an_object_closed_for_good_is_no_poi() {
+        for prefix in ["disused", "abandoned", "was", "demolished", "razed"] {
+            let closed = tags(&[("name", "De Pindol"), (&format!("{prefix}:amenity"), "pub")]);
+            assert!(!is_poi(&closed, Drawn::Point), "{prefix}");
+            assert!(!is_poi(&closed, Drawn::Area), "{prefix}");
+        }
+    }
+
     #[test]
     fn a_merged_place_takes_the_contact_and_hours_its_leader_lacks() {
         let stating = |id: i64, details: PoiDetails| {
