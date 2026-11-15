@@ -134,6 +134,20 @@
             "$ref": "#/components/schemas/Address",
             "description": "Address parts stated by the source record."
           },
+          "bbox": {
+            "description": "The box around a result that covers more than a point, as `[west,\nsouth, east, north]` in degrees: an area's outline, a street's line,\nor the outline a POI is drawn with. It is the narrowest box, so for\na result that crosses the antimeridian `west` is greater than\n`east`, and only then. Absent on a result that is only a point.",
+            "example": [
+              7.4090279,
+              43.7247599,
+              7.4398704,
+              43.7519311
+            ],
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
           "brand": {
             "$ref": "#/components/schemas/Brand",
             "description": "The chain a place belongs to, when its name may not say: \"Tankstation\nZanoli\" is an Esso. Present only on places."

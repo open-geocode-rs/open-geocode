@@ -188,7 +188,7 @@ pub enum PointType {
 // [`ReverseProperties`], which add the field each direction ranks by, so both
 // are one flat object on the wire.
 /// Properties shared by forward and reverse results.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Common {
     /// Stable ID from the source data, such as `osm:node:123`. Store it to
     /// find the record again: it outlives a Pack rebuild.
@@ -222,6 +222,14 @@ pub struct Common {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Mo-Fr 08:00-18:00; Sa 09:00-13:00")]
     pub opening_hours: Option<String>,
+    /// The box around a result that covers more than a point, as `[west,
+    /// south, east, north]` in degrees: an area's outline, a street's line,
+    /// or the outline a POI is drawn with. It is the narrowest box, so for
+    /// a result that crosses the antimeridian `west` is greater than
+    /// `east`, and only then. Absent on a result that is only a point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!([7.4090279, 43.7247599, 7.4398704, 43.7519311]))]
+    pub bbox: Option<[f64; 4]>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -1012,6 +1020,7 @@ fn common(
         brand: summary.brand,
         contact: summary.contact,
         opening_hours: summary.opening_hours,
+        bbox: summary.bbox,
         address: summary.address.with_parts(),
         context: contexts.of(record_id)?,
         source: Source {
@@ -1084,6 +1093,13 @@ fn flat(
         ),
         ("lat", coordinate(1)),
         ("lon", coordinate(0)),
+        (
+            "bbox",
+            field(&|p| {
+                p.bbox
+                    .map(|bbox| bbox.map(|side| format!("{side:.7}")).join(","))
+            }),
+        ),
         (
             "address_housenumber",
             field(&|p| p.address.housenumber.clone()),

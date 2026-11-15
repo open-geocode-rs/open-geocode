@@ -922,6 +922,20 @@ fn write_pack(dir: &PathBuf) {
         .collect(),
     );
     writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
+    writer.set_extents(vec![
+        (
+            country,
+            [-1_410_027_000, 416_765_000, -523_231_000, 833_362_000],
+        ),
+        (
+            region,
+            [-951_537_000, 416_765_000, -743_199_000, 568_593_000],
+        ),
+        (
+            locality,
+            [-796_392_727, 435_796_082, -791_132_193, 438_554_425],
+        ),
+    ]);
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -971,14 +985,16 @@ fn write_pack(dir: &PathBuf) {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
-                details: PoiDetails::stated(
-                    Contact::stated(
+                details: PoiDetails {
+                    contact: Contact::stated(
                         Some("+1 416-555-0111".to_string()),
                         Some("https://queenbakery.example/".to_string()),
                         Some("hello@queenbakery.example".to_string()),
                     ),
-                    Some("Mo-Fr 07:00-18:00; Sa 08:00-14:00".to_string()),
-                ),
+                    opening_hours: Some("Mo-Fr 07:00-18:00; Sa 08:00-14:00".to_string()),
+                    extent: Some([-790_051_000, 429_999_200, -790_049_000, 430_000_800]),
+                }
+                .kept(),
                 aliases: Vec::new(),
             }
             .into(),

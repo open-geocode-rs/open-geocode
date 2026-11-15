@@ -113,7 +113,7 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{OSM_DATASET, ObjectType, Record, RejectedRecord, StreetRecord},
+    record::{Extent, OSM_DATASET, ObjectType, Record, RejectedRecord, StreetRecord},
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
@@ -444,6 +444,7 @@ struct Contexts {
     country_codes: HashMap<RecordId, CountryCode>,
     subdivision_codes: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, crate::pack::LanguageNames>,
+    extents: Vec<(RecordId, Extent)>,
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
@@ -461,6 +462,7 @@ impl Contexts {
         let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
         let subdivision_codes = boundaries.subdivision_codes(&boundary_ids);
         let language_names = boundaries.language_names(&boundary_ids);
+        let extents = boundaries.extents(&boundary_ids);
         let area_names = boundaries.context_names(&boundary_ids, &country_ids);
         let region_groups = boundaries.region_groups(&boundary_ids);
         let index = boundaries.into_index(&boundary_ids, &country_ids);
@@ -474,6 +476,7 @@ impl Contexts {
             country_codes,
             subdivision_codes,
             language_names,
+            extents,
             region_groups,
         }
     }
@@ -1667,6 +1670,7 @@ impl<'a> Run<'a> {
             country_codes,
             subdivision_codes,
             language_names,
+            extents,
             region_groups,
             ..
         } = self
@@ -1686,6 +1690,7 @@ impl<'a> Run<'a> {
         writer.set_country_codes(country_codes);
         writer.set_subdivision_codes(subdivision_codes);
         writer.set_language_names(language_names);
+        writer.set_extents(extents);
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
         let context_count = ordered.len();
@@ -4932,6 +4937,106 @@ mod tests {
                 .iter()
                 .all(|(id, _, _)| id != "osm:node:3")
         );
+    }
+
+    #[test]
+    fn a_built_area_street_and_outlined_place_answer_with_their_bbox() {
+        let dir = temp_dir("bbox");
+        let input = dir.join("bbox.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.2, &[]),
+                    node(3, 52.1, 4.2, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(10, 52.03, 4.05, &[]),
+                    node(11, 52.04, 4.07, &[]),
+                    node(12, 52.035, 4.11, &[]),
+                    node(20, 52.0500, 4.1000, &[]),
+                    node(21, 52.0500, 4.1004, &[]),
+                    node(22, 52.0503, 4.1004, &[]),
+                    node(23, 52.0503, 4.1000, &[]),
+                    node(
+                        30,
+                        52.06,
+                        4.12,
+                        &[("name", "Cafe Blauw"), ("amenity", "cafe")],
+                    ),
+                    node(
+                        31,
+                        52.07,
+                        4.13,
+                        &[("addr:housenumber", "8"), ("addr:street", "Kadeweg")],
+                    ),
+                    // An island group over the antimeridian, drawn as OSM
+                    // draws one: a ring each side, meeting at 180.
+                    node(40, -17.0, 179.0, &[]),
+                    node(41, -17.0, 180.0, &[]),
+                    node(42, -16.0, 180.0, &[]),
+                    node(43, -16.0, 179.0, &[]),
+                    node(44, -17.0, -180.0, &[]),
+                    node(45, -17.0, -179.5, &[]),
+                    node(46, -16.5, -179.5, &[]),
+                    node(47, -16.5, -180.0, &[]),
+                ],
+                vec![
+                    way(100, &[1, 2, 3, 4, 1], &[]),
+                    way(
+                        101,
+                        &[10, 11, 12],
+                        &[("highway", "residential"), ("name", "Kadeweg")],
+                    ),
+                    way(
+                        102,
+                        &[20, 21, 22, 23, 20],
+                        &[("name", "Havenhal"), ("amenity", "theatre")],
+                    ),
+                    way(103, &[40, 41, 42, 43, 40], &[]),
+                    way(104, &[44, 45, 46, 47, 44], &[]),
+                ],
+                vec![
+                    relation(
+                        900,
+                        &[(100, "outer")],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "8"),
+                            ("name", "Havenstad"),
+                        ],
+                    ),
+                    relation(
+                        901,
+                        &[(103, "outer"), (104, "outer")],
+                        &[
+                            ("type", "multipolygon"),
+                            ("place", "island"),
+                            ("name", "Datumeiland"),
+                        ],
+                    ),
+                ],
+            ],
+        );
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let bbox = |id: &str| {
+            let record = reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"));
+            reader.record_summary(record).expect("summary").bbox
+        };
+        assert_eq!(bbox("osm:relation:900"), Some([4.0, 52.0, 4.2, 52.1]));
+        assert_eq!(bbox("osm:way:101"), Some([4.05, 52.03, 4.11, 52.04]));
+        assert_eq!(bbox("osm:way:102"), Some([4.1, 52.05, 4.1004, 52.0503]));
+        assert_eq!(
+            bbox("osm:relation:901"),
+            Some([179.0, -17.0, -179.5, -16.0])
+        );
+        assert_eq!(bbox("osm:node:30"), None);
+        assert_eq!(bbox("osm:node:31"), None);
     }
 
     #[test]

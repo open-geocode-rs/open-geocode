@@ -221,6 +221,11 @@ pub struct Brand {
     pub wikidata: Option<u32>,
 }
 
+/// The box around something larger than a point: west, south, east and
+/// north in 1e-7 degrees. West is greater than east when the box crosses the
+/// antimeridian, and only then.
+pub type Extent = [i32; 4];
+
 /// What few POIs state. Boxed on the record: every record of a build is as
 /// wide as the widest, and most would carry these empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -228,17 +233,24 @@ pub struct PoiDetails {
     pub contact: Option<Contact>,
     /// The `opening_hours` tag as written, never parsed.
     pub opening_hours: Option<String>,
+    /// The box around its outline, when it is drawn as an area.
+    pub extent: Option<Extent>,
 }
 
 impl PoiDetails {
-    /// None when nothing is stated: a record never holds empty details.
+    /// What a POI's tags state of it.
     pub fn stated(contact: Option<Contact>, opening_hours: Option<String>) -> Option<Box<Self>> {
-        (contact.is_some() || opening_hours.is_some()).then(|| {
-            Box::new(Self {
-                contact,
-                opening_hours,
-            })
-        })
+        Self {
+            contact,
+            opening_hours,
+            ..Self::default()
+        }
+        .kept()
+    }
+
+    /// None when it holds nothing: a record never holds empty details.
+    pub fn kept(self) -> Option<Box<Self>> {
+        (self != Self::default()).then(|| Box::new(self))
     }
 }
 
@@ -1050,6 +1062,10 @@ impl PoiRecord {
 
     pub fn opening_hours(&self) -> Option<&str> {
         self.details.as_ref()?.opening_hours.as_deref()
+    }
+
+    pub fn extent(&self) -> Option<Extent> {
+        self.details.as_ref()?.extent
     }
 }
 

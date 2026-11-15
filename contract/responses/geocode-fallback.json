@@ -10,6 +10,12 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
+        ],
         "confidence": 0.0,
         "fallback": true,
         "id": "osm:relation:3",

@@ -5,7 +5,10 @@
 //! report truncation as an error instead of panicking, because Pack bytes come
 //! from disk.
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    record::Extent,
+};
 
 pub(crate) fn put_u64(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -35,6 +38,37 @@ pub(crate) fn put_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
             put_str(out, value);
         }
         None => out.push(0),
+    }
+}
+
+pub(crate) fn put_extent(out: &mut Vec<u8>, extent: Extent) {
+    for side in extent {
+        put_i64(out, i64::from(side));
+    }
+}
+
+pub(crate) fn get_extent(input: &mut &[u8]) -> Result<Extent> {
+    let mut extent = [0; 4];
+    for side in &mut extent {
+        *side = i32::try_from(get_i64(input)?)
+            .map_err(|_| Error::Decode("an extent's side is out of range"))?;
+    }
+    Ok(extent)
+}
+
+/// A presence byte, then the extent it flags.
+pub(crate) fn put_opt_extent(out: &mut Vec<u8>, extent: Option<Extent>) {
+    out.push(u8::from(extent.is_some()));
+    if let Some(extent) = extent {
+        put_extent(out, extent);
+    }
+}
+
+pub(crate) fn get_opt_extent(input: &mut &[u8]) -> Result<Option<Extent>> {
+    match get_u8(input)? {
+        0 => Ok(None),
+        1 => get_extent(input).map(Some),
+        _ => Err(Error::Decode("an extent's presence byte is not 0 or 1")),
     }
 }
 
@@ -170,6 +204,32 @@ pub(crate) fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_extent_round_trips_and_a_bad_one_is_refused() {
+        let crossing = [1_770_000_000, -190_000_000, -1_785_000_000, i32::MAX];
+        let mut out = Vec::new();
+        put_opt_extent(&mut out, None);
+        put_opt_extent(&mut out, Some(crossing));
+        let mut input = out.as_slice();
+        assert_eq!(get_opt_extent(&mut input).unwrap(), None);
+        assert_eq!(get_opt_extent(&mut input).unwrap(), Some(crossing));
+        assert!(input.is_empty());
+        assert!(matches!(
+            get_opt_extent(&mut &out[1..out.len() - 1]),
+            Err(Error::Decode("unexpected end of encoded data"))
+        ));
+        assert!(matches!(
+            get_opt_extent(&mut [2u8].as_slice()),
+            Err(Error::Decode("an extent's presence byte is not 0 or 1"))
+        ));
+        let mut wide = vec![1];
+        put_i64(&mut wide, i64::from(i32::MAX) + 1);
+        assert!(matches!(
+            get_opt_extent(&mut wide.as_slice()),
+            Err(Error::Decode("an extent's side is out of range"))
+        ));
+    }
 
     #[test]
     fn round_trips_varints_and_zigzag() {

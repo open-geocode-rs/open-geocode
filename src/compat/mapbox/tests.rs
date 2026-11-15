@@ -843,6 +843,7 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         brand: None,
         contact: None,
         opening_hours: None,
+        bbox: None,
         address: Address {
             unit: unit.map(str::to_string),
             ..Address::default()

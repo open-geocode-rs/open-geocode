@@ -2328,6 +2328,220 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 
+    /// A town drawn as an area, a street, a hall drawn as a building, a cafe
+    /// mapped as a node and a house, in that order.
+    fn write_shaped_pack(dir: &Path) {
+        use crate::record::{PlaceLayer, PlaceRecord, PoiDetails, PoiRecord, StreetRecord};
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let poi = |id: i64, object_type, name: &str, lon: f64, details| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(object_type, id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            details,
+            aliases: Vec::new(),
+        };
+        let records: [crate::record::Record; 5] = [
+            crate::record::Record::Place(
+                PlaceLayer::Locality,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Portside".to_string(),
+                    place_type: "town".to_string(),
+                    geometry: point_geometry(-79.5, 43.5),
+                    source: SourceProvenance::osm(ObjectType::Relation, 7),
+                    prominence: Default::default(),
+                    wikidata: None,
+                },
+            ),
+            StreetRecord {
+                other_ways: Vec::new(),
+                road_class: crate::record::RoadClass::Residential,
+                alt_names: Vec::new(),
+                locality: None,
+                name: "Quay Street".to_string(),
+                geometry: geojson::Geometry::new(geojson::GeometryValue::LineString {
+                    coordinates: vec![
+                        vec![-79.2, 43.1].into(),
+                        vec![-79.19, 43.12].into(),
+                        vec![-79.21, 43.11].into(),
+                    ],
+                }),
+                representative_point: [-79.2, 43.11],
+                source: SourceProvenance::osm(ObjectType::Way, 30),
+            }
+            .into(),
+            poi(
+                40,
+                ObjectType::Way,
+                "Harbour Hall",
+                -79.0,
+                PoiDetails {
+                    extent: Some([-790_002_000, 429_999_000, -789_998_500, 430_001_250]),
+                    ..PoiDetails::default()
+                }
+                .kept(),
+            )
+            .into(),
+            poi(2, ObjectType::Node, "Lantern Cafe", -79.1, None).into(),
+            AddressRecord {
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: "10".to_string(),
+                    street: Some("King Street".to_string()),
+                    place: None,
+                    unit: None,
+                    locality: Some("Toronto".to_string()),
+                    region: None,
+                    postcode: Some("M5V 1A1".to_string()),
+                    country: None,
+                },
+                geometry: point_geometry(-79.3, 43.3),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 1),
+            }
+            .into(),
+        ];
+        for record in &records {
+            writer.write(record, None).expect("write");
+        }
+        writer.set_extents(vec![(
+            0,
+            [-796_000_000, 434_000_000, -794_000_000, 436_000_000],
+        )]);
+        writer.finish().expect("finish");
+    }
+
+    /// The box around a record is its own: every route that answers with
+    /// the record gives it, and a record that is only a point has none.
+    #[tokio::test]
+    async fn a_result_larger_than_a_point_carries_its_bbox_on_every_route() {
+        let pack = temp_path("bbox");
+        write_shaped_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let boxed = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (properties["id"].clone(), properties.get("bbox").cloned())
+        };
+        let with = |id: &str, bbox: serde_json::Value| (serde_json::json!(id), Some(bbox));
+        let town = with(
+            "osm:relation:7",
+            serde_json::json!([-79.6, 43.4, -79.4, 43.6]),
+        );
+        let street = with(
+            "osm:way:30",
+            serde_json::json!([-79.21, 43.1, -79.19, 43.12]),
+        );
+        let hall = with(
+            "osm:way:40",
+            serde_json::json!([-79.0002, 42.9999, -78.99985, 43.000125]),
+        );
+        let cafe = (serde_json::json!("osm:node:2"), None);
+        let house = (serde_json::json!("osm:node:1"), None);
+
+        for (uri, expected) in [
+            ("/geocode?q=Quay%20Street", &street),
+            ("/geocode?q=10%20King%20Street%2C%20Toronto", &house),
+            ("/geocode?q=Portside", &town),
+            ("/places?ids=osm:relation:7", &town),
+            ("/places?ids=osm:way:30", &street),
+            ("/places?q=Harbour%20Hall", &hall),
+            ("/places?ids=osm:way:40", &hall),
+            ("/places?q=Lantern%20Cafe", &cafe),
+            ("/autocomplete?q=Portsi", &town),
+            ("/autocomplete?q=Quay%20St", &street),
+            ("/autocomplete?q=Harbour", &hall),
+            ("/autocomplete?q=Lantern", &cafe),
+            ("/reverse?lon=-79.2&lat=43.1", &street),
+            ("/reverse?lon=-79.0&lat=43.0&layer=poi", &hall),
+            ("/reverse?lon=-79.1&lat=43.0&layer=poi", &cafe),
+            ("/reverse?lon=-79.3&lat=43.3", &house),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            assert_eq!(&boxed(&reply.json()), expected, "{uri}");
+        }
+
+        for (route, body, expected) in [
+            (
+                "/geocode",
+                r#"[{"q": "Quay Street"}, {"q": "10 King Street, Toronto"}]"#,
+                [&street, &house],
+            ),
+            (
+                "/places",
+                r#"[{"ids": "osm:relation:7"}, {"q": "Lantern Cafe"}]"#,
+                [&town, &cafe],
+            ),
+            (
+                "/reverse",
+                r#"[{"lon": -79.0, "lat": 43.0, "layer": "poi"},
+                    {"lon": -79.3, "lat": 43.3}]"#,
+                [&hall, &house],
+            ),
+        ] {
+            for method in ["POST", "QUERY"] {
+                let reply = send(router.clone(), batch_request(method, route, body)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{method} {route}");
+                let results = reply.json()["results"].clone();
+                for (item, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        &boxed(&results[item]["response"]),
+                        expected,
+                        "{method} {route} item {item}"
+                    );
+                }
+            }
+        }
+
+        let rows = "{\"lon\": -79.2, \"lat\": 43.1}\n{\"lon\": -79.3, \"lat\": 43.3}\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", rows),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(boxed(&lines[0]["response"]), street);
+        assert_eq!(boxed(&lines[1]["response"]), house);
+
+        let reply = send(
+            router.clone(),
+            upload(
+                "/jobs?endpoint=geocode",
+                "text/csv",
+                "address\nQuay Street\n\"10 King Street, Toronto\"\n",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let rows = csv_rows(&reply.body);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["geocode_bbox"],
+            "-79.2100000,43.1000000,-79.1900000,43.1200000"
+        );
+        assert_eq!(rows[1]["geocode_bbox"], "");
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
     /// A CSV comes back as it went, each row with `geocode batch`'s columns
     /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]

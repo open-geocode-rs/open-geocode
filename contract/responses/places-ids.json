@@ -19,6 +19,12 @@
             "type": "Street"
           }
         },
+        "bbox": [
+          -79.0051,
+          42.99992,
+          -79.0049,
+          43.00008
+        ],
         "category": "shop:bakery",
         "contact": {
           "email": "hello@queenbakery.example",
@@ -63,6 +69,12 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
+        ],
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",

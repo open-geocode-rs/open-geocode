@@ -10,6 +10,12 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -141.0027,
+          41.6765,
+          -52.3231,
+          83.3362
+        ],
         "id": "osm:relation:1",
         "label": "Toronto, Ontario, Canada",
         "layer": "country",
@@ -30,6 +36,12 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
+        ],
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
@@ -50,6 +62,12 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -95.1537,
+          41.6765,
+          -74.3199,
+          56.8593
+        ],
         "id": "osm:relation:2",
         "label": "Ontario",
         "layer": "region",
