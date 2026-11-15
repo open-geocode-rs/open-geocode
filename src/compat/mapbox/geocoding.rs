@@ -25,7 +25,7 @@ use crate::{
         problem::Problem,
     },
     reverse::GeocodeOptions,
-    runtime::{self, AppState, GeocodeRequest, PlacesRequest},
+    runtime::{self, AppState, GeocodeRequest, Named, PlacesRequest},
     stop::CancelOnDrop,
 };
 
@@ -331,9 +331,9 @@ pub(super) struct Batch {
 /// One batch query, checked by og's batch engine.
 #[derive(Clone)]
 enum Checked {
-    Places(PlacesRequest),
-    Geocode(GeocodeRequest),
-    Reverse(GeocodeOptions),
+    Places(Named<PlacesRequest>),
+    Geocode(Named<GeocodeRequest>),
+    Reverse(Named<GeocodeOptions>),
 }
 
 /// Where a query reads in the Pack, so neighbours run together.
@@ -510,7 +510,7 @@ fn look_up(state: &AppState, query: &Checked, cancel: &Arc<AtomicBool>) -> Resul
             state,
             runtime::REVERSE,
             None,
-            *options,
+            options.clone(),
             cancel,
         ))
         .map(Answer::Reverse),

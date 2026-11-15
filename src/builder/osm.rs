@@ -443,6 +443,7 @@ struct Contexts {
     area_names: HashMap<RecordId, Vec<String>>,
     country_codes: HashMap<RecordId, CountryCode>,
     subdivision_codes: HashMap<RecordId, String>,
+    language_names: HashMap<RecordId, crate::pack::LanguageNames>,
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
@@ -459,6 +460,7 @@ impl Contexts {
     ) -> Self {
         let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
         let subdivision_codes = boundaries.subdivision_codes(&boundary_ids);
+        let language_names = boundaries.language_names(&boundary_ids);
         let area_names = boundaries.context_names(&boundary_ids, &country_ids);
         let region_groups = boundaries.region_groups(&boundary_ids);
         let index = boundaries.into_index(&boundary_ids, &country_ids);
@@ -471,6 +473,7 @@ impl Contexts {
             area_names,
             country_codes,
             subdivision_codes,
+            language_names,
             region_groups,
         }
     }
@@ -1663,6 +1666,7 @@ impl<'a> Run<'a> {
             area_names,
             country_codes,
             subdivision_codes,
+            language_names,
             region_groups,
             ..
         } = self
@@ -1681,6 +1685,7 @@ impl<'a> Run<'a> {
         writer.set_context_names(area_names);
         writer.set_country_codes(country_codes);
         writer.set_subdivision_codes(subdivision_codes);
+        writer.set_language_names(language_names);
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
         let context_count = ordered.len();

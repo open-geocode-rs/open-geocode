@@ -1,0 +1,50 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          6.14,
+          46.2
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "context": {
+          "country": {
+            "code": "CH",
+            "id": "osm:relation:51701",
+            "name": "Suisse",
+            "translations": {
+              "de": "Schweiz"
+            }
+          }
+        },
+        "id": "osm:relation:1685488",
+        "label": "Genève",
+        "layer": "locality",
+        "name": "Genève",
+        "score": 0.0,
+        "source": {
+          "dataset": "osm"
+        },
+        "translations": {
+          "de": "Genf"
+        }
+      },
+      "type": "Feature"
+    }
+  ],
+  "geocoding": {
+    "attribution": [
+      {
+        "licence": "ODbL 1.0",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright"
+      }
+    ],
+    "query": "osm:relation:1685488",
+    "version": "1"
+  },
+  "type": "FeatureCollection"
+}

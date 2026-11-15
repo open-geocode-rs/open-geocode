@@ -71,6 +71,8 @@ const COUNTRY_CODES_SECTION: &str = "country_codes";
 const COUNTRY_CODES_VERSION: u32 = 1;
 const SUBDIVISION_CODES_SECTION: &str = "subdivision_codes";
 const SUBDIVISION_CODES_VERSION: u32 = 1;
+const LANGUAGE_NAMES_SECTION: &str = "language_names";
+const LANGUAGE_NAMES_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -219,6 +221,77 @@ fn subdivision_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, St
     Ok(codes)
 }
 
+/// The name of an area in each language it has one in, as pairs of a
+/// language code as its tag writes it (`de`, `zh-Hant`) and the name, in code
+/// order.
+pub type LanguageNames = Vec<(String, String)>;
+
+/// Each entry is the record's id, little-endian, then its name count as a
+/// little-endian `u16`, then each name as its code's length in one byte, the
+/// code, the name's length as a little-endian `u16` and the name.
+fn language_names_to_bytes(names: &HashMap<RecordId, LanguageNames>) -> Vec<u8> {
+    let fits = |(code, name): &&(String, String)| {
+        u8::try_from(code.len()).is_ok() && u16::try_from(name.len()).is_ok()
+    };
+    let mut sorted = names.iter().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|(record_id, _)| **record_id);
+    let mut bytes = Vec::new();
+    for (record_id, names) in sorted {
+        let kept = names
+            .iter()
+            .filter(fits)
+            .take(usize::from(u16::MAX))
+            .collect::<Vec<_>>();
+        if kept.is_empty() {
+            continue;
+        }
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        let count = u16::try_from(kept.len()).expect("taken to fit");
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for (code, name) in kept {
+            bytes.push(u8::try_from(code.len()).expect("filtered to fit"));
+            bytes.extend_from_slice(code.as_bytes());
+            let length = u16::try_from(name.len()).expect("filtered to fit");
+            bytes.extend_from_slice(&length.to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+        }
+    }
+    bytes
+}
+
+fn language_names_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, LanguageNames>> {
+    let truncated = || Error::Decode("language names are truncated");
+    let text = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| Error::Decode("a language name is not text"))
+    };
+    let mut all = HashMap::new();
+    while !bytes.is_empty() {
+        let (record_id, rest) = bytes.split_at_checked(8).ok_or_else(truncated)?;
+        let (count, mut rest) = rest.split_at_checked(2).ok_or_else(truncated)?;
+        let count = u16::from_le_bytes(count.try_into().expect("two bytes"));
+        let mut names = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let (&length, after) = rest.split_first().ok_or_else(truncated)?;
+            let (code, after) = after
+                .split_at_checked(usize::from(length))
+                .ok_or_else(truncated)?;
+            let (length, after) = after.split_at_checked(2).ok_or_else(truncated)?;
+            let length = u16::from_le_bytes(length.try_into().expect("two bytes"));
+            let (name, after) = after
+                .split_at_checked(usize::from(length))
+                .ok_or_else(truncated)?;
+            names.push((text(code)?, text(name)?));
+            rest = after;
+        }
+        let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
+        all.insert(record_id, names);
+        bytes = rest;
+    }
+    Ok(all)
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
     /// Pool every buffer of the build reserves from.
@@ -274,6 +347,7 @@ pub struct Writer {
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
     subdivision_codes: HashMap<RecordId, String>,
+    language_names: HashMap<RecordId, LanguageNames>,
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
@@ -420,6 +494,7 @@ impl Writer {
             context_names: Arc::default(),
             country_codes: Arc::default(),
             subdivision_codes: HashMap::new(),
+            language_names: HashMap::new(),
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
@@ -463,6 +538,12 @@ impl Writer {
     /// (`CA-ON`), by the area's id.
     pub fn set_subdivision_codes(&mut self, codes: HashMap<RecordId, String>) {
         self.subdivision_codes = codes;
+    }
+
+    /// The names of each area record in the languages it has one in, by the
+    /// area's id.
+    pub fn set_language_names(&mut self, names: HashMap<RecordId, LanguageNames>) {
+        self.language_names = names;
     }
 
     /// The groups of regions each region lies in, by the region's id.
@@ -603,6 +684,7 @@ impl Writer {
             context_names,
             country_codes,
             subdivision_codes,
+            language_names,
             postcode_addresses,
             dictionaries,
             ..
@@ -643,6 +725,12 @@ impl Writer {
             &subdivision_codes_to_bytes(&subdivision_codes),
         )?;
         drop(subdivision_codes);
+        pack.add(
+            LANGUAGE_NAMES_SECTION,
+            LANGUAGE_NAMES_VERSION,
+            &language_names_to_bytes(&language_names),
+        )?;
+        drop(language_names);
         Ok(Sealing {
             generation,
             scratch,
@@ -1017,6 +1105,8 @@ pub struct Reader {
     country_codes: HashMap<RecordId, CountryCode>,
     /// The ISO 3166-2 code of each area record that has one, by its id.
     subdivision_codes: HashMap<RecordId, String>,
+    /// The names of each area record in other languages, by its id.
+    language_names: HashMap<RecordId, LanguageNames>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -1065,6 +1155,13 @@ impl Reader {
         } else {
             HashMap::new()
         };
+        let language_names = if container.sections().contains_key(LANGUAGE_NAMES_SECTION) {
+            language_names_from_bytes(
+                &container.section(LANGUAGE_NAMES_SECTION, LANGUAGE_NAMES_VERSION)?,
+            )?
+        } else {
+            HashMap::new()
+        };
         Ok(Self {
             path,
             container,
@@ -1074,6 +1171,7 @@ impl Reader {
             postcode_addresses,
             country_codes,
             subdivision_codes,
+            language_names,
         })
     }
 
@@ -1106,6 +1204,25 @@ impl Reader {
     /// and for every record of a Pack sealed without subdivision codes.
     pub fn subdivision_code(&self, record_id: RecordId) -> Option<&str> {
         self.subdivision_codes.get(&record_id).map(String::as_str)
+    }
+
+    /// An area record's name in `language` (`de`, `zh-Hant`), matched
+    /// without regard to case. A language with a region or script that has
+    /// no name of its own takes the name of its base language, so `de-CH`
+    /// reads `de`. `None` when the record has no name in it, and for every
+    /// record of a Pack sealed without language names.
+    pub fn language_name(&self, record_id: RecordId, language: &str) -> Option<&str> {
+        let names = self.language_names.get(&record_id)?;
+        let find = |wanted: &str| {
+            names
+                .iter()
+                .find(|(code, _)| code.eq_ignore_ascii_case(wanted))
+                .map(|(_, name)| name.as_str())
+        };
+        find(language).or_else(|| {
+            let base = language.split(['-', '_']).next()?;
+            (base.len() < language.len()).then(|| find(base)).flatten()
+        })
     }
 
     /// See [`PostcodeAddresses`].
@@ -1344,6 +1461,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn language_names_survive_the_section_and_a_cut_one_fails() {
+        let names = HashMap::from([
+            (
+                3,
+                vec![
+                    ("de".to_string(), "Genf".to_string()),
+                    ("it".to_string(), "Ginevra".to_string()),
+                ],
+            ),
+            (9, vec![("zh-Hant".to_string(), "日內瓦".to_string())]),
+        ]);
+        let bytes = language_names_to_bytes(&names);
+        assert_eq!(language_names_from_bytes(&bytes).expect("decodes"), names);
+        assert!(language_names_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
 
     #[test]
     fn subdivision_codes_survive_the_section_and_a_cut_one_fails() {

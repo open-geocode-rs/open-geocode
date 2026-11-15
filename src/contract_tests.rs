@@ -1040,3 +1040,225 @@ fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
         coordinates: vec![vec![from_lon, from_lat].into(), vec![to_lon, to_lat].into()],
     })
 }
+
+/// Geneva in Switzerland, each area with its names in other languages, and
+/// an address in Geneva.
+fn write_geneva_pack(dir: &PathBuf) {
+    let _ = std::fs::remove_dir_all(dir);
+    let mut writer = Writer::create(dir).expect("writer");
+    let mut place = |layer, name: &str, alt_names: &[&str], id, context| {
+        writer
+            .write(
+                &Record::Place(
+                    layer,
+                    PlaceRecord {
+                        alt_names: alt_names.iter().map(|name| (*name).to_string()).collect(),
+                        name: name.to_string(),
+                        place_type: "admin_level:8".to_string(),
+                        geometry: point_geometry(6.14, 46.2),
+                        source: SourceProvenance::osm(ObjectType::Relation, id),
+                        prominence: Default::default(),
+                        wikidata: None,
+                    },
+                ),
+                context,
+            )
+            .expect("place")
+    };
+    let country = place(
+        PlaceLayer::Country,
+        "Schweiz/Suisse/Svizzera/Svizra",
+        &["Schweiz", "Suisse", "Svizzera"],
+        51_701,
+        None,
+    );
+    let locality = place(
+        PlaceLayer::Locality,
+        "Genève",
+        &["Genf", "Ginevra"],
+        1_685_488,
+        Some(RecordContext {
+            admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Country, country)]),
+            flags: 0,
+        }),
+    );
+    let names = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(code, name)| ((*code).to_string(), (*name).to_string()))
+            .collect::<Vec<_>>()
+    };
+    writer.set_language_names(
+        [
+            (
+                country,
+                names(&[("de", "Schweiz"), ("fr", "Suisse"), ("it", "Svizzera")]),
+            ),
+            (
+                locality,
+                names(&[("de", "Genf"), ("fr", "Genève"), ("it", "Ginevra")]),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    writer.set_country_codes(
+        [(
+            country,
+            crate::parse::lattice::CountryCode::parse("CH").expect("code"),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let context = Some(RecordContext {
+        admin_context: AdminContextTuple::from_tiers([
+            (PlaceLayer::Country, country),
+            (PlaceLayer::Locality, locality),
+        ]),
+        flags: 0,
+    });
+    writer
+        .write(
+            &AddressRecord {
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: "1".to_string(),
+                    street: Some("Rue du Rhône".to_string()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: Some("1204".to_string()),
+                    country: None,
+                },
+                geometry: point_geometry(6.145, 46.203),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 20),
+            }
+            .into(),
+            context,
+        )
+        .expect("address");
+    writer.finish().expect("finish");
+}
+
+fn geneva_router() -> Router {
+    let pack = std::env::temp_dir().join(format!(
+        "open-geocode-geneva-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    write_geneva_pack(&pack);
+    build_router(
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
+    )
+}
+
+/// `lang` names results and their areas. The first language gives `name`,
+/// with the local name standing in where there is none, and each other one
+/// gives `translations`.
+#[tokio::test]
+async fn lang_names_results_and_areas_in_the_languages_asked() {
+    let router = geneva_router();
+
+    let local = get(&router, "/places?ids=osm:relation:1685488").await;
+    let city = &local["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert!(city.get("translations").is_none());
+
+    let german = get(&router, "/places?ids=osm:relation:1685488&lang=de").await;
+    let city = &german["features"][0]["properties"];
+    assert_eq!(city["name"], "Genf");
+    assert_eq!(city["context"]["country"]["name"], "Schweiz");
+    assert!(city.get("translations").is_none());
+
+    let both = get(&router, "/places?ids=osm:relation:1685488&lang=fr,de").await;
+    assert_example("places-lang", &both);
+    let city = &both["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert_eq!(city["translations"], json!({"de": "Genf"}));
+    assert_eq!(city["context"]["country"]["name"], "Suisse");
+    assert_eq!(
+        city["context"]["country"]["translations"],
+        json!({"de": "Schweiz"})
+    );
+
+    // A language with no name falls back to the local one, and adds nothing.
+    let romansh = get(&router, "/places?ids=osm:relation:1685488&lang=rm,ja").await;
+    let city = &romansh["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert!(city.get("translations").is_none());
+    assert_eq!(
+        city["context"]["country"]["name"],
+        "Schweiz/Suisse/Svizzera/Svizra"
+    );
+
+    // A region or script with no name of its own reads its base language,
+    // and a repeat counts once.
+    let swiss = get(&router, "/places?ids=osm:relation:1685488&lang=de-CH,DE-ch").await;
+    let city = &swiss["features"][0]["properties"];
+    assert_eq!(city["name"], "Genf");
+    assert!(city.get("translations").is_none());
+
+    let address = get(&router, "/geocode?q=1%20Rue%20du%20Rh%C3%B4ne&lang=it,de").await;
+    let context = &address["features"][0]["properties"]["context"];
+    assert_eq!(context["locality"]["name"], "Ginevra");
+    assert_eq!(context["locality"]["translations"], json!({"de": "Genf"}));
+
+    let suggested = get(&router, "/autocomplete?q=1%20Rue%20du%20Rh&lang=de").await;
+    assert_eq!(
+        suggested["features"][0]["properties"]["context"]["locality"]["name"],
+        "Genf"
+    );
+
+    let reverse = get(&router, "/reverse?lon=6.145&lat=46.203&lang=de").await;
+    assert_eq!(
+        reverse["features"][0]["properties"]["context"]["locality"]["name"],
+        "Genf"
+    );
+
+    for uri in [
+        "/geocode?q=Rue&lang=german",
+        "/places?q=Rue&lang=d3",
+        "/reverse?lon=6.1&lat=46.2&lang=de,x",
+        "/autocomplete?q=Rue&lang=de-",
+    ] {
+        let (status, problem) = get_error(&router, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(problem["invalid_params"][0]["name"], "lang", "{uri}");
+    }
+}
+
+/// A batch item names its answer in its own `lang`, as its `GET` would.
+#[tokio::test]
+async fn a_batch_item_takes_lang() {
+    let router = geneva_router();
+    let body = json!([
+        {"ids": "osm:relation:1685488", "lang": "de"},
+        {"ids": "osm:relation:1685488"},
+        {"ids": "osm:relation:1685488", "lang": "d3"},
+    ])
+    .to_string();
+    let (status, answer) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let answer: Value = serde_json::from_slice(&answer).expect("batch is JSON");
+    let results = &answer["results"];
+    assert_eq!(
+        results[0]["response"]["features"][0]["properties"]["name"],
+        "Genf"
+    );
+    assert_eq!(
+        results[1]["response"]["features"][0]["properties"]["name"],
+        "Genève"
+    );
+    assert_eq!(results[2]["error"]["invalid_params"][0]["name"], "lang");
+}

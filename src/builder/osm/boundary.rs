@@ -27,7 +27,7 @@ use super::{
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
     poi::{PoiCandidate, outline},
-    tags::{OsmTags, alternate_names, item, name_tags, prominence},
+    tags::{OsmTags, alternate_names, item, language_names, name_tags, prominence},
 };
 
 /// Tags a boundary keeps after the scan besides its names. Its Wikidata
@@ -135,6 +135,8 @@ struct BuiltBoundary {
     place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
+    /// Its name in each language a `name:<lang>` tag states.
+    language_names: Vec<(String, String)>,
     prominence: Prominence,
     wikidata: Option<u32>,
     /// The layer its `place` tag names, if any (`place=city` is a locality).
@@ -319,6 +321,12 @@ impl BoundaryCandidate {
             + text(&boundary.designation)
             + text(&boundary.inferred_country_code)
             + text(&boundary.subdivision_code)
+            + boundary.language_names.capacity() * std::mem::size_of::<(String, String)>()
+            + boundary
+                .language_names
+                .iter()
+                .map(|(code, name)| code.capacity() + name.capacity())
+                .sum::<usize>()
     }
 }
 
@@ -512,6 +520,20 @@ impl BoundarySet {
             .iter()
             .filter_map(|(code, record_id)| Some((*record_id, CountryCode::parse(code)?)));
         boundaries.chain(derived).collect()
+    }
+
+    /// The names in other languages of each area record whose boundary
+    /// states any, by record id.
+    pub(crate) fn language_names(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, crate::pack::LanguageNames> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter(|(candidate, _)| !candidate.boundary.language_names.is_empty())
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.language_names.clone()))
+            .collect()
     }
 
     /// The ISO 3166-2 code of each area record below a country whose
@@ -953,6 +975,7 @@ fn built(
             place_type,
             name,
             alt_names,
+            language_names: language_names(tags),
             prominence: prominence(tags),
             wikidata: item(tags, "wikidata"),
             place_layer,
@@ -1854,6 +1877,11 @@ impl crate::extsort::Spill for SetItem {
                 for name in &boundary.alt_names {
                     put_str(out, name);
                 }
+                put_u64(out, boundary.language_names.len() as u64);
+                for (code, name) in &boundary.language_names {
+                    put_str(out, code);
+                    put_str(out, name);
+                }
                 out.push(boundary.prominence.to_byte());
                 out.push(boundary.prominence.importance);
                 put_u64(out, boundary.wikidata.map_or(0, u64::from));
@@ -1909,6 +1937,9 @@ impl crate::extsort::Spill for SetItem {
                 let alt_names = (0..get_u64(input)?)
                     .map(|_| get_string(input))
                     .collect::<crate::error::Result<Vec<_>>>()?;
+                let language_names = (0..get_u64(input)?)
+                    .map(|_| Ok((get_string(input)?, get_string(input)?)))
+                    .collect::<crate::error::Result<Vec<_>>>()?;
                 let prominence = Prominence::from_byte(get_u8(input)?, get_u8(input)?);
                 let wikidata = match get_u64(input)? {
                     0 => None,
@@ -1947,6 +1978,7 @@ impl crate::extsort::Spill for SetItem {
                         place_type,
                         name,
                         alt_names,
+                        language_names,
                         prominence,
                         wikidata,
                         place_layer,
@@ -2184,6 +2216,7 @@ mod tests {
             place_type: None,
             name: "Test".to_string(),
             alt_names: Vec::new(),
+            language_names: Vec::new(),
             place_layer: None,
             designation: None,
             inferred_country_code: None,
@@ -2581,6 +2614,7 @@ mod tests {
                     place_type: None,
                     name: format!("level {level}"),
                     alt_names: Vec::new(),
+                    language_names: Vec::new(),
                     place_layer,
                     designation: None,
                     inferred_country_code: country
