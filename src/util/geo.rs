@@ -72,8 +72,8 @@ pub(crate) fn narrowest_box(parts: impl IntoIterator<Item = Extent>) -> Option<E
     }
     spans.sort_unstable();
     let &(first, mut reach) = spans.first()?;
-    // The widest gap between parts: its width, the part after it and the
-    // reach of the parts before it.
+    // The widest gap between parts, as its width, the part after it and
+    // the reach of the parts before it.
     let mut widest = None::<(i64, i32, i32)>;
     for &(west, east) in &spans[1..] {
         let gap = i64::from(west) - i64::from(reach);
@@ -124,7 +124,7 @@ mod tests {
             ]),
             Some(part(176, -19, -178, -15))
         );
-        // Two gaps of one width: the box stays in one piece.
+        // With two gaps of one width the box stays in one piece.
         assert_eq!(
             narrowest_box([part(-90, 0, -80, 1), part(90, 0, 100, 1)]),
             Some(part(-90, 0, 100, 1))

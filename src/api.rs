@@ -100,27 +100,35 @@ pub struct Source {
     pub dataset: String,
 }
 
-fn attribution<'a>(pack: &Reader, datasets: impl Iterator<Item = &'a str>) -> Vec<Attribution> {
+/// The credits of an answer whose results are `results`. They are
+/// OpenStreetMap, each other data set a result comes from, and the timezone
+/// boundaries when a result carries a timezone.
+fn attribution<'a>(pack: &Reader, results: impl Iterator<Item = &'a Common>) -> Vec<Attribution> {
     let mut named = vec![OSM_DATASET];
-    for dataset in datasets {
+    let mut zoned = false;
+    for result in results {
+        let dataset = result.source.dataset.as_str();
         if !named.contains(&dataset) {
             named.push(dataset);
         }
+        zoned |= result.timezone.is_some();
     }
+    let credit = |licence: crate::licences::Licence, dataset: &str| Attribution {
+        text: licence.attribution.unwrap_or_else(|| dataset.to_string()),
+        licence: Some(licence.name),
+        url: licence.url,
+    };
     named
         .into_iter()
         .map(|dataset| match pack.records().licence(dataset) {
-            Some(licence) => Attribution {
-                text: licence.attribution.unwrap_or_else(|| dataset.to_string()),
-                licence: Some(licence.name),
-                url: licence.url,
-            },
+            Some(licence) => credit(licence, dataset),
             None => Attribution {
                 text: dataset.to_string(),
                 licence: None,
                 url: None,
             },
         })
+        .chain(zoned.then(|| credit(crate::licences::timezones(), "timezones")))
         .collect()
 }
 
@@ -223,13 +231,23 @@ pub struct Common {
     #[schema(example = "Mo-Fr 08:00-18:00; Sa 09:00-13:00")]
     pub opening_hours: Option<String>,
     /// The box around a result that covers more than a point, as `[west,
-    /// south, east, north]` in degrees: an area's outline, a street's line,
-    /// or the outline a POI is drawn with. It is the narrowest box, so for
-    /// a result that crosses the antimeridian `west` is greater than
-    /// `east`, and only then. Absent on a result that is only a point.
+    /// south, east, north]` in degrees. It holds an area's outline, a
+    /// street's line, or the outline a POI is drawn with. It is the
+    /// narrowest box, so for a result that crosses the antimeridian `west`
+    /// is greater than `east`, and only then. Absent on a result that is
+    /// only a point.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = json!([7.4090279, 43.7247599, 7.4398704, 43.7519311]))]
     pub bbox: Option<[f64; 4]>,
+    /// The IANA name of the timezone the result lies in, such as
+    /// `Europe/Monaco`. Its offset from UTC is the reader's to compute,
+    /// as it changes with the date. An area's is the zone it lies wholly in,
+    /// and any other result's is the zone at its point. Absent on an area
+    /// that reaches into two zones, where the timezone boundaries name no
+    /// zone or two, and on every result of a Pack built without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Europe/Monaco")]
+    pub timezone: Option<String>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -675,9 +693,7 @@ pub fn forward_collection(
         .collect::<Result<Vec<_>>>()?;
     let attribution = attribution(
         pack,
-        features
-            .iter()
-            .map(|feature| feature.properties.common.source.dataset.as_str()),
+        features.iter().map(|feature| &feature.properties.common),
     );
     Ok(ForwardCollection {
         kind: FeatureCollectionType::FeatureCollection,
@@ -948,9 +964,7 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
 
     let attribution = attribution(
         pack,
-        features
-            .iter()
-            .map(|feature| feature.properties.common.source.dataset.as_str()),
+        features.iter().map(|feature| &feature.properties.common),
     );
     Ok(ReverseCollection {
         kind: FeatureCollectionType::FeatureCollection,
@@ -1021,6 +1035,7 @@ fn common(
         contact: summary.contact,
         opening_hours: summary.opening_hours,
         bbox: summary.bbox,
+        timezone: summary.timezone,
         address: summary.address.with_parts(),
         context: contexts.of(record_id)?,
         source: Source {
@@ -1100,6 +1115,7 @@ fn flat(
                     .map(|bbox| bbox.map(|side| format!("{side:.7}")).join(","))
             }),
         ),
+        ("timezone", field(&|p| p.timezone.clone())),
         (
             "address_housenumber",
             field(&|p| p.address.housenumber.clone()),

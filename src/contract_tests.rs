@@ -936,6 +936,9 @@ fn write_pack(dir: &PathBuf) {
             [-796_392_727, 435_796_082, -791_132_193, 438_554_425],
         ),
     ]);
+    // Toronto lies wholly in one zone, as a build given timezone boundaries
+    // finds. Ontario and Canada reach into several, so they name none.
+    writer.set_timezones(vec!["America/Toronto".to_string()], vec![(locality, 0)]);
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -943,6 +946,7 @@ fn write_pack(dir: &PathBuf) {
             (PlaceLayer::Locality, locality),
         ]),
         flags: 0,
+        zone: None,
     });
     let king = AddressComponents {
         areas: Vec::new(),
@@ -1104,6 +1108,7 @@ fn write_geneva_pack(dir: &PathBuf) {
         Some(RecordContext {
             admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Country, country)]),
             flags: 0,
+            zone: None,
         }),
     );
     let names = |pairs: &[(&str, &str)]| {
@@ -1140,6 +1145,7 @@ fn write_geneva_pack(dir: &PathBuf) {
             (PlaceLayer::Locality, locality),
         ]),
         flags: 0,
+        zone: None,
     });
     writer
         .write(

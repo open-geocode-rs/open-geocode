@@ -221,8 +221,8 @@ pub struct Brand {
     pub wikidata: Option<u32>,
 }
 
-/// The box around something larger than a point: west, south, east and
-/// north in 1e-7 degrees. West is greater than east when the box crosses the
+/// The box around something larger than a point, as its west, south, east
+/// and north in 1e-7 degrees. West is greater than east when the box crosses the
 /// antimeridian, and only then.
 pub type Extent = [i32; 4];
 
@@ -248,7 +248,7 @@ impl PoiDetails {
         .kept()
     }
 
-    /// None when it holds nothing: a record never holds empty details.
+    /// None when it holds nothing, as a record never holds empty details.
     pub fn kept(self) -> Option<Box<Self>> {
         (self != Self::default()).then(|| Box::new(self))
     }

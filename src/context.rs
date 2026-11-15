@@ -14,9 +14,12 @@
 //!
 //! ```text
 //! context/tuples  chain_count u64, then per chain:
-//!                   len u8, then len x (record_id u32, tiers u16)
+//!                   len u8, zone u16, then len x (record_id u32, tiers u16)
 //!                 tiers is a bit per PlaceLayer discriminant, so one area
-//!                 can be two things at once; chains sorted by outermost
+//!                 can be two things at once; chains sorted by outermost.
+//!                 zone is 0 for none, else one more than the index of a
+//!                 timezone in the Pack's zone names (see
+//!                 [`RecordContext::zone`])
 //! ```
 
 use std::collections::HashMap;
@@ -33,12 +36,14 @@ use crate::{
 };
 
 pub const SECTION_TUPLES: &str = "context/tuples";
-/// 3 gives each entry a set of tiers; 2 gave it one; 1 held a fixed
-/// six-slot tuple.
-pub const CONTEXT_VERSION: u32 = 3;
+/// 4 gives each chain a timezone; 3 gave each entry a set of tiers; 2 gave
+/// it one; 1 held a fixed six-slot tuple.
+pub const CONTEXT_VERSION: u32 = 4;
 pub const CONTEXT_FLAG_AMBIGUOUS_ADMIN: u16 = 1;
 
 const ENTRY_BYTES: usize = 6;
+/// Bytes of a chain's length and zone, which come before its entries.
+const CHAIN_HEADER_BYTES: usize = 3;
 /// Bounds one chain so a corrupt length cannot drive a huge allocation. No
 /// country maps anywhere near this many tiers.
 const MAX_CHAIN: usize = 32;
@@ -131,6 +136,10 @@ pub struct AdminContextTuple {
 pub struct RecordContext {
     pub admin_context: AdminContextTuple,
     pub flags: u16,
+    /// The timezone at the record's point, by its index in the Pack's zone
+    /// names, when no area of the chain lies wholly in one zone to say it.
+    /// Records in an area two zones share then differ by this alone.
+    pub zone: Option<u16>,
 }
 
 impl AdminContextTuple {
@@ -284,17 +293,24 @@ impl FromIterator<AdminEntry> for AdminContextTuple {
 
 #[derive(Debug, Default)]
 pub struct TupleWriter {
-    tuples: Vec<AdminContextTuple>,
-    ids: HashMap<AdminContextTuple, u32>,
+    tuples: Vec<(AdminContextTuple, Option<u16>)>,
+    ids: HashMap<(AdminContextTuple, Option<u16>), u32>,
 }
 
 impl TupleWriter {
-    /// Reference for a record's context; `None` when there is no admin context.
+    /// Reference for a record's context; `None` when it lies in no area and
+    /// no zone.
     pub fn intern(&mut self, context: &RecordContext) -> Result<Option<ContextRef>> {
-        if context.admin_context.is_empty() {
+        if context.admin_context.is_empty() && context.zone.is_none() {
             return Ok(None);
         }
-        let tuple_id = match self.ids.get(&context.admin_context) {
+        if context.zone == Some(u16::MAX) {
+            return Err(Error::Inconsistent(
+                "a timezone's index is past what a chain stores".into(),
+            ));
+        }
+        let key = (context.admin_context.clone(), context.zone);
+        let tuple_id = match self.ids.get(&key) {
             Some(id) => *id,
             None => {
                 for entry in context.admin_context.entries() {
@@ -312,8 +328,8 @@ impl TupleWriter {
                 }
                 let id = u32::try_from(self.tuples.len())
                     .map_err(|_| Error::Inconsistent("context table is full".into()))?;
-                self.tuples.push(context.admin_context.clone());
-                self.ids.insert(context.admin_context.clone(), id);
+                self.tuples.push(key.clone());
+                self.ids.insert(key, id);
                 id
             }
         };
@@ -329,17 +345,19 @@ impl TupleWriter {
 
     /// Write the table, and hand back its tuples.
     pub fn finish(self, pack: &mut Writer) -> Result<Vec<AdminContextTuple>> {
-        let mut bytes = Vec::with_capacity(8 + self.tuples.len() * (1 + 4 * ENTRY_BYTES));
+        let mut bytes =
+            Vec::with_capacity(8 + self.tuples.len() * (CHAIN_HEADER_BYTES + 4 * ENTRY_BYTES));
         bytes.extend_from_slice(&(self.tuples.len() as u64).to_le_bytes());
-        for tuple in &self.tuples {
+        for (tuple, zone) in &self.tuples {
             bytes.push(tuple.entries().len() as u8);
+            bytes.extend_from_slice(&zone.map_or(0, |zone| zone + 1).to_le_bytes());
             for entry in tuple.entries() {
                 bytes.extend_from_slice(&(entry.record_id as u32).to_le_bytes());
                 bytes.extend_from_slice(&entry.tiers.bits().to_le_bytes());
             }
         }
         pack.add(SECTION_TUPLES, CONTEXT_VERSION, &bytes)?;
-        Ok(self.tuples)
+        Ok(self.tuples.into_iter().map(|(tuple, _)| tuple).collect())
     }
 }
 
@@ -369,7 +387,7 @@ impl Reader {
                     .map_err(|_| Error::Inconsistent("context table is too large".into()))?,
             );
             offset = offset
-                .checked_add(1 + len * ENTRY_BYTES)
+                .checked_add(CHAIN_HEADER_BYTES + len * ENTRY_BYTES)
                 .ok_or_else(truncated)?;
             if offset > tuples.len() {
                 return Err(truncated());
@@ -392,9 +410,10 @@ impl Reader {
         };
         let offset = offset as usize;
         let len = self.tuples[offset] as usize;
+        let zone = u16::from_le_bytes([self.tuples[offset + 1], self.tuples[offset + 2]]);
         let mut entries = Vec::with_capacity(len);
         for index in 0..len {
-            let at = offset + 1 + index * ENTRY_BYTES;
+            let at = offset + CHAIN_HEADER_BYTES + index * ENTRY_BYTES;
             let record_id = read_u32_le(&self.tuples, at).expect("validated table");
             let bits = u16::from_le_bytes([self.tuples[at + 4], self.tuples[at + 5]]);
             let tiers = TierSet::from_bits(bits)
@@ -411,6 +430,7 @@ impl Reader {
             } else {
                 0
             },
+            zone: zone.checked_sub(1),
         })
     }
 }
@@ -467,6 +487,59 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_keeps_the_zone_it_is_given_and_a_zone_alone_is_a_chain() {
+        let path =
+            std::env::temp_dir().join(format!("open-geocode-context-{}", uuid::Uuid::new_v4()));
+        let town = AdminContextTuple::from_tiers([(PlaceLayer::Locality, 3)]);
+        let context = |admin_context: &AdminContextTuple, zone| RecordContext {
+            admin_context: admin_context.clone(),
+            flags: 0,
+            zone,
+        };
+        let mut writer = TupleWriter::default();
+        let mut intern = |context: &RecordContext| {
+            writer
+                .intern(context)
+                .expect("intern")
+                .map(|reference| reference.tuple_id)
+        };
+        let nowhere = AdminContextTuple::default();
+        assert_eq!(intern(&context(&town, None)), Some(0));
+        assert_eq!(intern(&context(&town, Some(0))), Some(1));
+        assert_eq!(intern(&context(&town, Some(418))), Some(2));
+        assert_eq!(intern(&context(&town, Some(0))), Some(1));
+        assert_eq!(intern(&context(&nowhere, Some(7))), Some(3));
+        assert_eq!(intern(&context(&nowhere, None)), None);
+        assert_eq!(
+            writer
+                .intern(&context(&town, Some(u16::MAX)))
+                .expect_err("past the format")
+                .to_string(),
+            Error::Inconsistent("a timezone's index is past what a chain stores".into())
+                .to_string()
+        );
+        assert_eq!(writer.tuple_count(), 4);
+
+        let mut pack = Writer::create(&path).expect("pack");
+        writer.finish(&mut pack).expect("finish");
+        pack.finish().expect("pack finish");
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
+        let _ = std::fs::remove_file(&path);
+        let resolve = |tuple_id| {
+            reader
+                .resolve(ContextRef {
+                    tuple_id,
+                    ambiguous: false,
+                })
+                .expect("resolve")
+        };
+        assert_eq!(resolve(0), context(&town, None));
+        assert_eq!(resolve(1), context(&town, Some(0)));
+        assert_eq!(resolve(2), context(&town, Some(418)));
+        assert_eq!(resolve(3), context(&nowhere, Some(7)));
+    }
+
+    #[test]
     fn interns_tuples_and_resolves_references() {
         let path =
             std::env::temp_dir().join(format!("open-geocode-context-{}", uuid::Uuid::new_v4()));
@@ -480,6 +553,7 @@ mod tests {
             .intern(&RecordContext {
                 admin_context: tuple.clone(),
                 flags: 0,
+                zone: None,
             })
             .expect("intern")
             .expect("reference");
@@ -487,6 +561,7 @@ mod tests {
             .intern(&RecordContext {
                 admin_context: tuple.clone(),
                 flags: CONTEXT_FLAG_AMBIGUOUS_ADMIN,
+                zone: None,
             })
             .expect("intern")
             .expect("reference");

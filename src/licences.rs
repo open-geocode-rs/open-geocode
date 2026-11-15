@@ -32,6 +32,16 @@ pub fn osm() -> Licence {
     }
 }
 
+// The zones are OpenStreetMap's boundaries joined into zones, under its
+// licence. Credited apart from it so an answer says where its zone is from.
+pub fn timezones() -> Licence {
+    Licence {
+        name: "ODbL 1.0".to_string(),
+        url: Some("https://github.com/evansiroky/timezone-boundary-builder".to_string()),
+        attribution: Some("Timezone boundaries © OpenStreetMap contributors".to_string()),
+    }
+}
+
 /// What an OpenAddresses data set's licence lets a Pack do with its rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]

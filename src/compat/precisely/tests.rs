@@ -114,6 +114,7 @@ fn write_pack(dir: &Path) {
             (PlaceLayer::Neighbourhood, neighbourhood),
         ]),
         flags: 0,
+        zone: None,
     });
     let address = AddressComponents {
         areas: Vec::new(),

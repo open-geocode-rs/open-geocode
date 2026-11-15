@@ -135,7 +135,7 @@
             "description": "Address parts stated by the source record."
           },
           "bbox": {
-            "description": "The box around a result that covers more than a point, as `[west,\nsouth, east, north]` in degrees: an area's outline, a street's line,\nor the outline a POI is drawn with. It is the narrowest box, so for\na result that crosses the antimeridian `west` is greater than\n`east`, and only then. Absent on a result that is only a point.",
+            "description": "The box around a result that covers more than a point, as `[west,\nsouth, east, north]` in degrees. It holds an area's outline, a\nstreet's line, or the outline a POI is drawn with. It is the\nnarrowest box, so for a result that crosses the antimeridian `west`\nis greater than `east`, and only then. Absent on a result that is\nonly a point.",
             "example": [
               7.4090279,
               43.7247599,
@@ -190,6 +190,11 @@
           },
           "source": {
             "$ref": "#/components/schemas/Source"
+          },
+          "timezone": {
+            "description": "The IANA name of the timezone the result lies in, such as\n`Europe/Monaco`. Its offset from UTC is the reader's to compute,\nas it changes with the date. An area's is the zone it lies wholly in,\nand any other result's is the zone at its point. Absent on an area\nthat reaches into two zones, where the timezone boundaries name no\nzone or two, and on every result of a Pack built without them.",
+            "example": "Europe/Monaco",
+            "type": "string"
           },
           "translations": {
             "additionalProperties": {

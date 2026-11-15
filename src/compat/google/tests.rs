@@ -101,6 +101,7 @@ fn write_pack(dir: &Path) {
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers(tiers),
         flags: 0,
+        zone: None,
     });
     let address = AddressComponents {
         areas: vec!["Old Town".to_string(), "Market".to_string()],
