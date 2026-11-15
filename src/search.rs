@@ -6682,6 +6682,7 @@ impl TextSearcher {
                 contact: None,
                 opening_hours: None,
                 bbox: None,
+                timezone: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -10477,6 +10478,7 @@ mod tests {
             Some(RecordContext {
                 admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, locality)]),
                 flags: 0,
+                zone: None,
             })
         };
         let in_auckland = within(auckland);
@@ -11038,6 +11040,7 @@ mod tests {
             Some(RecordContext {
                 admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, record_id)]),
                 flags: 0,
+                zone: None,
             })
         };
         writer
@@ -11098,6 +11101,7 @@ mod tests {
         let in_township = Some(RecordContext {
             admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, township)]),
             flags: 0,
+            zone: None,
         });
         let poi = |object_id, name: &str, address| PoiRecord {
             alt_names: Vec::new(),
@@ -11602,6 +11606,7 @@ mod tests {
             contact: None,
             opening_hours: None,
             bbox: None,
+            timezone: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),
@@ -13278,6 +13283,7 @@ mod tests {
             Some(RecordContext {
                 admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, record_id)]),
                 flags: 0,
+                zone: None,
             })
         };
         // The same number elsewhere, and a range that has it in Toronto.
@@ -14396,6 +14402,7 @@ mod tests {
                         huron_east,
                     )]),
                     flags: 0,
+                    zone: None,
                 }),
             )
             .expect("address");
@@ -14484,6 +14491,7 @@ mod tests {
                         auckland,
                     )]),
                     flags: 0,
+                    zone: None,
                 }),
             )
             .expect("stated suburb");
@@ -14497,6 +14505,7 @@ mod tests {
                         dickson,
                     )]),
                     flags: 0,
+                    zone: None,
                 }),
             )
             .expect("sub-locality");
@@ -14617,6 +14626,7 @@ mod tests {
         Some(crate::pack::RecordContext {
             admin_context: crate::context::AdminContextTuple::from_tiers(tiers.iter().copied()),
             flags: 0,
+            zone: None,
         })
     }
 

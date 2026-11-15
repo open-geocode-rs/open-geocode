@@ -110,6 +110,7 @@ pub(super) fn pack(name: &str) -> TestPack {
             (PlaceLayer::Neighbourhood, neighbourhood),
         ]),
         flags: 0,
+        zone: None,
     });
     let king = AddressComponents {
         areas: Vec::new(),

@@ -75,6 +75,8 @@ const LANGUAGE_NAMES_SECTION: &str = "language_names";
 const LANGUAGE_NAMES_VERSION: u32 = 1;
 const EXTENTS_SECTION: &str = "extents";
 const EXTENTS_VERSION: u32 = 1;
+const TIMEZONES_SECTION: &str = "timezones";
+const TIMEZONES_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -294,8 +296,8 @@ fn language_names_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, Langu
     Ok(all)
 }
 
-/// Bytes of one extent entry: the area record's id, then its west, south,
-/// east and north sides in 1e-7 degrees, all little-endian.
+/// Bytes of one extent entry, which is the area record's id, then its west,
+/// south, east and north sides in 1e-7 degrees, all little-endian.
 const EXTENT_ENTRY_BYTES: usize = 24;
 
 fn extents_to_bytes(mut extents: Vec<(RecordId, Extent)>) -> Vec<u8> {
@@ -312,7 +314,7 @@ fn extents_to_bytes(mut extents: Vec<(RecordId, Extent)>) -> Vec<u8> {
 }
 
 /// The box around each area record, in id order and read where the Pack
-/// holds it: a planet has an area for every town and suburb.
+/// holds it, as a planet has an area for every town and suburb.
 #[derive(Debug, Default)]
 struct Extents(Option<container::Bytes>);
 
@@ -344,6 +346,99 @@ impl Extents {
             i32::from_le_bytes(entry[from..from + 4].try_into().expect("four bytes"))
         }))
     }
+}
+
+/// Bytes of one area's timezone, which is the area record's id, then the
+/// zone's index in the names, both little-endian.
+const AREA_ZONE_BYTES: usize = 10;
+
+/// The zone names as a little-endian `u16` count, then each name's length
+/// in one byte and the name, then an entry per area that lies wholly in one
+/// zone, in id order.
+fn timezones_to_bytes(names: &[String], mut areas: Vec<(RecordId, u16)>) -> Result<Vec<u8>> {
+    let count = u16::try_from(names.len())
+        .map_err(|_| Error::Inconsistent("more timezones than the Pack names".into()))?;
+    let mut bytes = count.to_le_bytes().to_vec();
+    for name in names {
+        let length = u8::try_from(name.len()).map_err(|_| {
+            Error::Inconsistent(format!("timezone name {name:?} is longer than 255 bytes"))
+        })?;
+        bytes.push(length);
+        bytes.extend_from_slice(name.as_bytes());
+    }
+    areas.sort_unstable();
+    areas.dedup_by_key(|(record_id, _)| *record_id);
+    for (record_id, zone) in areas {
+        if zone >= count {
+            return Err(Error::Inconsistent(format!(
+                "area record {record_id} lies in timezone {zone} of {count}"
+            )));
+        }
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        bytes.extend_from_slice(&zone.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// The timezone names of a Pack built with timezone boundaries, and the
+/// zone of each area that lies wholly in one, read where the Pack holds it.
+#[derive(Debug, Default)]
+struct Timezones {
+    names: Vec<String>,
+    /// The section, and where its area entries start.
+    areas: Option<(container::Bytes, usize)>,
+}
+
+impl Timezones {
+    fn open(bytes: container::Bytes) -> Result<Self> {
+        let truncated = || Error::Decode("timezones are truncated");
+        let (count, mut rest) = bytes.split_at_checked(2).ok_or_else(truncated)?;
+        let count = u16::from_le_bytes([count[0], count[1]]);
+        let mut names = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let (&length, after) = rest.split_first().ok_or_else(truncated)?;
+            let (name, after) = after
+                .split_at_checked(usize::from(length))
+                .ok_or_else(truncated)?;
+            let name = std::str::from_utf8(name)
+                .map_err(|_| Error::Decode("a timezone name is not text"))?;
+            names.push(name.to_string());
+            rest = after;
+        }
+        let (entries, cut) = rest.as_chunks::<AREA_ZONE_BYTES>();
+        if !cut.is_empty() {
+            return Err(truncated());
+        }
+        if !entries.is_sorted_by(|left, right| area_of(left) < area_of(right)) {
+            return Err(Error::Decode("area timezones are out of order"));
+        }
+        if entries.iter().any(|entry| zone_of(entry) >= count) {
+            return Err(Error::Decode(
+                "an area lies in a timezone the Pack does not name",
+            ));
+        }
+        let areas_at = bytes.len() - rest.len();
+        Ok(Self {
+            names,
+            areas: Some((bytes, areas_at)),
+        })
+    }
+
+    /// The zone the area record lies wholly in, by its index in the names.
+    fn of_area(&self, record_id: RecordId) -> Option<u16> {
+        let (bytes, at) = self.areas.as_ref()?;
+        let entries = bytes[*at..].as_chunks::<AREA_ZONE_BYTES>().0;
+        let found = entries.binary_search_by_key(&record_id, area_of).ok()?;
+        Some(zone_of(&entries[found]))
+    }
+}
+
+fn area_of(entry: &[u8; AREA_ZONE_BYTES]) -> RecordId {
+    RecordId::from_le_bytes(entry[..8].try_into().expect("eight bytes"))
+}
+
+fn zone_of(entry: &[u8; AREA_ZONE_BYTES]) -> u16 {
+    u16::from_le_bytes([entry[8], entry[9]])
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +484,14 @@ fn indexed_area_names<'a>(
         .map(String::as_str)
 }
 
+/// The timezone names, and the zone of each area record that lies wholly
+/// in one, by its index in them.
+#[derive(Debug)]
+struct AreaZones {
+    names: Vec<String>,
+    areas: Vec<(RecordId, u16)>,
+}
+
 /// Writes records in their final order. Record ids are assigned sequentially.
 #[derive(Debug)]
 pub struct Writer {
@@ -403,6 +506,8 @@ pub struct Writer {
     subdivision_codes: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Vec<(RecordId, Extent)>,
+    /// When the build was given timezone boundaries.
+    timezones: Option<AreaZones>,
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
@@ -551,6 +656,7 @@ impl Writer {
             subdivision_codes: HashMap::new(),
             language_names: HashMap::new(),
             extents: Vec::new(),
+            timezones: None,
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
@@ -605,6 +711,13 @@ impl Writer {
     /// The box around each area record, by the area's id.
     pub fn set_extents(&mut self, extents: Vec<(RecordId, Extent)>) {
         self.extents = extents;
+    }
+
+    /// The timezone names a record's context may point at by index (see
+    /// [`RecordContext::zone`]), and the zone of each area record that lies
+    /// wholly in one, by the area's id.
+    pub fn set_timezones(&mut self, names: Vec<String>, areas: Vec<(RecordId, u16)>) {
+        self.timezones = Some(AreaZones { names, areas });
     }
 
     /// The groups of regions each region lies in, by the region's id.
@@ -747,6 +860,7 @@ impl Writer {
             subdivision_codes,
             language_names,
             extents,
+            timezones,
             postcode_addresses,
             dictionaries,
             ..
@@ -794,6 +908,13 @@ impl Writer {
         )?;
         drop(language_names);
         pack.add(EXTENTS_SECTION, EXTENTS_VERSION, &extents_to_bytes(extents))?;
+        if let Some(AreaZones { names, areas }) = timezones {
+            pack.add(
+                TIMEZONES_SECTION,
+                TIMEZONES_VERSION,
+                &timezones_to_bytes(&names, areas)?,
+            )?;
+        }
         Ok(Sealing {
             generation,
             scratch,
@@ -1171,6 +1292,7 @@ pub struct Reader {
     /// The names of each area record in other languages, by its id.
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Extents,
+    timezones: Timezones,
 }
 
 impl std::fmt::Debug for Reader {
@@ -1231,6 +1353,11 @@ impl Reader {
         } else {
             Extents::default()
         };
+        let timezones = if container.sections().contains_key(TIMEZONES_SECTION) {
+            Timezones::open(container.section(TIMEZONES_SECTION, TIMEZONES_VERSION)?)?
+        } else {
+            Timezones::default()
+        };
         Ok(Self {
             path,
             container,
@@ -1242,6 +1369,7 @@ impl Reader {
             subdivision_codes,
             language_names,
             extents,
+            timezones,
         })
     }
 
@@ -1295,6 +1423,38 @@ impl Reader {
         })
     }
 
+    /// The IANA name of the timezone a record lies in, such as
+    /// `Europe/Monaco`. An area's is the zone it lies wholly in. Any other
+    /// record's is that of the most specific area of its context that has
+    /// one, else the zone the build found at its point. `None` where the
+    /// timezone boundaries name no zone or two, for an area that reaches
+    /// into two, and for every record of a Pack built without them.
+    pub fn timezone(&self, record_id: RecordId) -> Result<Option<&str>> {
+        if self.timezones.names.is_empty() {
+            return Ok(None);
+        }
+        let zone = match self.timezones.of_area(record_id) {
+            Some(zone) => Some(zone),
+            None => self.boundary_context(record_id)?.and_then(|context| {
+                context
+                    .admin_context
+                    .parent_record_ids()
+                    .find_map(|area| self.timezones.of_area(area))
+                    .or(context.zone)
+            }),
+        };
+        zone.map(|zone| {
+            self.timezones
+                .names
+                .get(usize::from(zone))
+                .map(String::as_str)
+                .ok_or(Error::Decode(
+                    "a record lies in a timezone the Pack does not name",
+                ))
+        })
+        .transpose()
+    }
+
     /// See [`PostcodeAddresses`].
     pub fn postcode_addresses(&self) -> &PostcodeAddresses {
         &self.postcode_addresses
@@ -1321,6 +1481,7 @@ impl Reader {
         if summary.bbox.is_none() {
             summary.bbox = self.extents.get(record_id).map(records::bbox);
         }
+        summary.timezone = self.timezone(record_id)?.map(str::to_string);
         if summary.layer == Layer::Poi.as_str()
             && let Record::Poi(poi) = self.records.record(record_id)?
             && poi
@@ -1580,6 +1741,69 @@ mod tests {
             Extents::open(container::Bytes::new(twice)),
             Err(Error::Decode("area extents are out of order"))
         ));
+    }
+
+    #[test]
+    fn timezones_are_found_by_area_and_a_bad_section_fails() {
+        let names = vec!["Europe/Monaco".to_string(), "Europe/Paris".to_string()];
+        let bytes = timezones_to_bytes(&names, vec![(9, 1), (3, 0), (3, 1)]).expect("the section");
+        let zones = Timezones::open(container::Bytes::new(bytes.clone())).expect("opens");
+        assert_eq!(zones.names, names);
+        assert_eq!(zones.of_area(3), Some(0));
+        assert_eq!(zones.of_area(9), Some(1));
+        assert_eq!(zones.of_area(4), None);
+        assert_eq!(Timezones::default().of_area(3), None);
+        let none = Timezones::open(container::Bytes::new(
+            timezones_to_bytes(&names, Vec::new()).expect("the section"),
+        ))
+        .expect("opens");
+        assert_eq!((none.of_area(3), none.names), (None, names.clone()));
+
+        let refused = |bytes: Vec<u8>| {
+            Timezones::open(container::Bytes::new(bytes))
+                .expect_err("refused")
+                .to_string()
+        };
+        let decode = |message: &'static str| Error::Decode(message).to_string();
+        for cut in [0, 1, 5, bytes.len() - 1] {
+            assert_eq!(
+                refused(bytes[..cut].to_vec()),
+                decode("timezones are truncated"),
+                "{cut}"
+            );
+        }
+        let areas_at = bytes.len() - 2 * AREA_ZONE_BYTES;
+        let mut swapped = bytes[..areas_at].to_vec();
+        swapped.extend_from_slice(&bytes[areas_at + AREA_ZONE_BYTES..]);
+        swapped.extend_from_slice(&bytes[areas_at..areas_at + AREA_ZONE_BYTES]);
+        assert_eq!(refused(swapped), decode("area timezones are out of order"));
+        let mut unnamed = bytes.clone();
+        *unnamed.last_mut().expect("a zone") = 2;
+        unnamed[bytes.len() - 2] = 2;
+        assert_eq!(
+            refused(unnamed),
+            decode("an area lies in a timezone the Pack does not name")
+        );
+        let mut garbled = bytes.clone();
+        garbled[3] = 0xff;
+        assert_eq!(refused(garbled), decode("a timezone name is not text"));
+
+        assert_eq!(
+            timezones_to_bytes(&names, vec![(3, 2)])
+                .expect_err("no such zone")
+                .to_string(),
+            Error::Inconsistent("area record 3 lies in timezone 2 of 2".into()).to_string()
+        );
+        assert_eq!(
+            timezones_to_bytes(&["x".repeat(256)], Vec::new())
+                .expect_err("too long")
+                .to_string(),
+            Error::Inconsistent(format!(
+                "timezone name {:?} is longer than 255 bytes",
+                "x".repeat(256)
+            ))
+            .to_string()
+        );
     }
 
     #[test]

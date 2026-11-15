@@ -82,6 +82,7 @@ fn write_pack() -> Pack {
             (PlaceLayer::Neighbourhood, neighbourhood),
         ]),
         flags: 0,
+        zone: None,
     });
     let king = AddressComponents {
         areas: Vec::new(),
@@ -844,6 +845,7 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         contact: None,
         opening_hours: None,
         bbox: None,
+        timezone: None,
         address: Address {
             unit: unit.map(str::to_string),
             ..Address::default()

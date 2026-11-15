@@ -24,10 +24,11 @@ use crate::{
 
 use super::{
     admin_levels::{self, admin_levels},
-    containment::{ShapeRef, ShapeWriter, Shapes, encode_shape, narrowest_extent},
+    containment::{SHAPES_LABEL, ShapeRef, ShapeWriter, Shapes, encode_shape, narrowest_extent},
     place::place_layer,
     poi::{PoiCandidate, outline},
     tags::{OsmTags, alternate_names, item, language_names, name_tags, prominence},
+    timezone::Timezones,
 };
 
 /// Tags a boundary keeps after the scan besides its names. Its Wikidata
@@ -152,8 +153,9 @@ struct BuiltBoundary {
     /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
-    /// The box an answer gives: `bounds` the short way round, which for an
-    /// area over the antimeridian is not the least and greatest longitude.
+    /// The box an answer gives. It is `bounds` the short way round, which
+    /// for an area over the antimeridian is not the least and greatest
+    /// longitude.
     extent: Extent,
     area: f64,
     representative_point: [f64; 2],
@@ -207,7 +209,7 @@ impl BoundaryBuilder {
     pub(crate) fn new(scratch: &Arc<crate::extsort::Scratch>) -> crate::error::Result<Self> {
         Ok(Self {
             candidates: Vec::new(),
-            shapes: ShapeWriter::create(scratch)?,
+            shapes: ShapeWriter::create(scratch, SHAPES_LABEL)?,
             heap_bytes: 0,
             vertices: 0,
         })
@@ -698,6 +700,20 @@ impl RTreeObject for BoundaryBox {
 }
 
 impl BoundaryIndex {
+    /// The timezone of each area that lies wholly in one, by record id, and
+    /// how many areas there are.
+    pub(crate) fn timezones(&self, zones: &Timezones) -> (Vec<(RecordId, u16)>, u64) {
+        let zoned = self
+            .boundaries
+            .par_iter()
+            .filter_map(|boundary| {
+                let block = self.shapes.block(boundary.shape)?;
+                Some((boundary.record_id, zones.of_area(block, boundary.bounds)?))
+            })
+            .collect();
+        (zoned, self.boundaries.len() as u64)
+    }
+
     fn new(boundaries: Vec<AcceptedBoundary>, shapes: Arc<Shapes>) -> Self {
         let boxes = boundaries
             .iter()
@@ -771,6 +787,7 @@ impl BoundaryIndex {
         RecordContext {
             admin_context: tuple,
             flags,
+            zone: None,
         }
     }
 }
@@ -2607,7 +2624,7 @@ mod tests {
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
         let scratch = test_scratch();
-        let mut shapes = ShapeWriter::create(&scratch).expect("shape file");
+        let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         let mut candidates = Vec::new();
         let levels = levels
             .iter()
@@ -2896,7 +2913,7 @@ mod tests {
     /// An index of square boundaries, each the square its box is.
     fn test_index(mut boundaries: Vec<AcceptedBoundary>) -> BoundaryIndex {
         let scratch = test_scratch();
-        let mut shapes = ShapeWriter::create(&scratch).expect("shape file");
+        let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         for boundary in &mut boundaries {
             let square = MultiPolygon::new(vec![boundary.bounds.to_polygon()]);
             boundary.shape = with_shape(&mut shapes, &square).0;

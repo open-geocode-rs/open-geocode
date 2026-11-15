@@ -125,6 +125,8 @@ Ontario's 2 million addresses build in about a minute on a 24-core machine, then
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 A build leaves out the OpenAddresses data sets whose licence forbids commercial use or serving them at all, judged by the licence each job states, and warns of each one.
 `open-geocode pack build --openaddresses-non-commercial` takes the non-commercial ones too, for a Pack used only for non-commercial purposes.
+`open-geocode pack build --timezones <file>` gives each result the timezone it lies in, from the timezone boundaries of [timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder): the GeoJSON file inside `timezones.geojson.zip` of a release, unpacked.
+They are derived from OpenStreetMap and under its licence, and an answer that names a timezone credits them.
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 

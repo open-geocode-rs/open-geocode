@@ -13,6 +13,7 @@ geocode_road_class
 geocode_lat
 geocode_lon
 geocode_bbox
+geocode_timezone
 geocode_address_housenumber
 geocode_address_unit
 geocode_address_street

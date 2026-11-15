@@ -69,6 +69,7 @@ mod tags;
 
 #[cfg(test)]
 mod test_pbf;
+mod timezone;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -95,7 +96,7 @@ use crate::{
         qrank::QRank,
         report::{
             BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, QRankReport, ReportInput,
-            ResumeReport, SlashNumberCounts, SorterReport, StageReport,
+            ResumeReport, SlashNumberCounts, SorterReport, StageReport, TimezoneReport,
         },
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
     },
@@ -142,6 +143,7 @@ use spill::{
     Body, Datasets, House, PendingAddress, PendingNamed, PendingRecord, PlacedAddress, Postcodes,
     WayKind,
 };
+use timezone::Timezones;
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -197,6 +199,9 @@ pub struct BuildOsmOptions {
     pub imported_rows: u64,
     /// QRank file (see [`crate::builder::qrank`]).
     pub qrank: Option<PathBuf>,
+    /// Timezone boundaries, the GeoJSON of timezone-boundary-builder. With
+    /// them a record carries the timezone it lies in.
+    pub timezones: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -215,6 +220,7 @@ impl Default for BuildOsmOptions {
             addresses: None,
             imported_rows: 0,
             qrank: None,
+            timezones: None,
         }
     }
 }
@@ -234,6 +240,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
             .field("qrank", &self.qrank)
+            .field("timezones", &self.timezones)
             .finish_non_exhaustive()
     }
 }
@@ -1700,6 +1707,22 @@ impl<'a> Run<'a> {
             Some(path) => Some(QRank::load(path, &self.memory)?),
             None => None,
         };
+        let zoning = match &self.options.timezones {
+            Some(path) => {
+                let zones = Timezones::load(path, &self.scratch)?;
+                let (areas, area_count) = index.timezones(&zones);
+                writer.set_timezones(zones.names().to_vec(), areas.clone());
+                Some(Zoning {
+                    zones,
+                    areas: areas.into_iter().collect(),
+                    area_count,
+                    by_area: AtomicU64::new(0),
+                    by_point: AtomicU64::new(0),
+                    without: AtomicU64::new(0),
+                })
+            }
+            None => None,
+        };
         let ranked_contexts = write_ordered(
             &mut writer,
             &mut sample,
@@ -1708,6 +1731,7 @@ impl<'a> Run<'a> {
             &index,
             None,
             qrank.as_ref(),
+            zoning.as_ref(),
             &self.progress,
             BuildStage::ContextRecords,
         )?;
@@ -1740,9 +1764,28 @@ impl<'a> Run<'a> {
             &index,
             Some(&books),
             qrank.as_ref(),
+            zoning.as_ref(),
             &self.progress,
             BuildStage::Records,
         )?;
+        if let (Some(path), Some(zoning)) = (&self.options.timezones, &zoning) {
+            let metadata = fs::metadata(path)?;
+            self.build.report.timezones = Some(TimezoneReport {
+                path: path.display().to_string(),
+                bytes: metadata.len(),
+                modified_unix: metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+                zones: zoning.zones.names().len() as u64,
+                areas: zoning.area_count,
+                areas_in_one_zone: zoning.areas.len() as u64,
+                records_zoned_by_area: zoning.by_area.load(Ordering::Relaxed),
+                records_zoned_by_point: zoning.by_point.load(Ordering::Relaxed),
+                records_without_zone: zoning.without.load(Ordering::Relaxed),
+            });
+        }
+        drop(zoning);
         if let (Some(path), Some(qrank)) = (&self.options.qrank, &qrank) {
             let metadata = fs::metadata(path)?;
             self.build.report.qrank = Some(QRankReport {
@@ -2971,6 +3014,43 @@ fn overlapped<T: Send>(
     })
 }
 
+/// The timezones of a build given timezone boundaries, and how each
+/// record came by its.
+struct Zoning {
+    zones: Timezones,
+    /// The zone of each area that lies wholly in one, by record id.
+    areas: HashMap<RecordId, u16>,
+    area_count: u64,
+    by_area: AtomicU64,
+    by_point: AtomicU64,
+    without: AtomicU64,
+}
+
+impl Zoning {
+    /// Gives `context` the zone at the record's point, unless an area of
+    /// its chain already says the zone. Every record of such an area reads
+    /// it from there, and the chain stays one for them all.
+    fn stamp(&self, record: &Record, context: &mut RecordContext) {
+        let chain = context.admin_context.entries();
+        let count = if chain
+            .iter()
+            .any(|entry| self.areas.contains_key(&entry.record_id))
+        {
+            &self.by_area
+        } else {
+            context.zone = record
+                .display_point()
+                .and_then(|point| self.zones.at(point));
+            if context.zone.is_some() {
+                &self.by_point
+            } else {
+                &self.without
+            }
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Write sorted records in batches, computing admin context in parallel, and
 /// offer each record to the parser's training sample under the country it
 /// lies in. Boundary and derived-country records describe context and get
@@ -2984,6 +3064,7 @@ fn write_ordered(
     index: &BoundaryIndex,
     book: Option<&AddressBook>,
     qrank: Option<&QRank>,
+    zoning: Option<&Zoning>,
     progress: &Progress,
     stage: BuildStage,
 ) -> Result<u64> {
@@ -3038,10 +3119,13 @@ fn write_ordered(
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
-                                let context: Option<RecordContext> = match origin {
+                                let mut context: Option<RecordContext> = match origin {
                                     Some(_) => None,
                                     None => located,
                                 };
+                                if let (Some(zoning), Some(context)) = (zoning, &mut context) {
+                                    zoning.stamp(&record, context);
+                                }
                                 ((record, context), country)
                             })
                             .unzip();
@@ -4971,7 +5055,7 @@ mod tests {
                         &[("addr:housenumber", "8"), ("addr:street", "Kadeweg")],
                     ),
                     // An island group over the antimeridian, drawn as OSM
-                    // draws one: a ring each side, meeting at 180.
+                    // draws one, a ring each side that meet at 180.
                     node(40, -17.0, 179.0, &[]),
                     node(41, -17.0, 180.0, &[]),
                     node(42, -16.0, 180.0, &[]),
@@ -5037,6 +5121,230 @@ mod tests {
         );
         assert_eq!(bbox("osm:node:30"), None);
         assert_eq!(bbox("osm:node:31"), None);
+    }
+
+    /// A town over the border of two zones with a suburb wholly in the
+    /// western one, a house in the suburb, one in the town either side of
+    /// the border, a cafe east of the town and a house in no zone.
+    fn town_in_two_zones(dir: &Path) -> (PathBuf, PathBuf) {
+        let input = dir.join("zones.osm.pbf");
+        let house = |id: i64, lat: f64, lon: f64| {
+            node(
+                id,
+                lat,
+                lon,
+                &[("addr:housenumber", "8"), ("addr:street", "Kadeweg")],
+            )
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.2, &[]),
+                    node(3, 52.1, 4.2, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(5, 52.02, 4.02, &[]),
+                    node(6, 52.02, 4.06, &[]),
+                    node(7, 52.06, 4.06, &[]),
+                    node(8, 52.06, 4.02, &[]),
+                    house(10, 52.04, 4.04),
+                    house(11, 52.08, 4.08),
+                    house(12, 52.05, 4.15),
+                    node(
+                        13,
+                        52.05,
+                        4.25,
+                        &[("name", "Cafe Oost"), ("amenity", "cafe")],
+                    ),
+                    house(14, 52.05, 4.5),
+                ],
+                vec![
+                    way(100, &[1, 2, 3, 4, 1], &[]),
+                    way(
+                        101,
+                        &[5, 6, 7, 8, 5],
+                        &[("place", "suburb"), ("name", "Westwijk")],
+                    ),
+                ],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Havenstad"),
+                    ],
+                )],
+            ],
+        );
+        let zones = dir.join("zones.json");
+        let zone = |tzid: &str, west: f64, east: f64| {
+            format!(
+                r#"{{"type":"Feature","properties":{{"tzid":"{tzid}"}},"geometry":{{"type":"Polygon","coordinates":[[[{west},51.9],[{east},51.9],[{east},52.2],[{west},52.2],[{west},51.9]]]}}}}"#
+            )
+        };
+        fs::write(
+            &zones,
+            format!(
+                r#"{{"type":"FeatureCollection","features":[{},{}]}}"#,
+                zone("Test/West", 3.9, 4.1),
+                zone("Test/East", 4.1, 4.3)
+            ),
+        )
+        .expect("zones");
+        (input, zones)
+    }
+
+    #[test]
+    fn a_built_record_answers_with_the_timezone_it_lies_in() {
+        let dir = temp_dir("timezones");
+        let (input, zones) = town_in_two_zones(&dir);
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            timezones: Some(zones.clone()),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let zoned = report.timezones.expect("the timezone file read");
+        assert_eq!(
+            (
+                zoned.path,
+                zoned.zones,
+                zoned.areas,
+                zoned.areas_in_one_zone
+            ),
+            (zones.display().to_string(), 2, 2, 1)
+        );
+        assert_eq!(
+            (
+                zoned.records_zoned_by_area,
+                zoned.records_zoned_by_point,
+                zoned.records_without_zone
+            ),
+            (1, 3, 1)
+        );
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let record = |id: &str| {
+            reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"))
+        };
+        let timezone = |id: &str| {
+            let record = record(id);
+            let zone = reader
+                .timezone(record)
+                .expect("timezone")
+                .map(str::to_string);
+            assert_eq!(
+                reader.record_summary(record).expect("summary").timezone,
+                zone
+            );
+            zone
+        };
+        // What the record's own chain stores, which is a zone only where
+        // no area of the chain says it.
+        let stamped = |id: &str| {
+            reader
+                .boundary_context(record(id))
+                .expect("context")
+                .and_then(|context| context.zone)
+        };
+        let (west, east) = (Some("Test/West".to_string()), Some("Test/East".to_string()));
+        assert_eq!(timezone("osm:way:101"), west, "a suburb in one zone");
+        assert_eq!(timezone("osm:relation:900"), None, "a town in two");
+        assert_eq!(
+            (timezone("osm:node:10"), stamped("osm:node:10")),
+            (west.clone(), None)
+        );
+        assert_eq!(
+            (timezone("osm:node:11"), stamped("osm:node:11")),
+            (west, Some(0))
+        );
+        assert_eq!(
+            (timezone("osm:node:12"), stamped("osm:node:12")),
+            (east.clone(), Some(1))
+        );
+        assert_eq!(
+            (timezone("osm:node:13"), stamped("osm:node:13")),
+            (east, Some(1))
+        );
+        assert_eq!(
+            (timezone("osm:node:14"), stamped("osm:node:14")),
+            (None, None)
+        );
+        assert_eq!(
+            reader
+                .boundary_context(record("osm:node:13"))
+                .expect("context"),
+            Some(RecordContext {
+                zone: Some(1),
+                ..RecordContext::default()
+            }),
+            "a zone alone is a context"
+        );
+    }
+
+    #[test]
+    fn a_build_given_no_timezones_or_a_bad_file_names_no_zone() {
+        let dir = temp_dir("no-timezones");
+        let (input, zones) = town_in_two_zones(&dir);
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.timezones, None);
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for id in [
+            "osm:way:101",
+            "osm:relation:900",
+            "osm:node:10",
+            "osm:node:13",
+        ] {
+            let record = reader.find_by_source_id(id).expect("lookup").expect(id);
+            assert_eq!(reader.timezone(record).expect("timezone"), None, "{id}");
+            assert_eq!(
+                reader.record_summary(record).expect("summary").timezone,
+                None,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            reader
+                .boundary_context(
+                    reader
+                        .find_by_source_id("osm:node:13")
+                        .expect("lookup")
+                        .expect("cafe")
+                )
+                .expect("context"),
+            None
+        );
+
+        fs::write(&zones, r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"tzid":"Test/Line"},"geometry":{"type":"LineString","coordinates":[[4.0,52.0],[4.1,52.0]]}}]}"#)
+            .expect("zones");
+        let error = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("bad"),
+            timezones: Some(zones.clone()),
+            ..BuildOsmOptions::default()
+        })
+        .expect_err("a file of lines");
+        assert_eq!(
+            error.to_string(),
+            Error::BadInput(format!(
+                "timezone file {} is not usable (zone Test/Line is a LineString, not a Polygon \
+                 or a MultiPolygon at line 1 column 164). It must be the GeoJSON of \
+                 timezone-boundary-builder, one feature per zone, each a Polygon or a \
+                 MultiPolygon with a `tzid` property",
+                zones.display()
+            ))
+            .to_string()
+        );
+        assert!(
+            Reader::open(dir.join("bad")).is_err(),
+            "nothing is published"
+        );
     }
 
     #[test]

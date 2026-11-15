@@ -2421,7 +2421,7 @@ mod router_tests {
         writer.finish().expect("finish");
     }
 
-    /// The box around a record is its own: every route that answers with
+    /// The box around a record is its own. Every route that answers with
     /// the record gives it, and a record that is only a point has none.
     #[tokio::test]
     async fn a_result_larger_than_a_point_carries_its_bbox_on_every_route() {
@@ -2538,6 +2538,260 @@ mod router_tests {
         );
         assert_eq!(rows[1]["geocode_bbox"], "");
 
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    /// A region and a town in it, each wholly in a zone, an area in none,
+    /// a house in the town, a house whose own point says its zone, and a
+    /// cafe in no zone.
+    fn write_zoned_pack(dir: &Path) {
+        use crate::context::{AdminContextTuple, RecordContext};
+        use crate::record::{PlaceLayer, PlaceRecord, PoiRecord, Record};
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let area = |layer, name: &str, id: i64, lon: f64| {
+            Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "admin_level:8".to_string(),
+                    geometry: point_geometry(lon, 43.5),
+                    source: SourceProvenance::osm(ObjectType::Relation, id),
+                    prominence: Default::default(),
+                    wikidata: None,
+                },
+            )
+        };
+        let house = |id: i64, street: &str, lon: f64| -> Record {
+            AddressRecord {
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: "10".to_string(),
+                    street: Some(street.to_string()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                geometry: point_geometry(lon, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, id),
+            }
+            .into()
+        };
+        let region = writer
+            .write(&area(PlaceLayer::Region, "Lakeland", 8, -79.6), None)
+            .expect("region");
+        let town = writer
+            .write(&area(PlaceLayer::Locality, "Portside", 7, -79.5), None)
+            .expect("town");
+        writer
+            .write(&area(PlaceLayer::Locality, "Borderton", 9, -79.4), None)
+            .expect("an area in two zones");
+        // The town's zone is read before the region's, as the most specific
+        // area of the chain says it.
+        writer
+            .write(
+                &house(1, "King Street", -79.0),
+                Some(RecordContext {
+                    admin_context: AdminContextTuple::from_tiers([
+                        (PlaceLayer::Region, region),
+                        (PlaceLayer::Locality, town),
+                    ]),
+                    flags: 0,
+                    zone: None,
+                }),
+            )
+            .expect("a house in the town");
+        writer
+            .write(
+                &house(2, "Queen Street", -79.1),
+                Some(RecordContext {
+                    zone: Some(2),
+                    ..RecordContext::default()
+                }),
+            )
+            .expect("a house zoned by its point");
+        writer
+            .write(
+                &PoiRecord {
+                    alt_names: Vec::new(),
+                    name: "Lantern Cafe".to_string(),
+                    category: "amenity:cafe".to_string(),
+                    address: None,
+                    geometry: point_geometry(-79.2, 43.0),
+                    location_precision: LocationPrecision::Point,
+                    source: SourceProvenance::osm(ObjectType::Node, 3),
+                    prominence: Default::default(),
+                    wikidata: None,
+                    brand: None,
+                    details: None,
+                    aliases: Vec::new(),
+                }
+                .into(),
+                None,
+            )
+            .expect("a cafe in no zone");
+        writer.set_timezones(
+            vec![
+                "America/Toronto".to_string(),
+                "America/Winnipeg".to_string(),
+                "America/Detroit".to_string(),
+            ],
+            vec![(region, 1), (town, 0)],
+        );
+        writer.finish().expect("finish");
+    }
+
+    /// A record's timezone is its own. Every route that answers with the
+    /// record gives it and credits the boundaries it is read from, and a
+    /// record in no zone has no such field and no such credit.
+    #[tokio::test]
+    async fn a_result_carries_its_timezone_on_every_route() {
+        let pack = temp_path("timezone");
+        write_zoned_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let osm = serde_json::json!({
+            "text": "© OpenStreetMap contributors",
+            "licence": "ODbL 1.0",
+            "url": "https://www.openstreetmap.org/copyright",
+        });
+        let boundaries = serde_json::json!({
+            "text": "Timezone boundaries © OpenStreetMap contributors",
+            "licence": "ODbL 1.0",
+            "url": "https://github.com/evansiroky/timezone-boundary-builder",
+        });
+        let zoned = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (
+                properties["id"].clone(),
+                properties.get("timezone").cloned(),
+                answer["geocoding"]["attribution"].clone(),
+            )
+        };
+        let within = |id: &str, zone: &str| {
+            (
+                serde_json::json!(id),
+                Some(serde_json::json!(zone)),
+                serde_json::json!([osm, boundaries]),
+            )
+        };
+        let without = |id: &str| (serde_json::json!(id), None, serde_json::json!([osm]));
+        let region = within("osm:relation:8", "America/Winnipeg");
+        let town = within("osm:relation:7", "America/Toronto");
+        let border = without("osm:relation:9");
+        let king = within("osm:node:1", "America/Toronto");
+        let queen = within("osm:node:2", "America/Detroit");
+        let cafe = without("osm:node:3");
+
+        for (uri, expected) in [
+            ("/geocode?q=10%20King%20Street", &king),
+            ("/geocode?q=10%20Queen%20Street", &queen),
+            ("/geocode?q=Portside", &town),
+            ("/geocode?q=Lakeland", &region),
+            ("/geocode?q=Borderton", &border),
+            ("/places?ids=osm:relation:7", &town),
+            ("/places?ids=osm:relation:9", &border),
+            ("/places?ids=osm:relation:8", &region),
+            ("/places?q=Lantern%20Cafe", &cafe),
+            ("/autocomplete?q=10%20King%20St", &king),
+            ("/autocomplete?q=Portsi", &town),
+            ("/autocomplete?q=Lantern", &cafe),
+            ("/reverse?lon=-79.0&lat=43.0", &king),
+            ("/reverse?lon=-79.1&lat=43.0", &queen),
+            ("/reverse?lon=-79.2&lat=43.0&layer=poi", &cafe),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            assert_eq!(&zoned(&reply.json()), expected, "{uri}");
+        }
+
+        for (route, body, expected) in [
+            (
+                "/geocode",
+                r#"[{"q": "10 King Street"}, {"q": "Borderton"}]"#,
+                [&king, &border],
+            ),
+            (
+                "/places",
+                r#"[{"ids": "osm:relation:8"}, {"q": "Lantern Cafe"}]"#,
+                [&region, &cafe],
+            ),
+            (
+                "/reverse",
+                r#"[{"lon": -79.0, "lat": 43.0},
+                    {"lon": -79.2, "lat": 43.0, "layer": "poi"}]"#,
+                [&king, &cafe],
+            ),
+        ] {
+            for method in ["POST", "QUERY"] {
+                let reply = send(router.clone(), batch_request(method, route, body)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{method} {route}");
+                let results = reply.json()["results"].clone();
+                for (item, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        &zoned(&results[item]["response"]),
+                        expected,
+                        "{method} {route} item {item}"
+                    );
+                }
+            }
+        }
+
+        let rows = "{\"lon\": -79.1, \"lat\": 43.0}\n\
+                    {\"lon\": -79.2, \"lat\": 43.0, \"layer\": \"poi\"}\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", rows),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(zoned(&lines[0]["response"]), queen);
+        assert_eq!(zoned(&lines[1]["response"]), cafe);
+
+        let reply = send(
+            router.clone(),
+            upload(
+                "/jobs?endpoint=geocode",
+                "text/csv",
+                "address\n10 King Street\nBorderton\n",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let rows = csv_rows(&reply.body);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["geocode_timezone"], "America/Toronto");
+        assert_eq!(rows[1]["geocode_timezone"], "");
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+
+        // A Pack built without timezone boundaries names no zone.
+        let pack = temp_path("no-timezone");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        for uri in [
+            "/geocode?q=10%20King%20Street%2C%20Toronto",
+            "/reverse?lon=-79.0&lat=43.0",
+            "/autocomplete?q=10%20King%20St",
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(zoned(&reply.json()), without("osm:node:1"), "{uri}");
+        }
         let _ = std::fs::remove_dir_all(&pack);
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }

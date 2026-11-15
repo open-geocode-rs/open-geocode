@@ -73,6 +73,26 @@ pub struct BuilderReport {
     pub resumes: Vec<ResumeReport>,
     #[serde(default)]
     pub qrank: Option<QRankReport>,
+    #[serde(default)]
+    pub timezones: Option<TimezoneReport>,
+}
+
+// Traces a Pack's timezones to the file, and says how each record got its.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TimezoneReport {
+    pub path: String,
+    pub bytes: u64,
+    pub modified_unix: u64,
+    pub zones: u64,
+    pub areas: u64,
+    /// Areas that lie wholly in one zone, which their records read it from.
+    pub areas_in_one_zone: u64,
+    /// Records in such an area.
+    pub records_zoned_by_area: u64,
+    /// Records in no such area, given the zone at their own point.
+    pub records_zoned_by_point: u64,
+    /// Records in no such area whose point lies in no zone, or in two.
+    pub records_without_zone: u64,
 }
 
 // Traces a Pack's importances to the file.

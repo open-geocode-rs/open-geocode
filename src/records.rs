@@ -154,8 +154,9 @@ const TAG_LAYER_MASK: u8 = 0x0f;
 const TAG_CENTROID: u8 = 0x10;
 const TAG_LINE: u8 = 0x20;
 const TAG_SOURCE_SHIFT: u8 = 6;
-/// Bit of a POI's details byte, past its four strings: its extent follows
-/// them, each side as a zigzag varint from the record's point.
+/// Bit of a POI's details byte, past its four strings. When set, its
+/// extent follows them, each side as a zigzag varint from the record's
+/// point.
 const POI_EXTENT: u8 = 1 << 4;
 const NUMBER_TEXT: u64 = 1;
 const NUMBER_UNIT: u64 = 2;
@@ -200,11 +201,15 @@ pub struct Summary {
     pub contact: Option<Contact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opening_hours: Option<String>,
-    /// The box around a record larger than a point, as [`bbox`] writes it:
-    /// a street's line, or the outline a POI is drawn with. An area's is
-    /// the Pack's to add, which holds it beside the record.
+    /// The box around a record larger than a point, as [`bbox`] writes it.
+    /// It holds a street's line, or the outline a POI is drawn with. An
+    /// area's is the Pack's to add, which holds it beside the record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bbox: Option<[f64; 4]>,
+    /// The IANA name of the timezone the record lies in, which the Pack
+    /// adds, as it holds the zones beside the records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<Point>,
     pub source: Source,
@@ -1411,6 +1416,7 @@ impl Reader {
             contact,
             opening_hours,
             bbox: extent.map(bbox),
+            timezone: None,
             point: Some(header.point()),
             source,
         })
@@ -2611,7 +2617,7 @@ pub(crate) fn dequantize(value: i32) -> f64 {
     value as f64 / COORDINATE_SCALE
 }
 
-/// An extent as an answer gives it: west, south, east and north in degrees.
+/// An extent as an answer gives it, in degrees.
 pub(crate) fn bbox(extent: Extent) -> [f64; 4] {
     extent.map(dequantize)
 }

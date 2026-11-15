@@ -208,6 +208,15 @@ enum PackCommand {
         /// by their tags alone.
         #[arg(long, value_name = "PATH")]
         qrank: Option<PathBuf>,
+
+        /// Give each result the timezone it lies in, from the timezone
+        /// boundaries of timezone-boundary-builder. That is the GeoJSON
+        /// file inside `timezones.geojson.zip` of a release at
+        /// https://github.com/evansiroky/timezone-boundary-builder,
+        /// unpacked. It is derived from OpenStreetMap, under the same
+        /// licence. Without one, no result has a timezone.
+        #[arg(long, value_name = "PATH")]
+        timezones: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -612,6 +621,7 @@ async fn main() -> Result<()> {
             openaddresses_non_commercial,
             address_files,
             qrank,
+            timezones,
         }) => {
             resources::opt_out_of_power_throttling();
             resources::yield_to_interactive_programs();
@@ -627,6 +637,7 @@ async fn main() -> Result<()> {
                 pack,
                 addresses,
                 qrank,
+                timezones,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()

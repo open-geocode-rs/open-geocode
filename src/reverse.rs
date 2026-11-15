@@ -718,6 +718,7 @@ mod tests {
                         locality_id,
                     )]),
                     flags: 0,
+                    zone: None,
                 }),
             )
             .expect("address");
