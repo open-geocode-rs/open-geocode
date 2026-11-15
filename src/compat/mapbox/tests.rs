@@ -848,6 +848,8 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         source: Source {
             dataset: "osm".to_string(),
         },
+        translations: None,
+        record_id: None,
     }
 }
 

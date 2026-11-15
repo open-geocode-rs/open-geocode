@@ -14,7 +14,7 @@
 //! ([`flat_columns`]), so a CSV row and a JSON answer never drift apart
 //! either.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -218,6 +218,15 @@ pub struct Common {
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     pub source: Source,
+    /// The result's name in each further language `lang` asks for, by the
+    /// code as asked. Present only when `lang` names more than one language
+    /// and the result has a name in at least one of the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!({"de": "Genf"}))]
+    pub translations: Option<BTreeMap<String, String>>,
+    /// The record behind the result, for the names `lang` asks for.
+    #[serde(skip)]
+    pub record_id: Option<RecordId>,
 }
 
 /// Properties of a forward geocoding result.
@@ -507,6 +516,15 @@ pub struct ContextArea {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "NZ")]
     pub code: Option<String>,
+    /// The area's name in each further language `lang` asks for, by the
+    /// code as asked. Present only when `lang` names more than one language
+    /// and the area has a name in at least one of the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!({"de": "Genf"}))]
+    pub translations: Option<BTreeMap<String, String>>,
+    /// The area's record, for the names `lang` asks for.
+    #[serde(skip)]
+    pub record_id: RecordId,
 }
 
 impl Point {
@@ -616,6 +634,8 @@ impl<'a> Contexts<'a> {
                     .country_code(record_id)
                     .map(|code| code.as_str().to_string())
                     .or_else(|| self.pack.subdivision_code(record_id).map(str::to_string)),
+                translations: None,
+                record_id,
             });
         self.areas.insert(record_id, area.clone());
         Ok(area)
@@ -649,6 +669,133 @@ pub fn forward_collection(
         },
         features,
     })
+}
+
+/// The languages a request asks names in, which `lang` gives as
+/// comma-separated language codes, such as `fr,de`. The first names each
+/// result and area, and the others give their `translations`. Repeats
+/// count once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Languages(Vec<String>);
+
+impl Languages {
+    /// Reads `lang`. A language code is two or three letters, then optional
+    /// subtags of letters and digits, such as `de`, `zh-Hant` or `pt-BR`.
+    /// `Err` names the first code that is not one.
+    pub fn parse(lang: &str) -> std::result::Result<Self, String> {
+        let mut codes = Vec::<String>::new();
+        for code in lang
+            .split(',')
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+        {
+            if !is_language_code(code) {
+                return Err(code.to_string());
+            }
+            if !codes.iter().any(|known| known.eq_ignore_ascii_case(code)) {
+                codes.push(code.to_string());
+            }
+        }
+        Ok(Self(codes))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn codes(&self) -> &[String] {
+        &self.0
+    }
+}
+
+fn is_language_code(code: &str) -> bool {
+    let mut parts = code.split(['-', '_']);
+    let language = parts.next().unwrap_or_default();
+    (2..=3).contains(&language.len())
+        && language.bytes().all(|byte| byte.is_ascii_alphabetic())
+        && parts.all(|part| {
+            !part.is_empty()
+                && part.len() <= 8
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+/// Names a result or area in `languages`. The first gives `name`, or the
+/// local name stays when it has none in that language. Each other one it
+/// has a name in goes into `translations`.
+fn localize_names(
+    pack: &Reader,
+    record_id: RecordId,
+    languages: &Languages,
+    name: &mut String,
+    translations: &mut Option<BTreeMap<String, String>>,
+) {
+    let Some((first, others)) = languages.codes().split_first() else {
+        return;
+    };
+    if let Some(local) = pack.language_name(record_id, first) {
+        local.clone_into(name);
+    }
+    let found = others
+        .iter()
+        .filter_map(|code| {
+            Some((
+                code.clone(),
+                pack.language_name(record_id, code)?.to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    *translations = (!found.is_empty()).then_some(found);
+}
+
+fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) {
+    if let Some(record_id) = common.record_id {
+        localize_names(
+            pack,
+            record_id,
+            languages,
+            &mut common.name,
+            &mut common.translations,
+        );
+    }
+    let context = &mut common.context;
+    for area in [
+        &mut context.neighbourhood,
+        &mut context.sublocality,
+        &mut context.locality,
+        &mut context.subdistrict,
+        &mut context.district,
+        &mut context.subregion,
+        &mut context.region,
+        &mut context.country,
+        &mut context.place,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        localize_names(
+            pack,
+            area.record_id,
+            languages,
+            &mut area.name,
+            &mut area.translations,
+        );
+    }
+}
+
+/// Names every result and context area of a forward answer in the
+/// languages `lang` asked for.
+pub fn localize_forward(pack: &Reader, collection: &mut ForwardCollection, languages: &Languages) {
+    for feature in &mut collection.features {
+        localize_common(pack, &mut feature.properties.common, languages);
+    }
+}
+
+/// [`localize_forward`] for a reverse answer.
+pub fn localize_reverse(pack: &Reader, collection: &mut ReverseCollection, languages: &Languages) {
+    for feature in &mut collection.features {
+        localize_common(pack, &mut feature.properties.common, languages);
+    }
 }
 
 /// Sets each result's distance from `focus`, when the request gave one.
@@ -857,6 +1004,8 @@ fn common(
         source: Source {
             dataset: summary.source.dataset,
         },
+        translations: None,
+        record_id: Some(record_id),
     })
 }
 

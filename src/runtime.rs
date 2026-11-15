@@ -202,6 +202,8 @@ pub(crate) struct PlacesParams {
     country: Param,
     focus: Param,
     bbox: Param,
+    /// See [`parse_lang`].
+    lang: Param,
 }
 
 /// `/autocomplete`: unlike `/places`, an empty `q` answers no suggestions
@@ -221,6 +223,8 @@ pub(crate) struct AutocompleteParams {
     focus: Param,
     /// `min_lon,min_lat,max_lon,max_lat`; see [`bounds::parse_bbox`].
     bbox: Param,
+    /// See [`parse_lang`].
+    lang: Param,
 }
 
 /// Resolve the `layer` filter, rejecting a layer that does not exist.
@@ -305,6 +309,8 @@ pub(crate) struct GeocodeParams {
     layer: Param,
     /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
     country: Param,
+    /// See [`parse_lang`].
+    lang: Param,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +319,31 @@ pub(crate) struct ReverseParams {
     lat: f64,
     /// See [`parse_layer`].
     layer: Param,
+    /// See [`parse_lang`].
+    lang: Param,
+}
+
+/// Resolve `lang`, the comma-separated language codes to name results in,
+/// such as `fr,de`. A malformed code is a 400 naming it, like an unknown `layer`.
+/// An empty value means local names, as no `lang` does.
+fn parse_lang(lang: &Param) -> Result<api::Languages, Problem> {
+    let value = match lang {
+        Param::Missing | Param::Empty => return Ok(api::Languages::default()),
+        Param::Value(value) => value,
+    };
+    api::Languages::parse(value).map_err(|code| {
+        Problem::malformed_parameter(format!(
+            "lang {code:?} is not a language code, such as de or zh-Hant"
+        ))
+        .with_invalid_params(vec![InvalidParam::new("lang", "not a language code")])
+    })
+}
+
+/// A lookup's checked request and the languages its answer is named in.
+#[derive(Debug, Clone)]
+pub(crate) struct Named<R> {
+    pub(crate) request: R,
+    languages: api::Languages,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -614,6 +645,13 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "4.73,52.28,5.07,52.43"),
+        ("lang" = Option<String>, Query,
+         description = "Languages to name results and their areas in, as \
+                        comma-separated language codes. The first names each \
+                        result and area, falling back to its local name; each \
+                        other one goes into `translations` where a name in it \
+                        exists. A malformed code returns `400`.",
+         example = "fr,de"),
     ),
     responses(
         (status = 200, description = "Matching places, highest `score` first.",
@@ -638,9 +676,9 @@ pub(crate) async fn places(
     params: Result<Query<PlacesParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-    let request = places_request(&state, params)?;
+    let request = (PLACES.prepare)(&state, params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || places_answer(&worker, request)).await?;
+    let collection = lookup(&state, move || (PLACES.answer)(&worker, request)).await?;
     Ok(Json(collection))
 }
 
@@ -711,12 +749,22 @@ pub(crate) async fn places_batch(State(state): State<AppState>, request: Request
 /// `/places` as a batch item, in `QUERY /places`. Not a `/jobs` endpoint: a
 /// job is a file of addresses or points too long for one request, and one
 /// batch already holds a saved-place list, ids and names alike.
-pub(crate) const PLACES: Lookup<PlacesParams, PlacesRequest, ForwardCollection, String> = Lookup {
-    route: "/places",
-    prepare: places_request,
-    place: places_place,
-    answer: places_answer,
-};
+pub(crate) const PLACES: Lookup<PlacesParams, Named<PlacesRequest>, ForwardCollection, String> =
+    Lookup {
+        route: "/places",
+        prepare: |state, params| {
+            Ok(Named {
+                languages: parse_lang(&params.lang)?,
+                request: places_request(state, params)?,
+            })
+        },
+        place: |named| places_place(&named.request),
+        answer: |state, named| {
+            let mut collection = places_answer(state, named.request)?;
+            api::localize_forward(&state.pack, &mut collection, &named.languages);
+            Ok(collection)
+        },
+    };
 
 #[derive(Clone)]
 pub(crate) enum PlacesRequest {
@@ -910,6 +958,13 @@ fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
+        ("lang" = Option<String>, Query,
+         description = "Languages to name results and their areas in, as \
+                        comma-separated language codes. The first names each \
+                        result and area, falling back to its local name; each \
+                        other one goes into `translations` where a name in it \
+                        exists. A malformed code returns `400`.",
+         example = "fr,de"),
     ),
     responses(
         (status = 200, description = "Suggested results, best first.",
@@ -936,6 +991,7 @@ pub(crate) async fn autocomplete(
         Param::Value(q) => bounds::validate_query_length(q)?,
     };
     bounds::validate_autocomplete_limit(params.limit)?;
+    let languages = parse_lang(&params.lang)?;
     let layer = parse_layer(&params.layer)?;
     let countries = parse_countries(&params.country)?;
     let focus = bounds::parse_focus(&params.focus)?;
@@ -964,6 +1020,7 @@ pub(crate) async fn autocomplete(
         };
         let mut collection = api::forward_collection(&worker.pack, query, hits)?;
         api::measure_from(&mut collection, focus);
+        api::localize_forward(&worker.pack, &mut collection, &languages);
         Ok(collection)
     })
     .await?;
@@ -1163,6 +1220,13 @@ fn place_named(
                         returns `400`. A code the Pack does not cover returns no \
                         results.",
          example = "NZ,AU"),
+        ("lang" = Option<String>, Query,
+         description = "Languages to name results and their areas in, as \
+                        comma-separated language codes. The first names each \
+                        result and area, falling back to its local name; each \
+                        other one goes into `translations` where a name in it \
+                        exists. A malformed code returns `400`.",
+         example = "fr,de"),
     ),
     responses(
         (status = 200,
@@ -1183,9 +1247,9 @@ pub(crate) async fn geocode(
     params: Result<Query<GeocodeParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-    let options = geocode_request(&state, params)?;
+    let request = (GEOCODE.prepare)(&state, params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || geocode_answer(&worker, options)).await?;
+    let collection = lookup(&state, move || (GEOCODE.answer)(&worker, request)).await?;
     Ok(Json(collection))
 }
 
@@ -1262,13 +1326,26 @@ pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/geocode` as a batch item, in `QUERY /geocode` and in `/jobs`.
-pub(crate) const GEOCODE: Lookup<GeocodeParams, GeocodeRequest, ForwardCollection, [String; 3]> =
-    Lookup {
-        route: "/geocode",
-        prepare: geocode_request,
-        place: geocode_place,
-        answer: geocode_answer,
-    };
+pub(crate) const GEOCODE: Lookup<
+    GeocodeParams,
+    Named<GeocodeRequest>,
+    ForwardCollection,
+    [String; 3],
+> = Lookup {
+    route: "/geocode",
+    prepare: |state, params| {
+        Ok(Named {
+            languages: parse_lang(&params.lang)?,
+            request: geocode_request(state, params)?,
+        })
+    },
+    place: |named| geocode_place(&named.request),
+    answer: |state, named| {
+        let mut collection = geocode_answer(state, named.request)?;
+        api::localize_forward(&state.pack, &mut collection, &named.languages);
+        Ok(collection)
+    },
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum GeocodeRequest {
@@ -1396,6 +1473,13 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
          description = "Return only the nearest result of this layer, or for an area \
                         layer the area of that layer the point lies in, and no other \
                         area. An unknown layer returns `400`."),
+        ("lang" = Option<String>, Query,
+         description = "Languages to name results and their areas in, as \
+                        comma-separated language codes. The first names each \
+                        result and area, falling back to its local name; each \
+                        other one goes into `translations` where a name in it \
+                        exists. A malformed code returns `400`.",
+         example = "fr,de"),
     ),
     responses(
         (status = 200, description = "Results at the point, most precise first. \
@@ -1413,9 +1497,9 @@ pub(crate) async fn reverse(
     params: Result<Query<ReverseParams>, QueryRejection>,
 ) -> Result<Json<ReverseCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
-    let options = reverse_request(&state, params)?;
+    let request = (REVERSE.prepare)(&state, params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || reverse_answer(&worker, options)).await?;
+    let collection = lookup(&state, move || (REVERSE.answer)(&worker, request)).await?;
     Ok(Json(collection))
 }
 
@@ -1470,16 +1554,31 @@ pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
-pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollection, u64> = Lookup {
-    route: "/reverse",
-    prepare: reverse_request,
-    place: reverse_place,
-    answer: reverse_answer,
-};
+pub(crate) const REVERSE: Lookup<ReverseParams, Named<GeocodeOptions>, ReverseCollection, u64> =
+    Lookup {
+        route: "/reverse",
+        prepare: |state, params| {
+            Ok(Named {
+                languages: parse_lang(&params.lang)?,
+                request: reverse_request(state, params)?,
+            })
+        },
+        place: |named| reverse_place(&named.request),
+        answer: |state, named| {
+            let mut collection = reverse_answer(state, named.request)?;
+            api::localize_reverse(&state.pack, &mut collection, &named.languages);
+            Ok(collection)
+        },
+    };
 
 /// `/reverse`'s parameters, checked.
 fn reverse_request(_: &AppState, params: ReverseParams) -> Result<GeocodeOptions, Problem> {
-    let ReverseParams { lon, lat, layer } = params;
+    let ReverseParams {
+        lon,
+        lat,
+        layer,
+        lang: _,
+    } = params;
     bounds::validate_coords(lon, lat)?;
     Ok(GeocodeOptions {
         lon,
@@ -3350,10 +3449,11 @@ mod router_tests {
                     ("postcode", "M5V 1A1"),
                     ("layer", "address"),
                     ("country", "CA"),
+                    ("lang", "fr,de"),
                 ],
                 modes: &["q", "address", "locality", "region", "postcode"],
                 empty_is_missing: &[
-                    "focus", "bbox", "locality", "region", "postcode", "layer", "country",
+                    "focus", "bbox", "locality", "region", "postcode", "layer", "country", "lang",
                 ],
                 expect: |sent| {
                     let fields = ["address", "locality", "region", "postcode"]
@@ -3382,9 +3482,10 @@ mod router_tests {
                     ("country", "CA"),
                     ("focus", "-79,43"),
                     ("bbox", "-80,42,-78,44"),
+                    ("lang", "fr,de"),
                 ],
                 modes: &["q", "ids"],
-                empty_is_missing: &["country", "focus", "bbox"],
+                empty_is_missing: &["country", "focus", "bbox", "lang"],
                 expect: |sent| match (sent["q"], sent["ids"]) {
                     (Sent::Missing, Sent::Missing) => Expect::Problem {
                         error_code: "invalid_query",
@@ -3413,9 +3514,10 @@ mod router_tests {
                     ("layer", "address"),
                     ("focus", "-79,43"),
                     ("bbox", "-80,42,-78,44"),
+                    ("lang", "fr,de"),
                 ],
                 modes: &["q"],
-                empty_is_missing: &["q", "country", "layer", "focus", "bbox"],
+                empty_is_missing: &["q", "country", "layer", "focus", "bbox", "lang"],
                 expect: |_| Expect::Answer,
             },
             Rules {
@@ -3423,9 +3525,9 @@ mod router_tests {
                 batchable: true,
                 fields: field_names::<ReverseParams>(),
                 fixed: &[("lon", "-79"), ("lat", "43")],
-                filled: &[("layer", "address")],
+                filled: &[("layer", "address"), ("lang", "fr,de")],
                 modes: &["layer"],
-                empty_is_missing: &["layer"],
+                empty_is_missing: &["layer", "lang"],
                 expect: |_| Expect::Answer,
             },
         ]
