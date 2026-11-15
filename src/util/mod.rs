@@ -8,5 +8,7 @@ pub(crate) mod codec;
 pub(crate) mod fold;
 pub(crate) mod geo;
 pub(crate) mod hilbert;
+#[cfg(test)]
+pub(crate) mod temp;
 pub(crate) mod text;
 pub(crate) mod transliterate;

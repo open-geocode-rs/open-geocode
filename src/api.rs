@@ -19,6 +19,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::{
+    enclosing::AreaTags,
     labels,
     pack::{Reader, RecordId, Summary},
     record::{
@@ -215,6 +216,17 @@ pub struct Common {
     /// Administrative areas containing the result.
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
+    /// Every area the result lies in, with its OSM tags: those of `context`
+    /// and those that lost their tier, such as a `place=city` area beside the
+    /// `admin_level=8` district that holds the locality. Present only with
+    /// `enclosing=true`.
+    ///
+    /// Ordered by the size of each area's outline, smallest first, which does
+    /// not prove that each lies in the next. Areas of equal size go by OSM
+    /// object type (relations, then ways, then nodes) and id. A country the
+    /// Pack derived from its regions comes last.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub enclosing: Vec<EnclosingArea>,
     pub source: Source,
 }
 
@@ -423,6 +435,17 @@ pub struct ContextArea {
     pub name: String,
 }
 
+/// An area a result lies in, as `enclosing` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct EnclosingArea {
+    /// Stable ID of the area, as in `context`.
+    pub id: String,
+    pub name: String,
+    /// Absent for an area with none, such as a country derived from regions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<AreaTags>,
+}
+
 impl Point {
     fn new(lon: f64, lat: f64) -> Self {
         Self {
@@ -482,13 +505,15 @@ impl ReverseFeature {
 pub struct Contexts<'a> {
     pack: &'a Reader,
     areas: HashMap<RecordId, Option<ContextArea>>,
+    enclosing: bool,
 }
 
 impl<'a> Contexts<'a> {
-    pub fn new(pack: &'a Reader) -> Self {
+    pub fn new(pack: &'a Reader, enclosing: bool) -> Self {
         Self {
             pack,
             areas: HashMap::new(),
+            enclosing,
         }
     }
 
@@ -510,6 +535,26 @@ impl<'a> Contexts<'a> {
             country: self.area(tuple.get(PlaceLayer::Country))?,
             place: self.area(tuple.get(PlaceLayer::Place))?,
         })
+    }
+
+    pub fn enclosing_of(&mut self, record_id: RecordId) -> Result<Vec<EnclosingArea>> {
+        if !self.enclosing {
+            return Ok(Vec::new());
+        }
+        let mut areas = Vec::new();
+        for area in self.pack.enclosing_areas(record_id)? {
+            let named = self.area(Some(area))?.ok_or_else(|| {
+                Error::Inconsistent(format!(
+                    "enclosing area {area} of record {record_id} is not an area record"
+                ))
+            })?;
+            areas.push(EnclosingArea {
+                id: named.id,
+                name: named.name,
+                tags: self.pack.area_tags(area)?,
+            });
+        }
+        Ok(areas)
     }
 
     fn area(&mut self, record_id: Option<RecordId>) -> Result<Option<ContextArea>> {
@@ -537,8 +582,9 @@ pub fn forward_collection(
     pack: &Reader,
     query: String,
     hits: Vec<TextSearchHit>,
+    enclosing: bool,
 ) -> Result<ForwardCollection> {
-    let mut contexts = Contexts::new(pack);
+    let mut contexts = Contexts::new(pack, enclosing);
     let features = hits
         .into_iter()
         .map(|hit| forward_feature(&mut contexts, hit))
@@ -600,8 +646,12 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
 /// An estimated address states its house number only in its label, which
 /// reverse writes as `"{number} {street}, ..."`; the number is read back from
 /// there.
-pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<ReverseCollection> {
-    let mut contexts = Contexts::new(pack);
+pub fn reverse_collection(
+    pack: &Reader,
+    response: &GeocodeResponse,
+    enclosing: bool,
+) -> Result<ReverseCollection> {
+    let mut contexts = Contexts::new(pack, enclosing);
     let mut features = Vec::new();
     let mut primary_record_id = None;
     if let Some(result) = &response.result
@@ -749,6 +799,7 @@ fn common(
         brand: summary.brand,
         address: summary.address,
         context: contexts.of(record_id)?,
+        enclosing: contexts.enclosing_of(record_id)?,
         source: Source {
             dataset: summary.source.dataset,
         },
@@ -893,7 +944,7 @@ mod tests {
         let response = geocoder
             .reverse(reverse::GeocodeOptions::at(-58.38, -34.6))
             .expect("answer");
-        let collection = reverse_collection(&pack, &response).expect("collection");
+        let collection = reverse_collection(&pack, &response, false).expect("collection");
         let _ = std::fs::remove_dir_all(&dir);
         let credits = serde_json::to_value(&collection.geocoding.attribution).expect("json");
         assert_eq!(

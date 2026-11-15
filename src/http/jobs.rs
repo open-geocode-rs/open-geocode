@@ -45,10 +45,11 @@ use crate::{
         batch::{self, Item, Lookup, Prepared, RawItem},
         bounds::UPLOAD_STALL_SECONDS,
         openapi::{self, PROBLEM_JSON},
+        param::Param,
         problem::{InvalidParam, Problem},
         request_id::RequestId,
     },
-    runtime::{AppState, GEOCODE, REVERSE},
+    runtime::{AppState, GEOCODE, REVERSE, parse_enclosing},
 };
 
 /// The media types a job's file is read and written as.
@@ -724,6 +725,10 @@ pub(crate) struct JobQuery {
     /// Comma-separated ISO 3166-1 alpha-2 codes every row is limited to.
     #[param(example = "CA")]
     country: Option<String>,
+    /// List every area each result lies in, as `enclosing` does on `GET`. A
+    /// row of a JSONL upload may set its own. Refused for CSV results, which
+    /// have no column for the areas.
+    enclosing: Option<bool>,
 }
 
 /// Geocode a file
@@ -783,7 +788,8 @@ pub(crate) struct JobQuery {
          body = JobStatus,
          headers(("Location" = String, description = "The job."))),
         (status = 400, description = "The CSV has no header row or no column to look \
-                                      up, or a parameter is malformed.",
+                                      up, a parameter is malformed, or `enclosing=true` \
+                                      is asked of CSV results.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
         (status = 413, description = "The declared body is over the server's upload limit.",
          body = openapi::Problem, content_type = PROBLEM_JSON),
@@ -821,6 +827,16 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         ));
     }
     let plan = Plan::read(request.uri().query(), input)?;
+    // JSONL rows may unset the flag and CSV rows cannot, so only CSV input is
+    // refused here; a repeated flag is left to each row's parse.
+    let mut shared = plan.shared.iter().filter(|(name, _)| name == "enclosing");
+    if input == Format::Csv
+        && let (Some((_, value)), None) = (shared.next(), shared.next())
+        && parse_enclosing(&Param::Value(value.clone()))?
+        && output == Format::Csv
+    {
+        return Err(csv_enclosing());
+    }
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -915,6 +931,13 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         .headers_mut()
         .insert(header::CONTENT_LOCATION, results);
     Ok(response)
+}
+
+/// A CSV row has no column for a list of areas.
+fn csv_enclosing() -> Problem {
+    Problem::malformed_parameter(
+        "CSV results have no column for enclosing areas: ask for JSONL results (Accept: application/jsonl)",
+    )
 }
 
 /// `Prefer: respond-async` (RFC 7240): answer once the upload is in, with
@@ -1155,7 +1178,15 @@ impl Run {
             let mut groups = HashMap::<String, (K, Q, Vec<RowIn>)>::new();
             for (index, cells, item) in window {
                 let prepared = match item {
-                    Ok(item) => batch::prepare(&self.state, lookup, &self.shared, item),
+                    Ok(item) => {
+                        // The key is serialised, so a flag that is on is this pair.
+                        let refuse =
+                            |key: &str| match key.split('&').any(|pair| pair == "enclosing=true") {
+                                true if self.output == Format::Csv => Err(csv_enclosing()),
+                                _ => Ok(()),
+                            };
+                        batch::prepare(&self.state, lookup, &self.shared, item, &refuse)
+                    }
                     Err(problem) => Prepared::Failed { id: None, problem },
                 };
                 match prepared {

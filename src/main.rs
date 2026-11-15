@@ -1125,7 +1125,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
         bbox: None,
     })?;
     write_json(&serde_json::to_value(api::forward_collection(
-        &pack, query, hits,
+        &pack, query, hits, false,
     )?)?)
 }
 
@@ -1135,7 +1135,7 @@ fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
     let response = geocoder.reverse(reverse::GeocodeOptions::at(lon, lat))?;
     write_json(&serde_json::to_value(api::reverse_collection(
-        &pack, &response,
+        &pack, &response, false,
     )?)?)
 }
 

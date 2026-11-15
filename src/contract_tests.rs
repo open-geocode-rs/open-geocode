@@ -22,13 +22,15 @@ use crate::{
     batch,
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
-    pack::Writer,
+    enclosing::AreaTags,
+    pack::{RecordId, Writer},
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
         InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
         Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
+    util::temp::TempPath,
 };
 
 /// Set to write the live answers and columns over the committed files.
@@ -222,6 +224,23 @@ fn contract_pack() -> PathBuf {
     ));
     write_pack(&pack);
     pack
+}
+
+#[tokio::test]
+async fn enclosing_responses_match_the_committed_examples() {
+    let pack = TempPath::new("contract-enclosing");
+    write_enclosing_pack(&pack);
+    let state = AppState::open(
+        &pack,
+        &pack.with_extension("jobs"),
+        crate::limits::Limits::DEFAULT,
+    );
+    let router = build_router(state.expect("open pack"), None, None);
+
+    let geocode = get(&router, "/geocode?q=10%20King%20Street&enclosing=true").await;
+    assert_example("geocode-enclosing", &geocode);
+    let reverse = get(&router, "/reverse?lon=-79.0&lat=43.0&enclosing=true").await;
+    assert_example("reverse-enclosing", &reverse);
 }
 
 #[tokio::test]
@@ -865,10 +884,21 @@ async fn get(router: &Router, uri: &str) -> Value {
 
 /// Canada > Ontario > Toronto, an address, a POI with an address, a street
 /// and an interpolation range in Toronto.
-fn write_pack(dir: &PathBuf) {
+fn write_pack(dir: &Path) {
+    write_pack_with(dir, false);
+}
+
+/// [`write_pack`] with Metro Area, a `place=city` area that loses the
+/// locality tier to Toronto and lies around it. It is a record, which moves
+/// the scores of the examples, so it has a Pack of its own.
+pub(crate) fn write_enclosing_pack(dir: &Path) {
+    write_pack_with(dir, true);
+}
+
+fn write_pack_with(dir: &Path, metro: bool) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
-    let place = |writer: &mut Writer, layer, name: &str, id| {
+    let place = |writer: &mut Writer, layer, name: &str, id, enclosing: &[RecordId]| {
         writer
             .write(
                 &Record::Place(
@@ -883,13 +913,38 @@ fn write_pack(dir: &PathBuf) {
                         wikidata: None,
                     },
                 ),
-                None,
+                Some(RecordContext {
+                    enclosing: enclosing.to_vec(),
+                    ..Default::default()
+                }),
             )
             .expect("place")
     };
-    let country = place(&mut writer, PlaceLayer::Country, "Canada", 1);
-    let region = place(&mut writer, PlaceLayer::Region, "Ontario", 2);
-    let locality = place(&mut writer, PlaceLayer::Locality, "Toronto", 3);
+    let country = place(&mut writer, PlaceLayer::Country, "Canada", 1, &[]);
+    let region = place(&mut writer, PlaceLayer::Region, "Ontario", 2, &[country]);
+    let metro = metro.then(|| {
+        place(
+            &mut writer,
+            PlaceLayer::Locality,
+            "Metro Area",
+            4,
+            &[region, country],
+        )
+    });
+    let areas = [metro.as_slice(), &[region, country]].concat();
+    let locality = place(&mut writer, PlaceLayer::Locality, "Toronto", 3, &areas);
+    let tags = |level| AreaTags::of(None, Some("administrative"), Some(level));
+    let city = metro.map(|metro| (metro, AreaTags::of(Some("city"), None, None)));
+    writer.set_area_tags(
+        [
+            (country, tags("2")),
+            (region, tags("4")),
+            (locality, tags("8")),
+        ]
+        .into_iter()
+        .chain(city)
+        .collect(),
+    );
     // The country record's ISO code, as a build derives it from the boundary.
     // Without it no record carries a country and the `country` filter, which
     // matches on the code, would find nothing.
@@ -908,6 +963,7 @@ fn write_pack(dir: &PathBuf) {
             (PlaceLayer::Locality, locality),
         ]),
         flags: 0,
+        enclosing: [&[locality], &areas[..]].concat(),
     });
     let king = AddressComponents {
         areas: Vec::new(),
