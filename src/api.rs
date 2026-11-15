@@ -320,6 +320,30 @@ pub struct ForwardProperties {
     /// judges.
     #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
     pub matched: Option<QueryMatch>,
+    /// The parts of `label` the typed text matched, in order, none
+    /// overlapping. Present on `/autocomplete` results, the only ones found
+    /// by text still being typed. Absent when no typed word can be placed
+    /// in the label, as on a place suggested for its category.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Option<Vec<Highlight>>)]
+    pub highlights: Vec<Highlight>,
+}
+
+/// A range of a result's `label` that the typed text matched.
+///
+/// `start` and `end` count Unicode scalar values from the start of the
+/// label, `end` exclusive. They are not bytes and not UTF-16 code units, so
+/// a client converts them to the offsets its strings use.
+///
+/// Search matches typed words against the record, not against the label,
+/// so each typed word is placed by finding it again in the label, cut into
+/// words and folded as the index folds text. `elysee` marks `Élysée`. A
+/// word still being typed marks only the letters typed so far, and a word
+/// matched through a typo marks the whole label word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+pub struct Highlight {
+    pub start: usize,
+    pub end: usize,
 }
 
 /// How each address part a query states matched one result. A part the
@@ -969,6 +993,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         fallback: hit.fallback,
         distance_m: None,
         matched: (!hit.matched.is_empty()).then_some(hit.matched),
+        highlights: hit.highlights,
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }

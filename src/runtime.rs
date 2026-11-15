@@ -3528,6 +3528,60 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 
+    #[tokio::test]
+    async fn a_suggestion_carries_its_highlights_and_no_other_result_does() {
+        let pack = temp_path("highlights");
+        write_matched_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let highlights = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (
+                properties["label"].clone(),
+                properties.get("highlights").cloned(),
+            )
+        };
+        let range = |start: u64, end: u64| serde_json::json!({"start": start, "end": end});
+        let house = serde_json::json!("10 King Street West, M5H 1A1");
+        for (uri, expected) in [
+            (
+                "/autocomplete?q=10%20King%20St",
+                (
+                    house.clone(),
+                    Some(serde_json::json!([range(0, 2), range(3, 7), range(8, 10)])),
+                ),
+            ),
+            (
+                "/autocomplete?q=lant",
+                (
+                    serde_json::json!("Lantern Cafe, Toronto"),
+                    Some(serde_json::json!([range(0, 4)])),
+                ),
+            ),
+            (
+                "/autocomplete?q=lantern&layer=poi",
+                (
+                    serde_json::json!("Lantern Cafe, Toronto"),
+                    Some(serde_json::json!([range(0, 7)])),
+                ),
+            ),
+            ("/geocode?q=10%20King%20Street%20West", (house, None)),
+            (
+                "/places?q=Lantern%20Cafe",
+                (serde_json::json!("Lantern Cafe, Toronto"), None),
+            ),
+            (
+                "/places?ids=osm:node:5",
+                (serde_json::json!("Lantern Cafe, Toronto"), None),
+            ),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            assert_eq!(highlights(&reply.json()), expected, "{uri}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
     /// A CSV comes back as it went, each row with `geocode batch`'s columns
     /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]
