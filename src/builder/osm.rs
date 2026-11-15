@@ -1130,6 +1130,12 @@ impl<'a> Run<'a> {
                 }
                 part.extend(
                     assembled
+                        .entrances
+                        .into_iter()
+                        .map(|(node, kind)| GeometryItem::Entrance(node, kind)),
+                );
+                part.extend(
+                    assembled
                         .output
                         .boundary_ways
                         .into_iter()
@@ -1189,6 +1195,9 @@ impl<'a> Run<'a> {
         let mut line_at = Vec::<(i64, u32, u32)>::new();
         let mut ways = Vec::new();
         let mut way_vertices = 0;
+        // The entrance nodes on the member ways, for the places relations
+        // draw.
+        let mut entrances = HashMap::new();
         for part in &self.geometry_saved {
             for item in part.reader()? {
                 let (way_id, line) = match item? {
@@ -1212,6 +1221,10 @@ impl<'a> Run<'a> {
                         (way_id, Some(vertices))
                     }
                     GeometryItem::Member(way_id, line) => (way_id, line),
+                    GeometryItem::Entrance(node, kind) => {
+                        entrances.insert(node, kind);
+                        continue;
+                    }
                     GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
                 };
                 let vertices = line.as_ref().map_or(0, Vec::len);
@@ -1270,7 +1283,7 @@ impl<'a> Run<'a> {
         }
         self.progress.check()?;
         let mut places = Emitted::default();
-        for candidate in boundary::place_relations(&relations, member_line)? {
+        for candidate in boundary::place_relations(&relations, member_line, &entrances)? {
             poi::emit_poi(&candidate, &mut places);
         }
         self.build.absorb(places)?;
@@ -2861,8 +2874,8 @@ impl Geometry {
                     self.boundary_feature_ids.insert(way_id);
                 }
                 // Their vertices stay on disk, in the input's spool, until
-                // the boundary stage reads them.
-                GeometryItem::Way(_) | GeometryItem::Member(..) => {}
+                // the boundary stage reads them, as the entrances do.
+                GeometryItem::Way(_) | GeometryItem::Member(..) | GeometryItem::Entrance(..) => {}
             }
         }
         Ok(())
@@ -5419,6 +5432,181 @@ mod tests {
             Reader::open(dir.join("bad")).is_err(),
             "nothing is published"
         );
+    }
+
+    /// A house and a theatre drawn as buildings and a school drawn as a
+    /// multipolygon, each with entrances on its outline, a house and a cafe
+    /// mapped on an entrance node, and a house and a hall with none.
+    fn buildings_with_entrances() -> Vec<Vec<TestElement>> {
+        let house =
+            |number: &'static str| [("addr:housenumber", number), ("addr:street", "Kadeweg")];
+        vec![
+            vec![
+                node(1, 52.0000, 4.0000, &[("entrance", "main")]),
+                node(2, 52.0000, 4.0004, &[]),
+                node(3, 52.0003, 4.0004, &[("entrance", "service")]),
+                // The tag says nothing, so the node is no entrance.
+                node(4, 52.0003, 4.0000, &[("entrance", " ")]),
+                node(10, 52.0010, 4.0010, &[("entrance", "yes")]),
+                node(11, 52.0010, 4.0014, &[]),
+                node(12, 52.0013, 4.0014, &[]),
+                node(13, 52.0013, 4.0010, &[]),
+                node(
+                    20,
+                    52.0020,
+                    4.0020,
+                    &[
+                        ("addr:housenumber", "8"),
+                        ("addr:street", "Kadeweg"),
+                        ("entrance", "main"),
+                    ],
+                ),
+                node(21, 52.0021, 4.0021, &house("9")),
+                node(
+                    22,
+                    52.0022,
+                    4.0022,
+                    &[
+                        ("name", "Cafe Deur"),
+                        ("amenity", "cafe"),
+                        ("entrance", "staircase"),
+                    ],
+                ),
+                node(30, 52.0030, 4.0030, &[]),
+                node(31, 52.0030, 4.0040, &[("entrance", "main")]),
+                node(32, 52.0040, 4.0040, &[]),
+                node(33, 52.0040, 4.0030, &[]),
+                node(34, 52.0033, 4.0033, &[]),
+                node(35, 52.0033, 4.0037, &[("entrance", "emergency")]),
+                node(36, 52.0037, 4.0037, &[]),
+                node(37, 52.0037, 4.0033, &[]),
+                node(40, 52.0050, 4.0050, &[]),
+                node(41, 52.0050, 4.0054, &[]),
+                node(42, 52.0053, 4.0054, &[]),
+                node(43, 52.0053, 4.0050, &[]),
+            ],
+            vec![
+                way(
+                    100,
+                    &[1, 2, 3, 4, 1],
+                    &[
+                        ("building", "yes"),
+                        ("addr:housenumber", "5"),
+                        ("addr:street", "Kadeweg"),
+                    ],
+                ),
+                way(
+                    101,
+                    &[10, 11, 12, 13, 10],
+                    &[("name", "Havenhal"), ("amenity", "theatre")],
+                ),
+                way(102, &[30, 31, 32], &[]),
+                way(103, &[32, 33, 30], &[]),
+                way(104, &[34, 35, 36, 37, 34], &[]),
+                way(
+                    105,
+                    &[40, 41, 42, 43, 40],
+                    &[("name", "Lege Hal"), ("amenity", "theatre")],
+                ),
+            ],
+            vec![relation(
+                900,
+                &[(102, "outer"), (103, "outer"), (104, "inner")],
+                &[
+                    ("type", "multipolygon"),
+                    ("name", "Havenschool"),
+                    ("amenity", "school"),
+                ],
+            )],
+        ]
+    }
+
+    #[test]
+    fn a_built_record_answers_with_the_entrances_mapped_for_it() {
+        use crate::record::AccessPoint;
+        let dir = temp_dir("entrances");
+        let input = dir.join("entrances.osm.pbf");
+        write_pbf(&input, &buildings_with_entrances());
+        let report = build(&dir.join("pack"), &input, None);
+        // Nodes 1, 3, 10, 31 and 35 are the entrances on a way the build
+        // keeps.
+        assert_eq!(report.geometry_passes.entrance_nodes, 5);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let access = |id: &str| {
+            let record = reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"));
+            reader.record_summary(record).expect("summary").access
+        };
+        let point = |lon: f64, lat: f64, kind: &str| AccessPoint {
+            lon,
+            lat,
+            kind: kind.to_string(),
+        };
+        assert_eq!(
+            access("osm:way:100"),
+            [point(4.0, 52.0, "main"), point(4.0004, 52.0003, "service")]
+        );
+        assert_eq!(access("osm:way:101"), [point(4.001, 52.001, "yes")]);
+        assert_eq!(access("osm:node:20"), [point(4.002, 52.002, "main")]);
+        assert_eq!(access("osm:node:21"), []);
+        assert_eq!(access("osm:node:22"), [point(4.0022, 52.0022, "staircase")]);
+        assert_eq!(
+            access("osm:relation:900"),
+            [
+                point(4.004, 52.003, "main"),
+                point(4.0037, 52.0033, "emergency")
+            ]
+        );
+        assert_eq!(access("osm:way:105"), []);
+    }
+
+    /// The entrances wait in the node store and beside the boundary
+    /// geometry between steps, so a build stopped at any step has to find
+    /// them again.
+    #[test]
+    fn a_build_resumed_after_any_step_keeps_the_entrances() {
+        let dir = temp_dir("resume-entrances");
+        let input = dir.join("entrances.osm.pbf");
+        write_pbf(&input, &buildings_with_entrances());
+        let options = BuildOsmOptions {
+            inputs: vec![input],
+            ..BuildOsmOptions::default()
+        };
+        build_osm_pack(&BuildOsmOptions {
+            pack: dir.join("whole"),
+            ..options.clone()
+        })
+        .expect("uninterrupted build");
+        let expected = records_and_contexts(&dir.join("whole"));
+        let with_access = expected
+            .iter()
+            .filter(|(record, _)| record.get("access").is_some())
+            .count();
+        assert_eq!(with_access, 5);
+        for (at, step) in Step::all(1).iter().enumerate() {
+            let pack = dir.join(format!("stopped-{at}"));
+            let options = BuildOsmOptions {
+                pack: pack.clone(),
+                ..options.clone()
+            };
+            let error = fail_before(&options, *step);
+            assert!(format!("{error}").contains("injected"), "{error}");
+            build_osm_pack(&BuildOsmOptions {
+                leftover: Leftover::Resume,
+                ..options
+            })
+            .unwrap_or_else(|error| panic!("resumed after {step:?}: {error}"));
+            assert_eq!(
+                records_and_contexts(&pack),
+                expected,
+                "the Pack resumed before the checkpoint of {step:?}"
+            );
+            let _ = fs::remove_dir_all(&pack);
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

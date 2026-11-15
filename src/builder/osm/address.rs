@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::{
     builder::report::CandidateIssue,
     record::{
-        AddressComponents, AddressRecord, LocationPrecision, ObjectType, Record, SourceProvenance,
-        point_geometry,
+        AddressComponents, AddressRecord, Entrance, LocationPrecision, ObjectType, Record,
+        SourceProvenance, point_geometry,
     },
     util::text::collapse_whitespace,
 };
@@ -19,6 +19,8 @@ pub(crate) struct AddressCandidate {
     pub lon: f64,
     pub location_precision: LocationPrecision,
     pub tags: BTreeMap<String, String>,
+    /// The entrances mapped for it (see [`Entrance`]).
+    pub entrances: Vec<Entrance>,
 }
 
 /// Turn a candidate into an address record, or count why it was not one.
@@ -46,6 +48,7 @@ pub(crate) fn address_record_from_candidate(
     Ok(AddressRecord {
         disputed: false,
         street_postcodes: Vec::new(),
+        access: candidate.entrances.clone(),
         address: address_components(&candidate.tags)?,
         geometry: point_geometry(candidate.lon, candidate.lat),
         location_precision: candidate.location_precision,
@@ -146,6 +149,7 @@ mod tests {
 
     fn candidate(tags: &[(&str, &str)]) -> AddressCandidate {
         AddressCandidate {
+            entrances: Vec::new(),
             object_type: ObjectType::Node,
             object_id: 42,
             lat: 43.6532,

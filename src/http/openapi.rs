@@ -45,7 +45,7 @@ use crate::{
     },
     http::batch,
     limits::Limits,
-    record::{Brand, Contact, Layer, RoadClass},
+    record::{AccessPoint, Brand, Contact, Layer, RoadClass},
     runtime::AppState,
 };
 
@@ -116,6 +116,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         RoadClass,
         Brand,
         Contact,
+        AccessPoint,
         // Only ever reached through a parameter, so it needs naming here or
         // it is left out of the components and the `$ref` dangles.
         Layer,

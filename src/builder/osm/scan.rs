@@ -14,7 +14,7 @@ use osmpbf::{Element, PrimitiveBlock, RelMemberType};
 
 use crate::{
     builder::report::CandidateIssue,
-    record::{LocationPrecision, ObjectType},
+    record::{Entrance, LocationPrecision, ObjectType},
 };
 
 use super::{
@@ -174,6 +174,10 @@ fn scan_node(
     if !poi {
         count_left_out(all_tags, Drawn::Point, out);
     }
+    // A node that is an entrance is the way in to what it maps.
+    let entrances = Entrance::of_tag(all_tags.get("entrance").map(String::as_str), lon, lat)
+        .into_iter()
+        .collect::<Vec<_>>();
     if poi {
         emit_poi(
             &PoiCandidate {
@@ -185,6 +189,7 @@ fn scan_node(
                 tags: poi_tags(all_tags, address.as_ref()),
                 outline: None,
                 nodes: vec![object_id],
+                entrances,
             },
             out,
         );
@@ -197,6 +202,7 @@ fn scan_node(
                 lon,
                 location_precision: LocationPrecision::Point,
                 tags,
+                entrances,
             },
             out,
         );

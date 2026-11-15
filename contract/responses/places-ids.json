@@ -9,6 +9,13 @@
         "type": "Point"
       },
       "properties": {
+        "access": [
+          {
+            "kind": "main",
+            "lat": 42.99992,
+            "lon": -79.005
+          }
+        ],
         "accuracy": "centroid",
         "address": {
           "housenumber": "12",

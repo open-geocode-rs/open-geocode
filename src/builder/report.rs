@@ -738,6 +738,9 @@ pub struct GeometryPassReport {
     pub stored_nodes: u64,
     /// Nodes whose address tags interpolation ways read.
     pub tagged_nodes: u64,
+    /// Needed nodes tagged `entrance`, kept for the records drawn with them.
+    #[serde(default)]
+    pub entrance_nodes: u64,
     /// Most bytes one input's node id bitmap and rank index held.
     pub peak_node_set_bytes: u64,
     /// Most bytes one input's coordinates held.
@@ -768,6 +771,7 @@ impl GeometryPassReport {
         self.needed_nodes += stored.needed;
         self.stored_nodes += stored.stored;
         self.tagged_nodes += stored.tagged;
+        self.entrance_nodes += stored.entrances;
         self.peak_node_set_bytes = self.peak_node_set_bytes.max(stored.set_bytes);
         self.peak_location_bytes = self.peak_location_bytes.max(stored.location_bytes);
         if stored.mapped {
@@ -2025,6 +2029,7 @@ mod tests {
     ) -> AddressRecord {
         let street = street.map(str::to_string);
         AddressRecord {
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {

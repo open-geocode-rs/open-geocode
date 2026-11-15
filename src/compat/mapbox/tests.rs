@@ -98,6 +98,7 @@ fn write_pack() -> Pack {
     writer
         .write(
             &AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: king.clone(),
@@ -846,6 +847,7 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         opening_hours: None,
         bbox: None,
         timezone: None,
+        access: Vec::new(),
         address: Address {
             unit: unit.map(str::to_string),
             ..Address::default()

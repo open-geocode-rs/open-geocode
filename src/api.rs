@@ -24,8 +24,8 @@ use crate::{
     labels,
     pack::{Reader, RecordId, Summary},
     record::{
-        AddressComponents, Brand, Contact, InterpolationAddressComponents, Layer, OSM_DATASET,
-        ObjectType, PlaceLayer, RoadClass,
+        AccessPoint, AddressComponents, Brand, Contact, InterpolationAddressComponents, Layer,
+        OSM_DATASET, ObjectType, PlaceLayer, RoadClass,
     },
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
@@ -248,6 +248,15 @@ pub struct Common {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Europe/Monaco")]
     pub timezone: Option<String>,
+    /// The points to route to when going to the result, which are the
+    /// entrances OpenStreetMap maps for it. They are the nodes tagged
+    /// `entrance` on the outline of the building or site an address or a
+    /// POI is drawn with, or the result's own point when its node is so
+    /// tagged. Absent when OpenStreetMap maps none, and on every other
+    /// layer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!([{"lon": 7.4263, "lat": 43.7396, "kind": "main"}]))]
+    pub access: Vec<AccessPoint>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -1036,6 +1045,7 @@ fn common(
         opening_hours: summary.opening_hours,
         bbox: summary.bbox,
         timezone: summary.timezone,
+        access: summary.access,
         address: summary.address.with_parts(),
         context: contexts.of(record_id)?,
         source: Source {
@@ -1117,6 +1127,16 @@ fn flat(
         ),
         ("timezone", field(&|p| p.timezone.clone())),
         (
+            "access",
+            field(&|p| {
+                let points = p
+                    .access
+                    .iter()
+                    .map(|point| format!("{:.7},{:.7},{}", point.lon, point.lat, point.kind));
+                Some(points.collect::<Vec<_>>().join("; "))
+            }),
+        ),
+        (
             "address_housenumber",
             field(&|p| p.address.housenumber.clone()),
         ),
@@ -1178,6 +1198,7 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
