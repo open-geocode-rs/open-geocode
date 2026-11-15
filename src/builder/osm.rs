@@ -3025,13 +3025,13 @@ fn write_ordered(
                                         ranked_ref.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                let own_area = match &origin {
+                                let own = match &origin {
                                     Some(ContextOrigin::Boundary(boundary)) => {
-                                        index.area_of(*boundary)
+                                        index.own_area(*boundary)
                                     }
                                     _ => None,
                                 };
-                                let located = record_context(index, &record, own_area);
+                                let located = record_context(index, &record, own);
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
@@ -5646,7 +5646,8 @@ mod tests {
             ("name", "Metro"),
         ];
         blocks[2].push(way(700, &[2001, 2002, 2003, 2004, 2001], &city));
-        // The centroid of the hook lies in its hollow, in the smaller pocket.
+        // The centroid of the hook lies in its hollow, in the pocket, which is
+        // larger than the hook yet not around it.
         let hook = [
             (43.85, -79.95),
             (43.85, -79.75),
@@ -5664,10 +5665,10 @@ mod tests {
         ]
         .concat();
         let pocket = [
-            (43.89, -79.87),
-            (43.89, -79.85),
-            (43.91, -79.85),
-            (43.91, -79.87),
+            (43.871, -79.929),
+            (43.871, -79.751),
+            (43.929, -79.751),
+            (43.929, -79.929),
         ];
         for (way_id, first, level, name, ring) in [
             (710, 3000, "9", "Hook", &hook[..]),

@@ -4071,5 +4071,22 @@ mod router_tests {
             format!("malformed_parameter: {refused}")
         );
         assert_eq!(rows[1]["geocode_status"], "resolved");
+
+        let rows = "{\"address\": \"10 King Street\", \"enclosing\": false}\n{\"address\": \"10 King Street\"}\n";
+        let reply = job(&old, "endpoint=geocode&enclosing=true", rows, "text/csv").await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let rows = csv_rows(&reply.body);
+        assert_eq!(rows[0]["geocode_status"], "resolved");
+        assert_eq!(
+            rows[1]["geocode_reason"],
+            format!("malformed_parameter: {refused}")
+        );
+        let row = "{\"address\": \"10 King Street\"}\n";
+        let reply = job(&old, "endpoint=geocode&enclosing=1", row, "text/csv").await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        assert_eq!(
+            csv_rows(&reply.body)[0]["geocode_reason"],
+            "malformed_parameter: enclosing must be true or false"
+        );
     }
 }

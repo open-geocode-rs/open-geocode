@@ -116,6 +116,7 @@ struct AcceptedBoundary {
     bounds: Rect<f64>,
     shape: ShapeRef,
     area: f64,
+    interior_point: Option<[f64; 2]>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +155,9 @@ struct BuiltBoundary {
     bounds: Rect<f64>,
     area: f64,
     representative_point: [f64; 2],
+    /// A point inside the outline; the representative point of a C-shaped
+    /// area lies outside it.
+    interior_point: Option<[f64; 2]>,
     /// Whether every outer way closed into a ring. A relation one of whose
     /// rings is left open, such as Russia's mainland, keeps the rings that
     /// closed (Kaliningrad) and covers only them.
@@ -588,6 +592,7 @@ impl BoundarySet {
                     layer: boundary.layer,
                     tiers: boundary_tiers(&boundary),
                     area: boundary.area,
+                    interior_point: boundary.interior_point,
                     bounds: boundary.bounds,
                     inferred_country_record_id: boundary
                         .inferred_country_code
@@ -611,7 +616,7 @@ impl BoundarySet {
 pub(crate) fn record_context(
     index: &BoundaryIndex,
     record: &Record,
-    own_area: Option<f64>,
+    own: Option<OwnArea>,
 ) -> Option<RecordContext> {
     let [lon, lat] = record.display_point()?;
     let source = match record {
@@ -648,7 +653,7 @@ pub(crate) fn record_context(
         },
         Record::Street(_) | Record::Postcode(_) => SourceContext::default(),
     };
-    Some(index.context_around(lon, lat, &source, own_area))
+    Some(index.context_around(lon, lat, &source, own))
 }
 
 pub(crate) fn boundary_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -693,27 +698,50 @@ impl BoundaryIndex {
         self.context_around(lon, lat, source_context, None)
     }
 
-    /// The area of the boundary a [`ContextOrigin::Boundary`] record was made from.
-    pub(crate) fn area_of(&self, origin: u32) -> Option<f64> {
+    /// The area and inner point of the boundary a [`ContextOrigin::Boundary`]
+    /// record was made from.
+    pub(crate) fn own_area(&self, origin: u32) -> Option<OwnArea> {
         self.boundaries
             .get(usize::try_from(origin).ok()?)
-            .map(|boundary| boundary.area)
+            .map(|boundary| OwnArea {
+                area: boundary.area,
+                point: boundary.interior_point,
+            })
     }
 
-    /// [`Self::context_for_point`], with `enclosing` listing only the areas
-    /// larger than `own_area`: the point of an area is a centroid, which can lie
-    /// outside its outline and inside areas that it does not lie in.
+    /// [`Self::context_for_point`], for a record made from an area of its own:
+    /// `enclosing` lists the areas around a point inside `own`, larger than
+    /// it. The point of the record is a centroid, which can lie outside its
+    /// outline, in the hole of a ring or a bay of a C, inside areas that it
+    /// does not lie in.
     pub(crate) fn context_around(
         &self,
         lon: f64,
         lat: f64,
         source_context: &SourceContext<'_>,
-        own_area: Option<f64>,
+        own: Option<OwnArea>,
     ) -> RecordContext {
         if self.boundaries.is_empty() || !lon.is_finite() || !lat.is_finite() {
             return RecordContext::default();
         }
 
+        let at = self.covering(lon, lat, source_context);
+        let around = own
+            .and_then(|own| own.point)
+            .filter(|point| *point != [lon, lat])
+            .map(|[lon, lat]| self.covering(lon, lat, source_context));
+        let (covered, derived_country) = match around {
+            Some(around) => (around.covered, around.derived_country),
+            None => (at.covered, at.derived_country),
+        };
+        RecordContext {
+            admin_context: at.tuple,
+            flags: at.flags,
+            enclosing: enclosing(covered, derived_country, own.map(|own| own.area)),
+        }
+    }
+
+    fn covering(&self, lon: f64, lat: f64, source_context: &SourceContext<'_>) -> Covering<'_> {
         let envelope = AABB::from_point([lon, lat]);
         let mut covered = Vec::new();
         for boundary_box in self.tree.locate_in_envelope_intersecting(&envelope) {
@@ -760,26 +788,52 @@ impl BoundaryIndex {
             derived_country = Some(country);
         }
 
-        // Size orders them; it does not prove one lies in the next. Ties break
-        // on the source object so one input gives one order.
-        let source = |boundary: &AcceptedBoundary| {
-            let object_type = source_type_rank(boundary.source_object_type);
-            (object_type, boundary.source_object_id)
-        };
-        covered.sort_by(|left, right| {
-            (left.area.total_cmp(&right.area)).then_with(|| source(left).cmp(&source(right)))
-        });
-        covered.retain(|boundary| own_area.is_none_or(|own| boundary.area > own));
-        RecordContext {
-            admin_context: tuple,
+        Covering {
+            covered,
+            tuple,
             flags,
-            enclosing: covered
-                .iter()
-                .map(|boundary| boundary.record_id)
-                .chain(derived_country)
-                .collect(),
+            derived_country,
         }
     }
+}
+
+/// The record of an area that a record was made from, as far as its list of
+/// enclosing areas is concerned.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnArea {
+    area: f64,
+    point: Option<[f64; 2]>,
+}
+
+struct Covering<'a> {
+    covered: Vec<&'a AcceptedBoundary>,
+    tuple: AdminContextTuple,
+    flags: u16,
+    derived_country: Option<RecordId>,
+}
+
+/// The covering areas, smallest first, and only those larger than
+/// `larger_than`.
+fn enclosing(
+    mut covered: Vec<&AcceptedBoundary>,
+    derived_country: Option<RecordId>,
+    larger_than: Option<f64>,
+) -> Vec<RecordId> {
+    // Size orders them; it does not prove one lies in the next. Ties break
+    // on the source object so one input gives one order.
+    let source = |boundary: &AcceptedBoundary| {
+        let object_type = source_type_rank(boundary.source_object_type);
+        (object_type, boundary.source_object_id)
+    };
+    covered.sort_by(|left, right| {
+        (left.area.total_cmp(&right.area)).then_with(|| source(left).cmp(&source(right)))
+    });
+    covered.retain(|boundary| larger_than.is_none_or(|own| boundary.area > own));
+    covered
+        .iter()
+        .map(|boundary| boundary.record_id)
+        .chain(derived_country)
+        .collect()
 }
 
 /// Whether the tags make an area records can lie in: an admin boundary, or
@@ -1005,6 +1059,9 @@ fn built(
             bounds,
             area: geometry.unsigned_area(),
             representative_point,
+            interior_point: geometry
+                .interior_point()
+                .map(|point| [point.x(), point.y()]),
             rings_closed,
         },
         block,
@@ -1913,6 +1970,15 @@ impl crate::extsort::Spill for SetItem {
                 {
                     out.extend_from_slice(&value.to_bits().to_le_bytes());
                 }
+                match boundary.interior_point {
+                    Some(point) => {
+                        out.push(1);
+                        for value in point {
+                            out.extend_from_slice(&value.to_bits().to_le_bytes());
+                        }
+                    }
+                    None => out.push(0),
+                }
                 out.push(u8::from(boundary.rings_closed));
             }
             Self::DerivedCountry(code, record) => {
@@ -1977,6 +2043,18 @@ impl crate::extsort::Spill for SetItem {
                     *value = super::checkpoint::get_f64(input)?;
                 }
                 let [min_x, min_y, max_x, max_y, area, lon, lat] = values;
+                let interior_point = match get_u8(input)? {
+                    0 => None,
+                    1 => Some([
+                        super::checkpoint::get_f64(input)?,
+                        super::checkpoint::get_f64(input)?,
+                    ]),
+                    _ => {
+                        return Err(Error::Decode(
+                            "a saved boundary's interior point flag is not 0 or 1",
+                        ));
+                    }
+                };
                 let rings_closed = match get_u8(input)? {
                     0 => false,
                     1 => true,
@@ -2002,6 +2080,7 @@ impl crate::extsort::Spill for SetItem {
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
                         area,
                         representative_point: [lon, lat],
+                        interior_point,
                         rings_closed,
                     },
                 }))
@@ -2182,6 +2261,8 @@ mod tests {
         for rings_closed in [false, true] {
             let mut boundary = test_boundary(PlaceLayer::Region);
             boundary.rings_closed = rings_closed;
+            boundary.interior_point = rings_closed.then_some([0.5, -0.25]);
+            let interior_point = boundary.interior_point;
             let mut bytes = Vec::new();
             SetItem::Candidate(Box::new(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
@@ -2194,6 +2275,7 @@ mod tests {
                 panic!("not a candidate");
             };
             assert_eq!(read.boundary.rings_closed, rings_closed);
+            assert_eq!(read.boundary.interior_point, interior_point);
         }
         let mut bytes = Vec::new();
         SetItem::Candidate(Box::new(BoundaryCandidate {
@@ -2235,6 +2317,7 @@ mod tests {
             subdivision_code: None,
             area_tags: AreaTags::default(),
             representative_point: representative_point(&geometry).expect("point"),
+            interior_point: None,
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
             area: geometry.unsigned_area(),
@@ -2635,6 +2718,7 @@ mod tests {
                     subdivision_code: None,
                     area_tags: AreaTags::default(),
                     representative_point: representative_point(&geometry).expect("point"),
+                    interior_point: None,
                     shape,
                     bounds,
                     area,
@@ -2850,6 +2934,7 @@ mod tests {
             source_object_type: ObjectType::Relation,
             source_object_id: record_id as i64,
             area: geometry.unsigned_area(),
+            interior_point: None,
             bounds: geometry.bounding_rect().expect("bounds"),
             shape: ShapeRef::default(),
         }
