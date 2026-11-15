@@ -170,6 +170,7 @@ pub(super) fn pack(name: &str) -> TestPack {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }
             .into(),

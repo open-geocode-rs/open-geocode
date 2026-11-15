@@ -128,6 +128,7 @@ fn write_pack() -> Pack {
                     name: "Queen Coffee".to_string(),
                     wikidata: None,
                 }),
+                details: None,
                 aliases: Vec::new(),
             }
             .into(),
@@ -840,6 +841,8 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         category: None,
         road_class: None,
         brand: None,
+        contact: None,
+        opening_hours: None,
         address: Address {
             unit: unit.map(str::to_string),
             ..Address::default()

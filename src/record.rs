@@ -199,6 +199,7 @@ pub struct PoiRecord {
     pub prominence: Prominence,
     pub wikidata: Option<u32>,
     pub brand: Option<Brand>,
+    pub details: Option<Box<PoiDetails>>,
     /// Ids of objects merged into it: they still find it.
     pub aliases: Vec<(ObjectType, i64)>,
 }
@@ -218,6 +219,58 @@ pub struct Brand {
     )]
     #[schema(value_type = Option<String>, example = "Q867662")]
     pub wikidata: Option<u32>,
+}
+
+/// What few POIs state. Boxed on the record: every record of a build is as
+/// wide as the widest, and most would carry these empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoiDetails {
+    pub contact: Option<Contact>,
+    /// The `opening_hours` tag as written, never parsed.
+    pub opening_hours: Option<String>,
+}
+
+impl PoiDetails {
+    /// None when nothing is stated: a record never holds empty details.
+    pub fn stated(contact: Option<Contact>, opening_hours: Option<String>) -> Option<Box<Self>> {
+        (contact.is_some() || opening_hours.is_some()).then(|| {
+            Box::new(Self {
+                contact,
+                opening_hours,
+            })
+        })
+    }
+}
+
+/// How to reach a place, each value as its source writes it: a phone number
+/// in any spelling, a website with or without its scheme. og rewrites none
+/// of them and does not check that one still answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Contact {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "+1 416-555-0111")]
+    pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "https://queenbakery.example/")]
+    pub website: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "hello@queenbakery.example")]
+    pub email: Option<String>,
+}
+
+impl Contact {
+    /// None when nothing is stated: a record never holds an empty contact.
+    pub fn stated(
+        phone: Option<String>,
+        website: Option<String>,
+        email: Option<String>,
+    ) -> Option<Self> {
+        (phone.is_some() || website.is_some() || email.is_some()).then_some(Self {
+            phone,
+            website,
+            email,
+        })
+    }
 }
 
 // serde's `serialize_with` hands the field by reference.
@@ -990,11 +1043,19 @@ impl PoiRecord {
     pub fn label(&self) -> String {
         labels::poi_label(&self.name, self.address.as_ref(), None)
     }
+
+    pub fn contact(&self) -> Option<&Contact> {
+        self.details.as_ref()?.contact.as_ref()
+    }
+
+    pub fn opening_hours(&self) -> Option<&str> {
+        self.details.as_ref()?.opening_hours.as_deref()
+    }
 }
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 13)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 15)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -1020,6 +1081,14 @@ impl Serialize for PoiRecord {
         match &self.brand {
             Some(brand) => state.serialize_field("brand", brand)?,
             None => state.skip_field("brand")?,
+        }
+        match self.contact() {
+            Some(contact) => state.serialize_field("contact", contact)?,
+            None => state.skip_field("contact")?,
+        }
+        match self.opening_hours() {
+            Some(hours) => state.serialize_field("opening_hours", hours)?,
+            None => state.skip_field("opening_hours")?,
         }
         if self.aliases.is_empty() {
             state.skip_field("aliases")?;

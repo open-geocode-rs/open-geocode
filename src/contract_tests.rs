@@ -24,9 +24,9 @@ use crate::{
     context::{AdminContextTuple, RecordContext},
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
-        InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
-        Record, SourceProvenance, StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, Contact, InterpolationAddressComponents,
+        InterpolationRange, InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer,
+        PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -971,6 +971,14 @@ fn write_pack(dir: &PathBuf) {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: PoiDetails::stated(
+                    Contact::stated(
+                        Some("+1 416-555-0111".to_string()),
+                        Some("https://queenbakery.example/".to_string()),
+                        Some("hello@queenbakery.example".to_string()),
+                    ),
+                    Some("Mo-Fr 07:00-18:00; Sa 08:00-14:00".to_string()),
+                ),
                 aliases: Vec::new(),
             }
             .into(),

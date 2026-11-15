@@ -20,6 +20,11 @@
           }
         },
         "category": "shop:bakery",
+        "contact": {
+          "email": "hello@queenbakery.example",
+          "phone": "+1 416-555-0111",
+          "website": "https://queenbakery.example/"
+        },
         "context": {
           "country": {
             "code": "CA",
@@ -40,6 +45,7 @@
         "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
         "layer": "poi",
         "name": "Queen Bakery",
+        "opening_hours": "Mo-Fr 07:00-18:00; Sa 08:00-14:00",
         "score": 0.0,
         "source": {
           "dataset": "osm"

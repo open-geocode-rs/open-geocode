@@ -6679,6 +6679,8 @@ impl TextSearcher {
                 category: None,
                 road_class: None,
                 brand: None,
+                contact: None,
+                opening_hours: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -11107,6 +11109,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         writer
@@ -11200,6 +11203,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         for record in [
@@ -11284,6 +11288,7 @@ mod tests {
                 prominence,
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             })
         };
@@ -11436,6 +11441,7 @@ mod tests {
                 },
                 wikidata,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             })
         };
@@ -11469,6 +11475,7 @@ mod tests {
             prominence,
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         for record in [
@@ -11591,6 +11598,8 @@ mod tests {
             category: None,
             road_class: None,
             brand: None,
+            contact: None,
+            opening_hours: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),
@@ -12018,6 +12027,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         for record in [
@@ -12115,6 +12125,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    details: None,
                     aliases: Vec::new(),
                 }
                 .into(),
@@ -12172,6 +12183,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         let cap = AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS as i64;
@@ -12230,6 +12242,7 @@ mod tests {
             prominence,
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         let known = Prominence {
@@ -12280,6 +12293,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         writer
@@ -12348,6 +12362,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             })
         };
@@ -12457,6 +12472,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         for record in [
@@ -12531,6 +12547,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         writer
@@ -12582,6 +12599,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         writer
@@ -12635,6 +12653,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         writer
@@ -13676,6 +13695,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    details: None,
                     aliases: Vec::new(),
                 }
                 .into(),
@@ -15194,6 +15214,7 @@ mod tests {
             },
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         for record in [

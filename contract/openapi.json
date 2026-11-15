@@ -142,6 +142,10 @@
             "description": "POI category, such as `amenity:cafe`. Present only on POIs.",
             "type": "string"
           },
+          "contact": {
+            "$ref": "#/components/schemas/Contact",
+            "description": "How to reach a place: its phone number, website and email, each as\nits source writes it. og rewrites none and does not check that one\nstill answers. Present only on POIs that state at least one."
+          },
           "context": {
             "$ref": "#/components/schemas/Context",
             "description": "Administrative areas containing the result."
@@ -159,6 +163,11 @@
           },
           "name": {
             "description": "House number and street for an address (`12 King Street West`), or\nthe name of a street, area or POI.",
+            "type": "string"
+          },
+          "opening_hours": {
+            "description": "When a place is open, in OpenStreetMap's `opening_hours` syntax as\nits source writes it. og does not parse it, so it never says whether\nthe place is open now. Present only on POIs that state it.",
+            "example": "Mo-Fr 08:00-18:00; Sa 09:00-13:00",
             "type": "string"
           },
           "road_class": {
@@ -190,6 +199,24 @@
           "label",
           "source"
         ],
+        "type": "object"
+      },
+      "Contact": {
+        "description": "How to reach a place, each value as its source writes it: a phone number\nin any spelling, a website with or without its scheme. og rewrites none\nof them and does not check that one still answers.",
+        "properties": {
+          "email": {
+            "example": "hello@queenbakery.example",
+            "type": "string"
+          },
+          "phone": {
+            "example": "+1 416-555-0111",
+            "type": "string"
+          },
+          "website": {
+            "example": "https://queenbakery.example/",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "Context": {

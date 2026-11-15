@@ -40,7 +40,9 @@
 //!                     as one byte and its Wikidata item as a varint (0 = none), a POI's
 //!                     aliases (a varint count, then each OSM object's
 //!                     number << 2 | kind), its brand's string id + 1 (0 = none) and the brand's
-//!                     Wikidata item, then its address after a presence byte; a postcode's country follows its code as
+//!                     Wikidata item, then a presence byte and the string ids of
+//!                     those of its phone, website, email and opening hours
+//!                     it states, then its address after a presence byte; a postcode's country follows its code as
 //!                     a varint, 0 = none, else its two letters as a u16
 //!       geometry      lines only: varint part count, then per part a varint
 //!                     point count and zigzag deltas, chained across parts
@@ -100,11 +102,11 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, Brand, DERIVED_FROM_ADDRESS_RECORDS,
+        AddressComponents, AddressRecord, Brand, Contact, DERIVED_FROM_ADDRESS_RECORDS,
         DerivedSourceProvenance, InterpolationAddressComponents, InterpolationRange,
         InterpolationRecord, Layer, LocationPrecision, OSM_DATASET, ObjectType, PlaceRecord,
-        PoiRecord, PostcodeRecord, Prominence, Record, RoadClass, SourceProvenance, StreetRecord,
-        point_geometry,
+        PoiDetails, PoiRecord, PostcodeRecord, Prominence, Record, RoadClass, SourceProvenance,
+        StreetRecord, point_geometry,
     },
     util::{
         codec::{
@@ -119,7 +121,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 11;
+pub const RECORDS_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
@@ -189,6 +191,10 @@ pub struct Summary {
     pub road_class: Option<RoadClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brand: Option<Brand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<Contact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening_hours: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point: Option<Point>,
     pub source: Source,
@@ -801,6 +807,16 @@ impl Writer {
                     }
                     None => put_u64(out, 0),
                 }
+                let contact = record.contact();
+                self.put_optional_strings(
+                    out,
+                    &[
+                        contact.and_then(|contact| contact.phone.as_deref()),
+                        contact.and_then(|contact| contact.website.as_deref()),
+                        contact.and_then(|contact| contact.email.as_deref()),
+                        record.opening_hours(),
+                    ],
+                )?;
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -1208,6 +1224,7 @@ impl Reader {
                     prominence: poi.prominence,
                     wikidata: poi.wikidata,
                     brand: poi.brand,
+                    details: poi.details,
                     aliases: poi.aliases,
                 })
             }
@@ -1280,6 +1297,8 @@ impl Reader {
         let mut category = None;
         let mut road_class = None;
         let mut brand = None;
+        let mut contact = None;
+        let mut opening_hours = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
@@ -1295,6 +1314,9 @@ impl Reader {
                 let poi = self.poi_fields(header.strings, &mut fields)?;
                 let (object_type, object_id) = header.object()?;
                 brand.clone_from(&poi.brand);
+                if let Some(details) = poi.details {
+                    (contact, opening_hours) = (details.contact, details.opening_hours);
+                }
                 category = Some(poi.category.to_string());
                 if let Some(address) = &poi.address {
                     stated = Address::from(address);
@@ -1358,6 +1380,8 @@ impl Reader {
             category,
             road_class,
             brand,
+            contact,
+            opening_hours,
             point: Some(header.point()),
             source,
         })
@@ -1978,6 +2002,7 @@ impl Reader {
                 wikidata: item_field(fields)?,
             }),
         };
+        let [phone, website, email, opening_hours] = self.optional_strings(strings, fields)?;
         let address = match get_u8(fields)? {
             0 => None,
             _ => Some(self.address_components(strings, fields)?),
@@ -1990,6 +2015,7 @@ impl Reader {
             wikidata,
             aliases,
             brand,
+            details: PoiDetails::stated(Contact::stated(phone, website, email), opening_hours),
             address,
         })
     }
@@ -2110,6 +2136,7 @@ struct PoiFields<'a> {
     wikidata: Option<u32>,
     aliases: Vec<(ObjectType, i64)>,
     brand: Option<Brand>,
+    details: Option<Box<PoiDetails>>,
     address: Option<AddressComponents>,
 }
 
@@ -2633,6 +2660,7 @@ mod tests {
                 },
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }),
             Record::Poi(PoiRecord {
@@ -2646,6 +2674,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }),
         ];
@@ -2705,6 +2734,85 @@ mod tests {
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
         Reader::open(&Container::open(&path).expect("open")).expect("reader")
+    }
+
+    fn detailed_poi(id: i64, details: Option<Box<PoiDetails>>) -> Record {
+        Record::Poi(PoiRecord {
+            alt_names: Vec::new(),
+            name: "Queen Bakery".into(),
+            category: "shop:bakery".into(),
+            address: None,
+            geometry: point_geometry(-79.0, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            details,
+            aliases: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_poi_round_trips_the_contact_and_hours_it_states() {
+        let text = |value: &str| Some(value.to_string());
+        let full = Contact {
+            phone: text("+1 416-555-0111"),
+            website: text("https://queenbakery.example/"),
+            email: text("hello@queenbakery.example"),
+        };
+        let hours = "Mo-Fr 07:00-18:00; Sa 08:00-14:00";
+        let stated = [
+            (Some(full.clone()), text(hours)),
+            (Some(full), None),
+            (None, text(hours)),
+            (Contact::stated(text("+1 416-555-0111"), None, None), None),
+            (
+                Contact::stated(None, text("queenbakery.example"), None),
+                None,
+            ),
+            (
+                Contact::stated(None, None, text("hello@queenbakery.example")),
+                text("24/7"),
+            ),
+            (None, None),
+        ];
+        let records = stated
+            .iter()
+            .enumerate()
+            .map(|(id, (contact, hours))| {
+                detailed_poi(
+                    id as i64,
+                    PoiDetails::stated(contact.clone(), hours.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reader = write_store(&records, &[]);
+        for (id, (record, (contact, hours))) in records.iter().zip(&stated).enumerate() {
+            let id = id as u64;
+            assert_eq!(&reader.record(id).expect("record"), record);
+            let summary = reader.summary(id).expect("summary");
+            assert_eq!((&summary.contact, &summary.opening_hours), (contact, hours));
+        }
+        assert_eq!(
+            reader.record_json(0).expect("json")["contact"],
+            json!({
+                "phone": "+1 416-555-0111",
+                "website": "https://queenbakery.example/",
+                "email": "hello@queenbakery.example",
+            })
+        );
+        assert_eq!(reader.record_json(0).expect("json")["opening_hours"], hours);
+        let bare = reader.record_json(6).expect("json");
+        assert_eq!(bare.get("contact"), None);
+        assert_eq!(bare.get("opening_hours"), None);
+        assert_eq!(
+            serde_json::to_value(reader.summary(3).expect("summary")).expect("value")["contact"],
+            json!({"phone": "+1 416-555-0111"})
+        );
+        let bare = serde_json::to_value(reader.summary(6).expect("summary")).expect("value");
+        assert_eq!(bare.get("contact"), None);
+        assert_eq!(bare.get("opening_hours"), None);
     }
 
     #[test]
