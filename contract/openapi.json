@@ -1,6 +1,32 @@
 {
   "components": {
     "schemas": {
+      "AccessPoint": {
+        "description": "A point to route to when going to a result.",
+        "properties": {
+          "kind": {
+            "description": "What kind of way in it is, as the value of the OpenStreetMap\n`entrance` tag that maps it, such as `main`, `yes`, `service` or\n`staircase`.",
+            "example": "main",
+            "type": "string"
+          },
+          "lat": {
+            "example": 43.7396,
+            "format": "double",
+            "type": "number"
+          },
+          "lon": {
+            "example": 7.4263,
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "lon",
+          "lat",
+          "kind"
+        ],
+        "type": "object"
+      },
       "Accuracy": {
         "description": "How precisely the coordinates locate the result, most precise first.\n\n- `rooftop`: the address or POI itself.\n- `interpolated`: a house number placed between known neighbours.\n- `street`: a point on the street.\n- `centroid`: the centre of a mapped area.\n- `approximate`: a point standing for something larger, such as a town\n  or postcode.",
         "enum": [
@@ -127,6 +153,20 @@
       "Common": {
         "description": "Properties shared by forward and reverse results.",
         "properties": {
+          "access": {
+            "description": "The points to route to when going to the result, which are the\nentrances OpenStreetMap maps for it. They are the nodes tagged\n`entrance` on the outline of the building or site an address or a\nPOI is drawn with, or the result's own point when its node is so\ntagged. Absent when OpenStreetMap maps none, and on every other\nlayer.",
+            "example": [
+              {
+                "kind": "main",
+                "lat": 43.7396,
+                "lon": 7.4263
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/AccessPoint"
+            },
+            "type": "array"
+          },
           "accuracy": {
             "$ref": "#/components/schemas/Accuracy"
           },

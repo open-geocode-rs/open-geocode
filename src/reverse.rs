@@ -886,6 +886,7 @@ mod tests {
 
     fn address_record() -> AddressRecord {
         AddressRecord {
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {

@@ -1630,6 +1630,7 @@ mod router_tests {
         writer
             .write(
                 &AddressRecord {
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
@@ -2392,6 +2393,7 @@ mod router_tests {
             .into(),
             poi(2, ObjectType::Node, "Lantern Cafe", -79.1, None).into(),
             AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
@@ -2566,6 +2568,7 @@ mod router_tests {
         };
         let house = |id: i64, street: &str, lon: f64| -> Record {
             AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
@@ -2792,6 +2795,201 @@ mod router_tests {
             let reply = send(router.clone(), request("GET", uri)).await;
             assert_eq!(zoned(&reply.json()), without("osm:node:1"), "{uri}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    /// A house and a hall with entrances mapped, and a house and a cafe
+    /// with none.
+    fn write_entered_pack(dir: &Path) {
+        use crate::record::{Entrance, PoiDetails, PoiRecord, Record};
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let entrance = |lon: i32, lat: i32, kind: &str| Entrance {
+            at: [lon, lat],
+            kind: kind.to_string(),
+        };
+        let house = |id: i64, street: &str, lon: f64, access| -> Record {
+            AddressRecord {
+                access,
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: "10".to_string(),
+                    street: Some(street.to_string()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                geometry: point_geometry(lon, 43.0),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(ObjectType::Way, id),
+            }
+            .into()
+        };
+        let poi = |id: i64, name: &str, lon: f64, details| -> Record {
+            PoiRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                category: "amenity:cafe".to_string(),
+                address: None,
+                geometry: point_geometry(lon, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Way, id),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                details,
+                aliases: Vec::new(),
+            }
+            .into()
+        };
+        for record in [
+            house(
+                1,
+                "King Street",
+                -79.0,
+                vec![
+                    entrance(-790_000_500, 429_999_000, "main"),
+                    entrance(-789_999_000, 430_001_250, "service"),
+                ],
+            ),
+            house(2, "Queen Street", -79.1, Vec::new()),
+            poi(
+                3,
+                "Harbour Hall",
+                -79.2,
+                PoiDetails {
+                    access: vec![entrance(-792_000_000, 430_002_000, "yes")],
+                    ..PoiDetails::default()
+                }
+                .kept(),
+            ),
+            poi(4, "Lantern Cafe", -79.3, None),
+        ] {
+            writer.write(&record, None).expect("write");
+        }
+        writer.finish().expect("finish");
+    }
+
+    /// The entrances mapped for a record are its own. Every route that
+    /// answers with the record gives them, and a record with none has no
+    /// such field.
+    #[tokio::test]
+    async fn a_result_carries_its_access_points_on_every_route() {
+        let pack = temp_path("access");
+        write_entered_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let entered = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (properties["id"].clone(), properties.get("access").cloned())
+        };
+        let king = (
+            serde_json::json!("osm:way:1"),
+            Some(serde_json::json!([
+                {"lon": -79.00005, "lat": 42.9999, "kind": "main"},
+                {"lon": -78.9999, "lat": 43.000125, "kind": "service"},
+            ])),
+        );
+        let hall = (
+            serde_json::json!("osm:way:3"),
+            Some(serde_json::json!([{"lon": -79.2, "lat": 43.0002, "kind": "yes"}])),
+        );
+        let queen = (serde_json::json!("osm:way:2"), None);
+        let cafe = (serde_json::json!("osm:way:4"), None);
+
+        for (uri, expected) in [
+            ("/geocode?q=10%20King%20Street", &king),
+            ("/geocode?q=10%20Queen%20Street", &queen),
+            ("/places?q=Harbour%20Hall", &hall),
+            ("/places?ids=osm:way:3", &hall),
+            ("/places?q=Lantern%20Cafe", &cafe),
+            ("/places?ids=osm:way:4", &cafe),
+            ("/autocomplete?q=10%20King%20St", &king),
+            ("/autocomplete?q=Harbour", &hall),
+            ("/autocomplete?q=Lantern", &cafe),
+            ("/reverse?lon=-79.0&lat=43.0", &king),
+            ("/reverse?lon=-79.1&lat=43.0", &queen),
+            ("/reverse?lon=-79.2&lat=43.0&layer=poi", &hall),
+            ("/reverse?lon=-79.3&lat=43.0&layer=poi", &cafe),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            assert_eq!(&entered(&reply.json()), expected, "{uri}");
+        }
+
+        for (route, body, expected) in [
+            (
+                "/geocode",
+                r#"[{"q": "10 King Street"}, {"q": "10 Queen Street"}]"#,
+                [&king, &queen],
+            ),
+            (
+                "/places",
+                r#"[{"ids": "osm:way:3"}, {"q": "Lantern Cafe"}]"#,
+                [&hall, &cafe],
+            ),
+            (
+                "/reverse",
+                r#"[{"lon": -79.0, "lat": 43.0},
+                    {"lon": -79.3, "lat": 43.0, "layer": "poi"}]"#,
+                [&king, &cafe],
+            ),
+        ] {
+            for method in ["POST", "QUERY"] {
+                let reply = send(router.clone(), batch_request(method, route, body)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{method} {route}");
+                let results = reply.json()["results"].clone();
+                for (item, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        &entered(&results[item]["response"]),
+                        expected,
+                        "{method} {route} item {item}"
+                    );
+                }
+            }
+        }
+
+        let rows = "{\"lon\": -79.2, \"lat\": 43.0, \"layer\": \"poi\"}\n\
+                    {\"lon\": -79.1, \"lat\": 43.0}\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", rows),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(entered(&lines[0]["response"]), hall);
+        assert_eq!(entered(&lines[1]["response"]), queen);
+
+        let reply = send(
+            router.clone(),
+            upload(
+                "/jobs?endpoint=geocode",
+                "text/csv",
+                "address\n10 King Street\n10 Queen Street\n",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let rows = csv_rows(&reply.body);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["geocode_access"],
+            "-79.0000500,42.9999000,main; -78.9999000,43.0001250,service"
+        );
+        assert_eq!(rows[1]["geocode_access"], "");
+
         let _ = std::fs::remove_dir_all(&pack);
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }

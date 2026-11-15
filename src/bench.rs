@@ -868,6 +868,7 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {

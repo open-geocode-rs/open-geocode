@@ -1809,6 +1809,7 @@ mod tests {
         let mut writer = crate::pack::Writer::create(&dir).expect("writer");
         for index in 0..count {
             let record = AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
@@ -1871,6 +1872,7 @@ mod tests {
     #[test]
     fn projects_address_fields_for_search() {
         let record = AddressRecord {
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {

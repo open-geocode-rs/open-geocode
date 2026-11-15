@@ -11,7 +11,7 @@ use osmpbf::{Element, PrimitiveBlock};
 
 use crate::{
     builder::report::CandidateIssue,
-    record::{LocationPrecision, ObjectType},
+    record::{Entrance, LocationPrecision, ObjectType},
 };
 
 use super::{
@@ -39,6 +39,8 @@ pub(crate) struct WayNode {
     pub id: i64,
     pub location: Location,
     pub tags: Option<BTreeMap<String, String>>,
+    /// The value of its `entrance` tag, when it has one.
+    pub entrance: Option<String>,
 }
 
 /// What one way block gave.
@@ -50,10 +52,21 @@ pub(crate) struct Assembled {
     pub members: Vec<(i64, Option<Vec<Vertex>>, u64)>,
     /// Node references of the block's kept ways that have coordinates.
     pub resolved: u64,
+    /// The nodes of the member ways that are tagged `entrance`, each with
+    /// the tag's value. A relation's outline is assembled after the node
+    /// store is gone.
+    pub entrances: Vec<(i64, String)>,
 }
 
 /// The nodes of `refs`, when `locations` has every one, and how many it has.
-fn resolve(refs: &[i64], locations: &Locations, tags: bool) -> (Option<Vec<WayNode>>, u64) {
+/// Each with its address tags when `tags` asks, and with whether it is an
+/// entrance when `entrances` does, as most ways read neither.
+fn resolve(
+    refs: &[i64],
+    locations: &Locations,
+    tags: bool,
+    entrances: bool,
+) -> (Option<Vec<WayNode>>, u64) {
     let mut found = 0;
     let mut nodes = Some(Vec::with_capacity(refs.len()));
     for id in refs {
@@ -66,6 +79,11 @@ fn resolve(refs: &[i64], locations: &Locations, tags: bool) -> (Option<Vec<WayNo
                         location,
                         tags: if tags {
                             locations.tags(*id).cloned()
+                        } else {
+                            None
+                        },
+                        entrance: if entrances {
+                            locations.entrance(*id).map(str::to_string)
                         } else {
                             None
                         },
@@ -102,14 +120,24 @@ pub(crate) fn assemble(
         };
         if !tags.is_empty() {
             for (feature, way_refs) in way_features(way.id(), &tags, refs) {
-                let (nodes, found) =
-                    resolve(&way_refs, locations, feature.kind == WayKind::Interpolation);
+                let (nodes, found) = resolve(
+                    &way_refs,
+                    locations,
+                    feature.kind == WayKind::Interpolation,
+                    matches!(feature.kind, WayKind::Address | WayKind::Poi),
+                );
                 assembled.resolved += found;
                 emit_feature(feature, nodes, &mut assembled.output);
             }
         }
         if members.contains(&way.id()) {
-            let (nodes, found) = resolve(refs(), locations, false);
+            let (nodes, found) = resolve(refs(), locations, false, true);
+            assembled.entrances.extend(
+                nodes
+                    .iter()
+                    .flatten()
+                    .filter_map(|node| Some((node.id, node.entrance.clone()?))),
+            );
             let vertices = nodes.map(|nodes| nodes.iter().map(vertex).collect());
             assembled.members.push((way.id(), vertices, found));
         }
@@ -139,6 +167,21 @@ pub(crate) fn emit_feature(
             .map(|node| (node.location.lat(), node.location.lon()))
             .collect::<Vec<_>>()
     };
+    // A closed way ends on its first node, which is one entrance, not two.
+    let entrances = |nodes: &[WayNode]| {
+        let mut seen = HashSet::new();
+        nodes
+            .iter()
+            .filter(|node| node.entrance.is_some() && seen.insert(node.id))
+            .filter_map(|node| {
+                Entrance::of_tag(
+                    node.entrance.as_deref(),
+                    node.location.lon(),
+                    node.location.lat(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     match feature.kind {
         WayKind::Address => {
             let center = nodes.as_deref().and_then(|nodes| centroid(&points(nodes)));
@@ -151,6 +194,7 @@ pub(crate) fn emit_feature(
                         lon,
                         location_precision: LocationPrecision::Centroid,
                         tags: feature.tags,
+                        entrances: nodes.as_deref().map(entrances).unwrap_or_default(),
                     },
                     out,
                 ),
@@ -178,6 +222,7 @@ pub(crate) fn emit_feature(
                         outline: closed_way_polygon(&points(nodes))
                             .map(|polygon| outline(&MultiPolygon::new(vec![polygon]))),
                         nodes: nodes.iter().map(|node| node.id).collect(),
+                        entrances: entrances(nodes),
                     },
                     out,
                 ),

@@ -117,6 +117,7 @@ fn write_pack(dir: &Path) {
     writer
         .write(
             &AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: address.clone(),

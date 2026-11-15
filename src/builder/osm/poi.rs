@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::{
     record::{
-        AddressComponents, AddressRecord, Brand, Contact, LocationPrecision, ObjectType,
+        AddressComponents, AddressRecord, Brand, Contact, Entrance, LocationPrecision, ObjectType,
         PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     util::fold::search_key,
@@ -198,6 +198,8 @@ pub(crate) struct PoiCandidate {
     pub outline: Option<Vec<u8>>,
     /// See [`Identity::nodes`].
     pub nodes: Vec<i64>,
+    /// The entrances mapped for it (see [`Entrance`]).
+    pub entrances: Vec<Entrance>,
 }
 
 pub(crate) fn is_poi(tags: &BTreeMap<String, String>, drawn: Drawn) -> bool {
@@ -501,6 +503,11 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
         ),
         opening_hours: own.opening_hours.or(theirs.opening_hours),
         extent: own.extent.or(theirs.extent),
+        access: if own.access.is_empty() {
+            theirs.access
+        } else {
+            own.access
+        },
     }
     .kept();
     leader.prominence = leader.prominence.max(member.prominence);
@@ -607,6 +614,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
             geometry: geometry.clone(),
             location_precision: candidate.location_precision,
             source: source.clone(),
+            access: candidate.entrances.clone(),
         };
         out.report.accept_address_with_tags(&record, Some(tags));
         out.records.push(Record::Address(record));
@@ -634,6 +642,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
                 .outline
                 .as_deref()
                 .and_then(containment::narrowest_extent),
+            access: candidate.entrances.clone(),
         }
         .kept(),
         aliases: Vec::new(),
@@ -715,6 +724,7 @@ mod tests {
         let mut out = Emitted::default();
         emit_poi(
             &PoiCandidate {
+                entrances: Vec::new(),
                 object_type: ObjectType::Node,
                 object_id: 7,
                 lat: 43.65,
@@ -1147,6 +1157,7 @@ mod tests {
         ]);
         emit_poi(
             &PoiCandidate {
+                entrances: Vec::new(),
                 object_type: ObjectType::Way,
                 object_id: 9,
                 lat: 43.65,
@@ -1254,6 +1265,7 @@ mod tests {
                 ("opening_hours", " Mo-Fr 08:00-18:00;  Sa 09:00-13:00 "),
             ]),
             Some(PoiDetails {
+                access: Vec::new(),
                 contact: Some(Contact {
                     phone: Some("+31 (0)50 123-4567".into()),
                     website: Some("HTTP://www.Shell.nl/Stations/".into()),
@@ -1322,6 +1334,7 @@ mod tests {
         assert_eq!(
             details(&[("opening_hours", "24/7")]),
             Some(PoiDetails {
+                access: Vec::new(),
                 contact: None,
                 opening_hours: Some("24/7".into()),
                 extent: None,

@@ -16,8 +16,8 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Extent, Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
-        SourceProvenance, point_geometry,
+        Entrance, Extent, Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord,
+        Prominence, Record, SourceProvenance, point_geometry,
     },
     util::text::normalize_for_compare,
 };
@@ -896,6 +896,7 @@ fn boundary_from_relation(
 pub(crate) fn place_relations(
     relations: &[BoundaryRelationStub],
     member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
+    entrances: &HashMap<i64, String>,
 ) -> crate::error::Result<Vec<PoiCandidate>> {
     relations
         .par_iter()
@@ -910,6 +911,19 @@ pub(crate) fn place_relations(
                 .chain(&lines.inner)
                 .flatten()
                 .map(|vertex| vertex.node_id)
+                .collect();
+            // Two member ways meet at a node, which is one entrance.
+            let mut seen = HashSet::new();
+            let entrances = lines
+                .outer
+                .iter()
+                .chain(&lines.inner)
+                .flatten()
+                .filter(|vertex| seen.insert(vertex.node_id))
+                .filter_map(|vertex| {
+                    let kind = entrances.get(&vertex.node_id)?;
+                    Entrance::of_tag(Some(kind), vertex.lon, vertex.lat)
+                })
                 .collect();
             let Some((geometry, _)) = rings_geometry(lines) else {
                 return Ok(None);
@@ -926,6 +940,7 @@ pub(crate) fn place_relations(
                 tags: stub.tags.clone(),
                 outline: Some(outline(&geometry)),
                 nodes,
+                entrances,
             }))
         })
         .filter_map(crate::error::Result::transpose)

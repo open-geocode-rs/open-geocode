@@ -30,6 +30,8 @@ pub struct AddressRecord {
     /// Whether another source places the same house farther from this point
     /// than sources placing one house ever disagree: the point may be wrong.
     pub disputed: bool,
+    /// The entrances its source maps (see [`Entrance`]).
+    pub access: Vec<Entrance>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +223,56 @@ pub struct Brand {
     pub wikidata: Option<u32>,
 }
 
+/// A way in that OpenStreetMap maps for a record, which is a node tagged
+/// `entrance` on the outline of the building or site the record is drawn
+/// with, or the record's own node when it is so tagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entrance {
+    /// Its longitude and latitude in 1e-7 degrees.
+    pub at: [i32; 2],
+    /// The value of its `entrance` tag as written, such as `main`.
+    pub kind: String,
+}
+
+impl Entrance {
+    /// The entrance a node's tags make of it, if they do.
+    pub fn of_tag(kind: Option<&str>, lon: f64, lat: f64) -> Option<Self> {
+        let kind = kind.map(str::trim).filter(|kind| !kind.is_empty())?;
+        Some(Self {
+            at: [
+                crate::records::quantize(lon).ok()?,
+                crate::records::quantize(lat).ok()?,
+            ],
+            kind: kind.to_string(),
+        })
+    }
+}
+
+/// A point to route to when going to a result.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct AccessPoint {
+    #[schema(example = 7.4263)]
+    pub lon: f64,
+    #[schema(example = 43.7396)]
+    pub lat: f64,
+    /// What kind of way in it is, as the value of the OpenStreetMap
+    /// `entrance` tag that maps it, such as `main`, `yes`, `service` or
+    /// `staircase`.
+    #[schema(example = "main")]
+    pub kind: String,
+}
+
+impl From<&Entrance> for AccessPoint {
+    fn from(entrance: &Entrance) -> Self {
+        let [lon, lat] = entrance.at.map(crate::records::dequantize);
+        Self {
+            lon,
+            lat,
+            kind: entrance.kind.clone(),
+        }
+    }
+}
+
 /// The box around something larger than a point, as its west, south, east
 /// and north in 1e-7 degrees. West is greater than east when the box crosses the
 /// antimeridian, and only then.
@@ -235,6 +287,8 @@ pub struct PoiDetails {
     pub opening_hours: Option<String>,
     /// The box around its outline, when it is drawn as an area.
     pub extent: Option<Extent>,
+    /// The entrances its source maps (see [`Entrance`]).
+    pub access: Vec<Entrance>,
 }
 
 impl PoiDetails {
@@ -850,7 +904,7 @@ impl AddressRecord {
 
 impl Serialize for AddressRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("AddressRecord", 8)?;
+        let mut state = serializer.serialize_struct("AddressRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
@@ -863,6 +917,7 @@ impl Serialize for AddressRecord {
         } else {
             state.skip_field("disputed")?;
         }
+        serialize_access(&mut state, &self.access)?;
         state.end()
     }
 }
@@ -1067,11 +1122,17 @@ impl PoiRecord {
     pub fn extent(&self) -> Option<Extent> {
         self.details.as_ref()?.extent
     }
+
+    pub fn access(&self) -> &[Entrance] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| details.access.as_slice())
+    }
 }
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 15)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 16)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -1106,6 +1167,7 @@ impl Serialize for PoiRecord {
             Some(hours) => state.serialize_field("opening_hours", hours)?,
             None => state.skip_field("opening_hours")?,
         }
+        serialize_access(&mut state, self.access())?;
         if self.aliases.is_empty() {
             state.skip_field("aliases")?;
         } else {
@@ -1117,6 +1179,18 @@ impl Serialize for PoiRecord {
             state.serialize_field("aliases", &aliases)?;
         }
         state.end()
+    }
+}
+
+fn serialize_access<S: SerializeStruct>(
+    state: &mut S,
+    access: &[Entrance],
+) -> Result<(), S::Error> {
+    if access.is_empty() {
+        state.skip_field("access")
+    } else {
+        let points = access.iter().map(AccessPoint::from).collect::<Vec<_>>();
+        state.serialize_field("access", &points)
     }
 }
 

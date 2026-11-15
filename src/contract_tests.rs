@@ -962,6 +962,7 @@ fn write_pack(dir: &PathBuf) {
     writer
         .write(
             &AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: king.clone(),
@@ -997,6 +998,10 @@ fn write_pack(dir: &PathBuf) {
                     ),
                     opening_hours: Some("Mo-Fr 07:00-18:00; Sa 08:00-14:00".to_string()),
                     extent: Some([-790_051_000, 429_999_200, -790_049_000, 430_000_800]),
+                    access: vec![crate::record::Entrance {
+                        at: [-790_050_000, 429_999_200],
+                        kind: "main".to_string(),
+                    }],
                 }
                 .kept(),
                 aliases: Vec::new(),
@@ -1150,6 +1155,7 @@ fn write_geneva_pack(dir: &PathBuf) {
     writer
         .write(
             &AddressRecord {
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {

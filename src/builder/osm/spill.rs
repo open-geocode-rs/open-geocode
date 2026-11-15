@@ -12,16 +12,16 @@ use crate::{
     extsort::Spill,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, Brand, Contact, DerivedSourceProvenance,
+        AddressComponents, AddressRecord, Brand, Contact, DerivedSourceProvenance, Entrance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
         LocationPrecision, ObjectType, PlaceRecord, PoiDetails, PoiRecord, PostcodeRecord,
         Prominence, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
     },
     util::{
         codec::{
-            Delta, get_bytes, get_delta, get_front, get_i64, get_opt_extent, get_opt_string,
-            get_string, get_u8, get_u32, get_u64, put_bytes, put_delta, put_front, put_i64,
-            put_opt_extent, put_opt_str, put_str, put_u64,
+            Delta, get_bytes, get_delta, get_entrances, get_front, get_i64, get_opt_extent,
+            get_opt_string, get_string, get_u8, get_u32, get_u64, put_bytes, put_delta,
+            put_entrances, put_front, put_i64, put_opt_extent, put_opt_str, put_str, put_u64,
         },
         geo::line_parts,
     },
@@ -197,6 +197,9 @@ pub(crate) struct PendingAddress {
     pub point: [f64; 2],
     pub precision: LocationPrecision,
     pub source: Source,
+    /// The entrances its source maps. A boxed slice, as few have any and
+    /// every pending address is as wide as this makes it.
+    pub access: Box<[Entrance]>,
 }
 
 /// The components a street order key holds, borrowed from it.
@@ -277,6 +280,10 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// Bit of a pending address's kind byte. When set, its entrances follow
+/// its point.
+const PENDING_ACCESS: u8 = 8;
+
 impl PendingAddress {
     pub(super) fn new(record: &AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
         let point = crate::util::geo::point_lon_lat(&record.geometry)
@@ -293,6 +300,7 @@ impl PendingAddress {
             record.location_precision,
             source,
             seq,
+            record.access.clone().into(),
         ))
     }
 
@@ -302,6 +310,7 @@ impl PendingAddress {
         precision: LocationPrecision,
         source: Source,
         seq: u64,
+        access: Box<[Entrance]>,
     ) -> Self {
         let [lon, lat] = point;
         let mut order = Vec::new();
@@ -347,6 +356,7 @@ impl PendingAddress {
             point,
             precision,
             source,
+            access,
         }
     }
 
@@ -359,7 +369,14 @@ impl PendingAddress {
 
     /// The same address stating `address` instead.
     pub(super) fn restated(&self, address: &AddressComponents) -> Self {
-        Self::from_parts(address, self.point, self.precision, self.source, self.seq)
+        Self::from_parts(
+            address,
+            self.point,
+            self.precision,
+            self.source,
+            self.seq,
+            self.access.clone(),
+        )
     }
 
     /// The components its key holds.
@@ -378,6 +395,7 @@ impl PendingAddress {
             street_postcodes: Vec::new(),
             location_precision: self.precision,
             disputed: false,
+            access: self.access.to_vec(),
             source: datasets.provenance(self.source)?,
             geometry: point_geometry(self.point[0], self.point[1]),
         })
@@ -471,12 +489,20 @@ impl PendingAddress {
             LocationPrecision::Point => 0,
             LocationPrecision::Centroid => 4,
         };
-        out.push(kind | precision);
+        let access = if self.access.is_empty() {
+            0
+        } else {
+            PENDING_ACCESS
+        };
+        out.push(kind | precision | access);
         put_i64(out, self.source.object_id);
         if self.source.object_type == ObjectType::Row {
             put_u64(out, u64::from(self.source.dataset));
         }
         encode_compact_point(out, self.point);
+        if !self.access.is_empty() {
+            put_entrances(out, &self.access);
+        }
     }
 
     fn decode_rest(previous: Option<&Self>, input: &mut &[u8]) -> Result<Self> {
@@ -530,6 +556,11 @@ impl PendingAddress {
                 dataset,
             },
             point: decode_compact_point(input)?,
+            access: if kind & PENDING_ACCESS == 0 {
+                Box::default()
+            } else {
+                get_entrances(input)?.into()
+            },
         })
     }
 }
@@ -979,7 +1010,7 @@ impl Spill for PendingAddress {
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.order.capacity()
+        std::mem::size_of::<Self>() + self.order.capacity() + entrances_heap_bytes(&self.access)
     }
 }
 
@@ -1089,6 +1120,13 @@ impl Spill for PendingRecord {
     }
 }
 
+fn entrances_heap_bytes(entrances: &[Entrance]) -> usize {
+    entrances
+        .iter()
+        .map(|entrance| std::mem::size_of::<Entrance>() + entrance.kind.len())
+        .sum()
+}
+
 fn record_heap_bytes(record: &Record) -> usize {
     let strings = match record {
         Record::Address(_) => 0,
@@ -1110,6 +1148,7 @@ fn record_heap_bytes(record: &Record) -> usize {
                         .flatten()
                         .map(String::len)
                         .sum::<usize>()
+                        + entrances_heap_bytes(&details.access)
                 })
         }
         Record::Interpolation(_) => 96,
@@ -1254,6 +1293,7 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
                 put_opt_str(out, value);
             }
             put_opt_extent(out, record.extent());
+            put_entrances(out, record.access());
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1354,6 +1394,7 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 ),
                 opening_hours: get_opt_string(input)?,
                 extent: get_opt_extent(input)?,
+                access: get_entrances(input)?,
             }
             .kept(),
             source: decode_source(input)?,
@@ -1897,6 +1938,7 @@ mod tests {
                 let lat = 34.0 + (street_id / 1000) as f64 * 0.001 + (random % 1000) as f64 * 1e-7;
                 let parse = |value: f64| format!("{value:.7}").parse::<f64>().expect("number");
                 AddressRecord {
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
@@ -1935,6 +1977,7 @@ mod tests {
         source: SourceProvenance,
     ) -> AddressRecord {
         AddressRecord {
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
@@ -2178,6 +2221,65 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_address_keeps_the_entrances_of_its_record() {
+        let mut record = address_record(
+            "5",
+            Some("Kadeweg"),
+            [4.0002, 52.00015],
+            SourceProvenance::osm(ObjectType::Way, 100),
+        );
+        record.location_precision = LocationPrecision::Centroid;
+        record.access = vec![
+            Entrance {
+                at: [40_000_000, 520_000_000],
+                kind: "main".into(),
+            },
+            Entrance {
+                at: [40_004_000, 520_003_000],
+                kind: "service".into(),
+            },
+        ];
+        let datasets = Datasets::default();
+        let pending = PendingAddress::new(&record, 4, 0).expect("new");
+        assert_eq!(pending.record(&datasets).expect("record"), record);
+        round_trip(&pending);
+        let bare = PendingAddress::new(
+            &address_record(
+                "7",
+                Some("Kadeweg"),
+                [4.0003, 52.0002],
+                SourceProvenance::osm(ObjectType::Node, 7),
+            ),
+            5,
+            0,
+        )
+        .expect("new");
+        // In the address book, after an address with none and before one.
+        for (previous, address) in [(&bare, &pending), (&pending, &bare)] {
+            let mut out = Vec::new();
+            address.encode_following(Some(previous), &mut out);
+            let mut input = out.as_slice();
+            assert_eq!(
+                &PendingAddress::decode_following(Some(previous), &mut input).expect("decode"),
+                address
+            );
+            assert!(input.is_empty());
+        }
+        // Stating its street another way, it is still the same building.
+        let mut restated = record.address.clone();
+        restated.street = Some("Kade Weg".into());
+        assert_eq!(
+            pending
+                .restated(&restated)
+                .record(&datasets)
+                .expect("record")
+                .access,
+            record.access
+        );
+        assert!(bare.record(&datasets).expect("record").access.is_empty());
+    }
+
+    #[test]
     fn a_pending_place_round_trips_its_contact_and_hours() {
         let text = |value: &str| Some(value.to_string());
         for details in [
@@ -2186,6 +2288,20 @@ mod tests {
             PoiDetails::stated(Contact::stated(None, None, text("peize@shell.nl")), None),
             PoiDetails {
                 extent: Some([65_660_000, 532_190_000, 65_670_000, 532_198_000]),
+                ..PoiDetails::default()
+            }
+            .kept(),
+            PoiDetails {
+                access: vec![
+                    Entrance {
+                        at: [65_664_000, 532_190_000],
+                        kind: "main".into(),
+                    },
+                    Entrance {
+                        at: [65_670_000, 532_195_000],
+                        kind: "service".into(),
+                    },
+                ],
                 ..PoiDetails::default()
             }
             .kept(),

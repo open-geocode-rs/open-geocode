@@ -7,7 +7,7 @@
 
 use crate::{
     error::{Error, Result},
-    record::Extent,
+    record::{Entrance, Extent},
 };
 
 pub(crate) fn put_u64(out: &mut Vec<u8>, mut value: u64) {
@@ -70,6 +70,36 @@ pub(crate) fn get_opt_extent(input: &mut &[u8]) -> Result<Option<Extent>> {
         1 => get_extent(input).map(Some),
         _ => Err(Error::Decode("an extent's presence byte is not 0 or 1")),
     }
+}
+
+/// A count, then each entrance as its longitude, its latitude and its kind.
+pub(crate) fn put_entrances(out: &mut Vec<u8>, entrances: &[Entrance]) {
+    put_u64(out, entrances.len() as u64);
+    for entrance in entrances {
+        put_i64(out, i64::from(entrance.at[0]));
+        put_i64(out, i64::from(entrance.at[1]));
+        put_str(out, &entrance.kind);
+    }
+}
+
+pub(crate) fn get_entrances(input: &mut &[u8]) -> Result<Vec<Entrance>> {
+    let count = get_u64(input)?;
+    // Each takes at least three bytes, so a corrupt count allocates nothing.
+    if count > input.len() as u64 {
+        return Err(Error::Decode("entrances are truncated"));
+    }
+    let side = |input: &mut &[u8]| {
+        i32::try_from(get_i64(input)?)
+            .map_err(|_| Error::Decode("an entrance's coordinate is out of range"))
+    };
+    (0..count)
+        .map(|_| {
+            Ok(Entrance {
+                at: [side(input)?, side(input)?],
+                kind: get_string(input)?,
+            })
+        })
+        .collect()
 }
 
 pub(crate) const fn zigzag(value: i64) -> u64 {
@@ -228,6 +258,42 @@ mod tests {
         assert!(matches!(
             get_opt_extent(&mut wide.as_slice()),
             Err(Error::Decode("an extent's side is out of range"))
+        ));
+    }
+
+    #[test]
+    fn entrances_round_trip_and_bad_ones_are_refused() {
+        let entrances = vec![
+            Entrance {
+                at: [74_263_000, 437_396_000],
+                kind: "main".to_string(),
+            },
+            Entrance {
+                at: [-1_799_999_999, -899_999_999],
+                kind: "staircase".to_string(),
+            },
+        ];
+        let mut out = Vec::new();
+        put_entrances(&mut out, &[]);
+        put_entrances(&mut out, &entrances);
+        let mut input = out.as_slice();
+        assert_eq!(get_entrances(&mut input).unwrap(), Vec::new());
+        assert_eq!(get_entrances(&mut input).unwrap(), entrances);
+        assert!(input.is_empty());
+        assert!(matches!(
+            get_entrances(&mut &out[1..out.len() - 1]),
+            Err(Error::Decode("unexpected end of encoded data"))
+        ));
+        assert!(matches!(
+            get_entrances(&mut [200u8, 1].as_slice()),
+            Err(Error::Decode("entrances are truncated"))
+        ));
+        let mut wide = vec![1];
+        put_i64(&mut wide, i64::from(i32::MIN) - 1);
+        wide.extend_from_slice(&[0, 0, 0]);
+        assert!(matches!(
+            get_entrances(&mut wide.as_slice()),
+            Err(Error::Decode("an entrance's coordinate is out of range"))
         ));
     }
 
