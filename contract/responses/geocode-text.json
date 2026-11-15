@@ -44,6 +44,10 @@
         "id": "osm:node:10",
         "label": "10 King Street, M5V 1A1",
         "layer": "address",
+        "match": {
+          "housenumber": "matched",
+          "street": "matched"
+        },
         "name": "10 King Street",
         "score": 0.0,
         "source": {

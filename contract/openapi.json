@@ -499,6 +499,10 @@
                 "description": "`true` when no match was found and the result is the most precise\narea the query names instead: its postcode, a town or other area,\nits region or its country. `layer` says which. Absent otherwise.",
                 "type": "boolean"
               },
+              "match": {
+                "$ref": "#/components/schemas/QueryMatch",
+                "description": "How each address part the query states matched the result. Present\non a `/geocode` result found by reading the query as an address,\nwhen it states a part. Absent on a result found by its whole name,\nand on `/places` and `/autocomplete`. A place is sought by its name\nand a suggestion by what is typed so far, which no address reading\njudges."
+              },
               "score": {
                 "description": "Text relevance. Higher is better. Comparable only within one\nresponse: use `confidence` to judge a single result.",
                 "format": "float",
@@ -798,6 +802,15 @@
         ],
         "type": "object"
       },
+      "PartMatch": {
+        "description": "How one stated address part matched a result, best first.\n\n- `matched`: the result has the value the query states, after\n  normalisation such as case, accents and abbreviations.\n- `partial`: the result's value differs and was accepted as the same.\n- `unmatched`: the result does not have the part, has another value, or\n  nothing says it has the stated one.",
+        "enum": [
+          "matched",
+          "partial",
+          "unmatched"
+        ],
+        "type": "string"
+      },
       "PlacesItem": {
         "description": "One item of a `/places` batch: `GET /places`' parameters and an `id`.\n\nEvery field is optional here because the request's query string may give\nit for all items. `q` or `ids` must come from one or the other.",
         "properties": {
@@ -917,6 +930,33 @@
           "error_code"
         ],
         "title": "Problem",
+        "type": "object"
+      },
+      "QueryMatch": {
+        "description": "How each address part a query states matched one result. A part the\nquery does not state is absent, whatever the result holds for it. Every\nresult fills in parts the query left out, so naming them says nothing.\nThe query's parts are the ones its reading labels, so no query states a\ndistrict.\n\nWhat judges each part is listed below.\n\n- `housenumber`: `matched` when the result states the number.\n  `partial` when the number is placed on a range or between its\n  neighbours, or the result states the number the stated one starts\n  with (`407` for `407a`). `unmatched` when a street or an area answers\n  for it.\n- `street`: the query's street words against the words of the result's\n  street, as search counts typos. `matched` when the street has each\n  word, or the word an abbreviation stands for. `partial` when a word is\n  a typo away or missing. `unmatched` when it has none of them or the\n  result has no street.\n- `unit`: `matched` when the result states the unit, else `unmatched`.\n- `locality`: `matched` when an area the result lies in has the name.\n  `partial` when the name is read through a typo, is the postal town of\n  the stated postcode, or is a settlement mapped as a point beside the\n  result. `unmatched` when the result lies elsewhere or the Pack does\n  not know the name.\n- `region` and `country`: `matched` when the result lies in the one\n  named, `partial` when the name is read through a typo, `unmatched`\n  when the Pack does not know the name.\n- `postcode`: `matched` when the result or its street states the\n  postcode. `partial` when one starts the other, or the result only\n  lies where the postcode does. `unmatched` when the result states\n  another or nothing places it.\n\nOn a `fallback` result the parts the area answers for are judged, and\nevery other stated part is `unmatched`.",
+        "properties": {
+          "country": {
+            "$ref": "#/components/schemas/PartMatch"
+          },
+          "housenumber": {
+            "$ref": "#/components/schemas/PartMatch"
+          },
+          "locality": {
+            "$ref": "#/components/schemas/PartMatch"
+          },
+          "postcode": {
+            "$ref": "#/components/schemas/PartMatch"
+          },
+          "region": {
+            "$ref": "#/components/schemas/PartMatch"
+          },
+          "street": {
+            "$ref": "#/components/schemas/PartMatch"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/PartMatch"
+          }
+        },
         "type": "object"
       },
       "ReverseBatch": {

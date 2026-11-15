@@ -21,6 +21,11 @@
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
+        "match": {
+          "housenumber": "unmatched",
+          "locality": "matched",
+          "street": "unmatched"
+        },
         "name": "Toronto",
         "score": 13.642908,
         "source": {
