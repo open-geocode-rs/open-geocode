@@ -828,8 +828,11 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
     }
     let plan = Plan::read(request.uri().query(), input)?;
     // A repeated flag is left to each row's parse, as other shared parameters.
+    // A JSONL row may unset the flag, so only a CSV input, whose rows cannot,
+    // is refused up front.
     let mut shared = plan.shared.iter().filter(|(name, _)| name == "enclosing");
-    if let (Some((_, value)), None) = (shared.next(), shared.next())
+    if input == Format::Csv
+        && let (Some((_, value)), None) = (shared.next(), shared.next())
         && parse_enclosing(&Param::Value(value.clone()))?
         && output == Format::Csv
     {
