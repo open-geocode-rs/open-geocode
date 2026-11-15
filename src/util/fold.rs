@@ -62,6 +62,95 @@ pub(crate) fn search_pieces(value: &str, piece: impl FnMut(Piece<'_>)) {
     split(value, Key::Search, piece);
 }
 
+/// A word of a text as its [`search_key`] writes it, and where in the text
+/// it was cut from. Offsets count characters of the text, not bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Span {
+    pub(crate) key: String,
+    pub(crate) start: usize,
+    /// Per character of `key`, where the characters of the text it was
+    /// folded from end. One of the text may fold to several ("ß" is "ss").
+    ends: Vec<usize>,
+}
+
+impl Span {
+    /// Where the word ends in the text, exclusive.
+    pub(crate) fn end(&self) -> usize {
+        self.end_of(self.ends.len())
+    }
+
+    /// Where the first `chars` characters of `key` end in the text, a
+    /// character of the text half taken counted whole.
+    pub(crate) fn end_of(&self, chars: usize) -> usize {
+        match chars.min(self.ends.len()).checked_sub(1) {
+            Some(last) => self.ends[last],
+            None => self.start,
+        }
+    }
+}
+
+/// The words of `value` as [`search_key`] writes them, each with where it
+/// lies in `value`.
+///
+/// Folded a letter and its marks at a time, so each character of a key
+/// knows the characters it came from. Conjoining jamo compose only across
+/// letters, so a word written with them keeps them apart here and has no
+/// key a query can equal.
+pub(crate) fn search_spans(value: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut open = None::<Span>;
+    let mut close = |open: &mut Option<Span>| {
+        // A run of replacement characters alone spells nothing (see `flush`).
+        spans.extend(open.take().filter(|span| {
+            span.key
+                .chars()
+                .any(|character| character != char::REPLACEMENT_CHARACTER)
+        }));
+    };
+    let mut characters = value.char_indices().peekable();
+    let mut at = 0;
+    while let Some((from, first)) = characters.next() {
+        let start = at;
+        at += 1;
+        let mut to = from + first.len_utf8();
+        while let Some(&(next, mark)) = characters.peek()
+            && is_mark(mark)
+        {
+            characters.next();
+            at += 1;
+            to = next + mark.len_utf8();
+        }
+        let add = |open: &mut Option<Span>, folded: &str| {
+            let span = open.get_or_insert_with(|| Span {
+                key: String::new(),
+                start,
+                ends: Vec::new(),
+            });
+            span.key.push_str(folded);
+            span.ends.extend(folded.chars().map(|_| at));
+        };
+        if first.is_ascii() && to == from + 1 {
+            match first.is_ascii_alphanumeric() {
+                true => add(
+                    &mut open,
+                    first.to_ascii_lowercase().encode_utf8(&mut [0; 4]),
+                ),
+                false => close(&mut open),
+            }
+        } else if first == char::REPLACEMENT_CHARACTER {
+            // Stays in its word, as `split_unicode` keeps it.
+            add(&mut open, first.encode_utf8(&mut [0; 4]));
+        } else {
+            split(&value[from..to], Key::Search, |piece| match piece {
+                Piece::Word(word) => add(&mut open, word),
+                Piece::Gap(_) => close(&mut open),
+            });
+        }
+    }
+    close(&mut open);
+    spans
+}
+
 fn join(value: &str, key: Key) -> Option<String> {
     let mut joined = String::with_capacity(value.len());
     split(value, key, |piece| {
@@ -254,6 +343,64 @@ mod tests {
         ] {
             assert_eq!(pieces(value, true), pieces(value, false), "{value:?}");
         }
+    }
+
+    #[test]
+    fn spans_are_the_words_of_the_search_key_where_the_text_writes_them() {
+        for value in [
+            "",
+            "  Main--STREET (rear) ",
+            "12A King St.",
+            "Palais de l'Élysée",
+            "Łódź, Straße 5",
+            "wa\u{304}naka",
+            "Ch\u{fffd}teauneuf \u{fffd}\u{fffd} de Gadagne",
+            "\u{fffd}cole",
+            "ﬁn １２ ½",
+            "東京都 渋谷",
+            "ʻokina hawaiʻi",
+            " \u{301}x",
+        ] {
+            let keys = search_spans(value)
+                .into_iter()
+                .map(|span| span.key)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (!keys.is_empty()).then(|| keys.join(" ")),
+                search_key(value),
+                "{value:?}"
+            );
+        }
+        let cut = |value: &str| {
+            search_spans(value)
+                .into_iter()
+                .map(|span| (span.key.clone(), span.start, span.end()))
+                .collect::<Vec<_>>()
+        };
+        let word = |key: &str, start, end| (key.to_string(), start, end);
+        assert_eq!(
+            cut("Palais de l'Élysée"),
+            [
+                word("palais", 0, 6),
+                word("de", 7, 9),
+                word("l", 10, 11),
+                word("elysee", 12, 18),
+            ]
+        );
+        // "É" is two bytes and "ß" folds to two letters. Neither moves a
+        // character offset.
+        assert_eq!(
+            cut("Été, Straße 5"),
+            [word("ete", 0, 3), word("strasse", 5, 11), word("5", 12, 13)]
+        );
+        // A decomposed letter is two characters of the text and one of the
+        // key.
+        assert_eq!(cut("wa\u{304}naka"), [word("wanaka", 0, 7)]);
+        let strasse = &search_spans("Straße 5")[0];
+        assert_eq!(
+            [0, 1, 4, 5, 6, 7, 99].map(|chars| strasse.end_of(chars)),
+            [0, 1, 4, 5, 5, 6, 6]
+        );
     }
 
     #[test]

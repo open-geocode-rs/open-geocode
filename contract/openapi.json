@@ -499,6 +499,13 @@
                 "description": "`true` when no match was found and the result is the most precise\narea the query names instead: its postcode, a town or other area,\nits region or its country. `layer` says which. Absent otherwise.",
                 "type": "boolean"
               },
+              "highlights": {
+                "description": "The parts of `label` the typed text matched, in order, none\noverlapping. Present on `/autocomplete` results, the only ones found\nby text still being typed. Absent when no typed word can be placed\nin the label, as on a place suggested for its category.",
+                "items": {
+                  "$ref": "#/components/schemas/Highlight"
+                },
+                "type": "array"
+              },
               "match": {
                 "$ref": "#/components/schemas/QueryMatch",
                 "description": "How each address part the query states matched the result. Present\non a `/geocode` result found by reading the query as an address,\nwhen it states a part. Absent on a result found by its whole name,\nand on `/places` and `/autocomplete`. A place is sought by its name\nand a suggestion by what is typed so far, which no address reading\njudges."
@@ -599,6 +606,24 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "Highlight": {
+        "description": "A range of a result's `label` that the typed text matched.\n\n`start` and `end` count Unicode scalar values from the start of the\nlabel, `end` exclusive. They are not bytes and not UTF-16 code units, so\na client converts them to the offsets its strings use.\n\nSearch matches typed words against the record, not against the label,\nso each typed word is placed by finding it again in the label, cut into\nwords and folded as the index folds text. `elysee` marks `Élysée`. A\nword still being typed marks only the letters typed so far, and a word\nmatched through a typo marks the whole label word.",
+        "properties": {
+          "end": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
         "type": "object"
       },
       "InvalidParam": {

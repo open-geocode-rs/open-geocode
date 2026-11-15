@@ -27,7 +27,7 @@ use tantivy::{
 };
 
 use crate::{
-    api::{Accuracy, Address, PartMatch, QueryMatch},
+    api::{Accuracy, Address, Highlight, PartMatch, QueryMatch},
     confidence::{self, Agreement, Features},
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
@@ -219,6 +219,10 @@ pub struct TextSearchHit {
     /// an answer no reading of the query was judged against.
     #[serde(skip)]
     pub matched: QueryMatch,
+    /// The parts of the label the typed text matched, on a suggestion (see
+    /// [`highlight`]).
+    #[serde(skip)]
+    pub highlights: Vec<Highlight>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +400,7 @@ impl TextSearchHit {
             fallback: false,
             signals: Signals::default(),
             matched: QueryMatch::default(),
+            highlights: Vec::new(),
         }
     }
 }
@@ -964,6 +969,10 @@ impl TextSearcher {
         }
         self.rate(&mut hits);
         hits.truncate(limit);
+        let highlighter = highlight::Highlighter::new(completion, number, words, typing);
+        for hit in &mut hits {
+            hit.highlights = highlighter.ranges(&hit.record.label);
+        }
         Ok(hits)
     }
 
@@ -2520,6 +2529,7 @@ impl TextSearcher {
                         fallback: false,
                         signals: Signals::default(),
                         matched: QueryMatch::default(),
+                        highlights: Vec::new(),
                     };
                     if !cx.search.filters.admit(&hit) {
                         continue;
@@ -6194,6 +6204,7 @@ impl TextSearcher {
                     fallback: false,
                     signals: Signals::default(),
                     matched: QueryMatch::default(),
+                    highlights: Vec::new(),
                 };
                 if !accept(&hit)? {
                     continue;
@@ -6884,6 +6895,7 @@ impl TextSearcher {
             fallback: false,
             signals: Signals::default(),
             matched: QueryMatch::default(),
+            highlights: Vec::new(),
         })
     }
 }
@@ -8556,10 +8568,13 @@ fn context_words(plan: &QueryPlan) -> Vec<String> {
 fn types_word(typed: &str, word: &str, last: bool) -> bool {
     typed == word
         || (last && word.starts_with(typed))
-        || (contraction(typed) && abbreviates(typed, word))
-        || lattice::forms_both_ways(typed)
-            .iter()
-            .any(|form| form == word)
+        || stands_for(typed, &lattice::forms_both_ways(typed), word)
+}
+
+/// Whether `typed` is `word` contracted, or written in another of its
+/// `forms` (see [`lattice::forms_both_ways`]).
+fn stands_for(typed: &str, forms: &[String], word: &str) -> bool {
+    (contraction(typed) && abbreviates(typed, word)) || forms.iter().any(|form| form == word)
 }
 
 /// Contractions drop vowels. "cit" keeps one, so it is "city" cut short,
@@ -10501,6 +10516,8 @@ fn is_address_number_token(token: &str) -> bool {
         .is_some_and(|character| character.is_ascii_digit())
 }
 
+mod highlight;
+
 mod named;
 
 mod choose;
@@ -11926,6 +11943,7 @@ mod tests {
             confidence: None,
             signals: Signals::default(),
             matched: QueryMatch::default(),
+            highlights: Vec::new(),
         };
         let addresses = || {
             vec![
@@ -12951,6 +12969,106 @@ mod tests {
         assert_eq!(first("pike plcae mark").as_deref(), Some("osm:node:2"));
         assert_eq!(first("xtarbucks"), None);
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_suggestion_marks_where_its_label_has_what_was_typed() {
+        let temp_dir = temp_pack_path("autocomplete-highlights");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let poi = |object_id, name: &str, other: &[&str]| PoiRecord {
+            alt_names: other.iter().map(|name| name.to_string()).collect(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(-122.34, 47.61),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, object_id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            details: None,
+            aliases: Vec::new(),
+        };
+        for record in [
+            poi(1, "Starbucks", &["Sbux"]),
+            poi(2, "Pike Place Market", &[]),
+            poi(3, "Palais de l'Élysée", &[]),
+            poi(4, "Café Łódź", &[]),
+        ] {
+            writer.write(&record.into(), None).expect("poi");
+        }
+        writer
+            .write(
+                &address_record("osm:node:5", "", "10", "King Street", Some("Toronto"), None)
+                    .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let first = |query: &str| {
+            let options = TextAutocompleteOptions {
+                query: query.to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            };
+            let hit = suggest(&searcher, &searcher.places(), &options)
+                .expect("suggest")
+                .into_iter()
+                .next()
+                .expect("a suggestion");
+            let ranges = hit
+                .highlights
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>();
+            (hit.record.label, ranges)
+        };
+        let (palace, cafe) = ("Palais de l'Élysée", "Café Łódź");
+        let house = "10 King Street, Toronto";
+        for (typed, label, ranges) in [
+            ("starb", "Starbucks", vec![(0, 5)]),
+            ("pike place", "Pike Place Market", vec![(0, 4), (5, 10)]),
+            // The word being typed marks what is typed of it.
+            ("pike pl", "Pike Place Market", vec![(0, 4), (5, 7)]),
+            ("place mar", "Pike Place Market", vec![(5, 10), (11, 14)]),
+            // Typed without its accent, and after an apostrophe.
+            ("elysee", palace, vec![(12, 18)]),
+            (
+                "palais de l'ely",
+                palace,
+                vec![(0, 6), (7, 9), (10, 11), (12, 15)],
+            ),
+            // A typo marks the word it is taken for, a word cut short and
+            // a typo away as many letters as were typed.
+            ("starbuks", "Starbucks", vec![(0, 9)]),
+            ("strabu", "Starbucks", vec![(0, 6)]),
+            (
+                "pike plcae mark",
+                "Pike Place Market",
+                vec![(0, 4), (5, 10), (11, 15)],
+            ),
+            // Characters, not bytes. "é" and each letter of "Łódź" but "d"
+            // are two bytes.
+            ("lodz", cafe, vec![(5, 9)]),
+            ("cafe lo", cafe, vec![(0, 4), (5, 7)]),
+            ("10 king st", house, vec![(0, 2), (3, 7), (8, 10)]),
+            ("king street 10", house, vec![(0, 2), (3, 7), (8, 14)]),
+            // Out of the label's order, and "st" whole as "street".
+            ("toronto king", house, vec![(3, 7), (16, 23)]),
+            ("king st tor", house, vec![(3, 7), (8, 14), (16, 19)]),
+            // Found by another name, which the label does not show.
+            ("sbux", "Starbucks", Vec::new()),
+        ] {
+            assert_eq!(first(typed), (label.to_string(), ranges), "{typed}");
+        }
+        assert_eq!(cafe.char_indices().nth(5).map(|(byte, _)| byte), Some(6));
+        assert_eq!(cafe.chars().skip(5).take(4).collect::<String>(), "Łódź");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
