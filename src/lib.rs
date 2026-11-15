@@ -1,3 +1,4 @@
+mod address_template;
 pub mod alloc;
 pub mod api;
 pub mod batch;
