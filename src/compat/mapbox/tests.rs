@@ -848,6 +848,7 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         bbox: None,
         timezone: None,
         access: Vec::new(),
+        address_lines: Vec::new(),
         address: Address {
             unit: unit.map(str::to_string),
             ..Address::default()

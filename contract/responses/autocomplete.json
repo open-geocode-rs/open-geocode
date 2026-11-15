@@ -26,6 +26,11 @@
             "type": "Street"
           }
         },
+        "address_lines": [
+          "12 King Street",
+          "Toronto, ON M5V 1A1",
+          "Canada"
+        ],
         "bbox": [
           -79.0051,
           42.99992,

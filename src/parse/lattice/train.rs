@@ -5,7 +5,7 @@
 //! planet build trains each country on as many rows as a build of that
 //! country alone, in memory that does not grow with the input. Once the Pack
 //! is sealed, [`train`] reads the drawn records back in Pack order and writes
-//! them out the way people write addresses: through its country's address
+//! them out the way people write addresses, through its country's address
 //! template ([`crate::address_template`]), with the noise real queries carry:
 //! commas dropped, fields left out or swapped, street types abbreviated, a
 //! unit added, one-letter typos. Some rows hide the dictionary hits of their
