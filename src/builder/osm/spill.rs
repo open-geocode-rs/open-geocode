@@ -12,10 +12,10 @@ use crate::{
     extsort::Spill,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, Brand, DerivedSourceProvenance,
+        AddressComponents, AddressRecord, Brand, Contact, DerivedSourceProvenance,
         InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Prominence, Record,
-        RoadClass, SourceProvenance, StreetRecord, point_geometry,
+        LocationPrecision, ObjectType, PlaceRecord, PoiDetails, PoiRecord, PostcodeRecord,
+        Prominence, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
     },
     util::{
         codec::{
@@ -1097,6 +1097,20 @@ fn record_heap_bytes(record: &Record) -> usize {
                 + strings_heap_bytes(&record.alt_names)
                 + record.category.len()
                 + record.address.as_ref().map_or(0, address_heap_bytes)
+                + record.details.as_ref().map_or(0, |details| {
+                    let contact = details.contact.as_ref();
+                    std::mem::size_of::<PoiDetails>()
+                        + [
+                            contact.and_then(|contact| contact.phone.as_ref()),
+                            contact.and_then(|contact| contact.website.as_ref()),
+                            contact.and_then(|contact| contact.email.as_ref()),
+                            details.opening_hours.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(String::len)
+                        .sum::<usize>()
+                })
         }
         Record::Interpolation(_) => 96,
         Record::Street(record) => {
@@ -1230,6 +1244,15 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
                     .and_then(|brand| brand.wikidata)
                     .map_or(0, u64::from),
             );
+            let contact = record.contact();
+            for value in [
+                contact.and_then(|contact| contact.phone.as_deref()),
+                contact.and_then(|contact| contact.website.as_deref()),
+                contact.and_then(|contact| contact.email.as_deref()),
+                record.opening_hours(),
+            ] {
+                put_opt_str(out, value);
+            }
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1322,6 +1345,14 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 let wikidata = spilled_item(input)?;
                 name.map(|name| Brand { name, wikidata })
             },
+            details: PoiDetails::stated(
+                Contact::stated(
+                    get_opt_string(input)?,
+                    get_opt_string(input)?,
+                    get_opt_string(input)?,
+                ),
+                get_opt_string(input)?,
+            ),
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -1756,6 +1787,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }),
             Record::Poi(PoiRecord {
@@ -1769,6 +1801,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }),
         ];
@@ -2107,6 +2140,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         let mut outline = Vec::new();
@@ -2137,6 +2171,49 @@ mod tests {
             .expect("a place");
             round_trip(&pending);
             assert_eq!(pending.into_place().identity, identity);
+        }
+    }
+
+    #[test]
+    fn a_pending_place_round_trips_its_contact_and_hours() {
+        let text = |value: &str| Some(value.to_string());
+        for details in [
+            None,
+            PoiDetails::stated(None, text("24/7")),
+            PoiDetails::stated(Contact::stated(None, None, text("peize@shell.nl")), None),
+            PoiDetails::stated(
+                Contact::stated(
+                    text("+31 50 123 4567"),
+                    text("https://shell.nl/peize"),
+                    text("peize@shell.nl"),
+                ),
+                text("Mo-Su 06:00-23:00"),
+            ),
+        ] {
+            let record = PoiRecord {
+                alt_names: Vec::new(),
+                name: "Shell".into(),
+                category: "amenity:fuel".into(),
+                address: None,
+                geometry: point_geometry(6.5665, 53.2194),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 16),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                details,
+                aliases: Vec::new(),
+            };
+            let pending = PendingNamed::place(
+                Place {
+                    record: record.clone(),
+                    identity: Identity::default(),
+                },
+                3,
+            )
+            .expect("a place");
+            round_trip(&pending);
+            assert_eq!(pending.into_place().record, record);
         }
     }
 

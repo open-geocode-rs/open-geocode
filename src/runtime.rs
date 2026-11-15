@@ -2206,6 +2206,128 @@ mod router_tests {
             .collect()
     }
 
+    /// A cafe stating its contact and hours at -79.0, and a bare one at -79.1.
+    fn write_poi_pack(dir: &Path) {
+        use crate::record::{Contact, PoiDetails, PoiRecord};
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let cafe = |id: i64, name: &str, lon: f64, details| PoiRecord {
+            alt_names: Vec::new(),
+            name: name.to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(lon, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, id),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            details,
+            aliases: Vec::new(),
+        };
+        let stated = PoiDetails::stated(
+            Contact::stated(
+                Some("+1 (416) 555-0111".to_string()),
+                Some("HTTP://Harbour.example/Cafe".to_string()),
+                None,
+            ),
+            Some("Mo-Fr 07:00-18:00; Sa off".to_string()),
+        );
+        for record in [
+            cafe(1, "Harbour Cafe", -79.0, stated),
+            cafe(2, "Lantern Cafe", -79.1, None),
+        ] {
+            writer.write(&record.into(), None).expect("write poi");
+        }
+        writer.finish().expect("finish");
+    }
+
+    /// A record's contact and hours are its own: every route that answers
+    /// with it gives them alike, and a POI stating none has no such field.
+    #[tokio::test]
+    async fn a_poi_carries_its_contact_and_hours_on_every_route() {
+        let pack = temp_path("poi-details");
+        write_poi_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let contact = serde_json::json!({
+            "phone": "+1 (416) 555-0111",
+            "website": "HTTP://Harbour.example/Cafe",
+        });
+        let hours = serde_json::json!("Mo-Fr 07:00-18:00; Sa off");
+        let details = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (
+                properties["id"].clone(),
+                properties.get("contact").cloned(),
+                properties.get("opening_hours").cloned(),
+            )
+        };
+        let stating = (serde_json::json!("osm:node:1"), Some(contact), Some(hours));
+        let bare = (serde_json::json!("osm:node:2"), None, None);
+
+        for (uri, expected) in [
+            ("/places?q=Harbour%20Cafe", &stating),
+            ("/places?ids=osm:node:1", &stating),
+            ("/autocomplete?q=Harbour", &stating),
+            ("/reverse?lon=-79.0&lat=43.0&layer=poi", &stating),
+            ("/places?q=Lantern%20Cafe", &bare),
+            ("/places?ids=osm:node:2", &bare),
+            ("/autocomplete?q=Lantern", &bare),
+            ("/reverse?lon=-79.1&lat=43.0&layer=poi", &bare),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            assert_eq!(&details(&reply.json()), expected, "{uri}");
+        }
+
+        for (route, body) in [
+            (
+                "/places",
+                r#"[{"q": "Harbour Cafe"}, {"ids": "osm:node:1"}, {"ids": "osm:node:2"}]"#,
+            ),
+            (
+                "/reverse",
+                r#"[{"lon": -79.0, "lat": 43.0, "layer": "poi"},
+                    {"lon": -79.0, "lat": 43.0, "layer": "poi"},
+                    {"lon": -79.1, "lat": 43.0, "layer": "poi"}]"#,
+            ),
+        ] {
+            for method in ["POST", "QUERY"] {
+                let reply = send(router.clone(), batch_request(method, route, body)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{method} {route}");
+                let results = reply.json()["results"].clone();
+                for (item, expected) in [&stating, &stating, &bare].into_iter().enumerate() {
+                    assert_eq!(
+                        &details(&results[item]["response"]),
+                        expected,
+                        "{method} {route} item {item}"
+                    );
+                }
+            }
+        }
+
+        let rows = "{\"lon\": -79.0, \"lat\": 43.0, \"layer\": \"poi\"}\n\
+                    {\"lon\": -79.1, \"lat\": 43.0, \"layer\": \"poi\"}\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=reverse", "application/jsonl", rows),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(details(&lines[0]["response"]), stating);
+        assert_eq!(details(&lines[1]["response"]), bare);
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
     /// A CSV comes back as it went, each row with `geocode batch`'s columns
     /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]

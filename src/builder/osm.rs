@@ -4921,6 +4921,93 @@ mod tests {
     }
 
     #[test]
+    fn a_built_place_answers_with_the_contact_and_hours_its_tags_state() {
+        let dir = temp_dir("contact");
+        let input = dir.join("contact.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        1,
+                        52.37,
+                        4.89,
+                        &[
+                            ("name", "Cafe Zanoli"),
+                            ("amenity", "cafe"),
+                            ("phone", "+31 20 555 0111;+31 20 555 0112"),
+                            ("contact:website", "https://Zanoli.example/"),
+                            ("email", "n/a"),
+                            ("opening_hours", "Mo-Fr 08:00-18:00; Sa 09:00-13:00"),
+                        ],
+                    ),
+                    node(
+                        2,
+                        52.38,
+                        4.90,
+                        &[("name", "Cafe Blauw"), ("amenity", "cafe")],
+                    ),
+                    node(
+                        3,
+                        52.39,
+                        4.91,
+                        &[
+                            ("name", "Cafe Oud"),
+                            ("disused:amenity", "cafe"),
+                            ("phone", "+31 20 555 0113"),
+                        ],
+                    ),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        build(&dir.join("pack"), &input, None);
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let found = |query: &str| {
+            places
+                .search(&TextSearchOptions {
+                    query: query.into(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record)
+                .map(|record| (record.id, record.contact, record.opening_hours))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found("Cafe Zanoli")[0],
+            (
+                "osm:node:1".to_string(),
+                Some(crate::record::Contact {
+                    phone: Some("+31 20 555 0111".to_string()),
+                    website: Some("https://Zanoli.example/".to_string()),
+                    email: None,
+                }),
+                Some("Mo-Fr 08:00-18:00; Sa 09:00-13:00".to_string()),
+            )
+        );
+        assert_eq!(
+            found("Cafe Blauw")[0],
+            ("osm:node:2".to_string(), None, None)
+        );
+        // Closed for good is no place: the Pack holds no record to label.
+        assert!(
+            found("Cafe Oud")
+                .iter()
+                .all(|(id, _, _)| id != "osm:node:3")
+        );
+    }
+
+    #[test]
     fn a_place_whose_wikidata_item_is_read_more_ranks_first() {
         let dir = temp_dir("qrank");
         let input = dir.join("cafes.osm.pbf");

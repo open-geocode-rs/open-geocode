@@ -24,8 +24,8 @@ use crate::{
     labels,
     pack::{Reader, RecordId, Summary},
     record::{
-        AddressComponents, Brand, InterpolationAddressComponents, Layer, OSM_DATASET, ObjectType,
-        PlaceLayer, RoadClass,
+        AddressComponents, Brand, Contact, InterpolationAddressComponents, Layer, OSM_DATASET,
+        ObjectType, PlaceLayer, RoadClass,
     },
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
@@ -211,6 +211,17 @@ pub struct Common {
     /// Zanoli" is an Esso. Present only on places.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brand: Option<Brand>,
+    /// How to reach a place: its phone number, website and email, each as
+    /// its source writes it. og rewrites none and does not check that one
+    /// still answers. Present only on POIs that state at least one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<Contact>,
+    /// When a place is open, in OpenStreetMap's `opening_hours` syntax as
+    /// its source writes it. og does not parse it, so it never says whether
+    /// the place is open now. Present only on POIs that state it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Mo-Fr 08:00-18:00; Sa 09:00-13:00")]
+    pub opening_hours: Option<String>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -999,6 +1010,8 @@ fn common(
         category: summary.category,
         road_class: summary.road_class,
         brand: summary.brand,
+        contact: summary.contact,
+        opening_hours: summary.opening_hours,
         address: summary.address.with_parts(),
         context: contexts.of(record_id)?,
         source: Source {
