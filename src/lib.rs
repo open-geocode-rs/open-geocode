@@ -1,3 +1,4 @@
+mod address_lines;
 mod address_template;
 pub mod alloc;
 pub mod api;

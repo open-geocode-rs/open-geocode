@@ -19,6 +19,11 @@
             "type": "Street"
           }
         },
+        "address_lines": [
+          "10 King Street",
+          "Toronto, ON M5V 1A1",
+          "Canada"
+        ],
         "confidence": 0.975873,
         "context": {
           "country": {

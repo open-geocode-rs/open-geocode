@@ -257,6 +257,19 @@ pub struct Common {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(example = json!([{"lon": 7.4263, "lat": 43.7396, "kind": "main"}]))]
     pub access: Vec<AccessPoint>,
+    /// The address as the lines of a postal address, top to bottom, the way
+    /// the result's country writes one. The country's address template
+    /// says which parts go on which line and in what order. Each part is
+    /// what `address` states or, where it states none, the area of
+    /// `context`, and a part og has nothing for is left out. A region is
+    /// its ISO 3166-2 short code where the template asks for one. The last
+    /// line names the country as `context.country` does, so `lang` names it
+    /// too. Present on an address with its house number, and on a POI that
+    /// states its street. Absent on every other layer, and on a result in
+    /// no country og has a template for.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["10 King Street West", "Toronto, ON M5H 1A1", "Canada"]))]
+    pub address_lines: Vec<String>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -825,6 +838,9 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) {
             &mut area.translations,
         );
     }
+    // The lines name areas, which just changed language.
+    common.address_lines =
+        crate::address_lines::address_lines(common.layer, &common.address, &common.context);
 }
 
 /// Names every result and context area of a forward answer in the
@@ -1032,6 +1048,8 @@ fn common(
             summary.layer
         ))
     })?;
+    let address = summary.address.with_parts();
+    let context = contexts.of(record_id)?;
     Ok(Common {
         id: summary.id,
         layer,
@@ -1046,8 +1064,9 @@ fn common(
         bbox: summary.bbox,
         timezone: summary.timezone,
         access: summary.access,
-        address: summary.address.with_parts(),
-        context: contexts.of(record_id)?,
+        address_lines: crate::address_lines::address_lines(layer, &address, &context),
+        address,
+        context,
         source: Source {
             dataset: summary.source.dataset,
         },
@@ -1151,6 +1170,10 @@ fn flat(
         ("address_region", field(&|p| p.address.region.clone())),
         ("address_postcode", field(&|p| p.address.postcode.clone())),
         ("address_country", field(&|p| p.address.country.clone())),
+        (
+            "address_lines",
+            field(&|p| Some(p.address_lines.join("; "))),
+        ),
         (
             "context_neighbourhood",
             area(|context| &context.neighbourhood),

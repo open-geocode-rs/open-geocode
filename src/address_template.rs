@@ -1,5 +1,5 @@
-//! How each country writes an address: which fields, in what order, on which
-//! line. The templates are those of OpenCageData's address-formatting
+//! How each country writes an address, which is its fields, their order and
+//! their lines. The templates are those of OpenCageData's address-formatting
 //! (<https://github.com/OpenCageData/address-formatting>, MIT, see `NOTICE`),
 //! vendored as `address_template/templates.tsv`.
 //!
@@ -19,7 +19,8 @@ const TEMPLATES: &str = include_str!("address_template/templates.tsv");
 pub(crate) enum Node<F> {
     Text(String),
     Field(F),
-    /// `{{#first}} a || b {{/first}}`: the first alternative with a value.
+    /// The alternatives of `{{#first}} a || b {{/first}}`, of which the
+    /// first with a value is written.
     First(Vec<Vec<Node<F>>>),
 }
 
