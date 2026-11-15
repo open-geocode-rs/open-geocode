@@ -3316,6 +3316,218 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 
+    /// One house and a café in a town, its region and its country, each an
+    /// area search knows by name.
+    fn write_matched_pack(dir: &Path) {
+        use crate::context::{AdminContextTuple, RecordContext};
+        use crate::parse::lattice::CountryCode;
+        use crate::record::{PlaceLayer, PlaceRecord, PoiRecord, Record};
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let within = |tiers: &[(PlaceLayer, crate::pack::RecordId)]| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
+                flags: 0,
+                zone: None,
+            })
+        };
+        let mut place = |layer, name: &str, id, context| {
+            let area = PlaceRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                place_type: "admin_level:8".to_string(),
+                geometry: point_geometry(-79.6, 43.5),
+                source: SourceProvenance::osm(ObjectType::Relation, id),
+                prominence: Default::default(),
+                wikidata: None,
+            };
+            let id = writer.write(&Record::Place(layer, area), context);
+            (id.expect("area"), vec![name.to_string()])
+        };
+        let canada = place(PlaceLayer::Country, "Canada", 11, None);
+        let in_canada = [(PlaceLayer::Country, canada.0)];
+        let ontario = place(PlaceLayer::Region, "Ontario", 12, within(&in_canada));
+        let in_ontario = [in_canada[0], (PlaceLayer::Region, ontario.0)];
+        let toronto = place(PlaceLayer::Locality, "Toronto", 13, within(&in_ontario));
+        let context = within(&[
+            in_ontario[0],
+            in_ontario[1],
+            (PlaceLayer::Locality, toronto.0),
+        ]);
+        let code = CountryCode::parse("CA").expect("code");
+        writer.set_country_codes([(canada.0, code)].into_iter().collect());
+        writer.set_context_names([canada, ontario, toronto].into_iter().collect());
+        let address = AddressComponents {
+            areas: Vec::new(),
+            number: "10".to_string(),
+            street: Some("King Street West".to_string()),
+            place: None,
+            unit: None,
+            locality: None,
+            region: None,
+            postcode: Some("M5H 1A1".to_string()),
+            country: None,
+        };
+        let house = AddressRecord {
+            access: Vec::new(),
+            disputed: false,
+            street_postcodes: Vec::new(),
+            address,
+            geometry: point_geometry(-79.0, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 1),
+        };
+        let cafe = PoiRecord {
+            alt_names: Vec::new(),
+            name: "Lantern Cafe".to_string(),
+            category: "amenity:cafe".to_string(),
+            address: None,
+            geometry: point_geometry(-79.4, 43.0),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 5),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            details: None,
+            aliases: Vec::new(),
+        };
+        writer.write(&house.into(), context.clone()).expect("house");
+        writer.write(&cafe.into(), context).expect("cafe");
+        writer.finish().expect("finish");
+    }
+
+    #[tokio::test]
+    async fn a_geocode_result_says_how_the_query_matched_it_on_every_form() {
+        let pack = temp_path("query-match");
+        write_matched_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let matched = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (properties["id"].clone(), properties.get("match").cloned())
+        };
+        let with = |id: &str, parts: serde_json::Value| (serde_json::json!(id), Some(parts));
+        let without = |id: &str| (serde_json::json!(id), None);
+        let house = |more: &[(&str, &str)]| {
+            let mut parts = serde_json::json!({"housenumber": "matched", "street": "matched"});
+            for (part, how) in more {
+                parts[part] = serde_json::json!(how);
+            }
+            with("osm:node:1", parts)
+        };
+        let in_town = house(&[("locality", "matched")]);
+        let in_postcode = house(&[("postcode", "matched")]);
+        let typo = with(
+            "osm:node:1",
+            serde_json::json!({"housenumber": "matched", "street": "partial"}),
+        );
+        let town_for_it = with(
+            "osm:relation:13",
+            serde_json::json!({
+                "housenumber": "unmatched", "street": "unmatched", "locality": "matched",
+            }),
+        );
+        let by_fields = house(&[("locality", "matched"), ("postcode", "matched")]);
+        let in_region = house(&[("region", "matched")]);
+        let town_by_fields = with(
+            "osm:relation:13",
+            serde_json::json!({
+                "housenumber": "unmatched", "street": "unmatched", "locality": "matched",
+                "region": "matched",
+            }),
+        );
+        let town = without("osm:relation:13");
+        let cafe = without("osm:node:5");
+
+        for (uri, expected) in [
+            ("/geocode?q=10%20King%20Street%20West,%20Toronto", &in_town),
+            (
+                "/geocode?q=10%20King%20Street%20West%20M5H%201A1",
+                &in_postcode,
+            ),
+            ("/geocode?q=10%20Knig%20Street%20West", &typo),
+            ("/geocode?q=99%20Nowhere%20Road,%20Toronto", &town_for_it),
+            (
+                "/geocode?address=10%20King%20Street%20West&locality=Toronto&postcode=M5H%201A1",
+                &by_fields,
+            ),
+            (
+                "/geocode?address=10%20King%20Street%20West&region=Ontario",
+                &in_region,
+            ),
+            (
+                "/geocode?address=99%20Nowhere%20Road&locality=Toronto&region=Ontario",
+                &town_by_fields,
+            ),
+            // Found by its whole name, which no reading labels.
+            ("/geocode?q=Toronto", &town),
+            // A place is sought by name, a suggestion by what is typed.
+            ("/places?q=Lantern%20Cafe,%20Toronto", &cafe),
+            ("/places?ids=osm:node:5", &cafe),
+            ("/autocomplete?q=10%20King%20St", &without("osm:node:1")),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            assert_eq!(&matched(&reply.json()), expected, "{uri}");
+        }
+        let reply = send(
+            router.clone(),
+            request("GET", "/geocode?q=99%20Nowhere%20Road,%20Toronto"),
+        )
+        .await;
+        assert_eq!(
+            reply.json()["features"][0]["properties"]["fallback"],
+            serde_json::json!(true)
+        );
+
+        let body = r#"[{"q": "10 King Street West, Toronto"},
+                       {"address": "10 King Street West", "locality": "Toronto",
+                        "postcode": "M5H 1A1"},
+                       {"q": "99 Nowhere Road, Toronto"}, {"q": "Toronto"}]"#;
+        for method in ["POST", "QUERY"] {
+            let reply = send(router.clone(), batch_request(method, "/geocode", body)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{method}");
+            let results = reply.json()["results"].clone();
+            for (item, expected) in [&in_town, &by_fields, &town_for_it, &town]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    &matched(&results[item]["response"]),
+                    expected,
+                    "{method} item {item}"
+                );
+            }
+        }
+        let reply = send(
+            router.clone(),
+            batch_request("POST", "/places", r#"[{"q": "Lantern Cafe, Toronto"}]"#),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(matched(&reply.json()["results"][0]["response"]), cafe);
+
+        let rows = "{\"q\": \"10 Knig Street West\"}\n\
+                    {\"address\": \"10 King Street West\", \"region\": \"Ontario\"}\n";
+        let reply = send(
+            router.clone(),
+            upload("/jobs?endpoint=geocode", "application/jsonl", rows),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+        let mut lines = std::str::from_utf8(&reply.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line["row"].as_u64());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(matched(&lines[0]["response"]), typo);
+        assert_eq!(matched(&lines[1]["response"]), in_region);
+
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
     /// A CSV comes back as it went, each row with `geocode batch`'s columns
     /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]

@@ -44,6 +44,10 @@
         "id": "osm:way:13:interp:2-98",
         "label": "50 Queen Street, Toronto",
         "layer": "interpolation",
+        "match": {
+          "housenumber": "partial",
+          "street": "matched"
+        },
         "name": "50 Queen Street",
         "score": 0.0,
         "source": {

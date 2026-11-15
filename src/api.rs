@@ -312,6 +312,88 @@ pub struct ForwardProperties {
     /// when the request gives `focus`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_m: Option<f64>,
+    /// How each address part the query states matched the result. Present
+    /// on a `/geocode` result found by reading the query as an address,
+    /// when it states a part. Absent on a result found by its whole name,
+    /// and on `/places` and `/autocomplete`. A place is sought by its name
+    /// and a suggestion by what is typed so far, which no address reading
+    /// judges.
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub matched: Option<QueryMatch>,
+}
+
+/// How each address part a query states matched one result. A part the
+/// query does not state is absent, whatever the result holds for it. Every
+/// result fills in parts the query left out, so naming them says nothing.
+/// The query's parts are the ones its reading labels, so no query states a
+/// district.
+///
+/// What judges each part is listed below.
+///
+/// - `housenumber`: `matched` when the result states the number.
+///   `partial` when the number is placed on a range or between its
+///   neighbours, or the result states the number the stated one starts
+///   with (`407` for `407a`). `unmatched` when a street or an area answers
+///   for it.
+/// - `street`: the query's street words against the words of the result's
+///   street, as search counts typos. `matched` when the street has each
+///   word, or the word an abbreviation stands for. `partial` when a word is
+///   a typo away or missing. `unmatched` when it has none of them or the
+///   result has no street.
+/// - `unit`: `matched` when the result states the unit, else `unmatched`.
+/// - `locality`: `matched` when an area the result lies in has the name.
+///   `partial` when the name is read through a typo, is the postal town of
+///   the stated postcode, or is a settlement mapped as a point beside the
+///   result. `unmatched` when the result lies elsewhere or the Pack does
+///   not know the name.
+/// - `region` and `country`: `matched` when the result lies in the one
+///   named, `partial` when the name is read through a typo, `unmatched`
+///   when the Pack does not know the name.
+/// - `postcode`: `matched` when the result or its street states the
+///   postcode. `partial` when one starts the other, or the result only
+///   lies where the postcode does. `unmatched` when the result states
+///   another or nothing places it.
+///
+/// On a `fallback` result the parts the area answers for are judged, and
+/// every other stated part is `unmatched`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct QueryMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub housenumber: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locality: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<PartMatch>,
+}
+
+impl QueryMatch {
+    /// Whether the query states no part.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How one stated address part matched a result, best first.
+///
+/// - `matched`: the result has the value the query states, after
+///   normalisation such as case, accents and abbreviations.
+/// - `partial`: the result's value differs and was accepted as the same.
+/// - `unmatched`: the result does not have the part, has another value, or
+///   nothing says it has the stated one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PartMatch {
+    Matched,
+    Partial,
+    Unmatched,
 }
 
 /// Properties of a reverse geocoding result.
@@ -886,6 +968,7 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         confidence: hit.confidence,
         fallback: hit.fallback,
         distance_m: None,
+        matched: (!hit.matched.is_empty()).then_some(hit.matched),
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }
