@@ -404,7 +404,7 @@ pub(super) async fn lookup(
             (_, None) => invalid("Lookup key cannot be null or empty (DIS-LI-1027)".to_string()),
             ("PB_KEY", Some(value)) => match decode_id(value) {
                 None => Outcome::found(None, &[], 1),
-                Some(og_id) => match native::by_id(&state, &og_id).await {
+                Some(og_id) => match native::by_id(&state, &og_id, None).await {
                     Ok(feature) => Outcome::of_features(None, feature.as_slice(), 1)?,
                     Err(problem) => Outcome::refused(None, problem, None),
                 },

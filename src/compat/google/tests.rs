@@ -98,6 +98,11 @@ fn write_pack(dir: &Path) {
         .collect(),
     );
     writer.set_subdivision_codes([(tiers[1].1, "CA-ON".to_string())].into_iter().collect());
+    writer.set_language_names(
+        [(tiers[0].1, vec![("de".to_string(), "Kanada".to_string())])]
+            .into_iter()
+            .collect(),
+    );
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers(tiers),
         flags: 0,
@@ -1029,6 +1034,171 @@ async fn every_og_value_lands_in_its_google_slot() {
         assert_eq!(
             postal["sublocality"],
             areas.map_or_else(|| context["sublocality"]["name"].clone(), Value::from)
+        );
+    }
+}
+
+/// `languageCode` names areas in that language where og has the name, and
+/// says so. An area og names only locally carries no `languageCode`.
+#[tokio::test]
+async fn language_code_names_areas_og_holds_in_that_language() {
+    let fixture = fixture();
+    let router = &fixture.router;
+    let country = |reply: &Reply, at: &str| {
+        reply
+            .body
+            .pointer(at)
+            .and_then(Value::as_array)
+            .and_then(|components| {
+                components
+                    .iter()
+                    .find(|component| component["types"][0] == "country")
+                    .cloned()
+            })
+            .expect("a country component")
+    };
+
+    let local = get(
+        router,
+        "/compat/google/v4/geocode/address?addressQuery=10%20King%20Street",
+    )
+    .await;
+    assert_eq!(
+        country(&local, "/results/0/addressComponents"),
+        json!({"longText": "Canada", "shortText": "CA", "types": ["country", "political"]})
+    );
+
+    let german = get(
+        router,
+        "/compat/google/v4/geocode/address?addressQuery=10%20King%20Street&languageCode=de",
+    )
+    .await;
+    assert_eq!(german.status, StatusCode::OK);
+    assert_eq!(
+        country(&german, "/results/0/addressComponents"),
+        json!({
+            "longText": "Kanada",
+            "shortText": "CA",
+            "types": ["country", "political"],
+            "languageCode": "de",
+        })
+    );
+    let locality = german.body["results"][0]["addressComponents"]
+        .as_array()
+        .and_then(|components| {
+            components
+                .iter()
+                .find(|component| component["types"][0] == "locality")
+        })
+        .expect("a locality");
+    assert_eq!(locality["longText"], "Toronto");
+    assert!(locality.get("languageCode").is_none());
+
+    let details = get(
+        router,
+        &format!("/compat/google/v1/places/{}?languageCode=de", bakery_id()),
+    )
+    .await;
+    assert_eq!(
+        country(&details, "/addressComponents")["longText"],
+        "Kanada"
+    );
+    assert!(details.body["displayName"].get("languageCode").is_none());
+
+    let searched = post(
+        router,
+        SEARCH_TEXT,
+        json!({"textQuery": "Queen Bakery", "languageCode": "de"}),
+    )
+    .await;
+    assert_eq!(
+        country(&searched, "/places/0/addressComponents")["languageCode"],
+        "de"
+    );
+    // Places answers in English when no language is named, and og holds no
+    // English name here.
+    let english = post(router, SEARCH_TEXT, json!({"textQuery": "Queen Bakery"})).await;
+    assert_eq!(
+        country(&english, "/places/0/addressComponents")["longText"],
+        "Canada"
+    );
+
+    // A region og holds no name for reads its base language, and says the
+    // language it read.
+    let swiss = get(
+        router,
+        "/compat/google/v4/geocode/address?addressQuery=10%20King%20Street&languageCode=de-CH",
+    )
+    .await;
+    assert_eq!(
+        country(&swiss, "/results/0/addressComponents"),
+        json!({
+            "longText": "Kanada",
+            "shortText": "CA",
+            "types": ["country", "political"],
+            "languageCode": "de",
+        })
+    );
+
+    // Autocomplete reads the browser's language when the body names none, and
+    // a header that names no language is no request to refuse.
+    for accept in ["de-CH,de;q=0.9", "*", "not a language"] {
+        let suggested = post_with(
+            router,
+            AUTOCOMPLETE,
+            &[("Accept-Language", accept)],
+            json!({"input": "Queen Bakery"}),
+        )
+        .await;
+        assert_eq!(suggested.status, StatusCode::OK, "{accept}");
+    }
+
+    // `languageCode` is one code.
+    let details = format!("/compat/google/v1/places/{}?languageCode=d3", bakery_id());
+    for (code, uri) in [
+        (
+            "german",
+            "/compat/google/v4/geocode/address?addressQuery=10%20King&languageCode=german",
+        ),
+        (
+            "fr,de",
+            "/compat/google/v4/geocode/address?addressQuery=10%20King&languageCode=fr,de",
+        ),
+        (
+            "fr,de",
+            "/compat/google/v4/geocode/location/43.0,-79.0?languageCode=fr,de",
+        ),
+        ("d3", details.as_str()),
+    ] {
+        let refused = get(router, uri).await;
+        assert_eq!(
+            refused.body,
+            google_error(
+                400,
+                "INVALID_ARGUMENT",
+                &format!("languageCode {code:?} is not a language code, such as de or zh-Hant")
+            ),
+            "{uri}"
+        );
+    }
+    for body in [
+        json!({"textQuery": "Queen Bakery", "languageCode": "fr,de"}),
+        json!({"input": "Queen Bakery", "languageCode": "fr,de"}),
+    ] {
+        let path = if body.get("textQuery").is_some() {
+            SEARCH_TEXT
+        } else {
+            AUTOCOMPLETE
+        };
+        let refused = post(router, path, body).await;
+        assert_eq!(
+            refused.body,
+            google_error(
+                400,
+                "INVALID_ARGUMENT",
+                "languageCode \"fr,de\" is not a language code, such as de or zh-Hant"
+            ),
+            "{path}"
         );
     }
 }

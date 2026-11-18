@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::{
     LatLng, QueryParams, Viewport, field_mask, from_problem, invalid,
+    language::Language,
     model::{GeocodeResult, granularity},
     places::by_place_id,
     respond, run,
@@ -116,13 +117,27 @@ async fn geocode_address(
             return Err(invalid("addressQuery or address is required"));
         }
     };
+    let language = language(state, query)?;
+    let args = args.maybe("lang", language.code());
     let found = native::geocode(state, args).await.map_err(from_problem)?;
     let results = found
         .features
         .iter()
-        .map(|feature| GeocodeResult::of(&feature.properties.common, feature.geometry.coordinates))
+        .map(|feature| {
+            GeocodeResult::of(
+                &feature.properties.common,
+                feature.geometry.coordinates,
+                &language,
+            )
+        })
         .collect();
     Ok(respond(&GeocodeResponse { results }, mask.as_ref()))
+}
+
+/// `languageCode`. Geocoding's default is the local language, which is og's
+/// own default too.
+fn language<'a>(state: &'a AppState, query: &QueryParams) -> Result<Language<'a>, VendorError> {
+    Language::parse(state.pack(), query.get("languageCode"))
 }
 
 /// The middle of `locationBias.rectangle`, as og's `focus`.
@@ -214,11 +229,13 @@ async fn reverse(
 ) -> Result<Response, VendorError> {
     let mask = field_mask(headers, query);
     let [lon, lat] = point.checked("location")?;
+    let language = language(state, query)?;
     let found = native::reverse(
         state,
         Args::new()
             .set("lon", lon.to_string())
-            .set("lat", lat.to_string()),
+            .set("lat", lat.to_string())
+            .maybe("lang", language.code()),
     )
     .await
     .map_err(from_problem)?;
@@ -234,7 +251,13 @@ async fn reverse(
             granularities.is_empty()
                 || granularities.contains(&granularity(feature.properties.common.accuracy))
         })
-        .map(|feature| GeocodeResult::of(&feature.properties.common, feature.geometry.coordinates))
+        .map(|feature| {
+            GeocodeResult::of(
+                &feature.properties.common,
+                feature.geometry.coordinates,
+                &language,
+            )
+        })
         .filter(|result| types.is_empty() || result.types.iter().any(|kind| types.contains(kind)))
         .collect();
     Ok(respond(&GeocodeResponse { results }, mask.as_ref()))
@@ -251,8 +274,13 @@ pub(super) async fn place(
     run(async {
         let query = QueryParams::parse(query.as_deref())?;
         let mask = field_mask(&headers, &query);
-        let feature = by_place_id(&state, &place_id).await?;
-        let result = GeocodeResult::of(&feature.properties.common, feature.geometry.coordinates);
+        let language = language(&state, &query)?;
+        let feature = by_place_id(&state, &place_id, &language).await?;
+        let result = GeocodeResult::of(
+            &feature.properties.common,
+            feature.geometry.coordinates,
+            &language,
+        );
         Ok(respond(&result, mask.as_ref()))
     })
     .await
