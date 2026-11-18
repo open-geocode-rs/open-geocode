@@ -1274,6 +1274,46 @@ async fn lang_names_results_and_areas_in_the_languages_asked() {
     }
 }
 
+/// `lang` takes at most twenty distinct languages. Repeats drop first, so a
+/// list over the cap only by repeats is answered.
+#[tokio::test]
+async fn lang_takes_at_most_twenty_languages() {
+    let router = geneva_router();
+    let twenty = "fr,de,it,rm,en,es,pt,nl,sv,da,fi,pl,cs,sk,hu,ro,bg,el,ru,ja";
+
+    let answer = get(
+        &router,
+        &format!("/places?ids=osm:relation:1685488&lang={twenty}"),
+    )
+    .await;
+    let city = &answer["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert_eq!(city["translations"]["de"], "Genf");
+
+    let repeated = format!("/places?ids=osm:relation:1685488&lang={twenty},DE,fr");
+    let answer = get(&router, &repeated).await;
+    assert_eq!(answer["features"][0]["properties"]["name"], "Genève");
+
+    for uri in [
+        format!("/places?ids=osm:relation:1685488&lang={twenty},ko"),
+        format!("/geocode?q=Rue&lang={twenty},ko"),
+        format!("/reverse?lon=6.1&lat=46.2&lang={twenty},ko"),
+        format!("/autocomplete?q=Rue&lang={twenty},ko"),
+    ] {
+        let (status, problem) = get_error(&router, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(
+            problem["invalid_params"],
+            json!([{"name": "lang", "reason": "at most 20 languages"}]),
+            "{uri}"
+        );
+        assert_eq!(
+            problem["detail"], "lang asks for 21 languages, and the most is 20",
+            "{uri}"
+        );
+    }
+}
+
 /// A batch item names its answer in its own `lang`, as its `GET` would.
 #[tokio::test]
 async fn a_batch_item_takes_lang() {

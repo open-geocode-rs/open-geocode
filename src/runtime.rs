@@ -324,18 +324,27 @@ pub(crate) struct ReverseParams {
 }
 
 /// Resolve `lang`, the comma-separated language codes to name results in,
-/// such as `fr,de`. A malformed code is a 400 naming it, like an unknown `layer`.
+/// such as `fr,de`. A malformed code is a 400 naming it, like an unknown `layer`,
+/// and so is asking for more than [`api::MAX_LANGUAGES`] distinct languages.
 /// An empty value means local names, as no `lang` does.
 fn parse_lang(lang: &Param) -> Result<api::Languages, Problem> {
     let value = match lang {
         Param::Missing | Param::Empty => return Ok(api::Languages::default()),
         Param::Value(value) => value,
     };
-    api::Languages::parse(value).map_err(|code| {
-        Problem::malformed_parameter(format!(
+    api::Languages::parse(value).map_err(|error| match error {
+        api::LanguagesError::NotACode(code) => Problem::malformed_parameter(format!(
             "lang {code:?} is not a language code, such as de or zh-Hant"
         ))
-        .with_invalid_params(vec![InvalidParam::new("lang", "not a language code")])
+        .with_invalid_params(vec![InvalidParam::new("lang", "not a language code")]),
+        api::LanguagesError::TooMany(count) => Problem::malformed_parameter(format!(
+            "lang asks for {count} languages, and the most is {}",
+            api::MAX_LANGUAGES
+        ))
+        .with_invalid_params(vec![InvalidParam::new(
+            "lang",
+            format!("at most {} languages", api::MAX_LANGUAGES),
+        )]),
     })
 }
 
@@ -650,7 +659,8 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
                         comma-separated language codes. The first names each \
                         result and area, falling back to its local name; each \
                         other one goes into `translations` where a name in it \
-                        exists. A malformed code returns `400`.",
+                        exists. Repeats count once. A malformed code, or more \
+                        than 20 distinct codes, returns `400`.",
          example = "fr,de"),
     ),
     responses(
@@ -963,7 +973,8 @@ fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
                         comma-separated language codes. The first names each \
                         result and area, falling back to its local name; each \
                         other one goes into `translations` where a name in it \
-                        exists. A malformed code returns `400`.",
+                        exists. Repeats count once. A malformed code, or more \
+                        than 20 distinct codes, returns `400`.",
          example = "fr,de"),
     ),
     responses(
@@ -1225,7 +1236,8 @@ fn place_named(
                         comma-separated language codes. The first names each \
                         result and area, falling back to its local name; each \
                         other one goes into `translations` where a name in it \
-                        exists. A malformed code returns `400`.",
+                        exists. Repeats count once. A malformed code, or more \
+                        than 20 distinct codes, returns `400`.",
          example = "fr,de"),
     ),
     responses(
@@ -1478,7 +1490,8 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
                         comma-separated language codes. The first names each \
                         result and area, falling back to its local name; each \
                         other one goes into `translations` where a name in it \
-                        exists. A malformed code returns `400`.",
+                        exists. Repeats count once. A malformed code, or more \
+                        than 20 distinct codes, returns `400`.",
          example = "fr,de"),
     ),
     responses(
