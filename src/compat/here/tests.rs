@@ -100,6 +100,19 @@ pub(super) fn pack(name: &str) -> TestPack {
         .collect(),
     );
     writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
+    writer.set_language_names(
+        [(
+            country,
+            vec![
+                ("fr".to_string(), "Canada".to_string()),
+                ("de".to_string(), "Kanada".to_string()),
+                ("sr".to_string(), "Канада".to_string()),
+                ("sr-Latn".to_string(), "Kanada".to_string()),
+            ],
+        )]
+        .into_iter()
+        .collect(),
+    );
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -1614,4 +1627,90 @@ async fn a_job_whose_og_job_is_gone_is_gone() {
     let reply = get(&router, &format!("/compat/here/v7/batch/jobs/{id}")).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(reply.json()["code"], "E6004041");
+}
+
+/// HERE's `lang` names the address in its first language, read without its
+/// region, and an area og holds no name in that language keeps its own.
+#[tokio::test]
+async fn lang_names_the_address_in_its_first_language() {
+    let pack = pack("lang");
+    let router = pack.router();
+    let address = |reply: Reply| reply.json()["items"][0]["address"].clone();
+
+    let german = address(
+        get(
+            &router,
+            "/compat/here/v1/geocode?q=10+King+Street&lang=de-CH,fr",
+        )
+        .await,
+    );
+    assert_eq!(german["countryName"], "Kanada");
+    assert_eq!(german["state"], "Ontario");
+
+    let local = address(get(&router, "/compat/here/v1/geocode?q=10+King+Street").await);
+    assert_eq!(local["countryName"], "Canada");
+
+    // A script is a language of its own, so the code goes to og whole.
+    for (lang, name) in [
+        ("sr", "Канада"),
+        ("sr-Latn", "Kanada"),
+        ("sr-Cyrl", "Канада"),
+    ] {
+        let named = address(
+            get(
+                &router,
+                &format!("/compat/here/v1/geocode?q=10+King+Street&lang={lang}"),
+            )
+            .await,
+        );
+        assert_eq!(named["countryName"], name, "{lang}");
+    }
+
+    let reversed = address(get(&router, "/compat/here/v1/revgeocode?at=43.0,-79.0&lang=de").await);
+    assert_eq!(reversed["countryName"], "Kanada");
+
+    let suggested = address(get(&router, "/compat/here/v1/autocomplete?q=10+King&lang=de").await);
+    assert_eq!(suggested["countryName"], "Kanada");
+
+    // Lookup answers the one item itself.
+    let found = get(&router, "/compat/here/v1/discover?q=Queen+Bakery&at=43,-79")
+        .await
+        .json();
+    let id = found["items"][0]["id"].as_str().expect("id").to_string();
+    let looked_up = get(&router, &format!("/compat/here/v1/lookup?id={id}&lang=de")).await;
+    assert_eq!(looked_up.json()["address"]["countryName"], "Kanada");
+}
+
+/// A batch record's `lang` column names its result as the endpoint's `lang`
+/// would.
+#[tokio::test]
+async fn a_batch_record_takes_its_lang_column() {
+    let pack = pack("batch-lang");
+    let router = pack.router();
+    let input = "recId|q|lang\n\
+                 g1|10 King Street|de-CH,fr\n\
+                 g2|10 King Street|\n";
+    let created = send(
+        &router,
+        "POST",
+        &format!(
+            "/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}\
+             &outputColumns=addressCountryName"
+        ),
+        Some(("text/plain", input)),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let id = created.json()["id"].as_str().expect("id").to_string();
+    let details = finished(&router, &id).await;
+    assert_eq!(details["records"]["succeeded"], 2);
+    let results = get(&router, &format!("/compat/here/v7/batch/jobs/{id}/results")).await;
+    assert_eq!(
+        sorted_lines(&results.text()),
+        [
+            "recId|seqNumber|seqLength|addressCountryName",
+            "g1|1|1|Kanada",
+            "g2|1|1|Canada",
+        ]
+    );
 }

@@ -40,7 +40,7 @@ use crate::{
 use super::{
     Area, Gs7Error, LatLng, Params, Rid,
     item::{Feature, Item, item},
-    search::{Geocode, Qualified, reverse_items},
+    search::{Geocode, Qualified, first_language, reverse_items},
 };
 
 const GEOCODE_HRN: &str = "hrn:here:service::olp-here:search-geocode-7";
@@ -1135,7 +1135,9 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
             .filter(|limit| (1..=100).contains(limit))
             .ok_or_else(|| Gs7Error::illegal("limit", value, "Provide an integer from 1 to 100"))?,
     };
-    match service {
+    // `lang` is an input column like any query parameter of the endpoint.
+    let lang = record.get("lang").and_then(first_language);
+    let translated = match service {
         Service::Geocode => {
             let qualified = match record.get("qq") {
                 Some(qq) => Qualified::parse(qq)?,
@@ -1246,7 +1248,11 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
                 radius_m: radius_m.map(|radius| radius.ceil() as u64),
             })
         }
-    }
+    };
+    translated.map(|mut translated| {
+        translated.fields.extend(lang.map(|lang| ("lang", lang)));
+        translated
+    })
 }
 
 /// Pass the request body on a chunk at a time, refusing one that grows past
