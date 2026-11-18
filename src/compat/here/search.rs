@@ -290,7 +290,7 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     let Some(fields) = request.og_fields() else {
         return Ok(Items { items: Vec::new() });
     };
-    let collection = native::geocode(state, args(fields))
+    let collection = native::geocode(state, args(fields).maybe("lang", og_lang(&params)))
         .await
         .map_err(Gs7Error::of)?;
     let items = features(&collection)?
@@ -312,6 +312,24 @@ pub(super) struct Reverse {
     pub(super) layer: Option<&'static str>,
     pub(super) types: Option<Vec<String>>,
     pub(super) limit: usize,
+    /// og's `lang`, from HERE's `lang`.
+    pub(super) lang: Option<String>,
+}
+
+/// og's `lang`, from HERE's. HERE renders in one language picked from its
+/// list, so og names in the first. og reads a region or script it holds no
+/// name in as its base language (`de` of `de-CH`), so the code goes as sent:
+/// cutting it would lose `zh-Hant` from `zh-Hans`.
+pub(super) fn og_lang(params: &Params) -> Option<String> {
+    first_language(params.get("lang")?)
+}
+
+/// The first code of a HERE `lang` list.
+pub(super) fn first_language(list: &str) -> Option<String> {
+    list.split(',')
+        .map(str::trim)
+        .find(|code| !code.is_empty())
+        .map(str::to_string)
 }
 
 impl Reverse {
@@ -352,6 +370,7 @@ impl Reverse {
                 types
             },
             limit: params.limit(1, max_limit)?,
+            lang: og_lang(params),
         })
     }
 
@@ -362,6 +381,9 @@ impl Reverse {
         ];
         if let Some(layer) = self.layer {
             fields.push(("layer", layer.to_string()));
+        }
+        if let Some(lang) = &self.lang {
+            fields.push(("lang", lang.clone()));
         }
         fields
     }
@@ -690,7 +712,7 @@ pub(super) async fn autosuggest(
             ),
         ];
         fields.extend(near.fields.iter().cloned());
-        let collection = native::autocomplete(&state, args(fields))
+        let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
         let items = features(&collection)?
@@ -725,7 +747,7 @@ pub(super) async fn autocomplete(
             ("limit", MAX_AUTOCOMPLETE_LIMIT.to_string()),
         ];
         fields.extend(near.fields.iter().cloned());
-        let collection = native::autocomplete(&state, args(fields))
+        let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
         let items = features(&collection)?
@@ -761,7 +783,7 @@ pub(super) async fn discover(
             ("limit", fetch(offset, limit, MAX_SEARCH_LIMIT).to_string()),
         ];
         fields.extend(near.fields.iter().cloned());
-        let collection = native::places(&state, args(fields))
+        let collection = native::places(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
         let items = features(&collection)?
@@ -795,7 +817,7 @@ pub(super) async fn lookup(
                 .cause(format!("Actual parameter value: '{id}'"))
         };
         let og_id = decode_id(id).ok_or_else(not_found)?;
-        let feature = native::by_id(&state, &og_id, None)
+        let feature = native::by_id(&state, &og_id, og_lang(&params).as_deref())
             .await
             .map_err(Gs7Error::of)?
             .ok_or_else(not_found)?;
