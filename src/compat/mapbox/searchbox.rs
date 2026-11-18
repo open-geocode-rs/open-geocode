@@ -171,6 +171,20 @@ impl Collection {
     }
 }
 
+/// The one language Search Box names results in. It is the first of
+/// `language`, or English when none is sent.
+fn language(params: &Params) -> &str {
+    params
+        .get("language")
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|code| !code.is_empty())
+        })
+        .unwrap_or("en")
+}
+
 fn required_q(params: &Params) -> Result<&str, VendorError> {
     params
         .get("q")
@@ -195,7 +209,8 @@ pub(super) async fn suggest(
         .maybe("country", params.get("country"))
         .maybe("focus", params.focus())
         .maybe("bbox", params.get("bbox"))
-        .maybe("layer", types.as_ref().and_then(Types::og_layer));
+        .maybe("layer", types.as_ref().and_then(Types::og_layer))
+        .set("lang", language(&params));
     let collection = native::autocomplete(&state, args).await.map_err(failed)?;
     let suggestions = collection
         .features
@@ -217,10 +232,13 @@ pub(super) async fn suggest(
 pub(super) async fn retrieve(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<Json<Collection>, VendorError> {
+    let params = Params::from_query(Api::SearchBox, query)?;
     let not_found = || error(StatusCode::NOT_FOUND, "Not Found");
     let og_id = decode_id(&id).ok_or_else(not_found)?;
-    let collection = match native::places(&state, Args::new().set("ids", og_id)).await {
+    let args = Args::new().set("ids", og_id).set("lang", language(&params));
+    let collection = match native::places(&state, args).await {
         Ok(collection) => collection,
         // An id `/places` cannot read is one it never issued for lookup.
         Err(problem) if problem.status() == 400 => return Err(not_found().caused_by(problem)),
@@ -251,7 +269,8 @@ pub(super) async fn forward(
         .maybe("limit", params.get("limit"))
         .maybe("country", params.get("country"))
         .maybe("focus", params.focus())
-        .maybe("bbox", params.get("bbox"));
+        .maybe("bbox", params.get("bbox"))
+        .set("lang", language(&params));
     let autocomplete = params
         .get("auto_complete")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
@@ -276,7 +295,8 @@ pub(super) async fn reverse(
     let args = Args::new()
         .maybe("lon", params.get("longitude"))
         .maybe("lat", params.get("latitude"))
-        .maybe("layer", types.as_ref().and_then(Types::og_layer));
+        .maybe("layer", types.as_ref().and_then(Types::og_layer))
+        .set("lang", language(&params));
     let collection = native::reverse(&state, args).await.map_err(failed)?;
     Ok(Json(Collection::reverse(&collection, types.as_ref())))
 }
