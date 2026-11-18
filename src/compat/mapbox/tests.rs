@@ -859,6 +859,7 @@ fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
         },
         translations: None,
         record_id: None,
+        local_name: None,
     }
 }
 

@@ -284,6 +284,7 @@ mod tests {
             code: code.map(str::to_string),
             translations: None,
             record_id: 0,
+            local_name: None,
         })
     }
 

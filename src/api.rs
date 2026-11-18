@@ -286,6 +286,9 @@ pub struct Common {
     /// The record behind the result, for the names `lang` asks for.
     #[serde(skip)]
     pub record_id: Option<RecordId>,
+    /// The result's local name, when `lang` renamed it.
+    #[serde(skip)]
+    pub local_name: Option<String>,
 }
 
 /// Properties of a forward geocoding result.
@@ -690,6 +693,9 @@ pub struct ContextArea {
     /// The area's record, for the names `lang` asks for.
     #[serde(skip)]
     pub record_id: RecordId,
+    /// The area's local name, when `lang` renamed it.
+    #[serde(skip)]
+    pub local_name: Option<String>,
 }
 
 impl Point {
@@ -801,6 +807,7 @@ impl<'a> Contexts<'a> {
                     .or_else(|| self.pack.subdivision_code(record_id).map(str::to_string)),
                 translations: None,
                 record_id,
+                local_name: None,
             });
         self.areas.insert(record_id, area.clone());
         Ok(area)
@@ -901,20 +908,24 @@ fn is_language_code(code: &str) -> bool {
 }
 
 /// Names a result or area in `languages`. The first gives `name`, or the
-/// local name stays when it has none in that language. Each other one it
-/// has a name in goes into `translations`.
+/// local name stays when it has none in that language. A renamed one keeps
+/// its local name in `local_name`. Each other language it has a name in goes
+/// into `translations`.
 fn localize_names(
     pack: &Reader,
     record_id: RecordId,
     languages: &Languages,
     name: &mut String,
+    local_name: &mut Option<String>,
     translations: &mut Option<BTreeMap<String, String>>,
 ) {
     let Some((first, others)) = languages.codes().split_first() else {
         return;
     };
-    if let Some(local) = pack.language_name(record_id, first) {
-        local.clone_into(name);
+    if let Some(named) = pack.language_name(record_id, first)
+        && named != name.as_str()
+    {
+        *local_name = Some(std::mem::replace(name, named.to_string()));
     }
     let found = others
         .iter()
@@ -935,6 +946,7 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) {
             record_id,
             languages,
             &mut common.name,
+            &mut common.local_name,
             &mut common.translations,
         );
     }
@@ -958,6 +970,7 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) {
             area.record_id,
             languages,
             &mut area.name,
+            &mut area.local_name,
             &mut area.translations,
         );
     }
@@ -1197,6 +1210,7 @@ fn common(
         },
         translations: None,
         record_id: Some(record_id),
+        local_name: None,
     })
 }
 
