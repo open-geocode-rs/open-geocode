@@ -1410,12 +1410,19 @@ impl Reader {
     /// reads `de`. `None` when the record has no name in it, and for every
     /// record of a Pack sealed without language names.
     pub fn language_name(&self, record_id: RecordId, language: &str) -> Option<&str> {
+        self.language_name_as(record_id, language)
+            .map(|(_, name)| name)
+    }
+
+    /// [`Self::language_name`], with the code the name is held under. That is
+    /// `de` when `de-CH` reads its base language.
+    pub fn language_name_as(&self, record_id: RecordId, language: &str) -> Option<(&str, &str)> {
         let names = self.language_names.get(&record_id)?;
         let find = |wanted: &str| {
             names
                 .iter()
                 .find(|(code, _)| code.eq_ignore_ascii_case(wanted))
-                .map(|(_, name)| name.as_str())
+                .map(|(code, name)| (code.as_str(), name.as_str()))
         };
         find(language).or_else(|| {
             let base = language.split(['-', '_']).next()?;
