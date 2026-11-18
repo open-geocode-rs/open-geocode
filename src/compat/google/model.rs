@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 
+use super::language::Language;
 use crate::{
     api::{Accuracy, Common, ContextArea},
     compat::{self, encode_id},
@@ -25,10 +26,14 @@ impl LatLng {
     }
 }
 
-// `languageCode` is left out, since og does not know the language a name is in.
+/// `languageCode` is set only when og holds the name in the language asked.
+/// A local name is in a language og does not know, so it goes without one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct LocalizedText {
     pub(super) text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) language_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -37,6 +42,8 @@ pub(super) struct AddressComponent {
     pub(super) long_text: String,
     pub(super) short_text: String,
     pub(super) types: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) language_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -77,7 +84,7 @@ pub(super) struct Place {
 }
 
 impl Place {
-    pub(super) fn of(common: &Common, coordinates: [f64; 2]) -> Self {
+    pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let id = encode_id(&common.id);
         let kind = Kind::of(common);
         Self {
@@ -85,12 +92,13 @@ impl Place {
             id,
             display_name: LocalizedText {
                 text: common.name.clone(),
+                language_code: language.of(common.record_id),
             },
             types: kind.types(),
             primary_type: kind.primary(),
             formatted_address: formatted_address(common),
             postal_address: postal_address(common),
-            address_components: address_components(common),
+            address_components: address_components(common, language),
             location: LatLng::of(coordinates),
         }
     }
@@ -115,7 +123,7 @@ pub(super) struct GeocodeResult {
 }
 
 impl GeocodeResult {
-    pub(super) fn of(common: &Common, coordinates: [f64; 2]) -> Self {
+    pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let place_id = encode_id(&common.id);
         Self {
             // Every v4 response Google documents writes the full resource
@@ -126,7 +134,7 @@ impl GeocodeResult {
             granularity: granularity(common.accuracy),
             formatted_address: formatted_address(common),
             postal_address: postal_address(common),
-            address_components: address_components(common),
+            address_components: address_components(common, language),
             types: Kind::of(common).types(),
         }
     }
@@ -204,12 +212,13 @@ fn component(text: &str, types: &[&'static str]) -> AddressComponent {
         long_text: text.to_string(),
         short_text: text.to_string(),
         types: types.to_vec(),
+        language_code: None,
     }
 }
 
 /// Google's address components, most specific first. Areas come from the
 /// areas og found the result in, falling back to the part the source states.
-fn address_components(common: &Common) -> Vec<AddressComponent> {
+fn address_components(common: &Common, language: &Language) -> Vec<AddressComponent> {
     const LOWER_ADMIN: [&str; 3] = [
         "administrative_area_level_2",
         "administrative_area_level_3",
@@ -217,9 +226,11 @@ fn address_components(common: &Common) -> Vec<AddressComponent> {
     ];
     let address = &common.address;
     let context = &common.context;
-    fn name(area: &Option<ContextArea>) -> Option<&str> {
-        area.as_ref().map(|area| area.name.as_str())
-    }
+    // An area og names in the language asked says so.
+    let area = |area: &ContextArea, types: &[&'static str]| AddressComponent {
+        language_code: language.of(Some(area.record_id)),
+        ..component(&area.name, types)
+    };
     let mut components = Vec::new();
     let mut push = |text: Option<&str>, types: &[&'static str]| {
         if let Some(text) = text.filter(|text| !text.is_empty()) {
@@ -229,44 +240,62 @@ fn address_components(common: &Common) -> Vec<AddressComponent> {
     push(address.unit.as_deref(), &["subpremise"]);
     push(address.housenumber.as_deref(), &["street_number"]);
     push(address.street.as_deref(), &["route"]);
-    push(name(&context.neighbourhood), &["neighborhood", "political"]);
-    push(name(&context.sublocality), &["sublocality", "political"]);
-    push(
-        name(&context.locality).or(address.locality.as_deref()),
-        &["locality", "political"],
-    );
+    let named = [
+        (&context.neighbourhood, &["neighborhood", "political"][..]),
+        (&context.sublocality, &["sublocality", "political"][..]),
+    ];
+    for (found, types) in named {
+        if let Some(found) = found.as_ref().filter(|found| !found.name.is_empty()) {
+            components.push(area(found, types));
+        }
+    }
+    match context
+        .locality
+        .as_ref()
+        .filter(|found| !found.name.is_empty())
+    {
+        Some(locality) => components.push(area(locality, &["locality", "political"])),
+        None => {
+            if let Some(text) = address.locality.as_deref().filter(|text| !text.is_empty()) {
+                components.push(component(text, &["locality", "political"]));
+            }
+        }
+    }
     // Google numbers the levels below the region by order, not by name, so
     // the first one present is level 2. og's tiers are sparse, so a country that
     // maps only `district` gets it as level 2, as Google would number it.
     let lower = [&context.subregion, &context.district, &context.subdistrict]
         .into_iter()
-        .filter_map(|area| name(area))
+        .filter_map(Option::as_ref)
+        .filter(|found| !found.name.is_empty())
         .collect::<Vec<_>>();
-    for (level, text) in lower.iter().enumerate().rev() {
-        push(Some(text), &[LOWER_ADMIN[level], "political"]);
+    for (level, found) in lower.iter().enumerate().rev() {
+        components.push(area(found, &[LOWER_ADMIN[level], "political"]));
     }
     // The region's short text is its code within its country (`ON` of
     // `CA-ON`) when og knows it.
     match &context.region {
         Some(region) => components.push(AddressComponent {
-            long_text: region.name.clone(),
             short_text: region
                 .code
                 .as_deref()
                 .and_then(|code| code.split_once('-'))
                 .map_or_else(|| region.name.clone(), |(_, own)| own.to_string()),
-            types: vec!["administrative_area_level_1", "political"],
+            ..area(region, &["administrative_area_level_1", "political"])
         }),
-        None => push(
-            address.region.as_deref(),
-            &["administrative_area_level_1", "political"],
-        ),
+        None => {
+            if let Some(text) = address.region.as_deref().filter(|text| !text.is_empty()) {
+                components.push(component(
+                    text,
+                    &["administrative_area_level_1", "political"],
+                ));
+            }
+        }
     }
     match &context.country {
         Some(country) => components.push(AddressComponent {
-            long_text: country.name.clone(),
             short_text: country.code.clone().unwrap_or_else(|| country.name.clone()),
-            types: vec!["country", "political"],
+            ..area(country, &["country", "political"])
         }),
         None => {
             if let Some(country) = address.country.as_deref().filter(|text| !text.is_empty()) {

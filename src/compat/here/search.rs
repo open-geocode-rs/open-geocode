@@ -795,7 +795,7 @@ pub(super) async fn lookup(
                 .cause(format!("Actual parameter value: '{id}'"))
         };
         let og_id = decode_id(id).ok_or_else(not_found)?;
-        let feature = native::by_id(&state, &og_id)
+        let feature = native::by_id(&state, &og_id, None)
             .await
             .map_err(Gs7Error::of)?
             .ok_or_else(not_found)?;

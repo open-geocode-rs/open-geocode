@@ -133,12 +133,14 @@ pub(crate) mod native {
 
     /// The record an og id names, or `None` when no record has it. An id
     /// `/places` cannot look up, such as an imported address row's, is
-    /// `None` too: those renumber every release.
+    /// `None` too, since those renumber every release.
+    /// The record is named in `lang` when it is given.
     pub(crate) async fn by_id(
         state: &AppState,
         og_id: &str,
+        lang: Option<&str>,
     ) -> Result<Option<ForwardFeature>, Problem> {
-        match places(state, Args::new().set("ids", og_id)).await {
+        match places(state, Args::new().set("ids", og_id).maybe("lang", lang)).await {
             Ok(collection) => Ok(collection.features.into_iter().next()),
             Err(problem) if problem.status() == 400 => Ok(None),
             Err(problem) => Err(problem),

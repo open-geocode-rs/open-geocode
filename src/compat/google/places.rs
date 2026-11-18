@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Area, Code, LatLng, QueryParams, body, both_shapes, error, field_mask, from_problem, invalid,
+    language::{Language, accept_language},
     model::{Kind, Place, after_name},
     proto_int, respond, run,
 };
@@ -41,6 +42,8 @@ struct SearchTextRequest {
     location_bias: Option<Area>,
     #[serde(alias = "location_restriction")]
     location_restriction: Option<Area>,
+    #[serde(alias = "language_code")]
+    language_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,14 +71,20 @@ pub(super) async fn search_text(
             request.location_bias.as_ref(),
             request.location_restriction.as_ref(),
         )?;
+        let language = places_language(&state, request.language_code)?;
         let args = Args::new()
             .set("q", text)
             .set("limit", limit.to_string())
             .maybe("focus", focus)
-            .maybe("bbox", bbox);
+            .maybe("bbox", bbox)
+            .maybe("lang", language.code());
         let found = native::places(&state, args).await.map_err(from_problem)?;
         let answer = SearchTextResponse {
-            places: found.features.iter().map(place).collect(),
+            places: found
+                .features
+                .iter()
+                .map(|feature| place(feature, &language))
+                .collect(),
         };
         Ok(respond(&answer, mask.as_ref()))
     })
@@ -134,8 +143,18 @@ fn bias_and_restriction(
     Ok((focus, bbox))
 }
 
-fn place(feature: &ForwardFeature) -> Place {
-    Place::of(&feature.properties.common, feature.geometry.coordinates)
+fn place(feature: &ForwardFeature, language: &Language) -> Place {
+    Place::of(
+        &feature.properties.common,
+        feature.geometry.coordinates,
+        language,
+    )
+}
+
+/// Places names its results in `languageCode`, English when none is sent.
+fn places_language(state: &AppState, code: Option<String>) -> Result<Language<'_>, VendorError> {
+    let code = code.filter(|code| !code.trim().is_empty());
+    Language::parse(state.pack(), Some(code.as_deref().unwrap_or("en")))
 }
 
 pub(super) async fn details(
@@ -147,8 +166,9 @@ pub(super) async fn details(
     run(async {
         let query = QueryParams::parse(query.as_deref())?;
         let mask = field_mask(&headers, &query);
-        let feature = by_place_id(&state, &place_id).await?;
-        Ok(respond(&place(&feature), mask.as_ref()))
+        let language = places_language(&state, query.get("languageCode").map(str::to_string))?;
+        let feature = by_place_id(&state, &place_id, &language).await?;
+        Ok(respond(&place(&feature, &language), mask.as_ref()))
     })
     .await
 }
@@ -157,6 +177,7 @@ pub(super) async fn details(
 pub(super) async fn by_place_id(
     state: &AppState,
     place_id: &str,
+    language: &Language<'_>,
 ) -> Result<ForwardFeature, VendorError> {
     let not_found = || {
         error(
@@ -165,7 +186,7 @@ pub(super) async fn by_place_id(
         )
     };
     let og_id = decode_id(place_id).ok_or_else(not_found)?;
-    native::by_id(state, &og_id)
+    native::by_id(state, &og_id, language.code())
         .await
         .map_err(from_problem)?
         .ok_or_else(not_found)
@@ -184,6 +205,8 @@ struct AutocompleteRequest {
     #[serde(alias = "included_region_codes")]
     included_region_codes: Vec<String>,
     origin: Option<LatLng>,
+    #[serde(alias = "language_code")]
+    language_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,9 +310,18 @@ pub(super) async fn autocomplete(
             .map(|code| code.trim())
             .filter(|code| !code.is_empty())
             .collect::<Vec<_>>();
+        // Autocomplete reads the browser's language when the body names none.
+        let language = places_language(
+            &state,
+            request
+                .language_code
+                .filter(|code| !code.trim().is_empty())
+                .or_else(|| accept_language(&headers)),
+        )?;
         let args = Args::new()
             .set("q", input.clone())
             .set("limit", MAX_SUGGESTIONS.to_string())
+            .maybe("lang", language.code())
             .maybe("focus", focus)
             .maybe("bbox", bbox)
             .maybe(
@@ -309,7 +341,7 @@ pub(super) async fn autocomplete(
                 })
             })
             .map(|feature| Suggestion {
-                place_prediction: prediction(feature, &input, origin),
+                place_prediction: prediction(feature, &input, origin, &language),
             })
             .collect();
         Ok(respond(
@@ -373,9 +405,14 @@ fn restriction(area: &Area) -> Result<(Option<String>, Option<Circle>), VendorEr
     }
 }
 
-fn prediction(feature: &ForwardFeature, input: &str, origin: Option<[f64; 2]>) -> PlacePrediction {
+fn prediction(
+    feature: &ForwardFeature,
+    input: &str,
+    origin: Option<[f64; 2]>,
+    language: &Language,
+) -> PlacePrediction {
     let common = &feature.properties.common;
-    let place = Place::of(common, feature.geometry.coordinates);
+    let place = Place::of(common, feature.geometry.coordinates, language);
     let [lon, lat] = feature.geometry.coordinates;
     PlacePrediction {
         text: formattable(&common.label, input),

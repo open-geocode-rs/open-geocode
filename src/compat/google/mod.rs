@@ -5,6 +5,7 @@
 //! URL changed. The two hosts share one prefix, as their paths never collide.
 
 mod geocode;
+mod language;
 mod model;
 mod places;
 #[cfg(test)]
