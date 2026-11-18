@@ -437,6 +437,24 @@ impl<L> Default for Context<L> {
 }
 
 impl Context<Area> {
+    /// [`Context::map`], with each layer's key.
+    fn map_named<L>(self, layer: impl Fn(&str, Area) -> L) -> Context<L> {
+        let layer = &layer;
+        let named = |key: &'static str| move |area| layer(key, area);
+        Context {
+            address: self.address.map(named("address")),
+            secondary_address: self.secondary_address.map(named("secondary_address")),
+            street: self.street.map(named("street")),
+            neighborhood: self.neighborhood.map(named("neighborhood")),
+            postcode: self.postcode.map(named("postcode")),
+            locality: self.locality.map(named("locality")),
+            place: self.place.map(named("place")),
+            district: self.district.map(named("district")),
+            region: self.region.map(named("region")),
+            country: self.country.map(named("country")),
+        }
+    }
+
     fn map<L>(self, layer: impl Fn(Area) -> L) -> Context<L> {
         Context {
             address: self.address.map(&layer),

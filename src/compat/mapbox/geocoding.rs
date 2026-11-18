@@ -1,6 +1,9 @@
 //! Geocoding v6: `forward`, `reverse` and `batch`.
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use axum::{
     Json,
@@ -17,9 +20,9 @@ use super::{
     admitted, attribution, error,
 };
 use crate::{
-    api::{ForwardCollection, ReverseCollection},
+    api::{Common, ContextArea, ForwardCollection, Languages, ReverseCollection},
     batch::map_in_order,
-    compat::{Args, decode_id, iso, native},
+    compat::{Args, decode_id, encode_id, iso, native},
     http::{
         batch::{self as og_batch, Prepared, RawItem},
         problem::Problem,
@@ -34,6 +37,9 @@ const BATCH_RETRY_AFTER_SECONDS: u32 = 1;
 
 /// Mapbox's forward default; og's own would let the server choose.
 const DEFAULT_FORWARD_LIMIT: &str = "5";
+
+/// Mapbox's cap on the languages one request names.
+const MAX_LANGUAGES: usize = 20;
 
 /// A Geocoding v6 response.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -73,11 +79,119 @@ struct Layer {
     mapbox_id: Option<String>,
     #[serde(flatten)]
     fields: LayerFields,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    translations: Option<BTreeMap<String, Translation>>,
 }
 
+/// A layer's name in one of the languages asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Translation {
+    language: String,
+    name: String,
+}
+
+/// The languages a request names in, as `language` lists them.
+#[derive(Clone, Copy)]
+struct Naming<'a> {
+    codes: &'a [String],
+}
+
+/// What og named a layer's record besides its name in the first language
+/// asked. That is its local name when the two differ, and its names in the
+/// other languages.
+#[derive(Clone, Copy, Default)]
+struct Names<'a> {
+    local_name: Option<&'a str>,
+    translations: Option<&'a BTreeMap<String, String>>,
+}
+
+impl<'a> Names<'a> {
+    fn of_area(area: &'a ContextArea) -> Self {
+        Self {
+            local_name: area.local_name.as_deref(),
+            translations: area.translations.as_ref(),
+        }
+    }
+
+    fn of_result(common: &'a Common) -> Self {
+        Self {
+            local_name: common.local_name.as_deref(),
+            translations: common.translations.as_ref(),
+        }
+    }
+}
+
+impl Naming<'_> {
+    /// A layer's `translations`, sent only when more than one language is
+    /// asked. Every language asked is in it, the first too. A language og
+    /// holds no name in gets the name og answers for it, the local one. A
+    /// layer filled from a part the source states names no record, so its
+    /// text is the name in every language.
+    fn translations(self, name: &str, names: Names) -> Option<BTreeMap<String, Translation>> {
+        let (first, others) = self.codes.split_first().filter(|_| self.codes.len() > 1)?;
+        let local = names.local_name.unwrap_or(name);
+        let named_in = |code: &String| {
+            names
+                .translations
+                .and_then(|found| found.get(code))
+                .map_or(local, String::as_str)
+        };
+        let entry = |code: &String, name: &str| {
+            (
+                code.clone(),
+                Translation {
+                    language: code.clone(),
+                    name: name.to_string(),
+                },
+            )
+        };
+        Some(
+            std::iter::once(entry(first, name))
+                .chain(others.iter().map(|code| entry(code, named_in(code))))
+                .collect(),
+        )
+    }
+}
+
+/// The layers `translations` is sent on.
+const TRANSLATED_LAYERS: [&str; 5] = ["neighborhood", "place", "district", "region", "country"];
+
 impl Feature {
-    fn of(common: &crate::api::Common, coordinates: [f64; 2]) -> Self {
+    fn of(common: &Common, coordinates: [f64; 2], naming: Naming) -> Self {
+        // What og named each area, by the id its layer carries. A result
+        // that is an area is its own layer.
+        let context = &common.context;
+        let mut areas = [
+            &context.neighbourhood,
+            &context.locality,
+            &context.district,
+            &context.region,
+            &context.country,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|area| (encode_id(&area.id), Names::of_area(area)))
+        .collect::<HashMap<_, _>>();
+        areas.insert(encode_id(&common.id), Names::of_result(common));
         let translated = Translated::of(common, coordinates);
+        let layer = |key: &str, area: super::Area| {
+            let (mapbox_id, fields) = area.split();
+            let translations = TRANSLATED_LAYERS
+                .contains(&key)
+                .then(|| {
+                    let names = mapbox_id
+                        .as_ref()
+                        .and_then(|id| areas.get(id).copied())
+                        .unwrap_or_default();
+                    naming.translations(&fields.name, names)
+                })
+                .flatten();
+            Layer {
+                mapbox_id,
+                fields,
+                translations,
+            }
+        };
         Self {
             kind: "Feature",
             id: translated.mapbox_id.clone(),
@@ -89,17 +203,14 @@ impl Feature {
                 name: translated.name,
                 coordinates: translated.coordinates,
                 place_formatted: translated.place_formatted,
-                context: translated.context.map(|area| {
-                    let (mapbox_id, fields) = area.split();
-                    Layer { mapbox_id, fields }
-                }),
+                context: translated.context.map_named(layer),
             },
         }
     }
 }
 
 impl Collection {
-    fn forward(collection: &ForwardCollection, types: Option<&Types>) -> Self {
+    fn forward(collection: &ForwardCollection, types: Option<&Types>, naming: Naming) -> Self {
         Self {
             kind: "FeatureCollection",
             features: collection
@@ -107,14 +218,18 @@ impl Collection {
                 .iter()
                 .filter(|feature| admitted(types, &feature.properties.common))
                 .map(|feature| {
-                    Feature::of(&feature.properties.common, feature.geometry.coordinates)
+                    Feature::of(
+                        &feature.properties.common,
+                        feature.geometry.coordinates,
+                        naming,
+                    )
                 })
                 .collect(),
             attribution: attribution(&collection.geocoding.attribution),
         }
     }
 
-    fn reverse(collection: &ReverseCollection, types: Option<&Types>) -> Self {
+    fn reverse(collection: &ReverseCollection, types: Option<&Types>, naming: Naming) -> Self {
         Self {
             kind: "FeatureCollection",
             features: collection
@@ -122,7 +237,11 @@ impl Collection {
                 .iter()
                 .filter(|feature| admitted(types, &feature.properties.common))
                 .map(|feature| {
-                    Feature::of(&feature.properties.common, feature.geometry.coordinates)
+                    Feature::of(
+                        &feature.properties.common,
+                        feature.geometry.coordinates,
+                        naming,
+                    )
                 })
                 .collect(),
             attribution: attribution(&collection.geocoding.attribution),
@@ -147,6 +266,34 @@ enum Lookup {
 struct Plan {
     lookup: Lookup,
     types: Option<Types>,
+    /// `language`, checked as Mapbox checks it.
+    languages: Vec<String>,
+}
+
+/// `language`, a comma-separated list of at most 20 unique language codes.
+/// The first names each result, and the others its context's
+/// `translations`.
+fn languages(params: &Params) -> Result<Vec<String>, crate::compat::VendorError> {
+    let Some(value) = params.get("language") else {
+        return Ok(Vec::new());
+    };
+    let mut codes = Vec::<String>::new();
+    for code in value.split(',').map(str::trim) {
+        if Languages::parse(code).map_or(true, |parsed| parsed.is_empty()) {
+            return Err(Api::Geocoding.invalid(format!("\"{code}\" is not a valid language code")));
+        }
+        if codes.iter().any(|known| known.eq_ignore_ascii_case(code)) {
+            return Err(Api::Geocoding
+                .invalid("options.language should be a list of unique language codes"));
+        }
+        codes.push(code.to_string());
+    }
+    if codes.len() > MAX_LANGUAGES {
+        return Err(Api::Geocoding.invalid(format!(
+            "options.language should be a list of no more than {MAX_LANGUAGES} languages"
+        )));
+    }
+    Ok(codes)
 }
 
 /// Search addresses (Mapbox Geocoding v6)
@@ -171,23 +318,26 @@ pub(super) async fn reverse(
 
 async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compat::VendorError> {
     let types = plan.types.as_ref();
+    let naming = Naming {
+        codes: &plan.languages,
+    };
     let failed = |problem| Api::Geocoding.failed(problem);
     match plan.lookup {
         Lookup::Geocode(args) => native::geocode(state, args)
             .await
-            .map(|collection| Collection::forward(&collection, types))
+            .map(|collection| Collection::forward(&collection, types, naming))
             .map_err(failed),
         Lookup::Id { ids, text } => match native::places(state, ids).await {
-            Ok(collection) => Ok(Collection::forward(&collection, types)),
+            Ok(collection) => Ok(Collection::forward(&collection, types, naming)),
             Err(problem) if problem.status() == 400 => native::geocode(state, text)
                 .await
-                .map(|collection| Collection::forward(&collection, types))
+                .map(|collection| Collection::forward(&collection, types, naming))
                 .map_err(failed),
             Err(problem) => Err(failed(problem)),
         },
         Lookup::Reverse(args) => native::reverse(state, args)
             .await
-            .map(|collection| Collection::reverse(&collection, types))
+            .map(|collection| Collection::reverse(&collection, types, naming))
             .map_err(failed),
     }
 }
@@ -208,6 +358,8 @@ const STRUCTURED: [&str; 9] = [
 
 fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let types = params.types(Api::Geocoding)?;
+    let languages = languages(params)?;
+    let lang = (!languages.is_empty()).then(|| languages.join(","));
     let layer = types.as_ref().and_then(Types::og_layer);
     let text = |q: &str| {
         Args::new()
@@ -220,16 +372,21 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
             .maybe("focus", params.focus())
             .maybe("bbox", params.get("bbox"))
             .maybe("layer", layer)
+            .maybe("lang", lang.clone())
     };
     if let Some(q) = params.get("q") {
         let lookup = match decode_id(q) {
             Some(og_id) => Lookup::Id {
-                ids: Args::new().set("ids", og_id),
+                ids: Args::new().set("ids", og_id).maybe("lang", lang.clone()),
                 text: text(q),
             },
             None => Lookup::Geocode(text(q)),
         };
-        return Ok(Plan { lookup, types });
+        return Ok(Plan {
+            lookup,
+            types,
+            languages,
+        });
     }
     if !STRUCTURED.iter().any(|name| params.get(name).is_some()) {
         return Err(error(StatusCode::NOT_FOUND, "Not Found"));
@@ -253,7 +410,8 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .maybe("region", params.get("region"))
                 .maybe("postcode", params.get("postcode"))
                 .maybe("country", code)
-                .maybe("layer", layer),
+                .maybe("layer", layer)
+                .maybe("lang", lang.clone()),
         ),
         // og's address fields need a street. Areas alone are a search for
         // the area, so they are searched as the text they spell.
@@ -280,11 +438,16 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .maybe("country", code)
                 .maybe("focus", params.focus())
                 .maybe("bbox", params.get("bbox"))
-                .maybe("layer", layer);
+                .maybe("layer", layer)
+                .maybe("lang", lang.clone());
             Lookup::Geocode(args)
         }
     };
-    Ok(Plan { lookup, types })
+    Ok(Plan {
+        lookup,
+        types,
+        languages,
+    })
 }
 
 /// A country code as og's `country` filter takes it, alpha-2. An alpha-3
@@ -312,13 +475,16 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
             "limit must be combined with a single type parameter when reverse geocoding",
         ));
     }
+    let languages = languages(params)?;
     let args = Args::new()
         .maybe("lon", params.get("longitude"))
         .maybe("lat", params.get("latitude"))
-        .maybe("layer", types.as_ref().and_then(Types::og_layer));
+        .maybe("layer", types.as_ref().and_then(Types::og_layer))
+        .maybe("lang", (!languages.is_empty()).then(|| languages.join(",")));
     Ok(Plan {
         lookup: Lookup::Reverse(args),
         types,
+        languages,
     })
 }
 
@@ -370,6 +536,7 @@ pub(super) async fn batch(
     }
     let mut checked = Vec::with_capacity(queries.len());
     let mut types = Vec::with_capacity(queries.len());
+    let mut languages = Vec::with_capacity(queries.len());
     for query in &queries {
         let params = batch_params(query)?;
         let plan = if params.get("longitude").is_some() || params.get("latitude").is_some() {
@@ -379,6 +546,7 @@ pub(super) async fn batch(
         };
         checked.push(check(&state, plan.lookup)?);
         types.push(plan.types);
+        languages.push(plan.languages);
     }
 
     let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
@@ -402,11 +570,16 @@ pub(super) async fn batch(
     .map_err(|failed| Api::Geocoding.failed(Problem::from(failed)))?;
 
     let mut batch = Vec::with_capacity(answers.len());
-    for (answer, types) in answers.into_iter().zip(&types) {
+    for ((answer, types), codes) in answers.into_iter().zip(&types).zip(&languages) {
+        let naming = Naming { codes };
         batch.push(
             match answer.map_err(|problem| Api::Geocoding.failed(problem))? {
-                Answer::Forward(collection) => Collection::forward(&collection, types.as_ref()),
-                Answer::Reverse(collection) => Collection::reverse(&collection, types.as_ref()),
+                Answer::Forward(collection) => {
+                    Collection::forward(&collection, types.as_ref(), naming)
+                }
+                Answer::Reverse(collection) => {
+                    Collection::reverse(&collection, types.as_ref(), naming)
+                }
             },
         );
     }

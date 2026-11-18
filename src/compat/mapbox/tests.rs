@@ -74,6 +74,20 @@ fn write_pack() -> Pack {
         .collect(),
     );
     writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
+    let names = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(code, name)| ((*code).to_string(), (*name).to_string()))
+            .collect::<Vec<_>>()
+    };
+    writer.set_language_names(
+        [
+            (country, names(&[("de", "Kanada"), ("fr", "Canada")])),
+            (region, names(&[("fr", "Ontario")])),
+        ]
+        .into_iter()
+        .collect(),
+    );
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -928,4 +942,141 @@ fn attribution_credits_og_sources() {
         "© OpenStreetMap contributors, ODbL 1.0 (https://www.openstreetmap.org/copyright); \
          OpenAddresses x (https://l); plain"
     );
+}
+
+/// `language` names results in its first language. With more than one, each
+/// layer Mapbox translates lists every language asked, the first too.
+#[tokio::test]
+async fn geocoding_language_names_layers_and_translates_them() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let forward = "/compat/mapbox/search/geocode/v6/forward?q=10%20King%20Street&types=address";
+
+    let (status, local) = get(&router, forward).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        local["features"][0]["properties"]["context"]["country"]["name"],
+        "Canada"
+    );
+
+    let (_, german) = get(&router, &format!("{forward}&language=de")).await;
+    let country = &german["features"][0]["properties"]["context"]["country"];
+    assert_eq!(country["name"], "Kanada");
+    assert!(country.get("translations").is_none());
+
+    let both_languages = |de: &str, fr: &str| {
+        json!({
+            "de": {"language": "de", "name": de},
+            "fr": {"language": "fr", "name": fr},
+        })
+    };
+    let (_, both) = get(&router, &format!("{forward}&language=de,fr")).await;
+    let context = &both["features"][0]["properties"]["context"];
+    assert_eq!(
+        context["country"],
+        json!({
+            "mapbox_id": id("osm:relation:1"),
+            "name": "Kanada",
+            "country_code": "CA",
+            "country_code_alpha_3": "CAN",
+            "translations": both_languages("Kanada", "Canada"),
+        })
+    );
+    // og has no German name for Ontario and no name in either language for
+    // Toronto or Downtown, so each keeps its local name in that language.
+    assert_eq!(context["region"]["name"], "Ontario");
+    assert_eq!(
+        context["region"]["translations"],
+        both_languages("Ontario", "Ontario")
+    );
+    assert_eq!(
+        context["place"]["translations"],
+        both_languages("Toronto", "Toronto")
+    );
+    assert_eq!(
+        context["neighborhood"]["translations"],
+        both_languages("Downtown", "Downtown")
+    );
+    // Mapbox translates only these five layers.
+    for layer in ["address", "street", "postcode", "secondary_address"] {
+        assert!(context[layer].get("translations").is_none(), "{layer}");
+    }
+
+    // A later language og holds no name in reads the local name, not the
+    // first language's.
+    let (_, italian) = get(&router, &format!("{forward}&language=de,it")).await;
+    assert_eq!(
+        italian["features"][0]["properties"]["context"]["country"]["translations"],
+        json!({
+            "de": {"language": "de", "name": "Kanada"},
+            "it": {"language": "it", "name": "Canada"},
+        })
+    );
+
+    // An area result is its own layer, translated as any other.
+    let (_, ontario) = get(
+        &router,
+        "/compat/mapbox/search/geocode/v6/forward?q=Ontario&types=region&language=fr,de",
+    )
+    .await;
+    assert_eq!(
+        ontario["features"][0]["properties"]["context"]["region"]["translations"],
+        json!({
+            "fr": {"language": "fr", "name": "Ontario"},
+            "de": {"language": "de", "name": "Ontario"},
+        })
+    );
+
+    let (_, reversed) = get(
+        &router,
+        "/compat/mapbox/search/geocode/v6/reverse?longitude=-79.0&latitude=43.0&language=de,fr",
+    )
+    .await;
+    assert_eq!(
+        reversed["features"][0]["properties"]["context"]["country"]["translations"]["fr"]["name"],
+        "Canada"
+    );
+
+    let (status, batch) = send(
+        &router,
+        "POST",
+        "/compat/mapbox/search/geocode/v6/batch",
+        Some(r#"[{"q": "10 King Street", "types": "address", "language": "de,fr"}]"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(batch["batch"][0], both);
+
+    for (language, message) in [
+        ("d3", "\"d3\" is not a valid language code"),
+        (
+            "de,DE",
+            "options.language should be a list of unique language codes",
+        ),
+        (
+            "aa,ab,ae,af,ak,am,an,ar,as,av,ay,az,ba,be,bg,bh,bi,bm,bn,bo,br",
+            "options.language should be a list of no more than 20 languages",
+        ),
+    ] {
+        let (status, body) = get(&router, &format!("{forward}&language={language}")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{language}");
+        assert_eq!(body, json!({"message": message}), "{language}");
+    }
+}
+
+/// Search Box names results in the first language it is sent and never
+/// translates.
+#[tokio::test]
+async fn search_box_names_results_in_its_first_language() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let (status, body) = get(
+        &router,
+        "/compat/mapbox/search/searchbox/v1/forward?q=10%20King%20Street&language=de,fr",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let country = &body["features"][0]["properties"]["context"]["country"];
+    assert_eq!(country["name"], "Kanada");
+    assert!(country.get("translations").is_none());
 }
