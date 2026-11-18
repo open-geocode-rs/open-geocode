@@ -114,6 +114,10 @@ impl AppState {
         // when it fits, so the first queries do not each wait on faults.
         pack.container()
             .advise_random_reads(resources.available_memory_bytes);
+        // Tables built once per process take up to a second on a slow
+        // build. Built on first use, they eat the first lookup's deadline.
+        crate::categories::load();
+        crate::parse::lattice::postcode::Table::global();
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         let catalogue = Catalogue::open(pack.container())?;
