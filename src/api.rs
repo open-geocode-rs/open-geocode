@@ -841,11 +841,25 @@ pub fn forward_collection(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Languages(Vec<String>);
 
+/// Most distinct languages one request may ask names in. Each one adds a
+/// name to every result and every area of it, so the cap bounds the size of
+/// an answer.
+pub const MAX_LANGUAGES: usize = 20;
+
+/// Why `lang` cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguagesError {
+    /// The first code that is not a language code.
+    NotACode(String),
+    /// More than [`MAX_LANGUAGES`] distinct codes, with how many.
+    TooMany(usize),
+}
+
 impl Languages {
     /// Reads `lang`. A language code is two or three letters, then optional
     /// subtags of letters and digits, such as `de`, `zh-Hant` or `pt-BR`.
-    /// `Err` names the first code that is not one.
-    pub fn parse(lang: &str) -> std::result::Result<Self, String> {
+    /// Repeats are dropped before the cap counts, keeping the first spelling.
+    pub fn parse(lang: &str) -> std::result::Result<Self, LanguagesError> {
         let mut codes = Vec::<String>::new();
         for code in lang
             .split(',')
@@ -853,11 +867,14 @@ impl Languages {
             .filter(|code| !code.is_empty())
         {
             if !is_language_code(code) {
-                return Err(code.to_string());
+                return Err(LanguagesError::NotACode(code.to_string()));
             }
             if !codes.iter().any(|known| known.eq_ignore_ascii_case(code)) {
                 codes.push(code.to_string());
             }
+        }
+        if codes.len() > MAX_LANGUAGES {
+            return Err(LanguagesError::TooMany(codes.len()));
         }
         Ok(Self(codes))
     }
@@ -1316,6 +1333,43 @@ mod tests {
         assert_eq!(unit_type("4"), None);
         assert_eq!(unit_type("Penthouse B"), None);
         assert_eq!(unit_type("Suite"), None);
+    }
+
+    /// Twenty distinct codes, the cap, are read in the order given.
+    const TWENTY: [&str; MAX_LANGUAGES] = [
+        "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hu", "it", "ja",
+        "ko", "nl", "pl", "pt", "ru",
+    ];
+
+    #[test]
+    fn lang_takes_up_to_twenty_distinct_languages() {
+        let languages = Languages::parse(&TWENTY.join(",")).expect("twenty is the cap");
+        assert_eq!(languages.codes(), TWENTY);
+
+        let twenty_one = format!("{},sv", TWENTY.join(","));
+        assert_eq!(
+            Languages::parse(&twenty_one),
+            Err(LanguagesError::TooMany(21))
+        );
+    }
+
+    #[test]
+    fn repeats_drop_before_the_cap_counts_and_the_first_spelling_stays() {
+        let repeated = format!("{},DE,de,Ar,ar", TWENTY.join(","));
+        let languages = Languages::parse(&repeated).expect("repeats count once");
+        assert_eq!(languages.codes(), TWENTY);
+
+        let languages = Languages::parse("pt-BR, de,PT-br,fr,De").expect("repeats count once");
+        assert_eq!(languages.codes(), ["pt-BR", "de", "fr"]);
+    }
+
+    #[test]
+    fn a_malformed_code_is_named_even_past_the_cap() {
+        let twenty_one = format!("{},sv,d3", TWENTY.join(","));
+        assert_eq!(
+            Languages::parse(&twenty_one),
+            Err(LanguagesError::NotACode("d3".to_string()))
+        );
     }
 
     #[test]
