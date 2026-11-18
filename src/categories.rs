@@ -59,6 +59,11 @@ struct Prefixed {
     categories: Box<[usize]>,
 }
 
+/// Builds the catalog's table now rather than on first use.
+pub fn load() {
+    table();
+}
+
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
     TABLE.get_or_init(|| {
